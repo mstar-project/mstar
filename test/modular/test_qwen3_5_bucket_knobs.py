@@ -3,6 +3,7 @@ prefill one from the deployment's model_kwargs; and every prefill ladder a
 shipped config sets, for whichever model it serves."""
 import ast
 import importlib
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -89,13 +90,14 @@ def _shipped_prefill_ladders():
 @pytest.mark.parametrize("config", _configs_with_prefill_ladders())
 def test_every_shipped_prefill_ladder_reaches_its_model(config):
     """The model a config serves takes ``prefill_token_buckets`` as its own
-    argument rather than dropping it into ``**kwargs``; Qwen3-Omni's Thinker
-    then captures its prefill on the ladder (Qwen3.5's, by the tests below)."""
-    import inspect
-
+    argument rather than dropping it into ``**kwargs``, and Qwen3-Omni's
+    Thinker captures its prefill on a ladder it is given (Qwen3.5's, by
+    ``test_prefill_ladder_from_model_kwargs``). The model's hand-off to its
+    submodule is not checked here."""
     from mstar.model.registry import get_model_class
     model, buckets = _configs_with_prefill_ladders()[config]
-    assert "prefill_token_buckets" in inspect.signature(get_model_class(model).__init__).parameters
+    assert "prefill_token_buckets" in inspect.signature(get_model_class(model).__init__).parameters, (
+        f"{model}.__init__ has no prefill_token_buckets argument, so a config's ladder is unchecked")
     if model == "qwen3_omni":
         from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
         node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
