@@ -447,8 +447,8 @@ Qwen3.5's LLM) splits a step's tokens over them; its ``min_tokens`` runs smaller
 every rank instead (default 0: every step that can split does). A captured step decides from its
 bucket's size, not its prompt's. On a node with a resource whose split steps run eagerly only (a
 ring, ``kv_gather``, a recurrent layer such as Qwen3.5's), the node doesn't capture the buckets a
-step could split in (``min_tokens`` and up, not one token a row): such a step runs eagerly and
-splits, and every other step keeps its graph. A step below ``min_tokens`` whose tightest bucket
+step could split in (``min_tokens`` and up, not a batched config's one token a row): such a step
+runs eagerly and splits, and every other step keeps its graph. A step below ``min_tokens`` whose tightest bucket
 reaches ``min_tokens`` runs eagerly too, copied. Each walk captures its own buckets, so that band
 is per walk; ``min_tokens`` one past a bucket of a walk closes it for that walk.
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by

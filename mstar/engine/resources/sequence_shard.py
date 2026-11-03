@@ -51,7 +51,7 @@ from mstar.distributed.communication import CommGroup, gather_sequence, sp_seq_s
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import gather_merge, position_pools, stripe_owners
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.engine.resources.step import ResourceStep, StepContext
+from mstar.engine.resources.step import BucketKey, ResourceStep, StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
@@ -549,6 +549,13 @@ class SequenceShard(Resource):
             and (tokens is None or tokens >= max(self.group.world_size, self.min_tokens))
             and (rows is None or tokens != rows)
         )
+
+    def may_split_in(self, bucket: BucketKey, packed: bool) -> bool:
+        """``may_split`` for a step leasing ``bucket``, read as ``_decide`` reads a lease: the
+        bucket's walk and tokens, and its rows only where it isn't ``packed`` (a packed replay plans
+        as a prefill, ``force_prefill``, so one token a row may still split there). For a resource
+        whose split steps run eagerly only (``Resource.captures_bucket``)."""
+        return self.may_split(bucket.graph_walk, bucket.num_tokens, None if packed else bucket.bs)
 
     @torch.compiler.disable
     def _bracket(self, label: str, xs: tuple, dim: int | None, scatter: bool):

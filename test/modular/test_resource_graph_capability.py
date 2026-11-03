@@ -98,11 +98,12 @@ _DECODE = {("decode", 1), ("decode", 2), ("decode", 4)}
 @pytest.mark.parametrize("resource, captured", [
     ("ring", {("prefill", 8), *_DECODE}),
     ("all_gather", {("prefill", 8), ("prefill", 64), ("prefill", 512), *_DECODE}),
+    ("linear-split", {("prefill", 8), *_DECODE}),
     ("linear-unsplit", {("prefill", 8), ("prefill", 64), ("prefill", 512), *_DECODE}),
 ])
 def test_a_node_whose_split_steps_run_eagerly_captures_only_the_buckets_that_cant_split(resource, captured):
-    """On SP ranks, a resource whose split steps run eagerly only (a ring here) leaves out the
-    buckets a step may split in (``min_tokens`` and up, not one token a row), so such a step runs
+    """On SP ranks, a resource whose split steps run eagerly only (a ring, a recurrent layer) leaves
+    out the buckets a step may split in (``min_tokens`` and up, not one token a row), so such a step runs
     eagerly and splits while decode and smaller steps keep their graphs; an exchange that captures
     (all_gather) keeps every bucket, and so does a resource on a node that never splits. Left
     out by design, so nothing counts as dropped."""
@@ -112,13 +113,13 @@ def test_a_node_whose_split_steps_run_eagerly_captures_only_the_buckets_that_can
     from mstar.engine.resources.linear_attn.gdn import GDNManager
     from mstar.engine.resources.sequence_shard import SequenceShard
 
-    if resource == "linear-unsplit":
+    shard = SequenceShard(("main",), 0, None, 64, CommGroup(0, 0, [0, 1]))
+    if resource.startswith("linear"):
         manager = object.__new__(GDNManager)
-        manager._shard = None
+        manager._shard = shard if resource == "linear-split" else None
     else:
         manager = object.__new__(FlashInferManager)
-        manager._split_exchange = resource
-        manager._shard = SequenceShard(("main",), 0, None, 64, CommGroup(0, 0, [0, 1]))
+        manager._split_exchange, manager._shard = resource, shard
     configs = [
         PackedAcceleratorGraphConfig(
             capture_graph_walk="prefill", capture_token_lengths=[8, 64, 512], capture_batch_sizes=[1],

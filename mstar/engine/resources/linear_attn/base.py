@@ -198,9 +198,7 @@ class LinearAttnManager(AttentionResource):
     def captures_bucket(self, bucket: BucketKey, packed: bool) -> bool:
         # both exchanges plan their halo and hand-off per rank on the host: a step that may split
         # runs eagerly. No shard where the node never splits (one SP rank, say)
-        return self._shard is None or not self._shard.may_split(
-            bucket.graph_walk, bucket.num_tokens, None if packed else bucket.bs,
-        )
+        return self._shard is None or not self._shard.may_split_in(bucket, packed)
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         if self._shard_key is None or not resources[self._shard_key].can_split:
