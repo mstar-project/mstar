@@ -217,6 +217,15 @@ def test_a_slot_override_that_cannot_work_is_refused(override, refusal):
         _specs(0)["state"].apply_yaml_overrides(**override)
 
 
+def test_a_pool_too_small_for_one_requests_labels_is_refused():
+    """A request holds a slot per label, so one usable slot never admits two."""
+    with pytest.raises(ValueError, match="max_slots=2"):
+        RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+            max_slots=2, labels=("main", "fork"),
+        )
+
+
 @pytest.mark.parametrize("admitted", [False, True])
 def test_removal_gives_back_the_lease_or_the_restore_its_plan_never_ran(admitted):
     pool = _pool()

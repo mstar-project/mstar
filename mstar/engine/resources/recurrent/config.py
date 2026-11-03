@@ -270,11 +270,13 @@ class RecurrentStateConfig:
         self.check_slots()
 
     def check_slots(self) -> None:
-        """A pool must hold at least one request's state, or every admit waits forever."""
-        if self.usable_slots < 1:
+        """A pool must hold at least one request's state, a slot per label, or
+        every admit waits forever."""
+        if self.usable_slots < len(self.labels):
             raise ValueError(
-                f"max_slots={self.max_slots} leaves nothing to hand out"
-                + ("." if self.disable_sink_slot else ": the sink takes one. Raise it or set disable_sink_slot.")
+                f"max_slots={self.max_slots} cannot hold one request's {len(self.labels)} "
+                f"label(s)" + ("." if self.disable_sink_slot else
+                               ": the sink takes one. Raise it or set disable_sink_slot.")
             )
 
     @property

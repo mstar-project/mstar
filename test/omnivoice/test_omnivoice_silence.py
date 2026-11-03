@@ -1,6 +1,7 @@
 """The vectorized silence trim against the reference's pydub one: sample-exact."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -85,24 +86,60 @@ def test_edge_cases_match_pydub(audio, reference):
     assert np.array_equal(got, want)
 
 
-def test_postprocess_shapes_the_waveform_and_refuses_a_masked_canvas():
+@pytest.fixture
+def fade_and_pad(monkeypatch):
+    """The reference package's ``omnivoice.utils.audio``, or a stand-in for its
+    fade and pad where it is not installed (CPU CI), so ``postprocess`` runs."""
+    try:
+        import omnivoice.utils.audio  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    def fade_and_pad_audio(audio, pad_duration, fade_duration, sample_rate):
+        fade = min(int(fade_duration * sample_rate), audio.shape[-1] // 2)
+        ramp = np.linspace(0.0, 1.0, fade, dtype=audio.dtype)
+        audio = audio.copy()
+        audio[..., :fade] *= ramp
+        audio[..., audio.shape[-1] - fade:] *= ramp[::-1]
+        pad = np.zeros((*audio.shape[:-1], int(pad_duration * sample_rate)), audio.dtype)
+        return np.concatenate([pad, audio, pad], axis=-1)
+
+    package = ModuleType("omnivoice")
+    utils = ModuleType("omnivoice.utils")
+    audio = ModuleType("omnivoice.utils.audio")
+    audio.fade_and_pad_audio = fade_and_pad_audio
+    package.utils, utils.audio = utils, audio
+    for name, module in (("omnivoice", package), ("omnivoice.utils", utils), ("omnivoice.utils.audio", audio)):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize("ref_rms", [None, 0.05], ids=["designed", "clone"])
+def test_postprocess_shapes_the_waveform_and_refuses_a_masked_canvas(fade_and_pad, ref_rms):
     """code2wav emits the raw float waveform and the API side shapes it the
-    reference's way (here: peak-normalised to 0.5, faded and padded); a canvas
-    that still held MASK cells arrives NaN-poisoned and is refused."""
-    pytest.importorskip("omnivoice.utils.audio")  # the fade and pad are the reference package's
+    reference's way (peak-normalised to 0.5, or matched to a clone reference's
+    level, then faded and padded); a canvas that still held MASK cells arrives
+    NaN-poisoned and is refused."""
     import torch
 
     from mstar.model.omnivoice.components.codec import post_process
     from mstar.model.omnivoice.config import OmniVoiceConfig
-    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+    from mstar.model.omnivoice.omnivoice_model import REF_RMS_KEY, OmniVoiceModel
 
     model = object.__new__(OmniVoiceModel)
     model.config = OmniVoiceConfig()
     rng = np.random.default_rng(0)
     wave = _speech(rng, 2.0)[0]
-    pcm = np.frombuffer(model.postprocess(torch.from_numpy(wave), "audio", request_kwargs={}), dtype=np.int16)
-    want = post_process(wave, config=model.config, ref_rms=None, pad_duration=0.1, fade_duration=0.1, enabled=True)
+    request_kwargs = {} if ref_rms is None else {REF_RMS_KEY: ref_rms}
+    pcm = np.frombuffer(
+        model.postprocess(torch.from_numpy(wave), "audio", request_kwargs=request_kwargs), dtype=np.int16,
+    )
+    want = post_process(wave, config=model.config, ref_rms=ref_rms, pad_duration=0.1, fade_duration=0.1, enabled=True)
     assert np.array_equal(pcm, (np.clip(want, -1, 1) * 32767).astype(np.int16))
+    if ref_rms is not None:
+        designed = post_process(wave, config=model.config, ref_rms=None, pad_duration=0.1, fade_duration=0.1,
+                                enabled=True)
+        assert not np.array_equal(want, designed), "the clone's level must not be the designed voice's"
     poisoned = torch.from_numpy(wave.copy())
     poisoned[:] = float("nan")
     with pytest.raises(RuntimeError, match="masked cells"):
