@@ -82,8 +82,10 @@ def _worker():
     w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
-    w._dropped, w._preempted, w._preemptions = {}, {}, defaultdict(PreemptionCounts)
+    w._rebuilding, w._dropped = frozenset(), {}
+    w._preemption = SimpleNamespace(
+        counts=defaultdict(PreemptionCounts), returned=lambda rid, node: None, remove_request=lambda rid: None,
+    )
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,

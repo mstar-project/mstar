@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sys
 from array import array
-from collections import Counter, defaultdict
+from collections import Counter
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -39,6 +39,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -71,11 +72,9 @@ def _worker(kv):
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
-    w._kv_caches, w._kv_keys = {"kv": PagedKVCache("kv", frozenset({NODE}), kv)}, {NODE: ["kv"]}
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
-    w._in_flight_rids, w._dropped, w._hold_logged = set(), {}, {}
-    w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
+    w._in_flight_rids, w._dropped, w._hold_logged, w._rid_str = set(), {}, {}, str
     w.held, w.tried, w.failed = [], [], {}
     w._is_tearing_down, w._fail_requests = lambda rid: False, w.failed.update
     w.scheduler = SimpleNamespace(
@@ -90,7 +89,9 @@ def _worker(kv):
             graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}, resource_publish_info=None,
         ),
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    caches = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)])
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine, engine=caches)
+    _preemption(w)
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
     w._apply_removes_whose_step_landed = lambda: None
     w._apply_pending_removes_safe_to_drop = lambda rids: None
@@ -98,6 +99,13 @@ def _worker(kv):
         w.tried.append(node)
     )
     return w
+
+
+def _preemption(w) -> None:
+    """The worker's `Preemption`, over its rebuilds and its own drop."""
+    w._preemption = Preemption(
+        w.engine_manager, w._rebuilds, w.scheduler, w._drop, w._rebuild_refusal, w._log_throttled, w._rid_str,
+    )
 
 
 def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ()):
@@ -111,6 +119,7 @@ def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ())
     w._in_flight_rids = set(in_flight)
     if case == "a node that keeps no ids":
         w._rebuilds = Rebuilds({}, {})
+        _preemption(w)
     elif case == "a node where no request keeps ids":
         w._rebuilds._kept[NODE] = {}
     elif case == "nothing to drop":
@@ -136,7 +145,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert not w.tried, "a pool that decides chose its victim by recency"
         assert w._dropped == {"v": NODE} and not w.held, "r's shortage didn't drop v"
         assert _step(kv, "r", 1).ok, "r didn't get the page v's drop freed"
-        assert w._preemptions[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
+        assert w._preemption.counts[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
     elif case == "a node where no request keeps ids":
         # the node's policy decides how it preempts, whichever requests keep ids now
         assert not w.tried and not w.held and _queue(kv) == ["r"] and kv.is_resident("v"), (
@@ -266,7 +275,7 @@ def test_preemptions_after_metrics_start_are_reported():
     metrics = w._start_metrics(3600.0)
     metrics.start_counting()
 
-    w._preemptions[NODE].victims += 1
+    w._preemption.counts[NODE].victims += 1
 
     (snapshot,) = [s for s in metrics.snapshot() if s.name == "mstar_kv_preemptions_total"]
     reported = dict(zip(map(tuple, snapshot.label_values), snapshot.values, strict=True))

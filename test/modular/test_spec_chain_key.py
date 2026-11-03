@@ -33,7 +33,6 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         request_state=None,
         _rebuilds=Rebuilds({}, {}),
         _dropped={},
-        _preempted={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
