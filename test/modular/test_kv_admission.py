@@ -346,44 +346,6 @@ def test_a_request_passes_beside_the_samplers_rows_only_while_one_is_left_for_th
     assert _ready(kv, "short") is passes, "a request that passes beside the KV waited behind the head for a row"
 
 
-class _Slots(Resource):
-    """A pool that lets a request pass and has no slot for ``refused``."""
-
-    def __init__(self, refused: str):
-        self.refused, self.held = refused, set()
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
-
-    def ask(self, rid, node_name, graph_walk):
-        return None if rid in self.held else ASKS
-
-    def reserve(self, rid, node_name, graph_walk, published):
-        if rid == self.refused:
-            return 0
-        self.held.add(rid)
-        return None
-
-    reserve_past = reserve
-
-    def unreserve(self, rid):
-        self.held.discard(rid)
-
-    def grew_since(self, mark):
-        return False
-
-
-def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds_it_back():
-    kv = _manager(max_num_pages=16)
-    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "slots": _Slots("p")}, node_resources={NODE: ["kv", "slots"]}))
-    kv = _passing(free=1, head=2, kv=kv)
-    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
-
-    assert not _ready(kv, "p"), "p passed though the other pool had no slot for it"
-    assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
-
-
 class _Picky(Resource):
     """A pool every request asks, which refuses the requests in ``refused``."""
 
@@ -410,6 +372,18 @@ class _Picky(Resource):
 
     def grew_since(self, mark):
         return self.moved != mark
+
+
+def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds_it_back():
+    kv = _manager(max_num_pages=16)
+    picky = _Picky()
+    picky.refused.add("p")
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "picky": picky}, node_resources={NODE: ["kv", "picky"]}))
+    kv = _passing(free=1, head=2, kv=kv)
+    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
+
+    assert not _ready(kv, "p"), "p passed though the other pool had no slot for it"
+    assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
 
 
 def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
