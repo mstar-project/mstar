@@ -32,7 +32,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_droid``
      - ``nvidia/Cosmos3-Nano-Policy-DROID``
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
-       ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
+       ``droid_lerobot``, 8-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
    * - ``cosmos3_edge``
      - ``nvidia/Cosmos3-Edge``
@@ -248,12 +248,14 @@ OmniVoice notes
   rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
   runs the same layer loop eagerly, and ``backbone_token_buckets`` sets the
   packed-token buckets (256 to 4096 by default).
-- ``configs/omnivoice_split.yaml`` runs code2wav (codec decode and the
-  host-side silence trim) on a second worker sharing GPU 0, so the unmask loop
-  no longer stops for each finished request, and sets ``mps: true`` (see
+- ``configs/omnivoice_split.yaml`` runs code2wav (the codec decode) on a
+  second worker sharing GPU 0, so the unmask loop no longer stops for each
+  finished request's decode; the silence trim and the rest of the output
+  shaping run on the API side in either config. It sets ``mps: true`` (see
   :doc:`serving`) so the two workers' kernels overlap. On an H200 it raised
   concurrency-32 throughput from ~153 to 176-184 audio-s/s and cut TTFA p95
-  from ~9 s to ~3 s; concurrency 1 is ~10% slower.
+  from ~9 s to ~3 s, measured while code2wav still did the shaping on its
+  worker; concurrency 1 was ~10% slower.
 
 Higgs Audio notes
 ~~~~~~~~~~~~~~~~~
@@ -428,6 +430,11 @@ default, which lowers the token count of short clips. Notes:
   large for a replay alone (a long video) gets a step of its own. The packed
   GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
+- On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
+  serves video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``, whose
+  vision encoder runs on one rank while the other waits for it in the lockstep
+  LLM: 9B on 2xH200 with TP-async on, DP2 gave 12.5-44% more output tok/s on
+  30 s and 60 s videos at c=16 and c=32.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
   beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
   eagerly.
@@ -450,6 +457,17 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+Text prefill and mixed steps replay captured graphs by total tokens, on the
+ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
+step's decode rows and batches a few tokens over; a mixed step keeps only the
+powers of two past 2176); a step pads to its bucket and a longer one runs
+eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
+deployment's own ladder (distinct positive token counts, checked when the
+worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
+and 2176 for a mixed step, since the LLM's 2048-token step budget
+(``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
+reached. Each bucket adds captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -603,7 +621,11 @@ Qwen3-Omni notes
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
   log-mel features: a step's clips (up to 8 requests) go through one packed
   forward, up to 4096 tokens. A step over 4096 tokens runs its clips one by
-  one, each replayed if it fits a bucket. A clip's embeddings can differ at
+  one, each replayed if it fits a bucket. A clip's last 1 s chunk is
+  zero-padded to a full chunk before the convolutions, as HF's encoder pads
+  it whenever its batch holds a full chunk, so a clip under 1 s encoded alone
+  differs from HF's: in its last conv row and, through the windowed
+  attention, in every embedding of the clip. A clip's embeddings can differ at
   the last bit with what it is batched beside, since the step's total tokens
   pick the captured bucket (or the eager GEMMs' shapes), and a prefix-cached
   audio prefix keeps the embeddings it was first computed with, so a later
@@ -625,6 +647,10 @@ Qwen3-Omni notes
   neither bit-exact with the unfused ops. Its 15 depth steps feed each sampled
   code into the next, so small differences can change later codes at
   near-ties.
+- The Thinker's text and audio prefill replay captured graphs on the ladder
+  ``128 ... 2048`` tokens, and a longer step runs eagerly.
+  ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
+  ladder. Each bucket adds captures, graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.
@@ -1312,12 +1338,30 @@ steps: batching keeps requests in step rather than adding throughput.
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
-``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8,
 "action_chunk_size": 32}``; the reply's ``action`` payload is float32
 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
-embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
-pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
-reports chunks/s, actions/s and latency percentiles.
+embodiment's actions. A policy request may also send the robot's current state
+as ``robot_state``, one row of ``raw_action_dim`` finite numbers (a NaN or inf is
+a 400), as pi0.5 takes it. The state is one more action token, kept clean at
+video frame 0 in front of the chunk, so ``num_frames`` is ``action_chunk_size + 1``
+and the reply carries only the predicted rows. The released DROID policies were
+trained this way. A request that sends a ``robot_state`` is a policy request, and
+its chunk, fps and domain default to the checkpoint's ``checkpoint.json`` (Edge
+DROID: 32 rows, 15 fps, ``droid_lerobot``; ``configs/cosmos3_droid.yaml`` sets the
+same for Nano, whose file is empty), so NVIDIA's RoboLab request is the image, the
+prompt, the state and ``size="736x544"``: the wrist frame above the two exterior
+frames reflection-padded to 736x544, the 7 joint positions and the gripper as
+DROID records them, and the task with view, duration and resolution text (a JSON
+caption for Edge). The DROID configs map the gripper to the checkpoint's
+``1 - gripper`` in every action a request sends and back in every action it
+gets (``inverted_action_dims``),
+and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
+``[960, 1001]`` (``guidance_interval_action``; outside it the conditional branch
+runs alone, batched requests too). For a control loop use ``/generate/ws`` (one
+connection, pipelined observations): ``examples/cosmos3_action_ws_client.py``
+builds that request, runs the loop and reports chunks/s, actions/s and latency
+percentiles.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------

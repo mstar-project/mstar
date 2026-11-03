@@ -201,8 +201,9 @@ You must implement these abstract methods:
    value that ``process_prompt`` moves onto a tensor edge must not travel there
    too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
    originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
-   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
-   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   lists ``robot_state``, and Cosmos3 lists ``action`` and ``robot_state`` (it passes
+   only their sizes on, as ``action_shape`` and ``robot_state_dim`` metadata). A tensor
+   left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
 
 .. note::
@@ -728,9 +729,10 @@ The spec types are:
        ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
        each sequence-parallel rank runs whole over its own tokens (one over a
        replicated stream, or a cross-attention from the rank's query shard).
-       ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
-       ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less,
-       since a ragged prefill only uses it for split-KV partials. ``compile_op``,
+       ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
+       ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
+       asks for more at startup grows it. A node with many labels can declare less, since a
+       ragged prefill only uses it for split-KV partials. ``compile_op``,
        ``shard_over_sp`` and ``workspace_mb`` are the model's declaration; the serving
        config's ``resources:`` overrides take only the backends and the ceilings. See
        `Cacheless attention (encoder towers)`_ for ``compile_op``.
@@ -2053,6 +2055,12 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
            ),
        ]
 
+An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
+replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
+deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Qwen3-Omni
+and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
+submodule raises ``ValueError`` when it is built.
+
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
 with guidance enabled and a decode step with guidance disabled declare different segments
@@ -2337,7 +2345,9 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
+     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
+       ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
+       slot for a request is refused at startup.
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``

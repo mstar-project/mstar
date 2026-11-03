@@ -21,7 +21,7 @@ import torch
 from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
-from mstar.communication.communicator import CommProtocol, make_communicator, requested_transport
+from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
 from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
@@ -173,15 +173,10 @@ def _make_graph_runtime(
     It requires the Rust communicator and the Rust bookkeeper: it sends
     WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
     transport, and settles refcounts on a share of the same bookkeeper, rather
-    than hopping back into Python for either. A Python one of either has no
-    such object to share, so this raises on one.
+    than hopping back into Python for either. Anything else has no such object
+    to share, so this raises on it.
     """
     require_rust_extension()
-    if requested_transport() == "0":
-        raise ValueError(
-            "MSTAR_RUST_ZMQ=0 pins the pyzmq communicator, which the graph "
-            "runtime cannot run on. Set MSTAR_RUST_ZMQ to 1 or AUTO."
-        )
 
     from mstar.communication.rust_communicator import RustZMQCommunicator
     from mstar.graph.runtime.rust import RustGraphRuntime
@@ -189,13 +184,12 @@ def _make_graph_runtime(
     if not isinstance(communicator, RustZMQCommunicator):
         raise ValueError(
             "The graph runtime needs the Rust communicator, but this worker "
-            f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+            f"built a {type(communicator).__name__}."
         )
     if not issubclass(communicator.codec, WireCodec):
         raise ValueError(
             "The graph runtime needs the msgpack codec, but this worker "
-            f"built a {communicator.codec.__name__}. Set "
-            "MSTAR_WIRE_CODEC=msgpack."
+            f"built a {communicator.codec.__name__}."
         )
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):
@@ -988,29 +982,36 @@ class Worker:
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
 
+        # One NewRequest comes per partition this worker serves, and a later one
+        # can land after a step already ran. The tensor manager and the engine
+        # hold request-wide state, so only the first opens it. Opening it again
+        # would reset that state under the partition that is running.
+        first = request_id not in self.request_state.per_request_info
         self.request_state.add_request(request_id, body.request_info)
         self.scheduler.note_arrival(request_id)
         self._graph_runtime.register_stop_limits(request_id, body.request_info)
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
+        if first:
+            self.tensor_manager.register_request(
+                request_id, self._graph_runtime.get_sharding_config(request_id),
+            )
         laps.lap("worker_state")
-        try:
-            self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs, body.request_info,
-            )
-            laps.lap("engine_add")
-            self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
-            laps.lap("skip_publish")
-        except Exception as err:
-            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            text, _ = client_error_text(
-                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
-                log=logger,
-            )
-            self._fail_requests({request_id: f"Error in worker: {text}"})
-            self._process_unprocessed(body.request_id)
-            return
+        if first:
+            try:
+                self.engine_manager.add_request(
+                    request_id, body.request_info.resource_configs, body.request_info,
+                )
+                laps.lap("engine_add")
+                self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
+                laps.lap("skip_publish")
+            except Exception as err:
+                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+                text, _ = client_error_text(
+                    err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                    log=logger,
+                )
+                self._fail_requests({request_id: f"Error in worker: {text}"})
+                self._process_unprocessed(body.request_id)
+                return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
