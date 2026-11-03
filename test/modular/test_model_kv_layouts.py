@@ -221,11 +221,17 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen", "fish_s2_pro"])
 def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
     """The prefill emits the first of max_output_tokens, so the decode loop's
     cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
     ends at the prefill."""
+    if model_name == "fish_s2_pro":
+        from test_fish_s2_pro_model import tiny_model
+
+        cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
+        assert cap == max(1, max_tokens - 1)
+        return
     if model_name == "canary":
         from mstar.model.canary.canary_model import CanaryModel
 

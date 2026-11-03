@@ -558,14 +558,14 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         depends on size: on CPU, MKLDNN's numel heuristic splits at 3, 6, 21
         and 81 frames, and the warm-up runs one canvas per range. The CUDA
         ranges (conv backend choice and Inductor's own guards) are unmeasured;
-        probably one. Canvases of one and two frames (80 ms at most) are not
-        warmed. The inputs are made as the codec's ``decode`` makes them
+        probably one. Canvases of one and two frames (80 ms at most) are
+        warmed too: dynamo specializes a size of one. The inputs are made as the codec's ``decode`` makes them
         (``fc2``, then a transpose): a tensor of other strides or view base
         fails the guards."""
         fc2 = self.codec.fc2
         latents = [
             torch.zeros(1, frames, fc2.in_features, dtype=fc2.weight.dtype, device=fc2.weight.device)
-            for frames in (3, 10, 40, 160)
+            for frames in (1, 2, 3, 10, 40, 160)
         ]
         return {"codec.acoustic_decoder": [(fc2(x).transpose(1, 2),) for x in latents]}
 

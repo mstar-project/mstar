@@ -887,7 +887,8 @@ Fish Audio S2-Pro notes
   it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
 - The codec decodes each chunk's new frames from its stream's decoder state
-  (the ``codec_state`` recurrent pool, 256 streams by default; size it with
+  (the ``codec_state`` recurrent pool, 64 streams by default, as many as the AR
+  decodes in a step, about 0.55 GiB; size it with
   ``resources: {codec_state: {max_slots: ...}}``), so every frame is decoded
   once. It decodes with TF32 by default: TF32 roughly halves its conv stack
   and the audio stays within ~60 dB SNR of the exact decode, both measured on

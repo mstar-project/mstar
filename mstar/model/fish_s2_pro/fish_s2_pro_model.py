@@ -119,9 +119,12 @@ class FishS2ProModel(Model):
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
-    # Streams the codec state pool holds (about 10 MiB each, fp32); a
-    # deployment sizes it with ``resources: {codec_state: {max_slots: ...}}``.
-    MAX_CODEC_STREAMS = 256
+    # Streams the codec state pool holds (about 8.5 MiB each, fp32): as many
+    # as the AR decodes in one step (``ARSubmodule.MAX_BATCH_SIZE``), so the
+    # pool does not cap what the AR can serve at once. Past that, a request
+    # waits in admission for a stream. A deployment sizes it with
+    # ``resources: {codec_state: {max_slots: ...}}``.
+    MAX_CODEC_STREAMS = 64
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         self.model_path_hf = model_path_hf
