@@ -428,6 +428,11 @@ default, which lowers the token count of short clips. Notes:
   large for a replay alone (a long video) gets a step of its own. The packed
   GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
+- On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
+  serves video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``, whose
+  vision encoder runs on one rank while the other waits for it in the lockstep
+  LLM: 9B on 2xH200 with TP-async on, DP2 gave 12.5-44% more output tok/s on
+  30 s and 60 s videos at c=16 and c=32.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
   beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
   eagerly.
@@ -450,6 +455,17 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+Text prefill and mixed steps replay captured graphs by total tokens, on the
+ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
+step's decode rows and batches a few tokens over; a mixed step keeps only the
+powers of two past 2176); a step pads to its bucket and a longer one runs
+eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
+deployment's own ladder (distinct positive token counts, checked when the
+worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
+and 2176 for a mixed step, since the LLM's 2048-token step budget
+(``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
+reached. Each bucket adds captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -603,7 +619,11 @@ Qwen3-Omni notes
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
   log-mel features: a step's clips (up to 8 requests) go through one packed
   forward, up to 4096 tokens. A step over 4096 tokens runs its clips one by
-  one, each replayed if it fits a bucket. A clip's embeddings can differ at
+  one, each replayed if it fits a bucket. A clip's last 1 s chunk is
+  zero-padded to a full chunk before the convolutions, as HF's encoder pads
+  it whenever its batch holds a full chunk, so a clip under 1 s encoded alone
+  differs from HF's: in its last conv row and, through the windowed
+  attention, in every embedding of the clip. A clip's embeddings can differ at
   the last bit with what it is batched beside, since the step's total tokens
   pick the captured bucket (or the eager GEMMs' shapes), and a prefix-cached
   audio prefix keeps the embeddings it was first computed with, so a later
@@ -624,6 +644,10 @@ Qwen3-Omni notes
   (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
   steps feed each sampled code into the next, so small differences can change
   later codes at near-ties.
+- The Thinker's text and audio prefill replay captured graphs on the ladder
+  ``128 ... 2048`` tokens, and a longer step runs eagerly.
+  ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
+  ladder. Each bucket adds captures, graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.

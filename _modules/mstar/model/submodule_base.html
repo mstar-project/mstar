@@ -2703,6 +2703,29 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the device; the loop-back hooks below follow from it.</span>
     <span class="n">device_loopback</span><span class="p">:</span> <span class="n">DeviceLoopback</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># The packed token counts a prefill capture is built at, which</span>
+    <span class="c1"># ``__init__``'s ``prefill_token_buckets`` replaces per instance. A</span>
+    <span class="c1"># submodule that takes that kwarg must read its capture ladder off</span>
+    <span class="c1"># ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.</span>
+    <span class="n">PREFILL_TOKEN_BUCKETS</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prefill_token_buckets</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""``prefill_token_buckets``: a deployment's own captured prefill ladder</span>
+<span class="sd">        (``model_kwargs.prefill_token_buckets``), in place of the class's</span>
+<span class="sd">        ``PREFILL_TOKEN_BUCKETS``."""</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">prefill_token_buckets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">buckets</span> <span class="o">=</span> <span class="n">prefill_token_buckets</span>
+            <span class="k">if</span> <span class="p">(</span>
+                <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">buckets</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">))</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">buckets</span>
+                <span class="ow">or</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">and</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">buckets</span><span class="p">)</span>
+                <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">buckets</span><span class="p">))</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">buckets</span><span class="p">)</span>
+            <span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"prefill_token_buckets must be a non-empty list of distinct positive token counts, got </span><span class="si">{</span><span class="n">buckets</span><span class="si">!r}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">PREFILL_TOKEN_BUCKETS</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">buckets</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_loops_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether this walk's token loops back on the device."""</span>
         <span class="n">loopback</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span>
