@@ -4,6 +4,9 @@ sampled token back in. Its stop checks are ``ARNodeSubmodule``'s, from the
 node's ``token_stop``."""
 from __future__ import annotations
 
+from collections import ChainMap
+from collections.abc import Mapping
+
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -67,9 +70,10 @@ class TokenStepNode:
         self,
         request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str]:
-        # a batched decode step routes its token as text_inputs alone
+        # a batched decode step routes its token as text_inputs alone. A view,
+        # not a copy: each output's host copy is made when it is first read
         if "new_token" not in outputs and "text_inputs" in outputs:
-            outputs = {**outputs, "new_token": outputs["text_inputs"]}
+            outputs = ChainMap({"new_token": outputs["text_inputs"]}, outputs)
         return super().check_stop(request_id, request_info, outputs)
