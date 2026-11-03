@@ -90,14 +90,13 @@ def compile_transformer_forward(
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
     tensor dtype exactly where eager PyTorch does (``emulate_precision_casts``): without it, fused
-    bf16 chains keep fp32 intermediates and the served images drift to 35-39 dB from the bit-exact
-    eager path on a 4-step distilled sampler (measured). Even with it the compiled transformer
-    lands at a median 37.6 dB over 100 prompts (klein-4B), because inductor's own reductions and
-    activation decompositions round differently: ``exact_ops`` keeps those modules on the eager
-    result (``exclude_from_compile``) and compiles the rest — ``True`` for all of them, or a list
-    of the op classes to keep (``["norms"]``, ``["activations"]``), since every kept module but a
-    1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion (klein-4B paid 8% at B=1 for all of
-    them while its RMSNorms were breaks too, Z-Image 48%)."""
+    bf16 chains keep fp32 intermediates and the served images drift from the bit-exact eager
+    path. Even with it the compiled transformer is not bit-exact, because inductor's own
+    reductions and activation decompositions round differently: ``exact_ops`` keeps those
+    modules on the eager result (``exclude_from_compile``) and compiles the rest — ``True`` for
+    all of them, or a list of the op classes to keep (``["norms"]``, ``["activations"]``), since
+    every kept module but a 1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion
+    (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst)."""
     types = exact_op_types(exact_ops)
     if types:
         kept = exclude_from_compile(transformer, types)

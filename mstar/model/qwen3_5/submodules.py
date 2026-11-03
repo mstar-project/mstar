@@ -722,8 +722,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
     """
 
     # Patch-count buckets of one replay. 16384 patches merge to the LLM's
-    # 4096 `prefill_vision` bucket; a larger step runs uncaptured.
-    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    # 4096 `prefill_vision` bucket; a larger step runs uncaptured. 12288 holds a
+    # 30 s video at 2 fps (~11.8k patches), which 16384 pads by 39%.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
     # Requests per encoder step. They share one replay, so a burst of image
     # requests pays the per-step host cost once per this many, not per image.
     MAX_BATCH_SIZE = 8
@@ -762,9 +763,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # the graph and makes h, w symints inductor cannot codegen from. And
         # built on the host: on the device, the grid upload and the
         # `repeat_interleave`s each block on the stream.
-        indices, weights = vision_interpolation(
-            grid, self.config.num_grid_per_side, merge, torch.device("cpu"),
-        )
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
         num_patches = sum(t * h * w for t, h, w in grid)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
@@ -773,9 +772,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
                 "indices": to_device_nonblocking(indices, device),
                 "weights": to_device_nonblocking(weights, device),
-                "position_ids": to_device_nonblocking(
-                    vision_grid_position_ids(grid, merge, torch.device("cpu")), device,
-                ),
+                "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
                 # not forward args: `declare_step` makes segments of the
                 # lengths, `forward_batched` cuts the output at the count
                 "seq_lengths": vision_seq_lengths(grid),
@@ -840,19 +837,24 @@ class VisionEncoderSubmodule(NodeSubmodule):
         256 pixels), in the dtypes a step brings: float32 pixels out of
         `_normalize`, merger rows in the tower's dtype. Dynamic in the patch
         count from that call, so no image compiles them on a live request. The
-        block loop takes no example (it needs a planned attention step): it
-        compiles in its capture's warm-up, or on the first image when capture
-        is off."""
+        blocks take no example (they need a planned attention step): they
+        compile in the block loop's capture warm-up, or on the first image when
+        capture is off. Each block compiles on its own rather than the whole
+        block loop: every block runs one code object, so Dynamo traces it once
+        and the others reuse the graph, where tracing the unrolled loop took
+        ~80 s of every start."""
         device, merge = self.get_device(), self.config.spatial_merge_size
         grid = [(1, 16, 16)]
-        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge, device)
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
+        position_ids = vision_grid_position_ids(grid, merge)
         patch = self.config.in_channels * self.config.temporal_patch_size * self.config.patch_size ** 2
         pixels = torch.zeros(16 * 16, patch, device=device)
         rows = torch.zeros(16 * 16, self.config.hidden_size, dtype=next(self.model.merger.parameters()).dtype,
                            device=device)
+        blocks = {f"model.blocks.{i}": [] for i in range(len(self.model.blocks))}
         return {
-            "model.embed": [(pixels, indices, weights, vision_grid_position_ids(grid, merge, device))],
-            "model.encode": [],
+            "model.embed": [(pixels, indices.to(device), weights.to(device), position_ids.to(device))],
+            **blocks,
             "model.merger": [(rows,)],
         }
 

@@ -5,19 +5,15 @@ model: "z_image_turbo"
 max_seq_len: 512
 
 model_kwargs:
-  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
-  # reference kernel; flashinfer stays available
+  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
   attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer still landed at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below
-  # 40 dB), measured before the compiled forward fused its q/k norms and rotary into one kernel
+  # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
   compile_eager_rounding: true
   # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
-  # 180 norm graph breaks per step: [norms] (or true) is >= 55.9 dB from the eager path on all 100 protocol prompts but
-  # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
-  # [activations] buys nothing (median 34.9 dB); the plain-compile and [activations] figures predate the fused q/k
-  # norm + rotary kernel. Default: the fast plain compile; set [norms] for reference-faithful output.
+  # 180 norm graph breaks per step (see compile_exact_ops in docs/models.rst). Default: the fast plain compile; set
+  # [norms] for reference-faithful output.
   compile_exact_ops: false
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
