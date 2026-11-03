@@ -43,6 +43,21 @@ def test_get_config_uses_nearest_batch_and_down_overrides(tuned_table):
     assert kernels.get_config(M=50, E=8, N=64, K=32, top_k=2)[0]["BLOCK_SIZE_M"] == 64
 
 
+def test_a_traced_launch_drops_the_tuned_warps_and_stages():
+    """The table lookup graph-breaks, so under a dynamic compile the config
+    reaches the launch with symbolic ints, which Triton takes only as constants."""
+    tile = {"BLOCK_SIZE_M": 16, "num_warps": 4, "num_stages": 3}
+
+    def lookup():
+        torch._dynamo.graph_break()
+        return dict(tile)
+
+    torch._dynamo.reset()
+    launch = torch.compile(lambda x: x + len(kernels._launch_options(lookup())), dynamic=True, backend="eager")
+    assert launch(torch.zeros(4)).tolist() == [1.0] * 4
+    assert kernels._launch_options(dict(tile)) == tile
+
+
 @CUDA
 @pytest.mark.parametrize(
     "table", sorted((kernels.config_path(1, 1, 1, "x").parent).glob("*.json")), ids=lambda p: p.name,
