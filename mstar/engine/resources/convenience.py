@@ -205,8 +205,9 @@ class KDACallable:
         first ``accepted + 1`` tokens (the drafts and the token after them) are the
         prefix the next step replays, from the side this step wrote. Device ops at
         the plan's slot ids, so a captured step records them; padding rows write
-        the sink. Every layer shares the count and the side."""
-        plan = self.current_plan()
+        the sink. Every layer shares the count and the side. Once per verify step, which the
+        resource checks."""
+        plan = self.attn.settle_verify()
         rows = plan.num_rows
         slots = plan.slot_ids[:rows].long()
         count = (accepted[:rows] + 1).to(torch.int32).unsqueeze(1)

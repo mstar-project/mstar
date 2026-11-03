@@ -84,6 +84,10 @@ class KDAPlan:
     # every row is a verify block of `block` tokens (LinearAttnStep.speculative)
     is_verify: bool = False
     block: int = 1
+    # the verify step's accepted count went to the pool (`KDAManager.settle_verify`)
+    settled: bool = False
+    # the bucket slot a captured verify step records, so its replays know it settles
+    capture_key: CGSlotKey | None = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -148,6 +152,11 @@ class KDAManager(LinearAttnManager):
 
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
+        # the verify captures that settled their count, which their replays then repeat
+        self._cg_settled: set[CGSlotKey] = set()
+        # requests that have verified: their state lags their accepted drafts, which only a
+        # verify step replays
+        self._verifying: set = set()
         self._layout_stager = PinnedStager(torch.int32)
         self._current: dict[str, KDAPlan] = {}
         # Pre-planning: the plan mutates no live state, so staging is caching
@@ -199,6 +208,12 @@ class KDAManager(LinearAttnManager):
             self.clear_preplan()
             return self._current
 
+        if (not step.speculative and self._verifying
+                and not self._verifying.isdisjoint(ctx.request_ids)):
+            raise ValueError(
+                "kda: a step that doesn't verify, for a request that verified; its state is "
+                "behind the drafts it accepted, which only a verify step replays"
+            )
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
@@ -247,6 +262,15 @@ class KDAManager(LinearAttnManager):
                 )
             assert num_tokens == rows * block, (num_tokens, rows, block)
             plan.is_verify, plan.block = True, block
+            if lease is not None:
+                key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+                if ctx.capture:
+                    plan.capture_key = key
+                elif key not in self._cg_settled:
+                    raise RuntimeError(
+                        f"kda: the capture of {key} ran no set_prefix_len, so its replays "
+                        "would leave each verify step's count unsettled"
+                    )
         elif not is_decode and self.kernels is not None:
             host = self.kernels.layout(spans, num_tokens, lease is not None)
             if host is not None:
@@ -290,7 +314,36 @@ class KDAManager(LinearAttnManager):
             )
         return found
 
+    def commit(self, step: LinearAttnStep, ctx: StepContext) -> None:
+        if not step.speculative or ctx.capture:
+            return
+        if ctx.slot_lease is None:
+            # an eager forward ran this step's Python, which had to settle it
+            for label, plan in self._current.items():
+                if not plan.settled:
+                    raise RuntimeError(
+                        f"kda: a verify step under {label!r} ended without set_prefix_len"
+                    )
+        self._verifying.update(ctx.request_ids)
+
+    def remove_request(self, rid: str) -> None:
+        self._verifying.discard(rid)
+
     # Submodule-level functionality
+
+    @torch.compiler.disable
+    def settle_verify(self, label: str | None = None) -> KDAPlan:
+        """This verify step's plan, for ``KDACallable.set_prefix_len`` to write its accepted
+        count; once per step."""
+        plan = self.current_plan(label)
+        if not plan.is_verify:
+            raise RuntimeError("kda: set_prefix_len after a step that didn't verify")
+        if plan.settled:
+            raise RuntimeError("kda: set_prefix_len twice for one verify step")
+        plan.settled = True
+        if plan.capture_key is not None:
+            self._cg_settled.add(plan.capture_key)
+        return plan
 
     @torch.compiler.disable
     def run(
@@ -337,4 +390,5 @@ class KDAManager(LinearAttnManager):
 
     def cleanup(self):
         self._cg_layout.clear()
+        self._cg_settled.clear()
         self._current.clear()
