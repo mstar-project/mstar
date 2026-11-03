@@ -5,6 +5,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
+from mstar.model.components.quant_linear import QuantCapability
 
 
 class _ColumnLora(LoraBound):
@@ -149,6 +150,12 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
             # All-gather across the partitions.
             return self.comm_group.all_gather(output_parallel, dim=-1)
         return output_parallel
+
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
+            "([N / tp, K] here) inside that forward, which takes no format yet"
+        ))
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -497,6 +504,12 @@ class RowParallelLinear(nn.Module, LoraCapable):
             output = output_parallel
 
         return output
+
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
+            "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"
+        ))
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(

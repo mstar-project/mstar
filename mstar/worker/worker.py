@@ -3098,8 +3098,11 @@ class Worker:
         spec_node_name = spec_target_info.node_name
         spec_target = (spec_node_name, graph_walk)
         # The merge below takes only this chain's capture group; another
-        # group's backlog runs only once the chain yields to it.
-        if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
+        # group's backlog runs only once the chain yields to it. The chain's
+        # rows run this step one loop iteration on, and their group is the
+        # one they have there.
+        next_iter_of = spec_target_info.loop_name if spec_target_info.is_new_loop_iter else None
+        if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid, next_iter_of):
             return None
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that. A rid is also filtered when the target node isn't ready
@@ -3125,7 +3128,7 @@ class Worker:
         # rows waiting at its target (backlogged, or on its queues) get the
         # step here or not at all while it runs. Nothing is popped yet.
         chain = self.scheduler.pick_chain_step(
-            self.request_state, spec_target, candidates, mid_prefill,
+            self.request_state, spec_target, candidates, mid_prefill, next_iter_of,
         )
         laps.lap("pick_step")
         mid_prefill = chain.mid_prefill
