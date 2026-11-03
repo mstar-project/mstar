@@ -670,14 +670,16 @@ def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declare
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="counts the device's allocations")
-def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy():
+# a walk reads a Qwen3.5 prompt with images as one tensor of ids for each run of text
+@pytest.mark.parametrize("tensors", [1, 2])
+def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy(tensors):
     device = torch.device("cuda")
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 12, device))
     assert _ingest(rebuilds, R, (PrefixSpan(256, 256, PREFILL),))
     prompt = torch.arange(256, device=device)
     step_done = torch.Event(device=device)
     step_done.record()
-    step = _ran(PREFILL, {R: {"text_inputs": [prompt]}})
+    step = _ran(PREFILL, {R: {"text_inputs": list(prompt.tensor_split(tensors))}})
     step.completion_event = step_done
     allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
 
@@ -689,3 +691,4 @@ def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy():
         "a cast on the pool's stream made every later decode step 0.16 ms slower at Qwen3.5-9B TP2"
     )
     assert kept.prompt.view.tolist() == list(range(256)), "the rebuild would prefill other ids"
+    assert kept.lengths == (None if tensors == 1 else (128, 128)), "the rebuild would join the runs of text"
