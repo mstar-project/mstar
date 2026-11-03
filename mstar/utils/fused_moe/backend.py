@@ -6,17 +6,24 @@ router's top-k pick, and returns the routing-weighted sum over those experts.
 A backend with its own weight layout converts the weights once after loading
 (prepare_weights).
 
-MoEBackend is what a model or deployment picks. AUTO is Triton everywhere,
-which has measured best so far.
+MoEBackend is what a model or deployment picks. AUTO is Triton, except for
+the expert sizes and GPUs in AITER_PROBLEMS.
 """
 
 from __future__ import annotations
 
 import enum
+import functools
+import importlib.util
+import logging
 from typing import NamedTuple
 
 import torch
 from torch import nn
+
+from mstar.kernels.table import device_key
+
+logger = logging.getLogger(__name__)
 
 
 class MoEProblem(NamedTuple):
@@ -29,7 +36,7 @@ class MoEProblem(NamedTuple):
 
 
 class MoEBackend(str, enum.Enum):
-    AUTO = "auto"
+    AUTO = "auto"  # see auto_backend
     TRITON = "triton"  # mstar's Triton grouped GEMM, any GPU Triton targets
     AITER = "aiter"  # AITER's CK / asm fused MoE, AMD Instinct GPUs
 
@@ -80,10 +87,46 @@ class TritonFusedMoE(FusedMoEBackend):
         )
 
 
-def make_moe_backend(kind: MoEBackend | str, problem: MoEProblem) -> FusedMoEBackend:
+# Expert sizes AITER's fused MoE runs faster than the Triton kernels with their
+# tuned table, by GPU (the table file stem, ``DeviceKey.stems()[0]``). AITER needs its own weight
+# layout and a layer keeps one, so the pick holds for every token count. The
+# Thinker on MI325X: 4-16 % faster from 2 to 4096 tokens, 3 % slower at 1.
+AITER_PROBLEMS: dict[str, frozenset[MoEProblem]] = {
+    "AMD_Instinct_MI325X": frozenset({
+        MoEProblem(num_experts=128, intermediate_size=768, hidden_size=2048, top_k=8),  # Qwen3-Omni Thinker
+    }),
+}
+
+
+def auto_backend(problem: MoEProblem, skips_rows: bool = False) -> MoEBackend:
+    """The backend AUTO runs for ``problem`` here. ``skips_rows`` is for layers
+    that pass ``skip_invalid``, which only Triton supports."""
+    from mstar.platforms import current_platform
+
+    if skips_rows or not current_platform.is_rocm():
+        return MoEBackend.TRITON
+    key = device_key()
+    if key is None or problem not in AITER_PROBLEMS.get(key.stems()[0], ()):
+        return MoEBackend.TRITON
+    if importlib.util.find_spec("aiter") is None:
+        return MoEBackend.TRITON
+    _log_auto_aiter(problem)
+    return MoEBackend.AITER
+
+
+@functools.cache
+def _log_auto_aiter(problem: MoEProblem) -> None:
+    # Named as the Triton table files are, once per expert size rather than per layer.
+    logger.info("fused MoE: auto runs AITER for E=%d,N=%d,K=%d", problem.num_experts,
+                2 * problem.intermediate_size, problem.hidden_size)
+
+
+def make_moe_backend(kind: MoEBackend | str, problem: MoEProblem, skips_rows: bool = False) -> FusedMoEBackend:
     """Build the backend named by kind. Raises if it can't run here."""
     kind = MoEBackend(kind)
-    if kind in (MoEBackend.AUTO, MoEBackend.TRITON):
+    if kind is MoEBackend.AUTO:
+        kind = auto_backend(problem, skips_rows)
+    if kind is MoEBackend.TRITON:
         return TritonFusedMoE(problem)
     if kind is MoEBackend.AITER:
         from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
