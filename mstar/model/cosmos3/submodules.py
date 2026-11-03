@@ -2025,9 +2025,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # step (an append) and drops the batch to the sequential path.
             if not all(st["uncond"] is not None for st in sts):
                 return False
+            cap = self.config.max_batched_vision_tokens
             if (
-                batch.graph_walk not in PREFILL_WALKS
-                and sum(st["cond"]["num_vision_tokens"] for st in sts) > self.config.max_batched_vision_tokens
+                cap is not None
+                and batch.graph_walk not in PREFILL_WALKS
+                and sum(st["cond"]["num_vision_tokens"] for st in sts) > cap
             ):
                 return False
             if batch.graph_walk not in GEN_WALKS:

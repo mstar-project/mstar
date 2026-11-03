@@ -1334,11 +1334,11 @@ arithmetic — under classifier-free guidance the branch rounding is amplified,
 so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). A generation
 step whose requests total more than ``max_batched_vision_tokens`` (a
-``model_kwargs`` key, 16384 by default: at 832x480, more than 42 latent frames
-across the step's requests, e.g. two clips of 85 or more frames each; a windowed
-request counts its current window) runs every request in it alone, since
-batching such steps cost more than it saved on an H100, so those outputs match
-their solo results. Serve with one request at a time
+``model_kwargs`` key, off by default since it is a per-GPU number; 16384 on an
+H100 is, at 832x480, more than 42 latent frames across the step's requests,
+e.g. two clips of 85 or more frames each; a windowed request counts its current
+window) runs every request in it alone, since batching such steps cost more
+than it saved on an H100, so those outputs match their solo results. Serve with one request at a time
 when outputs must be bitwise repeatable.
 
 The denoise step is compiled (``compile_denoise``) in Inductor's deterministic

@@ -489,14 +489,19 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     inp = lambda commit=False: SimpleNamespace(resource_step_info=SimpleNamespace(commit=commit))  # noqa: E731
     assert sub.can_batch(batch, [inp(), inp()])  # at any two steps, in any two windows
 
-    # A step whose requests total more vision tokens than the cap runs request
-    # by request, even when each is under it.
-    cap = sub.config.max_batched_vision_tokens
+    # With a cap set (an H100 deployment's 16384), a step whose requests total
+    # more vision tokens than it runs request by request, even when each is
+    # under it. Without one (the default) they batch.
+    cap = 16384
     for rid, n in (("q1", cap // 4), ("q2", cap // 4), ("h1", cap // 2 + 1), ("h2", cap // 2 + 1)):
         add_windowed(rid)["cond"]["num_vision_tokens"] = n
     pair = lambda *rids: SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=list(rids))  # noqa: E731
+    assert sub.config.max_batched_vision_tokens is None
+    assert sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = cap
     assert sub.can_batch(pair("q1", "q2"), [inp(), inp()])
     assert not sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = None
 
     # A kv request at its commit iteration vetoes the batch.
     st_kv = add_windowed("c")
