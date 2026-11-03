@@ -266,7 +266,8 @@ class ResidualCodePredictor(nn.Module):
     cache: the most rows a depth loop runs at once. ``embed_sum_dtype`` is the
     dtype a frame's embedding sum accumulates in (None: the embeddings' own,
     rounding after every add); each Talker keeps the sum it had before the
-    two shared this predictor.
+    two shared this predictor. ``two_token_first_pass`` is off until a Talker
+    turns it on, see ``depth_loop``.
     """
 
     lora_unservable = {"lm_head": "stacked into lm_head_weight at load, which the depth loop indexes"}
@@ -276,6 +277,7 @@ class ResidualCodePredictor(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_sum_dtype = embed_sum_dtype
+        self.two_token_first_pass = False
         self.num_code_groups = cp.num_code_groups
         residual = cp.num_code_groups - 1
         self.depth = DepthKV((
@@ -337,8 +339,9 @@ class ResidualCodePredictor(nn.Module):
         The depth sequence opens with the Talker's hidden state at position 0,
         then one token per group: group ``g - 1``'s embedding at position
         ``g`` predicts group ``g``. One-token passes throughout, so every pass
-        runs ``bs`` rows. Every op is graph-safe, so a capture records the
-        loop as is.
+        runs ``bs`` rows; with ``two_token_first_pass`` positions 0 and 1 share
+        one pass of ``2 * bs`` tokens instead. Every op is graph-safe, so a
+        capture records the loop as is.
 
         Args:
             last_hidden: ``[bs, talker_width]``, the Talker's hidden state.
@@ -358,12 +361,16 @@ class ResidualCodePredictor(nn.Module):
         # a copy even when the dtypes match: the sum is updated in place
         embed_sum = layer0_embed.to(self.embed_sum_dtype or layer0_embed.dtype, copy=True)
         embed = layer0_embed
-        # position 0 only fills the cache: group 0's code is the Talker's
         self.depth.bind_step(0)
-        self.forward_depth_unrolled(last_hidden.unsqueeze(1))
+        if self.two_token_first_pass:
+            hidden = self.forward_depth_unrolled(torch.stack((last_hidden, embed), dim=1))[:, -1]
+        else:
+            # position 0 only fills the cache: group 0's code is the Talker's
+            self.forward_depth_unrolled(last_hidden.unsqueeze(1))
         for group in range(1, self.num_code_groups):
-            self.depth.bind_step(group)
-            hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
+            if group > 1 or not self.two_token_first_pass:
+                self.depth.bind_step(group)
+                hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
             logits = torch.matmul(hidden, self.lm_head_weight[group - 1].t())
             embed = cp_embed_accumulate(
                 sample(logits), self.model.codec_embedding[group - 1].weight, embed_sum, codes, group,
