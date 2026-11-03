@@ -2,6 +2,7 @@
 no weights). The layout of HF's SiglipVisionModel changed between transformers
 4.x and 5.20, and a key that reaches no parameter leaves it uninitialized."""
 
+import pytest
 import torch
 
 from mstar.model.pi05.config import Pi05Config
@@ -62,3 +63,51 @@ def test_siglip_tower_prefix_follows_the_module_layout():
     flat.vision_model = tower()
     assert Pi05Model._siglip_tower_prefix(nested) == "vision_model.vision_model."
     assert Pi05Model._siglip_tower_prefix(flat) == "vision_model."
+
+
+def _tiny_vit_model():
+    """A Pi05Model whose SigLIP is small enough to build on the CPU, loading from a given flat dict."""
+    from mstar.model.pi05.pi05_model import Pi05Model
+
+    model = object.__new__(Pi05Model)
+    model.skip_weight_loading = False
+    model.siglip = None
+    model.config = Pi05Config(vit_hidden_size=8, vit_intermediate_size=16, vit_num_layers=1, vit_num_heads=2,
+                              vit_image_size=28, vit_patch_size=14, hidden_size=16)
+    return model
+
+
+def _lerobot_siglip_keys(model) -> dict[str, torch.Tensor]:
+    from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
+    from mstar.model.pi05.pi05_model import Pi05Model
+
+    with torch.device("meta"):
+        encoder = Pi05SiglipEncoder(model.config)
+    prefix = Pi05Model._siglip_tower_prefix(encoder)
+    pali = "paligemma_with_expert.paligemma.model"
+    flat = {}
+    for i, (name, param) in enumerate(encoder.named_parameters()):
+        key = (f"{pali}.vision_tower.vision_model.{name.removeprefix(prefix)}" if name.startswith(prefix)
+               else f"{pali}.multi_modal_projector.linear.{name.removeprefix('connector.')}")
+        flat[key] = torch.full(param.shape, float(i))
+    return flat
+
+
+def test_siglip_loads_every_parameter_from_the_lerobot_keys():
+    """The real loading path, with the installed transformers' SiglipVisionModel layout."""
+    model = _tiny_vit_model()
+    model._lerobot_flat = _lerobot_siglip_keys(model)
+    model._init_vit_components("cpu")
+    values = {float(p.detach().flatten()[0]) for p in model.siglip.parameters()}
+    assert values == {float(i) for i in range(len(model._lerobot_flat))}
+
+
+def test_siglip_loading_refuses_a_checkpoint_that_leaves_parameters_unset():
+    """A checkpoint whose SigLIP keys match nothing (a layout the mapping does not know)
+    stops the load instead of serving to_empty's memory."""
+    model = _tiny_vit_model()
+    model._lerobot_flat = {
+        k.replace("vision_tower.vision_model.", "vision_tower."): v for k, v in _lerobot_siglip_keys(model).items()
+    }
+    with pytest.raises(KeyError, match="parameters not in the checkpoint"):
+        model._init_vit_components("cpu")
