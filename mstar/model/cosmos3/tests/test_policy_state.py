@@ -17,6 +17,7 @@ import torch
 
 from mstar.model.base import ProcessPromptOutput
 from mstar.model.cosmos3.components.packing import action_start_frame_offset, resolve_action_domain_id
+from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import ACTION_GEN_WALK, COND_LABEL, Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
@@ -214,6 +215,35 @@ def test_reply_carries_the_predicted_rows_in_the_robots_convention() -> None:
     mk = {**POLICY, "action_mode": "inverse_dynamics", "action_chunk_size": 32, "raw_action_dim": 8}
     out = np.frombuffer(model.postprocess(chunk[:, :32], "action", mk), dtype=np.float32).reshape(-1, 64)
     assert np.array_equal(out, chunk[0, :32].numpy())
+
+
+def test_guidance_interval_is_an_action_default(tmp_path) -> None:
+    """The deployment's guidance_interval_action applies to action requests that
+    send none, and the Edge DROID warmup takes it, so its first request does not
+    compile the conditional-only step."""
+    from pathlib import Path
+
+    import yaml
+
+    import mstar
+
+    yaml_path = Path(mstar.__file__).resolve().parent.parent / "configs" / "cosmos3_edge_droid.yaml"
+    cfg = yaml.safe_load(yaml_path.read_text())
+    mk = cfg["model_kwargs"]
+    assert mk["guidance_interval_action"] == [960, 1001] and mk["inverted_action_dims"] == [7]
+    assert set(mk) <= set(Cosmos3Config.__dataclass_fields__)
+    warmup = cfg["warmup_requests"][0]
+    model = _policy_checkpoint(
+        tmp_path / "edge", {"action_chunk_size": 32, "conditioning_fps": 15.0, "domain_name": "droid_lerobot"},
+    )
+    model.config.guidance_interval_action = tuple(mk["guidance_interval_action"])
+    p = model._resolve_gen_params(warmup["model_kwargs"], ["image", "text"], warmup["output_modalities"])
+    assert p["guidance_interval"] == (960.0, 1001.0) and p["action_state_rows"] == 1
+    # A request's interval wins; image and video requests keep their own.
+    p = model._resolve_gen_params({"robot_state": STATE, "guidance_interval": [0, 1001]}, *MODALITIES)
+    assert p["guidance_interval"] == (0.0, 1001.0)
+    assert model._resolve_gen_params({}, ["text"], ["image"])["guidance_interval"] == (400.0, 1000.0)
+    assert "guidance_interval" not in model._resolve_gen_params({"num_frames": 17}, ["text"], ["video"])
 
 
 def test_action_guidance_interval() -> None:
