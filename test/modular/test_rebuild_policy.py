@@ -20,7 +20,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
@@ -166,6 +166,25 @@ def test_higgs_is_rebuilt_from_its_audio_step_with_the_text_before_the_audio_and
     assert policy.check("LLM", model.get_graph_walk_graphs()) == {
         "prefill_audio": frozenset({"text_pre", "audio_embeds"}),
     }, "a rebuild row would run without the text before the audio or the encoder's output"
+
+
+def test_a_higgs_transcription_can_be_dropped_where_its_llm_runs():
+    from test_model_kv_layouts import _higgs
+
+    from mstar.model.higgs_audio.config import KV_CACHE
+
+    model = _higgs()
+    out = model.process_prompt("transcribe", ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000 * 35)]})
+    config = KVReqConfig()
+    config.apply_conductor_config(
+        kv_layout={"main": out.metadata["kv_layout"][KV_CACHE]["main"].row()}, loop_caps={"decode_loop": 8},
+    )
+    rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 10, torch.device("cpu")))
+    writes = {KV_CACHE: {"LLM": NodeWrites(frozenset({"prefill_audio", "decode"}), frozenset({"decode_loop"}))}}
+
+    rebuildable = rebuilds.ingest_request(R, writes, {KV_CACHE: config.kv_layout.values()}, unpausable=False)
+
+    assert rebuildable[KV_CACHE], "every Higgs transcription would stay guaranteed"
 
 
 def _rows(*rids: int) -> dict:
