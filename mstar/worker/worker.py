@@ -2002,6 +2002,18 @@ class Worker:
             )
         return seq
 
+    def _next_batch(self, yield_away_from_target: tuple[str, str] | None) -> ScheduledBatch | None:
+        """The non-speculative path's step: one away from ``yield_away_from_target`` when given, else any.
+
+        A follower's first call can take a head of rank 0's with no rows, and rank 0 applied the removals
+        stamped with that head before it sent the next step, so this rank applies them before building it."""
+        if yield_away_from_target is not None:
+            batch = self.scheduler.get_next_batch(self.request_state, exclude_target=yield_away_from_target)
+            if batch is not None:
+                return batch
+            self._apply_removes_whose_step_landed()
+        return self.scheduler.get_next_batch(self.request_state)
+
     def _owes_tp_moves(self) -> bool:
         """Whether the journal of the lockstep instance this rank leads holds moves no step has carried."""
         return any(self.engine_manager.get_engine(node).owes_moves() for node in self._lockstep_led)
@@ -5443,14 +5455,7 @@ class Worker:
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
                 with self._span("worker.schedule"):
-                    batch = None
-                    if yield_away_from_target is not None:
-                        batch = self.scheduler.get_next_batch(
-                            self.request_state,
-                            exclude_target=yield_away_from_target,
-                        )
-                    if batch is None:
-                        batch = self.scheduler.get_next_batch(self.request_state)
+                    batch = self._next_batch(yield_away_from_target)
                 if batch is None or batch.node_name not in self._lockstep_led:
                     self._flush_tp_moves()
                 if batch is None:
