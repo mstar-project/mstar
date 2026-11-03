@@ -825,7 +825,10 @@ RVQ codec; user speech in, agent text and 22.05 kHz speech out.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pi05</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lerobot/pi05_base</span></code></p></td>
-<td><p>Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).</p></td>
+<td><p>Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+A request sends one image per camera, up to the config’s <code class="docutils literal notranslate"><span class="pre">num_cameras</span></code> (3 in
+<code class="docutils literal notranslate"><span class="pre">configs/pi05.yaml</span></code>). Cameras it leaves out are masked, as openpi does, and more
+images than that are a 400.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_5_{0.8,2,4,9,27}b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-4B</span></code></p></td>
