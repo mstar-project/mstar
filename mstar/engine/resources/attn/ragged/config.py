@@ -188,7 +188,8 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     over TP. A no-op on a node with no ``SeqShardSpec``. On SP ranks every label of a ``ulysses``
     resource goes through an exchange, so ``run(..., return_lse=True)`` raises there."""
 
-    sp_exchange: Literal["none", "ulysses"] = "none"
+    # the model's declaration, not a deployment's (``sp_exchanges`` stays empty)
+    sp_exchange: Literal["none", "ulysses"] = field(default="none", kw_only=True)
 
     def __post_init__(self):
         super().__post_init__()

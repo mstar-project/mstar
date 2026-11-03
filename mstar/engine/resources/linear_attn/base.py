@@ -72,8 +72,9 @@ class LinearAttnManager(AttentionResource):
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
-    # how a split step's prompt rows reach the recurrence (`LinearAttnSpec.split_exchange`)
-    _split_exchange: LinearSpExchange = "none"
+    # how a split step's prompt rows reach the recurrence (`LinearAttnSpec.sp_exchange`), read only
+    # where the node's shard splits (`bind_dependencies`)
+    _split_exchange: LinearSpExchange = "ulysses"
     # label -> this rank's share of it, for each label this step splits (the managers' `plan`)
     _split_rows: dict[str, SplitRows]
 
@@ -81,7 +82,7 @@ class LinearAttnManager(AttentionResource):
     def build(cls, spec: LinearAttnSpec, info: EngineResourceInfo):
         manager = cls._build_variant(spec, info)
         manager._shard_key = spec.shard_key
-        manager._split_exchange = spec.split_exchange
+        manager._split_exchange = spec.sp_exchange or spec.sp_exchanges[0]
         return manager
 
     @classmethod

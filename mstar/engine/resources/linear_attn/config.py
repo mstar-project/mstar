@@ -8,7 +8,7 @@ geometry is read off its blocks rather than declared here.
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
@@ -60,11 +60,9 @@ class LinearAttnConfig:
     splits: tuple[CombinedSplit, ...] = ()
 
 
-# How a split step's prompt rows reach the recurrence: "ulysses" trades tokens for heads,
-# "state_passing" hands each rank's state on to the next (`linear_attn.base`); "none" where the
-# node never splits
-LinearSpExchange = Literal["none", "ulysses", "state_passing"]
-LINEAR_SP_EXCHANGES: tuple[LinearSpExchange, ...] = ("ulysses", "state_passing")
+# How a split step's prompt rows reach the recurrence (`linear_attn.base`): "ulysses" trades tokens
+# for heads, "state_passing" hands each rank's state on to the next
+LinearSpExchange = Literal["ulysses", "state_passing"]
 
 
 @dataclass
@@ -72,12 +70,11 @@ class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # how a split step reaches the recurrence: a deployment's choice, set only by its `resources:`
-    # block; None takes ulysses wherever the node splits (`resolve_exchange`)
-    sp_exchange: LinearSpExchange | None = field(default=None, init=False, repr=False)
-    # `sp_exchange` resolved (`derive`), and the pool's config, which the refusals read
-    split_exchange: LinearSpExchange = field(default="none", init=False, repr=False)
+    # the pool's config (`derive`), which the refusals read
     _pool: "RecurrentStateConfig | None" = field(default=None, init=False, repr=False, compare=False)
+
+    # a deployment's ``sp_exchange``, ulysses unset
+    sp_exchanges = get_args(LinearSpExchange)
 
     def depends_on(self) -> set[str]:
         keys = {self.config.recurrent_state}
@@ -88,26 +85,19 @@ class LinearAttnSpec(NodeResourceSpec):
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        problems = take_shard_edge(self, specs)
-        self.split_exchange = self.resolve_exchange(specs)
         self._pool = specs[self.config.recurrent_state].config
-        return problems
+        return take_shard_edge(self, specs)
 
-    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> LinearSpExchange:
-        """``sp_exchange``, or where unset ``ulysses``, wherever its node's sequence shard splits
-        (``shard_exchange``); ``none`` where it doesn't, which the setting doesn't change."""
-        from mstar.engine.resources.sequence_shard import shard_exchange
-
-        if shard_exchange(self, specs) == "none":
-            return "none"
-        return self.sp_exchange or "ulysses"
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> str:
+        return self.own_exchange(specs)
 
     def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
         # both exchanges plan their halo and hand-off per rank on the host, eager only
         return self.resolve_exchange(specs) == "none"
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        exchange = self.split_exchange
+        # only a node whose shard splits gets here, so the choice is what its split steps take
+        exchange = self.sp_exchange or self.sp_exchanges[0]
         name = f"linear attention {self.resource_key!r}"
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
@@ -153,18 +143,9 @@ class LinearAttnSpec(NodeResourceSpec):
 
         return LinearAttnManager
 
-    def apply_yaml_overrides(
-        self, backend: str | LinearAttnBackend | None = None,
-        sp_exchange: LinearSpExchange | None = None,
-    ):
-        """Let the deployment pick the backend and how a split step reaches the recurrence
-        (``sp_exchange``); slot capacity is tuned on the pool."""
-        if sp_exchange is not None:
-            if sp_exchange not in LINEAR_SP_EXCHANGES:
-                raise ValueError(
-                    f"sp_exchange must be one of {', '.join(LINEAR_SP_EXCHANGES)}; got {sp_exchange!r}"
-                )
-            self.sp_exchange = sp_exchange
+    def apply_yaml_overrides(self, backend: str | LinearAttnBackend | None = None):
+        """Let the deployment pick the backend (and, as every spec, ``sp_exchanges``' choice);
+        slot capacity is tuned on the pool."""
         if backend is not None:
             self.config.backend = LinearAttnBackend(backend)
 

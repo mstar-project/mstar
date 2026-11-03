@@ -766,7 +766,8 @@ def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed
         apply_yaml_overrides(specs, {"resources": {} if choice is None else {"shard": {"exchange": choice}}})
         by_key = resolve_spec_dependencies(specs)
         shard = by_key["shard"]
-        assert (shard.splits, shard.eager_splits, shard.stripe_pool, by_key["linear"].split_exchange) == want, order
+        linear = by_key["linear"].resolve_exchange(by_key)
+        assert (shard.splits, shard.eager_splits, shard.stripe_pool, linear) == want, order
         assert by_key["linear"].depends_on() == {"state", "shard"}
 
 

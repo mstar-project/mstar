@@ -10,8 +10,8 @@ what those configs already describe.
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.attn.config import SpExchange
@@ -104,6 +104,14 @@ class RoutingMirror(Protocol):
 class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
+    # how a split step reaches this resource where it has more than one way (``sp_exchanges``): a
+    # deployment's choice, its ``resources:`` block's ``sp_exchange`` (`apply_yaml_overrides`); None
+    # takes the first wherever its node splits (`own_exchange`)
+    sp_exchange: str | None = field(default=None, init=False, repr=False)
+
+    # the ways a split step may reach this resource that a deployment picks among, the default first;
+    # none for one whose way follows from its storage or its model (an attention's, a ragged one's)
+    sp_exchanges: ClassVar[tuple[str, ...]] = ()
 
     def __post_init__(self):
         if not isinstance(self.nodes, set):
@@ -159,6 +167,16 @@ class NodeResourceSpec(ABC):
         specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
         field may still hold its default when the shard derives."""
         return "none"
+
+    def own_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> str:
+        """For a resource with ``sp_exchanges``: ``none`` where its node's sequence shard never
+        splits (``shard_exchange``), which ``sp_exchange`` doesn't change, and otherwise
+        ``sp_exchange`` or the first of them. From raw fields, as ``resolve_exchange``."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        if shard_exchange(self, specs) == "none":
+            return "none"
+        return self.sp_exchange or self.sp_exchanges[0]
 
     def captures_split_steps(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
         """Whether this resource runs a split step inside an accelerator graph. False for one whose
@@ -321,8 +339,19 @@ def apply_yaml_overrides(
     if unknown:
         raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
+        spec = by_key[key]
+        if isinstance(kwargs, Mapping) and "sp_exchange" in kwargs:
+            kwargs = dict(kwargs)
+            choice = kwargs.pop("sp_exchange")
+            if not spec.sp_exchanges:
+                raise ValueError(f"resources.{key}: resource {key!r} takes no sp_exchange; got {choice!r}")
+            if choice not in spec.sp_exchanges:
+                raise ValueError(
+                    f"resources.{key}: sp_exchange must be one of {', '.join(spec.sp_exchanges)}; got {choice!r}"
+                )
+            spec.sp_exchange = choice
         try:
-            by_key[key].apply_yaml_overrides(**kwargs)
+            spec.apply_yaml_overrides(**kwargs)
         except TypeError as e:
             # a key the resource doesn't take: a bad config, as every other problem here is
             raise ValueError(f"resources.{key}: {e}") from e
