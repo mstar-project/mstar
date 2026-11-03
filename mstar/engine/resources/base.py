@@ -141,6 +141,7 @@ class MoveKind(IntEnum):
     EARMARK = 4
     DROP = 5
     REBUILD = 6
+    SET_ASIDE = 7
 
 
 class Resource(ABC):

@@ -4331,9 +4331,7 @@ class KVManager(AttentionResource):
         footprint = overrides.pages(self._nodes, caps, self.config)
         # A request that no drop here can free, and that the host can't set room aside for, would wait
         # holding its pages once it ran short, so it reserves what it grows into.
-        if overrides.unpausable or not (
-            overrides.rebuildable or self._cpu_pool is not None and self._cpu_pool.reserve(rid, footprint)
-        ):
+        if overrides.unpausable or not (overrides.rebuildable or self._sets_aside(rid, footprint)):
             self._guaranteed.add(rid)
         pages = footprint if rid in self._guaranteed else prompt
         capacity = self.config.request_pages
@@ -4344,6 +4342,20 @@ class KVManager(AttentionResource):
             ))
         self._asks[rid] = pages
         return None
+
+    def _sets_aside(self, rid: str, pages: int) -> bool:
+        """Whether the host sets ``pages`` aside for ``rid``'s move there. A pool that decides asks the host and
+        journals the answer. The other ranks replay it, since they ask for ``rid`` only as they replay its
+        reservation, by when other moves can have changed the host's room."""
+        if self._cpu_pool is None:
+            return False
+        if not self._decides:
+            return rid in self._cpu_pool.reserved
+        if not self._cpu_pool.reserve(rid, pages):
+            return False
+        if self.journal is not None:
+            self.journal(MoveKind.SET_ASIDE, rid, pages)
+        return True
 
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -4650,6 +4662,8 @@ class KVManager(AttentionResource):
                 self._host(rid, victims)
             elif kind == MoveKind.UNRESERVE:
                 self.unreserve(rid)
+            elif kind == MoveKind.SET_ASIDE:
+                self._cpu_pool.reserved[rid] = count
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,

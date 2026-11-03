@@ -312,13 +312,13 @@ For example, an older and a newer request hold 5 pages each of a 10-page pool, a
 
 ## 6. TP followers
 
-Rank 0 decides every reservation and its undo, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode`, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts.
+Rank 0 decides every reservation and its undo, the host room it sets aside, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode`, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts.
 
 ```python
 @dataclass
 class OffloadDelta:
     rids: list[str]
-    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop or rebuild
+    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, rebuild or set aside
     ...                     # the page counts and victims the kinds carry
 ```
 
