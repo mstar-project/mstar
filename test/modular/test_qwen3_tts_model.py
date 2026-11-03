@@ -172,6 +172,29 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
     assert captured["fix_mistral_regex"] is True
 
 
+@pytest.mark.parametrize("config, side", [
+    ("qwen3tts_1p7b.yaml", (("Codec", "codec_chunk"),)),
+    ("qwen3tts_1p7b_split.yaml", ()),
+])
+def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, side):
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.worker.engine_manager import _side_lane_keys, side_stream_nodes
+
+    model = _make_model()
+    groups = yaml.safe_load((CONFIG_PATH.parent / config).read_text(encoding="utf-8"))["node_groups"]
+    assert CodecSubmodule.side_stream_walks == {"codec_chunk"}
+    codec = CodecSubmodule.__new__(CodecSubmodule)
+    for ranks in ({0}, {1}):
+        nodes = [n for g in groups if set(g["ranks"]) & ranks for n in g["node_names"]]
+        if "Codec" not in nodes:
+            continue
+        keys = _side_lane_keys(
+            {n: codec if n == "Codec" else object() for n in nodes}, model.get_node_resources(), model,
+            nodes, side_stream_nodes(groups), WorkerParallelGroups(num_workers=1, global_rank=0), True,
+        )
+        assert keys == side
+
+
 def test_qwen3_tts_declares_talker_and_codec_graphs():
     model = _make_model()
 

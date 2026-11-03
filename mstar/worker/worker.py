@@ -15,7 +15,7 @@ from enum import Enum
 from functools import cached_property, partial
 from time import sleep
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch.distributed import ReduceOp
@@ -110,12 +110,14 @@ from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import (
+    CHAIN_LANE,
     MicroScheduler,
     ScheduledBatch,
     tp_chunk_ranges,
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -288,6 +290,8 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
+    # the chain's step, or a side lane's (``mstar.worker.side_steps``)
+    lane: int = CHAIN_LANE
 
 
 class EvictionPolicy(Enum):
@@ -465,6 +469,11 @@ class Worker:
     # The CPUs the main, GPU and plan threads share (None: not pinned) and
     # the process mask everything else keeps; see ``mstar.utils.cpus``.
     _step_cpus: cpus.StepCpus | None = None
+    # Walks that run beside the main chain, when this worker has any
+    _side_steps: SideStepLane | None = None
+    # lane -> the rows its step in flight holds (``_hold_rows``); replaced,
+    # never updated in place
+    _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
     _process_cpus: frozenset[int] = frozenset()
 
     @cached_property
@@ -712,6 +721,13 @@ class Worker:
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
             batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
+        if self.engine_manager.side_keys:
+            self.scheduler.lane_of = dict.fromkeys(self.engine_manager.side_keys, SIDE_LANE)
+            self._side_steps = SideStepLane(self, SIDE_LANE)
+            logger.info(
+                "Worker %s: %s run beside the chain on a side stream",
+                worker_id, list(self.engine_manager.side_keys),
+            )
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
@@ -738,7 +754,8 @@ class Worker:
         # run()) because _remove_request — which can be invoked indirectly
         # from _process_messages on any iter — reads/writes them.
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
-        #   speculation; REMOVE_REQUEST for these is deferred.
+        #   speculation, on any lane (see ``_hold_rows``); REMOVE_REQUEST for
+        #   these is deferred.
         # _pending_removes: deferred REMOVE_REQUESTs, in the order they were
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
@@ -2327,12 +2344,13 @@ class Worker:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end = self._gpu_spans[0]
+            start, end, walk = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
             self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+            self._phase_record(f"gpu_exec.{walk}", start.elapsed_time(end) / 1000)
 
     def _execute_on_gpu_thread(
         self,
@@ -2443,7 +2461,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._gpu_spans.append((gpu_start, gpu_end, batch.graph_walk))
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
@@ -2511,6 +2529,7 @@ class Worker:
         batch: ScheduledBatch,
         node_batch: ExecutingBatch,
         plan_future: Future | None,
+        execute: Callable | None = None,
     ) -> Future:
         """Submit a step to the GPU thread with a fresh launch event.
 
@@ -2521,10 +2540,73 @@ class Worker:
         batch.chunk_loop_walks = self.chunk_loops.walks_by_node.get(batch.node_name, frozenset())
         event = node_batch.launch_started_event = threading.Event()
         future = gpu_executor.submit(
-            self._execute_on_gpu_thread, batch, node_batch, plan_future,
+            execute or self._execute_on_gpu_thread, batch, node_batch, plan_future,
         )
         future.add_done_callback(lambda _f: event.set())
         return future
+
+    def _submit_step(
+        self,
+        gpu_executor: ThreadPool,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch,
+        *,
+        lane: int = CHAIN_LANE,
+        plan_future: Future | None = None,
+        speculated: bool = False,
+        execute: Callable | None = None,
+        **step: Any,
+    ) -> PendingBatch:
+        """Hand a step to the GPU thread as ``lane``'s, through ``execute`` if
+        the lane runs it its own way. A ``speculated`` step was flagged in flight
+        when its speculation settled, and is not timed from here (see
+        ``PendingBatch.submitted_at``). Which rows the lane holds is the
+        caller's to record (``_hold_rows``): the chain's step N+1 takes over
+        only once N is postprocessed."""
+        if not speculated:
+            self._set_in_flight_flag(batch, True)
+        submitted_at = _time.perf_counter() if self._metrics is not None and not speculated else 0.0
+        future = self._submit_gpu_step(gpu_executor, batch, node_batch, plan_future, execute=execute)
+        self.wakeup_event.register_future(future)
+        step.setdefault("partition", self.request_state.get_partition_for_node(batch.node_name))
+        return PendingBatch(
+            batch=batch, node_batch=node_batch, node_name=batch.node_name,
+            graph_walk=batch.graph_walk, future=future, submitted_at=submitted_at,
+            lane=lane, **step,
+        )
+
+    def _hold_rows(self, lane: int, rids: Iterable[int]) -> None:
+        """The rows ``lane``'s step in flight holds are now ``rids``. Teardown
+        defers for every lane's (``_in_flight_rids``); a main-loop error fails
+        the chain's."""
+        rows = self._rows_by_lane = {**self._rows_by_lane, lane: frozenset(rids)}
+        self._in_flight_rids = set().union(*rows.values())
+
+    def _held_beside(self, lane: int) -> set[int]:
+        """The rows the other lanes' steps in flight hold."""
+        return set().union(*(rows for other, rows in self._rows_by_lane.items() if other != lane))
+
+    def _fail_step_rows(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """Fail the rows a per-rid stage (prepare_inputs, a per-request
+        forward, postprocess) blamed; the rest of the step still postprocesses
+        and routes."""
+        failed = dict(step.node_batch.failed_requests)
+        self._drop_failed_rids(step, outputs, failed)
+        self._fail_requests(failed)
+
+    def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """A step that ran, on any lane: its batch limit lifts, its outputs
+        are postprocessed and routed, and metrics count it."""
+        self.scheduler.clear_batch_limit(
+            step.node_name, step.graph_walk, len(step.batch.request_to_worker_graph),
+            walks=step.batch.rids_by_walk(),
+        )
+        chain = step.lane == CHAIN_LANE
+        span = "worker.postprocess_batch" if chain else "worker.postprocess_side"
+        with self._span(span, cpu=f"{span}.cpu"):
+            self._postprocess_batch(step, outputs, clear_loop_stops=chain)
+        if self._metrics is not None:
+            self._metrics.step_done(step.node_name, step.graph_walk, step.node_batch.inputs, step.submitted_at)
 
     def _count_turn(self, pending: "PendingBatch | None") -> None:
         """Once ``pending``'s admit has settled (``_await_admit_settled``): if
@@ -3381,7 +3463,7 @@ class Worker:
         self.scheduler.pop_tp_follow_head()
         # Its rids count as in flight now, so a remove landing before submit is
         # deferred like any other; ``_set_pending`` re-derives the set on submit.
-        self._in_flight_rids |= set(head_rids)
+        self._hold_rows(CHAIN_LANE, self._rows_by_lane.get(CHAIN_LANE, frozenset()) | set(head_rids))
         logger.debug(
             "Follow-speculating: %s %s (seq %d from %d)",
             head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
@@ -3552,6 +3634,7 @@ class Worker:
     def _postprocess_batch(
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
+        clear_loop_stops: bool = True,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -3615,8 +3698,11 @@ class Worker:
                 range_pop(synchronize=False)
             return
 
-        # pending stops are only needed for one iteration, so can be cleared now
-        self._graph_runtime.clear_pending_loop_stops()
+        # pending stops are only needed for one iteration of the chain, so can
+        # be cleared now; not by a side lane's step (``_finish_step``), which
+        # lands between two chain steps: the chain's next one has yet to read them.
+        if clear_loop_stops:
+            self._graph_runtime.clear_pending_loop_stops()
 
         # A rid failed or drained after this step was built is torn down, so
         # none of its outputs may leave: the step can already be in flight
@@ -4653,7 +4739,8 @@ class Worker:
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
 
-        failed_rids: set[int] = set(self._in_flight_rids)
+        # the chain's rows: a side lane's step fails on its own (``SideStepLane``)
+        failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
         for stale in in_flight:
             if stale is None:
                 continue
@@ -5005,6 +5092,8 @@ class Worker:
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
 
+        side_steps = self._side_steps
+
         def _arm_speculation(spec: Speculation) -> None:
             # Hand N+1 to the plan thread NOW. It waits on N's
             # commit event, then reserves a slot and pre-plans —
@@ -5018,7 +5107,7 @@ class Worker:
         def _set_pending(p: PendingBatch):
             nonlocal pending
             pending = p
-            self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._hold_rows(CHAIN_LANE, p.batch.request_to_worker_graph if p else ())
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can
@@ -5125,6 +5214,12 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 laps.lap("poll_stream_buffers")
+
+                if side_steps is not None:
+                    if pending is None:
+                        side_steps.finish()
+                    side_steps.launch(gpu_executor)
+                    laps.lap("side_steps")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
@@ -5234,16 +5329,11 @@ class Worker:
                         )
 
                     if pending.node_batch.failed_requests:
-                        # A per-rid stage (prepare_inputs, a per-request
-                        # forward, postprocess) blamed specific requests. Drop
-                        # the speculation: it was built from pending's rids and
-                        # may thread outputs that the failed rids never
-                        # produced. The rest of the batch still post-processes
-                        # and routes normally below.
+                        # Drop the speculation: it was built from pending's
+                        # rids and may thread outputs that the failed rids
+                        # never produced.
                         _maybe_clear_spec()
-                        failed = dict(pending.node_batch.failed_requests)
-                        self._drop_failed_rids(pending, outputs, failed)
-                        self._fail_requests(failed)
+                        self._fail_step_rows(pending, outputs)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
@@ -5276,15 +5366,18 @@ class Worker:
 
                             # Hold the main thread off the GIL until the GPU
                             # thread reaches the forward launch; see exec.
-                            spec_future = self._submit_gpu_step(
+                            spec_pending = self._submit_step(
                                 gpu_executor, spec_batch, spec_node_batch,
-                                speculation.plan_future,
+                                plan_future=speculation.plan_future, speculated=True,
+                                partition=speculation.partition,
+                                speculative_new_iter=speculation.is_new_iter,
+                                loop_name=speculation.loop_name,
+                                tp_seq=speculation.tp_seq,
                             )
                             # the GPU thread owns the pre-plan and the rids
                             # from here; see _handle_main_loop_error
                             speculation.plan_future = None
                             speculation.submitted = True
-                            self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
@@ -5296,17 +5389,6 @@ class Worker:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
-                            spec_pending = PendingBatch(
-                                batch=spec_batch,
-                                node_batch=spec_node_batch,
-                                node_name=spec_batch.node_name,
-                                partition=speculation.partition,
-                                graph_walk=spec_batch.graph_walk,
-                                future=spec_future,
-                                speculative_new_iter=speculation.is_new_iter,
-                                loop_name=speculation.loop_name,
-                                tp_seq=speculation.tp_seq,
-                            )
                         elif speculation.plan_future is not None:
                             # All continuing rids were dropped, so no spec
                             # batch was submitted. Drop the orphaned pre-plan
@@ -5325,27 +5407,19 @@ class Worker:
                     # failed rids upstream.
                     laps.skip()
                     if pending.node_batch.admit_error is None:
-                        self.scheduler.clear_batch_limit(
-                            pending.node_name, pending.graph_walk,
-                            len(pending.batch.request_to_worker_graph),
-                            walks=pending.batch.rids_by_walk(),
-                        )
-                        with self._span(
-                            "worker.postprocess_batch",
-                            cpu="worker.postprocess_batch.cpu",
-                        ):
-                            self._postprocess_batch(pending, outputs)
+                        self._finish_step(pending, outputs)
                         laps.skip()
-                        if metrics is not None:
-                            metrics.step_done(
-                                pending.node_name, pending.graph_walk,
-                                pending.node_batch.inputs, pending.submitted_at,
-                            )
 
-                    # Removes for any rid not in the in-flight spec step
-                    # are safe to apply now.
+                    # After N, while N+1 runs: the same thread, but not ahead of
+                    # the step the chain is about to speculate.
+                    if side_steps is not None:
+                        side_steps.finish()
+                    # Removes for any rid not in the in-flight spec step, or
+                    # another lane's, are safe to apply now.
                     laps.lap("step_done")
-                    in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    in_flight = self._held_beside(CHAIN_LANE)
+                    if spec_pending is not None:
+                        in_flight.update(spec_pending.batch.request_to_worker_graph)
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
@@ -5386,6 +5460,9 @@ class Worker:
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
+                    if side_steps is not None and side_steps.pending is not None:
+                        side_steps.finish(block=True)
+                        continue
                     self.communicator.wait_for_work(10)
                     continue
 
@@ -5408,21 +5485,12 @@ class Worker:
                 # Unlike the spec submit, this path doesn't hold off the GIL for
                 # the launch — but it still has to be fenceable, or the next
                 # iteration schedules against an admit that hasn't run.
-                self._set_in_flight_flag(batch, True)
-                submitted_at = _time.perf_counter() if metrics is not None else 0.0
-                future = self._submit_gpu_step(gpu_executor, batch, node_batch, None)
-                self.wakeup_event.register_future(future)
+                step = self._submit_step(
+                    gpu_executor, batch, node_batch,
+                    partition=batch_partition, tp_seq=fallthrough_tp_seq,
+                )
                 logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
-                _set_pending(PendingBatch(
-                    batch=batch,
-                    node_batch=node_batch,
-                    node_name=batch.node_name,
-                    partition=batch_partition,
-                    graph_walk=batch.graph_walk,
-                    future=future,
-                    tp_seq=fallthrough_tp_seq,
-                    submitted_at=submitted_at,
-                ))
+                _set_pending(step)
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
