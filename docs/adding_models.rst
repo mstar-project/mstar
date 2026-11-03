@@ -1643,6 +1643,18 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
+A walk named in ``resident_walks()`` runs its captured steps off per-request tables on the
+device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``). The
+walk must declare, for each resource, one stream that takes one token per row, or one
+it only reads at span 0 (a cross-attention context), with no forks, retention or sink,
+and its ``preprocess`` must read no planned position or KV location, because the
+captured graph fills those in first. Each KV pool of the node keeps its own block table
+and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
+turns it on only if every resource of the node can (``Resource.resident_refusal``) and
+the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
+otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+stale, so the first resident step after them writes it.
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 

@@ -73,6 +73,7 @@ class _StubMeasuredRunner:
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
         self._lent = set()
@@ -793,6 +794,7 @@ class _StubPlannedRunner:
         self._capture_costs = {bucket: _cost(100) for bucket in buckets}
         self._device = torch.device("cpu")
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 1
         self._buckets = {}
         self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())

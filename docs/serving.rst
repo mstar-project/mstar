@@ -391,9 +391,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
-       ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold``,
+       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
+       ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
+       ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
+       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
@@ -751,6 +753,73 @@ upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which 
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
+
+.. _host-idle:
+
+Host idle states
+----------------
+
+A decode step hands work between a worker's main, GPU and plan threads several
+times, and every step's tokens go from the API server's message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the ``powersave`` governor, so a small model's step is mostly
+host time spent waking CPUs. Two knobs deal with it:
+
+- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
+  one hardware thread of each, and the API server a core of its own. ``siblings``
+  puts a worker's three threads on one core's hardware threads (two cores of an L2
+  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
+  and logs one line saying why for this host, since neither layout has beaten no pin
+  on every host it was measured on (table below). ``off`` never pins, a number names
+  the first worker's core.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
+  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
+  containers hide, and it logs what it got.
+
+Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
+to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Host
+     - no pin
+     - ``always`` (three cores)
+     - ``siblings``
+     - every core held out of idle
+   * - 2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs)
+     - 548 / 3939
+     - 526 / 3851
+     - 808 / 5670
+     - c=1: no pin 906, three cores 935, ``siblings`` 753
+   * - 2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs)
+     - 371 / 2688
+     - not measured
+     - 527 / 3635 (two cores of a cluster)
+     - 636 / 4251, no pin
+   * - H100 VM without deep idle states (a handoff 22 µs)
+     - 529 (c=1) / 6520 (c=16)
+     - not measured
+     - 419 / 5526 (an earlier ``auto``, the same layout)
+     - not measured
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+     - 634 / 3617
+     - not measured
+     - 506 / 3103 (an earlier ``auto``, the same layout)
+     - not measured
+
+The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
+With the cores held awake, ``siblings`` loses to no pin and three separate cores are
+level with it, so ``auto`` names the hold first when it is set.
+
+Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
+at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
+at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
+leave it ``off``.
+
+Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
 
 .. _tensor-transport:
 

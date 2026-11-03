@@ -1,6 +1,7 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,6 +27,9 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import CapturedResidentStep
 
 
 class FlashInferManager(AttentionManager):
@@ -93,6 +97,22 @@ class FlashInferManager(AttentionManager):
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def resident_refusal(self) -> str | None:
+        if self._window_left >= 0:
+            return "a sliding window reads pages a resident row no longer holds"
+        return None
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # planned per label of its KV cache's plan, so its wrapper is under that stream's label
+        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.reads_tables = True
+        else:
+            step.host_planned = True
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -229,6 +249,8 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+            return
         refuse_context_only(step, type(self).__name__)
         if self._window_left >= 0 and not step.causal:
             raise ValueError("sliding_window requires causal attention")

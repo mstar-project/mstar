@@ -1110,6 +1110,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def resident_walks(self) -> frozenset[str]:
+        """Walks whose captured steps may read their rows off the resident
+        tables (`mstar.engine.resources.resident`). A walk here runs, for each
+        resource, one stream that takes one token a row or one it only reads
+        (span 0), with no forks or retention, and its `preprocess` reads no
+        planned position or KV location: the forward's graph fills those in.
+        The engine still refuses if a resource can't."""
+        return frozenset()
+
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
