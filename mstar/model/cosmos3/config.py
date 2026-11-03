@@ -449,6 +449,15 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # Policy-request defaults a policy checkpoint ships in ``checkpoint.json``
+    # (its "policy" section): the chunk the reply carries, the observation fps
+    # and the embodiment, so a client sends only the observation, the prompt
+    # and the robot_state. None keeps the generic action defaults (16 rows,
+    # ``fps``, and a domain the request must name). The Nano DROID checkpoint's
+    # file is empty, so its yaml sets them.
+    policy_action_chunk_size: int | None = None
+    policy_conditioning_fps: float | None = None
+    policy_domain_name: str | None = None
     # Default output size (width, height) for image and video requests that
     # send no ``size``: Nano/Super serve 1024^2 images and the same square for
     # video unless the deployment says otherwise; Edge is 480p-native (the
@@ -667,6 +676,17 @@ class Cosmos3Config:
             for name, value in EDGE_RECIPE_DEFAULTS.items():
                 if getattr(cfg, name) == getattr(defaults, name):
                     setattr(cfg, name, value)
+
+        ckpt_path = root / "checkpoint.json"
+        if ckpt_path.exists():
+            with open(ckpt_path) as f:
+                policy = (json.load(f) or {}).get("policy") or {}
+            if policy.get("action_chunk_size") is not None:
+                cfg.policy_action_chunk_size = int(policy["action_chunk_size"])
+            if policy.get("conditioning_fps") is not None:
+                cfg.policy_conditioning_fps = float(policy["conditioning_fps"])
+            if policy.get("domain_name"):
+                cfg.policy_domain_name = str(policy["domain_name"])
 
         modular_path = root / "modular_model_index.json"
         if modular_path.exists():
