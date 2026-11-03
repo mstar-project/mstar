@@ -16,6 +16,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
     _RaggedPrefillBase,
+    padded_head_dim,
 )
 from mstar.engine.resources.step import StepContext
 
@@ -39,6 +40,22 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         return super()._build_wrapper(
             label, slot, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
         )
+
+    def run(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        label: str | None = None, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._config.compile_op and not return_lse and torch.compiler.is_compiling():
+            # A head dim the kernels lack is padded here, in the traced graph,
+            # where the pad fuses into whatever produced q/k/v and the slice
+            # into whatever reads the output; inside the op both are
+            # full-size copies per layer.
+            d = q.shape[-1]
+            padded = padded_head_dim(d)
+            if padded != d:
+                q, k, v = (torch.nn.functional.pad(t, (0, padded - d)) for t in (q, k, v))
+                return super().run(q, k, v, label)[..., :d]
+        return super().run(q, k, v, label, return_lse)
 
 
 class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBase):

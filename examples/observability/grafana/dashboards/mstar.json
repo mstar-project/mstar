@@ -1451,7 +1451,7 @@
     {
       "type": "timeseries",
       "title": "Data worker queue depth vs requests in flight",
-      "description": "Requests submitted and not yet taken up by the data worker (read at scrape), against every request the API server holds.",
+      "description": "Inputs (requests and client-stream appends) waiting in the data worker: submitted, and neither being prepared nor handed on to the conductor yet (read at scrape), against every request the API server holds.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
