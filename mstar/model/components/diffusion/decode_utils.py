@@ -32,12 +32,18 @@ def compile_vae_decode(vae: nn.Module):
     tens of seconds, so the decoder warms every batch size it will ever call at load and splits
     larger batches into those sizes (see ``decode_in_chunks``).
 
-    Numerics (H100, 1024^2, measured 2026-09-21): the compiled decode lands ~56 dB from the eager
-    one (inductor's GroupNorm / SiLU decompositions), and because the autotuner benchmarks
-    candidate conv kernels, two server processes can pick different ones (64 dB apart on the same
-    seeds). An "exact" compile that keeps GroupNorm and SiLU on the eager kernels is bit-exact but
-    slower than eager (111 vs 89 ms), so the exactness knob for the VAE is ``vae_compile: false``.
+    Numerics: not bit-exact with the eager decode. Inductor's own reductions, the nearest-x2
+    upsamples folded into their convs (``UpStage.fold_upsample``) and the split-reduction
+    GroupNorm (``group_norm.norm_act``) each round differently from the eager modules; before the
+    last two the compiled decode measured ~56 dB from eager (H100, 1024^2, 2026-09-21). Because the
+    autotuner benchmarks candidate conv kernels, two server processes can pick different ones (64 dB
+    apart on the same seeds, measured then too). An "exact" compile of the unfolded decode that keeps
+    GroupNorm and SiLU on the eager kernels (``exclude_from_compile``) is bit-exact but slower than
+    eager (111 vs 89 ms), so the exactness knob for the VAE is ``vae_compile: false``.
     """
+    for module in vae.modules():
+        if callable(getattr(module, "fold_upsample", None)):
+            module.fold_upsample()
     return with_inductor_rounding(
         torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE),
         eager_rounding=True,

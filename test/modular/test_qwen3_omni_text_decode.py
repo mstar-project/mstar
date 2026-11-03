@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
-from test_graph_runtime import StubTensorManager, _sharding_config
+from rust_runtime import build_runtime
+from test_graph_runtime import _sharding_config
 from torch.overrides import TorchFunctionMode
 
 pytest.importorskip("flashinfer")
@@ -17,7 +18,6 @@ pytest.importorskip("flashinfer")
 from mstar.conductor.request_info import CurrentForwardConductorMetadata  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.graph.base import Loop  # noqa: E402
-from mstar.graph.runtime.python import PythonGraphRuntime  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.model.components.mrope import mrope_position_ids  # noqa: E402
@@ -390,7 +390,7 @@ def _runtime(model: Qwen3OmniModel, walk: str):
     walks = model.get_graph_walk_graphs()
     names = [*PREFILL_WALKS, *DECODE_WALKS]
     ids = list(range(len(names)))
-    runtime = PythonGraphRuntime(
+    runtime = build_runtime(
         my_worker_id="w0",
         my_worker_graphs=[
             WorkerGraph(section=walks[w], graph_walks={w}, ranks=[0], worker_graph_id=i)
@@ -403,7 +403,6 @@ def _runtime(model: Qwen3OmniModel, walk: str):
         all_wg_ids_to_nodes=dict.fromkeys(ids, {"Thinker"}),
         node_to_partition={"Thinker": "Thinker"},
         sharding_config=_sharding_config(),
-        tensor_manager=StubTensorManager(),
     )
     rid = runtime.add_request(
         request_id="r", partition="Thinker", graph_walk=walk, partition_worker_graph_ids=ids,

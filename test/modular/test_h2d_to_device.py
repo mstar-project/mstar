@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import types
 
+import numpy as np
 import pytest
 import torch
 
 from mstar.utils import h2d
-from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
 
 @pytest.fixture(params=["cuda", "xpu"])
@@ -71,3 +72,21 @@ def test_an_already_pinned_tensor_is_copied_from_in_place(monkeypatch, contiguou
     # a non-contiguous one is packed into a pinned buffer: ``.to`` would pack it pageable and sync
     assert (pinned_allocs == []) == contiguous and (got.data_ptr() == source.data_ptr()) == contiguous
     assert torch.equal(got, source)
+
+
+def test_runs_fill_their_destinations_in_order():
+    stager = PinnedStager(torch.long, numel=4)
+    store = torch.zeros(10, dtype=torch.long)
+    stager.copy_runs_([store[1:3], store[6:9]], [1, 2, 3, 4, 5])
+    assert store.tolist() == [0, 1, 2, 0, 0, 0, 3, 4, 5, 0]
+
+
+def test_runs_past_the_staging_buffer_grow_it(accelerator_device):
+    stager = PinnedStager(torch.long, numel=4)
+    store = torch.zeros(64, dtype=torch.long, device=accelerator_device)
+    values = np.arange(1, 33, dtype=np.int64)
+    stager.copy_runs_([store[:16], store[32:48]], values)
+    torch.accelerator.synchronize(accelerator_device)
+    assert store[:16].tolist() == values[:16].tolist()
+    assert store[16:32].tolist() == [0] * 16
+    assert store[32:48].tolist() == values[16:].tolist()

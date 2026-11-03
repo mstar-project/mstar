@@ -15,14 +15,17 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
-from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+from mstar.model.qwen3_tts import submodules
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel, blackwell_path_measured
 from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
     LANGUAGE_ID_KEY,
@@ -30,6 +33,7 @@ from mstar.model.qwen3_tts.config import (
     REF_CLIP_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
+    TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
@@ -166,6 +170,29 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
 
     assert captured["path"] == str(tmp_path)
     assert captured["fix_mistral_regex"] is True
+
+
+@pytest.mark.parametrize("config, side", [
+    ("qwen3tts_1p7b.yaml", (("Codec", "codec_chunk"),)),
+    ("qwen3tts_1p7b_split.yaml", ()),
+])
+def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, side):
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.worker.engine_manager import _side_lane_keys, side_stream_nodes
+
+    model = _make_model()
+    groups = yaml.safe_load((CONFIG_PATH.parent / config).read_text(encoding="utf-8"))["node_groups"]
+    assert CodecSubmodule.side_stream_walks == {"codec_chunk"}
+    codec = CodecSubmodule.__new__(CodecSubmodule)
+    for ranks in ({0}, {1}):
+        nodes = [n for g in groups if set(g["ranks"]) & ranks for n in g["node_names"]]
+        if "Codec" not in nodes:
+            continue
+        keys = _side_lane_keys(
+            {n: codec if n == "Codec" else object() for n in nodes}, model.get_node_resources(), model,
+            nodes, side_stream_nodes(groups), WorkerParallelGroups(num_workers=1, global_rank=0), True,
+        )
+        assert keys == side
 
 
 def test_qwen3_tts_declares_talker_and_codec_graphs():
@@ -324,7 +351,7 @@ def test_flashinfer_wrappers_forward_explicit_kernel_backend(monkeypatch):
         ),
     )
     common = {
-        "workspace_buffer": torch.empty(1),
+        "workspace_buffer": Workspace(torch.empty(1), "test"),
         "num_qo_heads": 2,
         "num_kv_heads": 1,
         "head_dim": 8,
@@ -822,7 +849,27 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     state = submodule.request_state("request")
     assert state["trailing_text_hidden"].shape == (4, 16)
     assert state["tts_pad_embed"].shape == (16,)
-    assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_decode_feeds_its_iterations_text_token_however_often_it_is_prepared():
+    """A refused admit prepares the step's decode rows again: each must feed
+    its own iteration's text token again, not skip to the next one."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
+    hidden = config.talker.hidden_size
+    trailing, pad = torch.randn(3, hidden), torch.randn(hidden)
+    submodule.request_state("r").add_all(generated_frames=1, trailing_text_hidden=trailing, tts_pad_embed=pad)
+
+    def text_condition(iteration: int) -> torch.Tensor:
+        return submodule.prepare_inputs(
+            "talker_decode", SimpleNamespace(request_id="r", rid_handle="r"),
+            {"talker_input_embeds": [torch.zeros(1, hidden)]},
+            input_metadata=InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": iteration}),
+        ).kwargs["text_condition"]
+
+    for iteration in (0, 0, 1, 2, 2):   # iterations 0 and 2 refused once
+        assert torch.equal(text_condition(iteration), trailing[iteration])
+    assert torch.equal(text_condition(3), pad)   # the text is used up
 
 
 def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
@@ -1154,7 +1201,6 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
     )
     real_state = submodule.request_state("real")
     real_state.add_all(
-        generation_step=0,
         generated_frames=config.generation.min_new_tokens,
         trailing_text_hidden=torch.zeros(1, config.talker.hidden_size),
         tts_pad_embed=torch.zeros(config.talker.hidden_size),
@@ -1293,7 +1339,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
 
     def decode_row(rid: str, generated_frames: int) -> ARNodeInputs:
         submodule.request_state(rid).add_all(
-            generation_step=0, generated_frames=generated_frames,
+            generated_frames=generated_frames,
             trailing_text_hidden=torch.randn(2, hidden), tts_pad_embed=torch.randn(hidden),
         )
         return submodule.prepare_inputs("talker_decode", info(rid), {"talker_input_embeds": [torch.randn(1, hidden)]})
@@ -1554,6 +1600,90 @@ def test_code_predictor_attention_projections_compile(monkeypatch, dynamo_counts
     attn = predictor.model.layers[0].self_attn
     traced = dynamo_counts(fn, *args).traced
     assert {attn.qkv_proj.weight.data_ptr(), attn.o_proj.weight.data_ptr()} <= traced
+
+
+@pytest.mark.parametrize("two_tokens", [True, False], ids=["two_tokens", "one_token"])
+def test_code_predictor_depth_loop_passes(monkeypatch, two_tokens):
+    """A frame's passes: positions 0 and 1 in one when asked, then one token per
+    group. A two-token pass predicts group 1 off its last token, group 0's."""
+    import mstar.model.components.code_predictor_kernels as kernels
+
+    monkeypatch.setattr(kernels, "cp_embed_accumulate", _fake_embed_accumulate)
+    config = _tiny_model_config()
+    predictor = _code_predictor(config)
+    predictor.two_token_first_pass = two_tokens
+    predictor.lm_head_weight = torch.ones_like(predictor.lm_head_weight)
+    groups, bs, hidden = config.talker.num_code_groups, 2, config.talker.hidden_size
+    passes, logits = [], []
+
+    def one_pass(inputs_embeds):
+        passes.append((inputs_embeds.shape[1], predictor.depth.cache_pos))
+        # each token's output says which token it was
+        tokens = inputs_embeds.shape[1]
+        return torch.arange(1.0, tokens + 1).view(1, -1, 1).expand(bs, tokens, config.code_predictor.hidden_size)
+
+    def sample(group_logits):
+        logits.append(group_logits)
+        return group_logits.argmax(-1)
+
+    monkeypatch.setattr(predictor, "forward_depth_unrolled", one_pass)
+    predictor.depth_loop(torch.randn(bs, hidden), torch.zeros(bs, dtype=torch.long), torch.randn(bs, hidden), sample)
+    first = [(2, 0)] if two_tokens else [(1, 0), (1, 1)]
+    assert passes == first + [(1, group) for group in range(2, groups)]
+    last_token = 2.0 if two_tokens else 1.0
+    assert logits[0].unique().item() == last_token * config.code_predictor.hidden_size
+
+
+@pytest.mark.parametrize("measured", [True, False])
+def test_one_gate_decides_the_two_token_pass(monkeypatch, measured):
+    monkeypatch.setattr(submodules, "blackwell_path_measured", lambda device: measured)
+    config = _tiny_model_config()
+    predictor = _code_predictor(config)
+    assert predictor.two_token_first_pass is False  # Qwen3-Omni's predictor never turns it on
+    TalkerSubmodule(Qwen3TTSTalkerModel(config), predictor, config)
+    assert predictor.two_token_first_pass is measured
+
+
+def test_blackwell_path_asks_only_of_a_gpu():
+    assert blackwell_path_measured(torch.device("cpu")) is False
+
+
+class _HalveAttention(torch.nn.Module):
+    """Stands in for the paged attention: the residual stream is what's under test."""
+
+    def __init__(self):
+        super().__init__()
+        self.attend = SimpleNamespace(bind_step=lambda label: None, set_layer_idx=lambda idx: None)
+
+    def forward(self, hidden_states):
+        return 0.5 * hidden_states
+
+
+def test_qwen3_tts_talker_leaves_its_input_alone():
+    """The fused add + norm writes the residual stream in place, and a replay's
+    input is a static buffer: a packed replay never restages the rows past its
+    real ones, so a stream started at that input would accumulate into them."""
+    config = _tiny_model_config()
+    model = Qwen3TTSTalkerModel(config).model
+    for layer in model.layers:
+        layer.self_attn = _HalveAttention()
+        layer.mlp = torch.nn.Identity()
+        layer.input_layernorm = _IdentityNorm()
+        layer.post_attention_layernorm = _IdentityNorm()
+    model.norm = _IdentityNorm()
+    embeds = torch.randn(3, config.talker.hidden_size)
+    before = embeds.clone()
+    with torch.no_grad():
+        model(embeds, label="main")
+    assert torch.equal(embeds, before)
+
+
+def test_qwen3_tts_talker_declares_the_rope_theta_its_kernel_reads():
+    """``Qwen3Attention``'s kernel reads the theta off the position resource,
+    whose default is not the checkpoint's."""
+    model = _make_model()
+    position = next(spec for spec in model.get_node_resources() if spec.resource_key == TALKER_POS)
+    assert position.config.rope_theta == model.config.talker.rope_theta != PositionConfig(kv_cache="kv").rope_theta
 
 
 def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
@@ -2016,6 +2146,87 @@ def test_qwen3_tts_fused_snake_matches_the_reference_activation():
     beta = torch.exp(snake.beta).cuda()[None, :, None]
     expected = x + (1.0 / (beta + snake.no_div_by_zero)) * torch.pow(torch.sin(x * alpha), 2)
     torch.testing.assert_close(fused(x), expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel runs on CUDA")
+def test_qwen3_tts_fused_snake_channels_last_matches_the_contiguous_form():
+    from mstar.model.qwen3_tts.components.snake import FusedSnakeBeta
+
+    snake = SimpleNamespace(
+        alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
+    )
+    fused = FusedSnakeBeta(snake).cuda()
+    # large activations too, where an approximate hardware sine drifts from torch.sin
+    scale = torch.tensor([1.0, 1.0, 1.0, 50.0, 50.0, 300.0], device="cuda")[:, None]
+    x = torch.randn(3, 6, 1000, device="cuda") * scale
+    channels_last = fused(x.unsqueeze(2).contiguous(memory_format=torch.channels_last))
+    assert channels_last.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(channels_last.squeeze(2), fused(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel runs on CUDA")
+def test_qwen3_tts_fused_snake_reads_a_4d_input_in_any_layout():
+    from mstar.model.qwen3_tts.components.snake import FusedSnakeBeta
+
+    snake = SimpleNamespace(
+        alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
+    )
+    fused = FusedSnakeBeta(snake).cuda()
+    x = torch.randn(3, 6, 1000, device="cuda")
+    want = fused(x).unsqueeze(2)
+    assert torch.equal(fused(x.unsqueeze(2)), want)
+    strided = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)[..., ::2]
+    assert not strided.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(fused(strided), want[..., ::2])
+
+
+def _codec_decoder(codec, dtype=torch.float32):
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
+    from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
+
+    decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
+    torch.manual_seed(0)
+    decoder = decoder_cls(decoder_config_cls(**codec.decoder_kwargs()))
+    for name, param in decoder.named_parameters():
+        if name.endswith(("alpha", "beta")):
+            torch.nn.init.normal_(param, std=0.3)
+        elif param.dim() > 1:
+            torch.nn.init.normal_(param, std=0.05)
+    return decoder.to(dtype)
+
+
+def test_qwen3_tts_channels_last_stack_is_the_reference_stack():
+    from mstar.model.qwen3_tts.components.conv_stack import ChannelsLastConvStack, conv_stack
+    from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
+
+    codec = _tiny_codec_config()
+    decoder = _codec_decoder(codec, torch.float64)
+    fuse_snake_activations(decoder)
+    decoder = decoder.double()
+    stack = ChannelsLastConvStack(decoder)
+    hidden = torch.randn(2, codec.latent_dim, 19, dtype=torch.float64)
+    with torch.no_grad():
+        want = hidden
+        for module in conv_stack(decoder):
+            want = module(want)
+        got = stack(hidden)
+    assert got.shape == want.shape
+    torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
+
+
+def test_qwen3_tts_channels_last_stack_keeps_dilated_convs_out_of_bf16():
+    from mstar.model.qwen3_tts.components.conv_stack import _CausalConv
+
+    def causal(dilation):
+        conv = torch.nn.Conv1d(4, 4, 7, dilation=dilation).to(torch.bfloat16)
+        return SimpleNamespace(conv=conv, padding=0, _get_extra_padding_for_conv1d=lambda x: 0)
+
+    assert _CausalConv(causal(1)).weight.dtype == torch.bfloat16
+    dilated = _CausalConv(causal(3))
+    assert dilated.weight.dtype == torch.float32
+    x = torch.randn(1, 4, 1, 32, dtype=torch.bfloat16)
+    assert dilated(x.contiguous(memory_format=torch.channels_last)).dtype == torch.bfloat16
 
 
 def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():

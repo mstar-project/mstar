@@ -24,7 +24,8 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.decoder_layer import DecoderLayer, run_layers
-from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.components.qwen3_lm import Qwen3Attention
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
@@ -32,6 +33,15 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
+from mstar.platforms import current_platform
+
+
+def blackwell_path_measured(device: torch.device) -> bool:
+    """Whether this GPU takes the two-token first depth pass. Nothing in it is
+    specific to Blackwell, but it was measured only there, so older GPUs keep one
+    token per pass until someone measures them."""
+    return current_platform.has_cuda_capability(10, 0, device)
+
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -59,7 +69,7 @@ class Qwen3TTSTalkerLayer(DecoderLayer):
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__(
-            self_attn=ParallelAttention(
+            self_attn=Qwen3Attention(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,

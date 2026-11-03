@@ -110,9 +110,8 @@ def _wrap_node_in_loop(
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
-        # where the two runtimes order the completion cascade differently
-        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
-        # rather than ship a shape only one runtime gets right.
+        # whose completion cascades into the parent's (rust/src/graph/state.rs).
+        # Chunking does not handle that, so refuse it.
         if node_name in section.section.get_nodes():
             raise ValueError(
                 f"node {node_name!r} is chunkable and already inside Loop "
@@ -482,7 +481,7 @@ def _divide_into_worker_graphs(
         # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
         # matching over a streamed latent) inexpressible. Honouring it instead
         # means changing this, Loop._is_streamed_input, and the Rust held_mask
-        # together, or the two runtimes disagree.
+        # together.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams
@@ -962,8 +961,8 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features`` from the
-        raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
+        ``image_grid_thw`` and ``audio_features`` from the raw
+        ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
             prompt: Raw text input from the user, or None if no text.

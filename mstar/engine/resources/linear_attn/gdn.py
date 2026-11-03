@@ -34,9 +34,22 @@ from mstar.engine.resources.recurrent.pool import (
 )
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.platforms.compile import compiled
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 logger = logging.getLogger(__name__)
+
+
+# Run compiled: eager, the normalize is four full-size passes per tensor (fp32
+# copy, norm, divide, cast); compiled, one. Not dynamic=True: a symbolic head dim
+# made the reduction ~3x slower; the token count goes dynamic on its own at the
+# second size.
+def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Both in one compiled call, so a layer pays one guard check, not two."""
+    def norm(t):
+        return torch.nn.functional.normalize(t.float(), dim=-1).to(t.dtype)
+    return norm(q), norm(k)
+
 
 # What each arch's chunked prefill kernel will read as its packed state.
 # SM90 is fp32 only; Blackwell takes the narrower ones, so a bf16 pool is not
@@ -143,6 +156,10 @@ class GDNManager(LinearAttnManager):
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
+    def resident_refusal(self) -> str | None:
+        # decode addresses the pool by slot alone, which the pool's table holds
+        return None
+
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
 
@@ -157,6 +174,9 @@ class GDNManager(LinearAttnManager):
             "linear-attn preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # a replayed decode wrapper reads only the pool's slots, which its graph fills
+            return self._current
         self.reset_default_cursors()
         if self._preplanned:
             self._current = self._cached_plan_output
@@ -353,8 +373,7 @@ class GDNManager(LinearAttnManager):
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
-            q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
-            k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
+            q, k = compiled(_l2norm_qk)(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
         if not plan.takes_strided_inputs:

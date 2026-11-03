@@ -36,7 +36,7 @@ from mstar.api_server.request_types import (
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
 
 # ── worker ─────────────────────────────────────────────────────────────────
@@ -122,7 +122,7 @@ def test_crashed_forward_fails_the_whole_batch():
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         w = _worker()
-        w._in_flight_rids = {"r1"}
+        w._hold_rows(CHAIN_LANE, {"r1"})
         pending = _pending_batch(["r1"], future=executor.submit(lambda: 1 / 0))
         try:
             pending.future.result()
@@ -169,7 +169,7 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
 def test_error_handler_also_fails_the_batch_built_this_iteration():
     w = _worker()
-    w._in_flight_rids = {"r1"}
+    w._hold_rows(CHAIN_LANE, {"r1"})
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r2": "wg"},

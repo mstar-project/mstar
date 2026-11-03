@@ -13,7 +13,7 @@ from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
-# readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
+# readiness in a u64 mask.
 MAX_NODE_INPUTS = 64
 
 

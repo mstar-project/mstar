@@ -245,11 +245,17 @@ def test_bagel_runs_a_walk_for_each_span_of_its_layout(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen", "fish_s2_pro"])
 def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
     """The prefill emits the first of max_output_tokens, so the decode loop's
     cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
     ends at the prefill."""
+    if model_name == "fish_s2_pro":
+        from test_fish_s2_pro_model import tiny_ar, tiny_model
+
+        caps = tiny_model().get_loop_caps(max_output_tokens=max_tokens)
+        assert caps[tiny_ar().token_stop.loop] == max(1, max_tokens - 1)
+        return
     if model_name == "canary":
         from mstar.model.canary.canary_model import CanaryModel
 
@@ -260,6 +266,34 @@ def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, m
 
         model = object.__new__(CanaryQwenModel)
     assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
+
+
+def _first_token_at_prefill(model_name):
+    """(model, decode loop) for a model whose prefill samples the reply's first token."""
+    if model_name == "higgs_audio":
+        return _higgs(), "decode_loop"
+    if model_name == "whisper":
+        return _whisper(), "decode_loop"
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    cls, loop = {
+        "orpheus": (OrpheusModel, "decode_loop"),
+        "qwen3_5": (Qwen3_5DenseModel, "decode_loop"),
+        "qwen3_omni": (Qwen3OmniModel, "thinker_decode_loop"),
+    }[model_name]
+    return object.__new__(cls), loop
+
+
+@pytest.mark.parametrize("max_tokens", [2, 3, 64])
+@pytest.mark.parametrize("model_name", ["higgs_audio", "orpheus", "qwen3_5", "qwen3_omni", "whisper"])
+def test_the_prefills_token_and_the_decode_cap_add_up_to_max_output_tokens(model_name, max_tokens):
+    """The decode loop's cap alone ends it (``TokenStop``), one token a step,
+    after the prefill's."""
+    model, loop = _first_token_at_prefill(model_name)
+
+    assert 1 + model.get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
 
 
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
@@ -368,25 +402,6 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_fish_s2_pro_model import tiny_ar, tiny_model
-
-    ar = tiny_ar()
-    outputs = {"new_token": [torch.tensor([4])]}
-    ar.request_state("r").add("generated_frames", 0)
-    ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
-    ar.check_stop("r", prefill, outputs)
-
-    cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-
-    assert cap == _stops_after(
-        ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("clone", [False, True])
 def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     from test_fish_s2_pro_model import tiny_ar, tiny_model
@@ -446,19 +461,38 @@ def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
-@pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
-def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
-    pytest.importorskip("flashinfer")
+@pytest.mark.parametrize("talker_max_tokens", [2, 3, 64])
+def test_qwen3_omni_talker_cap_alone_gives_the_frame_budget(talker_max_tokens):
+    """talker_last_prefill streams the first frame and each decode iteration
+    one more. The loop's cap ends decode, and the stop check looks only for
+    codec_eos."""
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
 
     cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), talker_max_output_tokens=talker_max_tokens)
 
-    assert cap["talker_decode_loop"] == _stops_after(
+    assert 1 + cap["talker_decode_loop"] == talker_max_tokens
+    assert _stops_after(
         lambda *args: TalkerSubmodule.check_stop(_omni_submodule(), *args), "talker_decode_loop", "talker_decode",
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
-    ), "the cap and the stop check end decode on different iterations"
+    ) == 2048, "the stop check ended decode on a frame that is not codec_eos"
+
+
+def test_qwen3_omni_talker_last_prefill_stops_no_loop():
+    """The last prefill's frame comes before talker_decode_loop exists, so a
+    stop there would name a loop its walk doesn't have."""
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+
+    info = ForwardPassInfoWrapper(
+        info=CurrentForwardPassInfo(
+            request_id="r", graph_walk="talker_last_prefill", fwd_index=0, random_seed=0,
+            max_tokens=2048, step_metadata={"talker_max_tokens": 2},
+        ),
+        metadata=InputMetadata(),
+    )
+
+    assert not TalkerSubmodule.check_stop(_omni_submodule(), "r", info, {"layer0_codes": [torch.tensor([NOT_EOS])]})
 
 
 def _tiny_qwen3_tts_talker():

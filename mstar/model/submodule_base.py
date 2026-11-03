@@ -557,7 +557,7 @@ NO_CHUNKING = ChunkingPolicy()
 
 # A chunk Loop's count before its prompt's first chunk sets the real cap (the
 # prompt's length), and the stride of a row that runs whole: it ends the Loop.
-# Within the u32 both runtimes hold loop counters in.
+# Within the u32 the runtime holds loop counters in.
 CHUNK_LOOP_END = 2**31 - 1
 
 
@@ -831,6 +831,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+    # Walks whose steps may run beside the worker's main chain, on a second
+    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # the serving config sets ``side_stream: true``. For a stream-fed walk that
+    # no chain step waits on. Where the config asks, ``EngineManager.build``
+    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # worker, a device without streams, a node that also has chain walks or
+    # holds resources, and a side walk that is not the node's alone, is part
+    # of a combined walk, or has output spans or a stop check.
+    side_stream_walks: frozenset[str] = frozenset()
 
     # Float32 math for this node's forward, where the process default (TF32
     # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
@@ -1105,6 +1114,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         (the default) prepares row by row."""
         del graph_walk, has_loopback
         return None
+
+    def resident_walks(self) -> frozenset[str]:
+        """Walks whose captured steps may read their rows off the resident
+        tables (`mstar.engine.resources.resident`). A walk here runs, for each
+        resource, one stream that takes one token a row or one it only reads
+        (span 0), with no forks or retention, and its `preprocess` reads no
+        planned position or KV location: the forward's graph fills those in.
+        The engine still refuses if a resource can't."""
+        return frozenset()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
@@ -1383,7 +1401,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
@@ -1410,6 +1428,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
+
+        ``outputs`` is read-only, and each name's host copy is made when the
+        check first reads it.
 
         Default: no stops.
         """
@@ -1491,6 +1512,29 @@ class ARNodeSubmodule(NodeSubmodule):
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
 
+    # The packed token counts a prefill capture is built at, which
+    # ``__init__``'s ``prefill_token_buckets`` replaces per instance. A
+    # submodule that takes that kwarg must read its capture ladder off
+    # ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.
+    PREFILL_TOKEN_BUCKETS: list[int]
+
+    def __init__(self, prefill_token_buckets: Sequence[int] | None = None):
+        """``prefill_token_buckets``: a deployment's own captured prefill ladder
+        (``model_kwargs.prefill_token_buckets``), in place of the class's
+        ``PREFILL_TOKEN_BUCKETS``."""
+        super().__init__()
+        if prefill_token_buckets is not None:
+            buckets = prefill_token_buckets
+            if (
+                not isinstance(buckets, (list, tuple)) or not buckets
+                or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in buckets)
+                or len(set(buckets)) < len(buckets)
+            ):
+                raise ValueError(
+                    f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
+                )
+            self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
+
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
         loopback = self.device_loopback
@@ -1560,7 +1604,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         stop = self.token_stop
         if stop is None:

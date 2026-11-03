@@ -66,12 +66,14 @@ class _StubMeasuredRunner:
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
+    _capture_stream = None
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
         self._lent = set()
@@ -344,10 +346,14 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
             ))},
         )
 
+    opened = set()
+
     def ensure(key, bs):
         rids = list(range(-bs, 0))
         for rid in rids:
-            kv.ingest_capture_row(rid)
+            if rid not in opened:  # each padding row once, as DummyRowPool keeps its rows
+                opened.add(rid)
+                kv.ingest_capture_row(rid)
         return rids
 
     runner = _StubMeasuredRunner(torch.device("cuda", 0), {wide: _cost(100), fits: _cost(10)})
@@ -788,6 +794,7 @@ class _StubPlannedRunner:
         self._capture_costs = {bucket: _cost(100) for bucket in buckets}
         self._device = torch.device("cpu")
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 1
         self._buckets = {}
         self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())

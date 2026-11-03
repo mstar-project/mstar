@@ -1,6 +1,6 @@
 """Cross-attention over a context written once and never extended."""
 
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -9,7 +9,6 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
-    WorkspacePool,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -18,6 +17,7 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
     refuse_context_only,
 )
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -36,6 +36,9 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import CapturedResidentStep
 
 
 class _LastPlan(NamedTuple):
@@ -134,7 +137,16 @@ class FlashInferCrossManager(CrossAttentionManager):
             backend=backend
         )
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
+
+    def resident_refusal(self) -> str | None:
+        if self._query_kv_cache_name == self._kv_cache_name:
+            return "a context in the query's own pool would be a second stream on one resident row"
+        return None
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # the context pool's row is read only, and this plans its views on the host
+        step.host_planned = True
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -407,7 +419,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
-    def _decode_wrapper(self, workspace: torch.Tensor, **kwargs) -> FlashInferDecodeWrapper:
+    def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
         kv = self._wrapper_kv_kwargs
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,

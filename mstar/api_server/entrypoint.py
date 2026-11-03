@@ -566,6 +566,8 @@ class APIServer:
         if plan.result is not None:
             logger.info("API server: message thread and frontend bridge on CPU %d (%s; mask %s)",
                         plan.result, plan.why, cpus.format_cpu_list(plan.mask))
+        elif plan.declined:
+            logger.info("API server: result threads not pinned (%s)", plan.why)
         elif knobs.step_thread_core() != "off":
             logger.warning("API server: result threads not pinned (%s)", plan.why)
 
@@ -1047,6 +1049,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1223,6 +1226,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1280,20 +1286,30 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -2752,8 +2768,8 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Under ``auto`` this also takes the GPUs' locks, and a server that finds one
-    held pins nothing, here or in its workers. A bad knob value is left for the
+    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and a
+    server that finds one held pins nothing, here or in its workers. A bad knob value is left for the
     conductor's deployment check to report; a CPU number the mask can't honour
     raises ``CpuPlanError``."""
     try:
@@ -2764,13 +2780,13 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     if setting == "off":
         return cpus.deployment_plan(setting, [])
     devices = deployment_workers(config, accelerator_type()).devices
-    plan = cpus.devices_plan(setting, devices)
-    if setting != "auto" or not plan.pinned:
+    plan = cpus.devices_plan(setting, devices, knobs.idle_hold())
+    if setting not in cpus.PLACED or not plan.pinned:
         return plan
     refused = cpus.claim_gpus(cpus.device_addresses(devices))
     if refused is None:
         return plan
-    logger.warning("step_thread_core auto: nothing pinned, %s", refused)
+    logger.warning("step_thread_core %s: nothing pinned, %s", setting, refused)
     # the workers read the knob when they build their plan
     os.environ[knobs.KNOBS["step_thread_core"]] = "off"
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
@@ -2928,6 +2944,8 @@ def main(argv: list[str] | None = None):
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
     _set_preprocess_threads(model, config)
 
     global api_server
