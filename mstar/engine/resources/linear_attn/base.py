@@ -64,6 +64,17 @@ class SplitRows(NamedTuple):
         """Each rank's tokens of the decode run, which every rank gathers."""
         return tuple(self.pieces[:, : self.run].sum(1).tolist())
 
+    @property
+    def prompt_slots(self) -> torch.Tensor:
+        """The slots of the rows past the decode run."""
+        return self.slots[self.run:]
+
+    @property
+    def has_prompt(self) -> bool:
+        """Whether any row past the decode run holds a token (a step of zero-span rows behind the
+        run would leave the chunked kernel nothing, on which it deadlocks)."""
+        return bool(self.pieces[:, self.run:].any())
+
 
 class LinearAttnManager(AttentionResource):
     # Abstract except for `build`, which dispatches on the variant.
@@ -215,14 +226,17 @@ class LinearAttnManager(AttentionResource):
 
     def _decode_slab(self, split: SplitRows, *xs: torch.Tensor) -> list[torch.Tensor]:
         """The step's decode run, every rank's tokens of it gathered: the first tokens of each of
-        ``xs``, this rank's, and the whole run back, one collective sized by the step."""
+        ``xs``, this rank's, and the whole run back, one collective per dtype sized by the step
+        (a ``cat`` of two would promote one)."""
         counts = split.decode_tokens
         mine = counts[split.range.group.rank]
-        flat = torch.cat([x[:mine].flatten(1) for x in xs], dim=1)
-        whole = gather_sequence(split.range.group, flat, counts)
-        sizes = [x[0].numel() for x in xs]
-        parts = whole.split(sizes, dim=1)
-        return [part.unflatten(1, x.shape[1:]).contiguous() for part, x in zip(parts, xs, strict=True)]
+        out: list[torch.Tensor | None] = [None] * len(xs)
+        for dtype in dict.fromkeys(x.dtype for x in xs):
+            chosen = [i for i, x in enumerate(xs) if x.dtype == dtype]
+            whole = gather_sequence(split.range.group, torch.cat([xs[i][:mine].flatten(1) for i in chosen], 1), counts)
+            for i, part in zip(chosen, whole.split([xs[i][0].numel() for i in chosen], dim=1), strict=True):
+                out[i] = part.unflatten(1, xs[i].shape[1:]).contiguous()
+        return out
 
 
 def finals_by_rank(pieces: np.ndarray, first: int) -> tuple[np.ndarray, list[int]]:

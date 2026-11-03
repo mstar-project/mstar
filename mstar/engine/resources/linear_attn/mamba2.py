@@ -40,7 +40,7 @@ from mstar.engine.resources.linear_attn.mamba2_kernels import (
 )
 from mstar.engine.resources.recurrent.config import Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
-from mstar.engine.resources.sequence_shard import state_passing
+from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -267,25 +267,24 @@ class Mamba2Manager(LinearAttnManager):
         rank where there are fewer than ranks), the scan over the replica's head block, the
         block's final states gathered into every replica, and the output back by token. It splits
         memory, not time: the scan is a loop over tokens."""
-        r = split.range
-        group, world = r.group, r.group.world_size
+        group = split.range.group
+        world = group.world_size
         heads = ssm_layer.shape[1] // world
         lo, hi = group.rank * heads, (group.rank + 1) * heads
         if b.shape[1] % world:
             b, c = (t.repeat_interleave(world // t.shape[1], dim=1) for t in (b, c))
-        sizes = list(r.counts)
-        if len({t.dtype for t in (x, dt, b, c)}) == 1:
-            x, dt, b, c = group.all_to_all([x, dt, b, c], scatter_dim=1, gather_dim=0, gather_sizes=sizes)
-        else:
-            x, dt, b, c = (group.all_to_all(t, scatter_dim=1, gather_dim=0, gather_sizes=sizes) for t in (x, dt, b, c))
-        block = ssm_layer[:, lo:hi]
-        out = self._scan_rows(
-            plan, x, dt, b, c, block, a[lo:hi], None if d is None else d[lo:hi],
-            None if dt_bias is None else dt_bias[lo:hi],
-        )
-        mine = block.index_select(0, plan.slots.long().clamp_min(0))
-        scatter_rows(ssm_layer, plan.slots, group.all_gather(mine, dim=1))
-        return group.all_to_all(out, scatter_dim=0, gather_dim=1, scatter_sizes=sizes)
+
+        def run(x, dt, b, c):
+            block = ssm_layer[:, lo:hi]
+            out = self._scan_rows(
+                plan, x, dt, b, c, block, a[lo:hi], None if d is None else d[lo:hi],
+                None if dt_bias is None else dt_bias[lo:hi],
+            )
+            mine = block.index_select(0, plan.slots.long().clamp_min(0))
+            scatter_rows(ssm_layer, plan.slots, group.all_gather(mine, dim=1))
+            return out
+
+        return ulysses(run, x, dt, b, c, r=split.range)
 
     def _state_passing(self, plan: Mamba2Plan, split: SplitRows, x, dt, b, c, ssm_layer, a, d, dt_bias):
         """A split step by token (``sequence_shard.state_passing``): each rank scans every row it

@@ -194,7 +194,7 @@ def _split_exchanges(rank, world, total, rows):
     dist.all_gather_into_tensor = record
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
-    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
+    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r=r), local(want))
     if rows is None:
         torch.testing.assert_close(all_gather(run, local(q), local(k), local(v), r), local(want))
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
@@ -209,7 +209,7 @@ def _split_exchanges(rank, world, total, rows):
         assert q is None
         written.append(k)
 
-    assert ulysses(write, None, local(k), local(v), r) is None
+    assert ulysses(write, None, local(k), local(v), r=r) is None
     assert head_slice(write, None, k, v, group) is None
     for got, expect in zip(written, (heads(k), heads(k)), strict=True):
         assert torch.equal(got, expect)
@@ -666,14 +666,17 @@ def _linear_step(manager, layers, variant, layout, walk, x, weight, gates, param
     return x, out
 
 
-def _linear_split(rank, world, variant, exchange, layout, walk, sink, gpu=False):
+def _linear_split(rank, world, variant, exchange, layout, walk, sink, gpu=False, gate_dtype=None):
     """The resource on this rank's share of a split step against the same resource running it
     whole on one rank: the conv and recurrence outputs (exact for ulysses on CPU, within tolerance
     for state_passing and the GPU's bf16), and the pool's state and conv windows, alike bit for
-    bit on every rank."""
+    bit on every rank. ``gate_dtype``: the gates in a dtype of their own (an fp32 gate projection
+    beside bf16 q/k/v)."""
     device = torch.device("cuda", rank) if gpu else CPU
     n = sum(span for span, _, _ in layout)
     x, weight, gates, params = _linear_inputs(variant, n, device, torch.bfloat16 if gpu else torch.float32)
+    if gate_dtype is not None:
+        gates = gates.to(gate_dtype)
     ref, ref_layers, _ = _linear(variant, sink=sink, device=device)
     # a clone: the one-token conv update writes its output over its input
     want_conv, want = _linear_step(ref, ref_layers, variant, layout, walk, x.clone(), weight, gates, params)
@@ -695,21 +698,25 @@ _MIXED = [(1, 2, True), (1, 4, True), (6, 5, True), (1, 8, False), (5, 9, False)
 
 
 @pytest.mark.parametrize("exchange", ["ulysses", "state_passing"])
-@pytest.mark.parametrize("variant, world, layout, walk, sink", [
-    ("gdn", 2, _FRESH_AND_CONTINUING, "prefill", True),
+@pytest.mark.parametrize("variant, world, layout, walk, sink, gate_dtype", [
+    ("gdn", 2, _FRESH_AND_CONTINUING, "prefill", True, None),
     # a row wholly on rank 0, pieces shorter than the conv window, a rank holding a middle piece
-    ("gdn", 3, _FRESH_AND_CONTINUING, "prefill", True),
-    ("gdn", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", True),
+    ("gdn", 3, _FRESH_AND_CONTINUING, "prefill", True, None),
+    ("gdn", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", True, None),
     # the decode run runs copied, the prompt rows split; the sink off, slot 0 a request's
-    ("gdn", 2, _MIXED, "mixed", True),
-    ("gdn", 3, [(1, 0, True), (1, 4, True), (9, 5, True), (4, 9, False)], "mixed", False),
+    ("gdn", 2, _MIXED, "mixed", True, None),
+    ("gdn", 3, [(1, 0, True), (1, 4, True), (9, 5, True), (4, 9, False)], "mixed", False, None),
+    # gates in their own dtype ride both exchanges, the decode run's gather too
+    ("gdn", 2, _MIXED, "mixed", True, torch.float64),
     # one B/C group under three ranks
-    ("mamba2", 3, _FRESH_AND_CONTINUING, "prefill", True),
-    ("mamba2", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", False),
-], ids=["gdn-2", "gdn-3", "gdn-3-middle-piece", "gdn-2-mixed", "gdn-3-mixed-sink-off", "mamba2-3",
-        "mamba2-3-middle-piece-sink-off"])
-def test_a_recurrent_layer_on_a_split_step_matches_one_rank(tmp_path, variant, world, layout, walk, sink, exchange):
-    _run(_linear_split, world, tmp_path / "store", variant, exchange, layout, walk, sink)
+    ("mamba2", 3, _FRESH_AND_CONTINUING, "prefill", True, None),
+    ("mamba2", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", False, None),
+], ids=["gdn-2", "gdn-3", "gdn-3-middle-piece", "gdn-2-mixed", "gdn-3-mixed-sink-off", "gdn-2-mixed-own-gate-dtype",
+        "mamba2-3", "mamba2-3-middle-piece-sink-off"])
+def test_a_recurrent_layer_on_a_split_step_matches_one_rank(
+    tmp_path, variant, world, layout, walk, sink, gate_dtype, exchange,
+):
+    _run(_linear_split, world, tmp_path / "store", variant, exchange, layout, walk, sink, False, gate_dtype)
 
 
 def _nccl_entry(rank, fn, world, store_path, args):

@@ -40,7 +40,7 @@ from mstar.engine.resources.recurrent.pool import (
     RecurrentStatePool,
     checkpoint_rows,
 )
-from mstar.engine.resources.sequence_shard import state_passing
+from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
@@ -400,25 +400,28 @@ class GDNManager(LinearAttnManager):
         return out
 
     def _ulysses(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
-        """A split step's prompt rows by head: every token of a block of heads, the chunked half
-        run on it over the replica's head block, the block's final states gathered into every
-        replica, and the output back by token. The decode run's tokens ride the exchange; the
-        chunked half (planned eagerly past the run) doesn't read them."""
-        r = split.range
-        group, world = r.group, r.group.world_size
-        heads = state_layer.shape[1] // world
+        """A split step's prompt rows by head (``sequence_shard.ulysses``): every token of a block
+        of heads, the chunked half run on it over the replica's block of the state, and the
+        block's final states gathered into every replica. The decode run's tokens ride the
+        exchange; the chunked half (planned eagerly past the run) doesn't read them."""
+        group = split.range.group
+        heads = state_layer.shape[1] // group.world_size
         lo, hi = group.rank * heads, (group.rank + 1) * heads
-        q, k, v, a, b = group.all_to_all([q, k, v, a, b], scatter_dim=1, gather_dim=0, gather_sizes=list(r.counts))
-        front = split.run
-        block = state_layer[:, lo:hi]
-        out = prefill.run(
-            q[front:], k[front:], v[front:], a[front:], b[front:], block, a_log[lo:hi], dt_bias[lo:hi],
-        )
-        slots = prefill._plan_state.slots
-        scatter_rows(state_layer, slots, group.all_gather(block.index_select(0, slots.long().clamp_min(0)), dim=1))
-        if front:
-            out = torch.cat([out.new_zeros(front, *out.shape[1:]), out])
-        return group.all_to_all(out, scatter_dim=0, gather_dim=1, scatter_sizes=list(r.counts))
+        front, slots = split.run, split.prompt_slots
+
+        def run(q, k, v, a, b):
+            if not split.has_prompt:
+                # nothing past the run (from the shared plan, so alike on every rank)
+                return torch.zeros_like(v)
+            block = state_layer[:, lo:hi]
+            out = prefill.run(
+                q[front:], k[front:], v[front:], a[front:], b[front:], block, a_log[lo:hi], dt_bias[lo:hi],
+            )
+            finals = group.all_gather(block.index_select(0, slots.long().clamp_min(0)), dim=1)
+            scatter_rows(state_layer, slots, finals)
+            return torch.cat([out.new_zeros(front, *out.shape[1:]), out]) if front else out
+
+        return ulysses(run, q, k, v, a, b, r=split.range)
 
     def _state_passing(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
         """A split step's prompt rows by token (``sequence_shard.state_passing``): each rank runs
