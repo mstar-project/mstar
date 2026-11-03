@@ -117,7 +117,7 @@ def _rank_main_every_row_fails(rank, scenario, inbox, outbox):
 
 
 @pytest.mark.parametrize("kind", acc.KINDS)
-def test_a_prepare_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkeypatch, kind):
+def test_an_embedding_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkeypatch, kind):
     """With the embedding all-reducing per row, r1's failed follower read
     still fails only r1, and r0's outputs equal a run with no failure: no rank
     runs r1, so no rank runs r1's embedding collectives."""
