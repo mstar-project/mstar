@@ -1,5 +1,5 @@
 """``Conductor.run`` waits on its communicator's poll between passes, over the
-real transports: a message ends the wait at once, and each timed check ends it
+Rust transport: a message ends the wait at once, and each timed check ends it
 on its own deadline with no message at all, without the loop spinning, whether
 or not a request is in flight."""
 import threading
@@ -8,11 +8,12 @@ import time
 import pytest
 
 pytest.importorskip("torch")
+pytest.importorskip("mstar_rust")
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.api_server.request_types import ConductorStatus  # noqa: E402
-from mstar.communication.communicator import ZMQCommunicator  # noqa: E402
+from mstar.communication.rust_communicator import RustZMQCommunicator  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
@@ -36,13 +37,8 @@ class _StopLoop(BaseException):
     pass
 
 
-def _communicator(kind, my_id, prefix):
-    if kind == "rust":
-        pytest.importorskip("mstar_rust")
-        from mstar.communication.rust_communicator import RustZMQCommunicator as Comm
-    else:
-        Comm = ZMQCommunicator
-    return Comm(my_id, push_ids=[], ipc_socket_path_prefix=prefix)
+def _communicator(my_id, prefix):
+    return RustZMQCommunicator(my_id, push_ids=[], ipc_socket_path_prefix=prefix)
 
 
 def _conductor(comm):
@@ -72,14 +68,13 @@ def _wait_until(predicate, timeout_s=5.0):
     return True
 
 
-@pytest.mark.parametrize("kind", ["python", "rust"])
 @pytest.mark.parametrize("check", TIMED_CHECKS)
 @pytest.mark.parametrize("in_flight", [False, True])
-def test_a_message_or_a_timed_check_ends_the_wait(kind, check, in_flight, tmp_path, monkeypatch):
+def test_a_message_or_a_timed_check_ends_the_wait(check, in_flight, tmp_path, monkeypatch):
     monkeypatch.setattr(conductor_mod, "freeze_after_setup", lambda _name: None)
     prefix = str(tmp_path) + "/"
-    comm = _communicator(kind, "conductor", prefix)
-    peer = _communicator(kind, "peer", prefix)
+    comm = _communicator("conductor", prefix)
+    peer = _communicator("peer", prefix)
     comm.send = lambda entity, msg: None
     c = _conductor(comm)
     if in_flight:

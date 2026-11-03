@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from mstar.engine.resources.attn.workspace import Workspace
+
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
 # one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
@@ -241,7 +243,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -252,17 +254,18 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     ):
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
         self.padded_head_dim = padded_head_dim(head_dim)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
         if not self.accelerator_graph:
             self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-                workspace_buffer, kv_layout, backend=backend
+                self._workspace.tensor, kv_layout, backend=backend
             )
             return
 
         self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            workspace_buffer,
+            self._workspace.tensor,
             kv_layout,
             use_cuda_graph=True,
             qo_indptr_buf=self._qo_indptr_buf,
@@ -290,7 +293,8 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
     ) -> None:
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             cu,
             kv_cu,
             self.num_qo_heads,

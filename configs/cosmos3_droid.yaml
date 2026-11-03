@@ -22,6 +22,17 @@ model_kwargs:
   # flow shift stays at the action default (5.0, the 480p training shift).
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
+  # The checkpoint takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): every action comes in and goes out in the robot's own values (the
+  # robot_state, a forward-dynamics action, the predicted rows), the same state
+  # a pi0.5 DROID policy takes.
+  inverted_action_dims: [7]
+  # The policy request defaults the Edge DROID checkpoint ships in its
+  # checkpoint.json (this checkpoint's file is empty), which NVIDIA's RoboLab
+  # server sends to both: 32 predicted rows, 15 fps observations, DROID.
+  policy_action_chunk_size: 32
+  policy_conditioning_fps: 15.0
+  policy_domain_name: droid_lerobot
 node_groups:
   - node_names: ["dit"]
     ranks: [0]

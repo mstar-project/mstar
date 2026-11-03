@@ -14,20 +14,6 @@ Communication
    * - Variable
      - Default
      - Meaning
-   * - ``MSTAR_RUST_ZMQ``
-     - ``AUTO``
-     - Transport selection for the ZeroMQ control mesh (see
-       :func:`mstar.communication.communicator.make_communicator`).
-       ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
-       ``rust/`` extension imports successfully, pyzmq otherwise.
-       ``1``: the Rust communicator, raising if the extension is missing.
-       ``0``: pyzmq. A worker cannot run on it any more, because the graph
-       runtime holds a share of the Rust transport: the conductor refuses the
-       setting before it starts any worker. An extension built before 0.1.1
-       has no non-blocking ``try_send``, which the API server's preprocess
-       thread sends with: for that thread alone, ``AUTO`` then uses pyzmq
-       with a warning and ``1`` raises, asking for a rebuild. The conductor,
-       the workers and the rest of the API server keep the Rust transport.
    * - ``MSTAR_WIRE_CODEC``
      - ``msgpack``
      - How messages are encoded on every communicator edge (see
@@ -624,6 +610,16 @@ Worker scheduling
        page unindexed. The default ``1`` extends on every step: ``16``
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
+   * - ``MSTAR_WORKSPACE_BUFFER_MB``
+     - ``512``
+     - The size each FlashInfer attention workspace starts at, per (plan label, slot), read
+       by ``workspace_bytes`` (``mstar/engine/resources/attn/workspace.py``). A floor: a plan
+       at startup that asks for more grows that workspace to what it asked for. Raise it for
+       an eager step that wants more than startup's plans left it, which raises with the bytes
+       it asked for, since a captured graph holds the workspace's address by then. A ragged
+       resource that declares ``workspace_mb`` starts there instead, and this doesn't reach
+       it: LTX-2.5's twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
+       ``512`` and 24 GiB at ``2048`` if this applied.
    * - ``MSTAR_KV_PINNED_INDPTRS``
      - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
