@@ -59,7 +59,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
                 raise
             read += 1
             data.extend(
-                {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
+                {"b64_json": base64.b64encode(c.data), "url": None}
                 for c in chunks
                 if c.modality == "image"
             )
@@ -116,7 +116,7 @@ async def create_image_edit(
     finally:
         media_io.schedule_upload_cleanup({"image": [str(image_path)]}, upload_dir)
     data = [
-        {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
+        {"b64_json": base64.b64encode(c.data), "url": None}
         for c in chunks
         if c.modality == "image"
     ]

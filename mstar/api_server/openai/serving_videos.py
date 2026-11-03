@@ -66,7 +66,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
                 )
             except Exception:  # noqa: BLE001 — degrade to video-only, keep serving
                 logger.exception("Muxing generated audio into the mp4 failed; returning video only")
-        data.append({"b64_json": base64.b64encode(video).decode("ascii"), "url": None})
+        data.append({"b64_json": base64.b64encode(video), "url": None})
     return {"created": now(), "data": data}
 
 
