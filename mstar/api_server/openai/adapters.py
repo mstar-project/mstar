@@ -542,6 +542,10 @@ class OrpheusAdapter(OpenAIAdapter):
     Orpheus control and is reported as ignored."""
 
     supports_speech = True
+    # 2,048 output tokens are about 25 s of speech (some 350 characters), and a
+    # longer input is cut off there, so long inputs go as sentence chunks well under it
+    speech_chunk_min_chars = 250
+    speech_chunk_max_chars = 200
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)

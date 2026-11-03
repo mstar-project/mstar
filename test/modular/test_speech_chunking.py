@@ -444,6 +444,14 @@ def test_text_with_no_break_points_is_still_cut_to_max_chars(text):
     assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
 
 
+def test_orpheus_splits_an_input_longer_than_its_output_cap():
+    """2,048 output tokens are about 25 s of speech; a longer input came back cut short with a 200."""
+    from mstar.api_server.openai import serving_speech
+
+    text = "The quick brown fox jumps over the lazy dog. " * 22
+    assert len(serving_speech._plan_chunks(types.SimpleNamespace(), adapters.OrpheusAdapter(), text)) > 1
+
+
 def test_the_adapter_maps_the_request_off_the_event_loop():
     """A slow ``speech_to_request`` (a clip decode, or an allowed remote fetch)
     must not hold the loop: a concurrent task keeps running while it works."""

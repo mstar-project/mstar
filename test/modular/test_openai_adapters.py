@@ -107,7 +107,6 @@ def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
     # Long inputs are sentence-chunked by the speech handler; short ones are not.
     assert adapters.Qwen3TTSAdapter.speech_chunk_min_chars == 600
     assert adapters.Qwen3TTSAdapter.speech_chunk_max_chars == 400
-    assert adapters.OrpheusAdapter.speech_chunk_min_chars is None
 
 
 def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path, monkeypatch):

@@ -288,6 +288,10 @@ Orpheus notes
   renormalizes over the custom tokens: the reference samples the full
   vocabulary, where a text token's probability during speech is negligible but
   not zero, so sampled output is not identical to the reference's.
+- ``/v1/audio/speech`` input of 250+ characters is synthesized as sentence chunks of
+  about 200: the default 2,048 output tokens are about 25 s of speech, and a longer
+  input would be cut off there (``sentence_chunking: false`` opts out). An input of
+  more than 32 chunks (some 6,400 characters) is a 400.
 
 Omnilingual ASR notes
 ~~~~~~~~~~~~~~~~~~~~~

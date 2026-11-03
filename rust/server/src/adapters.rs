@@ -341,6 +341,9 @@ impl Adapter {
         match self {
             // Each Talker request stays near the lengths the model was trained on.
             Adapter::Qwen3TTS => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
+            // 2,048 output tokens are about 25 s of speech (some 350 characters),
+            // and a longer input is cut off there
+            Adapter::Orpheus => SpeechChunking { min_chars: Some(250), max_chars: 200, ..SPEECH_CHUNKING },
             _ => SPEECH_CHUNKING,
         }
     }
@@ -937,13 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen3_tts_chunks_long_speech_by_default() {
+    fn qwen3_tts_and_orpheus_chunk_long_speech_by_default() {
         assert_eq!(Adapter::Qwen3TTS.speech_chunking().min_chars, Some(600));
-        assert_eq!(Adapter::Orpheus.speech_chunking().min_chars, None);
-        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+        assert_eq!(Adapter::Qwen3Omni.speech_chunking().min_chars, None);
+        for adapter in [Adapter::Qwen3TTS, Adapter::Qwen3Omni] {
             let c = adapter.speech_chunking();
             assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{adapter:?}");
         }
+        // 2,048 output tokens are about 25 s of speech: a longer input came back cut short with a 200
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(22);
+        let pieces = crate::speech_chunking::plan_chunks(None, &Adapter::Orpheus.speech_chunking(), &text).unwrap();
+        assert!(pieces.len() > 1, "{pieces:?}");
     }
 
     #[test]
