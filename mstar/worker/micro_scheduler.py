@@ -2232,7 +2232,11 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            self._start_rebuild(node_name, rid, fwd_info.graph_walk)
+            # A follower starts a rebuild only at rank 0's row of it, in `follow_rebuilds`. The request stays dropped
+            # here from the rebuild's last chunk until rank 0's land replays.
+            leads = self.parallel_leader_nodes
+            if leads is None or node_name in leads:
+                self._start_rebuild(node_name, rid, fwd_info.graph_walk)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
