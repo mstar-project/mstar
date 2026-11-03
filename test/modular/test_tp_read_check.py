@@ -340,7 +340,7 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
     w.wakeup_event = SimpleNamespace(drain=lambda: None)
@@ -379,7 +379,6 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
     w._in_flight_rids = set()
@@ -404,7 +403,11 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
         release_cached_prefix=lambda batch: w.released.extend(batch.request_ids),
     ))
-    w.tensor_manager = SimpleNamespace(get_tensor=lambda uuid: torch.zeros(1))
+    w.tensor_manager = SimpleNamespace(
+        get_tensor=lambda uuid: torch.zeros(1),
+        get_tensors=lambda uuids: [torch.zeros(1) for _ in uuids],
+    )
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
 
     w.continuing, w.inputs = [], []
 
@@ -527,7 +530,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
     w._rebuilds = Rebuilds({}, {})
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)

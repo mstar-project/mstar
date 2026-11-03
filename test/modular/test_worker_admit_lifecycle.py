@@ -83,13 +83,13 @@ def _worker():
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
     )
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=lambda rid_str: None,
+        note_arrival=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
@@ -100,7 +100,6 @@ def _worker():
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = {}
-    w._last_active = {}
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w.streaming_buffers = {}

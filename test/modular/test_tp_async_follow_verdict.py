@@ -162,7 +162,7 @@ def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
     ``ExecutingBatch`` the way the GPU thread leaves them."""
     return types.SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=tp_seq, future=future,
-        batch=types.SimpleNamespace(request_to_worker_graph={"r0": "wg0"}),
+        batch=types.SimpleNamespace(request_to_worker_graph={"r0": "wg0"}, incomplete_node_rids=set()),
         node_batch=types.SimpleNamespace(
             admit_error=admit_error,
             failed_requests={rid: "boom" for rid in failed_requests},
@@ -219,7 +219,7 @@ def test_env_parses_master_switch_and_node_list():
 
 
 @pytest.mark.parametrize("env, config, want", [
-    (None, None, (False, None)),
+    (None, None, (True, None)),  # on by default
     (None, True, (True, None)),
     (None, False, (False, None)),
     (None, ["thinker", "talker"], (True, frozenset({"thinker", "talker"}))),

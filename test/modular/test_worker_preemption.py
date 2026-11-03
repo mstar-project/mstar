@@ -92,7 +92,9 @@ def _worker(kv):
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
     w._apply_removes_whose_step_landed = lambda: None
     w._apply_pending_removes_safe_to_drop = lambda rids: None
-    w._try_offload_cold_request = lambda node, rids, affected_resources=None, inside_only=False: w.tried.append(node)
+    w._try_offload_cold_request = lambda node, walk, rids, affected_resources=None, inside_only=False: (
+        w.tried.append(node)
+    )
     return w
 
 

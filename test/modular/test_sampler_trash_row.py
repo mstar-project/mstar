@@ -35,23 +35,26 @@ def _bufs(ingraph: bool, max_bs: int = 4, slots: int = 8) -> SamplerBuffers:
 
 @pytest.mark.parametrize("ingraph", [False, True])
 def test_no_request_is_given_row_zero(ingraph):
-    bufs = _bufs(ingraph)
+    slots = 16
+    bufs = _bufs(ingraph, slots=slots)
     cap = bufs._master_capacity
-    assert bufs.offset.master.shape[0] == cap + 1
+    # with the knob on, the two masters a captured graph indexes are allocated in full
+    graph_rows = slots + 1 if ingraph else cap + 1
+    assert bufs.offset.master.shape[0] == graph_rows
     for i in range(cap):
         bufs.register_request(f"r{i}")
     assert sorted(bufs._rid_to_slot.values()) == list(range(1, cap + 1))
-    if ingraph:
-        return
     # growing keeps row 0 out of the free list and hands out new rows only
     bufs.register_request("extra")
     assert bufs._master_capacity == 2 * cap
     assert bufs.temperature.master.shape[0] == 2 * cap + 1
-    # the device masters follow on the gpu thread's next gather
-    assert bufs.offset.master.shape[0] == cap + 1
+    # the device masters follow on the gpu thread's next gather, except the two
+    # the knob allocated in full, which never grow
+    assert bufs.offset.master.shape[0] == graph_rows
     bufs._sync_device_capacity()
-    assert bufs.offset.master.shape[0] == 2 * cap + 1
-    assert bufs.last_token.master.shape[0] == 2 * cap + 1
+    grown = graph_rows if ingraph else 2 * cap + 1
+    assert bufs.offset.master.shape[0] == grown
+    assert bufs.last_token.master.shape[0] == grown
     assert bufs._rid_to_slot["extra"] > cap
     assert 0 not in bufs._free_slots
 
@@ -115,6 +118,8 @@ def test_capture_rows_take_no_master_rows(ingraph, monkeypatch):
     # a full machine of real requests fits without growing or raising
     for i in range(cap):
         res.ingest_request(f"real{i}")
+        if ingraph:  # the row is taken at admission
+            assert res.reserve(f"real{i}", "node", "decode", None) is None
     assert bufs._master_capacity == cap
     # removing a capture row frees nothing it never held
     res.remove_request(rids[0])

@@ -30,6 +30,7 @@ from torch import nn
 
 from mstar.model.components.audio_features import sinusoid_positions
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.masking import length_mask
 
 
 @dataclass
@@ -65,16 +66,21 @@ class AuTEncoderConfig:
         return 2 * self.n_window
 
     @staticmethod
-    def tokens_for_frames(num_frames: int) -> int:
-        """Encoder tokens for ``num_frames`` mel frames: 13 per full 100-frame
-        chunk, plus three stride-2 convolutions' worth of the remainder."""
-        full, rem = divmod(num_frames, 100)
-        rem_tokens = (((rem - 1) // 2 + 1 - 1) // 2 + 1 - 1) // 2 + 1 if rem else 0
-        return full * 13 + rem_tokens
+    def _conv_tokens(frames: int) -> int:
+        """Tokens three stride-2 convolutions make of ``frames`` mel frames."""
+        for _ in range(3):
+            frames = (frames - 1) // 2 + 1
+        return frames
+
+    def tokens_for_frames(self, num_frames: int) -> int:
+        """Encoder tokens for ``num_frames`` mel frames: each full chunk's
+        (13 for the released 100-frame chunk), plus the remainder's."""
+        full, rem = divmod(num_frames, self.chunk_frames)
+        return full * self.tokens_per_chunk + (self._conv_tokens(rem) if rem else 0)
 
     @property
     def tokens_per_chunk(self) -> int:
-        return self.tokens_for_frames(self.chunk_frames)
+        return self._conv_tokens(self.chunk_frames)
 
     @property
     def window_tokens(self) -> int:
@@ -283,7 +289,7 @@ class AuTEncoder(nn.Module):
         n, c, f, t = x.shape
         x = self.conv_out(x.permute(0, 3, 1, 2).reshape(n, t, c * f))
         x = x + self.positional_embedding[:t].to(x.dtype)
-        keep = torch.arange(t, device=x.device)[None, :] < torch.tensor(valid, device=x.device)[:, None]
+        keep = length_mask(torch.tensor(valid, device=x.device), t)
         return x[keep]
 
     def encode(self, hidden_states: torch.Tensor, cu_seqlens) -> torch.Tensor:

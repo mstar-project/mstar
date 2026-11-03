@@ -49,7 +49,7 @@ class _TensorManager:
     def __init__(self):
         self.tensor_store = TensorStore()
         self.reads: list[tuple[str, int]] = []  # (edge name, uuid) reads started
-        self.acked: list[tuple[str, int]] = []  # (wire rid, uuid) acked unread
+        self.acked: list[int] = []  # uuids acked unread
 
     def register_request(self, rid, sharding_config):
         pass
@@ -61,8 +61,8 @@ class _TensorManager:
     def force_cleanup_request(self, rid):
         pass
 
-    def ack_unread_tensors(self, request_id, graph_edges):
-        self.acked += [(request_id, i.uuid) for e in graph_edges for i in e.tensor_info]
+    def ack_unread_tensors(self, graph_edges):
+        self.acked += [i.uuid for e in graph_edges for i in e.tensor_info]
 
 
 def _worker(is_tp_follower=False) -> Worker:
@@ -86,7 +86,6 @@ def _worker(is_tp_follower=False) -> Worker:
     )
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs, info=None: None,
         remove_request=lambda rid: None,
         engine=SimpleNamespace(publisher_nodes={}),
@@ -96,6 +95,7 @@ def _worker(is_tp_follower=False) -> Worker:
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=w.wire_rids_cleared.append,
         fail_rids=lambda rids: None,
+        note_arrival=lambda rid: None,
         pending_tp_follow_count={},
         last_consumed_tp_seq=-1,
     )
@@ -109,7 +109,6 @@ def _worker(is_tp_follower=False) -> Worker:
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
@@ -177,7 +176,7 @@ def test_late_messages_for_a_removed_request_are_dropped_and_acked():
     w._process_message_list([_signals("A#1", 1, streaming=True), _stop_loops("A#1")])
     assert _parked(w) == 0
     # the peer can free its source buffer instead of waiting on its own teardown
-    assert w.tensor_manager.acked == [("A#1", 1)]
+    assert w.tensor_manager.acked == [1]
     assert w.tensor_manager.reads == []
 
 
@@ -198,13 +197,13 @@ def test_leader_remove_then_conductor_remove_goes_through_remove_request():
 
 
 def test_a_request_drained_before_its_new_request_acks_what_was_parked():
-    """A request drained before its NEW_REQUEST is still taken in, without reads, so a TP follower can apply rank
-    0's moves for it. Its parked inputs are never read, so they are ACKed unread, and the conductor's REMOVE tears
-    it down and clears its drain state."""
+    """A request drained before its NEW_REQUEST, which sent READS_DONE at once, is still taken in, without reads, so
+    a TP follower can apply rank 0's moves for it. Its parked inputs are never read, so they are ACKed unread, and the
+    conductor's REMOVE tears it down and clears its drain state."""
     w = _worker()
     w._process_message_list([_drain("D#1"), _signals("D#1", 3), _new("D#1")])
     assert w._rid("D#1") is not None and _parked(w) == 0
-    assert w.tensor_manager.acked == [("D#1", 3)] and w.tensor_manager.reads == []
+    assert w.tensor_manager.acked == [3] and w.tensor_manager.reads == []
 
     w._process_message_list([_remove("D#1")])
     assert not w._unprocessed_messages and w._rid("D#1") is None
@@ -224,7 +223,7 @@ def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
     w._process_message_list([_new("R#1")])
     assert w._rid("R#1") is None, "the replayed REMOVE tears the request down"
     assert not w._unprocessed_messages
-    assert w.tensor_manager.acked == [("R#1", 5)]
+    assert w.tensor_manager.acked == [5]
     assert w.tensor_manager.reads == []
 
 

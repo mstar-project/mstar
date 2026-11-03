@@ -113,6 +113,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                 model_kwargs=_chunk_kwargs(args.model_kwargs, index),
                 streaming=bool(req.stream),
                 request_id=chunk_id,
+                model=req.model,
             )
 
         lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))

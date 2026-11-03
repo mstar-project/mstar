@@ -3,7 +3,9 @@
 The operator keeps fused accelerator implementations behind one stable
 ``mstar::rms_norm`` graph boundary. CUDA currently dispatches to FlashInfer,
 XPU dispatches to vllm-xpu-kernels, and other devices use the portable
-PyTorch implementation.
+PyTorch implementation. ``mstar::fused_add_rms_norm`` does the same for the
+in-place residual add + RMSNorm: FlashInfer's fused kernel on CUDA in half
+precision, the unfused add and norm elsewhere.
 """
 
 import torch
@@ -96,3 +98,62 @@ def run_rms_norm(
         eps,
         rms_norm_dtype,
     )
+
+
+def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Gemma's RMSNorm, ``normed * (1 + weight)``, computed in fp32 as Hugging
+    Face Gemma computes it and returned in ``x``'s dtype."""
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    var = x.square().mean(dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(var + eps)
+    normed = normed * (1.0 + weight.to(torch.float32))
+    return normed.to(orig_dtype)
+
+
+def _unfused_add_rms_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
+) -> None:
+    residual.add_(x)
+    x.copy_(gemma_rms_norm(residual, weight, eps) if gemma_mode else rms_norm(residual, weight, eps))
+
+
+@torch.library.custom_op("mstar::fused_add_rms_norm", mutates_args=("x", "residual"))
+def fused_add_rms_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
+) -> None:
+    """In place: ``residual += x``, then ``x = rms_norm(residual)`` (Gemma's
+    ``(1 + weight)`` when ``gemma_mode``). Portable fallback: the add, then
+    ``mstar::rms_norm``."""
+    # The portable fallback (XPU, and CUDA in fp32). Inductor can't
+    # fuse the add across the op boundary; if an XPU model adopts ``run_layers``,
+    # register a fused XPU kernel for this op as CUDA does below.
+    _unfused_add_rms_norm(x, residual, weight, eps, gemma_mode)
+
+
+@torch.library.register_kernel(fused_add_rms_norm, "cuda")
+def _fused_add_rms_norm_cuda(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
+) -> None:
+    """FlashInfer's fused kernel, which takes half precision only, and reads
+    ``residual`` and ``weight`` in ``x``'s dtype: any other mix runs unfused. It
+    normalizes the sum before rounding it, where the unfused pair rounds first.
+
+    The op, rather than calling FlashInfer's wrapper directly, keeps the kernel
+    behind a graph boundary: the wrapper is plain Python (its op registration is
+    a no-op), so Dynamo traces into it and breaks the graph, and each call site
+    then compiles as a frame of its own, once per norm module and shape.
+    """
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.dtype == residual.dtype == weight.dtype:
+        _unfused_add_rms_norm(x, residual, weight, eps, gemma_mode)
+        return
+    from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
+
+    (gemma_fused_add_rmsnorm if gemma_mode else fused_add_rmsnorm)(x, residual, weight, eps)
+
+
+@fused_add_rms_norm.register_fake
+def _fused_add_rms_norm_fake(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
+) -> None:
+    return None
