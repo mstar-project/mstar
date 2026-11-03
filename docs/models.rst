@@ -80,6 +80,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+       A request sends one image per camera, up to the config's ``num_cameras`` (3 in
+       ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
+       images than that are a 400.
+       ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
+       openpi's DROID normalization: raw joint state in, joint velocities out.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -1831,6 +1836,51 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
    peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
    36 to 44 GiB compiled.
+
+``linear_dtype``
+   ``bf16`` (default), ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
+   the model declares (``QUANTIZABLE_LINEARS`` beside each transformer) in that format: a
+   ``QuantLinear`` holding the weight quantized once at load, after any ``lora``, whose forward
+   is one op (``mstar::mxfp8_linear`` / ``mstar::nvfp4_linear``) that quantizes the activation
+   with a Triton kernel and runs cuBLASLt's block-scaled GEMM. Modulation, timestep, patch and
+   caption embedders and the final projection stay bf16. A GPU below compute capability 10.0
+   stays on bf16 with a warning, and a linear whose K isn't a whole number of scale tiles (MXFP8
+   128, NVFP4 64), whose N isn't a multiple of 16, or whose kind can't take a format (a
+   tensor-parallel linear) is refused at load.
+
+   NVFP4 quantizes an activation's 16-value blocks with e4m3 scales in units of a per-linear
+   tensor scale ``s``, so a block clips above ``2688 * s``. Over the 100 protocol prompts,
+   klein's text feed-forward outputs reach 4080 (4B) and 5056 (9B) and Z-Image's feed-forward
+   outputs up to 340k; every other input stays under 1800. Those linears take the power of two
+   that holds their measured maximum (``input_amax`` in the declaration), the rest ``s = 1``.
+
+   It stays off by default because the images move. Against the bf16 image of the same prompt
+   and seed, over the 100 protocol prompts with the shipped config on one B300 (compute capability
+   10.3): klein 4B MXFP8 lands at a median 22.3 dB, lowest 13.6 dB, and NVFP4 at 15.6 dB,
+   lowest 9.3 dB. Two bf16 images of a prompt at different seeds are a median 10.4 dB apart.
+   MXFP8 keeps the scene with its details shifted; NVFP4 sometimes changes the composition. On
+   the same GPU the 4B's denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
+   and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
+   concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
+   9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+
+``linear_keep_bf16``
+   A list of module-name patterns over the transformer's linears to keep in bf16 for one
+   deployment, on top of the declaration. A pattern matches name segment by segment, ``*``
+   within one segment, and a segment may be an index range: ``single_blocks.0-3.*``. A pattern
+   that names none of the candidate linears, or a bare string, is refused at load; the log
+   names the linears each pattern kept.
+
+``linear_dtype_steps``
+   Some denoise steps in bf16 under a low-precision ``linear_dtype``: a count of leading steps
+   (``1``: the first step in bf16), or a dtype per step, each ``bf16`` or the ``linear_dtype``,
+   past the list its last entry. Those steps run a bf16 copy of the transformer taken before
+   quantizing, so the deployment holds both sets of weights. Rows batch, and each capture bucket
+   is captured, per dtype, and the scheduler keeps a step of one dtype apart from the other.
+   One leading bf16 step takes klein 4B MXFP8 from a median 22.3 dB to 27.0 dB, lowest 16.0 dB,
+   at a 26.0 ms step (24.4 ms MXFP8, 31.4 ms bf16); at 8 concurrent requests it serves 17% more
+   images per second than bf16, against MXFP8's 25%. Ignored when nothing is quantized (``bf16``,
+   or no block-scaled GEMM).
 
 ``max_image_area``
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
