@@ -1524,6 +1524,13 @@ holds, so a small prefill cap never limits a decode-only step.
 ``max_rows_in_combined(self, graph_walk)`` also bounds how many rows of one walk a mixed
 step may hold, for kernels sized to a few prompt rows (see ``CombinedSplit``).
 
+**Keeping captures apart.** A batch that spans two ``cg_key_info`` groups matches no capture
+or pays for the widest one. ``split_batches_by_capture_key(self, graph_walk)`` makes the
+scheduler batch each group on its own, oldest row first, and
+``capture_group_order(self, graph_walk)`` names groups to run first, in that order. Qwen3-TTS's
+codec does both: a request's first window, padded to a wide one, took twice as long to reach
+the client.
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
