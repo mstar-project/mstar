@@ -497,8 +497,9 @@ class Resource(ABC):
         what a captured graph reads keeps its address. Called once, by the engine."""
         # A no-op is safe for a resource that never reallocates what a graph reads once it
         # is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first
-        # plan during sizing). The one kind a plan grows is a FlashInfer workspace, and
-        # `AttentionResource` seals the pool every one of them comes from.
+        # plan during sizing). The one kind a plan grows is a FlashInfer workspace:
+        # `AttentionResource` seals the pools they come from, and the dense backend's own,
+        # outside a pool, is never captured.
         return
 
     def post_warmup_validate(self):
