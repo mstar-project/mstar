@@ -33,15 +33,6 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
-from mstar.platforms import current_platform
-
-
-def blackwell_path_measured(device: torch.device) -> bool:
-    """Whether this GPU takes the two-token first depth pass. Nothing in it is
-    specific to Blackwell, but it was measured only there, so older GPUs keep one
-    token per pass until someone measures them."""
-    return current_platform.has_cuda_capability(10, 0, device)
-
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames

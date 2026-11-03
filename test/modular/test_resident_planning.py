@@ -165,7 +165,7 @@ def _replay(res, planner, s, promote=True):
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
         planner.gather(s.captured)
-    state = res["kv"]._static_plan_state(lease.slot, ("main", 0))
+    state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
     s.pages = state.token_to_page[: bucket.bs].tolist()
     s.offsets = state.token_to_cache[: bucket.bs].tolist()
@@ -427,7 +427,7 @@ def test_a_row_whose_pages_moved_is_rewritten():
     stream = kv._streams[1]["main"]
     moved = kv._arena.acquire(len(stream.page_indices))
     kv._arena.release(stream.page_indices)
-    stream.page_indices = moved
+    stream.page_indices.assign(moved)
     kv._touch_plan_cache(1)
     assert 1 in planner._stale
     s = _captured_step(live, planner, [1], slot=1, bs=1)
@@ -895,7 +895,7 @@ def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
     res = _resources(max_num_pages=64)
     planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     stride = planner._tables[0].stride
-    assert planner._stager._numel >= 4 * stride + 4 * 4
+    assert planner._stager._seg_numel >= 4 * stride + 4 * 4
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
     rows = [(slot, 0, list(range(stride))) for slot in range(1, 5)]
     plan = SimpleNamespace(writes=SimpleNamespace(rows=rows))
@@ -982,9 +982,10 @@ def _preplan_engine(res, planner):
     engine = Engine.__new__(Engine)
     engine._enable_nvtx = False
     engine._device = CPU
+    engine._pre_plan_done = {}
     engine._runner = StepRunner(resources)
     runner = SimpleNamespace(
-        plan_stream=lambda: None, pad_inputs=lambda lease, inputs: inputs,
+        plan_stream=lambda: None, pad_inputs=lambda lease, inputs, uniform=None: inputs,
         step_ids=lambda lease, rids: list(rids), release=lambda lease, rows: None,
     )
 
@@ -1003,6 +1004,14 @@ def _preplan_engine(res, planner):
     return engine
 
 
+class _RecordedEvent:
+    def __init__(self, device=None):
+        self.recorded = False
+
+    def record(self, stream=None):
+        self.recorded = True
+
+
 def _preplan_batch(planner, rids, bs):
     bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
     lease = SlotLease(slot=0, bucket=bucket)
@@ -1010,7 +1019,7 @@ def _preplan_batch(planner, rids, bs):
     ctx.resident = planner
     return SimpleNamespace(
         node_name="n", inputs=[SimpleNamespace() for _ in rids], request_ids=list(rids), per_request_info={},
-        step_context=ctx, preplan_event=None, preplanned_rids=None, step=None,
+        step_context=ctx, preplan_event=None, preplanned_rids=None, step=None, uniform_inputs=None,
     )
 
 
@@ -1030,6 +1039,8 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     kv, stream = res["kv"], res["kv"]._streams[1]["main"]
     assert stream.stored_len == 4 and len(stream.page_indices) == 1
 
+    # a CPU torch.Event can't be made, and the pre-plan records one even when it raises
+    monkeypatch.setattr(torch, "Event", _RecordedEvent)
     engine = _preplan_engine(res, planner)
     batch = _preplan_batch(planner, [1], 1)
     target = planner if raiser == "resident" else engine._runner
@@ -1044,6 +1055,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     monkeypatch.setattr(target, name, real)
 
     assert batch.preplan_event is None and batch.preplanned_rids is None and batch.step is None
+    assert engine._pre_plan_done["n"].recorded
     assert engine._runner._pre_admitted is None and not engine._runner.staged
     assert not stream.step_in_flight
     assert len(stream.page_indices) == 2
@@ -1104,9 +1116,9 @@ class _HostPagesKV:
         stream = self.kv._streams[rid]["main"]
         if stream.step_in_flight:
             return 0
-        pages = stream.page_indices
+        pages = stream.page_indices.tolist()
         self.kv._touch_plan_cache(rid, row=False)
-        stream.page_indices = []
+        stream.page_indices.clear()
         self.kv._arena.release(pages)
         self.away[rid] = len(pages)
         return len(pages)
@@ -1114,7 +1126,7 @@ class _HostPagesKV:
     def reload(self, rid: int) -> bool:
         self.kv._touch_plan_cache(rid, row=False)
         stream = self.kv._streams[rid]["main"]
-        stream.page_indices = self.kv._arena.acquire(self.away.pop(rid))
+        stream.page_indices.assign(self.kv._arena.acquire(self.away.pop(rid)))
         return True
 
 
@@ -1335,7 +1347,7 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
     ck = CGSlotKey(bucket=bucket, slot=slot, label="main")
     out.positions = res["rope"]._static_pos_ids[ck][:bs].tolist()
     for key in ("kv", "ctx") if context_span else ("kv",):
-        state = res[key]._static_plan_state(slot, ("main", 0))
+        state = res[key]._static_plan_state(slot, ("main", 0), bucket.num_tokens)
         setattr(out, f"{key}_pages", state.token_to_page[:bs].tolist())
         setattr(out, f"{key}_offsets", state.token_to_cache[:bs].tolist())
     if planner is not None:

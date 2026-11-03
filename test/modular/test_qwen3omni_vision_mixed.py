@@ -125,6 +125,8 @@ def test_declare_step_stamps_the_key_cg_key_info_leased(thinker, step_walk, walk
 class _DecodeModel:
     """The Thinker body at decode: one hidden per row, a token per row."""
 
+    model = SimpleNamespace(embed_tokens=lambda input_ids: torch.randn(len(input_ids), HIDDEN))
+
     def __call__(self, input_embeds, **kwargs):
         return input_embeds, input_embeds, input_embeds
 
@@ -135,6 +137,11 @@ class _DecodeModel:
 class _Greedy:
     def sample(self, request_ids, logits):
         return logits.argmax(-1)
+
+
+def _decode_inputs(rows):
+    """What ``preprocess`` hands an eager decode step's forward."""
+    return {"input_ids": torch.zeros(rows, dtype=torch.long), "cos_3d": torch.zeros(rows), "sin_3d": torch.zeros(rows)}
 
 
 def _decode_rows_outputs(thinker, step_walk, walks):
@@ -148,7 +155,7 @@ def _decode_rows_outputs(thinker, step_walk, walks):
         engine_inputs = SimpleNamespace(
             resources={THINKER_ATTN: None, THINKER_SAMPLER: _Greedy()}, request_ids=rids,
         )
-        out = thinker.forward_batched(step_walk, engine_inputs, input_embeds=torch.randn(len(rids), HIDDEN))
+        out = thinker.forward_batched(step_walk, engine_inputs, **_decode_inputs(len(rids)))
         # what the engine hands each row: views of one clone of the batch tensor
         rows = out.clone_row_outputs(len(rids))
         per_row = [{name: [rows[name].split(1)[i]] for name in rows} for i in range(len(rids))]
@@ -192,7 +199,7 @@ def test_a_decode_step_s_thinker_states_are_the_rows_the_engine_handed_out(think
     rids = ["0", "1", "2"]
     thinker.__dict__["model"] = _DecodeModel()
     engine_inputs = SimpleNamespace(resources={THINKER_ATTN: None, THINKER_SAMPLER: _Greedy()}, request_ids=rids)
-    out = thinker.forward_batched("thinker_decode", engine_inputs, input_embeds=torch.randn(len(rids), HIDDEN))
+    out = thinker.forward_batched("thinker_decode", engine_inputs, **_decode_inputs(len(rids)))
     rows = out.clone_row_outputs(len(rids))
     views = rows["thinker_states"].split(1)
     for i, rid in enumerate(rids):
@@ -206,6 +213,6 @@ def test_a_decode_step_s_thinker_states_are_the_rows_the_engine_handed_out(think
     single = SimpleNamespace(
         resources={THINKER_SAMPLER: _Greedy()}, request_ids=["0"], single_request_info=info,
     )
-    outputs = thinker.forward("thinker_decode", single, input_embeds=torch.randn(1, HIDDEN))
+    outputs = thinker.forward("thinker_decode", single, **_decode_inputs(1))
     thinker.postprocess("0", info, outputs)
     assert outputs["thinker_states"][0].shape == (1, HIDDEN)

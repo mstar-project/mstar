@@ -40,13 +40,11 @@ STEPS = [(9, 8), (5, 3), (4, 2), (7, 1), (2, 2)]
 
 
 def _config() -> Qwen3TTSModelConfig:
-    code_predictor = Qwen3TTSCodePredictorConfig(
-        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, hidden_size=256,
-        intermediate_size=512, head_dim=64, vocab_size=128, num_code_groups=4,
-    )
+    # the predictor at the checkpoint's widths, which its kernels tile; the Talker as wide as it (the 0.6B's)
+    code_predictor = Qwen3TTSCodePredictorConfig(num_hidden_layers=2, vocab_size=128, num_code_groups=4)
     talker = Qwen3TTSTalkerConfig(
-        num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=4, hidden_size=512,
-        intermediate_size=1024, head_dim=64, vocab_size=128, text_hidden_size=64, text_vocab_size=128,
+        num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=4, hidden_size=1024,
+        intermediate_size=2048, head_dim=64, vocab_size=128, text_hidden_size=64, text_vocab_size=128,
         num_code_groups=4, codec_pad_id=120, codec_bos_id=121, codec_eos_token_id=122, codec_think_id=123,
         codec_nothink_id=124, codec_think_bos_id=125, codec_think_eos_id=126, code_predictor=code_predictor,
     )
@@ -80,7 +78,8 @@ class _Node:
         config = _config()
         model = Qwen3TTSModel.__new__(Qwen3TTSModel)
         model.config = config
-        specs = model.get_node_resources()
+        model.codec_dtype = torch.float32
+        specs = [spec for spec in model.get_node_resources() if NODE in spec.nodes]
         apply_yaml_overrides(specs, {"resources": {TALKER_KV: {"max_num_pages": 64, "page_size": 16}}})
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())

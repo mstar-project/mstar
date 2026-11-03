@@ -564,8 +564,9 @@ class APIServer:
         plan = cpus.plan()
         self._result_cpu, self._process_cpus = plan.result, plan.mask
         if plan.result is not None:
-            logger.info("API server: message thread and frontend bridge on CPU %d (%s; mask %s)",
-                        plan.result, plan.why, cpus.format_cpu_list(plan.mask))
+            locked = f"; lock held on cores {plan.locked}" if plan.locked else ""
+            logger.info("API server: message thread and frontend bridge on CPU %d (%s%s; mask %s)",
+                        plan.result, plan.why, locked, cpus.format_cpu_list(plan.mask))
         elif plan.declined:
             logger.info("API server: result threads not pinned (%s)", plan.why)
         elif knobs.step_thread_core() != "off":
@@ -2768,8 +2769,10 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and a
-    server that finds one held pins nothing, here or in its workers. A bad knob value is left for the
+    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and
+    any plan that pins takes its cores' locks, moving to the next core set
+    the mask holds when one is held; a server that finds a GPU held, or no set
+    free, pins nothing, here or in its workers. A bad knob value is left for the
     conductor's deployment check to report; a CPU number the mask can't honour
     raises ``CpuPlanError``."""
     try:
@@ -2780,12 +2783,16 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     if setting == "off":
         return cpus.deployment_plan(setting, [])
     devices = deployment_workers(config, accelerator_type()).devices
-    plan = cpus.devices_plan(setting, devices, knobs.idle_hold())
-    if setting not in cpus.PLACED or not plan.pinned:
+    plan = cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=0)
+    if not plan.pinned:
         return plan
-    refused = cpus.claim_gpus(cpus.device_addresses(devices))
+    refused = cpus.claim_gpus(cpus.device_addresses(devices)) if setting in cpus.PLACED else None
     if refused is None:
-        return plan
+        plan = cpus.claim_cores(plan, lambda slot: cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=slot))
+        if plan.pinned:
+            os.environ[cpus.CORE_SET_ENV] = str(plan.slot)
+            return plan
+        refused = plan.why.removeprefix("not pinned: ")
     logger.warning("step_thread_core %s: nothing pinned, %s", setting, refused)
     # the workers read the knob when they build their plan
     os.environ[knobs.KNOBS["step_thread_core"]] = "off"

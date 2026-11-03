@@ -13,6 +13,6 @@ node_groups:
     graph_walks: [prefill_text, prefill_audio, prefill_vision]
   - node_names: [Thinker]
     ranks: [1]
-    graph_walks: [thinker_decode]
+    graph_walks: [thinker_decode, thinker_text_decode]
   - node_names: [Talker]
     ranks: [0]
