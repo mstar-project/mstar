@@ -412,16 +412,19 @@ Qwen3-Omni MoE backend notes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
-  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
-  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
-  serving config's ``model_kwargs:`` block. It's read once when the model is
-  built, so a request's own ``model_kwargs`` can't change it::
+  kernels, except the Thinker's on MI325X, where ``auto`` runs AITER's fused MoE
+  (4-16 % faster a layer from 2 to 4096 tokens, 3 % slower at 1; the Talker's
+  sizes stay on Triton, which is faster at 32 tokens). AITER's kernels read the
+  expert weights re-tiled once at load. A deployment picks either backend for
+  both in the serving config's ``model_kwargs:`` block. It's read once when the
+  model is built, so a request's own ``model_kwargs`` can't change it::
 
       model_kwargs:
-        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+        moe_backend: triton   # auto (default) | triton | aiter
 
   ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
-  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. It can't
+  skip padding rows, so ``auto`` keeps Triton under EP or ``mask_padding``. Its
   output isn't bitwise reproducible (identical calls differ in the last bits),
   so greedy decoding can flip near-tied tokens and repeated requests may not
   match. The Triton kernels are reproducible.
@@ -2240,5 +2243,5 @@ A few things apply to every model on AMD GPUs:
 - Greedy output can differ between two server processes at near-tied tokens. For
   Qwen3.5, two instances agreed on 16 to 31 of 32 prompts, and every difference was a
   near tie.
-- On AMD GPUs Qwen3-Omni's routed experts can also run on AITER (``moe_backend: aiter``,
-  see `Qwen3-Omni notes`_). Triton stays the default.
+- On MI325X Qwen3-Omni's Thinker experts run on AITER's fused MoE by default, the
+  Talker's on Triton (``moe_backend``, see `Qwen3-Omni MoE backend notes`_).
