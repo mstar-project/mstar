@@ -429,10 +429,10 @@ default, which lowers the token count of short clips. Notes:
   GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
 - On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
-  serves image and video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``,
-  whose vision encoder runs on one rank while the other waits for it in the
-  lockstep LLM: 9B on 2xH200, video_60s c32 1520 vs ~900-1000 output tok/s,
-  MMMU c32 4457 vs ~3100.
+  serves video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``, whose
+  vision encoder runs on one rank while the other waits for it in the lockstep
+  LLM: 9B on 2xH200 with TP-async on, DP2 gave 12.5-44% more output tok/s on
+  30 s and 60 s videos at c=16 and c=32.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
   beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
   eagerly.
@@ -462,14 +462,10 @@ step's decode rows and batches a few tokens over; a mixed step keeps only the
 powers of two past 2176); a step pads to its bucket and a longer one runs
 eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
 deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 8192,
-2176 for a mixed step, and 3072, 5120, 6144 and 7168 in place of 4352 and 8704
-(with those two the ladder makes 84 compiles, Dynamo's whole recompile limit,
-leaving none spare). Adding 3072-7168 cut the padding of
-compute-bound long prefills (+2% output tok/s on 9B, random 1024/256 at
-c=64/128, H200, measured before 2176 was added); the same ladder was not a win
-on 0.8B, whose prefill is launch-bound. Each bucket adds captures and startup
-time.
+worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
+and 2176 for a mixed step, since the LLM's 2048-token step budget
+(``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
+reached. Each bucket adds captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -651,12 +647,7 @@ Qwen3-Omni notes
 - The Thinker's text and audio prefill replay captured graphs on the ladder
   ``128 ... 2048`` tokens, and a longer step runs eagerly.
   ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
-  ladder; ``configs/qwen3omni_2gpu_large_kv.yaml`` runs it to 8192 (with 4096
-  and 6144) on H200-class GPUs, so a burst of new prompts that batches into one
-  step of a few thousand tokens still replays (measured on 2xH200: the first
-  t2t c=32 burst's TTFT p99 3.5 s -> 0.45 s). Each bucket adds captures, graph
-  memory and startup time. ``configs/qwen3omni_2gpu.yaml``, sized for 80 GB
-  GPUs, keeps the default ladder.
+  ladder. Each bucket adds captures, graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.
