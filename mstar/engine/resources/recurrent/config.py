@@ -267,10 +267,16 @@ class RecurrentStateConfig:
             raise ValueError("a recurrent state pool must declare a block")
         if not self.labels:
             raise ValueError("a recurrent state pool must declare a label")
-        if not self.disable_sink_slot and self.max_slots < 2:
+        self.check_slots()
+
+    def check_slots(self) -> None:
+        """A pool must hold at least one request's state, a slot per label, or
+        every admit waits forever."""
+        if self.usable_slots < len(self.labels):
             raise ValueError(
-                f"max_slots={self.max_slots} leaves nothing to hand out: the "
-                "sink takes one. Raise it or set disable_sink_slot."
+                f"max_slots={self.max_slots} cannot hold one request's {len(self.labels)} "
+                f"label(s)" + ("." if self.disable_sink_slot else
+                               ": the sink takes one. Raise it or set disable_sink_slot.")
             )
 
     @property
@@ -298,6 +304,14 @@ class RecurrentStateSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache} if self.config.kv_cache else set()
 
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        # snapshots are keyed by `kv_cache`'s pages, and kept at one rank only
+        return bool(self.config.prefix_slots) and self.config.kv_cache is not None and world_size == 1
+
+    @property
+    def restores_prefix(self) -> bool:
+        return True
+
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
         prefix_slots: int | None = None,
@@ -311,6 +325,7 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+            self.config.check_slots()
         if prefix_slots is not None:
             if prefix_slots < 0:
                 raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
@@ -346,3 +361,5 @@ class RecurrentStep(ResourceStep):
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # the rows the forks apply to; None is every row (as KVStep.fork_rids)
+    fork_rids: frozenset | None = None

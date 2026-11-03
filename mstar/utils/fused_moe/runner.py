@@ -14,6 +14,7 @@ from typing import NamedTuple
 import torch
 import triton.language as tl
 
+from mstar.platforms import current_platform
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_quant_fp8,
@@ -127,6 +128,17 @@ def fused_experts(
     top_k = topk_ids.shape[1]
     topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
+    if (alignment is None and not skip_invalid and activation == "silu"
+            and hidden_states.is_cuda and current_platform.is_cuda()):
+        # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
+        # tiles target NVIDIA GPUs (swept on an H100), so ROCm keeps the grouped path.
+        from mstar.utils.fused_moe import decode
+
+        if num_tokens <= decode.ROUTED_MAX_TOKENS and decode.routed_fits(hidden, inter):
+            # At a few tokens each expert's GEMM tile is mostly padding rows: per-pair GEMVs
+            # read the same weights without the sort, the padding or a separate SwiGLU and sum.
+            return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
+                                         reduce=reduce_results)
 
     config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
     compute_type = _tl_compute_type(hidden_states.dtype)

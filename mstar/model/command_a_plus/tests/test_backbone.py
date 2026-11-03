@@ -4,6 +4,8 @@ These exercise real projections, MoE dispatch and AttentionCallable plumbing;
 they do not substitute for FlashInfer or Hugging Face end-to-end parity.
 """
 
+import shutil
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +25,8 @@ from mstar.model.command_a_plus.config import (
     ROPE,
     CommandAPlusConfig,
 )
+
+FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
 
 class MemoryKV:
@@ -65,18 +69,46 @@ class TorchAttention:
     def run(self, q, *, kv_cache_layer, k, v):
         assert (self.label, self.layer_idx) == (self.kv.default_label, self.kv.layer_idx)
         self.calls.append((self.label, self.layer_idx))
-        k, v = kv_cache_layer
-        prefix = len(k) - len(q)
-        queries = torch.arange(prefix, len(k))[:, None]
-        keys = torch.arange(len(k))[None, :]
-        mask = keys <= queries
-        if self.window is not None:
-            mask &= keys > queries - self.window
-        repeats = q.shape[1] // k.shape[1]
-        k, v = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
-        return F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=mask,
-        ).transpose(0, 1).contiguous()
+        return attend_last(q, *kv_cache_layer, self.window)
+
+
+def attend_last(q, k, v, window=None):
+    """Causal attention of the last ``len(q)`` of ``len(k)`` positions, over the last ``window``."""
+    prefix = len(k) - len(q)
+    queries = torch.arange(prefix, len(k))[:, None]
+    keys = torch.arange(len(k))[None, :]
+    mask = keys <= queries
+    if window is not None:
+        mask &= keys > queries - window
+    repeats = q.shape[1] // k.shape[1]
+    k, v = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
+    return F.scaled_dot_product_attention(
+        q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=mask,
+    ).transpose(0, 1).contiguous()
+
+
+class PagedTorchAttention:
+    """Attends over the pages the KV plan names for one group of the pool, as FlashInfer
+    reads them: what the pool kept of the stream, the step's tokens last."""
+
+    requires_kv_write = True
+
+    def __init__(self, window=None, group=0):
+        self.window, self.group, self.plans = window, group, None
+
+    def set_default_label(self, label):
+        self.label = label
+
+    def set_default_layer_idx(self, index):
+        pass
+
+    def run(self, q, *, kv_cache_layer, k, v):
+        plans = self.plans.groups[self.group]
+        (view,) = plans[self.label].views
+        slots = torch.arange(view.start, view.start + view.length)
+        page_size = kv_cache_layer.shape[2]
+        kept = kv_cache_layer[torch.tensor(view.page_idxs)[slots // page_size], :, slots % page_size]
+        return attend_last(q, kept[:, 0], kept[:, 1], self.window)
 
 
 class TorchPositions:
@@ -166,9 +198,7 @@ def dense_reference(model, token_ids, config):
 
 class BackboneTests(unittest.TestCase):
     def setUp(self):
-        self.config = CommandAPlusConfig.from_json(
-            Path(__file__).parent / "fixtures" / "tiny_config.json",
-        ).text_config
+        self.config = CommandAPlusConfig.from_json(FIXTURE).text_config
 
     def make_model(self, dtype=torch.float32):
         model = CommandAPlusLanguageModel(self.config).to(dtype=dtype)
@@ -196,6 +226,52 @@ class BackboneTests(unittest.TestCase):
         self.assertEqual(global_.calls, [("main", 3)] * 5)
         self.assertEqual(pos.calls, ["main"] * 15)
         self.assertTrue(all(len(k) == 9 for k, v in kv.cache.values()))
+
+    def test_a_cache_that_keeps_the_window_matches_dense_reference(self):
+        """The local layers attend over the KV pool as the model declares it, which frees their
+        pages behind the window, and still match the dense reference past the window."""
+        from mstar.communication.tensors import LocalTransferEngine
+        from mstar.engine.resources.kv.config import KVStep
+        from mstar.engine.resources.kv.manager import KVManager
+        from mstar.engine.resources.kv.transfer import TransferEngineInfo
+        from mstar.engine.resources.spec import apply_yaml_overrides
+        from mstar.engine.resources.step import Segment, StepContext
+        from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+
+        with tempfile.TemporaryDirectory() as directory:
+            shutil.copyfile(FIXTURE, Path(directory) / "config.json")
+            specs = CommandAPlusModel(directory).get_node_resources()
+        # 6-token full pages, so 2-token pages of the 3 local layers, a window's in 2 pages
+        apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 32}}})
+        cfg = next(spec.config for spec in specs if spec.resource_key == KV_CACHE)
+        self.assertEqual([(g.layers, g.page_size) for g in cfg.groups], [((3,), 6), ((0, 1, 2), 2)])
+        kv = KVManager(cfg=cfg, name=KV_CACHE, joint_comm_group=None,
+                       transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+                       device=torch.device("cpu"), dtype=torch.float32)
+        model, pos = self.make_model(), TorchPositions()
+        local, global_ = PagedTorchAttention(self.config.sliding_window, group=1), PagedTorchAttention()
+        resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_}
+        for module in model.modules():
+            if isinstance(module, CommandAPlusAttention):
+                module.bind_resources(resources)
+        token_ids = torch.randint(4, 128, (40,), generator=torch.Generator().manual_seed(5))
+        kv.ingest_request("r")
+        with torch.inference_mode():
+            for start, stop in [(0, 20)] + [(n, n + 1) for n in range(20, 40)]:
+                step, ctx = KVStep(segments=(Segment("r", "main", stop - start),)), StepContext(("r",), "w", 0, False)
+                self.assertTrue(kv.admit(step, ctx).ok)
+                local.plans = global_.plans = kv.plan(step, ctx)
+                pos.positions["main"] = torch.arange(start, stop)
+                actual = model(model.embed_tokens(token_ids[start:stop]), label="main")
+                kv.commit(step, ctx)
+                expected = dense_reference(model, token_ids[:stop], self.config)[start:stop]
+                torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        stream = kv._streams["r"]["main"]
+        self.assertEqual((stream.stored_len, stream.released), (40, 0))
+        window = stream.groups[1]
+        self.assertLess(window.stored_len, self.config.sliding_window + 2)
+        self.assertEqual(window.released + window.stored_len, 40)
+        kv.assert_pages_conserved()
 
     def test_bf16_cached_execution_and_label_switching(self):
         model = self.make_model(torch.bfloat16)

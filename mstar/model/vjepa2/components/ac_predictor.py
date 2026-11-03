@@ -24,7 +24,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
-from mstar.model.vjepa2.components.rope_utils import rotate_queries_or_keys, rotate_queries_or_keys_BNHD
+from mstar.model.vjepa2.components.rope_utils import (
+    RopeTables,
+    apply_rope_BNHD,
+    rope_tables_BNHD,
+    rotate_queries_or_keys,
+)
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
 
 
@@ -133,25 +138,11 @@ class ACRoPEAttention(nn.Module):
         action_tokens: int,
         t_0: int = 0,
         label: str | None = None,
-        # Pre-computed position tensors for the cached path.  When provided
-        # (CUDA-graph path), they are static GPU buffers already on device and
-        # no torch.arange / torch.full calls happen inside the captured region.
-        # When None (eager path), they are computed from t_0 here.
-        d_pos: torch.Tensor | None = None,
-        h_pos: torch.Tensor | None = None,
-        w_pos: torch.Tensor | None = None,
-        time_pos: torch.Tensor | None = None,
+        # the cached path's sin/cos, built once per step by the predictor
+        rope: RopeTables | None = None,
     ) -> torch.Tensor:
         if label is not None and self.attn is not None:
-            if d_pos is None:
-                d_pos, h_pos, w_pos, time_pos = self._compute_positions(
-                    t_0, h, w, action_tokens, x.device, x.dtype
-                )
-            return self.forward_cached(
-                x=x,
-                d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
-                action_tokens=action_tokens,
-            )
+            return self.forward_cached(x=x, rope=rope, action_tokens=action_tokens)
         b, n, c = x.size()
 
         # Position ids for the spatial part of each frame
@@ -226,18 +217,15 @@ class ACRoPEAttention(nn.Module):
     def forward_cached(
         self,
         x: torch.Tensor,                   # [B, L, C]
-        d_pos: torch.Tensor,               # [H*W]  — depth (frame) positions for spatial tokens
-        h_pos: torch.Tensor,               # [H*W]  — height positions
-        w_pos: torch.Tensor,               # [H*W]  — width positions
-        time_pos: torch.Tensor | None,     # [action_tokens] or None
+        rope: RopeTables,
         action_tokens: int,
     ) -> torch.Tensor:
-        """Single-frame cached attention with pre-computed position tensors.
+        """Single-frame cached attention with pre-computed sin/cos tables.
 
-        All position tensors are expected to already be on the correct device.
-        Callers must compute them via _compute_positions (or the model-level
-        _compute_rope_positions) and may store them in static GPU buffers
-        updated via .copy_() so the surrounding CUDA graph sees the new values.
+        Callers build ``rope`` with ``rope_tables`` from positions computed via
+        _compute_positions (or the model-level _compute_rope_positions), which they
+        may hold in static GPU buffers updated via .copy_() so the surrounding CUDA
+        graph sees the new values.
 
         Parity with the regular forward was partially validated in
         test/modular/vjepa2/test_ac_rope_parity.py and more thoroughly in
@@ -247,47 +235,28 @@ class ACRoPEAttention(nn.Module):
         hd = self.head_dim
 
         qkv: torch.Tensor = self.qkv(x).view(b, n, 3, self.num_heads, hd)
-        q, k, v = qkv.unbind(dim=2)
+        # q and k rotate together ([B, L, 2, H, D]); v is untouched
+        qk, v = qkv[:, :, :2], qkv[:, :, 2]
 
-        if action_tokens > 0:
-            q_action = q[:, :action_tokens]
-            k_action = k[:, :action_tokens]
-            v_action = v[:, :action_tokens]
-            q_spatial = q[:, action_tokens:]
-            k_spatial = k[:, action_tokens:]
-            v_spatial = v[:, action_tokens:]
-        else:
-            q_spatial, k_spatial, v_spatial = q, k, v
-
-        # 3-axis RoPE for spatial tokens
-        s = 0
-        qd = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.d_dim], d_pos)
-        kd = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.d_dim], d_pos)
-        s += self.d_dim
-        qh = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.h_dim], h_pos)
-        kh = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.h_dim], h_pos)
-        s += self.h_dim
-        qw = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.w_dim], w_pos)
-        kw = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.w_dim], w_pos)
-        s += self.w_dim
-        if s < hd:
-            q_spatial = torch.cat([qd, qh, qw, q_spatial[..., s:]], dim=-1)
-            k_spatial = torch.cat([kd, kh, kw, k_spatial[..., s:]], dim=-1)
-        else:
-            q_spatial = torch.cat([qd, qh, qw], dim=-1)
-            k_spatial = torch.cat([kd, kh, kw], dim=-1)
+        # 3-axis RoPE for spatial tokens, as one rotation over the whole head
+        # dim: each element sees exactly the arithmetic of the per-axis
+        # rotation (pairs never straddle two axes), in a fraction of the kernels
+        emb_sin, emb_cos = rope.spatial
+        qk_spatial = apply_rope_BNHD(qk[:, action_tokens:], emb_sin.unsqueeze(2), emb_cos.unsqueeze(2))
 
         # Temporal RoPE for action tokens
-        if action_tokens > 0 and time_pos is not None:
-            qd = rotate_queries_or_keys_BNHD(q_action[..., :self.d_dim], time_pos)
-            kd = rotate_queries_or_keys_BNHD(k_action[..., :self.d_dim], time_pos)
-            q_action = torch.cat([qd, q_action[..., self.d_dim:]], dim=-1)
-            k_action = torch.cat([kd, k_action[..., self.d_dim:]], dim=-1)
-            q = torch.cat([q_action, q_spatial], dim=1)
-            k = torch.cat([k_action, k_spatial], dim=1)
-            v = torch.cat([v_action, v_spatial], dim=1)
+        if action_tokens > 0:
+            if rope.time is None:
+                raise ValueError("action tokens need time_pos")
+            t_sin, t_cos = rope.time
+            qk_action = qk[:, :action_tokens]
+            qkd = apply_rope_BNHD(qk_action[..., :self.d_dim], t_sin.unsqueeze(2), t_cos.unsqueeze(2))
+            qk = torch.cat([torch.cat([qkd, qk_action[..., self.d_dim:]], dim=-1), qk_spatial], dim=1)
         else:
-            q, k, v = q_spatial, k_spatial, v_spatial
+            qk = qk_spatial
+        q = qk[:, :, 0].contiguous()
+        k = qk[:, :, 1].contiguous()
+        v = v.contiguous()
 
         # [B, L, H, D] -> [B*L, H, D] for FlashInfer
         q = q.reshape(b * n, self.num_heads, hd)
@@ -297,6 +266,26 @@ class ACRoPEAttention(nn.Module):
         x = self.attend(q, k, v)
         x = x.reshape(b, n, c)
         return self.proj(x)
+
+    def rope_tables(
+        self, d_pos: torch.Tensor, h_pos: torch.Tensor, w_pos: torch.Tensor, time_pos: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> RopeTables:
+        """``forward_cached``'s sin/cos for one step's positions, in the queries'
+        ``dtype``: the d/h/w tables side by side over the head dim, cos 1 / sin 0
+        on the unrotated tail."""
+        device = d_pos.device
+        parts = [
+            rope_tables_BNHD(pos, dim, dtype, device)
+            for pos, dim in ((d_pos, self.d_dim), (h_pos, self.h_dim), (w_pos, self.w_dim))
+        ]
+        tail = (1, d_pos.numel(), 1, self.head_dim - self.d_dim - self.h_dim - self.w_dim)
+        sin = torch.cat([p[0] for p in parts] + [torch.zeros(tail, dtype=dtype, device=device)], dim=-1)
+        cos = torch.cat([p[1] for p in parts] + [torch.ones(tail, dtype=dtype, device=device)], dim=-1)
+        return RopeTables(
+            spatial=(sin, cos),
+            time=None if time_pos is None else rope_tables_BNHD(time_pos, self.d_dim, dtype, device),
+        )
 
     def bind_resources(self, resources: dict) -> None:
         self.attn = resources.get("attn", self.attn)
@@ -336,15 +325,11 @@ class ACBlock(nn.Module):
         action_tokens: int,
         t_0: int = 0,
         label: str | None = None,
-        d_pos: torch.Tensor | None = None,
-        h_pos: torch.Tensor | None = None,
-        w_pos: torch.Tensor | None = None,
-        time_pos: torch.Tensor | None = None,
+        rope: RopeTables | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
-            action_tokens=action_tokens, t_0=t_0, label=label,
-            d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+            action_tokens=action_tokens, t_0=t_0, label=label, rope=rope,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -507,10 +492,11 @@ class VisionTransformerPredictorAC(nn.Module):
         gh, gw = self.grid_height, self.grid_width
 
         def fn(x: torch.Tensor) -> torch.Tensor:
-            d_pos   = static_pos_bufs["d_pos"]
-            h_pos   = static_pos_bufs["h_pos"]
-            w_pos   = static_pos_bufs["w_pos"]
-            time_pos = static_pos_bufs.get("time_pos")
+            # every block rotates by this step's positions: one sin/cos table each
+            rope = blocks[0].attn.rope_tables(
+                static_pos_bufs["d_pos"], static_pos_bufs["h_pos"], static_pos_bufs["w_pos"],
+                static_pos_bufs.get("time_pos"), x.dtype,
+            )
             if label is not None:
                 # cursors on the shared resources; see AttentionCallable
                 blocks[0].attn.attend.bind_step(label)
@@ -524,7 +510,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     h=gh, w=gw,
                     action_tokens=cond_tokens,
                     label=label,
-                    d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+                    rope=rope,
                 )
             return x
 
@@ -556,14 +542,15 @@ class VisionTransformerPredictorAC(nn.Module):
 
         if label is None:
             attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
-            d_pos = h_pos = w_pos = time_pos = None
+            rope = None
         else:
             attn_mask = None
-            # Compute positions once before the block loop so this work stays
-            # outside any CUDA-graph-captured region (see PiecewiseCudaGraphRunner).
-            d_pos, h_pos, w_pos, time_pos = self._compute_rope_positions(
+            # Compute positions and their sin/cos once before the block loop so this
+            # work stays outside any CUDA-graph-captured region (see PiecewiseCudaGraphRunner).
+            positions = self._compute_rope_positions(
                 t_0, self.grid_height, self.grid_width, cond_tokens, x.device, x.dtype
             )
+            rope = self.predictor_blocks[0].attn.rope_tables(*positions, x.dtype)
 
         if label is not None:
             # cursors on the shared resources; see AttentionCallable
@@ -580,7 +567,7 @@ class VisionTransformerPredictorAC(nn.Module):
                 action_tokens=cond_tokens,
                 t_0=t_0,
                 label=label,
-                d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+                rope=rope,
             )
 
         # the advance is the runner's now, off the step declaration

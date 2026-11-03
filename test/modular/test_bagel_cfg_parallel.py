@@ -9,6 +9,7 @@ import yaml
 
 from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
@@ -26,9 +27,11 @@ from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
 )
+from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
-from mstar.model.bagel.submodules import CombineCFGSubmodule
+from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule
+from mstar.model.submodule_base import END_PARTITION
 
 
 def test_offload_reset_preserves_remote_content_epoch():
@@ -62,13 +65,13 @@ def test_cfg_graph_is_reused_for_tp_branches():
 
     assert set(walks) == {
         "prefill_text", "prefill_vit", "prefill_vae", "decode",
-        "image_gen", "image_gen_cfg",
+        "image_gen", "image_gen_head", "image_gen_cfg2", "image_gen_cfg3", "image_decode",
     }
     assert model.get_default_sharding_config().tp_enabled_nodes == {
         "LLM", "LLM_cfg_text", "LLM_cfg_img",
     }
-    assert set(walks["image_gen_cfg"].get_nodes()) == {
-        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg", "vae_decoder",
+    assert set(walks["image_gen_cfg3"].get_nodes()) == {
+        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg",
     }
 
 
@@ -85,7 +88,9 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
 
     assert len(cfg_groups) == 2
     assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
-    assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
+    assert [group.get("graph_walks") for group in cfg_groups] == [
+        ["image_gen_cfg2", "image_gen_cfg3"], ["image_gen_cfg3"],
+    ]
 
 
 def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
@@ -136,6 +141,39 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
     assert model._image_gen_remote_handoff
     image_gen = model.get_graph_walk_graphs()["image_gen"]
     assert not image_gen.sections[0].section.enable_async_scheduling
+
+
+@pytest.mark.parametrize(
+    ("schedule", "target", "think", "ignore_eos", "stop"),
+    [
+        (["prefill_vit", "prefill_text"], "text", False, False, {END_PARTITION}),
+        (["prefill_vit", "prefill_text"], "text", False, True, set()),
+        # an earlier prefill's token is not the reply's
+        (["prefill_text", "prefill_vit", "prefill_text"], "text", False, False, set()),
+        # thinking ends here, but image_gen still has to run
+        (["prefill_text", "prefill_text"], "image", True, False, set()),
+        (["prefill_text"], "text", False, False, {"decode_loop"}),
+    ],
+    ids=["last-prefill", "ignore-eos", "earlier-prefill", "think-then-image", "decode"],
+)
+def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(schedule, target, think, ignore_eos, stop):
+    """The prefill's token comes before decode_loop exists, so a stop there
+    ends the partition rather than naming a loop the walk doesn't have."""
+    metadata = CurrentForwardConductorMetadata(graph_walk=schedule[0], is_prefill=True, kwargs={
+        "prefill_schedule": [(walk, object()) for walk in schedule], "prefill_step": 0,
+        "target_output": target, "think_mode": think, "requires_cfg": False,
+        "cfg_text_scale": 1.0, "cfg_img_scale": 1.0, "cfg_interval": (0.0, 1.0),
+        "cfg_renorm_type": "global", "cfg_renorm_min": 0.0, "width": 0, "height": 0, "image_preprocess": None,
+    })
+    step = _bare_model().get_partition_forward_pass_args("default", metadata, {})
+    info = CurrentForwardPassInfo(
+        request_id="r", graph_walk=step.full_metadata.graph_walk, fwd_index=0, random_seed=0, max_tokens=100,
+        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)}, step_metadata=step.step_metadata,
+    )
+    llm = SimpleNamespace(eos_token_id=4)
+    outputs = {"new_token": [torch.tensor([4])]}
+    LLMSubmodule.postprocess(llm, "r", info, outputs)
+    assert LLMSubmodule.check_stop(llm, "r", info, outputs) == stop
 
 
 def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():
@@ -572,13 +610,13 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     )
 
     broken = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     broken_again = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     healthy = manager.admit_retrieve(
-        "healthy", "LLM_cfg_text", "image_gen_cfg", healthy_publish,
+        "healthy", "LLM_cfg_text", "image_gen_cfg2", healthy_publish,
     )
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]

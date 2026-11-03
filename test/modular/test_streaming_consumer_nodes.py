@@ -13,6 +13,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, StreamingGraphEdge
+from mstar.worker.stream_buffers import consumer_nodes
 from mstar.worker.worker import Worker
 
 
@@ -71,7 +72,7 @@ def test_partition_nodes_recurse_into_loops_and_sequentials():
 
 
 def test_consumer_node_cache_finds_nested_consumers():
-    cache = Worker._build_consumer_node_cache(_connections(), _model().get_graph_walk_graphs())
+    cache = consumer_nodes(_connections(), _model().get_graph_walk_graphs())
     assert cache == {"chunk": "consumer", "codes": "codec"}
 
 

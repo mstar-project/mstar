@@ -682,7 +682,8 @@ class Cosmos3OmniTransformer(nn.Module):
             latent = latent.reshape(latent_channel, t_actual, h_patches, p, w_patches, p)
             latent = torch.einsum("cthpwq->thwpqc", latent).reshape(-1, p * p * latent_channel)
             packed_latent.append(latent)
-        return torch.cat(packed_latent, dim=0), original_latent_shapes
+        # the denoise loop keeps its latents in fp32; the projection takes them in the model dtype
+        return torch.cat(packed_latent, dim=0).to(self.proj_in.weight.dtype), original_latent_shapes
 
     def _unpatchify_and_unpack_latents(
         self,
@@ -761,6 +762,8 @@ class Cosmos3OmniTransformer(nn.Module):
         in-projection + the action modality embedding, then scatter-add the
         timestep embedding to the noisy (predicted) action tokens only. Returns
         [T, hidden]."""
+        # the denoise loop keeps its action latents in fp32; the projection takes them in the model dtype
+        action_latents = action_latents.to(self.action_proj_in.fc.weight.dtype)
         packed = self.action_proj_in(action_latents, action_domain_id)[0]  # [T, hidden]
         packed = packed + self.action_modality_embed.to(packed.dtype)
         ts = action_timesteps * self.config.timestep_scale
@@ -1294,6 +1297,44 @@ class Cosmos3OmniTransformer(nn.Module):
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
 
+    @staticmethod
+    def denoise_step_row(
+        layout: dict,
+        latents: torch.Tensor,
+        vision_timesteps: torch.Tensor,
+        rotary_cond: tuple[torch.Tensor, torch.Tensor],
+        rotary_uncond: tuple[torch.Tensor, torch.Tensor],
+        noisy_token_mask: torch.Tensor | None = None,
+        sound_latents: torch.Tensor | None = None,
+        sound_timesteps: torch.Tensor | None = None,
+    ) -> dict:
+        """One request of ``denoise_step_batched``, the only place its rows are
+        built: a change to what the step reads lands here and in every caller's
+        arguments, the startup warmup's included. ``layout`` is a request's
+        statics or a capture bucket's layout, and carries the sound band's token
+        layout when ``sound_latents`` is given. ``noisy_token_mask`` is a captured
+        graph's clean/noisy layout as data (see ``denoise_step_batched_cfg``)."""
+        row = {
+            "latents": latents,
+            "vision_timesteps": vision_timesteps,
+            "rotary_cond": rotary_cond,
+            "rotary_uncond": rotary_uncond,
+            "vision_token_shapes": layout["vision_token_shapes"],
+            "vision_noisy_frame_indexes": layout["vision_noisy_frame_indexes"],
+            "vision_mse_loss_indexes": layout["mse_gen_indexes"],
+        }
+        if noisy_token_mask is not None:
+            row["noisy_token_mask"] = noisy_token_mask
+        if sound_latents is not None:
+            row.update(
+                sound_latents=sound_latents,
+                sound_timesteps=sound_timesteps,
+                sound_token_shapes=layout["sound_token_shapes"],
+                sound_noisy_frame_indexes=layout["sound_noisy_frame_indexes"],
+                sound_mse_gen_indexes=layout["sound_mse_gen_indexes"],
+            )
+        return row
+
     def denoise_step_batched(self, requests: list[dict], label: str, attn):
         """Denoise one step for several requests at once (image / video).
 
@@ -1307,12 +1348,7 @@ class Cosmos3OmniTransformer(nn.Module):
         request order — each branch a velocity, or a ``(video, sound)`` pair for
         a request with a sound band.
 
-        Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
-        ``rotary_cond``, ``rotary_uncond`` (``(cos, sin)`` each), ``vision_token_shapes``,
-        ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``; sound-band
-        requests additionally carry ``sound_latents``, ``sound_timesteps``,
-        ``sound_token_shapes``, ``sound_noisy_frame_indexes``,
-        ``sound_mse_gen_indexes``."""
+        Each ``requests`` entry comes from ``denoise_step_row``."""
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])

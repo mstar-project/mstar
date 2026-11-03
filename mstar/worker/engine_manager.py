@@ -6,17 +6,50 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
-from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
 
+
+def _unchunkable_nodes(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
+) -> frozenset[str]:
+    """Check what a chunked walk must declare, and name the nodes this worker
+    turns chunking off for.
+
+    Reporting row lengths is the model's own declaration, so a walk that
+    chunks without ``get_input_sequence_len`` is refused anywhere. Under TP the
+    leader cuts the chunks and the followers run them off its head. Chunking
+    under SP is not supported yet; refusing there would take SP away from
+    every model that chunks, so those nodes run their prefills whole instead.
+    """
+    off = set()
+    for (node, walk), policy in model.chunking_policy_of().items():
+        submodule = submodules.get(node)
+        if submodule is None or not policy.chunkable:
+            continue
+        if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
+            raise ValueError(
+                f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
+                "report get_input_sequence_len"
+            )
+        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
+            off.add(node)
+    if off:
+        logger.warning(
+            "chunked prefill is off for %s: not supported under SP yet, so "
+            "their prefills run whole", sorted(off),
+        )
+    return frozenset(off)
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
     """A combined walk batches its walks together, so it must not split them by capture key."""
@@ -27,6 +60,16 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
                 f"{type(model).__name__}: {node!r} splits its combined walk "
                 f"{combined!r} by capture key"
             )
+
+
+def _speculates_into(node, edge, nodes: dict, submodules: dict) -> bool:
+    """Whether this worker may run ``edge``'s consumer speculatively, on the
+    step's outputs before the step's postprocess has seen them."""
+    target = nodes.get(edge.next_node)
+    return (
+        node.enable_async_scheduling and edge.next_node in submodules
+        and target is not None and target.enable_async_scheduling
+    )
 
 
 def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
@@ -41,15 +84,39 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                 continue
             spanned = submodule.spanned_outputs(walk)
             for edge in node.outputs:
-                target = nodes.get(edge.next_node)
-                if (
-                    edge.name in spanned and edge.next_node in submodules
-                    and target is not None and target.enable_async_scheduling
-                ):
+                if edge.name in spanned and _speculates_into(node, edge, nodes, submodules):
                     raise ValueError(
                         f"{type(model).__name__}: {name!r} spans {edge.name!r}, which "
                         f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
                         "set enable_async_scheduling=False on one of them"
+                    )
+
+
+def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
+    """A withheld output (``TokenStop.withhold``) is left out of the route
+    after the stop check, so it must be one the worker routes as a tensor on
+    a streaming edge (which then gets no item; any other consumer would wait
+    for one), and that no speculated step reads first. The loop-back signal
+    (``ARNodeSubmodule.device_loopback``) is sent inline or kept on the
+    device, so withholding it does nothing."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        nodes = section.get_nodes()
+        for name, node in nodes.items():
+            submodule = submodules.get(name)
+            stop = getattr(submodule, "token_stop", None)
+            if stop is None:
+                continue
+            loopback = getattr(submodule, "device_loopback", None)
+            loopback_signal = loopback.signal if loopback is not None and loopback.walk == walk else None
+            for edge in node.outputs:
+                if edge.name in stop.withhold and (
+                    not edge.is_streaming or edge.name == loopback_signal
+                    or _speculates_into(node, edge, nodes, submodules)
+                ):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} withholds {edge.name!r} in walk {walk!r}; "
+                        "only a streaming edge's output that no speculated node on this worker reads, "
+                        "and not the loop-back signal, can be withheld"
                     )
 
 
@@ -117,12 +184,11 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
-        specs = model.get_node_resources()
-        apply_yaml_overrides(specs, model_config)
+        specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
-        autocast_dtype = resolve_model_dtype(model, model_config)
+        autocast_dtype = parse_autocast_dtype(resolve_model_dtype(model, model_config))
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
@@ -156,6 +222,8 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
+        _refuse_unroutable_withholds(submodules, model)
+        no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -173,6 +241,23 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+        )
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        if not all(isinstance(flag, bool) for flag in override_mixed.values()):
+            raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
+        engine.set_chunking_policies(model.chunking_policy_of())
+        engine.set_token_budgets(
+            budgets, set(model.get_graph_walk_graphs()),
+            combined_walk_of=model.combined_walk_of(),
+            override_mixed={node for node, flag in override_mixed.items() if flag},
+            no_chunking=no_chunking,
+            min_chunk_tokens=model_config.get("min_chunk_tokens", DEFAULT_MIN_CHUNK_TOKENS),
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
@@ -203,11 +288,6 @@ class EngineManager:
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down; returns the resources it handed pages back to."""
         return self.engine.remove_request(request_id)
-
-    def evictable_nodes(self) -> list[str]:
-        """Nodes whose state can be reclaimed. The worker keeps the per-request
-        LRU timestamps it needs to pick victims among them."""
-        return [name for name in sorted(self.node_names) if self.engine.evictable(name)]
 
     def shutdown(self) -> None:
         self.engine.shutdown()
