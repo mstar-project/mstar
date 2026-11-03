@@ -276,6 +276,7 @@ def _consumer(policy):
     w.tensor_manager = SimpleNamespace(
         start_read_tensors=lambda *a, **k: [],
         get_tensor=lambda uuid: torch.tensor([uuid]),
+        clone_received=lambda tensors: [t.clone() for t in tensors],
         dereference_batch_uniform=lambda ids: None,
         store_and_return_tensor_info=lambda rid, d, **k: {
             name: [object()] for name in d
