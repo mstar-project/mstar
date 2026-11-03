@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import Rebuild, SamplerStep
+from mstar.engine.resources import Rebuild
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 
@@ -83,11 +83,7 @@ class Rebuilds:
         if not kept_ids:
             return
         name = self._policies[node].sample_output
-        step = node_batch.step
-        kept_rows = None if step is None else next(
-            (s.kept_rids for s in step.steps.values() if isinstance(s, SamplerStep)), None,
-        )
-        ctx, rebuild = node_batch.step_context, node_batch.rebuild_rids
+        ctx = node_batch.step_context
         if host_rows is not None:
             tokens = host_rows.buffers.get(name)
             if not torch.is_tensor(tokens) or tokens.dim() == 0:
@@ -110,10 +106,7 @@ class Rebuilds:
         for rid, token in pairs:
             kept = kept_ids.get(rid)
             # the host rows are the forward's, which can hold a row the worker has since taken out of the step
-            if (
-                kept is not None and ctx.is_real_row(rid) and (kept_rows is None or rid in kept_rows)
-                and rid not in rebuild and rid not in skip_rids
-            ):
+            if kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids:
                 kept.sampled.append(token)
 
     @staticmethod

@@ -45,7 +45,6 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -321,9 +320,10 @@ class ForwardPassInfoWrapper:
 
 def _runtime_rids(batch: "ExecutingBatch") -> Sequence[int]:
     """``batch.request_ids`` without the rebuild rows."""
-    if not batch.rebuild_rids:
+    rebuild = batch.step_context.rebuild_rids
+    if not rebuild:
         return batch.request_ids
-    return [rid for rid in batch.request_ids if rid not in batch.rebuild_rids]
+    return [rid for rid in batch.request_ids if rid not in rebuild]
 
 
 @dataclass
@@ -415,10 +415,6 @@ class ExecutingBatch:
     # device: such a row loops back as it would in a step of its walk alone,
     # while the step's other rows route tensors.
     loopback_rids: frozenset = frozenset()
-
-    # Rows that recompute a dropped request's KV from its token ids (`Worker._rebuild`). The graph
-    # runtime never sees them, and their samples are discarded.
-    rebuild_rids: frozenset = frozenset()
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -1753,6 +1749,7 @@ class Engine:
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
+                rebuild_rids=batch.step_context.rebuild_rids,
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
@@ -1881,9 +1878,6 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
-        if batch.rebuild_rids:
-            # a rebuild row samples again an id the request already has, and decode reads the kept one
-            discard_samples(step, rids, batch.rebuild_rids)
         if batch.chunk_ranges:
             walk_of = batch.step_context.walk_of
             ctx.chunk_tokens_after = {

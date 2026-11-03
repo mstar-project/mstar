@@ -15,8 +15,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.sampler.config import discard_samples
-from mstar.engine.resources.step import SubmoduleStep
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
@@ -100,20 +99,19 @@ def test_a_prompt_rows_ids_are_kept_once_and_its_steps_share_one_copy():
     )
 
 
-def _batch(rids, rebuild=frozenset(), kept_rids=None) -> SimpleNamespace:
-    step = SimpleNamespace(steps={"sampler": SamplerStep(kept_rids=kept_rids)})
-    return SimpleNamespace(node_name=NODE, request_ids=list(rids), rebuild_rids=rebuild, step=step,
-                           step_context=StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False))
+def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
+    ctx = StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False, rebuild_rids=rebuild)
+    return SimpleNamespace(node_name=NODE, request_ids=list(rids), step_context=ctx)
 
 
 @pytest.mark.parametrize("sampled", [[4, 5, 6], [[4], [5], [6]]])  # the sampler's [B] output, and a [B, 1] one
 def test_only_a_rows_kept_sample_is_appended(sampled):
     rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R, A, B))
-    # A's sampler throws its sample away, and B is a rebuild row
-    batch = _batch((R, A, B), rebuild=frozenset({B}), kept_rids=frozenset({R, B}))
+    # A runs a chunk short of its prompt's end, and B is a rebuild row
+    batch = _batch((R, A, B), rebuild=frozenset({B}))
 
-    rebuilds.keep_samples(batch, {}, HostRows((R, A, B), {"new_token": torch.tensor(sampled)}))
+    rebuilds.keep_samples(batch, {}, HostRows((R, A, B), {"new_token": torch.tensor(sampled)}), skip_rids={A})
     rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [torch.tensor([9])]}}, None)
 
     kept = rebuilds._kept[NODE]
@@ -162,10 +160,9 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
 
 
-def test_the_engine_keeps_no_sample_of_a_rebuild_row_whatever_the_model_declared():
+def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():
+    ctx = StepContext(request_ids=(R, A), graph_walk=PREFILL, slot=0, capture=False, rebuild_rids=frozenset({R}))
     for kept_rids in (None, frozenset({R, A})):
-        step = SubmoduleStep(segments=[], steps={"sampler": SamplerStep(kept_rids=kept_rids)})
+        kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
-        discard_samples(step, [R, A], frozenset({R}))
-
-        assert step.steps["sampler"].kept_rids == {A}, "the rebuild row's sample would overwrite decode's next input"
+        assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"

@@ -17,9 +17,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig, discard_samples
+from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import SlotLease, StepContext, SubmoduleStep
+from mstar.engine.resources.step import SlotLease, StepContext
 
 V = 64
 KEPT, DROPPED = 0, 1
@@ -171,23 +171,22 @@ def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch
         res.sample(list(pads), logits)
     res.commit(SamplerStep(), capture)
 
-    def replay(step: SubmoduleStep) -> None:
-        ctx = StepContext(request_ids=(KEPT, DROPPED), graph_walk="prefill", slot=0, capture=False, slot_lease=lease)
-        res.plan(step.steps["sampler"], ctx)
+    def replay(rebuild: frozenset = frozenset()) -> None:
+        ctx = StepContext(request_ids=(KEPT, DROPPED), graph_walk="prefill", slot=0, capture=False, slot_lease=lease,
+                          rebuild_rids=rebuild)
+        res.plan(SamplerStep(), ctx)
         logits.copy_(torch.randn(2, V, device=device))
         graph.replay()
-        res.commit(step.steps["sampler"], ctx)
+        res.commit(SamplerStep(), ctx)
         torch.cuda.synchronize()
 
     def state(rid: int) -> tuple[int, int]:
         slot = bufs._rid_to_slot[rid]
         return bufs.last_token.master[slot].item(), bufs.offset.master[slot].item()
 
-    replay(SubmoduleStep(steps={"sampler": SamplerStep()}))  # both requests decode once
+    replay()  # both requests decode once
     kept, rebuilt = state(KEPT), state(DROPPED)
-    step = SubmoduleStep(steps={"sampler": SamplerStep()})
-    discard_samples(step, [KEPT, DROPPED], frozenset({DROPPED}))  # as the engine does for a rebuild row
-    replay(step)
+    replay(frozenset({DROPPED}))
 
     assert state(KEPT)[1] > kept[1], "the step never drew for its kept row"
     assert state(DROPPED) == rebuilt, "the rebuild row's sample overwrote the token or offset decode reads next"

@@ -234,8 +234,8 @@ def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sampl
     _write(kv, "r", 20, 1)
     kv.drop("r")
     kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(20), 100, 101])))
-    batch = ExecutingBatch(node_name=NODE, per_request_info={}, rebuild_rids=frozenset({"r"}),
-                           step_context=StepContext(request_ids=("r", "a"), graph_walk=WALK, slot=0, capture=False))
+    ctx = StepContext(request_ids=("r", "a"), graph_walk=WALK, slot=0, capture=False, rebuild_rids=frozenset({"r"}))
+    batch = ExecutingBatch(node_name=NODE, per_request_info={}, step_context=ctx)
 
     rows = HostRows(("r", "a"), {"text_inputs": torch.tensor([[7], [8]])})
     Engine.extend_prefix_chains(SimpleNamespace(_runner=StepRunner({"kv": kv})), batch, {}, host_rows=rows)

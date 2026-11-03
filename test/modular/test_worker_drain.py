@@ -257,7 +257,8 @@ def test_draining_and_pending_removal_rids_are_not_published():
     w._pending_removes["pending"] = None
     w.scheduler.failed_rids.add("failed")
     batch = SimpleNamespace(
-        request_ids=["healthy", "draining", "pending", "failed"], rebuild_rids=frozenset(),
+        request_ids=["healthy", "draining", "pending", "failed"],
+        step_context=SimpleNamespace(rebuild_rids=frozenset()),
         per_request_info={
             rid: SimpleNamespace(request_id=rid)
             for rid in ("healthy", "draining", "pending", "failed")

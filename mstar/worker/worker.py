@@ -1888,7 +1888,7 @@ class Worker:
         )
         self._rebuilds.keep_prompts(batch.node_name, batch.graph_walk, batch.request_walks, per_request_inputs)
         if rebuild:
-            node_batch.rebuild_rids = frozenset(rebuild)
+            node_batch.step_context.rebuild_rids = frozenset(rebuild)
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
@@ -2554,7 +2554,7 @@ class Worker:
                 batch.discard_rid(rid)
 
         reason = node_batch.admit_error
-        if node_batch.rebuild_rids and self._handle_rebuild_refusal(batch, node_batch, reason):
+        if node_batch.step_context.rebuild_rids and self._handle_rebuild_refusal(batch, node_batch, reason):
             return
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
@@ -2578,7 +2578,7 @@ class Worker:
         ``AllocationFailed``, or fails its request when the refusal is terminal, and the step's other rows
         go back to their queues untouched. A row whose `prepare_inputs` failed has left the step, and the
         main loop fails its request."""
-        prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
+        prepared = node_batch.step_context.rebuild_rids & set(node_batch.request_ids)
         for rid in prepared:
             self.scheduler.queue_rebuild(rid, batch.rebuild_rows[rid])
         named = {getattr(reason, "request_id", None), *getattr(reason, "request_ids", ())} & prepared
@@ -2755,7 +2755,7 @@ class Worker:
             rid for rid in batch.request_ids
             if (info := batch.per_request_info.get(rid)) is not None
             if rid not in self._pending_removes
-            and rid not in batch.rebuild_rids
+            and rid not in batch.step_context.rebuild_rids
             and rid not in self.scheduler.failed_rids
             and info.request_id not in self._pending_drains
             and info.request_id not in self._draining_rids
@@ -3805,10 +3805,10 @@ class Worker:
 
     def _land_rebuilds(self, node_batch: ExecutingBatch) -> None:
         """For each rebuild row that ran in the step, make its request resident again."""
-        if not node_batch.rebuild_rids:
+        if not node_batch.step_context.rebuild_rids:
             return
         engine = self.engine_manager.get_engine(node_batch.node_name)
-        for rid in node_batch.rebuild_rids & set(node_batch.request_ids):
+        for rid in node_batch.step_context.rebuild_rids & set(node_batch.request_ids):
             engine.land_rebuild(node_batch.node_name, rid)
 
     def _runtime_stop_column(
@@ -5054,10 +5054,10 @@ class Worker:
             nonlocal pending
             pending = p
             self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
-            if p is not None and p.node_batch.rebuild_rids:
+            if p is not None and p.node_batch.step_context.rebuild_rids:
                 # a REMOVE waits for the step instead of freeing pages under it
-                self._in_flight_rids |= p.node_batch.rebuild_rids
-                self.scheduler.take_rebuilds(p.node_batch.rebuild_rids)
+                self._in_flight_rids |= p.node_batch.step_context.rebuild_rids
+                self.scheduler.take_rebuilds(p.node_batch.step_context.rebuild_rids)
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can
@@ -5306,7 +5306,7 @@ class Worker:
                         laps.lap("settle_speculation")
 
                         # a yield-away to rebuild rows alone has no graph row, and runs all the same
-                        if spec_batch.request_to_worker_graph or spec_node_batch.rebuild_rids:
+                        if spec_batch.request_to_worker_graph or spec_node_batch.step_context.rebuild_rids:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
@@ -5386,7 +5386,8 @@ class Worker:
                     # are safe to apply now.
                     laps.lap("step_done")
                     in_flight = (
-                        set(spec_pending.batch.request_to_worker_graph) | spec_pending.node_batch.rebuild_rids
+                        set(spec_pending.batch.request_to_worker_graph)
+                        | spec_pending.node_batch.step_context.rebuild_rids
                         if spec_pending else set()
                     )
                     self._apply_pending_removes_safe_to_drop(in_flight)

@@ -162,7 +162,7 @@ def test_a_request_is_rebuilt_only_once_per_drop(state):
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
     w, eng, batch, node_batch = _rebuilding()
-    assert node_batch.rebuild_rids == {R} and node_batch.per_request_info[R].graph_walk == PREFILL
+    assert node_batch.step_context.rebuild_rids == {R} and node_batch.per_request_info[R].graph_walk == PREFILL
     assert node_batch.per_request_input_tensors[R]["text_inputs"][0].tolist() == [1, 2, 3]
 
     w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
@@ -203,7 +203,7 @@ def test_the_run_loop_takes_a_rebuild_row_once_its_step_goes_out_and_a_remove_wa
         if len(calls) == 1:
             raise RuntimeError("the step's inputs failed")  # before `_set_pending`, so the row must stay queued
         node_batch = build(batch)
-        node_batch.rebuild_rids = frozenset(batch.rebuild_rows)
+        node_batch.step_context.rebuild_rids = frozenset(batch.rebuild_rows)
         return node_batch
 
     w._build_executing_batch = build_after_one_raise
@@ -229,7 +229,7 @@ def test_a_yield_away_to_rebuild_rows_alone_runs_them(monkeypatch):
             return None, None
         batch = ScheduledBatch(NODE, "rebuild", rebuild_rows={R: RebuildRow(NODE, "rebuild", {})})
         node_batch = w._build_executing_batch(batch)
-        node_batch.rebuild_rids = frozenset(batch.rebuild_rows)
+        node_batch.step_context.rebuild_rids = frozenset(batch.rebuild_rows)
         built.append(batch)
         return Speculation(scheduled_batch=batch, node_batch=node_batch, consumed_edges=set(), continuing_rids=set(),
                            partition="p", is_new_iter=False, is_same_node=False, is_yield_away=True), None
@@ -260,9 +260,10 @@ def test_a_step_that_raises_fails_its_rebuild_rows_with_its_other_rows(where):
 def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(reason, outcome):
     w, _, batch, node_batch = _rebuilding(fresh={A: 0})
     node_batch.admit_error = reason
-    node_batch.rebuild_rids |= {11}  # a second rebuild row, which left the step when its prepare_inputs raised
+    # a second rebuild row, which left the step when its prepare_inputs raised
+    node_batch.step_context.rebuild_rids |= {11}
     w._handle_allocation_failure = lambda *a: w.held.append("base")
-    w.scheduler.take_rebuilds(node_batch.rebuild_rids)  # as the step's launch does, before its admit
+    w.scheduler.take_rebuilds(node_batch.step_context.rebuild_rids)  # as the step's launch does, before its admit
 
     w._handle_admit_failure(batch, node_batch)
 
@@ -275,9 +276,9 @@ def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(rea
 
 def _step(rids=(R, A), walk=PREFILL, node=NODE, rebuild=R, **fields) -> ExecutingBatch:
     """A step of ``rids``, where the row ``rebuild`` only recomputes KV."""
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, rebuild_rids=frozenset({rebuild}))
     return ExecutingBatch(node_name=node, per_request_info={rid: SimpleNamespace(rid=rid) for rid in rids},
-                          rebuild_rids=frozenset({rebuild}), **fields,
-                          step_context=StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False))
+                          step_context=ctx, **fields)
 
 
 @pytest.mark.parametrize("batched", [True, False])

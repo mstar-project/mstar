@@ -127,6 +127,9 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
