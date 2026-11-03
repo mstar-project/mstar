@@ -43,7 +43,7 @@ case "$job" in
     rust)
         python -m pip install maturin
         # pyyaml: runtime tests import mstar.model.base.
-        python -m pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml
+        python -m pip install pytest==9.2.0 msgpack numpy pyyaml
         # The tensor-transport stack imports torch and Triton. Preserve this
         # job's existing unpinned versions and minimal mstar installation.
         python -m pip install torch --index-url https://download.pytorch.org/whl/cpu

@@ -172,6 +172,12 @@ ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
 
+# Denoise state (initial noise, latents between steps, the guidance combine and
+# the scheduler step) is fp32 for image, video, sound and action requests, as
+# diffusers' pipeline keeps it; only the transformer input is bf16. Windowed
+# rollouts keep their latents in the model dtype.
+LATENT_DTYPE = torch.float32
+
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
 REASONER_DECODE_LOOP = "reasoner_decode_loop"
@@ -300,6 +306,13 @@ def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
     import numpy as np
 
     return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1]
+
+
+def _guided(cond_v: torch.Tensor, uncond_v: torch.Tensor, gs: float, dtype: torch.dtype) -> torch.Tensor:
+    """Classifier-free guidance combine in the loop-state dtype."""
+    cond_v = cond_v.to(dtype)
+    uncond_v = uncond_v.to(dtype)
+    return uncond_v + gs * (cond_v - uncond_v)
 
 
 @dataclass(frozen=True)
@@ -669,12 +682,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _build_action_static(
         self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int,
-        mode: str, fps: float, action_fps: float, action_offset: int, device,
+        mode: str, fps: float, action_fps: float, action_offset: int, device, state_rows: int = 0,
     ) -> dict:
         latent_shape = self._latent_shape(height, width, num_frames)
         static = build_action_static_inputs(
             list(ids), latent_shape, action_chunk, mode,
             self.config, self.config.vae.scale_factor_temporal, fps, action_fps, action_offset, device,
+            state_rows=state_rows,
         )
         assert static["num_vision_tokens"] == latent_shape[2] * frame_tokens(height, width, self.config), (
             f"packing made {static['num_vision_tokens']} vision tokens of {latent_shape}, "
@@ -1195,7 +1209,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self, fwd_info, md, inputs, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
     ) -> ARNodeInputs:
         mode = md["action_mode"]
-        action_chunk = int(md["action_chunk_size"])
+        # The action band: the chunk the reply carries, behind a policy
+        # request's robot_state token (clean, at video frame 0).
+        state_rows = int(md.get("action_state_rows", 0))
+        action_chunk = int(md["action_chunk_size"]) + state_rows
         num_frames = int(md.get("num_frames") or action_chunk + 1)
         raw_action_dim = int(md["raw_action_dim"])
         domain_id = int(md.get("domain_id", 0))
@@ -1203,12 +1220,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_offset = action_start_frame_offset(action_chunk, num_frames)
 
         cond = self._build_action_static(
-            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+            state_rows,
         )
         uncond = None
         if uncond_ids is not None:
             uncond = self._build_action_static(
-                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+                state_rows,
             )
 
         latent_shape = self._latent_shape(height, width, num_frames)
@@ -1221,6 +1240,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_clean = torch.zeros((1, action_chunk, 1), device=device, dtype=dtype)
         if mode == "forward_dynamics":
             action_clean[:] = 1.0
+        elif state_rows:
+            action_clean[:, :state_rows] = 1.0
 
         # The visual conditioning (inverse-dynamics: the whole observed video;
         # forward-dynamics / policy: the conditioning frame) is VAE-encoded by
@@ -1229,7 +1250,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # latent frames are kept clean from it.
 
         # Forward-dynamics conditions on a clean action chunk supplied with the
-        # request; the other modes predict the action (clean values are zero).
+        # request, and a policy request's robot_state (in the policy's
+        # convention, see Cosmos3Model._action_prompt_output) is the band's
+        # first row. Everything else is predicted (clean values are zero).
         clean_action = torch.zeros((1, action_chunk, action_dim), device=device, dtype=dtype)
         action_inputs = (inputs or {}).get("action_inputs")
         raw_act = action_inputs[0] if action_inputs else None
@@ -1242,6 +1265,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             elif act.shape[0] > action_chunk:
                 act = act[:action_chunk]
             clean_action[:, :, :raw_action_dim] = act[:, :raw_action_dim]
+        elif state_rows and raw_act is not None:
+            act = torch.as_tensor(raw_act, device=device, dtype=dtype).reshape(state_rows, -1)
+            clean_action[:, :state_rows, :raw_action_dim] = act[:, :raw_action_dim]
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
@@ -1249,6 +1275,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond=cond,
             uncond=uncond,
             gs=gs,
+            guidance_interval=md.get("guidance_interval"),
             scheduler=self._new_scheduler(
                 steps, device, flow_shift=md.get("flow_shift"),
                 use_karras_sigma=md.get("use_karras_sigma")
@@ -1279,7 +1306,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # seeded windowed request is deterministic end to end.
                 st.add("ar_generator", gen)
             latents = torch.randn(
-                st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
+                st["latent_shape"], generator=gen, device=device,
+                dtype=self.transformer.proj_in.weight.dtype if windowed else LATENT_DTYPE,
             )
             cond_latents = st.get("cond_latents")
             if cond_latents is not None:
@@ -1373,8 +1401,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # First iteration: video noise first, then sound noise from the same
             # generator (the reference pipeline's RNG order), so the video band
             # of a sound request is bit-identical to the same-seed video-only
-            # request.
-            dtype = self.transformer.proj_in.weight.dtype
+            # request. Both in the fp32 loop dtype, as the video-only path draws.
+            dtype = LATENT_DTYPE
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             latents = torch.randn(st["latent_shape"], generator=gen, device=device, dtype=dtype)
             cond_latents = st.get("cond_latents")
@@ -1414,7 +1442,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # the video noise to match the fused pipeline's RNG order.
             from diffusers.utils.torch_utils import randn_tensor
 
-            dtype = self.transformer.proj_in.weight.dtype
+            dtype = LATENT_DTYPE
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             chunk, adim, raw = st["action_chunk"], st["action_dim"], st["raw_action_dim"]
             a_noise = randn_tensor((1, chunk, adim), generator=gen, device=device, dtype=dtype)
@@ -1534,11 +1562,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
-            # batched forward always applies guidance when the branch exists,
-            # so the interval does not narrow the batched declaration.
-            labels = (
-                (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
-            )
+            # image and sound batched forwards apply guidance whenever the
+            # branch exists. The action one runs the conditional branch alone
+            # when no row is inside its guidance interval, as a single request
+            # does (rows outside it in a guided batch drop the other branch).
+            cfg = infos[0].cfg and (graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos))
+            labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return self._gen_step(
                 request_ids, spans, labels, combined=True, attn_key=attn_key,
             )
@@ -1671,11 +1700,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run in the model's native bf16, NOT the engine autocast: autocast keeps
-    # norms in fp32, perturbing the velocity ~1 ULP/step — harmless for one
-    # image step but amplified geometrically over the multi-step video denoise.
-    # The reference pipeline runs pure bf16; parity requires matching it.
-    @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
         present, else the submodule's own store (paths that build their own
@@ -1694,6 +1718,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         resources = engine_inputs.resources or self.node_resources
         return resources[key]
 
+    # Run the transformer in the model's native bf16, NOT the engine autocast:
+    # autocast keeps norms in fp32, perturbing the velocity ~1 ULP/step, which
+    # the multi-step denoise amplifies, and it would run the fp32 scheduler
+    # step's einsum in bf16. The reference runs the transformer in pure bf16
+    # and the loop state around it in fp32 (LATENT_DTYPE).
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, **kwargs):
         rid = engine_inputs.request_ids[0]
         if graph_walk in PREFILL_WALKS:
@@ -1735,12 +1765,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _cfg_active(self, st, step_index: int) -> bool:
         """Whether this eager denoise step runs classifier-free guidance (both
         branches combined). False ⇒ the conditional branch runs alone — the
-        guidance_scale==1 case and, for the t2i recipe, steps whose timestep
-        falls outside the guidance_interval [lo, hi].
+        guidance_scale==1 case and steps whose timestep falls outside the
+        guidance_interval [lo, hi] (the t2i recipe's default, or the request's).
 
-        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen``
-        call this for the same step, so the declared attention (batched vs
-        cond-only) matches the forward that runs.
+        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen`` /
+        ``_forward_action_gen`` call this for the same step, so the declared
+        attention (batched vs cond-only) matches the forward that runs.
 
         The captured path does not consult it at all: its graph is fixed at
         both branches and ``postprocess`` combines unconditionally, so an
@@ -1786,7 +1816,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
-            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
+            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL).to(latents.dtype)
         elif self.batched_cfg:
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents,
@@ -1799,11 +1829,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 CFG_BATCHED_LABEL,
                 attn,
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
         else:
             cond_v = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
             uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
 
         new_latents, solver = self._scheduler_step(st, velocity, latents, step_index, solver)
         if st.get("vmask") is not None:
@@ -1837,7 +1867,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         multistep history (the flow update is linear per element), then split
         back. Every sound frame is noisy, so no clean re-injection is needed on
         the sound band; the video band's i2v anchor stays clean because its
-        predicted velocity is zero (as in the video-only path)."""
+        predicted velocity is zero (as in the video-only path). The step runs in
+        the latents' dtype, like the reference's fp32 step."""
+        video_v, sound_v = video_v.to(latents.dtype), sound_v.to(sound_latents.dtype)
         nv = video_v.numel()
         packed_next, solver = st["scheduler"].step(
             self._packed(video_v, sound_v), self._packed(latents, sound_latents), step_index, solver,
@@ -1874,8 +1906,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["cond"]["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], sound_latents.dtype)
         else:
             cond_v, s_c = self.transformer.denoise_step(
                 latents, vts, st["cond"]["rotary"],
@@ -1889,8 +1921,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["uncond"]["mse_gen_indexes"], UNCOND_LABEL, attn,
                 **self._sound_kwargs(st["uncond"], sound_latents, sts),
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], sound_latents.dtype)
 
         new_latents, new_sound, solver = self._sound_scheduler_step(
             st, latents, sound_latents, velocity, sound_v, step_index, solver,
@@ -1926,10 +1958,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         scheduler over the packed [video | action] state, then re-inject the clean
         conditioning anchors (conditioning frames / action stay clean each step,
         their masked-in values invariant). Shared by the single-request and
-        cross-request batched action forwards."""
+        cross-request batched action forwards. The step runs in the latents'
+        dtype, like the reference's fp32 step."""
         raw, chunk, adim = st["raw_action_dim"], st["action_chunk"], st["action_dim"]
-        video_v = video_v * (1.0 - st["vmask"])
-        action_v = action_v * (1.0 - st["action_clean_mask"])
+        video_v = video_v.to(latents.dtype) * (1.0 - st["vmask"])
+        action_v = action_v.to(action_latents.dtype) * (1.0 - st["action_clean_mask"])
         action_v[..., raw:] = 0
         nv = video_v.numel()
         packed_next, solver = st["scheduler"].step(
@@ -1957,7 +1990,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ats = torch.full((st["cond"]["num_noisy_action_tokens"],), t, device=device)
         domain = st["domain_t"]
 
-        if st["uncond"] is None:
+        if not self._cfg_active(st, step_index):
             video_v, action_v = self._denoise_action(
                 attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
             )
@@ -1979,8 +2012,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 action_timesteps=ats,
                 action_domain_id=domain,
             )
-            video_v = v_u + st["gs"] * (video_v - v_u)
-            action_v = a_u + st["gs"] * (action_v - a_u)
+            video_v = _guided(video_v, v_u, st["gs"], latents.dtype)
+            action_v = _guided(action_v, a_u, st["gs"], action_latents.dtype)
         else:
             video_v, action_v = self._denoise_action(
                 attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
@@ -1988,8 +2021,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             v_u, a_u = self._denoise_action(
                 attn, st["uncond"], latents, action_latents, vts, ats, domain, UNCOND_LABEL
             )
-            video_v = v_u + st["gs"] * (video_v - v_u)
-            action_v = a_u + st["gs"] * (action_v - a_u)
+            video_v = _guided(video_v, v_u, st["gs"], latents.dtype)
+            action_v = _guided(action_v, a_u, st["gs"], action_latents.dtype)
 
         new_latents, new_action, solver = self._action_scheduler_step(
             st, latents, action_latents, video_v, action_v, step_index, solver,
@@ -2024,6 +2057,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # window boundaries — but a kv commit iteration is a different
             # step (an append) and drops the batch to the sequential path.
             if not all(st["uncond"] is not None for st in sts):
+                return False
+            cap = self.config.max_batched_vision_tokens
+            if (
+                cap is not None
+                and batch.graph_walk not in PREFILL_WALKS
+                and sum(st["cond"]["num_vision_tokens"] for st in sts) > cap
+            ):
                 return False
             if batch.graph_walk not in GEN_WALKS:
                 # Windowed requests join only generation-loop batches; their
@@ -2099,7 +2139,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, k, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
             solver = {name: kwargs[name][rid] for name in self._solver_state}
             new_latents, solver = self._scheduler_step(st, velocity, lat, local, solver)
             if st.get("vmask") is not None:
@@ -2152,8 +2192,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, snd, k), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
             solver = {name: solvers[name][rid] for name in self._solver_state}
             new_latents, new_sound, solver = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, k, solver)
             if st.get("vmask") is not None:
@@ -2168,11 +2208,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step."""
+        branches (when present) and apply its own joint scheduler step. When no
+        row is inside its guidance interval the batch runs the conditional
+        branch alone, as ``declare_step`` planned it."""
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
-        with_cfg = states[rids[0]]["uncond"] is not None
+        with_cfg = states[rids[0]]["uncond"] is not None and any(
+            self._cfg_active(states[rid], _loop_step(engine_inputs.per_request_info[rid], graph_walk))
+            for rid in rids
+        )
         reqs, meta = [], []
         for rid in rids:
             st = states[rid]
@@ -2211,12 +2256,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
-            if with_cfg:
-                (cond_video, cond_action), (uncond_video, uncond_action) = branches
-                video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
-                action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
-            else:
-                (video_v, action_v), = branches
+            video_v, action_v = branches[0]
+            # The batch runs both branches, but a step outside the request's
+            # guidance_interval keeps the conditional one, as the single path does.
+            if with_cfg and self._cfg_active(st, k):
+                uncond_video, uncond_action = branches[1]
+                video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
+                action_v = _guided(action_v, uncond_action, st["gs"], act.dtype)
             solver = {name: solvers[name][rid] for name in self._solver_state}
             new_latents, new_action, solver = self._action_scheduler_step(st, lat, act, video_v, action_v, k, solver)
             out[rid] = {"latents": [new_latents], "action_latents": [new_action], **self._solver_edges(solver)}
@@ -2259,7 +2305,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             capture_batch_sizes = [int(x) for x in bs_env.split(",")]
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
-        dtype = self.transformer.proj_in.weight.dtype
+        # the static latents buffer holds the fp32 loop state; windowed bf16
+        # latents copy into it exactly
+        dtype = LATENT_DTYPE
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         # The capture is bit-faithful at every resolution (the rotary tables
@@ -2491,10 +2539,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if request_info.graph_walk not in GEN_WALKS or "cond_v" not in outputs:
             return
         st = self.request_states[request_id]
-        velocity = outputs["uncond_v"][0] + st["gs"] * (
-            outputs["cond_v"][0] - outputs["uncond_v"][0]
-        )
         latents = inputs.tensor_inputs["latents"]
+        velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
         solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
         outputs.clear()
         # step_index is in range here: prepare_inputs vetoes the loop's extra
@@ -2571,10 +2617,10 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
 
     def __init__(self, vae, config):
         super().__init__()
-        # Dedicated fp32 instance (not shared with the decoder node): encode
-        # runs fp32 everywhere (reference behavior; TF32 is the fast conv3d
-        # path pre-9.16 cuDNN) while the decode dtype is cuDNN-gated — sharing
-        # would re-cast the full VAE weights every encode/decode interleave.
+        # Dedicated instance (not shared with the decoder node): the encode
+        # runs in this VAE's own dtype (bf16, see Cosmos3Model._build_encode_vae)
+        # while the decode dtype is cuDNN-gated, and sharing would re-cast the
+        # full VAE weights every encode/decode interleave.
         self.vae = vae
         self.config = config
         self._video_processor = None
@@ -2673,15 +2719,15 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
         vae = self.vae
-        # The engine may cast the submodule; re-assert the fp32 encode weights.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
+        # In the VAE's own dtype, like the reference pipeline's encode and latent
+        # normalization: bf16 as built and as the engine casts this node. An
+        # fp32 encode moves the anchor latent enough to move the whole i2v
+        # trajectory.
+        dtype = next(vae.parameters()).dtype
         device = vision.device
-        mean, inv_std = _latent_affine(vae, torch.float32, device)
-        # fp32 outside autocast; pipeline-side latent normalization; the DiT
-        # consumes the latents in its bf16 checkpoint dtype.
+        mean, inv_std = _latent_affine(vae, dtype, device)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision).latent_dist.mode()
+            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
@@ -2769,10 +2815,11 @@ class ChainedWindowHead:
     decode the ``vae_decoder`` node runs (compiled, channels-last, the
     cuDNN-gated dtype, the frames quantized as served), behind
     ``chained_head_context_latents`` latents of the same window so the causal
-    decoder is warm at the kept frames; the encode runs fp32 like the encoder
-    node's. Both VAEs are the model's shared copies when the nodes share a
-    process. Held outside the module tree, so the engine's casts of the DiT
-    never reach them.
+    decoder is warm at the kept frames; the encode runs in the encode VAE's
+    own dtype (bf16), as the encoder node's and the reference's
+    video-to-video encode do. Both VAEs are the model's shared copies when
+    the nodes share a process. Held outside the module tree, so the engine's
+    casts of the DiT never reach them.
     """
 
     def __init__(self, decode_vae, encode_vae, config):
@@ -2787,11 +2834,11 @@ class ChainedWindowHead:
         frames = 1 + (units - 1) * self.config.vae.scale_factor_temporal
         pixels = self.decoder._decode_pixels(z)[:, :, -frames:]
         vae = self.encode_vae
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        mean, inv_std = _latent_affine(vae, torch.float32, z.device)
+        # read, never re-cast: the instance is the encoder node's when they share a process
+        dtype = next(vae.parameters()).dtype
+        mean, inv_std = _latent_affine(vae, dtype, z.device)
         with torch.autocast(device_type=z.device.type, enabled=False):
-            raw_mu = vae.encode(pixels.to(torch.float32) / 127.5 - 1).latent_dist.mode()
+            raw_mu = vae.encode((pixels.to(torch.float32) / 127.5 - 1).to(dtype)).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(window_latents.dtype)
 
 
@@ -2883,7 +2930,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
         # at higher resolutions. Contiguous whatever layout the decoder ended in.
-        return (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).contiguous()
+        # fp32 and rounded like diffusers' postprocess (bf16 math and truncation cost ~1 LSB)
+        return (decoded.float() / 2 + 0.5).clamp(0, 1).mul(255).round().to(torch.uint8).contiguous()
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""

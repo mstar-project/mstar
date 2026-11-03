@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.graph.runtime.base import SpeculationOutput
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.worker import SpeculationTarget, Worker
@@ -34,7 +35,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
         failed_rids=set(),
         backlog_splits_from=lambda *_: False,
         # an uncapped target: the chain keeps every row it brings
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
             taken=list(continuing), continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
@@ -42,7 +43,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
         _check_ready=lambda node, rid, info: rid != 2,
     )
     worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: 0, get_fwd_info=lambda rid, p: None)
-    target = SpeculationTarget(SimpleNamespace(node_name="decoder", graph_walk="walk"), [1, 2, 3])
+    target = SpeculationTarget(SpeculationOutput(node_name="decoder", graph_walk="walk"), [1, 2, 3])
 
     batch = ScheduledBatch(node_name="audio_encoder", graph_walk="walk")
     worker._try_speculate_next(SimpleNamespace(batch=batch), target)
