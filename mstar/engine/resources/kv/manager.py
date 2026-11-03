@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
+
 class RoomMark(NamedTuple):
     """A request `reserve` couldn't fit, and what it was measured against: the room, and the pages the
     index had filed and requests had taken out of the evictable set."""
