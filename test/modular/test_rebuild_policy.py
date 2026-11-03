@@ -180,13 +180,17 @@ def _rebuilds(pool_bytes: int = 1 << 10) -> Rebuilds:
 def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNamespace:
     """A step of ``walk`` that read ``inputs``, run on the host."""
     ctx = SimpleNamespace(graph_walk=walk, request_walks=request_walks or {})
-    return SimpleNamespace(node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, completion_event=None)
+    infos = {rid: SimpleNamespace(step_metadata={"is_prefill": True}) for rid in inputs}
+    return SimpleNamespace(
+        node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, per_request_info=infos,
+        completion_event=None,
+    )
 
 
 def _kept(prompt, *sampled: int) -> KeptIds:
     """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled))
+    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -294,7 +298,7 @@ def test_a_step_of_no_copied_walk_copies_nothing_and_reads_no_row():
     assert rebuilds._kept[NODE][R].copies.inputs is None, "a decode step would be taken for the image's step"
 
 
-def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_its_step_metadata():
+def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids():
     rebuilds = _copying(R, A)
     rebuilds._kept[NODE][B] = _kept([1])
     step = _vision_step((R, A, B), {A: DECODE}, completion_event=None)
@@ -306,8 +310,6 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_
     assert list(copies.inputs) == ["embeds"] and copies.inputs["embeds"][0].tolist() == [R, R], (
         "a rebuild would need the encoder to run again"
     )
-    assert copies.step_metadata == {"prefill_order": (R,)}, "the rebuild row would run under decode's metadata"
-    assert copies.step_metadata is not step.per_request_info[R].step_metadata, "a later step could rewrite the copy"
     assert copies.ready(), "the request could never be dropped"
     assert rebuilds._kept[NODE][A].copies.inputs is None, "a row of another walk would stand in for the prefill"
 
@@ -398,7 +400,7 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     waited. It runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
-    copies = HostCopies({"embeds": [torch.ones(6, 2)]}, {"prefill_order": ("text", "image", "text")})
+    copies = HostCopies({"embeds": [torch.ones(6, 2)]})
     rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, copies=copies), lengths=(3, 2))
 
     rebuilds.start(R, NODE, None)
@@ -412,8 +414,10 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
-    copies = HostCopies({"embeds": [embeds]}, metadata)
-    rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, 7, copies=copies), lengths=(3, 2))
+    copies = HostCopies({"embeds": [embeds]})
+    rebuilds._kept[NODE][R] = replace(
+        _media([1, 2, 3, 4, 5], 6, 7, copies=copies), lengths=(3, 2), step_metadata=metadata,
+    )
 
     rebuild = rebuilds.start(R, NODE, None)
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
@@ -531,7 +535,7 @@ def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
     prompt = torch.tensor([1, 2], dtype=torch.int32)
     copying = HostCopy(prompt, SimpleNamespace(query=lambda: False))
-    rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, torch.long, array("i", [5]))
+    rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, torch.long, array("i", [5]), {})
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"

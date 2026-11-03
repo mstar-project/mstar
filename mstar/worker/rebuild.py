@@ -37,11 +37,10 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 @dataclass(slots=True)
 class HostCopies:
-    """Host copies of what a request's prefill walk read besides its ids, and of that row's step metadata, for
-    the request's rebuild row. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
-    started, and ``landed`` is recorded after the last copy that has, None where the copies run in place."""
+    """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row. Empty
+    until the row's step has run. ``queued`` counts the tensors whose copy hasn't started, and ``landed`` is
+    recorded after the last copy that has, None where the copies run in place."""
     inputs: NameToTensorList | None = None
-    step_metadata: dict | None = None
     queued: int = 0
     landed: torch.Event | None = None
 
@@ -52,12 +51,14 @@ class HostCopies:
 @dataclass(slots=True)
 class KeptIds:
     """A request's ids on one node: its prompt copied to the host as int32, the ``walk`` it prefilled in and the
-    dtype that walk read it in, and each id sampled since. ``lengths`` splits the prompt into the tensors the walk
-    read, and is None for one tensor. A walk that read more than the ids has its other inputs in ``copies``."""
+    dtype that walk read it in, each id sampled since, and the prefill row's step metadata, which its rebuild row
+    runs under. ``lengths`` splits the prompt into the tensors the walk read, and is None for one tensor. A walk
+    that read more than the ids has its other inputs in ``copies``."""
     prompt: HostCopy
     walk: str
     dtype: torch.dtype
     sampled: array
+    step_metadata: dict
     lengths: tuple[int, ...] | None = None
     copies: HostCopies | None = None
 
@@ -82,9 +83,9 @@ class RebuildCursor:
     """A rebuild under way: the walk its rows run, the tokens it writes (``total``) of an input ``length`` long,
     and the end of its chunks that have landed, 0 before the first.
 
-    A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and writes every id but
-    the last, which the next decode step reads. A rebuild from host copies also reads ``copies`` and runs under
-    their step metadata. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut
+    A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and any host ``copies``,
+    runs under its prefill's ``step_metadata``, and writes every id but the last, which the next decode step
+    reads. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut
     from the input the engine keeps for the prompt, up to where the prompt stood."""
     walk: str
     total: int
@@ -93,6 +94,7 @@ class RebuildCursor:
     dtype: torch.dtype | None = None
     lengths: tuple[int, ...] | None = None
     copies: HostCopies | None = None
+    step_metadata: dict | None = None
     done: int = 0
 
     @property
@@ -266,15 +268,15 @@ class Rebuilds:
             copy = self._pool.copy_out(prompt, droppable[rid], node_batch.completion_event, torch.int32)
             copies = bool(self._copied[node_batch.node_name][row_walk])
             kept[rid] = KeptIds(
-                copy, row_walk, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies() if copies else None,
+                copy, row_walk, prompt.dtype, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
+                tuple(map(len, tensors)) if len(tensors) > 1 else None, HostCopies() if copies else None,
             )
             if not copies:
                 self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
         """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
-        request's slice after the ids, and keep its step metadata. A request whose copies don't fit its slice,
+        request's slice after the ids. A request whose copies don't fit its slice,
         which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
         node = node_batch.node_name
         copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
@@ -309,7 +311,6 @@ class Rebuilds:
                 self._queued.append(QueuedCopy(src, into, node_batch.completion_event, kept.copies))
                 kept.copies.queued += 1
                 used += aligned(tensor.nbytes)
-            kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
             self._trim(node, rid, used)
 
     def flush(self) -> None:
@@ -427,7 +428,9 @@ class Rebuilds:
         kept = self._kept[node][rid]
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        cursor = RebuildCursor(kept.walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths, kept.copies)
+        cursor = RebuildCursor(
+            kept.walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
+        )
         self._cursors[(node, rid)] = cursor
         return Rebuild(cursor.walk, ids)
 
@@ -444,20 +447,19 @@ class Rebuilds:
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
     ) -> list[torch.Event]:
-        """Give each rebuild row of ``rids`` its walk, and its kept ids and host copies on the device when it runs
-        its first chunk or runs whole, and return the events the step waits on before it reads the copies. The ids
+        """Give each rebuild row of ``rids`` its walk, a row from kept ids its prefill's step metadata, and its kept
+        ids and host copies on the device when it runs its first chunk or runs whole, and return the events the step
+        waits on before it reads the copies. The ids
         are split as its prefill row read them, with the ids sampled since appended to the last tensor. A later
         chunk is cut from the input the engine prepared on the first, and every chunk of a prompt's rebuild from
         the input the engine keeps for the prompt."""
         ids_input, ready = self._policies[node].ids_input, []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
-            info = infos[rid]
             copies = cursor.copies
-            infos[rid] = replace(
-                info, graph_walk=cursor.walk,
-                step_metadata=info.step_metadata if copies is None else copies.step_metadata,
-            )
+            infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
+            if cursor.ids is not None:
+                infos[rid] = replace(infos[rid], step_metadata=cursor.step_metadata)
             chunk = chunk_ranges.get(rid)
             if cursor.ids is not None and (chunk is None or chunk.is_first):
                 ids = to_device_nonblocking(_row_ids(cursor).to(cursor.dtype), self._pool.device)

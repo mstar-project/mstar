@@ -52,7 +52,7 @@ def _graphs() -> dict:
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled))
+    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
 
 
 def _cleanup(node, rids, wgs):
@@ -203,12 +203,10 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     )
 
 
-def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
+def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
     w, _ = _worker()
     w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
-    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(
-        PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, copies=HostCopies({}, {}),
-    )
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, step_metadata={})
 
     node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})))
 
