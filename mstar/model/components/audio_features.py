@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+import sys
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,7 @@ from torch import nn
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
 from mstar.model.components.dft import stft_as_real
+from mstar.model.components.masking import length_mask
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -296,7 +298,7 @@ class NemoLogMel:
         n_samples = to_device_nonblocking(lengths, device)
         if self.preemphasis:
             x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
-            x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
+            x = x * length_mask(n_samples, x.shape[1])
         if self.reflect_edges:
             # each clip reflected at its own end, as alone, not at the batch's zeros
             padded = x.new_zeros(x.shape[0], x.shape[1] + 2 * pad)
@@ -316,8 +318,9 @@ class NemoLogMel:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
             # zero where the reference's rounding amplifies it into noise
-            n = to_device_nonblocking(frames, device)[:, None, None]
-            valid = torch.arange(mel.shape[2], device=device) < n
+            n_frames = to_device_nonblocking(frames, device)
+            valid = length_mask(n_frames, mel.shape[2])[:, None, :]
+            n = n_frames[:, None, None]
             ref = mel[:, :, :1]
             mean = ref + ((mel - ref) * valid).sum(dim=2, keepdim=True) / n
             std = (((mel - mean) * valid).pow(2).sum(dim=2, keepdim=True) / (n - 1)).sqrt()
@@ -382,7 +385,9 @@ def _ffmpeg_decoder_loads() -> bool:
         from torchcodec.decoders import AudioDecoder  # noqa: F401
     except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
         return False
-    return True
+    # newer torchcodec imports without FFmpeg and records whether its FFmpeg ops
+    # loaded; older releases fail the import above
+    return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 
 def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:

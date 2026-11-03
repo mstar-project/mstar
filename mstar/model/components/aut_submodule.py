@@ -118,7 +118,7 @@ class AuTEncoderSubmodule(NodeSubmodule):
         count. At ASR clip lengths (13 tokens a second) its GEMMs are a few
         dozen rows, so eager it is launch-bound: a 7 s clip's 24-layer stack
         is ~6.3 ms eager and ~1.9 ms replayed. The conv frontend before it
-        runs eagerly. Batches past the largest bucket run eagerly too."""
+        runs eagerly. A clip past the largest bucket runs eagerly, alone."""
         d_model = self.encoder.config.d_model
         attn_key = self.attn_key
 
@@ -194,7 +194,11 @@ class AuTEncoderSubmodule(NodeSubmodule):
         return {"audio_embeds": [self._encode(audio_features, feature_lens, engine_inputs)[0]]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
+        # A packed step holds at most the largest capture's tokens. Past it the
+        # clips run one by one, each replayed if it fits a bucket, so an eager
+        # step's activations are one clip's rather than the whole batch's.
+        tokens = sum(inp.input_seq_len for inp in model_inputs)
+        return len(model_inputs) <= 1 or tokens <= self.ENCODE_TOKEN_BUCKETS[-1]
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         del graph_walk

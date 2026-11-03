@@ -48,10 +48,14 @@ from mstar.api_server.request_types import (
     PreprocessInput,
     ResultChunk,
 )
+from mstar.api_server.served_models import ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
+from mstar.engine.resources.lora.config import lora_enabled
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.engine.resources.lora.store import check_adapters
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -131,9 +135,11 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    lora_adapter_digests: dict[str, str] | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
-    turns on the conductor's status message (metrics on)."""
+    turns on the conductor's status message (metrics on). ``lora_adapter_digests``
+    are the API server's checked serving-config adapters (name -> hex digest)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -187,6 +193,7 @@ def _conductor_process_target(
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
         status_interval_s=status_interval_s,
+        lora_adapter_digests=lora_adapter_digests,
     )
     try:
         conductor.run()
@@ -456,6 +463,19 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # what an OpenAI request's `model` field may name: the base model, or an adapter
+        self.served_models = ServedModels.of(model_name, model_config)
+        specs = lora_specs(model, model_config)
+        lora_spec = specs[0] if specs else None
+        # Every adapter the serving config names, checked against every LoRA spec and
+        # read once before anything else starts. Their digests key the prefix cache here
+        # and travel to the conductor, which pins them for the workers' reads. So a LoRA
+        # deployment's `resources:` block is read here, before the conductor's
+        # validate_deployment; one without LoRA reads nothing here.
+        self.lora_adapter_digests: dict[str, bytes] = (
+            check_adapters(lora_spec, others=specs[1:])
+            if lora_spec is not None and lora_spec.adapters else {}
+        )
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         self.client_streams = frozenset(
@@ -476,6 +496,7 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
+            adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
         )
 
@@ -677,10 +698,15 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
+
+        ``model`` is an OpenAI request's ``model`` field: with LoRA on, it selects an
+        adapter (see :meth:`ServedModels.select`), and an unknown name is a 400. A
+        ``lora_adapter`` kwarg is checked the same way.
 
         Returns the ``request_id``. If a ``request_id`` is provided by the
         caller it is used as-is (useful for deterministic-noise debugging,
@@ -724,6 +750,7 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        model_kwargs = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
         if file_streams:
@@ -783,6 +810,14 @@ class APIServer:
             request_id, key, input_modalities, output_modalities,
         )
         return request_id
+
+    def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> dict | None:
+        """``model_kwargs`` naming the LoRA adapter ``model`` or a ``lora_adapter`` kwarg
+        selects; an adapter this deployment does not serve is a 400."""
+        try:
+            return self.served_models.select(model, model_kwargs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
     def _in_flight(self, request_id: str) -> bool:
         """The newest submission under ``request_id`` is still running: not
@@ -1014,6 +1049,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1190,6 +1226,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1247,20 +1286,30 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -2869,6 +2918,14 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    if args.rust_frontend and lora_enabled(config):
+        # The Rust frontend translates OpenAI requests itself: it does not map the `model`
+        # field onto an adapter, so it would serve every request on the base model.
+        raise SystemExit(
+            "LoRA adapters (`resources: lora:` in the serving config) are served by the "
+            "Python frontend only; drop --rust-frontend"
+        )
+
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
     # model instance too, so it sees the same Pi05Config (action_horizon, etc.)
@@ -2928,7 +2985,12 @@ def main(argv: list[str] | None = None):
             args.tcp_transfer_device
         ),
         # The API server drops these until enable_metrics(), after the warmups.
-        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
+        kwargs={
+            "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
+            "lora_adapter_digests": {
+                name: digest.hex() for name, digest in api_server.lora_adapter_digests.items()
+            },
+        },
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

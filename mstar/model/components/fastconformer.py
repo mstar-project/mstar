@@ -28,6 +28,7 @@ from mstar.model.components.fastconformer_kernels import (
     glu_depthwise_conv,
     use_triton,
 )
+from mstar.model.components.masking import length_mask
 
 if TYPE_CHECKING:
     from mstar.model.components.audio_features import NemoLogMel
@@ -153,12 +154,6 @@ def _conv_out_len(lengths, kernel: int, stride: int, causal: bool):
     return (lengths + pad - kernel) // stride + 1
 
 
-def _time_mask(lengths: torch.Tensor | None, max_len: int) -> torch.Tensor | None:
-    if lengths is None:
-        return None
-    return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
-
-
 class _Subsampling(nn.Module):
     """Depthwise-separable striding over (time, mel): a full conv into
     ``subsampling_channels``, then depthwise + pointwise pairs, then a linear
@@ -184,6 +179,11 @@ class _Subsampling(nn.Module):
                 nn.ReLU(),
             ]
         self.layers = nn.ModuleList(layers)
+        # refused on every device so the spec does not depend on the path
+        self.lora_unservable = {
+            f"layers.{i}": "run as F.conv2d over its weight on the Triton path (bias_relu_mask_)"
+            for i in range(len(layers) - 1) if isinstance(layers[i + 1], nn.ReLU)
+        }
         freq = config.num_mel_bins
         for _ in range(config.num_subsampling_layers):
             freq = _conv_out_len(freq, k, s, config.causal)
@@ -211,7 +211,7 @@ class _Subsampling(nn.Module):
             else:
                 x = layer(x)
                 if lengths is not None:
-                    x = x * _time_mask(lengths, x.shape[2])[:, None, :, None]
+                    x = x * length_mask(lengths, x.shape[2])[:, None, :, None]
                 x = torch.relu(x)
         b, c, t, f = x.shape
         return self.linear(x.transpose(1, 2).reshape(b, t, c * f))
@@ -246,6 +246,8 @@ class RelPositionAttention(nn.Module):
     A stream step attends its new frames in the bounded KV ``kv_key`` names
     instead, which keeps each stream's window of keys and values, with the
     distances it can see projected once, at bind (``band``)."""
+
+    lora_unservable = {"relative_k_proj": "projects position encodings, not the step's tokens (a stream's at bind)"}
 
     def __init__(self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None):
         super().__init__()
@@ -524,7 +526,7 @@ class FastConformerEncoder(nn.Module):
         if new is not None:
             return self._stream_blocks(x, new)
         t = x.shape[1]
-        valid = _time_mask(lengths, t)
+        valid = None if lengths is None else length_mask(lengths, t)
         mask = None
         if self.config.causal:
             mask = chunked_attention_mask(t, self.config.left_context, self.config.lookahead, x.device)[None, None]

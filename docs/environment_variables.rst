@@ -21,26 +21,13 @@ Communication
        ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
        ``rust/`` extension imports successfully, pyzmq otherwise.
        ``1``: the Rust communicator, raising if the extension is missing.
-       ``0``: always pyzmq. The two transports are wire-compatible, so
-       this can be set per-process while the rest of the mesh stays on
-       pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
-       worker's graph runtime on Python -- the Rust one cannot share a
-       pyzmq transport. An extension built before 0.1.1 has no
-       non-blocking ``try_send``, which the API server's preprocess thread
-       sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
-       warning and ``1`` raises, asking for a rebuild. The conductor, the
-       workers and the rest of the API server keep the Rust transport.
-   * - ``MSTAR_RUST_GRAPH``
-     - ``AUTO``
-     - Which graph runtime a worker builds (see
-       :func:`mstar.graph.runtime.utils.resolve_graph_runtime_type`).
-       ``AUTO``: Rust where the vendored ``rust/`` extension imports *and*
-       the Rust transport is in use, Python otherwise. ``1``: the Rust
-       runtime, failing at startup if the transport or the tensor bookkeeper
-       is a Python one -- it holds a share of both, so there is no degraded
-       mode to fall back to. ``0``: always the Python runtime. Resolved once
-       per process, because it also selects the tensor bookkeeper the
-       runtime and the tensor store must share.
+       ``0``: pyzmq. A worker cannot run on it any more, because the graph
+       runtime holds a share of the Rust transport: the conductor refuses the
+       setting before it starts any worker. An extension built before 0.1.1
+       has no non-blocking ``try_send``, which the API server's preprocess
+       thread sends with: for that thread alone, ``AUTO`` then uses pyzmq
+       with a warning and ``1`` raises, asking for a rebuild. The conductor,
+       the workers and the rest of the API server keep the Rust transport.
    * - ``MSTAR_WIRE_CODEC``
      - ``msgpack``
      - How messages are encoded on every communicator edge (see
@@ -151,6 +138,19 @@ Communication
        ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
        so one process can pin more than its own arena holds. Segments
        past the budget stay unpinned: copies work, without async overlap.
+   * - ``MSTAR_SHM_ARENA_GATHER_MAX_BYTES``
+     - ``16384``
+     - Largest item (bytes) a consumer gathers with others of the same
+       shape, dtype and segment into one pinned buffer and one H2D copy,
+       instead of a copy per item (``_read_many_from_arena``). The default
+       is the crossover measured on an H200 host; ``0`` disables the
+       gather. Read in ``ArenaShmCommunicationManager.__init__``.
+   * - ``MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES``
+     - ``512``
+     - Up to this item size (bytes, 8-byte aligned) the gather indexes
+       8-byte words in one pass; larger items are copied one slice each.
+       Measured on an H200 host. Read in
+       ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
      - ``0``
      - TTL backstop for abort-orphaned slots (a request aborted after
@@ -658,7 +658,7 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
        Whisper, which also keeps its timestamp rule state in the sampler's
        declared loop-back state) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
@@ -666,11 +666,11 @@ Worker scheduling
        master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured step of a text walk (Qwen3.5 decode, text prefill and
-       mixed) builds its rotary tables inside the graph from the position
-       resource's planned positions instead of building them before the
-       replay (``LLMSubmodule._rope_in_graph``). Experiment knob, measured
-       and gated on its own.
+     - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
+       inside the graph from the position resource's planned positions instead
+       of building them before the replay (``LLMSubmodule._rope_in_graph``); a
+       captured decode step always does. Experiment knob, measured and gated
+       on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``1``
      - The captured sampler gathers its RNG offsets from the slot masters
