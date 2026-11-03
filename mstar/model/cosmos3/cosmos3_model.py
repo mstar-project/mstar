@@ -1827,8 +1827,8 @@ class Cosmos3Model(Model):
                 scheduler=self._build_scheduler(),
                 # Chained windows re-encode the frames they continue from: the
                 # decode on the streaming decoder's VAE, the encode on the
-                # encoder node's fp32 one, both shared with those nodes when
-                # they are in this process.
+                # encoder node's, both shared with those nodes when they are in
+                # this process.
                 head_decode_vae=self._build_streaming_decode_vae(device) if self._windowed_serving_enabled() else None,
                 head_encode_vae=self._build_encode_vae(device) if self._windowed_serving_enabled() else None,
             )
@@ -1954,18 +1954,19 @@ class Cosmos3Model(Model):
         return self._decoder_only_vaes[device]
 
     def _build_encode_vae(self, device: str):
-        # The encoder node keeps its own fp32 instance instead of sharing the
-        # decoder's: encode always runs fp32 while the decode dtype is
-        # cuDNN-gated (bf16 from 9.16), so a shared instance would re-cast the
-        # full VAE weights on every encode/decode interleave. One per device,
-        # shared with a chained window's head when the DiT is on it.
+        # The encoder node keeps its own instance instead of sharing the
+        # decoder's: the encode runs in the checkpoint's bf16, as the reference
+        # pipeline's does, while the decode dtype is cuDNN-gated (fp32 before
+        # 9.16), so a shared instance would re-cast the full VAE weights on
+        # every encode/decode interleave. One per device, shared with a chained
+        # window's head when the DiT is on it.
         if self.skip_weight_loading:
             return None
         if device not in self._encode_vaes:
             from diffusers import AutoencoderKLWan
 
-            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-            self._encode_vaes[device] = vae.float().to(device).eval()
+            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"), torch_dtype=torch.bfloat16)
+            self._encode_vaes[device] = vae.to(device).eval()
         return self._encode_vaes[device]
 
     def _build_vision_model(self, device: str):
