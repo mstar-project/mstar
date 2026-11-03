@@ -1096,6 +1096,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
 
+        ``outputs`` are the request's outputs after ``postprocess``, except on
+        a step whose forward set ``check_stop_buffers``: there they are that
+        request's rows of those buffers, under the names the forward gave them.
+
         Default: no stops.
         """
         return set()
