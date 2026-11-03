@@ -2058,6 +2058,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # step (an append) and drops the batch to the sequential path.
             if not all(st["uncond"] is not None for st in sts):
                 return False
+            cap = self.config.max_batched_vision_tokens
+            if (
+                cap is not None
+                and batch.graph_walk not in PREFILL_WALKS
+                and sum(st["cond"]["num_vision_tokens"] for st in sts) > cap
+            ):
+                return False
             if batch.graph_walk not in GEN_WALKS:
                 # Windowed requests join only generation-loop batches; their
                 # prefill stays sequential (the committed kv text prefix must not

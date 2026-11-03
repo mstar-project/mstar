@@ -1,5 +1,9 @@
 model: "qwen3_5_2b"
 max_seq_len: 32768
+# Raise the gen-0 GC threshold: at CPython's 700 a 128-row decode step collects
+# almost every step and runs a full collection every few hundred.
+knobs:
+  gc_gen0_threshold: 50000
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
