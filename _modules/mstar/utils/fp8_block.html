@@ -979,7 +979,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.utils.fp8_block</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized.</span>
+<span></span><span class="sd">"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized; the scale</span>
+<span class="sd">layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4).</span>
 
 <span class="sd">A block-scale checkpoint (DeepSeek-V3's format, GLM-5.x's) stores each linear weight as e4m3 with one fp32</span>
 <span class="sd">``weight_scale_inv`` per ``weight_block_size`` block. Triton-free, so a model's config can import it on a</span>
@@ -989,6 +990,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Iterator</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -996,6 +998,65 @@ window.runMermaid = runMermaid;</script>
 <span class="n">_SCALE_INV</span> <span class="o">=</span> <span class="s2">".weight_scale_inv"</span>
 
 <span class="n">FP8_DTYPE</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span>
+<span class="n">E8M0_DTYPE</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float8_e8m0fnu</span>
+<span class="n">FP4_DTYPE</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float4_e2m1fn_x2</span>
+
+
+<span class="c1"># The swizzled scale layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4) tiles blocks by this many along K and</span>
+<span class="c1"># rows by 128; ``model.components.block_scaled`` holds the formats.</span>
+<span class="n">BLOCKS_PER_TILE</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">_ROWS_PER_TILE</span> <span class="o">=</span> <span class="mi">128</span>
+
+
+<div class="viewcode-block" id="BlockQuant">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.fp8_block.html#mstar.utils.fp8_block.BlockQuant">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BlockQuant</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One block-scaled matrix ``[rows, K // packing]``. ``scale`` is flat in the GEMM's swizzled layout;</span>
+<span class="sd">    ``tensor_scale`` is NVFP4's second level, a ``[1]`` fp32 (None under MXFP8)."""</span>
+
+    <span class="n">data</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">scale</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">tensor_scale</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_ceil_div</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">return</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">a</span> <span class="o">//</span> <span class="n">b</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="swizzled_scale_elements">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.fp8_block.html#mstar.utils.fp8_block.swizzled_scale_elements">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">swizzled_scale_elements</span><span class="p">(</span><span class="n">rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">k_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Length of the flat scales of ``[rows, k_blocks]``: both padded to whole tiles."""</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">_ceil_div</span><span class="p">(</span><span class="n">rows</span><span class="p">,</span> <span class="n">_ROWS_PER_TILE</span><span class="p">)</span> <span class="o">*</span> <span class="n">_ROWS_PER_TILE</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">_ceil_div</span><span class="p">(</span><span class="n">k_blocks</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span> <span class="o">*</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="swizzle_block_scales">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.fp8_block.html#mstar.utils.fp8_block.swizzle_block_scales">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">swizzle_block_scales</span><span class="p">(</span><span class="n">scales</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``[rows, k_blocks]`` -&gt; the flat 32x4x4 layout of the cuBLAS block scaling factors: 128x4 tiles of 512</span>
+<span class="sd">    elements, row ``r``, block ``j`` of a tile at ``(r % 32) * 16 + (r // 32) * 4 + j``."""</span>
+    <span class="n">rows</span><span class="p">,</span> <span class="n">blocks</span> <span class="o">=</span> <span class="n">scales</span><span class="o">.</span><span class="n">shape</span>
+    <span class="n">row_tiles</span><span class="p">,</span> <span class="n">col_tiles</span> <span class="o">=</span> <span class="n">_ceil_div</span><span class="p">(</span><span class="n">rows</span><span class="p">,</span> <span class="n">_ROWS_PER_TILE</span><span class="p">),</span> <span class="n">_ceil_div</span><span class="p">(</span><span class="n">blocks</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span>
+    <span class="n">padded</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+        <span class="n">row_tiles</span> <span class="o">*</span> <span class="n">_ROWS_PER_TILE</span><span class="p">,</span> <span class="n">col_tiles</span> <span class="o">*</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">scales</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">scales</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">padded</span><span class="p">[:</span><span class="n">rows</span><span class="p">,</span> <span class="p">:</span><span class="n">blocks</span><span class="p">]</span> <span class="o">=</span> <span class="n">scales</span>
+    <span class="n">tiles</span> <span class="o">=</span> <span class="n">padded</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">row_tiles</span><span class="p">,</span> <span class="n">_ROWS_PER_TILE</span><span class="p">,</span> <span class="n">col_tiles</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">tiles</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="unswizzle_block_scales">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.fp8_block.html#mstar.utils.fp8_block.unswizzle_block_scales">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">unswizzle_block_scales</span><span class="p">(</span><span class="n">flat</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">k_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The inverse of :func:`swizzle_block_scales`, padding dropped."""</span>
+    <span class="n">row_tiles</span><span class="p">,</span> <span class="n">col_tiles</span> <span class="o">=</span> <span class="n">_ceil_div</span><span class="p">(</span><span class="n">rows</span><span class="p">,</span> <span class="n">_ROWS_PER_TILE</span><span class="p">),</span> <span class="n">_ceil_div</span><span class="p">(</span><span class="n">k_blocks</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span>
+    <span class="n">tiles</span> <span class="o">=</span> <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="n">padded</span> <span class="o">=</span> <span class="n">tiles</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">row_tiles</span><span class="p">,</span> <span class="n">col_tiles</span><span class="p">,</span> <span class="n">_ROWS_PER_TILE</span><span class="p">,</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">padded</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">row_tiles</span> <span class="o">*</span> <span class="n">_ROWS_PER_TILE</span><span class="p">,</span> <span class="n">col_tiles</span> <span class="o">*</span> <span class="n">BLOCKS_PER_TILE</span><span class="p">)[:</span><span class="n">rows</span><span class="p">,</span> <span class="p">:</span><span class="n">k_blocks</span><span class="p">]</span></div>
+
 
 
 <div class="viewcode-block" id="Fp8BlockQuantConfig">

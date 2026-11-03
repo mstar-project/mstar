@@ -15,6 +15,9 @@ mstar.utils.fp8\_block
    
       dequant_fp8_block_stream
       dequantize_fp8_block_weight
+      swizzle_block_scales
+      swizzled_scale_elements
+      unswizzle_block_scales
    
    
 
@@ -24,6 +27,7 @@ mstar.utils.fp8\_block
 
    .. autosummary::
    
+      BlockQuant
       Fp8BlockQuantConfig
    
    

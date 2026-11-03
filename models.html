@@ -2557,7 +2557,7 @@ trajectories and PSNR against a recorded pipeline run
 (multipart <code class="docutils literal notranslate"><span class="pre">image</span></code> + <code class="docutils literal notranslate"><span class="pre">prompt</span></code>; up to four reference images are concatenated as
 conditioning tokens, in order).</p>
 <p>Deployment knobs live under <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> in <code class="docutils literal notranslate"><span class="pre">configs/flux2_klein.yaml</span></code>:</p>
-<dl class="simple">
+<dl>
 <dt><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">sdpa</span></code> (default) is the reference kernel, cuDNN on an H100. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> runs the
 DiT’s joint attention on the engine’s ragged FlashInfer resource; both are CUDA-graph
 replayable.</p>
@@ -2624,6 +2624,46 @@ paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the e
 decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
 peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
 36 to 44 GiB compiled.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">linear_dtype</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code> (default), <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> or <code class="docutils literal notranslate"><span class="pre">nvfp4</span></code>; klein 4B, 9B and Z-Image. Runs the block linears
+the model declares (<code class="docutils literal notranslate"><span class="pre">QUANTIZABLE_LINEARS</span></code> beside each transformer) in that format: a
+<code class="docutils literal notranslate"><span class="pre">QuantLinear</span></code> holding the weight quantized once at load, after any <code class="docutils literal notranslate"><span class="pre">lora</span></code>, whose forward
+is one op (<code class="docutils literal notranslate"><span class="pre">mstar::mxfp8_linear</span></code> / <code class="docutils literal notranslate"><span class="pre">mstar::nvfp4_linear</span></code>) that quantizes the activation
+with a Triton kernel and runs cuBLASLt’s block-scaled GEMM. Modulation, timestep, patch and
+caption embedders and the final projection stay bf16. A GPU below compute capability 10.0
+stays on bf16 with a warning, and a linear whose K isn’t a whole number of scale tiles (MXFP8
+128, NVFP4 64), whose N isn’t a multiple of 16, or whose kind can’t take a format (a
+tensor-parallel linear) is refused at load.</p>
+<p>NVFP4 quantizes an activation’s 16-value blocks with e4m3 scales in units of a per-linear
+tensor scale <code class="docutils literal notranslate"><span class="pre">s</span></code>, so a block clips above <code class="docutils literal notranslate"><span class="pre">2688</span> <span class="pre">*</span> <span class="pre">s</span></code>. Over the 100 protocol prompts,
+klein’s text feed-forward outputs reach 4080 (4B) and 5056 (9B) and Z-Image’s feed-forward
+outputs up to 340k; every other input stays under 1800. Those linears take the power of two
+that holds their measured maximum (<code class="docutils literal notranslate"><span class="pre">input_amax</span></code> in the declaration), the rest <code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">=</span> <span class="pre">1</span></code>.</p>
+<p>It stays off by default because the images move. Against the bf16 image of the same prompt
+and seed, over the 100 protocol prompts with the shipped config on one B300 (compute capability
+10.3): klein 4B MXFP8 lands at a median 22.3 dB, lowest 13.6 dB, and NVFP4 at 15.6 dB,
+lowest 9.3 dB. Two bf16 images of a prompt at different seeds are a median 10.4 dB apart.
+MXFP8 keeps the scene with its details shifted; NVFP4 sometimes changes the composition. On
+the same GPU the 4B’s denoise step goes from 31.4 ms to 24.4 ms (MXFP8) or 22.9 ms (NVFP4),
+and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
+concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
+9B and 6.9 GiB on Z-Image (MXFP8, each model’s shipped config with <code class="docutils literal notranslate"><span class="pre">attention_backend:</span> <span class="pre">sdpa</span></code>).</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">linear_keep_bf16</span></code></dt><dd><p>A list of module-name patterns over the transformer’s linears to keep in bf16 for one
+deployment, on top of the declaration. A pattern matches name segment by segment, <code class="docutils literal notranslate"><span class="pre">*</span></code>
+within one segment, and a segment may be an index range: <code class="docutils literal notranslate"><span class="pre">single_blocks.0-3.*</span></code>. A pattern
+that names none of the candidate linears, or a bare string, is refused at load; the log
+names the linears each pattern kept.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">linear_dtype_steps</span></code></dt><dd><p>Some denoise steps in bf16 under a low-precision <code class="docutils literal notranslate"><span class="pre">linear_dtype</span></code>: a count of leading steps
+(<code class="docutils literal notranslate"><span class="pre">1</span></code>: the first step in bf16), or a dtype per step, each <code class="docutils literal notranslate"><span class="pre">bf16</span></code> or the <code class="docutils literal notranslate"><span class="pre">linear_dtype</span></code>,
+past the list its last entry. Those steps run a bf16 copy of the transformer taken before
+quantizing, so the deployment holds both sets of weights. Rows batch, and each capture bucket
+is captured, per dtype, and the scheduler keeps a step of one dtype apart from the other.
+One leading bf16 step takes klein 4B MXFP8 from a median 22.3 dB to 27.0 dB, lowest 16.0 dB,
+at a 26.0 ms step (24.4 ms MXFP8, 31.4 ms bf16); at 8 concurrent requests it serves 17% more
+images per second than bf16, against MXFP8’s 25%. Ignored when nothing is quantized (<code class="docutils literal notranslate"><span class="pre">bf16</span></code>,
+or no block-scaled GEMM).</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">max_image_area</span></code></dt><dd><p>Pixels, default 2048². Bounds the output size a request may ask for; larger requests
 are rejected with a 400 before scheduling instead of occupying the worker for minutes

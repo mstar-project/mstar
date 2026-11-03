@@ -688,6 +688,12 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant"><code class="docutils literal notranslate"><span class="pre">BlockQuant</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.data"><code class="docutils literal notranslate"><span class="pre">BlockQuant.data</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.scale"><code class="docutils literal notranslate"><span class="pre">BlockQuant.scale</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.tensor_scale"><code class="docutils literal notranslate"><span class="pre">BlockQuant.tensor_scale</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig.activation_scheme"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig.activation_scheme</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig.fmt"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig.fmt</span></code></a></li>
@@ -698,6 +704,9 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.dequant_fp8_block_stream"><code class="docutils literal notranslate"><span class="pre">dequant_fp8_block_stream()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.dequantize_fp8_block_weight"><code class="docutils literal notranslate"><span class="pre">dequantize_fp8_block_weight()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.swizzle_block_scales"><code class="docutils literal notranslate"><span class="pre">swizzle_block_scales()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.swizzled_scale_elements"><code class="docutils literal notranslate"><span class="pre">swizzled_scale_elements()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.unswizzle_block_scales"><code class="docutils literal notranslate"><span class="pre">unswizzle_block_scales()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -711,7 +720,8 @@
                   
   <section id="module-mstar.utils.fp8_block">
 <span id="mstar-utils-fp8-block"></span><h1>mstar.utils.fp8_block<a class="headerlink" href="#module-mstar.utils.fp8_block" title="Link to this heading">#</a></h1>
-<p>FP8 block-scale checkpoints: the <code class="docutils literal notranslate"><span class="pre">quantization_config</span></code> they declare, and their weights dequantized.</p>
+<p>FP8 block-scale checkpoints: the <code class="docutils literal notranslate"><span class="pre">quantization_config</span></code> they declare, and their weights dequantized; the scale
+layout of cuBLASLt’s block-scaled GEMMs (MXFP8, NVFP4).</p>
 <p>A block-scale checkpoint (DeepSeek-V3’s format, GLM-5.x’s) stores each linear weight as e4m3 with one fp32
 <code class="docutils literal notranslate"><span class="pre">weight_scale_inv</span></code> per <code class="docutils literal notranslate"><span class="pre">weight_block_size</span></code> block. Triton-free, so a model’s config can import it on a
 CPU-only install; the activation quantizer that feeds the block-scale GEMMs is <code class="docutils literal notranslate"><span class="pre">quant_fp8</span></code>.</p>
@@ -724,18 +734,65 @@ CPU-only install; the activation quantizer that feeds the block-scale GEMMs is <
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.dequantize_fp8_block_weight" title="mstar.utils.fp8_block.dequantize_fp8_block_weight"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dequantize_fp8_block_weight</span></code></a>(weight_fp8, ...)</p></td>
 <td><p>Dequantize one 2-D fp8 weight: <code class="docutils literal notranslate"><span class="pre">w[i,</span> <span class="pre">j]</span> <span class="pre">*</span> <span class="pre">scale_inv[i//bo,</span> <span class="pre">j//bi]</span></code>.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.swizzle_block_scales" title="mstar.utils.fp8_block.swizzle_block_scales"><code class="xref py py-obj docutils literal notranslate"><span class="pre">swizzle_block_scales</span></code></a>(scales)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">k_blocks]</span></code> -&gt; the flat 32x4x4 layout of the cuBLAS block scaling factors: 128x4 tiles of 512 elements, row <code class="docutils literal notranslate"><span class="pre">r</span></code>, block <code class="docutils literal notranslate"><span class="pre">j</span></code> of a tile at <code class="docutils literal notranslate"><span class="pre">(r</span> <span class="pre">%</span> <span class="pre">32)</span> <span class="pre">*</span> <span class="pre">16</span> <span class="pre">+</span> <span class="pre">(r</span> <span class="pre">//</span> <span class="pre">32)</span> <span class="pre">*</span> <span class="pre">4</span> <span class="pre">+</span> <span class="pre">j</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.swizzled_scale_elements" title="mstar.utils.fp8_block.swizzled_scale_elements"><code class="xref py py-obj docutils literal notranslate"><span class="pre">swizzled_scale_elements</span></code></a>(rows, k_blocks)</p></td>
+<td><p>Length of the flat scales of <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">k_blocks]</span></code>: both padded to whole tiles.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.unswizzle_block_scales" title="mstar.utils.fp8_block.unswizzle_block_scales"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unswizzle_block_scales</span></code></a>(flat, rows, k_blocks)</p></td>
+<td><p>The inverse of <a class="reference internal" href="#mstar.utils.fp8_block.swizzle_block_scales" title="mstar.utils.fp8_block.swizzle_block_scales"><code class="xref py py-func docutils literal notranslate"><span class="pre">swizzle_block_scales()</span></code></a>, padding dropped.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig" title="mstar.utils.fp8_block.Fp8BlockQuantConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code></a>([weight_block_size, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.BlockQuant" title="mstar.utils.fp8_block.BlockQuant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BlockQuant</span></code></a>(data, scale[, tensor_scale])</p></td>
+<td><p>One block-scaled matrix <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">packing]</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig" title="mstar.utils.fp8_block.Fp8BlockQuantConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code></a>([weight_block_size, ...])</p></td>
 <td><p>The fields of an HF fp8 <code class="docutils literal notranslate"><span class="pre">quantization_config</span></code> a block-scale checkpoint carries.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.BlockQuant">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.fp8_block.</span></span><span class="sig-name descname"><span class="pre">BlockQuant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensor_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fp8_block.html#BlockQuant"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fp8_block.BlockQuant" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One block-scaled matrix <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">packing]</span></code>. <code class="docutils literal notranslate"><span class="pre">scale</span></code> is flat in the GEMM’s swizzled layout;
+<code class="docutils literal notranslate"><span class="pre">tensor_scale</span></code> is NVFP4’s second level, a <code class="docutils literal notranslate"><span class="pre">[1]</span></code> fp32 (None under MXFP8).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>data</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>scale</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>tensor_scale</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.BlockQuant.data">
+<span class="sig-name descname"><span class="pre">data</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.utils.fp8_block.BlockQuant.data" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.BlockQuant.scale">
+<span class="sig-name descname"><span class="pre">scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.utils.fp8_block.BlockQuant.scale" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.BlockQuant.tensor_scale">
+<span class="sig-name descname"><span class="pre">tensor_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.utils.fp8_block.BlockQuant.tensor_scale" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.fp8_block.Fp8BlockQuantConfig">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.fp8_block.</span></span><span class="sig-name descname"><span class="pre">Fp8BlockQuantConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">weight_block_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">(128</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">128)</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fmt</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'e4m3'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">activation_scheme</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'dynamic'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ignore</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fp8_block.html#Fp8BlockQuantConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig" title="Link to this definition">#</a></dt>
@@ -824,6 +881,56 @@ CPU-only install; the activation quantizer that feeds the block-scale GEMMs is <
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.swizzle_block_scales">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.fp8_block.</span></span><span class="sig-name descname"><span class="pre">swizzle_block_scales</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">scales</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fp8_block.html#swizzle_block_scales"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fp8_block.swizzle_block_scales" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">k_blocks]</span></code> -&gt; the flat 32x4x4 layout of the cuBLAS block scaling factors: 128x4 tiles of 512
+elements, row <code class="docutils literal notranslate"><span class="pre">r</span></code>, block <code class="docutils literal notranslate"><span class="pre">j</span></code> of a tile at <code class="docutils literal notranslate"><span class="pre">(r</span> <span class="pre">%</span> <span class="pre">32)</span> <span class="pre">*</span> <span class="pre">16</span> <span class="pre">+</span> <span class="pre">(r</span> <span class="pre">//</span> <span class="pre">32)</span> <span class="pre">*</span> <span class="pre">4</span> <span class="pre">+</span> <span class="pre">j</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>scales</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.swizzled_scale_elements">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.fp8_block.</span></span><span class="sig-name descname"><span class="pre">swizzled_scale_elements</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k_blocks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fp8_block.html#swizzled_scale_elements"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fp8_block.swizzled_scale_elements" title="Link to this definition">#</a></dt>
+<dd><p>Length of the flat scales of <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">k_blocks]</span></code>: both padded to whole tiles.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>k_blocks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.fp8_block.unswizzle_block_scales">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.fp8_block.</span></span><span class="sig-name descname"><span class="pre">unswizzle_block_scales</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">flat</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k_blocks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/fp8_block.html#unswizzle_block_scales"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.fp8_block.unswizzle_block_scales" title="Link to this definition">#</a></dt>
+<dd><p>The inverse of <a class="reference internal" href="#mstar.utils.fp8_block.swizzle_block_scales" title="mstar.utils.fp8_block.swizzle_block_scales"><code class="xref py py-func docutils literal notranslate"><span class="pre">swizzle_block_scales()</span></code></a>, padding dropped.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>flat</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>k_blocks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -873,6 +980,12 @@ CPU-only install; the activation quantizer that feeds the block-scale GEMMs is <
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant"><code class="docutils literal notranslate"><span class="pre">BlockQuant</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.data"><code class="docutils literal notranslate"><span class="pre">BlockQuant.data</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.scale"><code class="docutils literal notranslate"><span class="pre">BlockQuant.scale</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.BlockQuant.tensor_scale"><code class="docutils literal notranslate"><span class="pre">BlockQuant.tensor_scale</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig.activation_scheme"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig.activation_scheme</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.Fp8BlockQuantConfig.fmt"><code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig.fmt</span></code></a></li>
@@ -883,6 +996,9 @@ CPU-only install; the activation quantizer that feeds the block-scale GEMMs is <
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.dequant_fp8_block_stream"><code class="docutils literal notranslate"><span class="pre">dequant_fp8_block_stream()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.dequantize_fp8_block_weight"><code class="docutils literal notranslate"><span class="pre">dequantize_fp8_block_weight()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.swizzle_block_scales"><code class="docutils literal notranslate"><span class="pre">swizzle_block_scales()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.swizzled_scale_elements"><code class="docutils literal notranslate"><span class="pre">swizzled_scale_elements()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.fp8_block.unswizzle_block_scales"><code class="docutils literal notranslate"><span class="pre">unswizzle_block_scales()</span></code></a></li>
 </ul>
   </nav></div>
 
