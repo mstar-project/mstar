@@ -176,7 +176,7 @@ class Cosmos3Model(Model):
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
     # The width of a policy request's robot_state, which process_prompt hands
     # the conductor (the values themselves ride the action_inputs edge).
-    INTERNAL_KWARGS = ("robot_state_dim",)
+    INTERNAL_KWARGS = ("robot_state_dim", "action_shape")
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -1466,13 +1466,16 @@ class Cosmos3Model(Model):
             if raw_dim is None and state_dim:
                 raw_dim = state_dim
             is_fd = action_mode == ACTION_MODE_FORWARD_DYNAMICS
-            if raw_dim is None and is_fd and mk.get("action_shape"):
-                raw_dim = int(mk["action_shape"][-1])
-            if raw_dim is None and is_fd and mk.get("action") is not None:
+            fd_shape = None  # forward dynamics' action rows: [steps, width] or [1, steps, width]
+            if is_fd and mk.get("action_shape"):
+                fd_shape = list(mk["action_shape"])
+            elif is_fd and mk.get("action") is not None:
                 try:
-                    raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
+                    fd_shape = list(torch.as_tensor(mk["action"]).shape)
                 except (TypeError, ValueError, RuntimeError):
-                    raw_dim = None
+                    fd_shape = None
+            if raw_dim is None and fd_shape:
+                raw_dim = int(fd_shape[-1])
             if raw_dim is None:
                 raise ValueError(
                     "Cosmos3 action requests require 'raw_action_dim' (it may be left out when "
@@ -1485,6 +1488,14 @@ class Cosmos3Model(Model):
                     f"got {raw_dim}."
                 )
             params["raw_action_dim"] = raw_dim
+            if is_fd and not (
+                fd_shape and len(fd_shape) >= 2 and fd_shape[:-2] in ([], [1]) and fd_shape[-2] >= 1
+                and fd_shape[-1] >= raw_dim
+            ):
+                raise ValueError(
+                    f"Cosmos3 forward_dynamics requires an 'action' array of shape [steps, {raw_dim}] "
+                    f"with at least one step, got {fd_shape}."
+                )
             if state_dim:
                 if state_dim != raw_dim:
                     raise ValueError(
