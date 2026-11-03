@@ -99,8 +99,8 @@ What a cache hit costs:
 
 | A hit on | Costs |
 |---|---|
-| a page only the index holds | a fresh page |
-| a page another request holds | nothing, lent to a preemptible request |
+| a page only the index holds | a fresh page, out of the room alone for a guaranteed request until it adopts its lease |
+| a page another request holds | nothing, lent |
 | a cached prefix copied from the host at readiness | a grant within the request's reservation |
 
 Why this shape:
@@ -108,6 +108,7 @@ Why this shape:
 - **The rule lives in `_alloc`.** Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request's next grant would fail.
 - **Only the head is admitted.** Nothing newer passes the oldest request, so it can't wait forever behind a stream of small ones (§5.5).
 - **Evictable hits are charged as fresh.** Eviction could hand such a page to another request before the probe leases it.
+- **A guaranteed request is charged for no hit until it adopts its lease.** A cut lease leaves the walk to write the cut pages, and a cut page another request still holds frees no room, so its reservation keeps every page until then.
 
 ---
 
