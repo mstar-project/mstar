@@ -1209,7 +1209,7 @@ class Worker:
                 reason.pages_short,
             )
         counts = self._preemptions[node_batch.node_name]
-        for rid in (*victims.to_host, *victims.to_drop):
+        for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
             record = self._preempted.setdefault(rid, Preempted())
             record.times += 1
             counts.victims += 1
@@ -1220,9 +1220,10 @@ class Worker:
         return True
 
     def _move_victims(self, kv: PagedKVCache, victims: Victims, pages_short: int) -> None:
-        """Move each victim to the host or drop it, as `KVManager.preempt` decided. A backlogged row goes back to
-        the runtime and a queued rebuild row leaves its queue first, so neither runs on pages the move gave up."""
-        for rid in (*victims.to_host, *victims.to_drop):
+        """Move each victim to the host, drop it, or ask the node's resources again for one that gave back its
+        allotment, as `KVManager.preempt` decided. A backlogged row goes back to the runtime and a queued rebuild
+        row leaves its queue first, so neither runs on pages the move gave up."""
+        for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
             self.scheduler.return_backlogged(rid)
             self.scheduler.take_rebuilds((rid,))
         for rid in victims.to_host:
@@ -1245,6 +1246,15 @@ class Worker:
                         "preempted %d times (%d earlier moves not logged)",
                         node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
                     )
+        for rid in victims.to_ask:
+            for node_name in kv.nodes:
+                self.engine_manager.get_engine(node_name).readmit_request(node_name, rid)
+                self._log_throttled(
+                    self._drop_logged, node_name,
+                    "KV short on node=%s: %s, holding no page of its own, gave back its allotment for a shortage of "
+                    "%d, preempted %d times (%d earlier moves not logged)",
+                    node_name, self._rid_str(rid), pages_short, self._preempted[rid].times,
+                )
 
     def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
         """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since

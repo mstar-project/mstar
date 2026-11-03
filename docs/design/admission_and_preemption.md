@@ -133,7 +133,7 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). One that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
@@ -241,8 +241,8 @@ Lifecycle:
 A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
 
 ```
-need(V) = for each label, the pages V's kept history fills, plus 1,
-          capped at V's footprint
+need(V) = the larger of V's prompt and, for each label, the pages
+          V's kept history fills, plus 1, capped at V's footprint
 
 return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
@@ -254,7 +254,7 @@ A request on the host asks again when it moves there, and is admitted the same w
 
 Why this shape:
 
-- **A whole history and a page, not the prompt.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again.
+- **A whole history and a page, not the prompt alone.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again. A victim dropped partway through its prompt still writes the rest of it, so it returns with the whole prompt at least.
 - **Capped at the footprint.** The ingest 400 bounds the footprint, not the history plus a page.
 - **Outside `check_ready`.** After a partial cache hit, `admit_retrieve` would move the position counter past what the rebuild restores, so no `admit_retrieve` runs on a request between its drop and the end of its rebuild.
 

@@ -336,10 +336,12 @@ class Dropped(NamedTuple):
 
 
 class Victims(NamedTuple):
-    """The requests `KVManager.preempt` chose to move off the device: to the host, or dropped. ``waits`` is set
-    when no move covers the shortage, and the request that ran short asks the pool for it instead."""
+    """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
+    their own, already given back their leases and allotment to ask again. ``waits`` is set when no move covers
+    the shortage, and the request that ran short asks the pool for it instead."""
     to_host: list[str]
     to_drop: list[str]
+    to_ask: list[str]
     waits: bool = False
 
 
@@ -3399,12 +3401,17 @@ class KVManager(AttentionResource):
             # recorded.
             dropped = self._dropped.get(rid)
             if dropped is None:
-                # It returns with its history (the tokens its KV held, released ones included, and the sample its
-                # next step writes) and one page more, at most its footprint.
+                # It returns with the larger of its prompt and its history (the tokens its KV held, released
+                # ones included, and the sample its next step writes) and one page more, at most its footprint.
+                # A request dropped partway through its prompt still writes the rest.
                 streams = self._streams[rid].values()
                 written = max(stream.stored_len + stream.released for stream in streams)
                 history = -(-(written + 1) // self.config.tokens_per_page)
-                returns = sum(self._one_more(history, stream.footprint) for stream in streams)
+                allotment = self._allotments.get(rid)
+                returns = max(
+                    0 if allotment is None else allotment.prompt,
+                    sum(self._one_more(history, stream.footprint) for stream in streams),
+                )
                 # `check_drop` allows at most one laid-out label
                 laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
                 dropped = Dropped(returns, sum(self._streams[rid][label].stored_len for label in laid_out))
@@ -3485,9 +3492,6 @@ class KVManager(AttentionResource):
         claimed, read_futures = self._claim_for_offload(rid)
         if not claimed:
             with self._lock:
-                # a victim with no pages on the device still gives up its lease and allotment
-                if rid in self._hosted and not any(stream.pages() for stream in self._streams[rid].values()):
-                    self._vacate(rid, self._room())
                 self._settle(rid, 0)
             return 0
         released: set[str] = set()
@@ -4414,9 +4418,9 @@ class KVManager(AttentionResource):
             if then is not None:
                 pages_short -= max(0, room - then)
             if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
-                return Victims([], [])
+                return Victims([], [], [])
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
-            left, hosted, moving = on_host, set(), False
+            left, hosted, asking, moving = on_host, set(), set(), False
             victims: list[str] = []
             for other in newer:
                 if not self._holds(other):
@@ -4427,8 +4431,9 @@ class KVManager(AttentionResource):
                     continue
                 if not self._movable(other):
                     continue
-                pages = self._host_pages(other)
-                if pages is not None and pages <= left:
+                if self._unwritten(other):
+                    asking.add(other)
+                elif (pages := self._host_pages(other)) is not None and pages <= left:
                     left -= pages
                     hosted.add(other)
                 elif not droppable(other):
@@ -4443,9 +4448,9 @@ class KVManager(AttentionResource):
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
-                    return Victims([rid], []) if to_host else Victims([], [rid])
+                    return Victims([rid], [], []) if to_host else Victims([], [rid], [])
                 self._asks[rid] = pages_short
-                return Victims([], [], waits=True)
+                return Victims([], [], [], waits=True)
             freed = self._frees(victims)
             for victim in list(victims):
                 rest = [other for other in victims if other != victim]
@@ -4456,8 +4461,14 @@ class KVManager(AttentionResource):
                 self._victims[victim] = earmark
             self._hosted.update(hosted.intersection(victims))
             self._earmarks[rid] = earmark
-            to_host = [victim for victim in victims if victim in hosted]
-            return Victims(to_host, [victim for victim in victims if victim not in hosted])
+            to_ask = [victim for victim in victims if victim in asking]
+            for victim in to_ask:
+                self._vacate(victim, self._room())
+            return Victims(
+                [victim for victim in victims if victim in hosted],
+                [victim for victim in victims if victim not in hosted and victim not in asking],
+                to_ask,
+            )
 
     def _holds(self, rid: str) -> bool:
         allotment = self._allotments.get(rid)
@@ -4472,10 +4483,14 @@ class KVManager(AttentionResource):
             stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
         )
 
+    def _unwritten(self, rid: str) -> bool:
+        return not any(stream.pages() for stream in self._streams[rid].values())
+
     def _host_pages(self, rid: str) -> int | None:
         """The host pages that moving every stream of ``rid`` takes, or None when ``rid`` can't move there: the
-        pool has no host memory, ``rid`` isn't resident, or a stream holds a cached image end `plan` hasn't copied."""
-        if self._cpu_pool is None or not self.is_resident(rid):
+        pool has no host memory, ``rid`` isn't resident or holds no page, or a stream holds a cached image end
+        `plan` hasn't copied."""
+        if self._cpu_pool is None or not self.is_resident(rid) or self._unwritten(rid):
             return None
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):

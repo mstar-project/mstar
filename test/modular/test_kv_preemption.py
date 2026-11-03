@@ -187,9 +187,9 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
 
     waits = _preempt(kv, "r2", _short(kv, "r2"), droppable=lambda rid: True)
-    assert waits == Victims([], [], waits=True), "r2 took r1's victim or moved itself"
+    assert waits == Victims([], [], [], waits=True), "r2 took r1's victim or moved itself"
     _runner(kv).readmit("r2", NODE)
-    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], []), "r1 chose again"
+    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], [], []), "r1 chose again"
     _drop(kv, "v")
 
     assert not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
@@ -244,7 +244,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
     drops = then == "drops itself"
-    assert victims == Victims([], ["r"] if drops else [], waits=not drops), "r waits only when it can't drop itself"
+    assert victims == Victims([], ["r"] if drops else [], [], waits=not drops), "r waits only when it can't drop itself"
     assert not kv._earmarks, "nothing newer frees a page"
     if not drops:
         _runner(kv).readmit("r", NODE)
