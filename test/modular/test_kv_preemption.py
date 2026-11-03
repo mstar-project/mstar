@@ -241,6 +241,29 @@ def test_a_victim_whose_move_fails_comes_off_the_earmark():
     assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
 
 
+@pytest.mark.parametrize("moves", ["is dropped", "moves to the host"])
+def test_a_passer_moved_for_an_older_request_keeps_for_the_head_what_the_earmark_leaves(moves):
+    kv = _pool()
+    if moves == "moves to the host":
+        kv._cpu_pool = host._HostPool(64)
+    _running(kv, "x", 4, arrival=0)
+    _request(kv, "head", 7, arrival=1)
+    assert not _ready(kv, "head")
+    _request(kv, "p", 1, arrival=2)
+    assert _ready(kv, "p") and _step(kv, "p", PAGE_SIZE).ok
+    short = _step(kv, "x", 2 * PAGE_SIZE).reason.pages_short
+    victims = _preempt(kv, "x", short, droppable=lambda rid: True)
+    assert victims.to_drop + victims.to_host == ["p"]
+    (_drop if moves == "is dropped" else _offload)(kv, "p")
+    _request(kv, "q", 1, arrival=3)
+
+    assert not _ready(kv, "p") and not _ready(kv, "q"), (
+        "a request behind the head took what the passer's move freed past x's shortage")
+    assert _step(kv, "x", 2 * PAGE_SIZE).ok, "x didn't get the page its victim freed"
+    _remove(kv, "x")
+    assert _ready(kv, "head"), "the head waits though the room, the pages kept for it included, covers it"
+
+
 @pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
 def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     kv = _pool()
