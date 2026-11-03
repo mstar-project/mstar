@@ -11,6 +11,7 @@ sequence parallelism (``--parallel sp``) needs it.
 """
 import argparse
 import collections
+import dataclasses
 import os
 import time
 
@@ -39,7 +40,10 @@ def ragged_denoise(config, dit, shape, batch, device, joint):
     model.set_config(config)
     specs = resolve_spec_dependencies(model.get_node_resources())
     info = EngineResourceInfo(device=device, joint_comm_group=joint, kv_dtype=torch.bfloat16)
-    res = {key: build_resource(spec, info) for key, spec in specs.items()}
+    res = {
+        key: build_resource(spec, dataclasses.replace(info, dependencies={k: specs[k] for k in spec.depends_on()}))
+        for key, spec in specs.items()
+    }
     for key, spec in specs.items():
         res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
     sub = S.LTXDenoiseSubmodule(dit, config, loop_name="x", use_ragged_attention=True)

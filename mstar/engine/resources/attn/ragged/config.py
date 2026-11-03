@@ -183,10 +183,11 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     """Cacheless self-attention within each declared span (``AttentionStep``).
 
     ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
-    all-to-all from split tokens to split heads, and back), and shards heads over every TP and SP
-    rank, slicing them on a copied step. ``"none"`` (the default) attends only copied labels, heads
-    over TP. A no-op on a node with no ``SeqShardSpec``. On SP ranks every label of a ``ulysses``
-    resource goes through an exchange, so ``run(..., return_lse=True)`` raises there."""
+    all-to-all from split tokens to split heads, and back). On a node whose shard splits
+    (``SeqShardSpec.splits``) it shards heads over every TP and SP rank, slicing them on a copied
+    step, and every label goes through an exchange, so ``run(..., return_lse=True)`` raises there.
+    ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
+    node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
 
     # the model's declaration, not a deployment's (``sp_exchanges`` stays empty)
     sp_exchange: Literal["none", "ulysses"] = field(default="none", kw_only=True)

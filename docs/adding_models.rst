@@ -2387,7 +2387,7 @@ and the model writes no exchange:
    * - Copied
      - head slice: this rank's heads of q, k and v, write and attend, gather the heads
      - each rank attends its slots, partials merged (below)
-     - heads over TP; with ``sp_exchange``, a head slice
+     - heads over TP; with ``sp_exchange`` on a splitting node, a head slice
    * - Split
      - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
      - by the shard's ``exchange`` (below): ``all_gather``, one gather of every rank's q, k and
@@ -2441,7 +2441,8 @@ Splitting is declared in four places:
   pass the TP heads where the pool holds this rank's slice; a layer that fuses its K/V write
   (``Qwen3Attention``) calls ``AttentionCallable`` instead wherever the attention ``splits``. A cacheless self-attention that may see split tokens declares
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
-  on a node with no ``SeqShardSpec``, so one declaration serves every deployment shape.
+  on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
+  (``SeqShardSpec.splits``), so one declaration serves every deployment shape.
 
 **Recurrent, MLA and sliding-window layers.** They take split steps through their own resources
 too, and the model writes nothing more than the bracket. Each resource's state is stored one of
