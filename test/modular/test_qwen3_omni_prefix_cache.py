@@ -116,6 +116,24 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
     ), "the Talker masks or deepstack rows kept rows the embeds lost, so they would land on other tokens"
 
 
+def test_an_images_deepstack_lands_on_its_vision_rows_between_the_text_around_it(thinker):
+    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 10}
+    deepstack = [torch.arange(1, 7, dtype=torch.float)[:, None].expand(6, HIDDEN) * (i + 1) for i in range(2)]
+    image = {
+        "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": deepstack,
+        "image_grid_thw": [torch.tensor([1, 4, 6])], "text_inputs": [torch.arange(8, 12), torch.arange(12, 15)],
+    }
+
+    row = _prepare(thinker, "prefill_vision", image)
+
+    vision = row.tensor_inputs["masks_for_talker"][0]
+    assert vision.nonzero().flatten().tolist() == list(range(5, 11))
+    for layer, rows in zip(row.tensor_inputs["deepstack"], deepstack, strict=True):
+        assert torch.equal(layer[vision], rows) and not layer[~vision].any(), (
+            "deepstack rows landed on the text or the sentinels around the image"
+        )
+
+
 def test_a_cut_row_of_text_around_a_clip_is_the_tail_of_the_whole_row(thinker):
     rope = thinker.node_resources[THINKER_POS]
     rope._counters[RID] = {"main": 10}

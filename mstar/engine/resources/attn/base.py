@@ -241,6 +241,20 @@ class AttentionManager(AttentionResource):
         """
         return True
 
+    def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
+        """The current plan's query offsets per request, for backends that plan them."""
+        raise NotImplementedError(f"{type(self).__name__} plans no query offsets (qo_indptr_buf)")
+
+    # Eager as a whole: a break inside it leaves a compiled frame that holds the
+    # bucket's static token count beside its row count, which captured forwards
+    # recompile per prefill bucket until Dynamo's recompile limit.
+    @torch.compiler.disable
+    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
+        """Each request's last row of ``hidden``, used for sampling from prefill,
+        for a backend whose ``qo_indptr_buf`` holds the plan's query offsets."""
+        last = (self.qo_indptr_buf(label)[1:] - 1).long()
+        return hidden.index_select(0, last)
+
 
 class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged

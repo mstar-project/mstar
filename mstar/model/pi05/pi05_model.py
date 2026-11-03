@@ -52,8 +52,17 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+)
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
+from mstar.model.media_limits import read_image
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
@@ -256,27 +265,26 @@ class Pi05Model(Model):
         # case a future release adds them) and fall back to the canonical
         # PaliGemma repo. ``use_fast=True`` is required so we don't need
         # the slow sentencepiece+protobuf path.
+        errors = []
         for repo in (self.model_path_hf, "google/paligemma-3b-pt-224"):
             try:
                 hf_tok = AutoTokenizer.from_pretrained(
                     repo, cache_dir=self.cache_dir, use_fast=True
                 )
-                if repo != self.model_path_hf:
-                    logger.info(
-                        "Pi0.5 tokenizer loaded from fallback repo %s "
-                        "(model repo %s has no tokenizer files)",
-                        repo,
-                        self.model_path_hf,
-                    )
-                return Pi05Tokenizer(hf_tok, self.config)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not load Pi0.5 tokenizer from %s (%s); trying next.",
+                errors.append(f"{repo}: {exc}")
+                continue
+            if repo != self.model_path_hf:
+                logger.info(
+                    "Pi0.5 tokenizer loaded from fallback repo %s "
+                    "(model repo %s has no tokenizer files)",
                     repo,
-                    exc,
+                    self.model_path_hf,
                 )
-        logger.warning("All Pi0.5 tokenizer sources failed; proceeding without one.")
-        return None
+            return Pi05Tokenizer(hf_tok, self.config)
+        # Without a tokenizer every request would fail at ingest, so refuse to start.
+        # google/paligemma-3b-pt-224 is gated: the HF token needs its license accepted.
+        raise ValueError("Pi0.5 found no tokenizer:\n" + "\n".join(errors))
 
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
@@ -511,7 +519,7 @@ class Pi05Model(Model):
         format.
         """
         if self.tokenizer is None:
-            # Tokenizer-less fallback used by structural unit tests.
+            # Tokenizer-less fallback for dummy mode (skip_weight_loading), used by structural unit tests.
             if prompt is not None:
                 return {
                     "text_inputs": [
@@ -549,6 +557,12 @@ class Pi05Model(Model):
             scratch=cfg.action_horizon,
         )
         return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
+
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
+        normalizes uint8 on the GPU, so the API server skips a float pass per
+        camera and stages a quarter of the bytes for the worker."""
+        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}

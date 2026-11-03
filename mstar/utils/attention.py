@@ -4,6 +4,21 @@ import triton.language as tl
 
 
 @triton.jit
+def rms_norm_halves(
+    x_first, x_second, w_ptr, eps,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """One head, given as its two halves in fp32, RMSNorm'd by the weight at ``w_ptr``."""
+    offs_half = tl.arange(0, HALF_D)
+    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
+    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
+    return x_first, x_second
+
+
+@triton.jit
 def rms_norm_rope(
     x_first, x_second, w_ptr, pos, eps, rope_theta,
     D: tl.constexpr,
@@ -14,10 +29,7 @@ def rms_norm_rope(
     dim. Returns the two rotated halves. Shared by the kernels here and the
     code predictors' (``model/components/code_predictor_kernels.py``)."""
     offs_half = tl.arange(0, HALF_D)
-    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
-    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
-    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
-    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
+    x_first, x_second = rms_norm_halves(x_first, x_second, w_ptr, eps, D, HALF_D)
     inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
     angle = pos * inv_freq
     cos = tl.cos(angle)
@@ -92,19 +104,22 @@ def _qk_norm_rope_inplace_fake(q, k, q_weight, k_weight, pos_ids, q_eps, k_eps, 
 
 @triton.jit
 def _qk_norm_rope_kv_kernel(
-    Q_ptr, K_ptr, V_ptr, WQ_ptr, WK_ptr, Pos_ptr, Cache_ptr, Page_ptr, Slot_ptr,
+    Q_ptr, K_ptr, V_ptr, WQ_ptr, WK_ptr, Pos_ptr, Cos_ptr, Sin_ptr, Cache_ptr, Page_ptr, Slot_ptr,
     q_eps, k_eps, rope_theta, n_write,
-    sq_m, sq_h, sk_m, sk_h, sv_m, sv_h,
+    sq_m, sq_h, sk_m, sk_h, sv_m, sv_h, scs_m,
     sc_page, sc_kv, sc_slot, sc_head,
     H_Q: tl.constexpr,
     H_KV: tl.constexpr,
     D: tl.constexpr,
     HALF_D: tl.constexpr,
+    TABLE: tl.constexpr,
 ):
     """``_qk_pair_norm_rope_kernel`` plus the step's KV write: a k head is
     stored rotated into its (page, slot) of the NHD cache layer, a v head
     (programs past the q and k heads) copied there; tokens past ``n_write``
-    (the plan's padding) write nothing."""
+    (the plan's padding) write nothing. With ``TABLE`` the rotation reads each
+    token's cos/sin row (first half; a rotate-half table repeats it) instead
+    of computing it from ``Pos_ptr``."""
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_half = tl.arange(0, HALF_D)
@@ -129,8 +144,15 @@ def _qk_norm_rope_kv_kernel(
 
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
-    pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    if TABLE:
+        x_first, x_second = rms_norm_halves(x_first, x_second, w_ptr, eps, D, HALF_D)
+        cos = tl.load(Cos_ptr + pid_m * scs_m + offs_half).to(tl.float32)
+        sin = tl.load(Sin_ptr + pid_m * scs_m + offs_half).to(tl.float32)
+        out_first = x_first * cos - x_second * sin
+        out_second = x_second * cos + x_first * sin
+    else:
+        pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
+        out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
 
     if pid_h < H_Q:
         tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
@@ -144,6 +166,32 @@ def _qk_norm_rope_kv_kernel(
         tl.store(dst + offs_half + HALF_D, out_second.to(Cache_ptr.dtype.element_ty))
 
 
+def _launch_qk_norm_rope_kv(q, k, v, q_weight, k_weight, pos_ids, cos, sin, cache_layer, page_idx, slot_idx,
+                            n_write, q_eps, k_eps, rope_theta, num_warps: int = 4) -> None:
+    num_tokens, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    assert k.shape == v.shape and k.shape[0] == num_tokens and k.shape[2] == head_dim
+    assert q.stride(2) == 1 and k.stride(2) == 1 and v.stride(2) == 1
+    assert cache_layer.shape[-2:] == (num_kv_heads, head_dim) and cache_layer.stride(-1) == 1
+    table = cos is not None
+    if table:
+        assert cos.shape[0] >= num_tokens and cos.shape[1] == head_dim and cos.stride(1) == 1
+        assert sin.shape == cos.shape and sin.stride() == cos.stride()
+    if num_tokens == 0:
+        return
+    _qk_norm_rope_kv_kernel[(num_tokens, num_q_heads + 2 * num_kv_heads)](
+        q, k, v, q_weight, k_weight,
+        pos_ids if pos_ids is not None else cos, cos if table else pos_ids, sin if table else pos_ids,
+        cache_layer, page_idx, slot_idx,
+        q_eps, k_eps, rope_theta, n_write,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+        cos.stride(0) if table else 0,
+        cache_layer.stride(0), cache_layer.stride(1), cache_layer.stride(2), cache_layer.stride(3),
+        H_Q=num_q_heads, H_KV=num_kv_heads, D=head_dim, HALF_D=head_dim // 2, TABLE=table,
+        num_warps=num_warps, num_stages=1,
+    )
+
+
 @torch.library.custom_op("mstar::qk_norm_rope_kv_write", mutates_args={"q", "cache_layer"})
 def qk_norm_rope_kv_write(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -155,26 +203,35 @@ def qk_norm_rope_kv_write(
     launch: k normed and rotated, and v, stored at each token's (page, slot)
     of one NHD cache layer ``[pages, 2, page_size, H_kv, D]`` (``k`` itself
     is left as it was). The first ``n_write`` tokens are written."""
-    num_tokens, num_q_heads, head_dim = q.shape
-    num_kv_heads = k.shape[1]
-    assert k.shape == v.shape and k.shape[0] == num_tokens and k.shape[2] == head_dim
-    assert q.stride(2) == 1 and k.stride(2) == 1 and v.stride(2) == 1
-    assert cache_layer.shape[-2:] == (num_kv_heads, head_dim) and cache_layer.stride(-1) == 1
-    if num_tokens == 0:
-        return
-    _qk_norm_rope_kv_kernel[(num_tokens, num_q_heads + 2 * num_kv_heads)](
-        q, k, v, q_weight, k_weight, pos_ids, cache_layer, page_idx, slot_idx,
-        q_eps, k_eps, rope_theta, n_write,
-        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
-        cache_layer.stride(0), cache_layer.stride(1), cache_layer.stride(2), cache_layer.stride(3),
-        H_Q=num_q_heads, H_KV=num_kv_heads, D=head_dim, HALF_D=head_dim // 2,
-        num_warps=4, num_stages=1,
-    )
+    _launch_qk_norm_rope_kv(q, k, v, q_weight, k_weight, pos_ids, None, None, cache_layer, page_idx, slot_idx,
+                            n_write, q_eps, k_eps, rope_theta)
 
 
 @qk_norm_rope_kv_write.register_fake
 def _qk_norm_rope_kv_write_fake(q, k, v, q_weight, k_weight, pos_ids, cache_layer, page_idx, slot_idx,
                                 n_write, q_eps, k_eps, rope_theta) -> None:
+    return None
+
+
+@torch.library.custom_op("mstar::qk_norm_rope_table_kv_write", mutates_args={"q", "cache_layer"})
+def qk_norm_rope_table_kv_write(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q_weight: torch.Tensor, k_weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    cache_layer: torch.Tensor, page_idx: torch.Tensor, slot_idx: torch.Tensor, n_write: int,
+    q_eps: float, k_eps: float,
+) -> None:
+    """``qk_norm_rope_kv_write`` with the rotation given per token as rotate-half
+    ``cos``/``sin`` rows ``[tokens, head_dim]`` (both halves equal), e.g. the
+    Qwen3-Omni Thinker's multimodal RoPE, whose three position grids a single
+    1D position can't express."""
+    # one warp a head: a 128-wide head leaves most of four idle (10-16% faster on H100 at 1-4096 tokens)
+    _launch_qk_norm_rope_kv(q, k, v, q_weight, k_weight, None, cos, sin, cache_layer, page_idx, slot_idx,
+                            n_write, q_eps, k_eps, 0.0, num_warps=1)
+
+
+@qk_norm_rope_table_kv_write.register_fake
+def _qk_norm_rope_table_kv_write_fake(q, k, v, q_weight, k_weight, cos, sin, cache_layer, page_idx, slot_idx,
+                                  n_write, q_eps, k_eps) -> None:
     return None
 
 
