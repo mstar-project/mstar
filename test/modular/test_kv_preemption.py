@@ -240,6 +240,21 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
         assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
 
 
+def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
+    kv = _pool()
+    _running(kv, "a", 1, arrival=0)
+    _running(kv, "b", 4, arrival=1)
+    _running(kv, "r", 5, arrival=2)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    assert kv.preempt("r", short, droppable=lambda rid: False).waits
+    _runner(kv).readmit("r", NODE)
+
+    _remove(kv, "a")
+    assert not _admitted(kv, "r"), f"r was let go once one page freed, though it was short by {short}"
+    _remove(kv, "b")
+    assert _admitted(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r wasn't admitted once its shortage fit"
+
+
 @pytest.mark.parametrize("state", ["pending victim", "dropped", "rebuilding", "earmark's request"])
 def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
