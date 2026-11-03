@@ -666,20 +666,59 @@ def _linear_step(manager, layers, variant, layout, walk, x, weight, gates, param
     return x, out
 
 
+def _gdn_reference(layout, x, weight, gates, params, layers):
+    """A GDN step by the plain sequential recurrence (``_delta_rule``) over ``_conv_rows``, from
+    the pool's ``layers`` as they stood: an oracle independent of the resource's CPU stand-in
+    kernels. The conv output, the recurrence's, and each row's final state."""
+    g = LINEAR_GEOMETRIES["gdn"]
+    spans = [span for span, _, _ in layout]
+
+    def stored(name, slot, has):
+        return layers[name][slot].double() if has else torch.zeros_like(layers[name][0], dtype=torch.float64)
+
+    windows = torch.stack([stored("conv", slot, has) for _, slot, has in layout])
+    conv = torch.nn.functional.silu(_conv_rows(x.double(), weight.double(), windows, spans)[0])
+    keys, values = g.num_k_heads * g.head_k_dim, g.num_v_heads * g.head_v_dim
+    q, k, v = conv.split([keys, keys, values], dim=-1)
+    # a key head serves the value heads after it in order (GVA), as the model's TP shards take them
+    q, k = (torch.nn.functional.normalize(t.reshape(-1, g.num_k_heads, g.head_k_dim), dim=-1)
+            .repeat_interleave(g.num_v_heads // g.num_k_heads, dim=1) for t in (q, k))
+    v = v.reshape(-1, g.num_v_heads, g.head_v_dim)
+    a, b = gates[:, 0].double(), gates[:, 1].double()
+    decay = torch.exp(-params["a_log"].double().exp() * torch.nn.functional.softplus(a + params["dt_bias"].double()))
+    outs, finals, start = [], [], 0
+    for span, slot, has in layout:
+        rows = slice(start, start + span)
+        out, final = _delta_rule(stored("state", slot, has), q[rows] * g.head_k_dim ** -0.5, k[rows], v[rows],
+                                 decay[rows], torch.sigmoid(b[rows]))
+        outs.append(out)
+        finals.append(final)
+        start += span
+    return conv, torch.cat(outs), finals
+
+
 def _linear_split(rank, world, variant, exchange, layout, walk, sink, gpu=False, gate_dtype=None):
     """The resource on this rank's share of a split step against the same resource running it
     whole on one rank: the conv and recurrence outputs (exact for ulysses on CPU, within tolerance
     for state_passing and the GPU's bf16), and the pool's state and conv windows, alike bit for
-    bit on every rank. ``gate_dtype``: the gates in a dtype of their own (an fp32 gate projection
-    beside bf16 q/k/v)."""
+    bit on every rank. On CPU the one-rank GDN step is itself checked against ``_gdn_reference``.
+    ``gate_dtype``: the gates in a dtype of their own (an fp32 gate projection beside bf16 q/k/v)."""
     device = torch.device("cuda", rank) if gpu else CPU
     n = sum(span for span, _, _ in layout)
     x, weight, gates, params = _linear_inputs(variant, n, device, torch.bfloat16 if gpu else torch.float32)
     if gate_dtype is not None:
         gates = gates.to(gate_dtype)
     ref, ref_layers, _ = _linear(variant, sink=sink, device=device)
+    before = {name: layer.clone() for name, layer in ref_layers.items()}
     # a clone: the one-token conv update writes its output over its input
     want_conv, want = _linear_step(ref, ref_layers, variant, layout, walk, x.clone(), weight, gates, params)
+    if variant == "gdn":
+        oracle_conv, oracle, finals = _gdn_reference(layout, x, weight, gates, params, before)
+        torch.testing.assert_close(want_conv, oracle_conv.to(want_conv.dtype), rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(want, oracle.to(want.dtype), rtol=1e-4, atol=1e-5)
+        for (_, slot, _), final in zip(layout, finals, strict=True):
+            torch.testing.assert_close(ref_layers["state"][slot], final.to(ref_layers["state"].dtype),
+                                       rtol=1e-4, atol=1e-5)
     manager, layers, shard = _linear(variant, (rank, world), exchange, sink, device)
     got_conv, got = _linear_step(manager, layers, variant, layout, walk, x, weight, gates, params, shard)
     r = SeqRange(shard.group, tuple(sp_seq_split(n, world)), None)
