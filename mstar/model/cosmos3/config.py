@@ -423,6 +423,12 @@ class Cosmos3Config:
     # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
+    # A generation step whose requests total more vision tokens than this runs
+    # request by request. Off by default: it is a per-GPU number. On an H100,
+    # two 832x480 Nano clips of 189 frames batched took 2.4x one's step time,
+    # and two 121-frame Edge clips were slower than serial too, so an H100
+    # deployment sets 16384 in its model_kwargs.
+    max_batched_vision_tokens: int | None = None
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
