@@ -4734,7 +4734,7 @@ class KVManager(AttentionResource):
         if stream.reads:
             tables.gather(step, None, None)
             return
-        state = self._static_plan_state(step.slot, (stream.label, 0))
+        state = self._static_plan_state(step.slot, (stream.label, 0), step.bucket.num_tokens)
         tables.gather(step, state.token_to_page, state.token_to_cache)
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:

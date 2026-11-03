@@ -165,7 +165,7 @@ def _replay(res, planner, s, promote=True):
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
         planner.gather(s.captured)
-    state = res["kv"]._static_plan_state(lease.slot, ("main", 0))
+    state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
     s.pages = state.token_to_page[: bucket.bs].tolist()
     s.offsets = state.token_to_cache[: bucket.bs].tolist()
