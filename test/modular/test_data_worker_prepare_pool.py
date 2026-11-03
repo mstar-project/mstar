@@ -107,14 +107,18 @@ class _Comm:
         return True
 
 
-def _thread(model, config=None, pending=None) -> PreprocessWorkerThread:
-    return PreprocessWorkerThread(
+def _thread(model, config=None, pending=None, sized=True) -> PreprocessWorkerThread:
+    """A data-worker thread, ``sized``: with its prepare pool sized, as its first request sizes it."""
+    wt = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_Tensors(), model=model, model_config=config, is_pending=pending,
     )
+    if sized:
+        wt._size_prepare_pool()
+    return wt
 
 
 @pytest.fixture(autouse=True)
@@ -348,13 +352,21 @@ def test_a_thread_built_without_init_prepares_inline():
 
 @pytest.mark.parametrize("workers", ["auto", 0, -2, True, 2.0])
 def test_a_bad_preprocess_workers_fails_startup(workers, tmp_path):
-    """Refused where the server starts, not by the data-worker thread, which
-    would end on it and leave every request waiting."""
-    from mstar.api_server.data_worker import PreprocessWorker
-    from mstar.communication.communicator import CommProtocol
+    """Refused by the conductor's validate_deployment with the deployment's other
+    problems; the data-worker thread, which starts before it runs, sizes its pool
+    only with the first request."""
+    from mstar.validation import DeploymentError, validate_deployment
 
-    with pytest.raises(ValueError, match="preprocess_workers"):
-        PreprocessWorker(
-            model=_Model(), model_config={"preprocess_workers": workers},
-            tensor_comm_protocol=CommProtocol.SHM, socket_path_prefix=str(tmp_path / "pw"),
-        )
+    with pytest.raises(DeploymentError, match=r"preprocess_workers must be a positive integer"):
+        validate_deployment(_Model(), {"max_seq_len": 64, "preprocess_workers": workers}, str(tmp_path / "cfg.yaml"))
+
+
+def test_the_prepare_pool_is_sized_with_the_first_request(monkeypatch):
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    wt = _thread(_Model(), {"preprocess_workers": 2}, sized=False)
+    assert wt._prepare_pool is None and wt._prepare_workers is None
+    wt._process_waiting_input(_input("a"))
+    assert wt._prepare_workers == 2 and len(wt._preparing) == 1
+    wt.model.gate("a").set()
+    wt._prepare_pool.shutdown(wait=True)
+    wt._encode_pool.shutdown()

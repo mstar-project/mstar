@@ -77,6 +77,7 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
+from mstar.validation import positive_int
 
 logger = logging.getLogger(__name__)
 
@@ -1847,12 +1848,6 @@ class WarmupMedia:
         return cls(path=path, modality=modality)
 
 
-def _positive_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return value
-
-
 @dataclass
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
@@ -1875,7 +1870,7 @@ class WarmupRequest:
         text = spec.get("text")
         if text is not None and not isinstance(text, str):
             raise ValueError("text must be a string")
-        repeat = _positive_int("repeat", spec.get("repeat", 1))
+        repeat = positive_int("repeat", spec.get("repeat", 1))
         if repeat > 1 and not text:
             raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]

@@ -285,11 +285,6 @@ class PreprocessWorker:
         """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
         server's startup check read them."""
         check_media_limits()
-        # Here, before the thread starts: the thread reads it as it starts, and
-        # a value it cannot take would end the thread with every request waiting.
-        workers = (model_config or {}).get("preprocess_workers")
-        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
-            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -675,8 +670,10 @@ class PreprocessWorkerThread:
     # class-level so a thread built without __init__ stamps no read times
     enable_prof = False
     # None (no model that declares it, one CPU's worth of workers, or a thread
-    # built without __init__) prepares every request inline
+    # built without __init__) prepares every request inline. Sized with the
+    # first request (_size_prepare_pool): None workers until then.
     _prepare_pool: ThreadPool | None = None
+    _prepare_workers: int | None = 1
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -786,27 +783,28 @@ class PreprocessWorkerThread:
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
         self._encoded: deque[EncodedOutput] = deque()
-        self._prepare_workers = self._num_prepare_workers()
-        if self._prepare_workers > 1:
-            self._prepare_pool = ThreadPool(
-                max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
-            )
+        self._prepare_workers = None
         # Requests on the prepare pool, oldest first. They reach the conductor
         # in this order, whichever finishes first.
         self._preparing: deque[PreparingInput] = deque()
 
-    def _num_prepare_workers(self) -> int:
-        """Requests prepared at once. A model has to declare that its loaders
-        and ``process_prompt`` may overlap, and client streams need their
-        appends handled behind the request, so anything else runs inline."""
-        if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
-            return 1
-        workers = (self._model_config or {}).get("preprocess_workers")
-        if workers is not None:
-            return int(workers)
-        # each request runs on this process's intra-op pool, which the config
-        # or the model may size above the plan's default
-        return cpus.plan().prepare_workers(torch.get_num_threads())
+    def _size_prepare_pool(self) -> None:
+        """Size the prepare pool: requests prepared at once. A model has to
+        declare that its loaders and ``process_prompt`` may overlap, and client
+        streams need their appends handled behind the request, so anything else
+        runs inline. Run with the first request, after the conductor's
+        validate_deployment has accepted ``preprocess_workers`` (this thread
+        starts before it runs), so a bad value is reported with the rest."""
+        workers = 1
+        if getattr(self.model, "PREPROCESS_PARALLEL", False) and not self._client_edges:
+            workers = (self._model_config or {}).get("preprocess_workers")
+            if workers is None:
+                # each request runs on this process's intra-op pool, which the
+                # config or the model may size above the plan's default
+                workers = cpus.plan().prepare_workers(torch.get_num_threads())
+        self._prepare_workers = workers
+        if workers > 1:
+            self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -1958,6 +1956,8 @@ class PreprocessWorkerThread:
         try:
             if self.timing_requested.is_set():
                 profile = self._start_profile(pre_input)
+            if self._prepare_workers is None:
+                self._size_prepare_pool()
             if self._prepare_pool is not None:
                 self._submit_prepare(pre_input, profile)
             else:
