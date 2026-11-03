@@ -239,8 +239,7 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None, rebuild=fro
 
 def _record(prompt, landed=None) -> RowRecord:
     """A prefill step that read ``prompt`` as int64 ids, as `Rebuilds.record` keeps it."""
-    ids = torch.tensor(prompt, dtype=torch.int32)
-    return RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {"is_prefill": True}, landed=landed)
+    return RowRecord({"text_inputs": [torch.tensor(prompt)]}, {"is_prefill": True}, landed=landed)
 
 
 def _kept(prompt, *sampled: int) -> KeptIds:
@@ -261,14 +260,14 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     [ids_r], [ids_a] = kept[R].records[0].inputs["text_inputs"], kept[A].records[0].inputs["text_inputs"]
     assert ids_r.tolist() == [7, 8, 9] and ids_a.tolist() == [8, 9, 10], "it kept another row's ids"
     assert len(kept[R].records) == 1, "a rebuild row would be recorded as a prefill step"
-    assert kept[R].records[0].dtypes["text_inputs"] == torch.long, (
+    assert ids_r.dtype == torch.long, (
         "the rebuild row would read its ids in another dtype than the walk's"
     )
     assert not kept[B].records, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
 
     assert _ingest(rebuilds, A, (PrefixSpan(4, 4, PREFILL),)), "a request the pool holds would stay guaranteed"
     assert not _ingest(rebuilds, R, (PrefixSpan(2, 2, PREFILL),)), "two requests' ids would share host memory"
@@ -277,7 +276,7 @@ def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
     _ingest(rebuilds, R, (PrefixSpan(4, 4, PREFILL),))
 
     rebuilds.remove_request(R)
@@ -285,6 +284,18 @@ def test_removing_a_request_gives_its_slice_back():
     assert _ingest(rebuilds, A, (PrefixSpan(4, 4, PREFILL),)), (
         "the pool would fill with removed requests' ids and keep no more"
     )
+
+
+def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
+    """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    assert _ingest(rebuilds, R, (PrefixSpan(5, 5, PREFILL),))
+    assert rebuilds._droppable[NODE][R].nbytes == 40, "keeping the prompt would overflow its slice"
+
+    rebuilds.record(_ran(PREFILL, {R: {"text_inputs": [torch.arange(5)]}}))
+
+    [kept] = rebuilds._kept[NODE][R].records[0].inputs["text_inputs"]
+    assert kept.dtype == torch.long and kept.tolist() == [0, 1, 2, 3, 4], "the rebuild would prefill other ids"
 
 
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
@@ -367,11 +378,11 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
     pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
     before it is admitted and stays out of the drops."""
-    pool = HostPool(160, torch.device("cpu"))
+    pool = HostPool(176, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, node_dtypes=DTYPES)
 
-    # each text span's ids at 4 B, aligned to 16 and 8, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 24 + 48)
+    # each text span's ids at 8 B, 24 and 16, and the image's six slots at two float32 values each
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 40 + 48)
     assert _ingest(rebuilds, A, IMAGE_CHAT)
     assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
@@ -382,7 +393,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.record(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].nbytes == 24 + 32, "the sentinels' room would stay taken for the request's life"
+    assert rebuilds._droppable[NODE][R].nbytes == 40 + 32, "the sentinels' room would stay taken for the request's life"
     assert rebuilds._kept[NODE][R].records[0].inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
 
@@ -491,9 +502,8 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     waited. The copy back runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
-    texts = [torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([4, 5], dtype=torch.int32)]
-    dtypes = {"embeds": torch.float32, "text_inputs": torch.long}
-    record = RowRecord({"embeds": [torch.ones(6, 2)], "text_inputs": texts}, dtypes, {})
+    texts = [torch.tensor([1, 2, 3]), torch.tensor([4, 5])]
+    record = RowRecord({"embeds": [torch.ones(6, 2)], "text_inputs": texts}, {})
     rebuilds._kept[NODE][R] = KeptIds((LayoutRow(VISION, 11),), [record], array("i", [6]))
 
     rebuilds.start(R, NODE, None)
@@ -535,9 +545,8 @@ def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
-    texts = [torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([4, 5], dtype=torch.int32)]
-    dtypes = {"embeds": torch.float32, "text_inputs": torch.long}
-    record = RowRecord({"embeds": [embeds], "text_inputs": texts}, dtypes, metadata)
+    texts = [torch.tensor([1, 2, 3]), torch.tensor([4, 5])]
+    record = RowRecord({"embeds": [embeds], "text_inputs": texts}, metadata)
     rebuilds._kept[NODE][R] = KeptIds((LayoutRow(VISION, 11),), [record], array("i", [6, 7]))
 
     rebuild = rebuilds.start(R, NODE, None)
@@ -841,3 +850,29 @@ def test_a_request_dropped_in_a_later_prompt_step_reruns_the_steps_before_it_the
         (PREFILL, 3, 3, False), (VISION, 4, 11, True),
     ], "the rebuild would write the second step's chunks where the first step's KV was"
     assert not cursor.resumes_prefill, "the first row would be cut from the second step's input"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts the device's allocations")
+# a walk reads a Qwen3.5 prompt with images as one tensor of ids for each run of text
+@pytest.mark.parametrize("tensors", [1, 2])
+def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy(tensors):
+    device = torch.device("cuda")
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 12, device))
+    assert _ingest(rebuilds, R, (PrefixSpan(256, 256, PREFILL),))
+    prompt = torch.arange(256, device=device)
+    step_done = torch.Event(device=device)
+    step_done.record()
+    step = _ran(PREFILL, {R: {"text_inputs": list(prompt.tensor_split(tensors))}})
+    step.completion_event = step_done
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+
+    rebuilds.record(step)
+    [record] = rebuilds._kept[NODE][R].records
+    record.landed.synchronize()
+
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated, (
+        "a cast on the pool's stream made every later decode step 0.16 ms slower at Qwen3.5-9B TP2"
+    )
+    assert [ids.tolist() for ids in record.inputs["text_inputs"]] == [
+        ids.tolist() for ids in torch.arange(256).tensor_split(tensors)
+    ], "the rebuild would prefill other ids, or join the runs of text"
