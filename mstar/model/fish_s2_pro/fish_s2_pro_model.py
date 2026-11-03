@@ -216,7 +216,7 @@ class FishS2ProModel(Model):
         slow everyone streaming."""
         cap = config.get("max_concurrent_requests")
         overrides = (config.get("resources") or {}).get(CODEC_STATE) or {}
-        streams = int(overrides.get("max_slots", self.MAX_CODEC_STREAMS + 1)) - 1
+        streams = int(overrides.get("max_slots") or self.MAX_CODEC_STREAMS + 1) - 1
         if cap is not None and int(cap) > streams:
             raise ValueError(
                 f"{config_path}: max_concurrent_requests={cap} but resources.{CODEC_STATE} holds "
