@@ -2,9 +2,10 @@
 a release, the ones that need nothing from the transport.
 
 Two things have to hold. What is stored, what it resolves to, its refcounts and
-when it goes away must match the Python store the Python graph runtime uses
-(``MSTAR_RUST_GRAPH=0``) -- a divergence is a tensor freed under a reader, or
-one held until its request ends. And a tensor the transport still has state
+when it goes away must match the Python store (``TensorStore`` over
+``PythonTensorBookkeeping``, the fallback where the extension does not
+import) -- a divergence is a tensor freed under a reader, or one held until
+its request ends. And a tensor the transport still has state
 for (registered memory, an arena slot, a per-uuid file, a shard dim to undo)
 must still reach the transport's teardown, since only a reported uuid does.
 """
