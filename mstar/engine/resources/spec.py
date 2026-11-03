@@ -319,6 +319,21 @@ def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> 
     )
 
 
+def apply_resource_block(spec: NodeResourceSpec, block: Mapping[str, Any]) -> None:
+    """One ``resources:`` block on its spec: ``sp_exchange``, which every spec takes from its
+    ``sp_exchanges``, and the rest through the spec's own ``apply_yaml_overrides``. A key the spec
+    doesn't take is a TypeError, a value it can't take a ValueError."""
+    block = dict(block)
+    if "sp_exchange" in block:
+        choice = block.pop("sp_exchange")
+        if not spec.sp_exchanges:
+            raise ValueError(f"resource {spec.resource_key!r} takes no sp_exchange; got {choice!r}")
+        if choice not in spec.sp_exchanges:
+            raise ValueError(f"sp_exchange must be one of {', '.join(spec.sp_exchanges)}; got {choice!r}")
+        spec.sp_exchange = choice
+    spec.apply_yaml_overrides(**block)
+
+
 def apply_yaml_overrides(
     specs: Sequence[NodeResourceSpec], model_config: Mapping[str, Any],
 ) -> None:
@@ -341,19 +356,8 @@ def apply_yaml_overrides(
     if unknown:
         raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
-        spec = by_key[key]
-        if isinstance(kwargs, Mapping) and "sp_exchange" in kwargs:
-            kwargs = dict(kwargs)
-            choice = kwargs.pop("sp_exchange")
-            if not spec.sp_exchanges:
-                raise ValueError(f"resources.{key}: resource {key!r} takes no sp_exchange; got {choice!r}")
-            if choice not in spec.sp_exchanges:
-                raise ValueError(
-                    f"resources.{key}: sp_exchange must be one of {', '.join(spec.sp_exchanges)}; got {choice!r}"
-                )
-            spec.sp_exchange = choice
         try:
-            spec.apply_yaml_overrides(**kwargs)
+            apply_resource_block(by_key[key], kwargs)
         except TypeError as e:
             # a key the resource doesn't take: a bad config, as every other problem here is
             raise ValueError(f"resources.{key}: {e}") from e

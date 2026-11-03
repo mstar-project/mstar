@@ -419,10 +419,13 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      r"KV 'kv''s stored positions"),
     ([_shard(), _attention(), *_linear()], dict(sp_size=2), {"linear": {"sp_exchange": "ring"}},
      r"resources.linear: sp_exchange must be one of ulysses, state_passing; got 'ring'"),
+    # a paged attention's split is its node's shard's exchange, not a setting of its own
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
+     r"resources.attn: resource 'attn' takes no sp_exchange; got 'all_gather'"),
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
         "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
         "axis0_cross", "shard_misses_a_node", "linear_ulysses_heads", "linear_state_passing_head_dims",
-        "linear_axis1", "linear_beside_a_ring", "linear_unknown_exchange"])
+        "linear_axis1", "linear_beside_a_ring", "linear_unknown_exchange", "attention_exchange"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)

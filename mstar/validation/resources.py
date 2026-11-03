@@ -11,6 +11,7 @@ from mstar.engine.resources.runner import topo_sort
 from mstar.engine.resources.spec import (
     TOP_LEVEL_KV_CACHE,
     NodeResourceSpec,
+    apply_resource_block,
     derive_specs,
     spec_dependency_problems,
     unknown_overrides_message,
@@ -73,7 +74,7 @@ def _apply_overrides(
         if key not in by_key:
             continue
         try:
-            by_key[key].apply_yaml_overrides(**kwargs)
+            apply_resource_block(by_key[key], kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
     # after the overrides, so a page size from the YAML is checked against the pool's window
