@@ -311,21 +311,20 @@ class Resource(ABC):
         when it needs none, or the outcome that fails it when it can never fit."""
         return None
 
-    # whether a request may pass the first one waiting for this resource while that one can't start
-    passes = False
-
-    def may_pass(self) -> bool:
-        """Whether some request could pass the first one now, on a resource that `passes`."""
-        return False
-
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
-        passing: bool = False,
     ) -> object | None:
         """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
-        against for `grew_since`. ``passing`` asks for ``rid`` behind a first request that can't
-        start, on a resource that `passes`."""
+        against for `grew_since`."""
         return None
+
+    def reserve_past(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+    ) -> object | None:
+        """`reserve` for ``rid`` behind the first request in this resource's queue, which can't start:
+        take what ``rid`` asked for while leaving that request what it needs, or return a mark. The
+        base refuses, so a resource that doesn't override it keeps its queue in order."""
+        return 0
 
     def unreserve(self, rid: str) -> None:
         """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""

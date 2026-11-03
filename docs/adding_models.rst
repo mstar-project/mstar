@@ -1337,8 +1337,8 @@ instead.
 - ``ask(rid, node_name, graph_walk)`` returns ``ASKS`` while the request needs this resource's
   capacity to start on the node, None when it needs none, or a failing outcome when it can
   never fit.
-- ``reserve(rid, node_name, graph_walk, published, passing=False)`` takes what the request asked
-  for and returns None, or returns a mark of what it didn't fit against.
+- ``reserve(rid, node_name, graph_walk, published)`` takes what the request asked for and returns
+  None, or returns a mark of what it didn't fit against.
 - ``unreserve(rid)`` gives back what ``reserve`` took, when another resource the request asks
   didn't fit.
 - ``grew_since(mark)`` says whether a request that didn't fit against ``mark`` may fit now. The
@@ -1346,13 +1346,12 @@ instead.
   one call.
 
 A request is admitted once it is first in every queue it waits in. A resource may also let a later
-request pass a first request that can't start:
-
-- ``passes = True`` opts in. A resource that leaves it False keeps strict order, and a request
-  waiting in its queue can't pass anywhere.
-- ``may_pass()`` says whether any request could pass now.
-- ``reserve(..., passing=True)`` takes the passer's capacity behind the blocked first request. The
-  resource decides what it keeps for that request, so passing can't starve it.
+request pass a first request that can't start, by overriding
+``reserve_past(rid, node_name, graph_walk, published)``. It takes the passer's capacity while
+leaving the first request what it needs, so passing can't starve that request, or returns a mark.
+The runner calls it only while the first request didn't fit and the resource hasn't grown since. A
+resource that doesn't override it keeps strict order, and a request waiting in its queue can't pass
+anywhere.
 
 Step 3 — Declare the computation graph
 --------------------------------------

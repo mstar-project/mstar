@@ -29,7 +29,8 @@ class Admission:
 
     A waiting request is admitted once it is first in every queue it is in and each resource it
     asked reserves for it, all or nothing. It may also pass a first request that can't start, in a
-    queue whose resource `passes`, when it is first in every other queue it is in (`_pass`).
+    queue whose resource overrides `Resource.reserve_past`, when it is first in every other queue it
+    is in (`_pass`).
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -44,6 +45,7 @@ class Admission:
         # `_admitted` holds the nodes each request was admitted on, with the walk each was admitted for.
         # `_started` holds, for a request admitted during one node's check, the other nodes waiting on
         # it, which `admit_waiting` reports so their parked checks resume.
+        # `_passes` holds the resources that override `Resource.reserve_past`, whose queues a request may pass.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
         self._numbered: list[str] = []
@@ -53,6 +55,7 @@ class Admission:
         self._untried = False
         self._admitted: dict[str, dict[str, str]] = {}
         self._started: dict[str, set[str]] = {}
+        self._passes = {key for key in ask_order if type(resources[key]).reserve_past is not Resource.reserve_past}
 
     def set_arrival(self, rid: str, arrival: int) -> None:
         """Order ``rid`` by the conductor's arrival number. A worker serving two of the request's partitions
@@ -127,8 +130,8 @@ class Admission:
         Nothing is tried until a resource whose first waiting request didn't fit has grown, or a
         queue has a new first request, so a pass that changed neither costs one
         `Resource.grew_since` for each such resource. After the in-order sweep, while a resource
-        that `passes` has a first request that can't start, each later waiting request is tried, in
-        arrival order, to pass it.
+        that lets requests pass has a first request that can't start, each later waiting request is
+        tried, in arrival order, to pass it.
         """
         started = []
         if self._started:
@@ -157,7 +160,7 @@ class Admission:
                     admitted = True
         # the last sweep admitted nothing, so it tried every queue's first request
         self._untried = False
-        if any(self._resources[key].passes and self._resources[key].may_pass() for key in self._short):
+        if any(key in self._passes for key in self._short):
             for rid in sorted(self._waiting, key=self._arrival.__getitem__):
                 if rid in self._waiting and (nodes := self._pass(rid, lambda node, rid=rid: published_of(rid, node))):
                     started.extend((node, rid) for node in nodes)
@@ -198,9 +201,9 @@ class Admission:
         taken: list[str] = []
         for key, (node_name, graph_walk) in entry.asked.items():
             published = published_of(node_name)
-            args = (rid, node_name, graph_walk, None if published is None else published.get(key))
-            reserve = self._resources[key].reserve
-            mark = reserve(*args, passing=True) if key in passing else reserve(*args)
+            resource = self._resources[key]
+            reserve = resource.reserve_past if key in passing else resource.reserve
+            mark = reserve(rid, node_name, graph_walk, None if published is None else published.get(key))
             if mark is not None:
                 for done in taken:
                     self._resources[done].unreserve(rid)
@@ -217,23 +220,27 @@ class Admission:
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
     ) -> dict[str, str] | None:
         """Admit ``rid`` past the first request of each queue it waits behind, when that request can't
-        start and the queue's resource `passes`, and ``rid`` is first wherever else it waits. Return the
-        nodes waiting on it, or None."""
+        start and the queue's resource lets requests pass, and ``rid`` is first wherever else it waits.
+        Return the nodes waiting on it, or None."""
         passing = []
         for key in self._waiting[rid].asked:
             first = self._queues[key][0]
             if first == rid:
                 if key in self._short:
                     return None
-            elif self._resources[key].passes and self._blocked(first):
+            elif key in self._passes and self._blocked(first):
                 passing.append(key)
             else:
                 return None
         return self._reserve(rid, published_of, passing) if passing else None
 
     def _blocked(self, rid: str) -> bool:
-        """Whether ``rid`` is first in a queue whose resource it didn't fit."""
-        return any(key in self._short and self._queues[key][0] == rid for key in self._waiting[rid].asked)
+        """Whether ``rid`` is first in a queue whose resource it didn't fit and hasn't grown since, so it
+        can't start now."""
+        return any(
+            key in self._short and self._queues[key][0] == rid and not self._resources[key].grew_since(self._short[key])
+            for key in self._waiting[rid].asked
+        )
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,

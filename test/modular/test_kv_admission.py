@@ -301,8 +301,6 @@ def test_a_request_passes_beside_a_recurrent_pool_only_while_a_slot_is_left_for_
 class _Slots(Resource):
     """A pool that lets a request pass and has no slot for ``refused``."""
 
-    passes = True
-
     def __init__(self, refused: str):
         self.refused, self.held = refused, set()
 
@@ -313,11 +311,13 @@ class _Slots(Resource):
     def ask(self, rid, node_name, graph_walk):
         return None if rid in self.held else ASKS
 
-    def reserve(self, rid, node_name, graph_walk, published, passing=False):
+    def reserve(self, rid, node_name, graph_walk, published):
         if rid == self.refused:
             return 0
         self.held.add(rid)
         return None
+
+    reserve_past = reserve
 
     def unreserve(self, rid):
         self.held.discard(rid)
@@ -339,8 +339,6 @@ def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds
 class _Gate(Resource):
     """A pool every request asks, which refuses the requests in ``refused``."""
 
-    passes = True
-
     def __init__(self):
         self.refused, self.held, self.moved = set(), set(), 0
 
@@ -351,11 +349,13 @@ class _Gate(Resource):
     def ask(self, rid, node_name, graph_walk):
         return None if rid in self.held else ASKS
 
-    def reserve(self, rid, node_name, graph_walk, published, passing=False):
+    def reserve(self, rid, node_name, graph_walk, published):
         if rid in self.refused:
             return self.moved
         self.held.add(rid)
         return None
+
+    reserve_past = reserve
 
     def unreserve(self, rid):
         self.held.discard(rid)
@@ -389,6 +389,25 @@ def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
     _laid_out(kv, "q", HELD + list(range(5000, 5008)), keyed=True)
 
     assert not _ready(kv, "q"), "a request passed into the page kept for the head, lost when the gate refused the head"
+
+
+def test_no_request_passes_a_head_that_fits_now():
+    kv = _manager(max_num_pages=16)
+    head = list(range(3000, 3000 + 5 * PAGE_SIZE))
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    # "s" is admitted for the head's first two pages and hasn't written them
+    _laid_out(kv, "s", head[:2 * PAGE_SIZE], keyed=True)
+    assert _ready(kv, "s")
+    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - 3) * PAGE_SIZE)))
+    _laid_out(kv, "head", head, keyed=True)
+    assert not _ready(kv, "head")
+    # "s" writes and files those pages, which the head now hits, so the head fits in the room it waited for
+    _probe(kv, "s", 2 * PAGE_SIZE)
+    _grow(kv, "s", 2 * PAGE_SIZE)
+    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
+    _runner(kv).admit_retrieve("p", NODE, WALK, None)
+
+    assert _ready(kv, "head"), "a request passed the head on the head's last ask, though the head fits now"
 
 
 def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():

@@ -4363,19 +4363,11 @@ class KVManager(AttentionResource):
         caps = {loop: cap if loop in self.local_loops else 0 for loop, cap in (overrides.loop_caps or {}).items()}
         return overrides.pages(self._nodes, caps, self.config)
 
-    # a request may pass the first waiting request while it doesn't fit; see `reserve`
-    passes = True
-
     def reserve(
-        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None, passing: bool = False,
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> RoomMark | None:
         """Allot ``rid`` its prompt, less the cache hits another request holds, or what it returns with
-        from a drop or the host, or grow its allotment by the shortage it waits on.
-
-        A request ``passing`` the first one, while that one doesn't fit, is allotted its growth too (`_pass`).
-        """
-        if passing:
-            return self._pass(rid, node_name, graph_walk, published)
+        from a drop or the host, or grow its allotment by the shortage it waits on."""
         with self._lock:
             if self._host_copies:
                 self._land_host_copies()
@@ -4396,19 +4388,20 @@ class KVManager(AttentionResource):
             self._allotments[rid].kept, self._kept = self._kept, 0
             return None
 
-    def _pass(
+    def reserve_past(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> RoomMark | None:
-        """Allot ``rid`` past a first request that doesn't fit, when what its own admission would take and the
-        growth that admission leaves to the room fit in the room less the pages kept for that request.
+        """Allot ``rid`` past the first request in the queue, when what its own admission would take and the
+        growth that admission leaves to the room fit in the room less `_kept`.
 
         For a guaranteed request and one returning from a drop or the host, its admission already takes its
-        footprint, so passing costs it nothing more.
+        footprint, so passing costs it nothing more. A request that holds an allotment waits for its shortage
+        in order.
         """
         with self._lock:
             room = self._room()
             refused = RoomMark(rid, node_name, graph_walk, published, room, 0, 0)
-            if not self._may_pass() or rid in self._allotments:
+            if room <= self._kept or rid in self._allotments:
                 return refused
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
@@ -4418,7 +4411,7 @@ class KVManager(AttentionResource):
             self._root_chain(prefix_chain)
         with self._lock:
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
-            if not self._may_pass(pages):
+            if pages > self._room() - self._kept:
                 return refused
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
@@ -4502,15 +4495,6 @@ class KVManager(AttentionResource):
         if self._index is None:
             return 0, 0
         return self._index.filed + sum(pool.filed for pool in self._snapshots), self._index.taken
-
-    def may_pass(self) -> bool:
-        with self._lock:
-            return self._may_pass()
-
-    def _may_pass(self, need: int = 1) -> bool:
-        """Whether ``need`` pages fit in the room less the pages kept for the head. The default ``need`` is
-        the fewest pages a request takes."""
-        return need <= self._room() - self._kept
 
     def _keep_for_head(self, allotment: Allotment | None, room: int) -> None:
         """When ``allotment`` belongs to a request that passed a head, and a request waits, keep for the head
