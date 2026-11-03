@@ -13,7 +13,7 @@ class RebuildPolicy:
     and every id it has sampled since, but the last, which the next decode step reads.
 
     ``ids_input`` is the input that carries the prompt's ids, and the row's ids go under it. Whatever else the node
-    reads in a walk, such as the encoder's output a prompt with images reads, the worker copies to the host when the
+    reads in a walk, such as the encoder's output for a prompt with images, the worker copies to the host when the
     walk prefills a request, and the rebuild row reads it again. ``copy_bytes_per_slot`` gives, for each such walk,
     what one KV slot of those copies takes in the dtype the node runs in.
     ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of

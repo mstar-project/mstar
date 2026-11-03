@@ -343,7 +343,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
 
 def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     """The image copies queued every input of every prefill row at once, behind which the next step's output copy
-    waited on the device's one copy engine. They share the allowance #876's page writes keep to, and go first."""
+    waited on the device's one copy engine. They share one allowance with #876's page writes, and go first."""
     allowance = StepAllowance(24)
     rebuilds = _copying(R)
     rebuilds._allowance = allowance
@@ -403,8 +403,8 @@ def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
 
 
 def test_rebuild_tokens_count_the_slots_a_rebuild_runs():
-    """`rebuild_tokens` counted only text ids, so the slots of an image the rebuild recomputes were left out, and it
-    counted a cached prefix the rebuild never ran."""
+    """`rebuild_tokens` counted only text ids, so it left out the image slots the rebuild recomputes, and it counted
+    a cached prefix the rebuild never ran."""
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     _ingest(rebuilds, R, IMAGE_CHAT)
     rebuilds.keep_prompts(_ran(VISION, {R: {"text_inputs": [torch.arange(3), torch.arange(2)]}}))

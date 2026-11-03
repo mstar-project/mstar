@@ -39,7 +39,8 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 class HostCopies:
     """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
     ``slots`` of its KV. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
-    started, and ``landed`` is recorded after the last copy that has, None where the copies run in place."""
+    started, and ``landed`` is recorded after the last copy that has started, None where the copies run in
+    place."""
     slots: int = 0
     inputs: NameToTensorList | None = None
     queued: int = 0
@@ -227,8 +228,8 @@ class Rebuilds:
 
         A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps
         ``rid``'s ids only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
-        is False. It takes the pool's room for them now, so a request the pool can't hold is known before it is
-        admitted, and no drop can free it there."""
+        is False. A node takes the pool's room for the ids and host copies now, so a request the pool can't hold is
+        known before it is admitted and is never dropped on that node."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
         for key, nodes in writes.items():
@@ -343,8 +344,7 @@ class Rebuilds:
             queued.copies.queued -= 1
 
     def _trim(self, node: str, rid: int, used: int) -> None:
-        """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
-        keeps."""
+        """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
         room = self._droppable[node][rid]
         if used < room.piece.nbytes:
             self._pool.give(HostSlice(room.piece.offset + used, room.piece.nbytes - used))
@@ -462,7 +462,7 @@ class Rebuilds:
         """Give each rebuild row of ``rids`` its walk and its inputs, and return the events the step waits on before
         it reads them.
 
-        A row reads what its source holds. A rebuild of a prompt mid-prefill runs every chunk from the input the
+        A rebuild of a prompt mid-prefill runs every chunk from the input the
         engine keeps for the prompt, under the prompt's own step metadata. Any other runs under its prefill's
         recorded metadata and reads the log: its kept ids, split as its prefill row read them with the ids sampled
         since appended to the last tensor, and its host copies, both on the device when it runs its first chunk or
