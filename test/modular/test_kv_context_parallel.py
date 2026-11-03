@@ -1498,6 +1498,25 @@ def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_sha
     assert isinstance(attn.admit(step, ctx).reason, AllocationFailed)
 
 
+def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partners_own_queries_fit(monkeypatch):
+    """Under ``kv_gather`` (a pool stored by head, on SP ranks whose steps split) each rank plans its
+    contiguous pieces of the step's rows, which can take the FA planner past its cap where the whole
+    step fits: rows of 8 and 1 queries split 5 | 3, 1, and 16 heads put the step on two-tile
+    clusters and partner 1 on one-tile ones. Admission counts them, as it does a placed pool's."""
+    _fa_kernel(monkeypatch)
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=16, flashinfer_backend="fa2",
+                            placed=False, shard=SequenceShard(("main",), 0, None, 0, joint.sp_group))
+    assert attn._split_exchange == "kv_gather" and attn._placement is None
+    step = AttentionStep(segments=(Segment("r0", "main", 8), Segment("r1", "main", 1)))
+    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
+    context = fm.fa_work_items_bound(np.array([0, 8, 9]), 16, 132)
+    assert fm.fa_work_items_bound(np.array([0, 3, 4]), 16, 132) > context
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", context)
+    refused = attn.admit(step, ctx).reason
+    assert refused is not None and "the gathered latents of KV pool 'kv'" in refused.message
+
+
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):
     """A decode step's context is planned at every partner's heads, a count bind doesn't check, and
     over each rank's own KV lengths, so FA's causal tile-bound check could refuse it on one rank

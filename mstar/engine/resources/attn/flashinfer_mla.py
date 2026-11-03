@@ -17,6 +17,7 @@ import math
 import numpy as np
 import torch
 
+from mstar.distributed.communication import sp_seq_split
 from mstar.engine.resources.attn.base import (
     AttentionManager,
     EagerSlotKey,
@@ -35,6 +36,7 @@ from mstar.engine.resources.context_parallel import (
 )
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.sequence_shard import SeqRange
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitOutcome,
@@ -89,6 +91,12 @@ def _sm_count(device: torch.device) -> int | None:
     """The device's SMs; None off CUDA, where the torch fallback plans."""
     device = torch.device(device)
     return torch.cuda.get_device_properties(device).multi_processor_count if device.type == "cuda" else None
+
+
+def _partner_queries(pieces: np.ndarray) -> list[np.ndarray]:
+    """Each partner's qo_indptr under ``kv_gather``: its piece of each row it holds any of
+    (``SeqRange.row_pieces``)."""
+    return [np.concatenate([[0], np.cumsum(piece[piece > 0])]) for piece in pieces]
 
 
 @functools.cache
@@ -410,7 +418,8 @@ class FlashInferMLAManager(AttentionManager):
                 raise ValueError(
                     f"MLA attention over {what} {self._kv_cache_name!r} plans on FlashInfer's "
                     f"FA planner, whose causal tile-bound check can refuse a step at {heads} query heads a rank: "
-                    "use a TP size that gives each rank a head count dividing 64, or turn context_parallel off"
+                    "use a TP size that gives each rank a head count dividing 64, or "
+                    + ("turn context_parallel off" if self._placement is not None else "run the node on TP ranks")
                 )
             self._fa_sm_count = _sm_count(self._device)
             if self._fa_sm_count is not None:
@@ -484,7 +493,8 @@ class FlashInferMLAManager(AttentionManager):
         return True
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
-        """Over a placed pool on the FA planner, refuses a step its planner may not hold
+        """Where each rank plans its own lengths on the FA planner (a placed pool, or ``kv_gather``'s
+        own queries), refuses a step its planner may not hold
         (``_refuse_unplannable``) before it is planned, so the worker retries it smaller:
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
@@ -501,7 +511,7 @@ class FlashInferMLAManager(AttentionManager):
         if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
-                f"context-parallel KV pool {self._kv_cache_name!r}"
+                f"{self._planned_over()} {self._kv_cache_name!r}"
         # sized by the real rows: a capture's padding rows (no queries, but they move the planner's
         # tile) go with the bucket, so each retry is strictly smaller
         real = [rid for rid in rows if not ctx.is_padding_row(rid)]
@@ -526,24 +536,34 @@ class FlashInferMLAManager(AttentionManager):
 
     def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
-        the FA planner's work-item cap: its context's, and under SP placement every partner's
-        zigzag share of its own tokens, padded as a capture of ``captured_tokens`` pads it."""
-        heads, size = self._wrapper_kwargs["num_qo_heads"], self._placement.size
+        the FA planner's work-item cap: its context's; under SP placement every partner's zigzag
+        share of its own tokens, padded as a capture of ``captured_tokens`` pads it; and under
+        ``kv_gather`` every partner's own queries, should the step split (a leased one doesn't)."""
+        heads, placement = self._wrapper_kwargs["num_qo_heads"], self._placement
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
             plans = [qo]
-            if self._placement.over_sp:
+            if placement is not None and placement.over_sp:
+                size = placement.size
                 shares = [zigzag_share(qo, size, index) for index in range(size)]
                 if captured_tokens is not None:
                     shape = zigzag_capture(size, len(qo) - 1, captured_tokens)
                     shares = [padded_share(share, *shape) for share in shares]
                 plans += shares
+            elif placement is None and captured_tokens is None:
+                group = self._shard.group
+                r = SeqRange(group, tuple(sp_seq_split(int(qo[-1]), group.world_size)), None)
+                plans += _partner_queries(r.row_pieces(np.diff(qo).tolist()))
             if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
                 return False
         return True
 
+    def _planned_over(self) -> str:
+        # what each rank plans its own lengths over, for the refusals' messages
+        return "context-parallel KV pool" if self._placement is not None else "the gathered latents of KV pool"
+
     def _cap_hint(self) -> str:
-        if self._placement.over_sp:
+        if self._placement is None or self._placement.over_sp:
             return ""
         return (f" Under TP placement each rank plans every partner's query heads, so a step reaches the cap "
                 f"{self._placement.size}x sooner; placing positions over SP ranks avoids that.")
@@ -617,8 +637,8 @@ class FlashInferMLAManager(AttentionManager):
         stored = indptrs.kv_lens.numpy().astype(np.int64) - spans
         pieces = r.row_pieces(spans.tolist())
         if self._plan_check is not None:
-            for j in range(r.group.world_size):
-                self._plan_check(f"partner {j}'s queries", np.concatenate([[0], np.cumsum(pieces[j][pieces[j] > 0])]))
+            for j, partner in enumerate(_partner_queries(pieces)):
+                self._plan_check(f"partner {j}'s queries", partner)
         mine = pieces[r.group.rank]
         rows = np.flatnonzero(mine)
         ends = stored + (pieces[: r.group.rank + 1].sum(0) if causal else spans)
@@ -650,7 +670,7 @@ class FlashInferMLAManager(AttentionManager):
         if bound > _FA_MAX_WORK_ITEMS:
             raise ValueError(
                 f"{what}, {int(qo_indptr[-1])} queries at {heads} heads, can take FlashInfer's "
-                f"FA MLA planner up to {bound} work items over context-parallel KV pool "
+                f"FA MLA planner up to {bound} work items over {self._planned_over()} "
                 f"{self._kv_cache_name!r}, past its cap of {_FA_MAX_WORK_ITEMS}.{self._cap_hint()}"
             )
 
