@@ -1,9 +1,10 @@
 """Fused-MoE backend choice, without a GPU.
 
-AUTO is Triton everywhere. The Triton backend takes get_config's tuned table
-(test_fused_moe_config.py covers the lookup). Without one NVIDIA runs the
-kernel's own default config and AMD adds num_stages=2. The AITER backend
-refuses unsupported platforms and sizes up front.
+AUTO is Triton, except AITER for the expert sizes and AMD GPUs listed in
+AITER_PROBLEMS, where the layer never skips rows. The Triton backend takes
+get_config's tuned table (test_fused_moe_config.py covers the lookup). Without
+one NVIDIA runs the kernel's own default config and AMD adds num_stages=2. The
+AITER backend refuses unsupported platforms and sizes up front.
 """
 
 from __future__ import annotations
@@ -22,12 +23,17 @@ from mstar.utils.fused_moe.backend import (
     MoEBackend,
     MoEProblem,
     TritonFusedMoE,
+    auto_backend,
     make_moe_backend,
 )
+from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
 from mstar.utils.fused_moe.kernels import get_default_config
 
 THINKER = MoEProblem(num_experts=128, intermediate_size=768, hidden_size=2048, top_k=8)
+THINKER_TP2 = MoEProblem(num_experts=128, intermediate_size=384, hidden_size=2048, top_k=8)
+TALKER = MoEProblem(num_experts=128, intermediate_size=384, hidden_size=1024, top_k=6)
 TALKER_TP2 = MoEProblem(num_experts=128, intermediate_size=192, hidden_size=1024, top_k=6)
+MI325X = "AMD_Instinct_MI325X"
 
 
 @pytest.fixture
@@ -57,6 +63,53 @@ def test_unknown_backend_is_an_error(on_platform):
     on_platform(CudaPlatform())
     with pytest.raises(ValueError):
         make_moe_backend("cutlass", THINKER)
+
+
+@pytest.fixture
+def aiter_installed(monkeypatch):
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object() if name == "aiter" else real(name, *a))
+
+
+def test_auto_runs_aiter_for_the_qwen3_omni_thinker_on_mi325x(on_platform, aiter_installed):
+    on_platform(RocmPlatform(), device_name=MI325X)
+    assert auto_backend(THINKER) is MoEBackend.AITER
+    assert type(make_moe_backend("auto", THINKER)) is AiterFusedMoE
+
+
+@pytest.mark.parametrize("problem", [TALKER, THINKER_TP2, MoEProblem(64, 768, 2048, 8)], ids=repr)
+def test_auto_keeps_triton_for_other_expert_sizes_on_mi325x(on_platform, aiter_installed, problem):
+    on_platform(RocmPlatform(), device_name=MI325X)
+    assert type(make_moe_backend("auto", problem)) is TritonFusedMoE
+
+
+@pytest.mark.parametrize("platform,device_name", [
+    (RocmPlatform(), "AMD_Instinct_MI300X"),
+    (RocmPlatform(), None),
+    (CudaPlatform(), MI325X),
+    (CpuPlatform(), MI325X),
+], ids=repr)
+def test_auto_keeps_triton_on_gpus_aiter_was_not_measured_on(on_platform, aiter_installed, platform, device_name):
+    on_platform(platform, device_name=device_name)
+    assert type(make_moe_backend("auto", THINKER)) is TritonFusedMoE
+
+
+def test_auto_keeps_triton_without_aiter(on_platform, monkeypatch):
+    on_platform(RocmPlatform(), device_name=MI325X)
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "aiter" else real(name, *a))
+    assert type(make_moe_backend("auto", THINKER)) is TritonFusedMoE
+
+
+def test_auto_keeps_triton_for_layers_that_skip_rows(on_platform, aiter_installed):
+    on_platform(RocmPlatform(), device_name=MI325X)
+    assert type(make_moe_backend("auto", THINKER, skips_rows=True)) is TritonFusedMoE
+
+
+def test_the_knob_forces_either_backend_on_mi325x(on_platform, aiter_installed):
+    on_platform(RocmPlatform(), device_name=MI325X)
+    assert type(make_moe_backend("triton", THINKER)) is TritonFusedMoE
+    assert type(make_moe_backend("aiter", TALKER)) is AiterFusedMoE
 
 
 @pytest.mark.parametrize("m", [1, 8, 128, 129, 4096])
@@ -157,8 +210,8 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
     on_platform(CpuPlatform())
     built = []
 
-    def fake_make(kind, problem):
-        built.append((kind, problem))
+    def fake_make(kind, problem, skips_rows=False):
+        built.append((kind, problem, skips_rows))
         return _RecordingBackend(problem)
 
     monkeypatch.setattr(moe_module, "make_moe_backend", fake_make)
@@ -168,7 +221,8 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
         kwargs["shared_expert"] = GatedMLP(hidden_size=64, intermediate_size=32, activation="silu")
     with torch.device("meta"):
         block = getattr(moe_module, block_name)(**kwargs)
-    assert built == [("triton", MoEProblem(4, 32, 64, 2))]
+    # EP dispatch passes skip_invalid on every call
+    assert built == [("triton", MoEProblem(4, 32, 64, 2), block_name == "ExpertParallelSparseMoeBlock")]
 
     container = torch.nn.Sequential(block)
     moe_module.prepare_moe_weights(container)
@@ -176,24 +230,25 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
 
 
 @pytest.mark.parametrize("parallel", ["tp", "ep"])
-def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatch, parallel):
+@pytest.mark.parametrize("mask_padding", [False, True])
+def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatch, parallel, mask_padding):
     from mstar.model.components import MoeParallelConfig, instantiate_moe_block
     from mstar.model.components import moe as moe_module
 
     on_platform(CpuPlatform())
     built = []
 
-    def fake_make(kind, problem):
-        built.append(kind)
+    def fake_make(kind, problem, skips_rows=False):
+        built.append((kind, skips_rows))
         return _RecordingBackend(problem)
 
     monkeypatch.setattr(moe_module, "make_moe_backend", fake_make)
     with torch.device("meta"):
         instantiate_moe_block(
             hidden_size=64, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
-            moe_parallel=MoeParallelConfig(parallel=parallel), moe_backend="aiter",
+            moe_parallel=MoeParallelConfig(parallel=parallel, mask_padding=mask_padding), moe_backend="aiter",
         )
-    assert built == ["aiter"]
+    assert built == [("aiter", parallel == "ep" or mask_padding)]
 
 
 @pytest.mark.parametrize("skip_invalid", [False, True])
