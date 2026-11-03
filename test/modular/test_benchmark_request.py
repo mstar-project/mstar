@@ -7,8 +7,9 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
-from benchmark.base import Model, RequestType  # noqa: E402
+from benchmark.base import Model, Orpheus, RequestType  # noqa: E402
 from benchmark.request import (  # noqa: E402
+    OursOpenAI,
     RequestInput,
     RequestMetrics,
     SGLangOmni,
@@ -101,3 +102,19 @@ def test_an_audio_chunk_with_completion_tokens_zero_keeps_the_text_count():
     req = RequestInput(req_type=RequestType.T2T, prompt="hi")
     m = asyncio.run(SGLangOmni().send_request(_Session(lines + [b"data: [DONE]"]), req, "http://x", 0, _TextModel()))
     assert m.output_text_tokens == 7
+
+
+@pytest.mark.parametrize(
+    ("system", "model", "req_type"),
+    [
+        pytest.param(SGLangOmni, _TextModel, RequestType.T2T, id="sglang_omni"),
+        pytest.param(OursOpenAI, Orpheus, RequestType.T2S, id="mstar_audio_speech"),
+    ],
+)
+def test_the_stamped_output_length_reaches_the_payload(system, model, req_type):
+    """The runner stamps max_tokens / ignore_eos per request; an engine that
+    drops them generates its own lengths in a fixed-length comparison (#1044)."""
+    session = _Session()
+    req = RequestInput(req_type=req_type, prompt="hi", model_kwargs={"max_tokens": 33, "ignore_eos": True})
+    asyncio.run(system().send_request(session, req, "http://x", 0, model()))
+    assert (session.payload["max_tokens"], session.payload["ignore_eos"]) == (33, True)

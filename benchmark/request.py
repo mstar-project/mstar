@@ -1384,6 +1384,9 @@ class SGLangOmni(InferenceSystem):
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 **model.get_model_kwargs(req_type),
+                # Per-request overrides (max_tokens / ignore_eos stamped by the
+                # runner), as for vllm-omni.
+                **req_input.model_kwargs,
                 **additional_model_kwargs,
             }
             # Top-level multimodal fields (Fix 10a). sglang-omni reads files
@@ -1638,7 +1641,7 @@ class OursOpenAI(VLLMOmni):
         read is recorded as a PCM16 audio chunk so timing/throughput match the
         native path.
         """
-        kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
+        kwargs = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
         payload: dict = {
             "model": model.get_served_model_name(),
             "input": req_input.prompt,
