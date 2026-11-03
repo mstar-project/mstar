@@ -716,7 +716,7 @@ checkpoints published without the subfolder.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.codec.decode_canvas" title="mstar.model.omnivoice.components.codec.decode_canvas"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_canvas</span></code></a>(codec, tokens)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_tok]</span></code> tokens -&gt; 1-D waveform at <code class="docutils literal notranslate"><span class="pre">codec.config.sample_rate</span></code>.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_tok]</span></code> tokens -&gt; 1-D float32 waveform at <code class="docutils literal notranslate"><span class="pre">codec.config.sample_rate</span></code>, on the codec's device.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.codec.encode_reference" title="mstar.model.omnivoice.components.codec.encode_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">encode_reference</span></code></a>(codec, waveform)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">T]</span></code> waveform at the codec's rate -&gt; <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_tok]</span></code> tokens.</p></td>
@@ -733,7 +733,7 @@ checkpoints published without the subfolder.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.codec.decode_canvas">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.codec.</span></span><span class="sig-name descname"><span class="pre">decode_canvas</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">codec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/codec.html#decode_canvas"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.codec.decode_canvas" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_tok]</span></code> tokens -&gt; 1-D waveform at <code class="docutils literal notranslate"><span class="pre">codec.config.sample_rate</span></code>.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_tok]</span></code> tokens -&gt; 1-D float32 waveform at <code class="docutils literal notranslate"><span class="pre">codec.config.sample_rate</span></code>, on the codec’s device.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -742,7 +742,7 @@ checkpoints published without the subfolder.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><em>ndarray</em></p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
