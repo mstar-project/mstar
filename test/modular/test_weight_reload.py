@@ -526,7 +526,8 @@ def test_reload_drops_the_prefix_cache_and_reroots_it(ckpts, monkeypatch):
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    assert kv.enable_prefix_cache(b"root")
+    kv.enable_prefix_cache(b"root")
+    assert kv._index is not None
     free = kv._arena.num_free
     first, second = kv._arena.acquire(2)
     kv._index.insert(fingerprint(b"root", b"k0"), first)
@@ -555,7 +556,8 @@ def _kv_with_cached_pages(monkeypatch) -> KVManager:
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    assert kv.enable_prefix_cache(b"root")
+    kv.enable_prefix_cache(b"root")
+    assert kv._index is not None
     pages = kv._arena.acquire(2)
     kv._index.insert_run([fingerprint(b"root", k) for k in (b"k0", b"k1")], pages, None)
     kv._arena.release(pages)
@@ -648,7 +650,8 @@ def test_reload_frees_the_host_tier_too(ckpts, monkeypatch, caplog):
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    assert kv.enable_prefix_cache(b"root")
+    kv.enable_prefix_cache(b"root")
+    assert kv._index is not None
     keys = [fingerprint(b"root", k) for k in (b"k0", b"k1", b"k2")]
     device_free = kv._arena.num_free
     first, second = kv._arena.acquire(2)
