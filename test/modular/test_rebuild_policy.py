@@ -420,7 +420,7 @@ def test_a_media_copy_split_across_two_steps_lands_whole():
     step_done = torch.Event(device="cuda")
     step_done.record()
     step = _vision_step((R,), {}, completion_event=step_done)
-    step.per_request_input_tensors[R]["embeds"] = [embeds]
+    step.per_request_input_tensors[R] = {"text_inputs": [torch.tensor([R], device="cuda")], "embeds": [embeds]}
 
     rebuilds.record(step)
     rebuilds.flush()
@@ -572,6 +572,8 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     step = _ran(VISION, {R: {"text_inputs": texts, "embeds": [embeds]}})
     step.completion_event = completed
     rebuilds.record(step)
+    # what the worker does once the step's outputs are sent
+    rebuilds.flush()
     rebuilds._kept[NODE][R].sampled.append(6)
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
