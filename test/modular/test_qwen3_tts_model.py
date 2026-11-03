@@ -1587,7 +1587,8 @@ class _CodecDriver:
     """The codec node with its state pool, driven as the engine drives a step:
     declare, admit, plan, preprocess, forward, commit, postprocess. ``captured``
     runs a step as a replay does: padded to a batch bucket, the padding rows
-    on the pool's sink."""
+    on the pool's sink. A stream is ingested once, on its first step, and
+    ``remove`` ends it, as the worker does."""
 
     BUCKETS = (1, 2, 4, 8)
 
@@ -1603,6 +1604,11 @@ class _CodecDriver:
             num_layers=1, blocks=codec_state_blocks(submodule.config.codec, torch.float32), max_slots=max_slots))
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
+        self.streams: set[str] = set()
+
+    def remove(self, rid: str) -> None:
+        self.pool.remove_request(rid)
+        self.streams.discard(rid)
 
     def step(
         self, items: dict[str, ARNodeInputs], captured: bool = False, single: bool = False, postprocess: bool = True,
@@ -1620,7 +1626,9 @@ class _CodecDriver:
             ctx.set_padded_rids(tuple(rows))
             inputs = inputs + [inputs[0]] * (bs - len(rids))
         for rid in rids:
-            self.pool.ingest_request(rid)
+            if rid not in self.streams:
+                self.pool.ingest_request(rid)
+                self.streams.add(rid)
         step = self.node.declare_step("codec_chunk", rows, inputs)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
@@ -1997,7 +2005,7 @@ def test_qwen3_tts_codec_state_is_the_declared_pool_and_released_with_the_reques
     codes = torch.randint(0, 32, (3, 4))
     fresh = first_chunk("a", codes)
     first_chunk("a", torch.randint(0, 32, (3, 4)))   # a's state moves on
-    driver.pool.remove_request("a")
+    driver.remove("a")
     assert torch.equal(first_chunk("b", codes), fresh)
 
 
