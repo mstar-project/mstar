@@ -12,5 +12,3 @@ node_groups:
   - node_names: [Codec]
     ranks: [0]
     graph_walks: [codec_chunk]
-    # codec windows run beside the Talker's chain, on a second stream
-    side_stream: true

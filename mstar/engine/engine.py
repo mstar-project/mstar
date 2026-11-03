@@ -377,6 +377,9 @@ class ExecutingBatch:
     # them to their tokens on first use
     prepared_rids: tuple[int, ...] = ()
     _seq_lens: dict[int, int] | None = field(default=None, repr=False)
+    # the one object every row shares, when the step was prepared with the
+    # submodule's ``uniform_row_inputs``
+    uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -468,9 +471,10 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
-    def register_prepare_batch(self, inputs: list[NodeInputs]):
+    def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
         self._seq_lens = None
+        self.uniform_inputs = uniform
 
     def seq_len_of(self, rid: int) -> int:
         """The tokens ``rid`` runs this step; -1 before it is prepared."""
@@ -570,6 +574,9 @@ class Engine:
         self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
+        # node -> the event after its plan stream's latest pre-plan; see
+        # ``_order_after_pre_plans``
+        self._pre_plan_done: dict[str, Any] = {}
         self._graph_runtime = graph_runtime
         # chunked prefill: per-walk policies and budgets, and rows mid-prefill
         self._chunking = ChunkingManagement(self._submodules)
@@ -1210,7 +1217,7 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
-                batch.register_prepare_batch(node_inputs)
+                batch.register_prepare_batch(node_inputs, uniform=uniform)
                 batch.prepared_rids = tuple(batch.request_ids)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
@@ -1638,7 +1645,7 @@ class Engine:
         inputs = batch.inputs
         req_info = batch.per_request_info_wrapped
         if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, req_info
             )
@@ -1997,6 +2004,8 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # before any copy this plan issues, the resident stage's included
+            self._order_after_pre_plans()
             # promoted and inline plans per resource, apart
             plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
             if ctx.resident is not None:
@@ -2113,7 +2122,8 @@ class Engine:
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
             return cg_runner.run_forward(
-                lease, preprocessed, plan_done_event=batch.preplan_event,
+                lease, preprocessed,
+                plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -2946,7 +2956,7 @@ class Engine:
         inputs = (
             cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs)
+            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
         )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
@@ -2986,24 +2996,46 @@ class Engine:
                 return False
             stream = cg_runner.plan_stream()
             ctx = batch.step_context
-            with stream if stream is not None else nullcontext():
-                # A raise here takes what a raise from `pre_plan` below takes:
-                # `Worker._preplan_spec` resets the pre-plan, whose reservation
-                # stays with its streams for exec's admit to find.
-                if ctx.resident is not None:
-                    ctx.plan_phase = "res.pre_plan"
-                    t0 = phase_start()
-                    ctx.resident.plan(step, ctx)
-                    phase_end("res.pre_plan.resident", t0)
-                self._runner.pre_plan(step)
+            event = torch.Event(device=self._device)
+            try:
+                with stream if stream is not None else nullcontext():
+                    self._order_after_pre_plans()
+                    # A raise here takes what a raise from `pre_plan` below takes:
+                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # stays with its streams for exec's admit to find.
+                    if ctx.resident is not None:
+                        ctx.plan_phase = "res.pre_plan"
+                        t0 = phase_start()
+                        ctx.resident.plan(step, ctx)
+                        phase_end("res.pre_plan.resident", t0)
+                    self._runner.pre_plan(step)
+            finally:
+                # recorded even when the plan raised: its copies are in flight
+                event.record(stream)
+                self._pre_plan_done[batch.node_name] = event
             laps.skip()
-            batch.preplan_event = torch.Event(device=self._device)
-            batch.preplan_event.record(stream)
+            batch.preplan_event = event
             batch.preplanned_rids = tuple(batch.request_ids)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
+
+    def _order_after_pre_plans(self) -> None:
+        """Order the current stream after every copy a pre-plan has issued.
+
+        Resources skip a copy into a slot's buffer that already holds the
+        bytes (``H2DMirror``, ``_SlotBuffer.zero_prefix``), recorded when the
+        copy is issued. A pre-plan's copy runs on its node's plan stream, and
+        the pre-plan may be dropped before its batch runs, so nothing else
+        orders a later step that skips its own copy, or overwrites the buffer,
+        after it. Every plan stream is waited on, not just this node's: nodes
+        can share a resource and its slot buffers."""
+        events = tuple(self._pre_plan_done.values())
+        if events:
+            stream = torch.accelerator.current_stream(self._device)
+            for event in events:
+                stream.wait_event(event)
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""

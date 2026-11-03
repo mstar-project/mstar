@@ -601,7 +601,7 @@ group runs that node's steps on a lane of their own instead of the worker's main
 they take no turn on it, run on a second CUDA stream beside its steps, and whatever
 comes ready meanwhile batches into the next one. It applies to the walks the node's
 submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
-``codec_chunk``, and its colocated configs set the field), and keeps both nodes on one
+``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
 worker and one CUDA context, unlike a split with MPS. Startup fails with a
 ``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
 alone on its worker, a device without streams, a node that also runs walks on the
@@ -772,7 +772,10 @@ host time spent waking CPUs. Two knobs deal with it:
   cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
   and logs one line saying why for this host, since neither layout has beaten no pin
   on every host it was measured on (table below). ``off`` never pins, a number names
-  the first worker's core.
+  the first worker's core. Under a job's mask too small for every GPU the container
+  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
+  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+  on different cores.
 - ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
   through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
   containers hide, and it logs what it got.

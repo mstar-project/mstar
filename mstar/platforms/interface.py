@@ -85,6 +85,13 @@ class Platform:
         sysfs lists the host's GPUs even in a container given two of them."""
         return frozenset()
 
+    def visible_pci_addresses(self) -> frozenset[str]:
+        """The PCI addresses of the devices this process was given
+        (``CUDA_VISIBLE_DEVICES``, which ``--gpus`` sets); empty where the
+        platform doesn't report an address."""
+        return frozenset(a for i in range(torch.accelerator.device_count())
+                         if (a := self.pci_address(i)) is not None)
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
