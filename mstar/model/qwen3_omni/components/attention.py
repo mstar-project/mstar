@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.kernels.qk_norm_rope import qk_norm_rope_kernel
 from mstar.model.components.distributed import ParallelAttention
 
 _fa2_maxlen_patched = False
@@ -97,6 +98,10 @@ class Qwen3OmniAttention(ParallelAttention):
 
         )
         self.use_mrope = use_mrope
+        # On AMD GPUs the q/k norms and the multimodal rotation run as one
+        # kernel; elsewhere this is None and the unfused path runs. Picked here,
+        # not in forward: the pick takes a lock dynamo can't trace.
+        self._qk_norm_rope = qk_norm_rope_kernel.resolve() if use_mrope else None
 
     def forward(
         self,
@@ -105,6 +110,18 @@ class Qwen3OmniAttention(ParallelAttention):
         mrope_section: Optional[list[int]] = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
+        if self._qk_norm_rope is not None and cos_sin_3d is not None:
+            qkv = self.qkv_proj(hidden_states)
+            cos, sin = cos_sin_3d
+            q, k = self._qk_norm_rope(
+                qkv, self.q_norm.weight, self.k_norm.weight, cos, sin,
+                self.num_heads, self.num_kv_heads, self.head_dim, self.q_norm.variance_epsilon,
+            )
+            v = qkv[:, (self.num_heads + self.num_kv_heads) * self.head_dim:]
+            attn_output = self.attend(q, k, v.view(num_tokens, self.num_kv_heads, self.head_dim))
+            attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
+            return self.o_proj(attn_output)
+
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
 
