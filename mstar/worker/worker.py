@@ -967,7 +967,7 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
         laps.lap("worker_state")
-        self._guarantee(body.request_info.resource_configs)
+        self._set_rebuildable(body.request_info.resource_configs)
         try:
             self.engine_manager.add_request(
                 request_id, body.request_info.resource_configs, body.request_info,
@@ -1157,14 +1157,13 @@ class Worker:
         for key, kv in self._kv_caches.items():
             kv.cache.local_loops = {loop for writes in self._kv_writes[key].values() for loop in writes.loops}
 
-    def _guarantee(self, configs: dict[str, ResourceReqConfig]) -> None:
-        """A request is guaranteed in a paged KV cache where no drop here can free its pages."""
+    def _set_rebuildable(self, configs: dict[str, ResourceReqConfig]) -> None:
         layouts = {
             key: (config.kv_layout or {}).values() for key, config in configs.items() if isinstance(config, KVReqConfig)
         }
         for key, rebuildable in self._rebuilds.rebuildable(self._kv_writes, layouts).items():
-            if not rebuildable:
-                configs[key].guaranteed = True
+            if key in configs:
+                configs[key].rebuildable = rebuildable
 
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return

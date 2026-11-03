@@ -456,9 +456,13 @@ request on the host waits at its place in the queue until its pages and one more
 its pages are then copied back. A dropped request waits until its history and one more page
 fit, then recomputes its KV in one prefill row. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
-and is never dropped or moved to the host. A request that holds KV made from media or another node's outputs does so in the pools
-of the node that writes it, and so does a request in the pools of a node that keeps no token ids
-to rebuild it. Voice requests then queue when the pool is short and are never preempted mid-stream.
+and is never dropped or moved to the host. Voice requests then queue when the pool is short and
+are never preempted mid-stream. A request no drop can free, because it holds KV made from media
+or another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
+when it is admitted the host pool sets room for its whole footprint aside, and it reserves only
+its prompt. When the host pool can't, it reserves its whole footprint in that pool, as a voice
+request does. So ``cpu_offload_pages`` also sets how many such requests run at once with only
+their prompt reserved.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
 until they time out. At one rank, a request that runs short and can neither move to the host

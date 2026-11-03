@@ -34,7 +34,7 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import mark_guaranteed, refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import (
     LORA_ADAPTER_KWARG,
     LORA_RESOURCE_KEY,
@@ -1394,7 +1394,7 @@ class Conductor:
             )
             for key, cfg in resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        mark_guaranteed(
+        mark_unpausable(
             resource_configs,
             body.streaming and not self._unpausable_outputs.isdisjoint(body.initial_output_modalities),
         )

@@ -384,8 +384,11 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
-    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
-    guaranteed: bool = False
+    # `unpausable`: the request streams an output that can't pause, set by the conductor.
+    # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
+    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    unpausable: bool = False
+    rebuildable: bool = True
 
     def apply_conductor_config(
         self,
@@ -553,12 +556,11 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     return None
 
 
-def mark_guaranteed(configs: Mapping[str, ResourceReqConfig], guaranteed: bool) -> None:
-    """Give every KV config in ``configs`` the class of the whole request. A request whose streamed output can't
-    pause is guaranteed in every pool, since a pause in any of them is heard."""
+def mark_unpausable(configs: Mapping[str, ResourceReqConfig], unpausable: bool) -> None:
+    """Mark every KV config in ``configs``, since a pause in any pool is heard."""
     for config in configs.values():
         if isinstance(config, KVReqConfig):
-            config.guaranteed = guaranteed
+            config.unpausable = unpausable
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:

@@ -131,7 +131,7 @@ def test_a_rebuild_tells_the_node_what_its_row_writes_and_queues_the_row():
     "own pool", "pool shared with a node that writes nothing for it",
     "pool shared with a node with no rebuild policy that writes for it",
 ])
-def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeypatch, talker_walk):
+def test_a_request_no_rebuild_can_write_again_isnt_rebuildable_in_its_pools(monkeypatch, talker_walk):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     w, _ = _worker()
     if talker_walk is not None:
@@ -148,16 +148,16 @@ def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeyp
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     # 12's KV grows in a loop the node's policy doesn't name, so no rebuild can write it again.
     # 13's prompt was written in a walk the node's policy doesn't prefill, so it keeps no ids.
-    # 10 lays out nothing, so it isn't guaranteed.
+    # 10 lays out nothing, so nothing refuses it.
     configs = {R: _config(), 12: _config(growth=(("embeds_loop", 1),)), 13: _config(walk="audio"),
                10: {"kv": KVReqConfig(kv_layout={})}}
     for rid, config in configs.items():
         info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=config, stream_lead_items={})
         w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
                                            worker_graph_to_workers={}, initial_inputs=[], request_info=info))
-    guaranteed = {rid for rid in configs if kv._overrides[rid].guaranteed}
-    assert guaranteed == ({R, 12, 13} if talker_walk == PREFILL else {12, 13}), (
-        "a request nothing can drop would reserve only its prompt"
+    refused = {rid for rid in configs if not kv._overrides[rid].rebuildable}
+    assert refused == ({R, 12, 13} if talker_walk == PREFILL else {12, 13}), (
+        "a request nothing can drop would count as one a drop frees"
     )
 
 

@@ -48,7 +48,7 @@ def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | N
     )
     _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
-        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival, guaranteed=guaranteed,
+        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival, unpausable=guaranteed,
     )})
 
 

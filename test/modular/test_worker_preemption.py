@@ -273,9 +273,9 @@ def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
     layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
     configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64})}
 
-    w._guarantee(configs)
+    w._set_rebuildable(configs)
 
-    assert not configs["kv"].guaranteed, "a node that writes nothing for the request made it guaranteed"
+    assert configs["kv"].rebuildable, "a node that writes nothing for the request made it guaranteed"
 
 
 def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
