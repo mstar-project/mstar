@@ -403,7 +403,7 @@ class Qwen3TTSModelConfig:
     # Present only on Base checkpoints (``speaker_encoder_config`` in
     # config.json); CustomVoice and VoiceDesign carry no speaker encoder.
     speaker_encoder: Qwen3TTSSpeakerEncoderConfig | None = None
-    # Accepted reference-clip duration (Base), as vLLM-Omni: longer clips exhaust
+    # Accepted reference-clip duration (Base): longer clips exhaust
     # the worker or degrade the clone, shorter ones are too little speech.
     reference_min_seconds: float = 1.0
     reference_max_seconds: float = 30.0
@@ -478,7 +478,7 @@ class Qwen3TTSModelConfig:
 
     @property
     def default_non_streaming_mode(self) -> bool:
-        """Reference/vLLM-Omni/SGLang-Omni default text layout per variant.
+        """The reference implementation's default text layout per variant.
 
         CustomVoice and VoiceDesign place the whole text in the prefill;
         Base (voice clone) feeds text one token per generated frame.

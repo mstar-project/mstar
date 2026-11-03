@@ -23,12 +23,15 @@ import io
 import math
 import os
 import threading
+import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import numpy as np
+
+from mstar.utils.threads import Thread
 
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
@@ -176,9 +179,9 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
 # 16 kHz).
 MIN_REF_AUDIO_SAMPLE_RATE = 8000
 # Voice cloning needs seconds of speech. Twice the longest reference a model
-# takes (Qwen3-TTS refuses over 30 s, Chatterbox keeps 30 s), so this never
-# refuses a clip a model would use; without it a 66 MB FLAC probe-decodes to
-# about 23 GB.
+# uses (Qwen3-TTS refuses over 30 s, Chatterbox trims to 30 s), so this only
+# refuses a clip well past what any model would keep; without it a 66 MB FLAC
+# probe-decodes to about 23 GB.
 MAX_REF_AUDIO_SECONDS = 60.0
 # The probe decode runs in the request thread pool (32 threads); this bounds
 # how many decode at once.
@@ -216,43 +219,29 @@ def check_ref_audio(path: str, decoder: str) -> None:
     """Open the reference clip at ``path`` the way the model's ``load_audio``
     will; on failure delete it and raise ValueError.
 
-    ``decoder`` is the library that ``load_audio`` uses, ``"soundfile"`` or
-    ``"torchcodec"``. torchcodec decodes the clip, not just its header: some
-    FFmpeg builds parse a container header (MAT4, MAT5) they cannot decode. A
-    clip whose header rate is below ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose
-    header duration is over ``MAX_REF_AUDIO_SECONDS``, is refused before any
-    decode; the decode itself stops just past ``MAX_REF_AUDIO_SECONDS``, so a
-    header that hides or understates the length cannot make it unbounded.
+    ``decoder`` is the library that ``load_audio`` uses: ``"soundfile"``,
+    ``"torchcodec"``, or ``"soundfile+torchcodec"`` for a loader that tries
+    libsndfile first and FFmpeg for what it cannot open, as
+    ``Model.load_audio`` does. torchcodec decodes the clip, not just its
+    header: some FFmpeg builds parse a container header (MAT4, MAT5) they
+    cannot decode. A clip whose header rate is below
+    ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose header duration is over
+    ``MAX_REF_AUDIO_SECONDS``, is refused before any decode; the decode itself
+    stops just past ``MAX_REF_AUDIO_SECONDS``, so a header that hides or
+    understates the length cannot make it unbounded.
     """
     try:
         if decoder == "torchcodec":
-            from torchcodec.decoders import AudioDecoder
-
-            header = AudioDecoder(path).metadata
-            _require_ref_audio_rate(header.sample_rate)
-            _require_ref_audio_seconds(header.duration_seconds_from_header)
-            with _ref_audio_decodes:
-                # Mono at a fixed rate: a small compressed upload can declare many
-                # channels at a high rate, and decoding it natively takes gigabytes.
-                samples = AudioDecoder(
-                    path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
-                ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
-            if samples.duration_seconds == 0:
-                raise ValueError("reference audio has no samples in its first seconds")
-            _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
+            _check_ref_audio_torchcodec(path)
+        elif decoder == "soundfile":
+            _check_ref_audio_soundfile(path)
         else:
-            import soundfile
-
-            from mstar.model.media_limits import count_sound_file_seconds, sound_file_seconds
-
-            info = soundfile.info(path)
-            _require_ref_audio_rate(info.samplerate)
-            seconds = sound_file_seconds(info.frames, info.samplerate)
-            if seconds is None:
-                # no sample count in the header (a FLAC written to a pipe)
-                with _ref_audio_decodes:
-                    seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
-            _require_ref_audio_seconds(seconds)
+            try:
+                _check_ref_audio_soundfile(path)
+            except RefAudioTooLongError:
+                raise
+            except Exception:  # noqa: BLE001 — not a libsndfile container; the loader tries FFmpeg
+                _check_ref_audio_torchcodec(path)
     except RefAudioTooLongError:
         Path(path).unlink(missing_ok=True)
         raise
@@ -261,6 +250,40 @@ def check_ref_audio(path: str, decoder: str) -> None:
         raise ValueError(
             f"ref_audio must be audio the model can decode, at {MIN_REF_AUDIO_SAMPLE_RATE} Hz or more"
         ) from exc
+
+
+def _check_ref_audio_torchcodec(path: str) -> None:
+    from torchcodec.decoders import AudioDecoder
+
+    header = AudioDecoder(path).metadata
+    _require_ref_audio_rate(header.sample_rate)
+    _require_ref_audio_seconds(header.duration_seconds_from_header)
+    with _ref_audio_decodes:
+        # Mono at a fixed rate: a small compressed upload can declare many
+        # channels at a high rate, and decoding it natively takes gigabytes.
+        samples = AudioDecoder(
+            path, sample_rate=_REF_AUDIO_PROBE_RATE, num_channels=1
+        ).get_samples_played_in_range(0.0, MAX_REF_AUDIO_SECONDS + 1.0)
+    if samples.duration_seconds == 0:
+        raise ValueError("reference audio has no samples in its first seconds")
+    _require_ref_audio_seconds(samples.pts_seconds + samples.duration_seconds)
+
+
+def _check_ref_audio_soundfile(path: str) -> None:
+    import soundfile
+
+    from mstar.model.media_limits import count_sound_file_seconds, sound_file_seconds
+
+    info = soundfile.info(path)
+    _require_ref_audio_rate(info.samplerate)
+    seconds = sound_file_seconds(info.frames, info.samplerate)
+    if seconds is None:
+        # no sample count in the header (a FLAC written to a pipe)
+        with _ref_audio_decodes:
+            seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
+    if not seconds:
+        raise ValueError("reference audio has no samples")
+    _require_ref_audio_seconds(seconds)
 
 
 def _require_ref_audio_rate(rate: int | None) -> None:
@@ -311,6 +334,40 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
             raise ValueError("Remote media fetch is disabled on this server")
         return save_remote_url(ref, upload_dir)
     raise ValueError("server file paths are refused; send media as a data URL or a file upload")
+
+
+# How long a submitted request's uploads outlive it: the data worker reads them
+# from its queue after the submission returns. The Rust frontend waits 60 s too.
+UPLOAD_CLEANUP_DELAY_S = 60.0
+
+
+def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """Delete a request's files under ``upload_dir`` now. A path elsewhere is
+    left alone: no route puts one in ``file_paths`` today, and a file the
+    server did not save is never the request's to delete."""
+    root = Path(upload_dir).resolve()
+    for paths in (file_paths or {}).values():
+        for path in paths:
+            p = Path(path)
+            if not p.resolve().is_relative_to(root):
+                continue
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
+    """:func:`remove_uploads` after :data:`UPLOAD_CLEANUP_DELAY_S`, for a
+    request that was submitted and may not have been read yet."""
+    if not file_paths:
+        return
+
+    def _cleanup() -> None:
+        time.sleep(UPLOAD_CLEANUP_DELAY_S)
+        remove_uploads(file_paths, upload_dir)
+
+    Thread(target=_cleanup, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +451,9 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             frames += len(data)
             if frames > limit:
                 raise AudioTooLongError(max_seconds)
-            parts.append(data.mean(axis=1))
+            # a mono block is its own mean, and numpy's reduction over the
+            # length-1 axis costs ~10x the copy
+            parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 
@@ -433,26 +492,13 @@ def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_A
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
     refused with :class:`AudioTooLongError` past ``max_seconds``.
 
-    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-    then torchcodec for the rest (m4a, webm, ...).
+    The same decode as a model's own uploads (``load_speech_file``): a file
+    neither libsndfile nor FFmpeg reads raises ``ValueError`` (HTTP 400), while a
+    missing FFmpeg stays the server's error.
     """
-    try:
-        audio, sr = read_soundfile_capped(path, max_seconds)
-    except AudioRefusedError:
-        raise
-    except Exception:  # noqa: BLE001 — not a libsndfile container
-        return decode_torchcodec_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
-    check_resample_rate(sr, sample_rate)
-    if sr != sample_rate:
-        try:
-            import torch
-            import torchaudio
+    from mstar.model.components.audio_features import load_speech_file
 
-            audio = torchaudio.functional.resample(torch.from_numpy(audio), sr, sample_rate).numpy()
-        except ImportError:
-            idx = np.linspace(0, len(audio) - 1, int(round(len(audio) * sample_rate / sr)))
-            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
-    return audio
+    return load_speech_file(path, sample_rate, max_seconds).numpy()
 
 
 def window_stop(start: int, total: int, step: int, balanced: bool) -> int:
@@ -498,9 +544,80 @@ def split_windows(
     return pieces
 
 
+class StreamResampler:
+    """Resample a stream that arrives in pieces of any size (``push``), with
+    the same output however it was split. A Kaiser-windowed sinc lowpass at
+    the lower Nyquist, applied polyphase: output ``k`` is centered on input
+    time ``k * rate_in / rate_out``, so timing is kept exactly. The passband
+    is flat to 0.1 dB up to 0.9 of the lower Nyquist and 3 dB down at 0.94
+    (7.2 and 7.5 kHz at 24 to 16 kHz), close to what a 16 kHz recording
+    holds; anything above that Nyquist, which would fold back, is down 46 dB
+    or more, and 100 dB from 1.06 of it on. Each output waits for half a
+    kernel of input past its center (72 samples, 3 ms, at 24 to 16 kHz); ``flush``
+    emits the rest as if the input went on as
+    silence, ``ceil(n_in * rate_out / rate_in)`` samples in all, and starts
+    over. The kernel has ``2 * half_width * max(up, down) + 1`` taps for the
+    reduced ratio ``up/down``, so callers bound the rates."""
+
+    def __init__(self, rate_in: int, rate_out: int, half_width: int = 48, beta: float = 10.0, rolloff: float = 0.95):
+        g = math.gcd(rate_in, rate_out)
+        self.up, self.down = rate_out // g, rate_in // g
+        self.half = half_width * max(self.up, self.down)        # kernel half length, upsampled samples
+        n = np.arange(-self.half, self.half + 1)
+        cutoff = rolloff * 0.5 / max(self.up, self.down)          # cycles per upsampled sample
+        self.kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.kaiser(n.size, beta) * self.up
+        self.reset()
+
+    def reset(self) -> None:
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._base = 0      # input index of _buf[0]
+        self._n_in = 0      # input samples pushed
+        self._k_out = 0     # output samples emitted
+
+    def push(self, x: np.ndarray) -> np.ndarray:
+        self._buf = np.concatenate([self._buf, np.asarray(x, dtype=np.float64)])
+        self._n_in += int(np.size(x))
+        # output k is final once every input within half a kernel of it is in
+        return self._emit(-(-(self._n_in * self.up - self.half) // self.down))
+
+    def held(self, extra: int = 0) -> int:
+        """Output samples ``flush`` would still emit, after ``extra`` more
+        input samples."""
+        return -(-((self._n_in + extra) * self.up) // self.down) - self._k_out
+
+    def flush(self) -> np.ndarray:
+        out = self._emit(-(-(self._n_in * self.up) // self.down))
+        self.reset()
+        return out
+
+    def _emit(self, k_end: int) -> np.ndarray:
+        up, down, half = self.up, self.down, self.half
+        if k_end <= self._k_out or not self._buf.size:
+            n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
+            return np.zeros(n, dtype=np.float32)
+        span = half // up + 1
+        taps = np.arange(-span, span + 1)[None, :]
+        out = []
+        for k0 in range(self._k_out, k_end, 4096):              # bounds the gather to 4096 rows
+            t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
+            ns = t // up + taps                                  # candidate input indices
+            idx = t - ns * up + half
+            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
+            vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
+            out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
+        self._k_out = k_end
+        keep = max(self._base, -(-(k_end * down - half) // up))  # first input the next output needs
+        self._buf = self._buf[keep - self._base:]
+        self._base = keep
+        return np.concatenate(out).astype(np.float32)
+
+
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``."""
-    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
+    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
+    sample."""
+    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
+    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
     Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 

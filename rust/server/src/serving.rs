@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::stream::Stream;
@@ -26,6 +26,9 @@ use crate::tokenizer::{IncrementalDecoder, Tok};
 #[derive(Clone)]
 pub struct AppState {
     pub model_name: String,
+    /// The model's adapter class in Python's `ADAPTER_REGISTRY`
+    /// (`MSTAR_OPENAI_ADAPTER`, set by the launcher); empty when it has none.
+    pub python_adapter: String,
     pub upload_dir: PathBuf,
     /// Fetching arbitrary http(s) media is SSRF surface; off by default.
     pub allow_remote: bool,
@@ -108,40 +111,64 @@ pub fn try_result_stream(
 ) -> Result<OutStream, (u16, String)> {
     let base = raw_result_stream(state, args, request_id, streaming)?;
     Ok(match (&args.tokens, &state.tok) {
-        (Some(_), Some(tok)) => {
-            use futures::StreamExt;
-            let detok = IncrementalDecoder::new(tok.clone());
-            Box::pin(
-                base.scan(detok, |detok, item| {
-                    let mapped = match item {
-                        Out::Chunk(c) if c.modality == "token" && c.data.len() == 4 => {
-                            let id = u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]);
-                            detok.step(id).map(|piece| {
-                                Out::Chunk(ResultChunk {
-                                    modality: "text".to_string(),
-                                    data: piece.into_bytes(),
-                                    metadata: c.metadata,
-                                })
-                            })
-                        }
-                        // A "token" chunk that isn't a 4-byte LE id is malformed
-                        // — drop it rather than forwarding an unknown modality.
-                        Out::Chunk(c) if c.modality == "token" => {
-                            eprintln!(
-                                "mstar-server: dropping malformed token chunk ({} bytes, expected 4)",
-                                c.data.len()
-                            );
-                            None
-                        }
-                        other => Some(other),
-                    };
-                    futures::future::ready(Some(mapped))
-                })
-                .filter_map(futures::future::ready),
-            )
-        }
+        (Some(_), Some(tok)) => detokenize(base, tok.clone()),
         _ => base,
     })
+}
+
+/// Token-id chunks -> text chunks through one [`IncrementalDecoder`]; at the
+/// end of the stream, whatever it still holds goes out as a last text chunk.
+fn detokenize(base: OutStream, tok: Arc<Tok>) -> OutStream {
+    use futures::StreamExt;
+    // (decoder, failed): the tail flushes what the decoder still holds,
+    // unless the stream already ended on an error.
+    let detok = Arc::new(Mutex::new((IncrementalDecoder::new(tok), false)));
+    let tail_detok = detok.clone();
+    let body = base.filter_map(move |item| {
+        let mut st = detok.lock().unwrap();
+        let mapped = match item {
+            Out::Chunk(c) if c.modality == "token" && c.data.len() == 4 => {
+                let id = u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]);
+                st.0.step(id).map(|piece| {
+                    Out::Chunk(ResultChunk {
+                        modality: "text".to_string(),
+                        data: piece.into_bytes(),
+                        metadata: c.metadata,
+                    })
+                })
+            }
+            // A "token" chunk that isn't a 4-byte LE id is malformed
+            // — drop it rather than forwarding an unknown modality.
+            Out::Chunk(c) if c.modality == "token" => {
+                eprintln!(
+                    "mstar-server: dropping malformed token chunk ({} bytes, expected 4)",
+                    c.data.len()
+                );
+                None
+            }
+            err @ Out::Error { .. } => {
+                st.1 = true;
+                Some(err)
+            }
+            other => Some(other),
+        };
+        futures::future::ready(mapped)
+    });
+    let tail = futures::stream::once(async move {
+        let mut st = tail_detok.lock().unwrap();
+        if st.1 {
+            return None;
+        }
+        st.0.finish().map(|rest| {
+            Out::Chunk(ResultChunk {
+                modality: "text".to_string(),
+                data: rest.into_bytes(),
+                metadata: serde_json::Value::Null,
+            })
+        })
+    })
+    .filter_map(futures::future::ready);
+    Box::pin(body.chain(tail))
 }
 
 fn raw_result_stream(
@@ -276,4 +303,50 @@ pub fn now() -> i64 {
 /// `<prefix>-<uuid4-hex>`, matching mstar's request-id shape.
 pub fn rid(prefix: &str) -> String {
     format!("{}-{}", prefix, Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn token(id: u32) -> Out {
+        Out::Chunk(ResultChunk {
+            modality: "token".to_string(),
+            data: id.to_le_bytes().to_vec(),
+            metadata: serde_json::Value::Null,
+        })
+    }
+
+    fn texts(out: Vec<Out>) -> Vec<String> {
+        out.into_iter()
+            .map(|o| match o {
+                Out::Chunk(c) => String::from_utf8(c.data).unwrap(),
+                Out::Error { message, .. } => format!("error: {message}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn detokenize_keeps_split_characters_and_flushes_the_tail() {
+        let tok = crate::tokenizer::byte_tok();
+        let mut ids = tok.encode("中文 😀");
+        ids.pop(); // the stream ends inside the emoji
+        let base: OutStream = Box::pin(futures::stream::iter(ids.into_iter().map(token).collect::<Vec<_>>()));
+        let out = futures::executor::block_on(detokenize(base, tok).collect::<Vec<_>>());
+        assert_eq!(texts(out), vec!["中", "文", " ", "\u{FFFD}"]);
+    }
+
+    #[test]
+    fn detokenize_adds_nothing_after_an_error() {
+        let tok = crate::tokenizer::byte_tok();
+        let ids = tok.encode("中");
+        let items = vec![
+            token(ids[0]),
+            Out::Error { status: 500, message: "boom".to_string() },
+        ];
+        let base: OutStream = Box::pin(futures::stream::iter(items));
+        let out = futures::executor::block_on(detokenize(base, tok).collect::<Vec<_>>());
+        assert_eq!(texts(out), vec!["error: boom"]);
+    }
 }

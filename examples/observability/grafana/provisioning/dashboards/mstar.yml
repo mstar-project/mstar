@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: mstar
+    folder: M*
+    type: file
+    # Dashboards come from the files; edits in the UI are not saved back.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      # grafana/dashboards, mounted by docker-compose.yml
+      path: /etc/grafana/dashboards/mstar

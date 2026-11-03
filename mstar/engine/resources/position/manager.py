@@ -2,10 +2,12 @@
 
 has ownership of per-(request,label) position counter"""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 
 import torch
 
+from mstar.engine.node_dtype import warn_implicit_downcast
 from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotKey,
@@ -65,6 +67,13 @@ class PositionManager(Resource):
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        """The theta of the RoPE ``apply_qk`` applies, when that is plain
+        rotate-half RoPE over the whole ``head_dim`` (not interleaved, no
+        scaling, no RoPE dtype), which a layer may apply in a fused kernel of
+        its own instead; None otherwise."""
+        return None
+
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
@@ -95,6 +104,13 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
+            # XPU always rotates from this cache, so it already rounds the
+            # table to cache_dtype; another rope_table_dtype has no kernel here.
+            if config.rope_table_dtype not in (None, cache_dtype):
+                raise NotImplementedError(
+                    f"rope_table_dtype={config.rope_table_dtype} is not implemented for XPU, "
+                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the KV dtype)"
+                )
             self._rope_cache_key = (
                 rotary_dim,
                 config.rope_scale,
@@ -107,6 +123,27 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
+        # CUDA rotates from this table instead of in-kernel angles when set.
+        self._rope_table: torch.Tensor | None = None
+        if config.rope_table_dtype is not None and device.type != "xpu":
+            if config.llama31_params:
+                raise NotImplementedError("rope_table_dtype does not support Llama 3.1 RoPE scaling")
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            if device.type == "cuda" and rotary_dim % 16:
+                # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
+                # rotation reads past each head and returns garbage, without an error
+                raise ValueError(
+                    f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
+                    f"not {rotary_dim}")
+            self._rope_table = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                config.rope_table_dtype,
+            ).float()
+            self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
@@ -125,6 +162,14 @@ class RopeManager(PositionManager):
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
         # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
+
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        cfg = self._config
+        plain = (
+            cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
+            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+        )
+        return float(cfg.rope_theta) if plain else None
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -285,7 +330,7 @@ class RopeManager(PositionManager):
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
         self._apply_forks(
-            plan_outputs.pre_forks, ctx.padded_request_ids,
+            plan_outputs.pre_forks, self._forking_rids(plan_outputs, ctx),
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
@@ -303,18 +348,32 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
-                counters = self._counters.setdefault(segment.request_id, {})
+                counters = all_counters.get(segment.request_id)
+                if counters is None:
+                    counters = all_counters[segment.request_id] = {}
                 counters[segment.label] = counters.get(segment.label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
-            self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
+            self._apply_forks(plan_outputs.post_forks, self._forking_rids(plan_outputs, ctx))
+
+    @staticmethod
+    def _forking_rids(plan_outputs: KVPlanOutputs, ctx: StepContext) -> Sequence[int]:
+        """The rows KV forked: a step's forks may cover only some of its rows.
+        A chunked prompt forks on some of its chunks only (BAGEL's pre-forks on
+        its first), and a later chunk re-forking the target's counter would
+        restart its positions."""
+        fork_rids = plan_outputs.fork_rids
+        if fork_rids is None:
+            return ctx.padded_request_ids
+        return [rid for rid in ctx.padded_request_ids if rid in fork_rids]
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
@@ -379,13 +438,18 @@ class RopeManager(PositionManager):
         eager path has no slot to key a buffer by, so allocates plainly.
         """
         block = self._config.scheme == PosScheme.BLOCK
+        counters = self._counters
         pos_ids: list[int] = []
+        append, extend = pos_ids.append, pos_ids.extend
         for rid, label, to_compute in rows:
-            start = self.position(rid, label)
-            if block:
-                pos_ids.extend([start] * to_compute)
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            if to_compute == 1:
+                append(start)  # a decode row
+            elif block:
+                extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + to_compute))
+                extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
@@ -430,6 +494,34 @@ class RopeManager(PositionManager):
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
 
+    def _check_rope_table_args(
+        self,
+        rotary_dim: int,
+        rope_scale: float,
+        rope_theta: float,
+        llama31_params: dict,
+    ) -> None:
+        """Refuse per-call RoPE arguments the ``rope_table_dtype`` table
+        does not encode: the CUDA kernel reads only the table."""
+        runtime = (rotary_dim, rope_scale, rope_theta)
+        if runtime != self._rope_table_key:
+            raise RuntimeError(
+                "RoPE runtime arguments do not match the rope_table_dtype "
+                "table built from PositionConfig: "
+                f"runtime (rotary_dim, rope_scale, rope_theta)={runtime}, "
+                f"configured={self._rope_table_key}"
+            )
+        # Llama 3.1 scaling at rope_scale 1 leaves every frequency unchanged,
+        # which is what Attention passes by default.
+        llama31 = all(
+            llama31_params.get(key) is not None
+            for key in ("low_freq_factor", "high_freq_factor", "old_context_len")
+        )
+        if llama31 and rope_scale != 1.0:
+            raise NotImplementedError(
+                "rope_table_dtype does not support Llama 3.1 RoPE scaling"
+            )
+
     def _build_rope_cache(
         self,
         rotary_dim: int,
@@ -464,17 +556,26 @@ class RopeManager(PositionManager):
     def apply_qk(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        label: str,
+        k: torch.Tensor | None,
+        label: str | None = None,
         rotary_dim: int | None = None,
         interleave: bool | None = None,
         rope_scale: float | None = None,
         rope_theta: float | None = None,
         rope_dtype: torch.dtype | None = None,
+        pos_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        pos_ids = self._current_pos_ids[label]
+        """Rotate ``q`` and ``k`` at ``label``'s planned positions, or at ``pos_ids``, one per
+        row, for a model that threads positions itself (an offset, or a slice of the step).
+        ``k=None`` rotates ``q`` alone and returns ``(q, None)``."""
+        if pos_ids is None:
+            pos_ids = self._current_pos_ids[label]
         config = self._config
+        alone = k is None
+        if alone:
+            # the kernel rotates a (q, k) pair; a one-head scratch key stands in
+            k = q.new_zeros(q.shape[0], 1, q.shape[-1])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
@@ -484,6 +585,7 @@ class RopeManager(PositionManager):
             dtype = torch.get_autocast_dtype(q.device.type)
             q, k = q.to(dtype), k.to(dtype)
         elif q.dtype == torch.float32:
+            warn_implicit_downcast("RoPE", q.dtype, torch.bfloat16)
             q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
         llama31_params = {
@@ -502,7 +604,11 @@ class RopeManager(PositionManager):
             rope_theta if rope_theta is not None else config.rope_theta
         )
 
-        cos_sin_cache = None
+        cos_sin_cache = self._rope_table
+        if cos_sin_cache is not None:
+            self._check_rope_table_args(
+                rotary_dim or q.shape[-1], rope_scale, rope_theta, llama31_params,
+            )
         kernel_pos_ids = pos_ids[:q.shape[0]]
         if q.device.type == "xpu":
             rotary_dim = rotary_dim or q.shape[-1]
@@ -533,7 +639,7 @@ class RopeManager(PositionManager):
             rope_theta,
             **llama31_params,
         )
-        return q.to(orig_dtype), k.to(orig_dtype)
+        return q.to(orig_dtype), None if alone else k.to(orig_dtype)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings

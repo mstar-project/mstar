@@ -1,17 +1,15 @@
 """Conditioning-frame preprocessing for image-to-video.
 
-Two references disagree on how a conditioning image reaches the target
-resolution, and both are served:
+Two recipes take a conditioning image to the generation size:
 
-* ``stretch`` — the diffusers 0.39 pipeline (``VideoProcessor.preprocess``):
-  a plain bilinear resize to ``(height, width)``, aspect ratio not preserved,
-  values mapped to [-1, 1] without 8-bit rounding. What the Nano checkpoints
-  were validated against.
-* ``aspect_crop`` — the diffusers 0.40 pipeline (``_preprocess_conditioning_image``)
-  and the vLLM-Omni recipe: scale so the image covers the target
+* ``aspect_crop`` (the default): scale so the image covers the target
   (``max(width / w, height / h)``), antialiased bilinear resize to the ceiled
-  size, center crop, round to 8-bit, then ``x / 127.5 - 1``. The Edge model
-  card's recipe.
+  size, center crop, round to 8 bits, then ``x / 127.5 - 1``. NVIDIA's
+  cosmos-framework (``_resize_and_center_crop`` in ``inference/vision.py``) and
+  diffusers >= 0.40 (``_preprocess_conditioning_image``) both do this.
+* ``stretch``: antialiased bilinear resize straight to ``(height, width)``,
+  aspect ratio not preserved, then the same 8-bit rounding. What diffusers 0.39
+  did with a PIL image; kept for A/B against that recipe.
 
 ``prepare_conditioning_frames`` takes the frames the data worker loaded
 (``[T, C, H, W]`` in [0, 1], or a single ``[C, H, W]``) and returns
@@ -25,7 +23,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-CONDITIONING_RESIZE_MODES = ("stretch", "aspect_crop")
+CONDITIONING_RESIZE_MODES = ("aspect_crop", "stretch")
 
 
 def _to_float_0_255(frames: torch.Tensor) -> torch.Tensor:
@@ -40,7 +38,7 @@ def _to_float_0_255(frames: torch.Tensor) -> torch.Tensor:
 
 
 def prepare_conditioning_frames(
-    frames: torch.Tensor, height: int, width: int, mode: str = "stretch",
+    frames: torch.Tensor, height: int, width: int, mode: str = "aspect_crop",
 ) -> torch.Tensor:
     """Resize conditioning pixels to the generation size; see the module docstring."""
     if mode not in CONDITIONING_RESIZE_MODES:
@@ -54,17 +52,17 @@ def prepare_conditioning_frames(
     elif frames.shape[1] == 4:
         frames = frames[:, :3]
     x = _to_float_0_255(frames)
-    if mode == "stretch":
-        x = F.interpolate(x, size=(height, width), mode="bilinear", align_corners=False)
-        x = (x / 255.0) * 2.0 - 1.0
-    else:
+    if mode == "aspect_crop":
         src_h, src_w = x.shape[-2:]
         scale = max(width / src_w, height / src_h)
         rh, rw = math.ceil(scale * src_h), math.ceil(scale * src_w)
         x = F.interpolate(x, size=(rh, rw), mode="bilinear", align_corners=False, antialias=True)
+        # Python's round (half to even), like torchvision's center_crop
         top = round((rh - height) / 2)
         left = round((rw - width) / 2)
         x = x[:, :, top:top + height, left:left + width]
-        x = x.round().clamp(0, 255) / 127.5 - 1.0
+    else:
+        x = F.interpolate(x, size=(height, width), mode="bilinear", align_corners=False, antialias=True)
+    x = x.round().clamp(0, 255) / 127.5 - 1.0
     # [T, 3, H, W] -> [1, 3, T, H, W]
     return x.permute(1, 0, 2, 3).unsqueeze(0).contiguous()

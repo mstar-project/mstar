@@ -5,7 +5,8 @@ A process other than the API server keeps one recorder per family and sends
 exports the latest snapshot of each family. Snapshots are cumulative, never
 deltas, so a lost or reordered message cannot corrupt a counter.
 
-Not thread-safe: update and snapshot a recorder from one thread.
+Not thread-safe: update and snapshot a recorder from one thread (an
+``EdgeTransfers`` hands ``latest`` to another thread whole).
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import accumulate
 
-from mstar.observability.catalog import HISTOGRAM, Family
+from mstar.observability.catalog import (
+    HISTOGRAM,
+    TRANSFER_BYTES,
+    TRANSFER_SECONDS,
+    TRANSFERS,
+    Family,
+)
 
 Labels = tuple[str, ...]
 
@@ -79,6 +86,78 @@ class Histogram:
             bucket_counts=[list(accumulate(c)) for c in self._counts.values()],
             sums=list(self._sums.values()),
         )
+
+
+class EdgeTransfers:
+    """One tensor manager's transfer families (``TRANSFER_BYTES``,
+    ``TRANSFERS``, ``TRANSFER_SECONDS``). ``transport`` is the manager's
+    protocol.
+
+    ``record`` only appends to five columns; ``snapshot`` folds them into one
+    row per (src, dst) once per status interval, so an edge read creates no
+    object and touches no per-edge state.
+
+    ``latest`` is the last ``publish()``: the data worker publishes from its
+    own thread and the API server reads it from another, swapping whole lists.
+    """
+
+    # row layout: bytes, tensors, seconds sum, then one count per bucket
+    _BUCKETS0 = 3
+
+    def __init__(self, transport: str):
+        self.transport = transport
+        self._bounds = TRANSFER_SECONDS.buckets
+        self._width = self._BUCKETS0 + len(self._bounds) + 1
+        self._rows: dict[tuple[str, str], list] = {}
+        self._srcs: list[str] = []
+        self._dsts: list[str] = []
+        self._bytes: list[int] = []
+        self._tensors: list[int] = []
+        self._seconds: list[float] = []
+        self.latest: list[MetricSnapshot] = self.snapshot()
+
+    def record(self, src: str, dst: str, nbytes: int, tensors: int, seconds: float) -> None:
+        self._srcs.append(src)
+        self._dsts.append(dst)
+        self._bytes.append(nbytes)
+        self._tensors.append(tensors)
+        self._seconds.append(seconds)
+
+    def _fold(self) -> None:
+        rows, bounds, b0 = self._rows, self._bounds, self._BUCKETS0
+        for src, dst, nbytes, tensors, seconds in zip(
+                self._srcs, self._dsts, self._bytes, self._tensors, self._seconds, strict=True):
+            row = rows.get((src, dst))
+            if row is None:
+                row = rows[(src, dst)] = [0, 0, 0.0] + [0] * (self._width - b0)
+            row[0] += nbytes
+            row[1] += tensors
+            row[2] += seconds
+            # le is inclusive: a value equal to a bound falls in that bucket.
+            row[b0 + bisect_left(bounds, seconds)] += 1
+        for column in (self._srcs, self._dsts, self._bytes, self._tensors, self._seconds):
+            column.clear()
+
+    def snapshot(self) -> list[MetricSnapshot]:
+        self._fold()
+
+        def labels():
+            return [[src, dst, self.transport] for src, dst in self._rows]
+
+        rows = list(self._rows.values())
+        b0 = self._BUCKETS0
+        return [
+            MetricSnapshot(TRANSFER_BYTES.name, labels(), [float(r[0]) for r in rows]),
+            MetricSnapshot(TRANSFERS.name, labels(), [float(r[1]) for r in rows]),
+            MetricSnapshot(
+                TRANSFER_SECONDS.name, labels(),
+                bucket_counts=[list(accumulate(r[b0:])) for r in rows],
+                sums=[r[2] for r in rows],
+            ),
+        ]
+
+    def publish(self) -> None:
+        self.latest = self.snapshot()
 
 
 def merge(family: Family, snapshots: Iterable[MetricSnapshot]) -> MetricSnapshot:

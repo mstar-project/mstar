@@ -105,7 +105,7 @@ def test_shipped_manifest():
     assert {c.kind for x in m.models.values() for c in x.cases} >= {"tts", "asr", "duplex", *mf.CLIENT_KINDS}
     assert {c.check["kind"] for x in m.models.values() for c in x.cases} == set(mf.CHECKS)
     mc = m.select("tag:mooncake")
-    assert {x.name for x in mc} == {"qwen3_omni_mooncake", "orpheus_mooncake"}
+    assert {x.name for x in mc} == {"qwen3_omni_mooncake", "orpheus_mooncake"}   # not the 2- and 3-GPU w2w entries
     assert all(x.optional and x.serve_args[:2] == ["--tensor-comm-protocol", "TCP"] for x in mc)
     for x in m.models.values():
         for c in x.cases:
@@ -1444,11 +1444,33 @@ def test_requires_can_call_the_servers_own_loader(tmp_path, monkeypatch):
                            (["loader:nope"], "loader:nope: AttributeError")):
         monkeypatch.setattr(arm, "job", {"python": sys.executable, "model": {"requires": requires}})
         assert arm.requirements_problem({"src": str(tmp_path)}) == want
-    qwen = mf.load().models["qwen3_tts"].requires
+    models = mf.load().models
+    qwen = models["qwen3_tts"].requires
     assert qwen == ["mstar.model.qwen3_tts.qwen3_tts_model:_load_qwen3_tts_codec_classes"]
+    for m in models.values():   # the split and transport entries serve the same model through the same loader
+        if m.serve.startswith("qwen3_tts"):
+            assert qwen[0] in m.requires and "qwen_tts" not in m.requires, m.name
     module, fn = qwen[0].split(":")
     assert f"def {fn}(" in Path(module.replace(".", "/") + ".py").read_text()
 
+
+
+def test_requires_reads_only_its_result_line_whatever_an_import_prints(tmp_path, monkeypatch):
+    """qwen_tts prints transformers' docstring warnings to stdout while the codec loads; the model was skipped
+    as lacking its loader. Output can land before or after the check's own line."""
+    from benchmark.eval.e2e import arm
+
+    (tmp_path / "noisy.py").write_text(
+        "import atexit\n"
+        "print('[ERROR] `cache_position` is part of the forward signature, but not documented.')\n"
+        "atexit.register(print, '[ERROR] printed at exit')\n"
+        "def load():\n    return 1\n")
+    (tmp_path / "dies.py").write_text("import os\nos._exit(3)\n")
+    for requires, want in ((["noisy:load"], ""), (["noisy:load", "no_such_module_xyz"],
+                                                   "no_such_module_xyz: ModuleNotFoundError"),
+                           (["dies"], "requirement check exited 3")):
+        monkeypatch.setattr(arm, "job", {"python": sys.executable, "model": {"requires": requires}})
+        assert arm.requirements_problem({"src": str(tmp_path)}) == want
 
 def test_results_pulls_work_with_an_rsync_older_than_3_2_3(tmp_path, monkeypatch):
     """RHEL 8's rsync 3.1.3 has no --mkpath; every push and pull lands in a directory whose parents may not exist."""

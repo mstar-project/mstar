@@ -24,7 +24,7 @@ import torch
 
 from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
@@ -100,13 +100,13 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-            prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+            kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
         )})
 
     def resolve(self, rid: str) -> int:
         """Both halves, in the order the engine runs them: every resource has
         to be told the length before any of them is asked to act on it."""
-        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].prefix_layout["main"][0].length)
+        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].kv_layout["main"].spans[0].length)
         prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
@@ -252,24 +252,24 @@ def test_two_schedules_over_the_same_tokens_agree_without_any_cache():
 
 
 def test_orpheus_declares_the_tensor_its_llm_prefills_from():
-    from mstar.model.base import PrefixStream
+    from mstar.model.base import PrefixKeys
     from mstar.model.orpheus.config import KV_CACHE
     from mstar.model.orpheus.orpheus_model import OrpheusModel
 
     # the method reads nothing off the model, so a stand-in is the whole of it
-    declared = OrpheusModel.prefix_key_streams(object())
+    declared = OrpheusModel.kv_labels(object())
 
-    assert declared == {
-        KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill")}
-    }, "the LLM node's prompt does not arrive under the name it keys"
+    assert declared[KV_CACHE]["main"].keys == PrefixKeys("text_inputs", ("prefill",)), (
+        "the LLM node's prompt does not arrive under the name it keys"
+    )
 
 
 def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
     from mstar.model.bagel.bagel_model import BagelModel
-    from mstar.model.base import PrefixStream
+    from mstar.model.base import PrefixKeys
 
-    declared = BagelModel.prefix_key_streams(object())
+    declared = BagelModel.kv_labels(object())
 
-    assert declared == {
-        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode", ("prefill_vit",))}
-    }, "the text walk's prompt does not arrive under the name it keys"
+    assert declared["kv"]["main"].keys == PrefixKeys("text_inputs", ("prefill_text", "prefill_vit"), growth=True), (
+        "the text walk's prompt does not arrive under the name it keys"
+    )

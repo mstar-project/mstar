@@ -44,6 +44,13 @@ COMPONENT_IN_FLIGHT = Family(
     "dispatched and whose completion it has not received yet.",
     ("component",),
 )
+ROUTING_PREDICTED_SAVING = Family(
+    "mstar_routing_predicted_saving_total", COUNTER,
+    "Per term of the data-parallel replica cost, the saving the mirrors "
+    "predicted on the replica each request was sent to, in request-equivalents: "
+    "for prefix, the share of the request's prompt predicted cached there.",
+    ("term",),
+)
 REQUEST_QUEUE_SECONDS = Family(
     "mstar_request_queue_seconds", HISTOGRAM,
     "Successful requests: the conductor taking the request in to admitting it "
@@ -107,17 +114,50 @@ COMPONENT_PENDING_STEPS = Family(
     ("component",),
 )
 
+#: ``src`` / ``dst`` of a tensor edge into or out of the graph: the data
+#: worker (a thread of the API server) sends the request's inputs and reads
+#: its results. Every other endpoint is a graph node name.
+TRANSFER_API_SERVER = "api_server"
+
+_TRANSFER_LABELS = ("src", "dst", "transport")
+
+# Counted by the consumer, once per edge read: the tensors of one graph edge it
+# read from one producer, over the transport (not a tensor already in its own
+# store). ``transport`` is the protocol: SHM, TCP or RDMA.
+TRANSFER_BYTES = Family(
+    "mstar_transfer_bytes_total", COUNTER,
+    "Tensor bytes the consumer read from the producer over this edge.",
+    _TRANSFER_LABELS,
+)
+TRANSFERS = Family(
+    "mstar_transfers_total", COUNTER,
+    "Tensors the consumer read from the producer over this edge.",
+    _TRANSFER_LABELS,
+)
+TRANSFER_SECONDS = Family(
+    "mstar_transfer_seconds", HISTOGRAM,
+    "Consumer-side time to read one edge's tensors from the producer (one "
+    "observation per edge read; the producer's own write or registration is "
+    "not included).",
+    _TRANSFER_LABELS,
+    buckets=(
+        0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025,
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ),
+)
+
 #: Families the engine workers report to the conductor (``WorkerStatus``); the
 #: conductor sums the workers' series and forwards them in its status message.
 WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
         KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
         PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+        TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )
 }
 
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
-    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT)
+    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, ROUTING_PREDICTED_SAVING)
 } | WORKER_FAMILIES

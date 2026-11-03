@@ -456,7 +456,8 @@ def cmd_compare(args) -> int:
     man = mf.load(args.cases)
     if args.list:
         for m in man.models.values():
-            cases = ", ".join(c.id + ("*" if c.optional else "") for c in m.cases)
+            cases = ", ".join(c.id + ("*" if c.optional else "") + (f" [{'+'.join(c.quality)}]" if c.quality else "")
+                              for c in m.cases)
             gpus = f" ({m.gpus} GPUs)" if m.gpus > 1 else ""
             print(f"{m.name + ('+' if m.optional else ''):26} {m.family:7} tags: {','.join(m.tags):50} cases: {cases}"
                   f"{gpus}")

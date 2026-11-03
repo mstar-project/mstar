@@ -52,7 +52,7 @@ else:
     MISSING_DEPENDENCY = None
 
 from mstar.observability import catalog
-from mstar.observability.recorders import MetricSnapshot
+from mstar.observability.recorders import MetricSnapshot, merge
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import PendingRequest
@@ -150,12 +150,17 @@ class _ConductorStatus:
     """The families in the conductor's latest status message
     (``catalog.STATUS_FAMILIES``), and ``mstar_conductor_status_age_seconds``.
 
+    ``local`` returns the snapshots this process records itself (the data
+    worker's transfers), summed into the same families at each scrape.
+
     The message thread swaps in each message's snapshots whole and a scrape
     reads them whole, so neither needs a lock.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str,
+                 local: Callable[[], list[MetricSnapshot]] | None = None):
         self.model_name = model_name
+        self._local = local
         self._snapshots: dict[str, MetricSnapshot] = {}
         # Until the first message, the age counts from enabling metrics, so a
         # conductor that never reports shows a growing age, not a missing one.
@@ -192,9 +197,12 @@ class _ConductorStatus:
         age.add_metric([self.model_name], time.monotonic() - self._received)
         yield age
         snapshots = self._snapshots
+        local = {s.name: s for s in self._local()} if self._local is not None else {}
         for family in catalog.STATUS_FAMILIES.values():
             labels = ["model_name", *family.labels]
             snap = snapshots.get(family.name) or MetricSnapshot(family.name, [])
+            if family.name in local:
+                snap = merge(family, [snap, local[family.name]])
             if family.kind == catalog.HISTOGRAM:
                 out = HistogramMetricFamily(family.name, family.help, labels=labels)
                 le = self._le[family.name]
@@ -355,7 +363,10 @@ class ServingMetrics:
     def __init__(
         self, model_name: str, in_flight: Callable[[], int],
         data_worker_queue_depth: Callable[[], int],
+        local_status: Callable[[], list[MetricSnapshot]] | None = None,
     ):
+        """``local_status``: status-family snapshots this process records
+        itself, summed with the conductor's (see ``_ConductorStatus``)."""
         require_prometheus_client()
         self.model_name = model_name
         self.content_type = CONTENT_TYPE_LATEST
@@ -394,7 +405,7 @@ class ServingMetrics:
         ))
         self.refusals = _Refusals(model_name)
         self.registry.register(self.refusals)
-        self._conductor = _ConductorStatus(model_name)
+        self._conductor = _ConductorStatus(model_name, local_status)
         self.registry.register(self._conductor)
 
         # Where a successful request's time went, from the timestamps it

@@ -15,6 +15,9 @@
 #
 #   usage: .github/review/replay.sh <pr-number> [outfile]
 #   MODE=thorough for the on-demand mode (default: light)
+#   MAX_TURNS=<n> for the turn cap (default: 40, as in the workflow)
+#   (a replay that reaches the cap prints only Claude's max-turns error, no findings; rerun it
+#   with a larger MAX_TURNS)
 #   HEAD=<full sha> to review the PR as it was at an earlier commit, e.g. the one a
 #   human reviewer flagged a bug on; existing comments are then left out so the
 #   reviewer can't read the answer
@@ -29,6 +32,7 @@ OUT="${2:-/tmp/mstar-review-$PR.md}"
 REPO="${REPO:-mstar-project/mstar}"
 MODEL="${MODEL:-claude-sonnet-5-5}"
 MODE="${MODE:-light}"
+MAX_TURNS="${MAX_TURNS:-40}"
 REMOTE="${REMOTE:-origin}"
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -84,12 +88,14 @@ claude -p "Read .github/review/review-prompt.md from the repository root and fol
    Mode: $MODE
    PR #$PR: $title
    pr.diff is $lines lines.
+   Turn cap: $MAX_TURNS.
 
    DRY RUN: nothing will be posted, and you have no posting tools. Where the prompt
    says to call create_inline_comment, print the call instead as a fenced json block
-   with keys path, line, startLine, side and body. Where it says to post the summary
-   with gh pr comment, print the summary markdown instead. Print nothing else." \
+   with keys path, line, startLine, side and body. Where it says to return the summary
+   fields, print them as one fenced json block instead. Print nothing else." \
   --model "$MODEL" \
+  --max-turns "$MAX_TURNS" \
   --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch | tee "$OUT"
 
 echo >&2

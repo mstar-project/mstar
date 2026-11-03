@@ -66,13 +66,72 @@ impl IncrementalDecoder {
     pub fn step(&mut self, id: u32) -> Option<String> {
         self.ids.push(id);
         let full = self.tok.decode(&self.ids);
-        if full.len() <= self.emitted.len() || !full.starts_with(&self.emitted) {
-            // The decode didn't extend our stable prefix yet; hold.
+        // A token that ends mid-character decodes to a trailing U+FFFD; hold
+        // it until the character completes, as vLLM and SGLang do. Committing
+        // it would also stall the stream: later decodes no longer start with
+        // `emitted`.
+        if full.ends_with('\u{FFFD}')
+            || full.len() <= self.emitted.len()
+            || !full.starts_with(&self.emitted)
+        {
             return None;
         }
         let piece = full[self.emitted.len()..].to_string();
-        // decode() already yields valid UTF-8, so `full` is safe to commit.
         self.emitted = full;
         Some(piece)
+    }
+
+    /// At the end of the stream: whatever `step` still holds (a character
+    /// that never completed comes out as U+FFFD).
+    pub fn finish(&mut self) -> Option<String> {
+        let full = self.tok.decode(&self.ids);
+        let rest = full.strip_prefix(self.emitted.as_str())?.to_string();
+        self.emitted = full;
+        (!rest.is_empty()).then_some(rest)
+    }
+}
+
+/// A byte-level BPE with one token per byte and no merges, so every byte of a
+/// multi-byte character is its own token.
+#[cfg(test)]
+pub(crate) fn byte_tok() -> Arc<Tok> {
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+
+    let vocab = ByteLevel::alphabet()
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| (c.to_string(), i as u32))
+        .collect();
+    let bpe = BPE::builder().vocab_and_merges(vocab, vec![]).build().unwrap();
+    let mut inner = Tokenizer::new(bpe);
+    inner.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
+    inner.with_decoder(Some(ByteLevel::new(false, false, false)));
+    Arc::new(Tok { inner })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_characters_stream_whole() {
+        let tok = byte_tok();
+        let ids = tok.encode("a中😀b");
+        assert_eq!(ids.len(), 9);
+        let mut d = IncrementalDecoder::new(tok);
+        let pieces: Vec<String> = ids.iter().filter_map(|&i| d.step(i)).collect();
+        assert_eq!(pieces, vec!["a", "中", "😀", "b"]);
+        assert_eq!(d.finish(), None);
+    }
+
+    #[test]
+    fn unfinished_character_flushes_at_the_end() {
+        let tok = byte_tok();
+        let ids = tok.encode("ok😀");
+        let mut d = IncrementalDecoder::new(tok);
+        let pieces: String = ids[..ids.len() - 1].iter().filter_map(|&i| d.step(i)).collect();
+        assert_eq!(pieces, "ok");
+        assert_eq!(d.finish().as_deref(), Some("\u{FFFD}"));
     }
 }

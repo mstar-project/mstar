@@ -20,7 +20,7 @@ import types
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -35,9 +35,11 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
-from mstar.observability.recorders import Counter, Gauge, Histogram, MetricSnapshot
+from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
+from mstar.streaming.topology import PartitionTopology
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -47,14 +49,24 @@ class _DataWorker:
     reports each request's preprocess-finish time once asked to."""
 
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.inputs = []
         self.aborted = []
         self.chunks = queue.Queue()
         self.profiles = queue.Queue()
         self.reporting = False
+        self.transfers = None
+        self.worker_metrics = False
 
     def report_preprocess_finish(self):
         self.reporting = True
+
+    def enable_worker_metrics(self):
+        self.worker_metrics = True
+
+    def enable_transfer_metrics(self):
+        self.transfers = EdgeTransfers("SHM")
+        return self.transfers
 
     def queue_depth(self):
         return 0
@@ -91,10 +103,11 @@ class _DataWorker:
         pass
 
 
-class _Conductor:
+class _Conductor(StandInSocket):
     """The API server's socket to the conductor."""
 
     def __init__(self):
+        super().__init__()
         self.inbox = queue.Queue()
 
     def get_all_new_messages(self):
@@ -401,14 +414,14 @@ def _in_flight_id(served, client):
                          headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", content=_chunked(2**21),
                          headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
-    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 422, "/v1/chat/completions"),
+    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 400, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
     (_in_flight_id, 409, "/generate"),
     (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
     # The served model has no OpenAI adapter.
     (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
     (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
-], ids=["401", "401-unmatched", "413-declared", "413-chunked", "422", "400", "409", "404-unmatched",
+], ids=["401", "401-unmatched", "413-declared", "413-chunked", "400-schema", "400", "409", "404-unmatched",
         "404-no-adapter", "405"])
 def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
         served, refusing, send, status, route):
@@ -677,35 +690,48 @@ class _StubTensorManager:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def has_inflight_reads(self, request_id):
         return False
 
     def force_cleanup_request(self, request_id):
         pass
 
+    def enable_transfer_metrics(self):
+        return EdgeTransfers("SHM")
+
 
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
     class _Model:
         def process_prompt(self, *args, **kwargs):
             return None
 
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["default"])
+
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
-    facade.profile_queue = queue.Queue()
+    facade.profile_queue = ResultQueue(EventWakeup())
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
-        communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                           send=lambda entity, msg: sent.append(msg)),
+        # codec / try_send_bytes: the thread's outbox sends through them
+        communicator=types.SimpleNamespace(
+            get_all_new_messages=lambda: [],
+            codec=types.SimpleNamespace(encode=lambda msg: msg),
+            try_send_bytes=lambda entity, msg: sent.append(msg) or True,
+        ),
         tensor_manager=_StubTensorManager(), model=_Model(),
         timing_requested=facade.timing_requested,
     )
@@ -889,6 +915,94 @@ def test_the_rust_bridge_serves_the_conductor_families(served):
     assert _without_age(bridged) == _without_age(python_route)
 
 
+# ── tensor transfers ─────────────────────────────────────────────────────────
+
+def _transfers(samples):
+    """{(sample name, src, dst, transport): value} of the transfer families."""
+    out = {}
+    for (name, labels), value in samples.items():
+        if name.startswith(("mstar_transfer_", "mstar_transfers_")) and "le" not in dict(labels):
+            kv = dict(labels)
+            assert kv["model_name"] == "dummy"
+            out[(name, kv["src"], kv["dst"], kv["transport"])] = value
+    return out
+
+
+def test_transfers_reach_metrics_from_the_conductor_and_the_data_worker(served, tmp_path, monkeypatch):
+    """Real SHM reads on two workers (two TP ranks reading the same edge) go
+    through their WorkerStatus into a real conductor's status; the data
+    worker's own read of a result is summed in at the scrape."""
+    import torch
+    from test_conductor_status import _conductor
+    from test_transfer_metrics import _read, _send, _shm
+
+    from mstar.graph.base import GraphEdge
+    from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, WorkerStatus
+
+    producer = _shm("worker_0", tmp_path)
+    ranks = [_shm(f"worker_{i}", tmp_path) for i in (1, 2)]
+    data_worker = _shm("api_server_preprocess_worker", tmp_path)
+    # the real data worker's manager behind the stand-in, as enable_metrics() finds it
+    monkeypatch.setattr(served.data_worker, "enable_transfer_metrics", data_worker.enable_transfer_metrics)
+    served.server.enable_metrics()
+    hidden = torch.randn(8, 4)
+    edge = _send(producer, "r1", {"h": [hidden]})["h"]
+    conductor = _conductor(tmp_path, monkeypatch, status_interval_s=0.0)
+    for rank in ranks:
+        stats = rank.enable_transfer_metrics()
+        _read(rank, "r1", [GraphEdge(next_node="llm", name="h", tensor_info=list(edge))])
+        status = wire.decode(wire.encode(ConductorMessage(
+            ConductorMessageType.WORKER_STATUS, WorkerStatus(rank.my_entity_id, stats.snapshot()))))
+        conductor._route_message(status, [])
+    token = torch.tensor([3])
+    out = _send(producer, "r1", {"new_token": [token]}, node="llm")["new_token"]
+    _read(data_worker, "r1", [GraphEdge(next_node="emit_to_client", name="text_output", tensor_info=out)])
+    data_worker.transfer_stats.publish()
+
+    served.conductor.inbox.put(wire.decode(wire.encode(
+        APIServerMessage("conductor_status", conductor._status()))))
+    samples = _scrape_until(served, _transfers)
+    got = _transfers(samples)
+    sums = [v for k, v in got.items() if k[0] == "mstar_transfer_seconds_sum"]
+    assert len(sums) == 2 and all(s > 0 for s in sums)
+    assert {k: v for k, v in got.items() if k[0] != "mstar_transfer_seconds_sum"} == {
+        ("mstar_transfer_bytes_total", "enc", "llm", "SHM"): 2 * hidden.nbytes,
+        ("mstar_transfers_total", "enc", "llm", "SHM"): 2,
+        ("mstar_transfer_seconds_count", "enc", "llm", "SHM"): 2,
+        ("mstar_transfer_bytes_total", "llm", "api_server", "SHM"): token.nbytes,
+        ("mstar_transfers_total", "llm", "api_server", "SHM"): 1,
+        ("mstar_transfer_seconds_count", "llm", "api_server", "SHM"): 1,
+    }
+    inf = _labels(src="enc", dst="llm", transport="SHM", le="+Inf")
+    assert samples[("mstar_transfer_seconds_bucket", inf)] == 2
+
+
+def test_transfer_snapshots_render_as_prometheus_client_would():
+    prometheus_client = pytest.importorskip("prometheus_client")
+    seconds = [0.00001, 0.0003, 0.02, 30.0]
+    stats = EdgeTransfers("TCP")
+    reference = prometheus_client.CollectorRegistry()
+    labels = ["model_name", *catalog.TRANSFER_SECONDS.labels]
+    ref_bytes = prometheus_client.Counter("mstar_transfer_bytes", "b", labels, registry=reference)
+    ref_tensors = prometheus_client.Counter("mstar_transfers", "t", labels, registry=reference)
+    ref_seconds = prometheus_client.Histogram(
+        "mstar_transfer_seconds", "s", labels, buckets=catalog.TRANSFER_SECONDS.buckets, registry=reference)
+    for i, s in enumerate(seconds):
+        stats.record("enc", "llm", 100 * i, i, s)
+        ref_bytes.labels("dummy", "enc", "llm", "TCP").inc(100 * i)
+        ref_tensors.labels("dummy", "enc", "llm", "TCP").inc(i)
+        ref_seconds.labels("dummy", "enc", "llm", "TCP").observe(s)
+
+    server = make_test_api_server(preprocess_worker=_DataWorker())
+    server.enable_metrics()
+    server.metrics.conductor_status(ConductorStatus(stats.snapshot()))
+    ours = {k: v for k, v in _parse(server.metrics.render().decode()).items()
+            if k[0].startswith(("mstar_transfer_", "mstar_transfers_"))}
+    theirs = {k: v for k, v in _parse(prometheus_client.generate_latest(reference).decode()).items()
+              if not k[0].endswith("_created")}
+    assert ours == theirs
+
+
 SLOW_PROMPT_S = 0.03
 
 
@@ -903,6 +1017,9 @@ class _MediaModel:
 
     def max_input_files(self):
         return {"image": 1}
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def load_image(self, filepath, device):
         from mstar.model.base import Model
@@ -936,16 +1053,20 @@ class _RealDataWorker:
     stand-in transport and conductor, and the API server's message thread."""
 
     def __init__(self, tmp_path, *, metrics, enable_prof=False):
-        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 
         self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
         facade = self.facade = PreprocessWorker.__new__(PreprocessWorker)
         for name in ("request_input_queue", "result_tensor_input_queue", "cleanup_request_queue",
-                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
-                     "output_queue", "profile_queue"):
+                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
             setattr(facade, name, queue.Queue())
+        facade.results_wakeup = EventWakeup()
+        facade.output_queue = ResultQueue(facade.results_wakeup)
+        facade.profile_queue = ResultQueue(facade.results_wakeup)
         facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
+        facade.worker_metrics_requested = threading.Event()
         facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
+        facade.tensor_manager = _StubTensorManager()
         worker = PreprocessWorkerThread(
             in_queue=facade.request_input_queue, result_tensor_queue=facade.result_tensor_input_queue,
             out_queue=facade.output_queue, profile_queue=facade.profile_queue,
@@ -953,10 +1074,15 @@ class _RealDataWorker:
             abort_request_queue=facade.abort_request_queue,
             reads_done_queue=facade.reads_done_queue,
             discard_tensor_queue=facade.discard_tensor_queue, stop_event=facade.stop_event,
-            communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                               send=lambda entity, msg: self.sent.append(msg)),
-            tensor_manager=_StubTensorManager(), model=self.model, enable_prof=enable_prof,
+            # codec / try_send_bytes: the thread's outbox sends through them
+            communicator=types.SimpleNamespace(
+                get_all_new_messages=lambda: [],
+                codec=types.SimpleNamespace(encode=lambda msg: msg),
+                try_send_bytes=lambda entity, msg: self.sent.append(msg) or True,
+            ),
+            tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
+            worker_metrics_requested=facade.worker_metrics_requested,
         )
         facade.thread = threading.Thread(target=worker.run, daemon=True)
         facade.thread.start()
@@ -1074,7 +1200,8 @@ def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modali
     elapsed = time.perf_counter() - start
     s = served.scrape()
 
-    assert len(served.sent) == 3  # the three that reached the conductor
+    # the three that reached the conductor, after the workers' ENABLE_METRICS
+    assert [m.message_type.value for m in served.sent] == ["enable_metrics"] + ["new_request"] * 3
     text_n, text_s = _data_worker_hist(s, "text")
     assert text_n == 1 and SLOW_PROMPT_S <= text_s < elapsed
     for modalities in ("image,text", "audio,text"):
@@ -1182,6 +1309,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+    # sizing torch's pool would outlive the test in this process
+    monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     return str(cfg)
 
 
@@ -1207,6 +1336,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1245,7 +1375,9 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context",
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
@@ -1260,6 +1392,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1284,7 +1417,8 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "lora_adapter_digests": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 

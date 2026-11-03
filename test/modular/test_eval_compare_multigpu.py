@@ -61,7 +61,8 @@ def test_shipped_multi_gpu_configs_match_their_rank_layouts():
     assert {x.name: x.gpus for x in picked} == SIX
     assert all(x.optional and x.case_timeout_s for x in picked)
     assert not {x.name for x in m.select("all")} & set(SIX)          # out of `all`
-    assert all(x.gpus == 1 for x in m.models.values() if x.name not in SIX)
+    six_configs = {m.models[n].config for n in SIX}                   # the transport variants reuse them
+    assert all(x.gpus == 1 for x in m.models.values() if x.name not in SIX and x.config not in six_configs)
     for x in picked:                                   # the config's ranks land on exactly devices 0..gpus-1
         cfg = yaml.safe_load(Path(x.config).read_text())
         devices = {(cfg.get("rank_devices") or {}).get(r, r) for g in cfg["node_groups"] for r in g["ranks"]}
