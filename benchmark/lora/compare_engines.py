@@ -30,8 +30,8 @@ Stages, each resumable (a finished cell or file is skipped on a rerun):
     g_all_linear_mixed alllinear two all-linear adapters and the base round-robin
     ================== ========= ==================================================
 
-    (f) and (g) need mstar's LoRA on the delta-net (``lora/gdn`` or later); on a branch
-    without it mstar refuses the adapters and they are recorded as not supported there.
+    (f) and (g) need mstar's LoRA on the delta-net (``in_proj_fused``); an mstar without
+    it refuses the adapters, and they are recorded as not supported there.
     Before anything starts, each adapter's modules are read from its file and checked
     against what each engine applies; an engine that would apply only some of them
     (SGLang has no ``in_proj_a``/``in_proj_b`` target on Qwen3.5) is excluded from the
@@ -49,9 +49,10 @@ mstar ``max_slots: S``, SGLang ``--max-loras-per-batch S+1`` because SGLang coun
 base model as one of its adapters per batch, but ``S`` on the churn server, whose
 scenario has no base rows and so would leave SGLang's base buffer to an adapter), the max
 rank of the loaded adapters (their ``r``), every adapter held in host memory, prefix
-caching off (mstar's Qwen3.5 has none;
-vLLM ``--no-enable-prefix-caching``, SGLang ``--disable-radix-cache``), context length and
-max running requests from the mstar config, fp32 GDN state, thinking off in the chat template, greedy, CUDA graphs on.
+caching off (mstar ``prefix_cache: false`` on its KV cache, vLLM
+``--no-enable-prefix-caching``, SGLang ``--disable-radix-cache``), context length and max
+running requests from the mstar config, fp32 GDN state, thinking off in the chat template,
+greedy, CUDA graphs on (an mstar server that drops a capture bucket does not count).
 
 An engine that fails to start, or rejects LoRA or an adapter, is recorded as not
 supported with an excerpt of its error, and the run goes on without it.
@@ -101,7 +102,7 @@ KINDS = ("off", "fit", "churn", "alllinear")
 CORRECTNESS_KINDS = ("fit", "alllinear")
 ATTN_MLP = frozenset({"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"})
 # Hub adapters that also touch the gated delta-net (`linear_attn.*`); the same three as
-# `qwen3_5_parity.DELTA_NET_ADAPTERS` on lora/gdn. The first two are PEFT all-linear, rank
+# `qwen3_5_parity.DELTA_NET_ADAPTERS`. The first two are PEFT all-linear, rank
 # 16; `medvqa` is rank 8 on in_proj_qkv / in_proj_z / out_proj only (correctness only).
 ALL_LINEAR_ADAPTERS = {
     "qwen3_5_0.8b": {
@@ -179,6 +180,8 @@ def _mstar_config(args, kind: str) -> Path:
     config = yaml.safe_load((REPO / "configs" / f"{args.model}.yaml").read_text())
     # text-only load; the vision warmup is not what is measured
     config.pop("warmup_requests", None)
+    # matched with the competitors' prefix caching, which is off
+    config.setdefault("resources", {}).setdefault("kv_cache", {})["prefix_cache"] = False
     slots = _slots(args, kind)
     if slots is not None:
         config.setdefault("resources", {})["lora"] = {
@@ -232,7 +235,7 @@ def _server(args, engine: str, kind: str, log: Path, extra_env: dict[str, str] |
     slots = _slots(args, kind)
     adapters = [f"{n}={d}" for n, d in _kind_dirs(args, kind).items()]
     if engine == "mstar":
-        env = {"MSTAR_SHM_ARENA": "1", "MSTAR_REQUIRE_CUDA_GRAPHS": "1", "HF_HUB_OFFLINE": "1",
+        env = {"MSTAR_SHM_ARENA": "1", "MSTAR_REQUIRE_ACCELERATOR_GRAPHS": "1", "HF_HUB_OFFLINE": "1",
                **(extra_env or {})}
         return ManagedServer(
             args.model, config=str(_mstar_config(args, kind)), env=env, log_path=log,
@@ -626,6 +629,15 @@ def start(args, engine: str, kind: str, label: str, extra_env: dict[str, str] | 
         _write(_support_path(args, engine, kind), {"ok": False, "error": _excerpt(log), "log": str(log)})
         print(f"!! {label}: not supported: {_excerpt(log, 300)}", flush=True)
         return None
+    # MSTAR_REQUIRE_ACCELERATOR_GRAPHS fails startup on a dropped bucket; any other
+    # capture that failed would run eager, so the server's cells do not count
+    dropped = log.read_text(errors="replace").count("Failed to capture") if engine == "mstar" else 0
+    if dropped:
+        srv.stop()
+        error = f"{dropped} accelerator graph capture(s) failed, so some steps would run eager"
+        _write(_support_path(args, engine, kind), {"ok": False, "error": error, "log": str(log)})
+        print(f"!! {label}: {error}", flush=True)
+        return None
     # one short request per model the server serves; an adapter it rejects is recorded
     labels = [BASE, *_kind_dirs(args, kind)]
     rejected = {}
@@ -645,16 +657,6 @@ def start(args, engine: str, kind: str, label: str, extra_env: dict[str, str] | 
     for name, why in rejected.items():
         print(f"!! {label}: adapter {name} rejected: {why}", flush=True)
     return srv
-
-
-def stop(args, srv, engine: str, label: str) -> None:
-    srv.stop()
-    if engine == "mstar":
-        # MSTAR_REQUIRE_CUDA_GRAPHS fails startup on a dropped bucket; count any other fallback
-        text = (args.out / "servers" / f"{label}.log").read_text(errors="replace")
-        n = text.count("Failed to capture")
-        if n:
-            print(f"!! {label}: {n} 'Failed to capture' lines", flush=True)
 
 
 def _adapter_modules(d: Path) -> list[str]:
@@ -700,7 +702,7 @@ def _skip_reason(args, engine: str, kind: str, labels: list[str]) -> str | None:
     rec = _support(args, engine, kind)
     if rec is None:
         return None
-    # mstar serves LoRA on the delta-net from lora/gdn on; before that it refuses these
+    # an mstar without LoRA on the delta-net refuses these
     head = "mstar: not supported on this branch" if engine == "mstar" and kind == "alllinear" else "not supported"
     if not rec.get("ok"):
         return f"{head} ({rec.get('error', '')[:300]})"
@@ -758,7 +760,7 @@ def stage_correctness(args) -> None:
                     for (n, i), got in zip(jobs, pool.map(ask, jobs), strict=True):
                         mixed.setdefault(n, {})[str(i)] = got
             finally:
-                stop(args, srv, engine, label)
+                srv.stop()
             _write(path, {"single": single, "mixed": mixed, "skipped": skipped})
         score_correctness(args, kind)
 
@@ -863,7 +865,7 @@ def stage_perf(args) -> None:
                 except Exception as exc:  # noqa: BLE001 - one engine failing must not cost the others their run
                     print(f"!! {label}: {exc!r}; its remaining cells are left for a rerun", flush=True)
                 finally:
-                    stop(args, srv, engine, label)
+                    srv.stop()
 
 
 def stage_profile(args) -> None:
@@ -910,7 +912,7 @@ def stage_profile(args) -> None:
                 (pdir / f"{s.name}_c{c}.txt").write_text(render(segs))
                 print(f"== profile {s.name} c={c}: {pdir / f'{s.name}_c{c}.txt'}", flush=True)
         finally:
-            stop(args, srv, "mstar", label)
+            srv.stop()
 
 
 # --- summary -------------------------------------------------------------------------
