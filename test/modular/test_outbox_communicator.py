@@ -243,7 +243,8 @@ def _factory(monkeypatch, *, version=None, has_try_send=True):
 def test_the_expected_build_carries_every_sender(monkeypatch):
     make = _factory(monkeypatch)
     assert make("conductor", []) == "rust"
-    assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "rust"
+    outbox = make("api_server_preprocess_worker", [], nonblocking_send=True)
+    assert isinstance(outbox, OutboxCommunicator) and outbox._inner == "rust"
 
 
 def test_a_build_of_another_version_is_refused(monkeypatch):
@@ -257,7 +258,7 @@ def test_a_build_of_another_version_is_refused(monkeypatch):
 def test_a_build_without_try_send_fails_the_outbox(monkeypatch):
     """Only the outbox needs try_send, so the other senders still start."""
     make = _factory(monkeypatch, has_try_send=False)
-    assert make("conductor", []) == "rust"
+    assert make("worker_0", []) == "rust"
     with pytest.raises(RuntimeError, match="predates ZmqCommunicator.try_send"):
         make("api_server_preprocess_worker", [], nonblocking_send=True)
 

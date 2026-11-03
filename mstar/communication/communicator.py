@@ -129,13 +129,15 @@ class BaseCommunicator(ABC):
     #     pass
 
 
-def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
+def make_communicator(
+    *args, nonblocking_send: bool = False, **kwargs,
+) -> "BaseCommunicator | OutboxCommunicator":
     """Construct the process's communicator: ``RustZMQCommunicator``, on the
     vendored ``rust/`` extension (see ``communication/rust_communicator.py``).
 
     Raises when the extension is missing or is not the version this tree
-    expects. ``nonblocking_send`` is for a communicator ``OutboxCommunicator``
-    wraps, which needs ``try_send_bytes``: an extension built before
+    expects. ``nonblocking_send`` wraps it in an ``OutboxCommunicator``, which
+    needs ``try_send_bytes``: an extension built before
     ``ZmqCommunicator.try_send`` is refused for it.
     """
     try:
@@ -165,10 +167,11 @@ def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCo
     if nonblocking_send and not hasattr(mstar_rust.ZmqCommunicator, "try_send"):
         raise RuntimeError(
             f"mstar_rust {version} predates ZmqCommunicator.try_send, which the "
-            "API server's preprocess thread sends with: rebuild it with "
+            "conductor and the API server's preprocess thread send with: rebuild it with "
             "`maturin develop --release -m rust/Cargo.toml`"
         )
-    return RustZMQCommunicator(*args, **kwargs)
+    communicator = RustZMQCommunicator(*args, **kwargs)
+    return OutboxCommunicator(communicator) if nonblocking_send else communicator
 
 
 class OutboxCommunicator:
@@ -176,8 +179,9 @@ class OutboxCommunicator:
     (at its high-water mark) is queued, in order behind any earlier one to the
     same peer, and retried by ``flush``.
 
-    For a loop that peers block on while it sends to them (the API server's
-    preprocess thread, against the conductor and the workers): if it blocked on
+    For a loop that peers block on while it sends to them (the conductor
+    against the workers, and the API server's preprocess thread against the
+    conductor and the workers): if it blocked on
     a full peer it would stop reading the input that peer waits to deliver, and
     the two would wait on each other for good. Everything else is the wrapped
     communicator's.

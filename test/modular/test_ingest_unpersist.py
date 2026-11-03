@@ -49,6 +49,9 @@ class _StubComm:
     def poll_for_messages(self, timeout_ms):
         return bool(self.batches)
 
+    def flush(self):
+        return False  # every send above went out
+
 
 class _ScriptDoneError(Exception):
     pass
