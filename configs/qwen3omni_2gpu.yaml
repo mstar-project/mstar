@@ -1,8 +1,13 @@
 model: "qwen3_omni"
 max_seq_len: 32768
-# The Thinker's KV pool defaults to 2,048 pages, 24 GiB at 12 MiB a page, which
-# doesn't fit beside its weights on an 80 GB GPU; qwen3omni_2gpu_large_kv.yaml
-# keeps the default for larger GPUs. Host pages give a full pool a request to move.
+# The Thinker's KV pool holds 1,024 GPU pages (128k tokens; its default 2,048, 24 GiB at
+# 12 MiB a page, doesn't fit beside the weights on an 80 GB GPU) plus 1,024 host pages
+# that give a full pool a request to move. Its text prefill ladder stays at the default
+# 128-2048. Whether every capture fits beside this pool on an 80 GB GPU such as the
+# H100 is unmeasured; qwen3omni_2gpu_h100.yaml is the H100 placement. On H200-class
+# GPUs, when concurrent requests hold more than 128k tokens of Thinker KV, serve
+# qwen3omni_2gpu_large_kv.yaml, which keeps 2,048 pages (256k tokens) on the GPU; see
+# the Qwen3-Omni notes in docs/models.rst for its caveats.
 resources:
   thinker_kv:
     max_num_pages: 1024

@@ -399,9 +399,10 @@ class Qwen3TTSModel(Model):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Server-init knob (deployment YAML ``model_kwargs``): the speech
-        # codec decoder's dtype. float32 reproduces the reference decoder
-        # bit for bit. bfloat16 is not faster on B300: cuDNN's heuristics run
-        # several of its convs on a kernel without tensor cores.
+        # codec decoder's dtype. float32 stays within rounding of the reference
+        # decoder, bit for bit off the channels-last conv stack. bfloat16 only
+        # gains there (see ``ChannelsLastConvStack``): on the reference stack
+        # cuDNN runs several convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
         # Server-init knob: opt-in AudioSeal watermark on the codec's output
         # (``mstar.model.audio_watermark``). Checked here so a missing package
@@ -449,8 +450,8 @@ class Qwen3TTSModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Talker paged KV + attention/position/sampler resources.
 
-        The CodePredictor's frame-local KV scratch is not a resource; the
-        Talker submodule owns it (overwritten every step)."""
+        The CodePredictor's frame-local KV scratch is not a resource; its
+        ``DepthKV`` owns it (overwritten every step)."""
         talker = self.config.talker
         cp = talker.code_predictor
         talker_kv = PagedKVConfig(
@@ -468,7 +469,7 @@ class Qwen3TTSModel(Model):
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},
-                config=PositionConfig(kv_cache=TALKER_KV),
+                config=PositionConfig(kv_cache=TALKER_KV, rope_theta=talker.rope_theta),
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
@@ -1088,7 +1089,7 @@ class Qwen3TTSModel(Model):
         )
 
     def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        # the prefill samples the first frame, so decode runs one iteration fewer than max tokens
         return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
@@ -1157,12 +1158,10 @@ class Qwen3TTSModel(Model):
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
         ) -> NodeSubmodule:
+        from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
         from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
-        from mstar.model.qwen3_tts.components.talker import (
-            Qwen3TTSCodePredictor,
-            Qwen3TTSTalkerModel,
-        )
+        from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
         from mstar.model.qwen3_tts.submodules import TalkerSubmodule
 
         # Construct on meta first so worker startup never holds both a random
@@ -1198,7 +1197,12 @@ class Qwen3TTSModel(Model):
         # CodePredictor is small and depth-wise. It is loaded separately from
         # ``talker.code_predictor.*`` and remains replicated under Talker TP.
         with torch.device("meta"):
-            code_predictor = Qwen3TTSCodePredictor(self.config)
+            # the frame's embedding sum rounds to the model dtype after every add, as
+            # this Talker always has (the reference sums in fp32, rounded once)
+            code_predictor = ResidualCodePredictor(
+                self.config.code_predictor, self.config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                embed_sum_dtype=None,
+            )
         if autocast_dtype is not None:
             code_predictor = code_predictor.to(autocast_dtype)
         code_predictor.to_empty(device=device)

@@ -324,7 +324,6 @@ def invoke_fused_moe_kernel(
 
     K = B.shape[2]
     even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
-
     fused_moe_kernel[grid](
         A,
         B,

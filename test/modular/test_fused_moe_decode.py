@@ -144,16 +144,21 @@ def test_router_launch_follows_the_table(table, launches, monkeypatch):
     assert logits["BK"] == bk and logits["num_warps"] == tuning.router["warps"]
 
 
-def test_router_topk_op(launches):
-    w, ids = decode.router_topk(torch.randn(5, 64), torch.zeros(64), 8, 2.5, True)
+@pytest.mark.parametrize("softmax", [False, True])
+def test_router_topk_op(launches, softmax):
+    # the softmax router passes bf16 logits and no bias; the weights are fp32 either way
+    dtype, bias = (torch.bfloat16, None) if softmax else (torch.float32, torch.zeros(64))
+    w, ids = decode.router_topk(torch.randn(5, 64, dtype=dtype), bias, 8, 2.5, True, softmax)
     assert w.shape == ids.shape == (5, 8) and ids.dtype == torch.int64
     (_, grid, _, kw), = launches
-    assert grid == (5,) and kw["S"] == 1 and kw["NORM"] is True
+    assert grid == (5,) and kw["S"] == 1 and kw["NORM"] is True and kw["SOFTMAX"] is softmax
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode():
-        w, ids = decode.router_topk(torch.empty(5, 64), torch.empty(64), 8, 2.5, True)
-    assert w.shape == (5, 8) and ids.dtype == torch.int64
+        fake_bias = None if softmax else torch.empty(64)
+        w, ids = decode.router_topk(torch.empty(5, 64, dtype=dtype), fake_bias, 8, 2.5, True,
+                                    softmax)
+    assert w.shape == (5, 8) and w.dtype == torch.float32 and ids.dtype == torch.int64
 
 
 # ---------------------------------------------------------------- CUDA

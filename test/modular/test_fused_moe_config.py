@@ -140,6 +140,39 @@ def test_compiled_fused_experts_is_one_graph():
     assert explain.graph_count == 1
 
 
+def _shipped_entries():
+    for path in sorted((table.TABLE_DIR / "moe_gemm").glob("*.json")):
+        for i, _ in enumerate(json.loads(path.read_text())["entries"]):
+            yield pytest.param(path, i, id=f"{path.stem}-{i}")
+
+
+@CUDA
+@pytest.mark.parametrize(("path", "index"), list(_shipped_entries()))
+def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(path, index, monkeypatch):
+    """An uncaptured step compiles fused_experts with a dynamic batch size, and every row of a
+    shipped table must trace that way, its launch options included."""
+    from mstar.utils.fused_moe import fused_experts
+
+    entry = json.loads(path.read_text())["entries"][index]
+    shape = entry["shape"]
+    experts, two_inter, hidden, top_k = shape["E"], shape["N"], shape["K"], shape["top_k"]
+    monkeypatch.delenv(table.TABLES_ENV, raising=False)
+    monkeypatch.setattr(registry, "device_key", lambda device: DeviceKey(path.stem))
+    registry.reset_lookups()
+    torch._dynamo.reset()
+    assert kernels._tile_rows(experts, two_inter, hidden, top_k, torch.bfloat16, torch.device("cuda", 0))
+    w1 = torch.randn(experts, two_inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    w2 = torch.randn(experts, hidden, two_inter // 2, device="cuda", dtype=torch.bfloat16) * 0.02
+    run = torch.compile(lambda x, w, i: fused_experts(x, w1, w2, w, i), dynamic=True)
+    # each row's largest batch and one past the last; 0 and 1 are specialized, never symbolic
+    bounds = [int(key) for key in entry["rows"] if key != "*"]
+    for num_tokens in sorted({max(m, 2) for m in [*bounds, bounds[-1] + 1]}):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        weights, ids = torch.rand(num_tokens, experts, device="cuda").topk(top_k, dim=-1)
+        run(x, weights.to(torch.bfloat16), ids)
+    registry.reset_lookups()
+
+
 @CUDA
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64])
 def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):

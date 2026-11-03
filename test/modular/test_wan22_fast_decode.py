@@ -97,7 +97,7 @@ def _spy_eager_calls(step) -> list[int]:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_off_switch_is_stock_vae_decode(monkeypatch, vae, dtype) -> None:
     sub = _decoder(monkeypatch, vae, fast=False, dtype=dtype)
-    assert sub._fast_step is None
+    assert sub._fast is None
     assert not wan_vae.is_channels_last(sub.vae)
     assert {type(m) for m in sub.vae.modules()} == {type(m) for m in vae.modules()}
     z = _latents()
@@ -108,9 +108,8 @@ def test_eager_default_layout_is_stock_vae_decode(monkeypatch, vae) -> None:
     """The fast path's wiring with an eager step on the default layout issues
     ``vae.decode``'s decoder calls, one latent each, and its frames bit for bit."""
     sub = _decoder(monkeypatch, vae, fast=False)
-    sub._fast_step = wan_vae.DecoderStep(sub.vae, compile=False)
-    monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: None)
-    calls = _spy_eager_calls(sub._fast_step)
+    sub._fast = wan_vae.FastDecoder(sub.vae, channels_last=False, compile=False)
+    calls = _spy_eager_calls(sub._fast.step)
     z = _latents()
     assert torch.equal(_forward(sub, z), _stock(vae, z))
     assert calls == [1] * z.shape[2]
@@ -124,7 +123,7 @@ def test_default_fast_path_is_stock_to_rounding(monkeypatch, vae, dtype) -> None
     step's warm-up) return the same frames."""
     sub = _decoder(monkeypatch, vae, fast=True, dtype=dtype)
     assert Wan22Config().vae_decode_fast
-    assert wan_vae.is_channels_last(sub.vae) and sub._fast_step.compiled
+    assert wan_vae.is_channels_last(sub.vae) and sub._fast.step.compiled
     z = _latents()
     first = _forward(sub, z)
     if dtype == torch.float32:
@@ -140,7 +139,7 @@ def test_compiled_calls_see_one_layout_whatever_the_clip_length(monkeypatch, vae
     """The compiled step's inputs have the same shape and strides for every
     clip length at one resolution, so a new frame count does not recompile."""
     sub = _decoder(monkeypatch, vae, fast=True)
-    step = sub._fast_step
+    step = sub._fast.step
     seen = []
 
     def spy(x, **kw):
@@ -156,8 +155,7 @@ def test_compiled_calls_see_one_layout_whatever_the_clip_length(monkeypatch, vae
 
 def test_channels_last_eager_is_stock_to_rounding(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae, fast=False)
-    wan_vae.to_channels_last(sub.vae)
-    sub._fast_step = wan_vae.DecoderStep(sub.vae, compile=False)
+    sub._fast = wan_vae.FastDecoder(sub.vae, compile=False)
     z = _latents()
     _u8_close(_forward(sub, z), _stock(vae, z), 1)
 
@@ -169,7 +167,7 @@ def test_tiled_fallback_is_stock_tiled_decode(monkeypatch, vae) -> None:
     ref = _stock(vae, z, tiled=True)
     assert torch.equal(_forward(_decoder(monkeypatch, vae, fast=False, tiling="tiled"), z), ref)
     sub = _decoder(monkeypatch, vae, fast=True, tiling="tiled")
-    calls = _spy_eager_calls(sub._fast_step)
+    calls = _spy_eager_calls(sub._fast.step)
     assert torch.equal(_forward(sub, z), ref)
     assert calls == [] and not wan_vae.is_channels_last(sub.vae)
 

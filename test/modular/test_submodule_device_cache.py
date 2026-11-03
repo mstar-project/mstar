@@ -35,3 +35,17 @@ def test_get_device_does_not_walk_the_parameters_again():
     for _ in range(3):
         assert sub.get_device().type == "cpu"
     assert calls == []
+
+
+def test_a_compiled_forward_reading_the_device_does_not_recompile():
+    from torch._dynamo.utils import counters
+
+    with torch.device("meta"):
+        sub = _submodule()
+    sub.to_empty(device="cpu")
+    torch._dynamo.reset()
+    counters.clear()
+    forward = torch.compile(lambda x: sub.lin(x) + torch.ones(2, device=sub.get_device()), backend="eager")
+    for _ in range(2):
+        forward(torch.randn(3, 2))
+    assert counters["stats"]["unique_graphs"] == 1

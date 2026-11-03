@@ -647,6 +647,10 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
     assert interleaving_failure(log, ("rid-a", "rid-b")) is None
     assert harness["_execution_count_failure"](log, ("rid-a", "rid-b"), 2) is None
     assert harness["_cleaned_request_ids"](log) == {"rid-a", "rid-b"}
+    # the server logs the internal id: the client's plus a "#<n>" suffix
+    suffixed = log.replace("rid-a", "rid-a#0").replace("rid-b", "rid-b#0")
+    assert harness["_dit_schedule"](suffixed, {"rid-a", "rid-b"}) == harness["_dit_schedule"](log, {"rid-a", "rid-b"})
+    assert harness["_cleaned_request_ids"](suffixed) == {"rid-a", "rid-b"}
     serial = "\n".join(
         [
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",

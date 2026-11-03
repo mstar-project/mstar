@@ -103,6 +103,25 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
         assert torch.equal(actual, reference)
 
 
+def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
+    """Cameras travel to the worker as uint8 and normalize to the same ViT
+    input as the base class's float [0, 1] encoding."""
+    from torchvision.io import write_png
+
+    pixels = torch.arange(3 * 6 * 10, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(3, 6, 10)
+    path = tmp_path / "cam.png"
+    write_png(pixels, str(path))
+
+    loaded = _make_model().load_image(str(path), "cpu").data
+    assert loaded.dtype == torch.uint8
+    assert torch.equal(loaded, pixels)
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=8, num_cameras=1))
+    from_uint8 = submodule._prepare_one(loaded.unsqueeze(0))
+    from_float = submodule._prepare_one(loaded.unsqueeze(0).float() / 255.0)
+    torch.testing.assert_close(from_uint8, from_float, rtol=0, atol=1e-6)
+
+
 # ----------------------------------------------------------------------
 # Graph structure
 # ----------------------------------------------------------------------
@@ -315,6 +334,21 @@ class _StubTokenizer:
         # Return a deterministic tensor of length 1; the test only inspects
         # last_prompt.
         return torch.tensor([0], dtype=torch.long)
+
+
+def test_pi05_refuses_to_start_without_a_tokenizer(monkeypatch):
+    """A served model that can't load a tokenizer must fail at load, not take
+    the dummy-mode path and fail every request at ingest."""
+    import transformers
+
+    def unavailable(repo, **kwargs):
+        raise OSError(f"{repo} is gated")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", unavailable)
+    model = _make_model()
+    model.skip_weight_loading = False
+    with pytest.raises(ValueError, match="google/paligemma-3b-pt-224 is gated"):
+        model._load_tokenizer()
 
 
 def test_pi05_process_prompt_formats_state_into_text():
