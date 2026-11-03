@@ -32,7 +32,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_droid``
      - ``nvidia/Cosmos3-Nano-Policy-DROID``
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
-       ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
+       ``droid_lerobot``, 8-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
    * - ``cosmos3_edge``
      - ``nvidia/Cosmos3-Edge``
@@ -1301,12 +1301,30 @@ steps: batching keeps requests in step rather than adding throughput.
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
-``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8,
 "action_chunk_size": 32}``; the reply's ``action`` payload is float32
 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
-embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
-pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
-reports chunks/s, actions/s and latency percentiles.
+embodiment's actions. A policy request may also send the robot's current state
+as ``robot_state``, one row of ``raw_action_dim`` finite numbers (a NaN or inf is
+a 400), as pi0.5 takes it. The state is one more action token, kept clean at
+video frame 0 in front of the chunk, so ``num_frames`` is ``action_chunk_size + 1``
+and the reply carries only the predicted rows. The released DROID policies were
+trained this way. A request that sends a ``robot_state`` is a policy request, and
+its chunk, fps and domain default to the checkpoint's ``checkpoint.json`` (Edge
+DROID: 32 rows, 15 fps, ``droid_lerobot``; ``configs/cosmos3_droid.yaml`` sets the
+same for Nano, whose file is empty), so NVIDIA's RoboLab request is the image, the
+prompt, the state and ``size="736x544"``: the wrist frame above the two exterior
+frames reflection-padded to 736x544, the 7 joint positions and the gripper as
+DROID records them, and the task with view, duration and resolution text (a JSON
+caption for Edge). The DROID configs map the gripper to the checkpoint's
+``1 - gripper`` in every action a request sends and back in every action it
+gets (``inverted_action_dims``),
+and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
+``[960, 1001]`` (``guidance_interval_action``; outside it the conditional branch
+runs alone, batched requests too). For a control loop use ``/generate/ws`` (one
+connection, pipelined observations): ``examples/cosmos3_action_ws_client.py``
+builds that request, runs the loop and reports chunks/s, actions/s and latency
+percentiles.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------
