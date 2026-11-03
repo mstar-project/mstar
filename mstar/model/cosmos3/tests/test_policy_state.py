@@ -7,6 +7,7 @@ no weights."""
 
 from __future__ import annotations
 
+import json
 import math
 import types
 
@@ -15,7 +16,7 @@ import pytest
 import torch
 
 from mstar.model.base import ProcessPromptOutput
-from mstar.model.cosmos3.components.packing import action_start_frame_offset
+from mstar.model.cosmos3.components.packing import action_start_frame_offset, resolve_action_domain_id
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import ACTION_GEN_WALK, COND_LABEL, Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
@@ -98,6 +99,42 @@ def test_robot_state_must_be_finite_numbers(bad) -> None:
         _submit(_model(), {**POLICY, "robot_state": state})
     with pytest.raises(ValueError, match="robot_state"):
         _submit(_model(), {**POLICY, "robot_state": "0.1, 0.2"})
+
+
+def _policy_checkpoint(root, policy):
+    (root / "transformer").mkdir(parents=True)
+    (root / "transformer" / "config.json").write_text(json.dumps({"_class_name": "Cosmos3OmniTransformer"}))
+    (root / "checkpoint.json").write_text(json.dumps({"policy": policy} if policy else {}))
+    return Cosmos3Model(model_path_hf=str(root), skip_weight_loading=True)
+
+
+def test_policy_defaults_come_from_the_checkpoint(tmp_path) -> None:
+    """The Edge DROID checkpoint's checkpoint.json carries the chunk, fps and
+    domain its policy serves, so a request sends only the observation, the
+    prompt and the robot_state."""
+    model = _policy_checkpoint(
+        tmp_path / "edge", {"action_chunk_size": 32, "conditioning_fps": 15.0, "domain_name": "droid_lerobot"},
+    )
+    p = model._resolve_gen_params({"size": "736x544", "robot_state": STATE}, *MODALITIES)
+    assert p["action_mode"] == "policy" and p["action_chunk_size"] == 32 and p["num_frames"] == 33
+    assert p["fps"] == 15.0 and p["domain_id"] == resolve_action_domain_id(None, "droid_lerobot")
+    assert p["raw_action_dim"] == 8 and p["action_state_rows"] == 1
+    # The request wins.
+    p = model._resolve_gen_params(
+        {"robot_state": STATE, "action_chunk_size": 16, "fps": 10, "domain_id": 3}, *MODALITIES,
+    )
+    assert p["action_chunk_size"] == 16 and p["fps"] == 10.0 and p["domain_id"] == 3
+    # Only policy requests take them.
+    p = model._resolve_gen_params(
+        {"action_mode": "inverse_dynamics", "domain_id": 3, "raw_action_dim": 8}, *MODALITIES,
+    )
+    assert p["action_chunk_size"] == 16 and p["fps"] == model.config.fps
+    # A checkpoint without them (Nano DROID's checkpoint.json is empty) keeps the
+    # generic defaults, so its yaml sets them.
+    nano = _policy_checkpoint(tmp_path / "nano", None)
+    assert nano.config.policy_action_chunk_size is None
+    with pytest.raises(ValueError, match="domain_id"):
+        nano._resolve_gen_params({"robot_state": STATE}, *MODALITIES)
 
 
 def test_robot_state_reaches_the_dit_in_the_policys_convention() -> None:
