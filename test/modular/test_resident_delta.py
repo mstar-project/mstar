@@ -209,6 +209,7 @@ class _Engine:
     _journal = Engine._journal
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
+    owes_moves = Engine.owes_moves
     residency = Engine.residency
     admit_request = Engine.admit_request
     offload_request = Engine.offload_request
@@ -634,6 +635,8 @@ class _Leader:
     """``maybe_send_zmq_to_tp_followers`` over stubs."""
 
     maybe_send_zmq_to_tp_followers = Worker.maybe_send_zmq_to_tp_followers
+    _flush_tp_moves = Worker._flush_tp_moves
+    _owes_tp_moves = Worker._owes_tp_moves
     _rid_str = Worker._rid_str
     _step_reads = Worker._step_reads
 
@@ -657,6 +660,8 @@ class _Leader:
         # Live requests moved off the worker-graph manager onto here; the
         # broadcast reads it to say what its page state should add up to.
         self.request_state = SimpleNamespace(per_request_info={"r0": object()})
+        self.streams = StreamBufferManager(self.request_state, None, [])
+        self._lockstep_led = frozenset({"node"})
         self.sent: list = []
         self.communicator = SimpleNamespace(
             send=lambda worker, msg: self.sent.append((worker, msg))
@@ -744,6 +749,22 @@ def test_the_journal_is_drained_by_the_broadcast():
     assert len(leader.sent[0][1].body.resident_delta) == 0, (
         "the same move went out twice"
     )
+
+
+def test_a_pass_with_no_step_of_the_instance_sends_rank_0s_moves_in_a_step_with_no_rows():
+    """The step goes through the worker's own batch builder and broadcast, so a flush that can't build its step
+    fails here."""
+    leader, follower = _Leader(followers=("rank1",)), _Engine("follower")
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.sent.clear()
+    leader.engine.offload_request("node", "a")
+
+    leader._flush_tp_moves()
+
+    [(worker, msg)] = leader.sent
+    assert (worker, msg.body.node_name, msg.body.request_ids) == ("rank1", "node", [])
+    assert follower.apply_resident_delta(msg.body.resident_delta, _keeps_none)
+    assert follower.resource.offloaded == {"a"}, "the follower never got rank 0's offload"
 
 
 # --- the wiring: a follower does not run rank 0's OOM recovery --------------
