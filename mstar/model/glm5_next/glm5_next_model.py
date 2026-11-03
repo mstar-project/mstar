@@ -190,7 +190,6 @@ class Glm5NextModel(Model):
                     recurrent_state=KDA_STATE,
                     variant=LinearAttnVariant.KDA,
                     backend=LinearAttnBackend.TRITON,
-                    gate_lower_bound=self.config.gate_lower_bound,
                 ),
             ),
         ]
