@@ -29,7 +29,7 @@ from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.rebuild import HostCopies, KeptIds, NodeWrites, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.worker import _LazyHostOutputs
 
@@ -179,7 +179,7 @@ def test_a_higgs_transcription_can_be_dropped_where_its_llm_runs():
     config.apply_conductor_config(
         kv_layout={"main": out.metadata["kv_layout"][KV_CACHE]["main"].row()}, loop_caps={"decode_loop": 8},
     )
-    rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 22, torch.device("cpu")))
     writes = {KV_CACHE: {"LLM": NodeWrites(frozenset({"prefill_audio", "decode"}), frozenset({"decode_loop"}))}}
 
     rebuildable = rebuilds.ingest_request(R, writes, {KV_CACHE: config.kv_layout.values()}, unpausable=False)
@@ -216,7 +216,7 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
 def _kept(prompt, *sampled: int) -> KeptIds:
     """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), PREFILL, torch.long, array("i", sampled))
+    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled))
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -236,22 +236,24 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
-def test_a_full_pool_keeps_no_ids():
-    rebuilds = _rebuilds(16)
+def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
 
+    assert _ingest(rebuilds, A, (PrefixSpan(4, 4, PREFILL),)), "a request the pool holds would stay guaranteed"
+    assert not _ingest(rebuilds, R, (PrefixSpan(2, 2, PREFILL),)), "two requests' ids would share host memory"
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
-
-    assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE], "two requests' ids would share host memory"
+    assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE]
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = _rebuilds(16)
-    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    _ingest(rebuilds, R, (PrefixSpan(4, 4, PREFILL),))
 
     rebuilds.remove_request(R)
-    rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
 
-    assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
+    assert _ingest(rebuilds, A, (PrefixSpan(4, 4, PREFILL),)), (
+        "the pool would fill with removed requests' ids and keep no more"
+    )
 
 
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
@@ -273,6 +275,15 @@ def test_a_request_no_drop_can_free_keeps_no_ids(why):
 
 def _media(prompt=(1,), *sampled: int, copies: HostCopies | None = None) -> KeptIds:
     return replace(_kept(prompt, *sampled), walk=VISION, copies=HostCopies() if copies is None else copies)
+
+
+def _copying(*rids: int) -> Rebuilds:
+    """`Rebuilds` whose ``rids`` keep their ids from ``VISION`` and wait for their copies, each with a slice."""
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
+    for rid in rids:
+        rebuilds._kept[NODE][rid], rebuilds._droppable[NODE][rid] = _media(), pool.take(64)
+    return rebuilds
 
 
 def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_its_copies():
@@ -304,8 +315,7 @@ def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
 
 
 def test_a_step_of_no_copied_walk_copies_nothing_and_reads_no_row():
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
-    rebuilds._kept[NODE] = {R: _media()}
+    rebuilds = _copying(R)
     ctx = StepContext(request_ids=(R,), graph_walk=DECODE, slot=0, capture=False)
 
     # the step carries no rows' inputs, so reading one would raise
@@ -315,21 +325,44 @@ def test_a_step_of_no_copied_walk_copies_nothing_and_reads_no_row():
 
 
 def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_its_step_metadata():
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
-    rebuilds._kept[NODE] = {rid: _media() for rid in (R, A)}
+    rebuilds = _copying(R, A)
     rebuilds._kept[NODE][B] = _kept([1])
-    step = _vision_step((R, A, B), {A: DECODE})
+    step = _vision_step((R, A, B), {A: DECODE}, completion_event=None)
 
     rebuilds.keep_copies(step)
 
     copies = rebuilds._kept[NODE][R].copies
-    assert copies.inputs == {"embeds": [step.per_request_input_tensors[R]["embeds"][0]]}, (
+    assert list(copies.inputs) == ["embeds"] and copies.inputs["embeds"][0].tolist() == [R, R], (
         "a rebuild would need the encoder to run again"
     )
     assert copies.step_metadata == {"prefill_order": (R,)}, "the rebuild row would run under decode's metadata"
     assert copies.step_metadata is not step.per_request_info[R].step_metadata, "a later step could rewrite the copy"
     assert copies.ready(), "the request could never be dropped"
     assert rebuilds._kept[NODE][A].copies.inputs is None, "a row of another walk would stand in for the prefill"
+
+
+def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_gives_back_what_they_didnt_use():
+    """Every image request pinned its encoder output in blocks of its own for its whole life, and nothing capped the
+    total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
+    pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
+    before it is admitted and stays out of the drops."""
+    pool = HostPool(160, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
+
+    # five ids at 4 B, aligned to 24, and the image's six slots at 8 B
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R].nbytes == 24 + 48
+    assert _ingest(rebuilds, A, IMAGE_CHAT)
+    assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
+    step = _vision_step((R,), {}, completion_event=None)
+    # the image's four rows, without its two sentinels
+    step.per_request_input_tensors[R] = {
+        "text_inputs": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], "embeds": [torch.ones(4, 2)],
+    }
+    rebuilds.keep_prompts(step)
+    rebuilds.keep_copies(step)
+
+    assert rebuilds._droppable[NODE][R].nbytes == 24 + 32, "the sentinels' room would stay taken for the request's life"
+    assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
 
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
@@ -446,7 +479,7 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
     prompt = torch.tensor([1, 2], dtype=torch.int32)
-    copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
+    copying = HostCopy(prompt, SimpleNamespace(query=lambda: False))
     rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, torch.long, array("i", [5]))
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (

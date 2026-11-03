@@ -40,7 +40,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
-from mstar.worker.host_pool import HostCopy, HostSlice
+from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
@@ -66,7 +66,7 @@ class _Engine(SimpleNamespace):
 def _kept(tokens: int) -> KeptIds:
     """A request's prompt of ``tokens`` ids on the host, and one sample."""
     view = torch.arange(tokens, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), "prefill", torch.long, array("i", [0]))
+    return KeptIds(HostCopy(view, None), "prefill", torch.long, array("i", [0]))
 
 
 def _worker(kv):
@@ -81,7 +81,7 @@ def _worker(kv):
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
-    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 20, torch.device("cpu")))
     w._rebuilds._kept[NODE] = {rid: _kept(5 * PAGE_SIZE) for rid in "rv"}
     w._in_flight_rids, w._hold_logged, w._rid_str = set(), {}, str
     w.held, w.tried, w.failed = [], [], {}

@@ -118,7 +118,13 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
+from mstar.worker.rebuild import (
+    DEFAULT_REBUILD_HOST_MB,
+    DEFAULT_REBUILD_MEDIA_HOST_MB,
+    Rebuilds,
+    node_writes,
+    policies_run_here,
+)
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -442,6 +448,12 @@ class _LazyHostRow(Mapping):
         return len(self._row)
 
 
+def _serving_mb(model_config: dict | None, key: str, default: int) -> int:
+    value = (model_config or {}).get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key}: {value!r} is not a non-negative int")
+    return value
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -743,9 +755,9 @@ class Worker:
         policies = {} if model is None else policies_run_here(
             model.rebuild_policies(), graphs, my_walks, self.parallel_nodes,
         )
-        host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-        if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-            raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+        host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+        if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
+            host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
         self._rebuilds = Rebuilds(
             policies, graphs,
             HostPool(host_mb << 20, self.device) if host_mb and policies else None, self._side_stream,

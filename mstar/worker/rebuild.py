@@ -15,11 +15,11 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild
-from mstar.engine.resources.kv.config import StreamLayout, rebuild_refusal
+from mstar.engine.resources.kv.config import SpanKind, StreamLayout, rebuild_refusal
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 from mstar.utils.h2d import to_device_nonblocking
-from mstar.worker.host_pool import HostCopy, HostPool
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice, aligned
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
@@ -29,13 +29,16 @@ if TYPE_CHECKING:
 # The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
 # at 4 B each.
 DEFAULT_REBUILD_HOST_MB = 64
+# The serving config's ``rebuild_media_host_mb`` unless it sets one, taken only where a node copies what a walk reads
+# besides the ids: a Qwen3.5-9B image of 1024 tokens is 8 MiB of encoder output.
+DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
 @dataclass(slots=True)
 class HostCopies:
     """Host copies of what a request's prefill walk read besides its ids, and of that row's step metadata, for
-    the request's rebuild row. Empty until the row's step has run. ``landed`` is recorded after the copies, and
-    stays None on a CPU device, where the inputs are kept as they are."""
+    the request's rebuild row. Empty until the row's step has run. ``landed`` is recorded after the last copy, and
+    stays None where the copies were made in place."""
     inputs: NameToTensorList | None = None
     step_metadata: dict | None = None
     landed: torch.Event | None = None
@@ -169,8 +172,9 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free. Only these keep their ids.
-        self._droppable: dict[str, set[int]] = {node: set() for node in policies}
+        # node -> the handles whose pages a drop there can free, each with the slice of the pool its ids and host
+        # copies go to. Only these keep them.
+        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
 
@@ -189,7 +193,20 @@ class Rebuilds:
         return (
             policy is not None and rebuild_refusal(layouts) is None
             and all(loop == policy.loop for layout in layouts for loop, _ in layout.growth)
-            and all(span.walk in policy.walks for layout in layouts for span in layout.spans)
+            and all(
+                span.walk in policy.walks and (span.kind == SpanKind.IDS or self._copied[node][span.walk])
+                for layout in layouts for span in layout.spans
+            )
+        )
+
+    def _log_bytes(self, node: str, layouts: Iterable[StreamLayout]) -> int:
+        """The host bytes ``node``'s log takes for a request of ``layouts``: its prompt's ids as int32, and the
+        host copies of what each other span's walk read."""
+        per_slot = self._policies[node].copy_bytes_per_slot
+        ids = sum(span.length for layout in layouts for span in layout.spans if span.kind == SpanKind.IDS)
+        return aligned(4 * ids) + sum(
+            span.length * per_slot[span.walk]
+            for layout in layouts for span in layout.spans if span.kind != SpanKind.IDS
         )
 
     def ingest_request(
@@ -202,7 +219,8 @@ class Rebuilds:
 
         A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps
         ``rid``'s ids only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
-        is False."""
+        is False. It takes the pool's room for them now, so a request the pool can't hold is known before it is
+        admitted, and no drop can free it there."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
         for key, nodes in writes.items():
@@ -212,20 +230,28 @@ class Rebuilds:
                     written[node] += laid_out
                     writers[key].append(node)
         refused = {node for node, laid_out in written.items() if not self.can_rebuild(node, laid_out)}
+        taken = {}
+        if not unpausable:
+            for node in written.keys() - refused:
+                piece = None if self._pool is None else self._pool.take(self._log_bytes(node, written[node]))
+                if piece is None:
+                    refused.add(node)
+                else:
+                    taken[node] = piece
         rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
-        if not unpausable:
-            for node in written.keys() - refused:
-                if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                    self._droppable[node].add(rid)
+        for node, piece in taken.items():
+            if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
+                self._droppable[node][rid] = piece
+            else:
+                self._pool.give(piece)
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in one of
-        the policy's walks, a drop here can free its request's pages, and the request keeps no ids yet. A row the
-        pool can't hold keeps none. A row of a walk that reads more than the ids gets its host copies once its step
-        has run (`keep_copies`)."""
+        """Copy a row's prompt into its request's slice once the step that read the prompt completes, when the row
+        is in one of the policy's walks, a drop here can free its request's pages, and the request keeps no ids
+        yet. A row of a walk that reads more than the ids gets its host copies after them (`keep_copies`)."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
             return
@@ -240,16 +266,19 @@ class Rebuilds:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
             prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, node_batch.completion_event, torch.int32)
-            if copy is not None:
-                kept[rid] = KeptIds(
-                    copy, row_walk, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                    HostCopies() if self._copied[node_batch.node_name][row_walk] else None,
-                )
+            copy = self._pool.copy_out(prompt, droppable[rid], node_batch.completion_event, torch.int32)
+            copies = bool(self._copied[node_batch.node_name][row_walk])
+            kept[rid] = KeptIds(
+                copy, row_walk, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
+                HostCopies() if copies else None,
+            )
+            if not copies:
+                self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
-        """Copy to the host what each row of a copied walk read besides its ids, as the step received it, and
-        its step metadata. The host has waited on the step, so the copies need no wait."""
+        """Copy what each row of a copied walk read besides its ids, as the step received it, into its request's
+        slice after the ids, once the step completes, and keep its step metadata. A request whose copies don't fit
+        its slice, which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
         node = node_batch.node_name
         copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
         walks = {walk for walk, names in copied.items() if names}
@@ -268,18 +297,36 @@ class Rebuilds:
                 and node_batch.per_request_info[rid].graph_walk == kept.walk
             ):
                 rows.append((rid, kept))
-        if not rows:
-            return
-        stream = self._side_stream()
         for rid, kept in rows:
-            inputs = node_batch.per_request_input_tensors[rid]
-            kept.copies.inputs = {name: [_to_host(t, stream) for t in inputs[name]] for name in copied[kept.walk]}
+            piece, inputs = self._droppable[node][rid], node_batch.per_request_input_tensors[rid]
+            tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
+            used = aligned(kept.prompt.view.nbytes)
+            if used + sum(aligned(tensor.nbytes) for _, tensor in tensors) > piece.nbytes:
+                self._forget(node, rid)
+                continue
+            kept.copies.inputs = {name: [] for name in copied[kept.walk]}
+            for name, tensor in tensors:
+                copy = self._pool.copy_out(
+                    tensor, HostSlice(piece.offset + used, piece.nbytes - used), node_batch.completion_event,
+                )
+                kept.copies.inputs[name].append(copy.view)
+                kept.copies.landed, used = copy.landed, used + aligned(tensor.nbytes)
             kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
-        if stream is not None:
-            landed = torch.Event(device=stream.device)
-            landed.record(stream)
-            for _, kept in rows:
-                kept.copies.landed = landed
+            self._trim(node, rid, used)
+
+    def _trim(self, node: str, rid: int, used: int) -> None:
+        """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
+        keeps."""
+        piece = self._droppable[node][rid]
+        if used < piece.nbytes:
+            self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
+            self._droppable[node][rid] = HostSlice(piece.offset, used)
+
+    def _forget(self, node: str, rid: int) -> None:
+        self._kept[node].pop(rid, None)
+        piece = self._droppable[node].pop(rid, None)
+        if piece is not None:
+            self._pool.give(piece)
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -408,24 +455,10 @@ class Rebuilds:
         return self._cursors.pop((node, rid))
 
     def remove_request(self, rid: int) -> None:
-        for node, kept in self._kept.items():
-            self._droppable[node].discard(rid)
-            ids = kept.pop(rid, None)
-            if ids is not None:
-                self._pool.give(ids.prompt.slice)
+        for node in self._kept:
+            self._forget(node, rid)
             self._cursors.pop((node, rid), None)
 
 
 def _row_ids(cursor: RebuildCursor) -> torch.Tensor:
     return torch.frombuffer(cursor.ids, dtype=torch.int32)[:-1]
-
-
-def _to_host(tensor: torch.Tensor, stream: torch.Stream | None) -> torch.Tensor:
-    if stream is None or tensor.device.type == "cpu":
-        return tensor
-    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-    with stream:
-        host.copy_(tensor, non_blocking=True)
-    # Once the worker drops the tensor, the step's stream may reuse its memory before the copy has read it.
-    tensor.record_stream(stream)
-    return host
