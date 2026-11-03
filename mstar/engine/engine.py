@@ -2244,6 +2244,10 @@ class Engine:
         cg_runner = submodule_mgmt.accelerator_graph_runner
         return cg_runner is not None and cg_runner.captures_walk(graph_walk)
 
+    def capture_group_order(self, node_name: str, graph_walk: str) -> tuple:
+        """Capture groups this walk runs first, in order (``capture_group_order``)."""
+        return self._submodules[node_name].submodule.capture_group_order(graph_walk)
+
     def capture_group(
         self, node_name: str, graph_walk: str, request_id: int,
         request_info: CurrentForwardPassInfo,
