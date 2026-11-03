@@ -1000,7 +1000,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,</span>
 <span class="sd">_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,</span>
 <span class="sd">_admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,</span>
-<span class="sd">_moved} (purged by release), and WorkerProfileInfo.</span>
+<span class="sd">_moved} (purged by release), SamplerCells._cells (purged by the sampler's</span>
+<span class="sd">remove_request), and WorkerProfileInfo.</span>
 
 <span class="sd">MicroScheduler.pending_tp_follow_count is the one deliberate exception: a</span>
 <span class="sd">ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it</span>

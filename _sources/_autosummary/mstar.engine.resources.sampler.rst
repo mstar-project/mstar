@@ -28,6 +28,7 @@ mstar.engine.resources.sampler
    :recursive:
 
    config
+   resident
    resource
    utils
 

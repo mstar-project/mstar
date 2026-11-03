@@ -2329,7 +2329,10 @@ and lengths; positions read the pool their <code class="docutils literal notrans
 turns it on only if every resource of the node can (<code class="docutils literal notranslate"><span class="pre">Resource.resident_refusal</span></code>) and
 the deployment left <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">resident_planning</span></code> at <code class="docutils literal notranslate"><span class="pre">auto</span></code>; the worker log says why
 otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
-stale, so the first resident step after them writes it.</p>
+stale, so the first resident step after them writes it. The sampler takes part on its
+own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
+of the row, so a resident step stages none of them, while the RNG offset, the last token
+and the repetition-penalty mask stay by the sampler’s own row of each request.</p>
 <p>A <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code> contains a list of <code class="docutils literal notranslate"><span class="pre">Segment</span></code> objects and one <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> per
 resource key:</p>
 <ul class="simple">
