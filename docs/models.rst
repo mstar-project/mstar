@@ -1703,6 +1703,34 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
    36 to 44 GiB compiled.
 
+``linear_precision``
+   ``bf16`` (default), ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
+   the model declares (``LOW_PRECISION_LINEARS`` beside each transformer) through cuBLASLt's
+   block-scaled GEMM, ``torch._scaled_mm``. Modulation, timestep, patch and caption embedders and
+   the final projection stay bf16. Weights are quantized once at load, after any ``lora``,
+   and activations per call by a Triton kernel (``utils.quant_fp8.quant_block``). A GPU below
+   compute capability 10.0 stays on bf16 with a warning, and a linear whose K isn't a whole
+   number of scale tiles (MXFP8 128, NVFP4 64) or whose N isn't a multiple of 16 is refused at
+   load.
+
+   It stays off by default because the images move. Against the bf16 image of the same prompt
+   and seed, over the 100 protocol prompts with the shipped config on one B300 (compute capability
+   10.3): klein 4B MXFP8 lands at a median 22.3 dB, lowest 13.6 dB, and NVFP4 at 15.8 dB, lowest
+   8.3 dB. Two bf16 images of a prompt at different seeds are a median 10.4 dB apart. MXFP8 keeps
+   the scene with its details shifted; NVFP4 sometimes changes the composition. On the same GPU
+   the 4B's denoise step goes from 31.7 ms to 24.8 ms (MXFP8) or 23.4 ms (NVFP4), and images per
+   second at 8 concurrent requests rise 24% or 36%. Peak VRAM falls 2.1 to 2.8 GiB with MXFP8.
+
+``linear_precision_keep``
+   Extra ``fnmatch`` patterns over the transformer's linear names to keep in bf16 for one
+   deployment, on top of the declaration.
+
+``linear_precision_bf16_steps``
+   Klein only. A request's first N denoise steps run a bf16 twin of the transformer, and each
+   capture bucket is captured twice. Those steps don't batch with later ones, and the deployment
+   holds both sets of weights. One step takes klein 4B MXFP8 from a median 22.3 dB to 27.0 dB,
+   lowest 16.0 dB, at a 26.7 ms mean step.
+
 ``max_image_area``
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
    are rejected with a 400 before scheduling instead of occupying the worker for minutes

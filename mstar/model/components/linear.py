@@ -15,7 +15,7 @@ projections but don't need TP.
 ``BlockScaledLinear`` runs a linear through cuBLASLt's block-scaled GEMM: weights quantized once
 at load, the activation per call. A model opts in by declaring which of its linears may run that way
 (``LowPrecisionLinears``, applied by ``apply_linear_precision``). The output differs from the bf16
-GEMM's by the format's rounding, so this is a knob for a calibrated quality bar, never a default.
+GEMM's by the format's rounding, so it is opt-in, checked against a calibrated quality bar.
 """
 from __future__ import annotations
 
