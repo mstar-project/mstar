@@ -543,8 +543,9 @@ class APIServer:
         # _process_messages).
         self.conductor_proc: mp.Process | None = None
         # Non-None once the deployment is going down because the conductor
-        # died. It is the error every pending (and later) request gets, and the
-        # reason main() exits non-zero. on_fatal stops the HTTP server.
+        # died or the message loop ended. It is the error every pending (and
+        # later) request gets, and the reason main() exits non-zero. on_fatal
+        # stops the HTTP server.
         self.fatal_error: str | None = None
         self.on_fatal: Callable[[], None] | None = None
         self._liveness_interval_s = 0.5
@@ -622,14 +623,15 @@ class APIServer:
             return None
         return describe_exitcode(proc.exitcode)
 
-    def _fail_pending_for_dead_conductor(self, exited: str) -> None:
-        """The conductor is gone (it exits when a worker dies, or it crashed).
+    def _fail_pending_and_stop(self, cause: str) -> None:
+        """The server can't deliver results any more: the conductor is gone (it
+        exits when a worker dies, or it crashed), or the message loop ended.
         Release every waiting client with a 503 now rather than at the request
         timeout, refuse new requests, and stop the HTTP server so the process
         exits non-zero instead of serving a deployment that can't run anything.
         """
-        message = f"conductor process exited with {exited}, so the server is shutting down"
-        logger.error("Conductor process exited with %s, shutting the server down", exited)
+        message = f"{cause}, so the server is shutting down"
+        logger.error("%s, shutting the server down", cause)
         with self.request_lock:
             self.fatal_error = message
             for req in self.pending_requests.values():
@@ -1044,21 +1046,34 @@ class APIServer:
         return None if oldest is None else oldest + self._recently_completed_ttl
 
     def _process_messages(self) -> None:
+        """Run ``_message_loop``. When it ends while the server runs (the
+        conductor exited, or its wait raised: a closed wakeup fd, the one error
+        the transport raises there, never recovers), every pending request
+        fails with a 503 and the HTTP server stops."""
+        try:
+            cause = self._message_loop()
+        except Exception as e:
+            if not self.running:
+                return
+            logger.exception("Message processing loop failed")
+            cause = f"the API server's message loop failed ({type(e).__name__}: {e})"
+        if cause is not None:
+            self._fail_pending_and_stop(cause)
+
+    def _message_loop(self) -> str | None:
         """Drain the ZMQ pull socket and route results to pending requests.
-        Also watches the conductor process. Once it exits, every pending
-        request is failed and the HTTP server is told to stop."""
+        Also watches the conductor process: returns why the server must go
+        down once it exits, None once the server stops."""
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
-        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
                 next_liveness_check = now + self._liveness_interval_s
                 exited = self._conductor_exited()
                 if exited is not None:
-                    self._fail_pending_for_dead_conductor(exited)
-                    return
+                    return f"conductor process exited with {exited}"
             next_expiry = None
             try:
                 for message in self.communicator.get_all_new_messages():
@@ -1287,30 +1302,21 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
-                # Everything else that changes what a pass reads signals the poll:
-                # a message, the data worker's flush (``ResultQueue``) and a
-                # request handler (``_wake_message_loop``). Only the liveness
-                # check and the delivery TTL are on a timer. Inside the try: a
-                # transport error from the wait is a failed pass, not the end of
-                # the thread that delivers every request's results.
-                wait_s = next_liveness_check - time.monotonic()
-                if next_expiry is not None:
-                    wait_s = min(wait_s, next_expiry - time.time())
-                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
-                if failed_passes:
-                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
-                    failed_passes = 0
             except Exception:
-                # the next pass goes after the back-off, without a wait: the
-                # prune may not have run. A transport that stays broken logs
-                # its traceback once, then a count, backing off to 1 s a pass.
+                # one pass's error (a message it can't route) is logged and the
+                # loop goes on; a prune it skipped runs by the next liveness check
                 if self.running:
-                    failed_passes += 1
-                    if failed_passes == 1:
-                        logger.exception("Error in message processing loop")
-                    elif failed_passes % 100 == 0:
-                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
-                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
+                    logger.exception("Error in message processing loop")
+            # Everything else that changes what a pass reads signals the poll:
+            # a message, the data worker's flush (``ResultQueue``) and a
+            # request handler (``_wake_message_loop``). Only the liveness
+            # check and the delivery TTL are on a timer. Outside the try: an
+            # error here ends the loop (see ``_process_messages``).
+            wait_s = next_liveness_check - time.monotonic()
+            if next_expiry is not None:
+                wait_s = min(wait_s, next_expiry - time.time())
+            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+        return None
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
