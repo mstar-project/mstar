@@ -307,10 +307,11 @@ class Cosmos3Config:
     action_gen: bool = True
     max_action_dim: int = 64
     num_embodiment_domains: int = 32
-    # Action dims the served policy takes as 1 - x: DROID's gripper (7) for the
-    # released DROID policies. A policy request's robot_state is mapped on the
-    # way in and its predicted rows on the way out, so a client sends and reads
-    # the robot's own values (the same robot_state a pi0.5 DROID policy takes).
+    # Action dims the served checkpoint takes as 1 - x: DROID's gripper (7) for
+    # the released DROID policies. Every action a request sends (a policy's
+    # robot_state, a forward-dynamics action) is mapped on the way in and every
+    # predicted action on the way out, so a client sends and reads the robot's
+    # own values (the same robot_state a pi0.5 DROID policy takes).
     inverted_action_dims: tuple[int, ...] = ()
     sound_gen: bool = True
     sound_dim: int | None = 64

@@ -151,6 +151,10 @@ def test_robot_state_reaches_the_dit_in_the_policys_convention() -> None:
     # `action` keeps meaning the action chunk: on a policy request it conditions nothing.
     tensors, p, _ = _submit(model, {**POLICY, "raw_action_dim": 8, "action_chunk_size": 32, "action": [STATE]})
     assert "action_inputs" not in tensors and "action_state_rows" not in p
+    # A forward-dynamics `action` goes in the same convention, so a policy reply
+    # sent back as `action` reaches the DiT with the gripper the policy predicted.
+    fd = model._action_prompt_output({}, {"action_mode": "forward_dynamics", "action": [STATE, STATE]})
+    assert torch.allclose(fd.new_input_tensors["action_inputs"][0], torch.tensor([expected, expected]))
 
 
 def test_prefill_puts_the_state_in_front_of_the_chunk() -> None:
@@ -211,10 +215,10 @@ def test_reply_carries_the_predicted_rows_in_the_robots_convention() -> None:
     expected = chunk[0, :32].clone()
     expected[:, 7] = 1 - expected[:, 7]
     assert np.allclose(out, expected.numpy())
-    # Another mode's action rows are not the policy's.
+    # An inverse-dynamics reply goes back to the robot's convention too.
     mk = {**POLICY, "action_mode": "inverse_dynamics", "action_chunk_size": 32, "raw_action_dim": 8}
     out = np.frombuffer(model.postprocess(chunk[:, :32], "action", mk), dtype=np.float32).reshape(-1, 64)
-    assert np.array_equal(out, chunk[0, :32].numpy())
+    assert np.allclose(out, expected.numpy())
 
 
 def test_guidance_interval_is_an_action_default(tmp_path) -> None:

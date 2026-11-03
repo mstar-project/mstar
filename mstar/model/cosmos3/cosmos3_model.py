@@ -956,12 +956,12 @@ class Cosmos3Model(Model):
         """Put conditioning values on a tensor edge; only their shape is metadata.
         Forward dynamics sends the action chunk as ``action``; a policy request
         may send the robot's current state as ``robot_state``, which rides the
-        same edge in the policy's convention (``inverted_action_dims``)."""
+        same edge. Both go in the checkpoint's convention (``inverted_action_dims``)."""
         metadata = dict(metadata or {})
         mode = str(kwargs.get("action_mode", "")).strip().lower()
         if mode == ACTION_MODE_FORWARD_DYNAMICS and kwargs.get("action") is not None:
             action = torch.as_tensor(kwargs["action"])
-            tensors["action_inputs"] = [action]
+            tensors["action_inputs"] = [self._invert_action_dims(action, action.shape[-1])]
             metadata["action_shape"] = list(action.shape)
         state = self._robot_state(kwargs)
         if state is not None:
@@ -1009,13 +1009,13 @@ class Cosmos3Model(Model):
 
     def _invert_action_dims(self, rows: torch.Tensor, raw_action_dim: int) -> torch.Tensor:
         """``rows`` with the deployment's ``inverted_action_dims`` mapped to 1 - x, the
-        convention its policy was trained in (DROID's 1 - gripper); the map is its
-        own inverse, so it serves the state on the way in and the reply on the way
-        out. Padding columns past ``raw_action_dim`` stay zero."""
+        convention its checkpoint was trained in (DROID's 1 - gripper); the map is its
+        own inverse, so it serves every action a request sends on the way in and every
+        predicted action on the way out. Padding columns past ``raw_action_dim`` stay zero."""
         dims = [d for d in self.config.inverted_action_dims if d < raw_action_dim]
         if not dims:
             return rows
-        rows = rows.clone()
+        rows = rows.clone() if rows.is_floating_point() else rows.float()
         rows[..., dims] = 1.0 - rows[..., dims]
         return rows
 
@@ -1241,13 +1241,12 @@ class Cosmos3Model(Model):
             # raw_action_dim are zero padding (the client keeps the first
             # raw_action_dim, the real action width for its embodiment). A
             # policy request's robot_state token is its own input, so it is
-            # dropped, and the rows go back to the robot's convention.
+            # dropped, and every mode's rows go back to the robot's convention.
             mk = request_kwargs or {}
             x = output[0] if output.ndim == 3 else output
             x = x.detach().to(torch.float32)
-            if self._is_policy(mk):
-                state_dim = self._robot_state_dim(mk)
-                x = self._invert_action_dims(x[1 if state_dim else 0:], int(mk.get("raw_action_dim") or state_dim))
+            state_dim = self._robot_state_dim(mk) if self._is_policy(mk) else 0
+            x = self._invert_action_dims(x[1 if state_dim else 0:], int(mk.get("raw_action_dim") or state_dim))
             return x.cpu().numpy().tobytes()
         if modality == "audio":
             # The audio decoder emits a [channels, samples] waveform in [-1, 1];

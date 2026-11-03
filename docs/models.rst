@@ -1313,8 +1313,9 @@ same for Nano, whose file is empty), so NVIDIA's RoboLab request is the image, t
 prompt, the state and ``size="736x544"``: the wrist frame above the two exterior
 frames reflection-padded to 736x544, the 7 joint positions and the gripper as
 DROID records them, and the task with view, duration and resolution text (a JSON
-caption for Edge). The DROID configs map the gripper to the policy's
-``1 - gripper`` on the way in and back on the way out (``inverted_action_dims``),
+caption for Edge). The DROID configs map the gripper to the checkpoint's
+``1 - gripper`` in every action a request sends and back in every action it
+gets (``inverted_action_dims``),
 and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
 ``[960, 1001]`` (``guidance_interval_action``; outside it the conditional branch
 runs alone, batched requests too). For a control loop use ``/generate/ws`` (one

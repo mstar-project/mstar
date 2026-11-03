@@ -26,9 +26,10 @@ model_kwargs:
   # The cookbook's guidance interval: of the 4 steps only the first guides,
   # the rest run the conditional branch alone (and the warmup compiles both).
   guidance_interval_action: [960, 1001]
-  # The policy takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
-  # flips it): the robot_state comes in and the predicted rows go out in the
-  # robot's own values, the same state a pi0.5 DROID policy takes.
+  # The checkpoint takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): every action comes in and goes out in the robot's own values (the
+  # robot_state, a forward-dynamics action, the predicted rows), the same state
+  # a pi0.5 DROID policy takes.
   inverted_action_dims: [7]
 node_groups:
   # No reasoner: the policy checkpoint ships no vision encoder, so the chat
