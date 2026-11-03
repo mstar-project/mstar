@@ -140,12 +140,12 @@ def test_an_eager_step_leaves_a_dropped_rows_last_token(device):
 def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch):
     """Under the in-graph scatter the replay writes each row's token and advanced RNG offset to the masters, a
     row outside ``kept_rids`` to the trash row. The engine takes a rebuild row out of ``kept_rids``, so its
-    request's next decode step reads the token and offset it had before the rebuild."""
+    request's next decode step reads the token, offset and history count it had before the rebuild."""
     pytest.importorskip("flashinfer")
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
     device = torch.device("cuda")
-    res = SamplerResource(vocab_size=V, enable_repetion_penalty=False, device=device)
+    res = SamplerResource(vocab_size=V, enable_repetion_penalty=False, max_repetition_window=4, device=device)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=2, max_seq_len=1)
     bufs = res._cg_buffers
@@ -180,16 +180,17 @@ def test_a_captured_step_leaves_a_rebuild_rows_last_token_and_offset(monkeypatch
         res.commit(SamplerStep(), ctx)
         torch.cuda.synchronize()
 
-    def state(rid: int) -> tuple[int, int]:
-        slot = bufs._rid_to_slot[rid]
-        return bufs.last_token.master[slot].item(), bufs.offset.master[slot].item()
+    def state(rid: int) -> tuple[int, int, int]:
+        slot, history = bufs._rid_to_slot[rid], res._history
+        count = history.count[history._rid_to_slot[rid]]
+        return bufs.last_token.master[slot].item(), bufs.offset.master[slot].item(), count.item()
 
     replay()  # both requests decode once
     kept, rebuilt = state(KEPT), state(DROPPED)
     replay(frozenset({DROPPED}))
 
     assert state(KEPT)[1] > kept[1], "the step never drew for its kept row"
-    assert state(DROPPED) == rebuilt, "the rebuild row's sample overwrote the token or offset decode reads next"
+    assert state(DROPPED) == rebuilt, "the rebuild row's sample overwrote state decode reads next"
 
 
 @pytest.mark.parametrize(

@@ -117,6 +117,24 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
+def test_a_full_pool_keeps_no_ids():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+
+    rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
+
+    assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE], "two requests' ids would share host memory"
+
+
+def test_removing_a_request_gives_its_slice_back():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
+
+    rebuilds.remove_request(R)
+    rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
+
+    assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
+
+
 def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
     ctx = StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False, rebuild_rids=rebuild)
     return SimpleNamespace(node_name=NODE, request_ids=list(rids), step_context=ctx)
@@ -164,6 +182,17 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
     assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters})
     rebuilds._kept[NODE][R] = _kept([1, 2], 5, 6)
     assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}) is None, "a request its ids cover was refused"
+
+
+def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
+    rebuilds = _rebuilds()
+    prompt = torch.tensor([1, 2], dtype=torch.int32)
+    copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
+    rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
+
+    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}), (
+        "a rebuild would read ids the copy hasn't written yet"
+    )
 
 
 def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_last():
