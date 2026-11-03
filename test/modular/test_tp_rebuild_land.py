@@ -7,14 +7,16 @@ Under MSTAR_KV_DEBUG_ASSERTS the follower's page trail then differs from rank 0'
 stops.
 
 Two ranks with real KV pools and rebuild logs drop v, rebuild it over N and N+1, and the follower checks rank 0's
-trail on the step after. The follower builds N+1 with the real `Worker._try_follow_speculation`, and both ranks
-post-process with the real `Worker._finish_rebuild_rows`.
+trail on the step after. The follower builds N+1 with the real `Worker._try_follow_speculation`, or with
+`MicroScheduler._try_schedule_tp_follow` when rank 0 sends N+1 after N, and both ranks post-process with the real
+`Worker._finish_rebuild_rows`.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from test_resident_delta import NODE, PAGE_SIZE, _both_short_then_drop, _counts, manager_mod
 from test_worker_rebuild import POLICY, _graphs, _kept
@@ -112,11 +114,12 @@ def _head(lead, seq: int, rids=(), **kwargs) -> ScheduleTPNode:
     )
 
 
-def test_a_rebuild_over_a_speculated_step_lands_on_the_follower_with_rank_0s(monkeypatch):
+@pytest.mark.parametrize("speculated", [True, False], ids=["N+1 speculated from N", "N+1 sent after N"])
+def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch, speculated):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     zero, one = _Rank(leader, lead), _Rank(follower, follow)
-    sched = one.scheduler
+    sched, request_state = one.scheduler, one.worker.request_state
 
     # the step after the refusal carries v's drop
     sched.register_tp_follow(_head(lead, 0))
@@ -126,23 +129,23 @@ def test_a_rebuild_over_a_speculated_step_lands_on_the_follower_with_rank_0s(mon
     # N: rank 0's log starts v's rebuild and offers its first chunk. The follower knows v from its own KV.
     zero.scheduler._start_rebuild(NODE, "v", "decode")
     sched.register_tp_follow(_head(lead, 1, ["v"]))
-    assert sched.settle_tp_follow_delta(caught_up=True)
-    assert sched.follow_rebuilds(one.worker.request_state, NODE, ["v"]) == {"v"}
-    sched.pop_tp_follow_head()
-    n = _step(1)
+    n = sched._try_schedule_tp_follow(request_state)
+    assert n.rebuild_rids == {"v"}
 
-    # N+1, speculated from N
-    sched.register_tp_follow(_head(lead, 2, ["v"], speculative=True, spec_from_seq=1))
-    pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n,
-                              node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)))
-    followed = Worker._try_follow_speculation(one.worker, pending)
-    assert followed is not None
-
-    # each rank post-processes N, then N+1, and rank 0 sends the step after
-    zero.post_process(_step(1))
+    if speculated:
+        sched.register_tp_follow(_head(lead, 2, ["v"], speculative=True, spec_from_seq=1))
+        pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n,
+                                  node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)))
+        n_1 = Worker._try_follow_speculation(one.worker, pending).scheduled_batch
+        zero.post_process(_step(1))
+        one.post_process(n)
+    else:
+        zero.post_process(_step(1))
+        sched.register_tp_follow(_head(lead, 2, ["v"]))
+        one.post_process(n)
+        n_1 = sched._try_schedule_tp_follow(request_state)
     zero.post_process(_step(2))
-    one.post_process(n)
-    one.post_process(followed.scheduled_batch)
+    one.post_process(n_1)
     sched.register_tp_follow(_head(lead, 3))
 
     assert sched.settle_tp_follow_delta(caught_up=True)

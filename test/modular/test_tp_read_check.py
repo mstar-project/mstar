@@ -40,7 +40,7 @@ from mstar.communication.tensors import StoredOutputs
 from mstar.communication.wire import decode, encode
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import Rebuild, Residency
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import FULL_ADMIT_REBUILD, StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.model.submodule_base import chunk_loop_name
@@ -260,6 +260,11 @@ class _DroppedHere(_Engine):
 
     def residency(self, node_name, rid):
         return Residency.DROPPED if rid in self.dropped else Residency.RESIDENT
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if rid in self.dropped:
+            return FULL_ADMIT_REBUILD
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
 
     def prepare_rebuild(self, node_name, rid, rebuild):
         self.started.append(rid)
@@ -539,6 +544,16 @@ def test_an_async_follower_takes_a_rebuilds_next_chunk_after_n_as_a_rebuild_row(
     assert spec is not None
     assert spec.scheduled_batch.rebuild_rids == {"rb"}, "rb's rebuild would not land with rank 0's"
     assert w.preps == [["c0"]] and spec.continuing_rids == {"rb"}
+
+
+def test_a_follower_checking_a_dropped_requests_row_starts_no_rebuild():
+    """A follower's own rebuild of rb has landed and rank 0's land of it hasn't replayed yet, so rb is still dropped
+    here. A readiness check of rb's row in that gap finds it not ready and starts nothing, or rb's rebuild would run
+    a second time on this rank alone."""
+    sched, _ = _follower_scheduler(ready=[], dropped=["rb"])
+
+    assert not sched._check_ready(NODE, "rb", SimpleNamespace(graph_walk=WALK))
+    assert sched.engine_manager.get_engine(NODE).started == [] and not sched.rebuilds.rebuilding("rb", NODE)
 
 
 def test_a_follower_builds_rank_0s_rebuild_row_from_its_own_log():
