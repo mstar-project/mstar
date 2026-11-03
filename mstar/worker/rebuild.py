@@ -285,16 +285,23 @@ class Rebuilds:
             if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
-            prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event)
+            piece = droppable[rid].piece
+            prompt = self._pool.view(piece, tensors[0].dtype, torch.Size([sum(map(len, tensors))]))
+            # Copy each tensor to its place in the slice, since joining them first would allocate on the device. The
+            # copies run in order on the pool's stream, so the last one's event covers all of them.
+            offset = piece.offset
+            for tensor in tensors:
+                copy = self._pool.copy_out(tensor, HostSlice(offset, tensor.nbytes), node_batch.completion_event)
+                offset += tensor.nbytes
             copies = bool(self._copied[node_batch.node_name][row_walk])
             kept[rid] = KeptIds(
-                copy, row_walk, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
+                HostCopy(prompt, copy.landed), row_walk, array("i"),
+                dict(node_batch.per_request_info[rid].step_metadata),
                 tuple(map(len, tensors)) if len(tensors) > 1 else None,
                 HostCopies(droppable[rid].copied_slots) if copies else None,
             )
             if not copies:
-                self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
+                self._trim(node_batch.node_name, rid, aligned(prompt.nbytes))
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
         """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
