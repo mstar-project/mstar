@@ -101,7 +101,7 @@ class OmniVoiceConfig:
     max_target_seconds: float = 30.0
 
     # Requests per step. Packing is ragged so length skew costs nothing; this
-    # bounds the Python-side per-item work and the number of reveal loops.
+    # bounds a step's per-request host work (inputs, the canvas layout).
     max_batch_size: int = 16
 
     # The cap that actually matters: a step's cost is sum(doc_lens) tokens
@@ -125,11 +125,15 @@ class OmniVoiceConfig:
     backbone_graphs: bool = True
     backbone_capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
     # Packed tokens per step (both CFG documents of every request); a step
-    # above the largest bucket runs eagerly. Past a few thousand tokens the
-    # step is GPU-bound, eager launches hide behind it, and a bucket's padding
-    # would only add work.
+    # above the largest bucket runs eagerly. Eager steps stay launch-bound well
+    # past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took
+    # ~12 ms of host time for ~10 ms of GPU work on an H100. 8192 covers 16
+    # requests of up to ~10 s of speech each.
     backbone_token_buckets: list[int] = field(
-        default_factory=lambda: [256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
+        default_factory=lambda: [
+            256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
+            4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
+        ]
     )
 
     @property

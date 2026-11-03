@@ -32,7 +32,7 @@ from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
     fail_if_graphs_required,
 )
-from mstar.engine.resources import BucketKey, CGSlotSpec
+from mstar.engine.resources import BucketKey, CGSlotSpec, SlotLease
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="capture allocates a graph pool"
@@ -347,6 +347,36 @@ def test_a_smaller_bucket_along_the_hoisted_axis_still_reslices_the_shared_buffe
     assert resliced.shape == (3, 4)
     assert resliced.data_ptr() == shared_view.data_ptr()
     assert torch.equal(shared_view[:, :4], small)
+
+
+def _staging_runner(buffers: dict[str, torch.Tensor], seq_dims: dict[str, int]):
+    """The real `_stage` on the smallest runner it reads: one bucket of one slot."""
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._submodule_name = "node"
+    bucket = BucketKey(graph_walk="prefill", bs=1, num_tokens=8)
+    slot = SimpleNamespace(static_inputs=buffers, static_input_keys=tuple(buffers), config_idx=0)
+    runner._buckets = {bucket: SimpleNamespace(slots=[slot])}
+    runner._static_buffer_seq_dims = {(0, key): dim for key, dim in seq_dims.items()}
+    return runner, SlotLease(slot=0, bucket=bucket)
+
+
+def test_stage_fills_a_shorter_input_along_its_seq_dim():
+    embeds, mrope = torch.zeros(8, 4), torch.zeros(3, 8)
+    runner, lease = _staging_runner({"embeds": embeds, "mrope": mrope}, {"embeds": 0, "mrope": 1})
+    runner._stage(lease, {"embeds": torch.ones(5, 4), "mrope": torch.ones(3, 5)})
+    assert embeds[:5].eq(1).all() and embeds[5:].eq(0).all()
+    assert mrope[:, :5].eq(1).all() and mrope[:, 5:].eq(0).all()
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 3, 4, 4), (1, 2, 3, 4, 4), (3, 3, 4, 4)])
+def test_stage_refuses_an_input_that_differs_outside_its_seq_dim(shape):
+    """copy_ broadcasts one camera into all three slots of a captured
+    (bs, cameras, C, H, W) buffer without a word, and fails only for two."""
+    pixels = torch.zeros(1, 3, 3, 4, 4)
+    runner, lease = _staging_runner({"pixel_values": pixels}, {"pixel_values": 0})
+    with pytest.raises(RuntimeError, match="only dim 0 may be shorter"):
+        runner._stage(lease, {"pixel_values": torch.ones(shape)})
+    assert pixels.eq(0).all()
 
 
 def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):

@@ -214,8 +214,8 @@ class LTX25Model(Model):
                     max_segments_per_request=1,
                     dtype=torch.bfloat16,
                     shard_over_sp=key == VIDEO_ATTN,
-                    # six labels x two slots: at the 512 MB default, 6 GB the split-KV
-                    # partials of these shapes never come near
+                    # six labels x two slots: 6 GB at the 512 MB default. A floor; the
+                    # labels whose plans want more than this grow to what they ask for
                     workspace_mb=128,
                 ),
             )

@@ -77,6 +77,11 @@ Consequences:
   into a projected 2x.
 * Waits GROW when the CPU side gets faster, because the CPU arrives at them
   sooner. A larger wait is not automatically worse.
+* `postprocess_side` is a side step's `postprocess_batch`, run off the chain (see
+  `mstar/worker/side_steps.py`). It is work, like `postprocess_batch`, and not part of it.
+* `gpu_exec` is a step's GPU time, from an event recorded on its stream after
+  `prepare_inputs` to one after its last launch, so it includes any gaps the host
+  leaves inside the step. `gpu_exec.<walk>` is the same per graph walk.
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
   does not sum with them.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
