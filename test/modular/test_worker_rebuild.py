@@ -17,7 +17,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources import AllocationFailed, Residency, StepContext
 from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
@@ -70,9 +70,10 @@ class _Scheduler:
 
 
 def _worker():
-    eng = SimpleNamespace(dropped=[], landed=[], prepared=[], is_offloaded=lambda node, rid: False)
+    eng = SimpleNamespace(dropped=[], landed=[], prepared=[])
     eng.prepare_rebuild = lambda node, rid, rebuild: eng.prepared.append((rid, rebuild))
-    eng.is_resident, eng.drop_request = lambda _, rid: rid not in eng.dropped, lambda _, rid: eng.dropped.append(rid)
+    eng.residency = lambda _, rid: Residency.DROPPED if rid in eng.dropped else Residency.RESIDENT
+    eng.drop_request = lambda _, rid: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")

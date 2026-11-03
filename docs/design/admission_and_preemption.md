@@ -183,9 +183,9 @@ class KVManager:
         of pages that reach the free list. Keyed pages stay in the index as
         evictable pages. Needs no host pool."""
 
-    def is_resident(self, rid: str) -> bool:
-        """False while rid is offloaded, and from its drop until its rebuild
-        step lands."""
+    def residency(self, rid: str) -> Residency:
+        """ON_HOST while rid is offloaded, DROPPED from its drop until its
+        rebuild lands, and RESIDENT otherwise."""
 ```
 
 A drop releases the request's whole reservation. `KVManager.check_drop` refuses:

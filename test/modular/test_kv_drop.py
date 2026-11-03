@@ -19,7 +19,7 @@ import torch
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources.base import EngineResourceInfo, Rebuild
+from mstar.engine.resources.base import EngineResourceInfo, Rebuild, Residency
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
@@ -203,7 +203,9 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
 
     with pytest.raises(RuntimeError):
         engine.drop_request(NODE, "r")
-    assert kv.is_resident("r") and kv._streams["r"]["main"].page_indices, "one KV cache dropped and the other kept"
+    assert kv.residency("r") is Residency.RESIDENT and kv._streams["r"]["main"].page_indices, (
+        "one KV cache dropped and the other kept"
+    )
     assert rope._counters["r"] == {"main": PAGE_SIZE}, "the positions were reset for a request that keeps its KV"
 
 
@@ -275,11 +277,11 @@ def test_removing_a_dropped_or_relaid_request_leaks_no_page():
         kv.drop(rid)
     kv.prepare_rebuild("relaid", Rebuild(WALK, array("i", range(21))))
     kv.land_rebuild("relaid")
-    assert kv.is_resident("relaid"), "a rebuilt request would never be ready again"
+    assert kv.residency("relaid") is Residency.RESIDENT, "a rebuilt request would never be ready again"
 
     for rid in ("dropped", "relaid"):
         kv.remove_request(rid)
     kv.assert_pages_conserved()
-    assert kv.is_resident("dropped"), "the next request given this handle would never be ready"
+    assert kv.residency("dropped") is Residency.RESIDENT, "the next request given this handle would never be ready"
     assert (counts := kv.page_counts()).used == counts.cached, "a page outlived its request outside the index"
 

@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
+from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
 from mstar.model.submodule_base import CHUNK_LOOP_END, InputMetadata, StepOrder, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -713,8 +714,9 @@ class MicroScheduler:
         and holding the blamed one is what makes the retry smaller.
 
         Asked of the graph, not the engine: an engine readiness check would
-        start reloading an offloaded row. Offloaded rows are left out; they
-        come back only once their pages fit. Refusal path only.
+        start reloading an offloaded row. Rows not resident are left out; they
+        come back only once their pages fit or their rebuild lands. Refusal
+        path only.
         """
         key = self._key(node_name, graph_walk)
         if self._live_backlog(key) - batch_rids:
@@ -722,7 +724,7 @@ class MicroScheduler:
         exclude = self.failed_rids.union(self.pending_removes, self.held_until, batch_rids)
         engine = self.engine_manager.get_engine(node_name)
         return any(
-            not engine.is_offloaded(spec.node_name, rid)
+            engine.residency(spec.node_name, rid) is Residency.RESIDENT
             for spec in self._ready_specs(exclude, key, None)
             if spec.node_name == node_name
             for rid in spec.rids

@@ -32,6 +32,7 @@ from mstar.engine.resources import (
     NodeResourceSpec,
     PublishedInfo,
     Rebuild,
+    Residency,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -2761,8 +2762,11 @@ class Engine:
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if not self.is_resident(node_name, request_id):
-            if not allow_reload or not self.is_offloaded(node_name, request_id):
+        residency = self.residency(node_name, request_id)
+        if residency is Residency.DROPPED:
+            return FULL_ADMIT_NOT_READY
+        if residency is Residency.ON_HOST:
+            if not allow_reload:
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
@@ -3002,16 +3006,11 @@ class Engine:
             if resources is None or key in resources
         )
 
-    def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        return any(
-            resource.is_offloaded(request_id)
-            for resource in self._submodules[node_name].resources.values()
-        )
-
-    def is_resident(self, node_name: str, request_id: str) -> bool:
-        return all(
-            resource.is_resident(request_id)
-            for resource in self._submodules[node_name].resources.values()
+    def residency(self, node_name: str, request_id: str) -> Residency:
+        """The furthest from the device that any of the node's resources holds the request."""
+        return max(
+            (resource.residency(request_id) for resource in self._submodules[node_name].resources.values()),
+            default=Residency.RESIDENT,
         )
 
     def drop_request(self, node_name: str, request_id: int) -> int:
@@ -3068,7 +3067,7 @@ class Engine:
         offloaded = [
             resource
             for resource in self._submodules[node_name].resources.values()
-            if resource.supports_eviction and resource.is_offloaded(request_id)
+            if resource.supports_eviction and resource.residency(request_id) is Residency.ON_HOST
         ]
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
@@ -3158,7 +3157,7 @@ class Engine:
                 delta.pop_left()
                 continue
             if is_offload:
-                if self.is_offloaded(node_name, rid):
+                if self.residency(node_name, rid) is Residency.ON_HOST:
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
                     )
@@ -3192,14 +3191,14 @@ class Engine:
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
                     )
-            elif not self.is_offloaded(node_name, rid):
+            elif self.residency(node_name, rid) is not Residency.ON_HOST:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
             elif not all(
                 resource.reload(rid)
                 for resource in resources
-                if resource.supports_eviction and resource.is_offloaded(rid)
+                if resource.supports_eviction and resource.residency(rid) is Residency.ON_HOST
             ):
                     # No room yet. Silent until now, and this is the shape of a
                     # follower that stops mid-delta and never finishes: rank 0

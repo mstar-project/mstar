@@ -36,7 +36,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
@@ -1141,7 +1141,7 @@ class Worker:
         walk, with its loop-back input pending, and routes none of the row's outputs.
         """
         engine = self.engine_manager.get_engine(node_name)
-        if engine.is_resident(node_name, request_id) or engine.is_offloaded(node_name, request_id):
+        if engine.residency(node_name, request_id) is not Residency.DROPPED:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
         if self.scheduler.rebuild_queued(request_id) or request_id in self._in_flight_rids:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
@@ -1771,7 +1771,7 @@ class Worker:
 
         active = [
             rid for rid in self.scheduler.arrival
-            if not engine.is_offloaded(node_name, rid)
+            if engine.residency(node_name, rid) is Residency.RESIDENT
             and (not inside_only or rid in batch_ids)
         ]
 

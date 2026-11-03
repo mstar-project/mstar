@@ -20,6 +20,7 @@ from mstar.engine.resources.base import (
     KeyedWalks,
     PublishedInfo,
     Rebuild,
+    Residency,
 )
 from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, PageAllocator, held_pages, on_pages
@@ -3313,11 +3314,10 @@ class KVManager(AttentionResource):
                 stream.offloaded for stream in self._streams.get(rid, {}).values()
             )
 
-    def is_resident(self, rid: str) -> bool:
-        """False once ``rid``'s offload is claimed or its drop is applied."""
+    def residency(self, rid: str) -> Residency:
         if rid in self._dropped:
-            return False
-        return self._cpu_pool is None or not self.is_offloaded(rid)
+            return Residency.DROPPED
+        return Residency.ON_HOST if self.is_offloaded(rid) else Residency.RESIDENT
 
     def check_drop(self, rid: str) -> None:
         if self._world_size > 1:

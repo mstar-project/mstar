@@ -27,6 +27,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
+from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -133,11 +134,8 @@ class _Resource:
         self.refuse_offload = False
         self.refuse_reload = False
 
-    def is_offloaded(self, rid):
-        return rid in self.offloaded
-
-    def is_resident(self, rid):
-        return rid not in self.offloaded
+    def residency(self, rid):
+        return Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT
 
     def reclaimable(self, rid):
         return 0 if rid in self.holds_nothing else 1
@@ -193,8 +191,7 @@ class _Engine:
 
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
-    is_offloaded = Engine.is_offloaded
-    is_resident = Engine.is_resident
+    residency = Engine.residency
     offload_request = Engine.offload_request
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
@@ -235,7 +232,7 @@ def test_a_follower_may_not_start_an_offload_of_its_own():
     engine = _Engine("follower")
 
     assert engine.offload_request("node", "a") == 0
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
     assert engine.resource.offloaded == set(), "the resource was touched anyway"
 
 
@@ -246,7 +243,7 @@ def test_a_follower_may_not_start_a_reload_of_its_own():
     engine.resource.offloaded = {"a"}
 
     assert engine.reload_request("node", "a") is False
-    assert engine.is_offloaded("node", "a"), "reloaded despite following"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "reloaded despite following"
 
 
 def test_replay_is_exempt_from_both_guards():
@@ -257,12 +254,12 @@ def test_replay_is_exempt_from_both_guards():
     delta.add_offloaded("wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is Residency.ON_HOST
 
     back = OffloadDelta.new()
     back.add_reloaded("wire-a")
     assert engine.apply_resident_delta("node", back) is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
 
 def test_an_unsharded_node_still_evicts_for_itself():
@@ -271,7 +268,7 @@ def test_an_unsharded_node_still_evicts_for_itself():
     engine = _Engine("solo")
 
     assert engine.offload_request("node", "a") == 1
-    assert engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is Residency.ON_HOST
     assert engine.reload_request("node", "a") is True
 
 
@@ -283,7 +280,7 @@ def test_reload_request_reports_whether_it_worked():
     engine.resource.offloaded = {"a"}
 
     assert engine.reload_request("node", "a") is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
     engine.resource.offloaded = {"b"}
     engine.resource.refuse_reload = True
@@ -327,8 +324,8 @@ def test_a_partial_reload_gives_back_what_it_reloaded():
 
     assert engine.reload_request("node", "a") is False
     assert len(engine.take_resident_delta("node")) == 0
-    assert second.is_offloaded("a")
-    assert first.is_offloaded("a") and first.free == 8, (
+    assert "a" in second.offloaded
+    assert "a" in first.offloaded and first.free == 8, (
         "the first resource kept pages the delta never mentions"
     )
 
@@ -355,7 +352,7 @@ def test_a_resource_that_never_offloaded_the_request_does_not_block_its_reload()
     }
 
     assert engine.reload_request("node", "a") is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
 
 def test_a_resource_that_cannot_fit_stops_the_reload_before_anything_moves():
@@ -401,7 +398,7 @@ def test_a_rank_that_leads_nothing_journals_nothing():
     engine = _Engine("solo")
     engine.offload_request("node", "a")
 
-    assert engine.is_offloaded("node", "a"), "a solo rank still evicts"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "a solo rank still evicts"
     assert len(engine.take_resident_delta("node")) == 0
 
 
@@ -413,7 +410,7 @@ def test_replaying_a_delta_reproduces_the_leaders_state():
     delta.add_offloaded("wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a"), (
+    assert engine.residency("node", "a") is Residency.ON_HOST, (
         "replay ended with 'a' resident; the leader has it on the host"
     )
     assert len(delta) == 0
@@ -433,7 +430,7 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
 
     engine.resource.refuse_offload = False
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
+    assert engine.residency("node", "a") is Residency.ON_HOST and engine.residency("node", "b") is Residency.ON_HOST
 
 
 def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
@@ -451,7 +448,7 @@ def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
 
     assert engine.apply_resident_delta("node", delta) is True
     assert len(delta) == 0, "the moot entry was left to be retried for ever"
-    assert engine.is_offloaded("node", "a"), "it stopped short of the next move"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "it stopped short of the next move"
     assert None not in engine.resource.offloaded, "None reached the resources"
 
 
@@ -831,7 +828,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
         apply_resident_delta=lambda node, delta: False,  # refuses
-        is_offloaded=lambda node, rid: False,
+        residency=lambda node, rid: Residency.RESIDENT,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
     )
@@ -1067,7 +1064,7 @@ class _FollowSpec:
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
             apply_resident_delta=lambda node, delta: not replay_refuses,
-            is_offloaded=lambda node, rid: False,
+            residency=lambda node, rid: Residency.RESIDENT,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
             get_max_batch_size=lambda node, walk: None,

@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     AllocationFailed,
     FullAdmitOutcome,
     RequestOffloading,
+    Residency,
     StepContext,
     SubmoduleStep,
 )
@@ -337,9 +338,9 @@ class _SchedEngine(_Engine):
         super().__init__(*args, **kwargs)
         self.offloaded = set(offloaded)
 
-    def is_offloaded(self, node_name, rid):
+    def residency(self, node_name, rid):
         del node_name
-        return rid in self.offloaded
+        return Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT
 
 
 def _sized_refusal(rid, rows_fit=None, rows_fit_alone=None) -> AllocationFailed:
@@ -488,7 +489,7 @@ class _EvictingWorker(_HoldingWorker):
             self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
             evictable=lambda node, resources=None: True,
-            is_offloaded=lambda node, rid: rid in self.offloaded,
+            residency=lambda node, rid: Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT,
             reclaimable=lambda node, rid, resources: rid in holders,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,
         )
