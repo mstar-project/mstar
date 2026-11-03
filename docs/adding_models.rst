@@ -1737,8 +1737,9 @@ handled as special cases. BAGEL uses all of them, in
 rather than through ``write_kv``, asks the KV resource where the step's tokens go:
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
-Tokens past that number are the plan's padding and must not be written. Qwen3-ASR's
-fused q/k norm, RoPE and KV-write kernel (``Qwen3Attention``) is the example.
+Tokens past that number are the plan's padding and must not be written. The fused q/k
+norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni's Thinker call through
+``AttentionCallable.norm_rope_attend`` and ``norm_rope_table_attend`` are the example.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/vjepa2/fake_resources.py`` shows how to stub
@@ -2463,8 +2464,10 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    model: "qwen3_omni"
    preprocess_workers: 2
 
-The pool only helps work that releases the GIL, so measure each stage first. A model with
-client streams always prepares inline, since an append has to follow its request.
+The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni and
+V-JEPA2 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8 and 4, the
+sizes measured for their video decode). A model with client streams always prepares inline,
+since an append has to follow its request.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed

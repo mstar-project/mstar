@@ -1,5 +1,12 @@
 model: "vjepa2_ac"
 max_seq_len: 16384
+# Requests the data worker prepares at once (PREPROCESS_PARALLEL): a rollout
+# decodes 8 frames, and 8 workers x 16 threads measured 2-5% slower than 4
+# workers on torch's one-per-core pool (on an H200 host), not re-measured since.
+# The pool runs 4 x CpuPlan.preprocess_threads (at most 4) and is taken as
+# given, so on a smaller host lower it. Dropping the key sizes the pool to the
+# CPUs left, which can pick up to 8, a size not measured here.
+preprocess_workers: 4
 
 # Uses facebook/vjepa2-ac-vitg (from HF_MODELS["vjepa2_ac"] in
 # mstar/model/registry.py).  AC weights loaded from the public S3 mirror
