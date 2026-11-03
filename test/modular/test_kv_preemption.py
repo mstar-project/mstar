@@ -40,7 +40,9 @@ def _pool():
     return kv
 
 
-def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None, guaranteed=False) -> None:
+def _request(
+    kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None, guaranteed=False, rebuildable=True,
+) -> None:
     """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(
@@ -48,7 +50,7 @@ def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | N
     )
     _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
-        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival, unpausable=guaranteed,
+        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival, unpausable=guaranteed, rebuildable=rebuildable,
     )})
 
 
@@ -429,3 +431,55 @@ def test_a_guaranteed_request_is_never_moved_to_the_host():
     assert kv.preempt("r", short, droppable=lambda rid: False) == Victims(["r"], []), (
         "a guaranteed request was moved to the host"
     )
+
+
+@pytest.mark.parametrize("host_pages, guaranteed", [(None, True), (4, True), (64, False)], ids=[
+    "no host pool", "a host pool short of its footprint", "a host pool with room",
+])
+def test_a_request_no_drop_can_free_reserves_its_footprint_only_when_the_host_cant_set_it_aside(
+    host_pages, guaranteed,
+):
+    """qwen3_asr_realtime's sessions can't be rebuilt, since the model declares no rebuild policy. Reserving each
+    one's whole decode cap fits 29 of its 64 sessions, though a host pool could take any of them back."""
+    kv = _pool()
+    kv._cpu_pool = None if host_pages is None else host._HostPool(host_pages)
+    _request(kv, "r", 2, arrival=0, rebuildable=False)
+
+    assert _ready(kv, "r")
+    assert ("r" in kv._guaranteed, kv._allotments["r"].pages) == (guaranteed, 6 if guaranteed else 2), (
+        "the class didn't follow the room the host can set aside"
+    )
+    assert host_pages is None or kv._cpu_pool.reserved == ({} if guaranteed else {"r": 6})
+
+
+def test_a_victim_that_can_be_rebuilt_never_moves_into_room_set_aside_on_the_host():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(8)
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "r", 2, arrival=1, rebuildable=False)
+    _running(kv, "v", 3, arrival=2)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
+    short = _step(kv, "o", PAGE_SIZE).reason.pages_short
+
+    assert kv.preempt("o", short, droppable=lambda rid: True) == Victims([], ["v"]), (
+        "v moved into the host room set aside for r"
+    )
+
+
+def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(8)
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "r", 2, arrival=1, rebuildable=False)
+    _running(kv, "x", 2, arrival=2)
+    assert _step(kv, "o", 3 * PAGE_SIZE).ok
+    assert kv.preempt("o", _step(kv, "o", PAGE_SIZE).reason.pages_short, droppable=lambda rid: False) == (
+        Victims(["x"], [])
+    )
+    assert _offload(kv, "x")
+    while (outcome := _step(kv, "o", PAGE_SIZE)).ok:
+        pass
+
+    victims = kv.preempt("o", outcome.reason.pages_short, droppable=lambda rid: False)
+
+    assert victims == Victims(["r"], []) and _offload(kv, "r"), "r had no way off the device once the host was full"
