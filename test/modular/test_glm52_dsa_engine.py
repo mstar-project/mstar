@@ -49,14 +49,12 @@ from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
 def test_cleanup_request_drops_the_request_state():
     """Retirement leaves NO per-request growth: the engine's request removal calls
-    cleanup_request on every managed submodule, which drops the MTP counters, the MTP token
-    budget and the prefill's stop (the index keys are the DSA resource's, which remove_request
-    drops)."""
+    cleanup_request on every managed submodule, which drops the MTP counters and the MTP token
+    budget (the index keys are the DSA resource's, which remove_request drops)."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
@@ -67,7 +65,7 @@ def test_cleanup_request_drops_the_request_state():
     sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
     sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
 
-    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
+    sub.request_state("r0").add("token_budget", 20)
     sub.cleanup_request("r0")
     assert sub.request_states == {}
     assert sub._mtp_emitted == {}
@@ -93,7 +91,6 @@ class _FakePositions:
 def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._index_stager = PinnedStager(torch.long)
     return sub
 
 

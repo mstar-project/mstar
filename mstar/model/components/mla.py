@@ -137,6 +137,8 @@ class MLAAttention(nn.Module):
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
             self.register_buffer("fused_qkv_a_proj_scale_inv", None, persistent=False)  # dense_fp8
+            self.lora_unservable = dict.fromkeys(
+                self._ABSORBED_SOURCE_PROJS, "folded into the absorbed MLA weights at load (mla_absorb)")
         # engine-built, bound once at load (bind_resources)
         self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv_label, self._cache_layer = kv_label, cache_layer

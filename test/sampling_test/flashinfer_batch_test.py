@@ -7,13 +7,14 @@ at different positions (padding the rest with random distractor rows), and check
 its sampled token never changes.
 
 Two paths are checked:
-  - ``sample_cuda_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
+  - ``sample_accelerator_graphable_gpu`` — mstar's captured path. At this
+    vocabulary (V <= ``FUSED_SAMPLE_MAX_VOCAB``) it is ``fused_sample``, one
+    Triton kernel drawing from each row's own (seed, offset).
   - raw ``flashinfer...top_k_top_p_sampling_from_probs`` on **fixed pre-computed
-    probs**, skipping the fused kernel entirely.
+    probs**, which larger vocabularies (and the eager sampler) use.
 
-If the raw-flashinfer path is also batch-variant, the position-dependence is
-flashinfer's own RNG (it folds the batch row index into philox) — nothing mstar
-does can beat it, and batched decoding cannot be bit-reproducible.
+FlashInfer folds the batch row index into philox, so the raw path is expected
+to be batch-variant; ``fused_sample`` is not.
 
     python test/sampling_test/flashinfer_batch_test.py
 
@@ -39,7 +40,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _mstar_sample(logits_rows, seeds, offsets):
-    """mstar path: fused_temperature_softmax → flashinfer, on raw logits."""
+    """mstar's captured path on raw logits (``fused_sample`` at this V)."""
     bs = logits_rows.shape[0]
     return sample_accelerator_graphable_gpu(
         logits_rows,

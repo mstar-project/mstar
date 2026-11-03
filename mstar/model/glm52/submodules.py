@@ -38,14 +38,16 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
     HostRows,
     ModelInputsFromEngine,
     NodeInputs,
+    TokenStop,
 )
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__()
+        super().__init__(config.prefill_token_buckets)
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
@@ -86,13 +88,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_checked: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
-        # the step's per-step indices, in one pinned H2D
-        self._index_stager = PinnedStager(torch.long)
         # Per request, in its request_state: "token_budget", under MTP, max_tokens capped at
         # the context limit less two verify blocks (prompt-aware, set by the prefill's
-        # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:
-        # the prefill walk has no loop to stop, so the first decode step stops decode_loop and
-        # emits nothing.
+        # preprocess, read by check_stop).
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.eos_token_ids),
+            sampler=SAMPLER_RESOURCE, prefill_walks=frozenset({"prefill"}),
+        )
         # Each request's seed slot (the MTP state that drafts d1, and d1) in the device seed
         # buffers; slot 0 is the sink that padding and capture rows write.
         self._mtp_slot: dict[str, int] = {}
@@ -275,16 +277,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return []
         if self._moe_capture_blocked(tp_world_size):
             return []
-        prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        groups = [(prefill_buckets, prefill_batch_sizes)]
+        groups = [(self.PREFILL_TOKEN_BUCKETS, prefill_batch_sizes)]
         batched = self.config.prefill_batched_token_buckets
         if batched:
             # one request's buckets and a batch's apart, so each can be fine or coarse
-            groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
+            groups = [(self.PREFILL_TOKEN_BUCKETS, [bs for bs in prefill_batch_sizes if bs == 1]),
                       (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
         configs = [
             BatchedAcceleratorGraphConfig(
@@ -456,8 +457,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 fields["mtp_seq"] = [self._mtp_stage_seq(engine_inputs)]
         out = {}
         if fields:
-            staged = self._index_stager.to_device(
-                [v for values in fields.values() for v in values], device)
+            staged = to_device_nonblocking(
+                [v for values in fields.values() for v in values], device, dtype=torch.long)
             out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
@@ -820,70 +821,46 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # an MTP verify step's forward returned the next input (the token after the
         # accepted drafts); new_token is the host's cut of the verdict
         outputs.setdefault("text_inputs", outputs["new_token"])
-        if self.request_state(request_id).get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        if not self.mtp_k:
+            return super().check_stop(request_id, request_info, outputs)
         tokens = outputs["new_token"][0].reshape(-1).tolist() if "new_token" in outputs else None
-        return self._stops(request_id, request_info, tokens)
+        return self._mtp_stops(request_id, request_info, tokens)
 
     def check_stop_batched(
         self,
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
-        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist`` of the step's tokens."""
-        tokens = host_rows.buffers.get("new_token")
-        if self.mtp_k > 0 or not torch.is_tensor(tokens) or tokens.dim() == 0:
+        if self.mtp_k:
             # an MTP verify step emits several tokens a row, which check_stop counts
             return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
-            loops = self._stops(rid, request_infos[rid], [values[i]])
-            if loops:
-                stops[rid] = loops
-        return stops
+        return super().check_stop_batched(request_ids, request_infos, host_rows)
 
-    def _stops(
+    def _mtp_stops(
         self, request_id: str, request_info: CurrentForwardPassInfo, tokens: list[int] | None,
     ) -> set[str]:
-        """The loops the step's new ``tokens`` stop; None when the step emitted none."""
-        state = self.request_state(request_id)
-        if state.get("ended_at_prefill"):
-            return {"decode_loop"}
+        """``token_stop`` for an MTP step, whose row carries every token it emitted (None:
+        none). Those count toward the budget here: a plain step's budget is the loop's cap,
+        but a verify step emits up to k+1 tokens per iteration."""
         if tokens is None:
             return set()
-        ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
-        # under MTP the prompt-aware cap from the prefill's preprocess, else the request's own
-        budget = state.get("token_budget", request_info.max_tokens)
-        # in-step truncation (MTP) leaves a stop id only as the LAST element
-        is_eos = tokens[-1] in self.config.eos_token_ids
-        if self.mtp_k > 0:
-            # a verify step emits several tokens: count them, not the loop's iterations
-            generated = self._mtp_checked.get(request_id, 0) + len(tokens)
-            self._mtp_checked[request_id] = generated
-        else:
-            # max_tokens counts the token the prefill emits, so the total is
-            # 1 + (iters + 1) decode tokens
-            generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                state.add("ended_at_prefill", True)
+        stop = self.token_stop
+        # in-step truncation leaves a stop id only as the LAST element
+        is_eos = (tokens[-1] in stop.stop_ids
+                  and not request_info.resource_configs[stop.sampler].ignore_eos)
+        # the prompt-aware cap from the prefill's preprocess, else the request's own
+        budget = self.request_state(request_id).get("token_budget", request_info.max_tokens)
+        generated = self._mtp_checked.get(request_id, 0) + len(tokens)
+        self._mtp_checked[request_id] = generated
+        if not (is_eos or generated >= budget):
             return set()
-        if (not ignore_eos and is_eos) or generated >= budget:
-            return {"decode_loop"}
-        return set()
+        # the prefill has no decode_loop to stop yet: a stop token or a one-token budget
+        # ends the partition, as token_stop does
+        return {END_PARTITION} if request_info.graph_walk in stop.prefill_walks else {stop.loop}

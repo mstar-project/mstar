@@ -682,7 +682,8 @@ class Cosmos3OmniTransformer(nn.Module):
             latent = latent.reshape(latent_channel, t_actual, h_patches, p, w_patches, p)
             latent = torch.einsum("cthpwq->thwpqc", latent).reshape(-1, p * p * latent_channel)
             packed_latent.append(latent)
-        return torch.cat(packed_latent, dim=0), original_latent_shapes
+        # the denoise loop keeps its latents in fp32; the projection takes them in the model dtype
+        return torch.cat(packed_latent, dim=0).to(self.proj_in.weight.dtype), original_latent_shapes
 
     def _unpatchify_and_unpack_latents(
         self,
@@ -761,6 +762,8 @@ class Cosmos3OmniTransformer(nn.Module):
         in-projection + the action modality embedding, then scatter-add the
         timestep embedding to the noisy (predicted) action tokens only. Returns
         [T, hidden]."""
+        # the denoise loop keeps its action latents in fp32; the projection takes them in the model dtype
+        action_latents = action_latents.to(self.action_proj_in.fc.weight.dtype)
         packed = self.action_proj_in(action_latents, action_domain_id)[0]  # [T, hidden]
         packed = packed + self.action_modality_embed.to(packed.dtype)
         ts = action_timesteps * self.config.timestep_scale
