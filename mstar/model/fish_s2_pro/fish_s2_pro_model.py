@@ -120,9 +120,10 @@ class FishS2ProModel(Model):
     REF_ENCODER_INPUTS = ("audio_inputs",)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
     # Streams the codec state pool holds (about 8.5 MiB each, fp32): as many
-    # as the AR decodes in one step (``ARSubmodule.MAX_BATCH_SIZE``), so the
-    # pool does not cap what the AR can serve at once. Past that, a request
-    # waits in admission for a stream. A deployment sizes it with
+    # as the AR decodes in one step (``ARSubmodule.MAX_BATCH_SIZE``). A request
+    # holds its stream until it ends, so the deployment caps concurrent requests
+    # at this (``max_concurrent_requests``, checked in ``validate_config_yaml``)
+    # and later ones queue before the AR. Size it with
     # ``resources: {codec_state: {max_slots: ...}}``.
     MAX_CODEC_STREAMS = 64
 
@@ -207,6 +208,20 @@ class FishS2ProModel(Model):
                 ),
             ),
         ]
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a request cap the codec state pool cannot hold: a request takes
+        a codec stream at admission and keeps it until it ends, so requests past
+        the pool wait a whole request for their first audio while their AR rows
+        slow everyone streaming."""
+        cap = config.get("max_concurrent_requests")
+        overrides = (config.get("resources") or {}).get(CODEC_STATE) or {}
+        streams = int(overrides.get("max_slots", self.MAX_CODEC_STREAMS + 1)) - 1
+        if cap is not None and int(cap) > streams:
+            raise ValueError(
+                f"{config_path}: max_concurrent_requests={cap} but resources.{CODEC_STATE} holds "
+                f"{streams} streams (max_slots minus the sink); raise max_slots or lower the cap"
+            )
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration

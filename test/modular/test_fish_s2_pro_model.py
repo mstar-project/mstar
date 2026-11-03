@@ -27,6 +27,7 @@ from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
 from mstar.model.fish_s2_pro.components.slow_ar import FishSlowAR, remap_slow_ar_weights
 from mstar.model.fish_s2_pro.config import (
     AR_SAMPLER,
+    CODEC_STATE,
     PROMPT_LAYOUT_KEY,
     FishDACConfig,
     FishFastARConfig,
@@ -707,3 +708,14 @@ def test_postprocess_emits_pcm16_bytes():
     assert model.postprocess(torch.tensor([7, -3], dtype=torch.int16), "audio") == b"\x07\x00\xfd\xff"
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(torch.zeros(1), "text")
+
+
+def test_the_shipped_request_cap_fits_the_codec_streams():
+    """A request keeps its codec stream until it ends, so the shipped yaml caps
+    requests at the pool and a cap past it (or a smaller pool) is refused."""
+    cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    model = tiny_model()
+    model.validate_config_yaml(cfg, str(CONFIG_PATH))
+    small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        model.validate_config_yaml(small, str(CONFIG_PATH))

@@ -227,10 +227,10 @@ def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, m
     cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
     ends at the prefill."""
     if model_name == "fish_s2_pro":
-        from test_fish_s2_pro_model import tiny_model
+        from test_fish_s2_pro_model import tiny_ar, tiny_model
 
-        cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-        assert cap == max(1, max_tokens - 1)
+        caps = tiny_model().get_loop_caps(max_output_tokens=max_tokens)
+        assert caps[tiny_ar().token_stop.loop] == max(1, max_tokens - 1)
         return
     if model_name == "canary":
         from mstar.model.canary.canary_model import CanaryModel

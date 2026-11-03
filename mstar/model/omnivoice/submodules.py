@@ -558,9 +558,11 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         depends on size: on CPU, MKLDNN's numel heuristic splits at 3, 6, 21
         and 81 frames, and the warm-up runs one canvas per range. The CUDA
         ranges (conv backend choice and Inductor's own guards) are unmeasured;
-        probably one. Canvases of one and two frames (80 ms at most) are
-        warmed too: dynamo specializes a size of one. The inputs are made as the codec's ``decode`` makes them
-        (``fc2``, then a transpose): a tensor of other strides or view base
+        probably one. Canvases of one and two frames (80 ms at most) get
+        graphs of their own, so they are warmed too: six graphs, under
+        dynamo's recompile limit of 8 if the CUDA ranges add none. The inputs
+        are made as the codec's ``decode`` makes them (``fc2``, then a
+        transpose): a tensor of other strides or view base
         fails the guards."""
         fc2 = self.codec.fc2
         latents = [
