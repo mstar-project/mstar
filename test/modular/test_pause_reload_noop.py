@@ -110,7 +110,7 @@ def _normal_messages() -> list[tuple[str, object]]:
             loop_stop_times={"decode_loop": NestedLoopIndices(
                 loop_name_order=["decode_loop"], loop_indices={"decode_loop": 9}, wg_fwd_pass_idx=1)}))),
         ("worker.tensor_received", WorkerMessage(w.TENSOR_RECEIVED, TensorReceived(
-            request_id="r0", successful_tensors={11: 1}, failed_tensor_ids=[]))),
+            successful_tensors={11: 1}, failed_tensor_ids=[]))),
         ("worker.unpersist", WorkerMessage(w.UNPERSIST_TENSORS, UnpersistTensors(
             request_id="r0", uuid_to_ref_count={11: 2}))),
         ("worker.enable_metrics", WorkerMessage(w.ENABLE_METRICS, EnableMetrics())),
@@ -329,7 +329,7 @@ def serving_worker(monkeypatch, steps: int, inbox=None):
 
     w.scheduler = SimpleNamespace(
         get_next_batch=next_batch, take_admit_errors=dict, tp_batches_pending_schedule=[],
-        clear_batch_limit=lambda *a, **k: None,
+        clear_batch_limit=lambda *a, **k: None, note_ran=lambda batch: None,
     )
     w.engine_manager = SimpleNamespace(warmup_all=lambda: None)
     w.communicator = SimpleNamespace(
@@ -349,7 +349,7 @@ def serving_worker(monkeypatch, steps: int, inbox=None):
 
     per_request = [
         WorkerMessage(WorkerMessageType.TENSOR_RECEIVED, TensorReceived(
-            request_id="r0", successful_tensors={11: 1}, failed_tensor_ids=[])),
+            successful_tensors={11: 1}, failed_tensor_ids=[])),
         WorkerMessage(WorkerMessageType.UNPERSIST_TENSORS, UnpersistTensors(
             request_id="r0", uuid_to_ref_count={11: 1})),
     ]
