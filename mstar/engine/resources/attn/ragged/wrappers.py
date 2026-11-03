@@ -41,10 +41,9 @@ def zero_unplanned_rows(out: torch.Tensor, qo_indptr: torch.Tensor) -> torch.Ten
     segment's tile boundary under an additive mask, which a NaN/Inf survives."""
     assert out.is_contiguous(), "the tail is zeroed by flat offset"
     numel = out.numel()
-    if numel:
-        _zero_rows_from[(triton.cdiv(numel, _ZERO_BLOCK),)](
-            out, qo_indptr[-1:], numel, out.stride(0), BLOCK=_ZERO_BLOCK,
-        )
+    _zero_rows_from[(triton.cdiv(numel, _ZERO_BLOCK),)](
+        out, qo_indptr[-1:], numel, out.stride(0), BLOCK=_ZERO_BLOCK,
+    )
     return out
 
 

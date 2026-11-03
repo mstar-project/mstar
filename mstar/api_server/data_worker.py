@@ -670,9 +670,11 @@ class PreprocessWorkerThread:
     # class-level so a thread built without __init__ stamps no read times
     enable_prof = False
     # None (no model that declares it, one CPU's worth of workers, or a thread
-    # built without __init__) prepares every request inline. Sized with the
-    # first request (_size_prepare_pool): None workers until then.
+    # built without __init__) prepares every request inline.
     _prepare_pool: ThreadPool | None = None
+    # Requests prepared at once: None from __init__ until the first request
+    # sizes the pool (_size_prepare_pool); 1, inline, for a thread built
+    # without __init__, which has no model to size it from.
     _prepare_workers: int | None = 1
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file

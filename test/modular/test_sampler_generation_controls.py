@@ -692,8 +692,8 @@ print(torch.bincount(tokens, minlength=32).tolist())
     root = Path(__file__).resolve().parents[2]
     env = {**os.environ, "TRITON_INTERPRET": "1",
            "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
-    out = subprocess.run([sys.executable, "-c", script], env=env, cwd=root,
-                         capture_output=True, text=True, check=True)
+    out = subprocess.run([sys.executable, "-c", script], env=env, cwd=root, capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
     counts = [int(c) for c in out.stdout.strip().splitlines()[-1].strip("[]").split(",")]
     assert counts[3] == 0 and sum(counts[4:]) == 0, counts
     assert min(counts[:3]) > 0, counts
