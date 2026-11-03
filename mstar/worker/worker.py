@@ -371,8 +371,8 @@ class _LazyPerRid(Mapping):
 
 
 class _LazyHostOutputs(Mapping):
-    """Per-rid host copies of a step's outputs, copied one output name at a time
-    on first read (``copy_name(name) -> {rid: host value}``).
+    """Per-rid host copies of a step's outputs, copied by output name on first
+    read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
 
     The stop check reads at most the sampled token, and a loop that stops on
     its iteration count reads nothing, so copying every output down each step
@@ -380,25 +380,27 @@ class _LazyHostOutputs(Mapping):
     copied by the send instead; ``landed`` hands it what was copied here.
     """
 
-    __slots__ = ("_source", "_copy_name", "_landed")
+    __slots__ = ("_source", "_copy_names", "_landed")
 
-    def __init__(self, source: dict, copy_name: Callable[[str], dict]):
+    def __init__(self, source: dict, copy_names: Callable[[list[str]], dict]):
         self._source = source
-        self._copy_name = copy_name
+        self._copy_names = copy_names
         self._landed: dict[str, dict] = {}
 
+    def _copy(self, names) -> None:
+        missing = [n for n in dict.fromkeys(names) if n not in self._landed]
+        if missing:
+            self._landed.update(self._copy_names(missing))
+
     def _host(self, name: str) -> dict:
-        landed = self._landed.get(name)
-        if landed is None:
-            landed = self._landed[name] = self._copy_name(name)
-        return landed
+        self._copy((name,))
+        return self._landed[name]
 
     def landed(self, names=()) -> dict[int, NameToTensorList]:
-        """What was copied, ``names`` first copied too: one batched copy per
-        name for a host transport, which would otherwise copy each tensor on
-        its own."""
-        for name in names:
-            self._host(name)
+        """What was copied, ``names`` first copied too, in one batched copy
+        and one sync for a host transport, which would otherwise copy each
+        tensor on its own."""
+        self._copy(names)
         out: dict[int, NameToTensorList] = {}
         for name, by_rid in self._landed.items():
             for rid, value in by_rid.items():
@@ -4519,35 +4521,36 @@ class Worker:
         # one pinned buffer.
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
 
-        def copy_name(name: str) -> dict:
-            host: dict = {}
+        def copy_names(names: list[str]) -> dict[str, dict]:
+            host: dict[str, dict] = {name: {} for name in names}
             with side:
-                for rid, name_to_list in source.items():
-                    if not isinstance(name_to_list, dict) or name not in name_to_list:
-                        continue
-                    tensors = name_to_list[name]
-                    if not isinstance(tensors, list):
-                        host[rid] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.device.type == self.device.type:
-                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
-                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    host[rid] = new_list
+                for name in names:
+                    for rid, name_to_list in source.items():
+                        if not isinstance(name_to_list, dict) or name not in name_to_list:
+                            continue
+                        tensors = name_to_list[name]
+                        if not isinstance(tensors, list):
+                            host[name][rid] = tensors
+                            continue
+                        new_list = []
+                        for t in tensors:
+                            if torch.is_tensor(t) and t.device.type == self.device.type:
+                                # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
+                                key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
+                                idx = buffer_indices[key]
+                                buffer_indices[key] += 1
+                                cpu_t = self._get_pinned_d2h_buffer(
+                                    "check_stop", t.shape, t.dtype, idx,
+                                )
+                                cpu_t.copy_(t, non_blocking=True)
+                                new_list.append(cpu_t)
+                            else:
+                                new_list.append(t)
+                        host[name][rid] = new_list
             side.synchronize()
             return host
 
-        return _LazyHostOutputs(source, copy_name), None
+        return _LazyHostOutputs(source, copy_names), None
 
     def _removal_step_reached(self, body: RemoveRequest) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages
