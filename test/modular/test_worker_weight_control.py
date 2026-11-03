@@ -5,7 +5,7 @@ engine holding its TP shard of a tiny Orpheus language model. They are wired to
 the conductor's real ``GenerationControl`` over an in-memory bus: a message to a
 worker goes through its ``_process_message_list``, and the worker runs the step
 from ``_run_weight_op`` as its loop does once nothing is in flight. What the
-graph runtime reports idle is stubbed here; both runtimes' counts are compared in
+graph runtime reports idle is stubbed here; the runtime's counts are checked in
 ``test/rust/test_runtime_parity.py``.
 """
 from __future__ import annotations
