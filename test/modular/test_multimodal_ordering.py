@@ -753,3 +753,15 @@ def test_the_talker_skips_system_and_earlier_assistant_turns(ids, kept):
 
     config = SimpleNamespace(im_start_token_id=1, system_token_id=2, assistant_token_id=4)
     assert talker_text_mask(torch.tensor(ids), config).tolist() == [bool(k) for k in kept]
+
+
+def test_an_image_only_chat_still_opens_the_assistant_turn(bagel, tmp_path):
+    # a chat with no text part flattens to no prompt; it is still an understanding turn
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+    text, _, in_mods, parts = flatten_messages([{"role": "user", "content": [image]}], tmp_path)
+    assert text is None
+    spans = _decoded(bagel, bagel.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"])
+    assert spans == [
+        bagel.VLM_UNDERSTANDING_PREFIX.format(system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT),
+        bagel.VLM_UNDERSTANDING_SUFFIX.format(prompt=""),
+    ]

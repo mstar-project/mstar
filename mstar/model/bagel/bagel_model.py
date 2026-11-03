@@ -655,6 +655,9 @@ class BagelModel(Model):
                     raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
+        if prompt is None and "image" in input_modalities and (output_modalities or ["text"])[0] == "text":
+            # an image-only chat still gets its turn and the assistant's opener
+            prompt = ""
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = target_output == "text"
