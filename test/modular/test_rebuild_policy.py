@@ -123,6 +123,15 @@ def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and
     )
 
 
+def test_a_video_on_a_walk_whose_inputs_are_copied_can_be_rebuilt():
+    """A Qwen3.5 video's frame groups are `rows` spans on the vision walk, which reads the encoder's output for them as
+    it does for an image. `rows` only says a span has no digest key, so a rebuild from the same copies writes them."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    video = (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], kind="rows"), IMAGE_CHAT[2])
+
+    assert _ingest(rebuilds, R, video), "a video on the copied walk stays guaranteed"
+
+
 @pytest.mark.parametrize("model_class, attrs", [
     (Qwen3_5DenseModel, {
         "config": SimpleNamespace(max_position_embeddings=4096, hidden_size=64), "vision_config": None,
