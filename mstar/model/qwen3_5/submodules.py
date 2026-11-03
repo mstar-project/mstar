@@ -158,6 +158,11 @@ class LLMSubmodule(ARNodeSubmodule):
         prefill_token_buckets: list[int] | None = None,
     ):
         super().__init__(prefill_token_buckets)
+        if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
+            logger.warning(
+                "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
+                "with `model_kwargs.prefill_token_buckets` in the serving config",
+            )
         # follows a deployment's own prefill ladder
         self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
         self.model = model

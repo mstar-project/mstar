@@ -28,7 +28,3 @@ node_groups:
 
   - node_names: [Code2Wav]
     ranks: [0]
-# A Thinker prefill row rides the speculated decode step instead of a step of
-# its own (a prefill reads nearly every expert, as a decode step at 16+ rows does).
-speculation_mixes_walks:
-  Thinker: true

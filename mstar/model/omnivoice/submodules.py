@@ -589,5 +589,5 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
     ) -> NameToTensorList:
         masked = audio_tokens == self.config.audio_mask_id
         waveform = decode_canvas(self.codec, audio_tokens.masked_fill(masked, 0))
-        waveform = torch.where(masked.any(), torch.full_like(waveform, float("nan")), waveform)
+        waveform = waveform.masked_fill(masked.any(), float("nan"))
         return {"audio_output": [waveform]}

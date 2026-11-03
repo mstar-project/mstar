@@ -447,7 +447,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
-            # the step's own iteration, so a step prepared twice feeds its text token twice
+            # the step's own iteration, so a step prepared again feeds the same text token
             step = input_metadata.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
             trailing = state["trailing_text_hidden"]
             text_condition = (

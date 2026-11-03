@@ -14,7 +14,6 @@ there, and only once it has reproduced the installed torch's result on the devic
 
 from __future__ import annotations
 
-import functools
 import logging
 
 import torch
@@ -86,18 +85,27 @@ def _fits(x: torch.Tensor, weight: torch.Tensor | None) -> bool:
     )
 
 
-@functools.cache
+_REPRODUCES: dict[tuple[torch.device, torch.dtype], bool] = {}
+
+
 def _reproduces_torch(device: torch.device, dtype: torch.dtype) -> bool:
     """Whether the replica gives torch's result on ``device``, checked once on random rows; if not,
-    torch's kernel runs from then on. The first call is a warm-up forward, before any capture."""
+    torch's kernel runs from then on. The first call is a warm-up forward, before any capture; one
+    that lands under capture anyway takes torch's kernel (the same result) rather than reading the
+    check back to the host mid-capture, and the check runs on the next eager call."""
+    known = _REPRODUCES.get((device, dtype))
+    if known is not None:
+        return known
+    if torch.cuda.is_current_stream_capturing():
+        return False
     gen = torch.Generator(device=device).manual_seed(0)
     x = torch.randn(3 * _ROWS, EXACT_RMS_DIM, generator=gen, device=device).to(dtype)
     w = torch.randn(EXACT_RMS_DIM, generator=gen, device=device).to(dtype)
-    if torch.equal(_replica(x, w, 1e-6), F.rms_norm(x, (EXACT_RMS_DIM,), w, 1e-6)):
-        return True
-    logger.warning("exact_rms_norm: the replica differs from torch %s's RMSNorm on %s; using torch's kernel",
-                   torch.__version__, device)
-    return False
+    ok = _REPRODUCES[(device, dtype)] = torch.equal(_replica(x, w, 1e-6), F.rms_norm(x, (EXACT_RMS_DIM,), w, 1e-6))
+    if not ok:
+        logger.warning("exact_rms_norm: the replica differs from torch %s's RMSNorm on %s; using torch's kernel",
+                       torch.__version__, device)
+    return ok
 
 
 def _replica(x: torch.Tensor, weight: torch.Tensor, eps: float | None) -> torch.Tensor:
