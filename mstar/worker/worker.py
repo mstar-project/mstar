@@ -2635,7 +2635,9 @@ class Worker:
         defers for every lane's (``_in_flight_rids``); a main-loop error fails
         the chain's."""
         rows = self._rows_by_lane = {**self._rows_by_lane, lane: frozenset(rids)}
-        self._in_flight_rids = set().union(*rows.values())
+        # in place: the scheduler holds the set too, and starts no rebuild for a row in it
+        self._in_flight_rids.clear()
+        self._in_flight_rids.update(*rows.values())
 
     def _held_beside(self, lane: int) -> set[int]:
         """The rows the other lanes' steps in flight hold."""
