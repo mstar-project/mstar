@@ -53,6 +53,7 @@ DECLARING_MODULES = (
     "mstar.engine.resources.spec_decode.draft_head",
     "mstar.engine.resources.spec_decode.kernels",
     "mstar.kernels.fp8_gemm",
+    "mstar.kernels.qk_norm_rope",
     "mstar.platforms.rocm_gemm",
     "mstar.utils.fused_moe.topk_softmax",
 )
