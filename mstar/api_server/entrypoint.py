@@ -2596,6 +2596,17 @@ async def generate(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
+    # Every field is a form field: any other body (JSON, say) parses as an
+    # empty form, and would be submitted as an empty request.
+    content_type = request.headers.get("content-type", "")
+    if content_type and content_type.split(";", 1)[0].strip().lower() not in (
+        "multipart/form-data", "application/x-www-form-urlencoded",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"/generate takes multipart/form-data or urlencoded fields, not {content_type}",
+        )
+
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
     if "streaming" not in await request.form():
