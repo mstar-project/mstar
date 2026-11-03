@@ -730,7 +730,11 @@ Qwen3-TTS notes
   first chunk to warm the state on the voice and trimmed from its audio.
   The SnakeBeta activations run as one fused kernel. A deployment sets the
   ramp and the steady chunk with ``model_kwargs: {codec_chunk_schedule: [1, 3,
-  8, 16], codec_chunk_frames: 25}``.
+  8, 16], codec_chunk_frames: 25}``. ``configs/qwen3tts_1p7b.yaml`` opens with
+  4 frames ([4, 8, 16]): on an H200 the streaming SLO (first audio within 200
+  ms, under 10 ms of pauses) then holds 101 Seed-TTS sentences a second
+  against 90 with [1, 3, 8, 16], which halves idle first audio (15 vs 31 ms
+  p50 at 1 req/s).
 - Talker prefill, the clone prefill included, replays a packed CUDA Graph for
   the smallest token bucket (32 to 1024 tokens) that holds the batch; a clone's
   reference frames join the codec stream in ``postprocess``. Prefill and decode
@@ -769,13 +773,16 @@ Qwen3-TTS notes
 - The codec decoder runs in float32 by default: a stream's audio is the
   reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs:
   {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay
-  float32), which ``configs/qwen3tts_1p7b.yaml`` serves. Its dilated convs
-  run as undilated ones over their interleaved subsequences: cuDNN takes some
-  bfloat16 dilated convs (384 and 768 channels) through a direct kernel
-  without tensor cores, about 100x slower on an H100. On a B300 the bf16
-  codec measured slower while those convs still ran dilated; measure there
-  before switching. The decode is compiled (Inductor) once per chunk width, its
-  batch dimension dynamic.
+  float32), which ``configs/qwen3tts_1p7b.yaml`` serves. Against the float32
+  whole decode of the 1.7B's frames it gives 35 dB SNR median (20 dB worst),
+  1.0 dB mel cepstral distortion, 0.9999 speaker cosine and the same WER, and
+  the streaming SLO holds 101 Seed-TTS req/s against float32's 90 (H200). Its
+  dilated convs run as undilated ones over their interleaved subsequences:
+  cuDNN takes some bfloat16 dilated convs (384 and 768 channels) through a
+  direct kernel without tensor cores, about 100x slower on an H100. On a B300
+  the bf16 codec measured slower while those convs still ran dilated; measure
+  there before switching. The decode is compiled (Inductor) twice per chunk
+  width, batch 1 apart: its batch dimension is dynamic.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 

@@ -6,12 +6,12 @@
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
 model_kwargs:
-  # bf16 codec decoder (RMSNorm and RoPE stay fp32)
+  # bf16 codec decoder (RMSNorm and RoPE stay fp32): 101 Seed-TTS req/s under
+  # the streaming SLO where float32 holds 90 (H200), at 35 dB SNR from the
+  # float32 decode and the same WER (docs/models.rst)
   codec_dtype: bfloat16
-  # A 4-frame first chunk (320 ms of audio): with a 1-frame one (80 ms) the
-  # next chunk arrived after the client had played it under load, the one
-  # pause behind the misses near capacity. It costs about 20 ms of first
-  # audio on an idle server.
+  # A 4-frame first chunk (320 ms of audio): [1, 3, 8, 16] halves idle first
+  # audio (15 vs 31 ms p50 at 1 req/s) but holds 90 Seed-TTS req/s, not 101
   codec_chunk_schedule: [4, 8, 16]
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
