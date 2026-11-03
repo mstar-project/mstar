@@ -83,6 +83,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
@@ -316,6 +317,11 @@ class Qwen3_5DenseModel(Model):
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
         )}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # a prompt with images or video can't be recomputed from ids, so the KV cache refuses to drop it
+        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(

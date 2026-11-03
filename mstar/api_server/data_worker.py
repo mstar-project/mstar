@@ -980,6 +980,7 @@ class PreprocessWorkerThread:
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
+                streaming=input.streaming,
             ),
         )
         self.communicator.send("conductor", msg)

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -109,11 +110,45 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+@dataclass
+class CachedLease:
+    """Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its ``pages``, and the
+    ones it ``lent``, which another request holds and so take no room."""
+    pages: list[int]
+    lent: list[int]
+
+
+class Residency(IntEnum):
+    """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
+    from its ids. Ordered by how far the state is from the device."""
+    RESIDENT = 0
+    ON_HOST = 1
+    DROPPED = 2
+
+
+class Rebuild(NamedTuple):
+    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
+    The last id is the one the next decode step reads."""
+    walk: str
+    ids: Sequence[int]
+
+
 class KeyedWalks(NamedTuple):
     """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
     writes: tuple[str, ...]
     growth: tuple[str, ...] = ()
+
+
+class MoveKind(IntEnum):
+    """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
+    OFFLOAD = 0
+    RELOAD = 1
+    RESERVE = 2
+    UNRESERVE = 3
+    EARMARK = 4
+    DROP = 5
+    SET_ASIDE = 6
 
 
 class Resource(ABC):
@@ -197,15 +232,15 @@ class Resource(ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, or None."""
+        return the lease, or None."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        """On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and
         raises if it still lacks them once ``caught_up``."""
         return True
 
@@ -213,9 +248,10 @@ class Resource(ABC):
         """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
         return
 
-    def page_trail(self) -> tuple[int, int] | None:
-        """How many page allocations this resource has made and a hash of their pages in
-        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+    def page_trail(self) -> tuple[int, ...] | None:
+        """What a TP follower checks against rank 0's before each step, such as how many page
+        allocations this resource has made and a hash of their pages in order. None where it
+        keeps no trail."""
         return None
 
     @classmethod
@@ -449,15 +485,42 @@ class Resource(ABC):
     def supports_eviction(self):
         return False
 
-    def is_offloaded(self, rid: str) -> bool:
-        return False
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
+    def residency(self, rid: str) -> Residency:
+        return Residency.RESIDENT
 
     def offload(self, rid: str) -> int:
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
 
+    def check_drop(self, rid: str) -> str | None:
+        """Why ``drop`` would refuse ``rid``, or None. Changes nothing."""
+        return None
+
+    def drop(self, rid: str) -> int:
+        """Discard the request's state that can be recomputed from its token
+        ids, and keep the rest. Returns what was reclaimed."""
+        return 0
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
+        return
+
+    def land_rebuild(self, rid: str) -> None:
+        """The dropped request's rebuild has run its last chunk."""
+        return
+
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def can_offload(self, rid: str) -> bool:
+        """Whether the request may be moved off the device to free room. If this is False, the request is no
+        eviction candidate however much it holds."""
         return True
 
     def can_reload(self, rid: str) -> bool:

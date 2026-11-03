@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     AllocationFailed,
     FullAdmitOutcome,
     RequestOffloading,
+    Residency,
     StepContext,
     SubmoduleStep,
 )
@@ -210,6 +211,7 @@ class _HoldingWorker:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _push_back_batch = Worker._push_back_batch
     _is_tp_follower_node = Worker._is_tp_follower_node
+    _log_throttled = Worker._log_throttled
 
     def __init__(self):
         self._graph_runtime = _Runtime()
@@ -217,6 +219,8 @@ class _HoldingWorker:
             hold_requests=lambda rids: None,
             **_NO_LIMITS,
         )
+        # no paged KV cache, so nothing preempts
+        self._preemption = SimpleNamespace(preempt=lambda node_batch: False)
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
         self.parallel_nodes = set()
@@ -332,13 +336,15 @@ def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplo
 class _SchedEngine(_Engine):
     """The scheduler's engine fake, with the offload state the refill check reads."""
 
-    def __init__(self, *args, offloaded=(), **kwargs):
+    def __init__(self, *args, offloaded=(), dropped=(), **kwargs):
         super().__init__(*args, **kwargs)
-        self.offloaded = set(offloaded)
+        self.offloaded, self.dropped = set(offloaded), set(dropped)
 
-    def is_offloaded(self, node_name, rid):
+    def residency(self, node_name, rid):
         del node_name
-        return rid in self.offloaded
+        if rid in self.dropped:
+            return Residency.DROPPED
+        return Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT
 
 
 def _sized_refusal(rid, rows_fit=None, rows_fit_alone=None) -> AllocationFailed:
@@ -477,7 +483,7 @@ class _EvictingWorker(_HoldingWorker):
     _try_offload_cold_request = Worker._try_offload_cold_request
     _select_eviction_victim = Worker._select_eviction_victim
 
-    def __init__(self, holders, sched=None):
+    def __init__(self, holders, sched=None, dropped=()):
         super().__init__()
         self.offloaded: list[str] = []
         self.eviction_policy = SimpleNamespace(value="last_in_line")
@@ -487,8 +493,9 @@ class _EvictingWorker(_HoldingWorker):
             self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
             evictable=lambda node, resources=None: True,
-            is_offloaded=lambda node, rid: rid in self.offloaded,
-            reclaimable=lambda node, rid, resources: rid in holders,
+            residency=lambda node, rid: Residency.DROPPED if rid in dropped
+            else Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT,
+            reclaimable=lambda node, rid, resources: rid in holders, can_offload=lambda node, rid: True,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,
         )
         # #461's worker keeps one; harmless here
@@ -581,6 +588,14 @@ def test_a_row_that_never_ran_at_the_key_takes_its_place_in_line(order, victim):
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == victim
 
 
+def test_a_refused_step_never_offloads_a_request_mid_rebuild():
+    """``mid`` is last in line and holds the pages its rebuild has written so
+    far, but those are the rebuild's to finish."""
+    worker = _EvictingWorker(["r0", "mid"], _scheduler(_SchedEngine(order=StepOrder.TURNS)), dropped={"mid"})
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "r0"
+
+
 def _decode_waiters(order, ran):
     """The worker's eviction over ``ran``'s steps: (rid, walk), oldest first,
     with every rid holding pages. Prefill and decode are separate keys here."""
@@ -618,6 +633,16 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
 
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "outside"
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
+
+
+def test_a_request_its_resources_keep_on_the_device_is_no_eviction_candidate():
+    """A KV pool keeps a guaranteed request on the device. Chosen as the victim, its offload moved nothing, and the
+    refused step got no room."""
+    worker = _EvictingWorker(["r0", "r1", "g"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    worker.engine_manager.get_engine(SCHED_NODE).can_offload = lambda node, rid: rid != "g"
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "r1", "g was chosen as the victim"
+    assert worker.offloaded == ["r1"]
 
 
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
@@ -664,11 +689,11 @@ def test_a_mixed_step_lifts_the_limits_of_the_walks_it_ran():
 def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
     """The real `could_refill`, which the handler tests above stub. Rows of
     the key outside the batch refill it, unless they are failed, held,
-    being removed, offloaded or of another walk. ``pending_removes`` is the
-    worker's dict: a set union over it raised TypeError."""
-    sched = _scheduler(_SchedEngine(max_bs=8, offloaded={"off"}))
+    being removed, offloaded, dropped or of another walk. ``pending_removes``
+    is the worker's dict: a set union over it raised TypeError."""
+    sched = _scheduler(_SchedEngine(max_bs=8, offloaded={"off"}, dropped={"drop"}))
     manager = _Manager(
-        ["b0", "b1", "w0", "failed", "held", "gone", "off", "p0"], walks={"p0": "prefill"},
+        ["b0", "b1", "w0", "failed", "held", "gone", "off", "drop", "p0"], walks={"p0": "prefill"},
     )
     sched.runtime = manager.runtime
     manager.runtime.combined_walk_of = sched.combined_walk_of

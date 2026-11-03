@@ -20,6 +20,7 @@ from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker, _LazyPerRid
 
@@ -191,6 +192,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._innermost_loop_by_node = {}
+    w._rebuilds = Rebuilds({}, {})
     w._walk_drivers = {}  # no producer-driven walk transitions here
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._graph_runtime = _RecordingRuntime()

@@ -92,7 +92,8 @@ class _Node:
             {KV: self.kv, ROPE: self.rope}, node_resources={NODE: [KV, ROPE]},
         )
 
-    def ingest(self, rid: str, tokens: list[int]) -> None:
+    def ingest(self, rid: str, tokens: list[int], growth: int = 0) -> None:
+        """``growth`` is the cap of a decode loop that writes a token per iteration."""
         whole = len(tokens) // PAGE_SIZE
         self.runner.ingest_request(rid, {KV: KVReqConfig(
             prefix_keys={"main": chain([
@@ -100,7 +101,11 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-            kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
+            loop_caps={"decode_loop": growth} if growth else {},
+            kv_layout={"main": StreamLayout(
+                spans=(PrefixSpan(len(tokens), len(tokens), WALK),),
+                growth=(("decode_loop", 1),) if growth else (), keyed_spans=1,
+            )},
         )})
 
     def resolve(self, rid: str) -> int:
@@ -245,6 +250,36 @@ def test_two_schedules_over_the_same_tokens_agree_without_any_cache():
 
     torch.testing.assert_close(
         one.attended("x"), other.attended("x"), atol=0.0, rtol=0.0,
+    )
+
+
+# ── a prompt dropped between its chunks ─────────────────────────────────
+
+
+def test_a_prompt_dropped_between_chunks_and_run_again_to_where_it_stood_attends_what_a_fresh_run_computed():
+    """A preempted prompt is dropped between two of its chunks, and its rebuild runs those chunks again past
+    what the cache holds. Another request wrote the whole prompt meanwhile, so the cache holds more of it than
+    the dropped request wrote. The rebuild stops where the prompt stood, since its next chunk starts there."""
+    node, tokens = _Node(), PROMPT + SUFFIX
+    node.ingest("r", tokens, growth=8)
+    node.resolve("r")
+    node.step("r", 37)
+    node.step("r", 61)
+    _schedule_b(node, "other", PROMPT)
+    node.kv.drop("r")
+    node.rope.drop("r")
+
+    start = node.resolve("r")
+    assert start == 96, "the rebuild would start past where the prompt stood, or recompute what the cache holds"
+    node.step("r", 98 - start)
+    node.kv.land_rebuild("r")
+    node.step("r", len(tokens) - 98)
+
+    fresh = _Node(cached=False)
+    _schedule_b(fresh, "r", tokens)
+    torch.testing.assert_close(
+        node.attended("r"), fresh.attended("r"), atol=0.0, rtol=0.0,
+        msg="a prompt rebuilt between its chunks attends other bytes than the same prompt run without a drop",
     )
 
 

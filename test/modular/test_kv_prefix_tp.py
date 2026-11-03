@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -25,7 +26,7 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, open
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import MoveKind, ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
@@ -388,6 +389,69 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
     assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
     assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
+
+
+@pytest.mark.parametrize("guaranteed", [False, True])
+def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guaranteed):
+    """The follower lends the pages it adopts as rank 0 lent the pages it leased, a guaranteed request's
+    included."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        kv.ingest_request("b", replace(_config([prompt]), unpausable=guaranteed))
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
+
+    assert _follow(follower, _send(leader, "b"))
+
+    assert leader._streams["b"]["main"].lent, "rank 0 lent nothing, so the test checks nothing"
+    assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent
+    assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
+def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts():
+    """Owner counts can differ between ranks, since above one rank a page is filed under a parent only its
+    stream holds. A follower that worked out the lent pages from its own evictable set would then count other room
+    than rank 0 and could refuse a grant rank 0 makes. Here a cached page has one more owner on the follower."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
+    _cache(ranks, "a", shared)
+    first = _pages(follower, "a")[0]
+    for kv in ranks:
+        kv.remove_request("a")
+        kv.ingest_request("b", _config([prompt]))
+    follower._arena.retain([first])
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
+
+    assert _follow(follower, _send(leader, "b"))
+
+    assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent == set(), (
+        "the follower lent a page rank 0 charged to b's allotment"
+    )
+    assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_commit_above_one_rank_keeps_the_room_when_it_files_under_a_page_only_the_index_holds(rank):
+    """z prefills beside x, so it finds nothing cached and loses x's keys at commit. Its next page goes in with no
+    parent, so the cached pages x left stay evictable and the room the allotments count doesn't drop."""
+    kv = _manager(rank, max_num_pages=12)
+    x = _tokens(2 * PAGE_SIZE + 1, seed=50)
+    z = x[:2 * PAGE_SIZE] + _tokens(PAGE_SIZE + 3, seed=51)
+    _ingest(kv, "x", x)
+    _ingest(kv, "z", z)
+    steps = _step(kv, "x", len(x)), _step(kv, "z", len(z))
+    kv.commit(steps[0], _ctx("x"))
+    kv.remove_request("x")
+    room = kv._room()
+
+    kv.commit(steps[1], _ctx("z"))
+
+    assert kv._room() == room, "the commit pinned cached pages the room counted"
 
 
 def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():

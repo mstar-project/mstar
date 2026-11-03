@@ -8,7 +8,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext
@@ -321,15 +321,22 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+class SpanKind(StrEnum):
+    """What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""
+    IDS = "ids"
+    DIGEST = "digest"
+    ROWS = "rows"
+
+
 @dataclass(frozen=True)
 class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
 
     ``length`` is how many slots the write fills and ``advance`` is how far it
-    moves the position counter. ``digest`` is an item's digest, and None for
-    ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end. ``opens_step`` is False for a span the step of the
-    span before it writes too, in one row.
+    moves the position counter. ``kind`` is the span's `Span.kind`. ``digest`` is
+    an item's digest, and None for ids. ``end_key`` is set for an item that ends
+    inside a page, and keys that page up to the item's end. ``opens_step`` is
+    False for a span the step of the span before it writes too, in one row.
     """
     length: int
     advance: int
@@ -338,6 +345,11 @@ class PrefixSpan:
     digest: bytes | None = None
     end_key: bytes | None = None
     opens_step: bool = True
+    kind: SpanKind = SpanKind.IDS
+
+    def __post_init__(self):
+        # a layout row carries the kind as its string
+        object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
 @dataclass
@@ -370,6 +382,11 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
+    # `unpausable`: the request streams an output that can't pause, set by the conductor.
+    # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
+    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    unpausable: bool = False
+    rebuildable: bool = True
 
     def apply_conductor_config(
         self,
@@ -402,8 +419,10 @@ class KVReqConfig(ResourceReqConfig):
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
                     keyed_spans=keyed_spans,
+                    max_growth=max_growth[0] if max_growth else None,
                 )
-                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                # a row may leave out the growth bound, as a span row may leave out its later fields
+                for label, (spans, growth, scratch, retention, keyed_spans, *max_growth) in kv_layout.items()
                 if label in opened
             }
         if loop_caps is not None and self.kv_layout is not None:
@@ -442,8 +461,8 @@ class KVReqConfig(ResourceReqConfig):
         the one model that declares one, computes its positions in each forward.
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
-        has for requests. The pool admits on the prompt alone, so such a request would be admitted
-        and then could not finish even alone in an empty pool."""
+        has for requests. The pool admits a preemptible request on its prompt alone, so a request this
+        large would be admitted and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
@@ -522,6 +541,23 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
         if missing := sorted(configs[key].opened_labels() - laid_out):
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
+
+
+def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
+    """Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""
+    laid_out = [layout for layout in layouts if layout.spans]
+    if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
+        return "it holds KV that can't be recomputed from token ids"
+    if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label, span or growth loop, which one rebuild row can't lay out again"
+    return None
+
+
+def mark_unpausable(configs: Mapping[str, ResourceReqConfig], unpausable: bool) -> None:
+    """Mark every KV config in ``configs``, since a pause in any pool is heard."""
+    for config in configs.values():
+        if isinstance(config, KVReqConfig):
+            config.unpausable = unpausable
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
@@ -700,16 +736,17 @@ class StreamLayout:
     scratch: int = 0
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
+    max_growth: int | None = None
 
     def slots(self, caps: Mapping[str, int]) -> int:
-        return sum(span.length for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.length for span in self.spans) + self._grown(caps)
 
     def positions(self, caps: Mapping[str, int]) -> int:
-        return sum(span.advance for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.advance for span in self.spans) + self._grown(caps)
+
+    def _grown(self, caps: Mapping[str, int]) -> int:
+        grown = sum(slots * caps[loop] for loop, slots in self.growth)
+        return grown if self.max_growth is None else min(grown, self.max_growth)
 
     def pages(
         self, caps: Mapping[str, int], page_size: int, retention: "RetentionPolicy | None" = None,

@@ -4,12 +4,13 @@ import logging
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
+from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
 from mstar.model.submodule_base import CHUNK_LOOP_END, InputMetadata, StepOrder, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -24,6 +25,7 @@ from mstar.worker.batch_builder import (
 )
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Prefilling, RebuildCursor, Rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +52,10 @@ class ReadyNodeEntry:
 
 
 class MidPrefillRow(NamedTuple):
-    """A row of the caller's in-flight step whose node needs another chunk:
-    the end of the chunk in flight, where its next one starts, and its
-    prompt's length."""
+    """A row mid-prefill that nothing popped: a row of the caller's in-flight
+    step whose node needs another chunk, or a rebuild the log holds. ``start``
+    is where its next chunk starts, 0 for a rebuild that has run none, and
+    ``total`` its prompt's length."""
     request_id: int
     worker_graph_id: int
     graph_walk: str
@@ -119,6 +122,9 @@ class ScheduledBatch:
     # runs; and the rows whose node needs at least one more chunk.
     chunk_ranges: dict[int, ChunkRange] = field(default_factory=dict)
     incomplete_node_rids: set[int] = field(default_factory=set)
+    # Set once scheduled too: the rows that rebuild their request from its
+    # kept ids, which the graph runtime holds no node of.
+    rebuild_rids: frozenset[int] = frozenset()
     # This node's walks that run as a chunk Loop on this worker, stamped when
     # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
     # not the scheduler, and every step that runs passes through there.
@@ -127,6 +133,12 @@ class ScheduledBatch:
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
+
+    def graph_rows(self) -> dict[int, int]:
+        """``request_to_worker_graph`` without the rebuild rows: the rows the graph runtime holds."""
+        if not self.rebuild_rids:
+            return self.request_to_worker_graph
+        return {rid: wg for rid, wg in self.request_to_worker_graph.items() if rid not in self.rebuild_rids}
 
     def loop_strides(self, rids: Iterable[int]) -> list[int] | None:
         """``RouteInput.loop_strides`` for ``rids``, in that order: a row of a
@@ -338,6 +350,11 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """Return ``message`` without its rows, prefix hits and page trails, so it carries only rank 0's moves."""
+    return replace(message, request_ids=[], speculative=False, prefix_hits={}, page_trails={})
+
+
 class ChainPick(NamedTuple):
     """A speculation chain's next step at its target, as ``pick_chain_step``
     chose it; ``take_chain_step`` pops the rows it took off the queues."""
@@ -347,6 +364,8 @@ class ChainPick(NamedTuple):
     specs: list
     # the caller's rows mid-prefill that the step took (``pick_chain_step``)
     mid_prefill: Sequence[MidPrefillRow] = ()
+    # the rebuilds the log holds that the step took
+    rebuilds: Sequence[MidPrefillRow] = ()
 
 
 def runs_final_chunk(chunk: ChunkRange | None) -> bool:
@@ -359,13 +378,6 @@ def chunk_loop_stride(chunk: ChunkRange | None) -> int:
     """How far a row of a chunk-Loop walk moves its Loop: its chunk's stride,
     or to the end for a row that runs whole."""
     return CHUNK_LOOP_END if chunk is None else chunk.stride
-
-
-def runs_first_chunk(chunk: ChunkRange) -> bool:
-    """Whether ``chunk`` is its prompt's first, which caps its chunk Loop. A
-    first chunk's stride runs from 0 even past a cached prefix; a later one's
-    is its own span, which starts past 0."""
-    return chunk.stride == chunk.end
 
 
 def tp_chunk_ranges(message: ScheduleTPNode, rids: list[int]) -> dict[int, ChunkRange]:
@@ -484,6 +496,9 @@ class MicroScheduler:
 
         # (node, graph walk) -> ScheduledBatch
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
+        # The worker's log of rebuilds, installed by the worker: the scheduler offers their rows where it offers
+        # a chunk in flight (`_rebuild_rows`).
+        self.rebuilds = Rebuilds({}, {})
 
         self.node_and_walk_to_last_batch_num = {}
         # scheduling key -> rid -> its turn there: a counter over every row of
@@ -514,6 +529,9 @@ class MicroScheduler:
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: dict[int, None] = {}
+        # Rids a step in flight holds, whose rebuild the log can't offer again until that
+        # step lands. Shared by reference with Worker._in_flight_rids.
+        self.in_flight_rids: set[int] = set()
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
         # still queued. On the fail/abort path we drain these before ACKing
@@ -526,8 +544,8 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
-        # pending resident deltas for TP follow nodes
-        self._pending_resident_deltas: dict[str, OffloadDelta] = {}
+        # rank 0's moves this rank has yet to replay, on any of the nodes it follows
+        self._pending_resident_delta = OffloadDelta.new()
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
@@ -707,16 +725,19 @@ class MicroScheduler:
         and holding the blamed one is what makes the retry smaller.
 
         Asked of the graph, not the engine: an engine readiness check would
-        start reloading an offloaded row. Offloaded rows are left out; they
-        come back only once their pages fit. Refusal path only.
+        start reloading an offloaded row. Rows not resident are left out, since
+        they come back only once their pages fit or their rebuild lands.
+        Refusal path only.
         """
         key = self._key(node_name, graph_walk)
         if self._live_backlog(key) - batch_rids:
             return True
+        if any(row.request_id not in batch_rids for row in self._rebuild_rows(key)):
+            return True
         exclude = self.failed_rids.union(self.pending_removes, self.held_until, batch_rids)
         engine = self.engine_manager.get_engine(node_name)
         return any(
-            not engine.is_offloaded(spec.node_name, rid)
+            engine.residency(spec.node_name, rid) is Residency.RESIDENT
             for spec in self._ready_specs(exclude, key, None)
             if spec.node_name == node_name
             for rid in spec.rids
@@ -809,23 +830,27 @@ class MicroScheduler:
         return self.tp_batches_pending_schedule[0]
 
     def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None=None) -> bool:
-        if node_name not in self._pending_resident_deltas:
-            self._pending_resident_deltas[node_name] = OffloadDelta.new()
-        delta = self._pending_resident_deltas[node_name]
+        delta = self._pending_resident_delta
         if new_delta is not None:
             delta.extend(new_delta)
 
         if not len(delta):
             return True
 
-        engine = self.engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta)
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self._kept_count)
+
+    def _kept_count(self, node_name: str, rid: int) -> int:
+        return self.rebuilds.kept_count(rid, node_name)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        new_delta = None
         if self._last_resident_delta < message.spec_seq:
             self._last_resident_delta = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            new_delta = message.resident_delta
+        try:
+            return self._apply_resident_delta(message.node_name, new_delta)
+        except Exception as exc:
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def settle_tp_follow_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
@@ -856,18 +881,29 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
-        # and the async follower's build / drop / void paths) pops here, so the
-        # drain refcount is discharged in one place.
+        # and the async follower's build path) pops here. `void_tp_follow_head`
+        # discharges the drain refcount of a head this rank won't build.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_tp_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self.tp_batches_pending_schedule[0]
+        self._discharge(head.request_ids)
+        self.tp_batches_pending_schedule[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
-        return message
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -952,25 +988,31 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
+        if not first_tp_node.request_ids:
+            # a step with no rows, so pop it rather than build an empty batch
+            self.pop_tp_follow_head()
+            return
         rids = self.tp_rids(first_tp_node)
         # before anything is popped: lists that do not match the rows raise
         chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
+        rebuild = self.follow_rebuilds(request_state, first_tp_node.node_name, rids)
+        unpopped = unread | rebuild
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
-            [r for r in rids if r not in unread],
+            [r for r in rids if r not in unpopped],
             walks=first_tp_node.walks,
             walk_idx=[
-                w for r, w in zip(rids, first_tp_node.walk_idx, strict=True) if r not in unread
+                w for r, w in zip(rids, first_tp_node.walk_idx, strict=True) if r not in unpopped
             ] if first_tp_node.walks else None,
         )
         if popped is None:
             self.warn_unchecked_read_failure(first_tp_node, rids)
             return
         request_to_worker_graph, input_edges, output_signals, request_walks, walk_signals = popped
-        if unread:
-            request_to_worker_graph, request_walks = self.with_unread_rows(
-                first_tp_node, rids, unread, request_to_worker_graph, request_walks,
+        if unpopped:
+            request_to_worker_graph, request_walks = self.with_unpopped_rows(
+                first_tp_node, rids, unpopped, request_to_worker_graph, request_walks,
             )
 
         self.pop_tp_follow_head()
@@ -984,6 +1026,7 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            rebuild_rids=rebuild,
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
             # the leader's chunks, so the chunk Loop ends on the same step here
             chunk_ranges=chunk_ranges,
@@ -991,6 +1034,28 @@ class MicroScheduler:
         )
         self.cap_chunk_loops(batch)
         return batch
+
+    def follow_rebuilds(
+        self, request_state: RequestStateManager, node_name: str, rids: Iterable[int],
+    ) -> frozenset[int]:
+        """The rows of rank 0's step that rebuild a request dropped on ``node_name``. This rank knows them from
+        its own KV, which replayed rank 0's drop, and starts each rebuild at its first row, from the same source
+        as rank 0, since the request's chunk Loop is lockstep."""
+        engine = self.engine_manager.get_engine(node_name)
+        rebuild = set()
+        for rid in rids:
+            if self.rebuilds.rebuilding(rid, node_name):
+                rebuild.add(rid)
+            elif engine.residency(node_name, rid) is Residency.DROPPED:
+                info = request_state.get_fwd_info(rid, request_state.get_partition_for_node(node_name))
+                self._start_rebuild(node_name, rid, info.graph_walk)
+                rebuild.add(rid)
+        return frozenset(rebuild)
+
+    def _start_rebuild(self, node_name: str, rid: int, graph_walk: str) -> None:
+        rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, graph_walk))
+        if rebuild is not None:
+            self.engine_manager.get_engine(node_name).prepare_rebuild(node_name, rid, rebuild)
 
     def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
         """The rows of ``head`` whose input read failed on this rank, which a
@@ -1003,19 +1068,20 @@ class MicroScheduler:
             return set()
         return {r for r in rids if r in failed}
 
-    def with_unread_rows(
-        self, head: ScheduleTPNode, rids: list[int], unread: set[int],
+    def with_unpopped_rows(
+        self, head: ScheduleTPNode, rids: list[int], unpopped: Collection[int],
         request_to_worker_graph: dict[int, int], request_walks: dict[int, str],
     ) -> tuple[dict[int, int], dict[int, str]]:
-        """``request_to_worker_graph`` and ``request_walks`` with ``unread``'s
-        rows put back, in the leader's order: the step has rank 0's rows on
-        every rank until its read check, so it is built, submitted, voided and
-        settled alike. The unread rows were never popped."""
+        """``request_to_worker_graph`` and ``request_walks`` with the rows
+        nothing popped put back, in the leader's order: rows whose read failed
+        here, which the step carries on every rank until its read check takes
+        them out, so it is built, submitted, voided and settled alike, and
+        rebuild rows, which the graph runtime holds no node of."""
         walk_of = dict(zip(rids, (head.walks[w] for w in head.walk_idx), strict=True)) if head.walks else {}
         request_walks = dict(request_walks)
         rows = {}
         for rid in rids:
-            if rid not in unread:
+            if rid not in unpopped:
                 rows[rid] = request_to_worker_graph[rid]
                 continue
             walk = walk_of.get(rid, head.graph_walk)
@@ -1092,6 +1158,12 @@ class MicroScheduler:
         # A queued row can be first in line even where a backlog fills the
         # step on its own (a row holding the step, back on its queue).
         ready = self._scan_ready(request_state, None, scan_exclude)
+        # A key whose only work is a rebuild takes its turn too, except the key of a mixing chain
+        # yielded from, which takes its rebuilds itself.
+        for node, _, cursor in self._waiting_rebuilds():
+            key = self._key(node, cursor.walk)
+            if key != exclude_target or skip_walk is not None:
+                ready.setdefault(key, [])
 
         def schedule(key, entries):
             # a yield-away runs the other walks: the chain's own rows parked
@@ -1219,18 +1291,22 @@ class MicroScheduler:
         node_walk: tuple[str, str], entries: list[ReadyNodeEntry],
         skip_walk: str | None = None,
     ) -> ScheduledBatch | None:
-        """One step for ``node_walk`` out of its backlog and its ready
-        ``entries`` (already found ready), as the batch builder picks it.
-        Under a combined walk, backlogged rows of ``skip_walk`` (a yield-away
-        from that walk) stay parked."""
+        """One step for ``node_walk`` out of its rebuilds, its backlog and its
+        ready ``entries`` (already found ready), as the batch builder picks it.
+        Under a combined walk, rebuilds and backlogged rows of ``skip_walk`` (a
+        yield-away from that walk) stay parked."""
+        rebuilds = self._rebuild_rows(node_walk, skip_walk=skip_walk)
         backlogged = self.backlog.pop(node_walk, None)
         live = [] if backlogged is None else self._backlog_candidates(
             backlogged, skip_walk=skip_walk,
         )
-        found = {entry.request_id for entry in entries}
+        if rebuilds:
+            live = [row.request_id for row in rebuilds] + live
+        found = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
         walk_of = None
         if node_walk in self._walks_of_key:
             walks = {entry.request_id: entry.graph_walk for entry in entries}
+            walks.update((row.request_id, row.graph_walk) for row in rebuilds)
             walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
         check = self._readiness(request_state, node_walk[0])
         pick = self.batch_builder.pick(self._step_candidates(
@@ -1245,7 +1321,7 @@ class MicroScheduler:
                 backlogged = None  # every row failed
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
-        return self._build_step(request_state, node_walk, backlogged, fresh or None, pick)
+        return self._build_step(request_state, node_walk, backlogged, fresh or None, pick, rebuilds)
 
     def _build_step(
         self, request_state: RequestStateManager, node_walk: tuple[str, str],
@@ -1282,6 +1358,8 @@ class MicroScheduler:
                     tokens, chunks = self._measure_rows(request_state, batch, started, resumed, taken)
                     row_tokens.update(tokens)
                     chunkable |= chunks
+            if continuing is not None:
+                row_tokens.update(self._measure_unstarted(request_state, continuing, taken.difference(starts)))
         min_chunk = 1
         if max_tokens is not None and row_tokens:
             min_chunk = engine.min_chunk_tokens(max_tokens)
@@ -1303,11 +1381,13 @@ class MicroScheduler:
         self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],
         row_tokens: dict[int, int], chunkable: set[int], started: dict[int, int],
     ) -> tuple[ScheduledBatch | None, dict[int, tuple[int, int]]]:
-        """``rows`` as a batch to build from, measured from where each next
-        chunk starts; not popped, since their nodes are in flight. Returns the
-        batch, or None for no row, and rid -> (its next chunk's start, its
-        prompt's length)."""
+        """``rows`` as a batch to build from, not popped: their nodes are in
+        flight, or the log holds them. A row past its first chunk is measured
+        from where its next one starts. Returns the batch, or None for no row,
+        and rid -> (its next chunk's start, its prompt's length) for each row
+        past its first chunk."""
         node = node_walk[0]
+        engine = self.engine_manager.get_engine(node)
         rows = [row for row in rows if row.start < row.total]
         if not rows:
             return None, {}
@@ -1317,12 +1397,40 @@ class MicroScheduler:
         )
         if node_walk in self._walks_of_key:
             batch.request_walks = {row.request_id: row.graph_walk for row in rows}
+        resumed = {}
         for row in rows:
             rid = row.request_id
-            row_tokens[rid] = row.total - row.start
-            started[rid] = self.chunk_started.get((rid, node), 0)
-            chunkable.add(rid)
-        return batch, {row.request_id: (row.start, row.total) for row in rows}
+            # a walk the deployment doesn't chunk rebuilds whole
+            if engine.supports_chunked_prefill(node, row.graph_walk):
+                chunkable.add(rid)
+            if row.start:
+                row_tokens[rid] = row.total - row.start
+                started[rid] = self.chunk_started.get((rid, node), 0)
+                resumed[rid] = (row.start, row.total)
+        return batch, resumed
+
+    def _measure_unstarted(
+        self, request_state: RequestStateManager, batch: ScheduledBatch, only: Collection[int],
+    ) -> dict[int, int]:
+        """The tokens of each rebuild of ``batch`` in ``only`` that has run no chunk, past the cached prefix, as
+        `_measure_rows` measures a fresh row, so a refused first chunk is measured again against the pages the
+        next try finds."""
+        node = batch.node_name
+        engine = self.engine_manager.get_engine(node)
+        partition = request_state.get_partition_for_node(node)
+        tokens: dict[int, int] = {}
+        for rid in batch.request_to_worker_graph:
+            if rid not in only:
+                continue
+            cursor = self.rebuilds.cursor(rid, node)
+            info = engine.unserved_len(
+                node, batch.walk_of(rid), request_state.get_fwd_info(rid, partition), rid, cursor.length,
+                cursor.total,
+            )
+            if info.cached_prefix:
+                self.cached_prefix[(rid, node)] = info.cached_prefix
+            tokens[rid] = info.seq_len
+        return tokens
 
 
     def pick_chain_step(
@@ -1344,7 +1452,8 @@ class MicroScheduler:
         ``mid_prefill``: the chain's step's rows whose chunk is in flight.
         Their nodes are off the ready queue until it lands, so without them
         the next chunk would wait a step. They wait first in line, ahead of
-        the backlog, and are never popped.
+        the backlog, and are never popped, as are the rebuilds the log holds
+        at ``target``.
         """
         self._let_rows_back(request_state)
         key = self._key(*target)
@@ -1359,12 +1468,15 @@ class MicroScheduler:
             and self._key(target[0], row.graph_walk) == key
             and row.start < row.total
         ] if mid_prefill else []
-        if mid:
-            live = [row.request_id for row in mid] + live
+        rebuilds = self._rebuild_rows(key, only_walk=own_walk)
+        unpopped = [row.request_id for row in (*mid, *rebuilds)]
+        if unpopped:
+            live = unpopped + live
         specs = []
         # a chain holding every request here has nothing waiting on the queues
-        if len(request_state.per_request_info) > len(continuing) + len(mid):
-            exclude = self.failed_rids.union(self.pending_removes, self.held_until)
+        if len(request_state.per_request_info) > len(continuing) + len(unpopped):
+            # A rebuild's request also has its decode row on a queue, which the step mustn't pop.
+            exclude = self.failed_rids.union(self.pending_removes, self.held_until, unpopped)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
@@ -1375,22 +1487,23 @@ class MicroScheduler:
         walk_of = None
         if key in self._walks_of_key:
             walks = {rid: spec.graph_walk for spec in specs for rid in spec.rids}
-            walks.update((row.request_id, row.graph_walk) for row in mid)
+            walks.update((row.request_id, row.graph_walk) for row in (*mid, *rebuilds))
             walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
         ready = self._readiness(request_state, target[0])
-        if mid:
-            check, in_flight = ready, {row.request_id for row in mid}
-            ready = lambda rid: rid in in_flight or check(rid)  # noqa: E731
+        if unpopped:
+            check, unpopped_rids = ready, set(unpopped)
+            ready = lambda rid: rid in unpopped_rids or check(rid)  # noqa: E731
         pick = self.batch_builder.pick(self._step_candidates(
             request_state, key, backlog=live, queued=queued, walk_of=walk_of,
             ready=ready,
             continuing=continuing, own_walk=target[1],
             one_walk=own_walk,
         ))
-        if mid:
+        if unpopped:
             took = set(pick.taken)
             mid = [row for row in mid if row.request_id in took]
-        return ChainPick(key, pick, specs, mid)
+            rebuilds = [row for row in rebuilds if row.request_id in took]
+        return ChainPick(key, pick, specs, mid, rebuilds)
 
     def take_chain_step(
         self, request_state: RequestStateManager, chain: "ChainPick",
@@ -1402,9 +1515,9 @@ class MicroScheduler:
         chain gave all of it away. Queued rows it held back (another capture
         group, a walk the step can't mix) are popped and parked, so the chain
         yields to them (``backlog_splits_from``) rather than run past them.
-        The chain's rows mid-prefill that it took join from their held inputs;
-        the chain's own ``pre_existing_batch_size`` rows count against a token
-        budget (``_build_step``)."""
+        The chain's rows mid-prefill and the rebuilds that it took join without
+        a pop. The chain's own ``pre_existing_batch_size`` rows count against a
+        token budget (``_build_step``)."""
         key = chain.key
         own = set(chain.pick.continuing)
         taken = [rid for rid in chain.pick.taken if rid not in own]
@@ -1428,7 +1541,7 @@ class MicroScheduler:
         fresh = self._assemble_batch(request_state, *key, entries) if entries else None
         return self._build_step(
             request_state, key, backlogged, fresh or None, chain.pick,
-            chain.mid_prefill, pre_existing_batch_size, pre_existing_seq_lens,
+            [*chain.mid_prefill, *chain.rebuilds], pre_existing_batch_size, pre_existing_seq_lens,
         )
 
     def _step_candidates(
@@ -1598,6 +1711,16 @@ class MicroScheduler:
             for rid, count, cap in zip(rows, counts, caps, strict=True) if count > 0
         }
 
+    def prefilling(self, node_name: str, rid: int, graph_walk: str) -> Prefilling | None:
+        """Where ``rid``'s prompt stands while it is mid-prefill in ``graph_walk`` on ``node_name``, read off its
+        chunk Loop as `_chunk_loop_progress` reads it, else None."""
+        if graph_walk not in self.chunk_loop_walks.get(node_name, ()):
+            return None
+        (done,), (total,) = self.runtime.loop_progress(
+            node_name, [rid], [graph_walk], [chunk_loop_name(node_name, graph_walk)],
+        )
+        return Prefilling(graph_walk, done, total) if 0 < done < total else None
+
     def _backlog_candidates(
         self, batch: ScheduledBatch,
         only_walk: str | None = None, skip_walk: str | None = None,
@@ -1620,6 +1743,33 @@ class MicroScheduler:
                 if (only_walk is None or batch.walk_of(rid) == only_walk)
                 and batch.walk_of(rid) != skip_walk
             ]
+        return rows
+
+    def _waiting_rebuilds(self) -> Iterator[tuple[str, int, RebuildCursor]]:
+        """(node, rid, cursor) of each rebuild whose next chunk could run now: its request isn't held, failed,
+        being removed, or in a step in flight."""
+        now = time.monotonic()
+        held, removing, failed, in_flight = self.held_until, self.pending_removes, self.failed_rids, self.in_flight_rids
+        for (node, rid), cursor in self._cursors_here():
+            if rid not in in_flight and rid not in removing and rid not in failed and held.get(rid, 0.0) <= now:
+                yield node, rid, cursor
+
+    def _cursors_here(self) -> Iterator[tuple[tuple[str, int], RebuildCursor]]:
+        """The rebuilds this rank schedules: a follower's rebuild on a node rank 0 leads runs as rank 0 sends it."""
+        leads = self.parallel_leader_nodes
+        return ((key, cursor) for key, cursor in self.rebuilds.cursors() if leads is None or key[0] in leads)
+
+    def _rebuild_rows(
+        self, key: tuple[str, str], only_walk: str | None = None, skip_walk: str | None = None,
+    ) -> list[MidPrefillRow]:
+        """``key``'s waiting rebuilds as rows mid-prefill, as `_backlog_candidates` reads ``only_walk`` and
+        ``skip_walk``."""
+        rows = []
+        for node, rid, cursor in self._waiting_rebuilds():
+            walk = cursor.walk
+            if self._key(node, walk) == key and walk != skip_walk and only_walk in (None, walk):
+                wg_id = self.runtime.get_worker_graph_id_for_node(node, walk)
+                rows.append(MidPrefillRow(rid, wg_id, walk, cursor.done, cursor.total))
         return rows
 
     def _drop_failed_rows(self, batch: ScheduledBatch) -> None:
@@ -1654,17 +1804,20 @@ class MicroScheduler:
             expected |= request.backlog.request_to_worker_graph.keys()
         if request.fresh is not None:
             expected |= request.fresh.request_to_worker_graph.keys()
+        unpopped = set()
         if request.continuing is not None:
-            expected |= request.continuing.request_to_worker_graph.keys()
+            unpopped = set(request.continuing.request_to_worker_graph)
+            expected |= unpopped
         result: BatchBuildResult = self.batch_builder.build_batch(request)
         self._refuse_lost_rows(node_walk, expected, result)
         backlog, returned = result.backlog, result.returned
-        if mid_prefill_starts:
-            # left out, a row mid-prefill goes back to its queue when its chunk lands
+        if unpopped:
+            # left out, a row mid-prefill goes back to its queue when its chunk lands, and a rebuild
+            # stays in the log
             if backlog is not None:
-                backlog, _ = backlog.split_off_first(None, exclude_rids=set(mid_prefill_starts))
+                backlog, _ = backlog.split_off_first(None, exclude_rids=unpopped)
             if returned:
-                returned = {rid: wg for rid, wg in returned.items() if rid not in mid_prefill_starts}
+                returned = {rid: wg for rid, wg in returned.items() if rid not in unpopped}
         # Whatever was popped past this step has to be remembered here, or it
         # would never run.
         if backlog is not None:
@@ -1675,6 +1828,10 @@ class MicroScheduler:
                 request.node_name, list(returned), list(returned.values()),
             )
         if result.scheduled is not None:
+            result.scheduled.rebuild_rids = frozenset(
+                rid for rid in unpopped
+                if rid in result.scheduled.request_to_worker_graph and self.rebuilds.rebuilding(rid, request.node_name)
+            )
             self._mark_scheduled(*node_walk, len(result.scheduled))
             self._assign_chunks(
                 result.scheduled, result.chunk_tokens or {}, request.row_tokens,
@@ -1722,9 +1879,12 @@ class MicroScheduler:
         range at all: it runs whole, and its stride ends its chunk Loop
         (``chunk_loop_stride``).
         """
-        if not (chunk_tokens or resumed or self.cached_prefix):
-            return
         node = batch.node_name
+        # A rebuild of a prompt mid-prefill is cut from the input the engine keeps for the prompt, so it runs as a
+        # chunk even when it fits whole, and the prompt keeps its place in line for its next chunk.
+        prefills = {rid for rid in batch.rebuild_rids if self.rebuilds.cursor(rid, node).resumes_prefill}
+        if not (chunk_tokens or resumed or self.cached_prefix or prefills):
+            return
         for rid in batch.request_to_worker_graph:
             at = resumed.get(rid)
             if at is not None:
@@ -1734,15 +1894,15 @@ class MicroScheduler:
             else:
                 key = (rid, node)
                 cached = self.cached_prefix.pop(key, 0)
-                if rid not in chunk_tokens:
+                if rid not in chunk_tokens and rid not in prefills:
                     continue
                 total = cached + row_tokens[rid]
-                end = cached + chunk_tokens[rid]
+                end = cached + chunk_tokens.get(rid, row_tokens[rid])
                 batch.chunk_ranges[rid] = ChunkRange(cached, end, total, end)
                 self.chunk_started[key] = next(self._chunk_starts)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
-            else:
+            elif rid not in prefills:
                 self.chunk_started.pop((rid, node), None)
         self.cap_chunk_loops(batch)
 
@@ -1755,7 +1915,7 @@ class MicroScheduler:
         loop_walks = self.chunk_loop_walks.get(node, ())
         capped = [
             rid for rid, chunk in batch.chunk_ranges.items()
-            if runs_first_chunk(chunk) and batch.walk_of(rid) in loop_walks
+            if chunk.is_first and rid not in batch.rebuild_rids and batch.walk_of(rid) in loop_walks
         ]
         if capped:
             walks = [batch.walk_of(rid) for rid in capped]
@@ -1798,6 +1958,16 @@ class MicroScheduler:
         )
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
+
+    def return_backlogged(self, rid: int) -> None:
+        """Put ``rid``'s backlogged rows back on the runtime's ready queues, as `_build_and_schedule`
+        returns rows a step doesn't take."""
+        for (node_name, _), batch in self.backlog.items():
+            wg_id = batch.request_to_worker_graph.get(rid)
+            if rid in batch.request_to_worker_graph:
+                self._set_in_flight(node_name, {rid: wg_id}, False)
+                self.runtime.push_back_node(node_name, [rid], [wg_id])
+        self._drop_backlogged_rid(rid)
 
     def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it.
@@ -1978,6 +2148,13 @@ class MicroScheduler:
             scan_exclude = exclude_target
         if self._backlog_has_schedulable(exclude_target, exclude_walk):
             return True
+        # A waiting rebuild yields the step unless the chain takes it: one of the chain's own walk, or under a mix
+        # one of its key.
+        if any(
+            self._key(node, cursor.walk) != exclude_target or exclude_walk not in (None, cursor.walk)
+            for node, _, cursor in self._waiting_rebuilds()
+        ):
+            return True
 
         # A failed rid is normally invisible here — get_next_batch refuses to
         # schedule it, so reporting it as ready would break the spec chain for
@@ -2046,13 +2223,17 @@ class MicroScheduler:
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; a ``terminal`` reason never will, so the
         rid goes to the worker to fail instead of being rescanned forever. A
-        rid waiting for capacity is parked on its node until `_unpark`."""
-        if rid in self.parked.get(node_name, ()):
+        rid waiting for capacity is parked on its node until `_unpark`, and a
+        dropped rid waits until its rebuild lands."""
+        if rid in self.parked.get(node_name, ()) or self.rebuilds.rebuilding(rid, node_name):
             return False
         engine = self.engine_manager.get_engine(node_name)
         outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
         if outcome.queued:
             self.parked.setdefault(node_name, set()).add(rid)
+            return False
+        if outcome.rebuild:
+            self._start_rebuild(node_name, rid, fwd_info.graph_walk)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
@@ -2071,11 +2252,14 @@ class MicroScheduler:
         """Per node this rank schedules, rows ready for a step but not in one:
         its backlog, and graph-ready rows still on the queues. Read-only and
         graph-level (no engine readiness check, which can reload), so a held
-        or not yet reloaded row counts; a failed or removed one does not."""
+        or not yet reloaded row counts; a failed or removed one does not.
+        A rebuild counts while no step holds it."""
         exclude = self.failed_rids.union(self.pending_removes)
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
+        for (node, rid), _ in self._cursors_here():
+            rows[node] += rid not in exclude and rid not in self.in_flight_rids
         for spec in self._rows_here(self.runtime.get_ready_nodes(exclude)):
             rows[spec.node_name] += len(spec.rids)
         return rows

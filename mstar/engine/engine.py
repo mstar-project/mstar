@@ -6,9 +6,10 @@ import threading
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -31,6 +32,8 @@ from mstar.engine.resources import (
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
+    Rebuild,
+    Residency,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -38,7 +41,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -47,6 +50,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
+    FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
 )
@@ -76,7 +80,7 @@ from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
-from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.utils.ipc_format import MoveKind, OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PhaseLaps,
     mark,
@@ -568,10 +572,12 @@ class Engine:
         # chunked prefill: per-walk policies and budgets, and rows mid-prefill
         self._chunking = ChunkingManagement(self._submodules)
 
-        # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
-        # Only a TP leader drains this, to replicate its resident set onto the
-        # rest of the instance; see ``ScheduleTPNode``.
-        self._resident_delta: dict[str, OffloadDelta] = {}
+        # The moves on the nodes this rank leads since the last ``take_resident_delta``,
+        # or None when it leads none. One for the lockstep instance, which a worker's
+        # lockstep nodes share, so any of its steps carries every move. Only a TP leader
+        # drains this, to replicate its resident set onto the rest of the instance; see
+        # ``ScheduleTPNode``.
+        self._resident_delta: OffloadDelta | None = None
         # Nodes this rank leads (journals its moves for the others) and nodes it
         # follows (may not move pages at all — see ``offload_request``). A node
         # that is not sharded is in neither: it owns its own eviction.
@@ -662,6 +668,10 @@ class Engine:
             declared_by=declared_by,
         )
 
+        for kv in self.paged_kv_caches():
+            if kv.nodes & self._tp_leader_nodes:
+                kv.cache.journal = partial(self._journal, pool=kv.key)
+
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
         for node_name, submodule in submodules.items():
@@ -692,6 +702,30 @@ class Engine:
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
+        if model is not None:
+            self._check_rebuild_policies(model)
+
+    def _check_rebuild_policies(self, model: "Model") -> None:
+        """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
+        combined = model.combined_walk_of()
+        for node, policy in model.rebuild_policies().items():
+            mgmt = self._submodules.get(node)
+            if mgmt is None:
+                continue
+            refusing = sorted(key for key, resource in mgmt.resources.items() if not resource.supports_drop)
+            if refusing:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but {refusing} can't drop a "
+                    "request's state"
+                )
+            walks = {policy.walk, combined.get((node, policy.walk), policy.walk)}
+            split = sorted(walk for walk in walks if mgmt.submodule.split_batches_by_capture_key(walk))
+            if split:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but splits steps of {split} by "
+                    "capture key, which the scheduler reads from a request's forward-pass info, and that names "
+                    "the decode walk while the request is rebuilt"
+                )
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -1233,9 +1267,12 @@ class Engine:
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
         steps = self._loopback_steps
+        # a rebuild row leaves its request's entry for the decode step it resumes
+        rebuild = batch.step_context.rebuild_rids
+        rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
         if batch.rows_only:
             steps.update(dict.fromkeys(
-                batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
+                rids, (batch.node_name, batch.step_context.graph_walk),
             ))
         elif batch.loopback_rids:
             # a mixed step: a row looped back under its own walk, so the next
@@ -1243,13 +1280,13 @@ class Engine:
             keep, node, walk_of = (
                 batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
             )
-            for rid in batch.request_ids:
+            for rid in rids:
                 if rid in keep:
                     steps[rid] = (node, walk_of(rid))
                 else:
                     steps.pop(rid, None)
         elif steps:
-            for rid in batch.request_ids:
+            for rid in rids:
                 steps.pop(rid, None)
 
     def inline_client_signals(
@@ -1267,6 +1304,7 @@ class Engine:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
         (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any.
+        A rebuild of a prompt mid-prefill is cut from the prompt's input, which its first chunk finds prepared.
 
         Raises when the prepared input is not the length the scheduler cut it
         by (``get_input_sequence_len`` disagreeing with ``prepare_inputs``):
@@ -1275,7 +1313,7 @@ class Engine:
         key = (rid, batch.node_name)
         full = self._chunking.prepared.get(key)
         start, end, total = chunk.start, chunk.end, chunk.total
-        if full is None:
+        if chunk.is_first and full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
                 fwd_info=batch.per_request_info_wrapped[rid],
@@ -1291,6 +1329,9 @@ class Engine:
                     f"{batch.node_name}/{walk}: the row was measured at {total} tokens "
                     f"and chunked by that, but its prepared inputs hold {full.input_seq_len}"
                 )
+            self._chunking.prepared[key] = full
+            batch.first_chunk_rids.add(rid)
+        if chunk.is_first:
             if walk in self._keyed_walks.get(batch.node_name, ()):
                 # a first chunk starts past what `input_sequence_len` matched;
                 # the probe answers the same again, now checked against the prepared inputs
@@ -1315,8 +1356,6 @@ class Engine:
                     prefix = prefix._replace(tokens=0, position=prefix.position - prefix.tokens)
                 # a declined or uncuttable walk writes over the lease (prefix None)
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
-            self._chunking.prepared[key] = full
-            batch.first_chunk_rids.add(rid)
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -1390,7 +1429,7 @@ class Engine:
                     keys=keys,
                 )
 
-    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, CachedLease]]:
         """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
         followers can take the same pages before they build it."""
         keyed = self._keyed_walks.get(batch.node_name)
@@ -1415,10 +1454,12 @@ class Engine:
 
     def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
         """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
-        ready = True
         for rid, walk, leases in self._resolve_hits(head):
-            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
-        return ready
+            # stop at the first lease this rank doesn't hold yet, so it takes the leases in rank 0's order and
+            # counts their pages as rank 0 did
+            if not self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up):
+                return False
+        return True
 
     def release_cached_prefix(self, batch: ExecutingBatch) -> None:
         """Give back the leases of a step this rank built and won't run."""
@@ -1441,18 +1482,18 @@ class Engine:
                 walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
                 yield rid, walk, leases
 
-    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, ...]]:
         return self._runner.page_trails(node_name)
 
     def check_page_trails(
-        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, ...]],
     ) -> None:
-        """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
+        """On a TP follower, raise if a resource's page trail differs from rank 0's when it
         sent this step."""
         for pool, mine in self._runner.page_trails(node_name).items():
             if trails.get(pool, mine) != mine:
                 raise RuntimeError(
-                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"KV {pool}: this rank's page trail {mine} differs from "
                     f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
                 )
 
@@ -1717,6 +1758,7 @@ class Engine:
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
+                rebuild_rids=batch.step_context.rebuild_rids,
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
@@ -2709,24 +2751,31 @@ class Engine:
         write over the lease the walks before it were served from."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        if info is None or rid is None:
+            return info
+        return self.unserved_len(node_name, graph_walk, request_info, rid, info.seq_len, info.seq_len)
+
+    def unserved_len(
+        self, node_name: str, graph_walk: str, request_info: CurrentForwardPassInfo, rid: int,
+        length: int, end: int,
+    ) -> InputSeqLenInfo:
+        """The tokens up to ``end`` of ``rid``'s ``length``-token row, as `input_sequence_len` measures them. A
+        rebuild of a prompt mid-prefill writes only the tokens before ``end``."""
         policy = self._chunking.policy(node_name, graph_walk)
         if (
-            info is None or rid is None
-            or graph_walk not in self._keyed_walks.get(node_name, ())
+            graph_walk not in self._keyed_walks.get(node_name, ())
             # the manager's, not the policy's: a walk the deployment does not
             # chunk is never cut, so it starts at its first token
             or not self._chunking.chunkable(node_name, graph_walk)
             or (policy.reuses_cached_prefix is not None
                 and not policy.reuses_cached_prefix(request_info))
         ):
-            return info
+            return InputSeqLenInfo(end)
         prefix = self._runner.resolve_cached_prefix(
-            rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
+            rid, node_name, graph_walk, _MeasuredRow(length),
         )
-        matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
-        if matched <= 0:
-            return info
-        return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
+        matched = min(prefix.tokens if prefix is not None else 0, end)
+        return InputSeqLenInfo(end - matched, cached_prefix=matched)
 
     def check_ready(
         self, node_name: str, request_id: str,
@@ -2735,17 +2784,28 @@ class Engine:
     ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
-        An offloaded request is brought back first; it stays not-ready until
-        that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). Then each resource takes in whatever the request
-        published elsewhere — a KV transfer from a prefill worker, say — and
-        reports whether that has landed.
+        The node's resources admit the request first, a returning one
+        included, and it is ``queued`` until they do. An offloaded request is
+        then brought back; it stays not-ready until that fits, which is the
+        scheduler's cue to run something else (and, on OOM, to evict). Then each
+        resource takes in whatever the request published elsewhere — a KV
+        transfer from a prefill worker, say — and reports whether that has
+        landed.
+
+        A dropped request is not ready: the caller rebuilds it from its token
+        ids.
 
         The outcome, not a bool: a resource can report the request
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id):
+        waits = self.admit_request(node_name, request_id, request_info)
+        if waits is not None:
+            return waits
+        residency = self.residency(node_name, request_id)
+        if residency is Residency.DROPPED:
+            return FULL_ADMIT_REBUILD if allow_reload else FULL_ADMIT_NOT_READY
+        if residency is Residency.ON_HOST:
             if not allow_reload:
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
@@ -2754,6 +2814,15 @@ class Engine:
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
+        )
+
+    def admit_request(
+        self, node_name: str, request_id: str, request_info: CurrentForwardPassInfo,
+    ) -> FullAdmitOutcome | None:
+        """None once the node's resources have admitted the request, else why it waits or fails; see
+        `StepRunner.admit_request`."""
+        return self._runner.admit_request(
+            request_id, node_name, request_info.graph_walk, request_info.resource_publish_info,
         )
 
     def admit_waiting(
@@ -2986,18 +3055,62 @@ class Engine:
             if resources is None or key in resources
         )
 
-    def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        return any(
-            resource.is_offloaded(request_id)
-            for resource in self._submodules[node_name].resources.values()
+    def residency(self, node_name: str, request_id: str) -> Residency:
+        """The furthest from the device that any of the node's resources holds the request."""
+        return max(
+            (resource.residency(request_id) for resource in self._submodules[node_name].resources.values()),
+            default=Residency.RESIDENT,
         )
+
+    def newer_than(self, request_id: int) -> list[str] | None:
+        """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
+        return self._runner.newer_than(request_id)
+
+    def readmit_request(self, node_name: str, request_id: int) -> None:
+        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        `Admission.readmit`."""
+        self._runner.readmit(request_id, node_name)
+
+    def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
+        """Discard the request's state on this node that can be recomputed from
+        its token ids, and return the pages freed. ``kept`` is how many of those ids
+        this rank keeps, which rank 0 journals for its followers to check."""
+        # check every resource before dropping any, so a refusal changes nothing,
+        # as `reload_request` checks `can_reload`
+        refusal = self.drop_refusal(node_name, request_id)
+        if refusal is not None:
+            raise RuntimeError(refusal)
+        freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        if node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.DROP, request_id, kept, node=node_name)
+        self._runner.readmit(request_id, node_name)
+        return freed
+
+    def drop_refusal(self, node_name: str, request_id: int) -> str | None:
+        """Why `drop_request` would refuse the request on this node, or None."""
+        for resource in self._submodules[node_name].resources.values():
+            refusal = resource.check_drop(request_id)
+            if refusal is not None:
+                return refusal
+        return None
+
+    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
+        """Tell each of the node's resources what the dropped request's rebuild row writes."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.prepare_rebuild(request_id, rebuild)
+
+    def land_rebuild(self, node_name: str, request_id: int) -> None:
+        """Make the dropped request resident again, once its rebuild row has run."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.land_rebuild(request_id)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
-        victim.
+        victim. A victim `KVManager.preempt` chose is the exception: it can
+        move with 0 reclaimed.
         """
         if node_name in self._tp_follower_nodes:
             # Rank 0 decides what this instance evicts, and its decision arrives
@@ -3009,10 +3122,11 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        # a victim can be offloaded without freeing a page
+        moved = freed > 0 or self.residency(node_name, request_id) is Residency.ON_HOST
+        if moved and node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.OFFLOAD, request_id, node=node_name)
+        self._runner.readmit(request_id, node_name)
         return freed
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
@@ -3026,7 +3140,7 @@ class Engine:
         offloaded = [
             resource
             for resource in self._submodules[node_name].resources.values()
-            if resource.supports_eviction and resource.is_offloaded(request_id)
+            if resource.supports_eviction and resource.residency(request_id) is Residency.ON_HOST
         ]
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
@@ -3047,10 +3161,8 @@ class Engine:
             "Reloaded request %s on %s",
             self._graph_runtime.get_rid_string(request_id), node_name,
         )
-        if node_name in self._resident_delta:
-            self._resident_delta[node_name].add_reloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        if node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.RELOAD, request_id, node=node_name)
         return True
 
     def _classify_tp_roles(
@@ -3073,54 +3185,89 @@ class Engine:
             if parallel_groups.get_instance_rank_for_node(node) == 0
         }
         self._tp_follower_nodes = sharded - self._tp_leader_nodes
-        for node in self._tp_leader_nodes:
-            self._resident_delta[node] = OffloadDelta.new()
+        if self._tp_leader_nodes:
+            self._resident_delta = OffloadDelta.new()
 
-    def take_resident_delta(
-        self, node_name: str,
-    ) -> OffloadDelta:
-        """The moves on this node since the last call, ready for the wire.
+    def _journal(
+        self, kind: MoveKind, request_id: int, count: int = 0, victims: Sequence[int] = (), *, node: str = "",
+        pool: str = "",
+    ) -> None:
+        wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta
+        # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
+        # `check_ready` where a second KV cache on the node keeps the request not ready
+        if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
+            return
+        wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
+        journal.add(kind, wire_rid, pool, count, wire_victims, node)
+        if kind in (MoveKind.EARMARK, MoveKind.DROP):
+            # matched against the followers' replay lines to compare the ranks' victims
+            logger.debug("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node or pool, count,
+                        wire_victims)
+
+    def take_resident_delta(self) -> OffloadDelta:
+        """The moves on the nodes this rank leads since the last call, ready for the wire.
 
         Verbatim. Every move in it is one this rank executed, so a rank in the
         same state can always apply it — which is what makes a refused replay
         mean the states differ, and nothing else.
         """
-        if node_name not in self._resident_delta:
+        if self._resident_delta is None:
             return OffloadDelta.new()
-        return self._resident_delta[node_name].take()
+        return self._resident_delta.take()
+
+    def owes_moves(self) -> bool:
+        return bool(self._resident_delta)
 
     def apply_resident_delta(
-        self, node_name: str, delta: OffloadDelta,
+        self, delta: OffloadDelta, kept_count: Callable[[str, int], int],
     ) -> bool:
-        """Match the leader's resident set on this node. Mutates OffloadDelta
+        """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
+        ``kept_count(node, rid)`` is how many ids this rank keeps of a request on a node.
         """
-
-        resources = self._submodules[node_name].resources.values()
         for _ in range(len(delta)):
-            wire_rid, is_offload = delta.peek_left()
+            move = delta.peek_left()
+            wire_rid, kind, node_name = move.rid, move.kind, move.node
             # Wire strings, not handles: a handle is minted per worker, so rank
-            # 0's is meaningless here. None means this rank has no live request
-            # by that name -- it removed it already, on the other side of the
-            # step rank 0 recorded the move. Its pages are gone, so the move is
-            # moot and the entry is spent; logged because reaching this for a
-            # rid the rank has NOT YET admitted would silently lose a move and
-            # diverge the resident set for good.
+            # 0's is meaningless here. Rank 0 removes a request only once its
+            # journal has gone out, so None means this rank hasn't ingested the
+            # request yet, and the move waits for it.
             rid = self._graph_runtime.get_rid_handle(wire_rid)
             if rid is None:
                 logger.debug(
-                    "Replay: no live request named %s on %s; move is moot",
-                    wire_rid, node_name,
+                    "Replay: %s not ingested yet; %d moves still owed",
+                    wire_rid, len(delta),
                 )
-                delta.pop_left()
-                continue
-            if is_offload:
-                if self.is_offloaded(node_name, rid):
+                return False
+            if move.pool:
+                victims = [self._graph_runtime.get_rid_handle(victim) for victim in move.victims]
+                self._resources[move.pool].replay(kind, rid, move.count, victims)
+                if kind == MoveKind.EARMARK:
+                    logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
+                                move.pool, move.count, move.victims)
+            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and any(
+                kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes
+            ):
+                logger.debug("Replay: %s's %s on %s waits for its step; %d moves still owed",
+                             wire_rid, kind.name, node_name, len(delta))
+                return False
+            elif kind == MoveKind.DROP:
+                kept = kept_count(node_name, rid)
+                if kept != move.count:
+                    raise RuntimeError(
+                        f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps {kept}"
+                    )
+                freed = self.drop_request(node_name, rid, move.count)
+                logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
+                            move.count, freed)
+            elif kind == MoveKind.OFFLOAD:
+                hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
+                if self.residency(node_name, rid) is Residency.ON_HOST:
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
                     )
-                elif self.reclaimable(node_name, rid) <= 0:
+                elif self.reclaimable(node_name, rid) <= 0 and not hosted:
                     # Nothing resident to move, so this rank already matches the
                     # leader. Distinct from the refusal below, and the difference
                     # matters: ``offload`` answers 0 for both, and treating
@@ -3132,10 +3279,10 @@ class Engine:
                 else:
                     freed = sum(
                         resource.offload(rid)
-                        for resource in resources
+                        for resource in self._submodules[node_name].resources.values()
                         if resource.supports_eviction
                     )
-                    if freed <= 0:
+                    if self.residency(node_name, rid) is not Residency.ON_HOST:
                         # Refused for now: a step still holds these pages and
                         # will release them when it commits.
                         logger.warning(
@@ -3150,14 +3297,14 @@ class Engine:
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
                     )
-            elif not self.is_offloaded(node_name, rid):
+            elif self.residency(node_name, rid) is not Residency.ON_HOST:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
             elif not all(
                 resource.reload(rid)
-                for resource in resources
-                if resource.supports_eviction and resource.is_offloaded(rid)
+                for resource in self._submodules[node_name].resources.values()
+                if resource.supports_eviction and resource.residency(rid) is Residency.ON_HOST
             ):
                     # No room yet. Silent until now, and this is the shape of a
                     # follower that stops mid-delta and never finishes: rank 0
@@ -3176,6 +3323,12 @@ class Engine:
                 )
             delta.pop_left()
         return True
+
+    def can_offload(self, node_name: str, request_id: str) -> bool:
+        return all(
+            resource.can_offload(request_id)
+            for resource in self._submodules[node_name].resources.values() if resource.supports_eviction
+        )
 
     def reclaimable(self, node_name: str, request_id: str, affected_resources: set[str] | None=None) -> int:
         """What this node's resources could reclaim from the request. 0 means
@@ -3208,7 +3361,7 @@ class Engine:
     ) -> None:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
-        self._runner.ingest_request(request_id, overrides)
+        self._runner.ingest_request(request_id, overrides, None if request_info is None else request_info.arrival)
         if request_info is None:
             return
         try:
