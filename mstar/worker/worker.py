@@ -117,7 +117,7 @@ from mstar.worker.micro_scheduler import (
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.rebuild import Rebuilds, policies_run_here
+from mstar.worker.rebuild import Rebuilds, node_writes, policies_run_here
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -713,7 +713,7 @@ class Worker:
         self._preemptions: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         # node -> when its last move of a victim was logged, and the moves since
         self._drop_logged: dict[str, tuple[float, int]] = {}
-        self._set_local_loops(model, my_walks)
+        self._set_kv_writes(model, my_walks)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -974,6 +974,7 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
         laps.lap("worker_state")
+        self._guarantee(body.request_info.resource_configs)
         try:
             self.engine_manager.add_request(
                 request_id, body.request_info.resource_configs, body.request_info,
@@ -990,7 +991,6 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {text}"})
             self._process_unprocessed(body.request_id)
             return
-        self._guarantee(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
@@ -1154,26 +1154,25 @@ class Worker:
         self._graph_runtime.remove_request(request_id)
         laps.lap("runtime")
 
-    def _set_local_loops(self, model: Model | None, my_walks: set[tuple[str, str]]) -> None:
-        """Give each paged KV cache the loops that grow it in a walk this worker runs on one of the cache's nodes."""
+    def _set_kv_writes(self, model: Model | None, my_walks: set[tuple[str, str]]) -> None:
+        """Record what each node of each paged KV cache writes here, and give each cache the loops that grow it
+        in a walk this worker runs on one of its nodes."""
         labels = model.kv_labels() if model is not None else {}
-        for kv in self._kv_caches.values():
-            kv.cache.local_loops = {
-                loop for label in labels.get(kv.key, {}).values() for walk, loop in label.growth
-                if any((node, walk) in my_walks for node in kv.nodes)
-            }
+        # key -> node -> its `NodeWrites`
+        self._kv_writes = {
+            key: node_writes(labels.get(key, {}), kv.nodes, my_walks) for key, kv in self._kv_caches.items()
+        }
+        for key, kv in self._kv_caches.items():
+            kv.cache.local_loops = {loop for writes in self._kv_writes[key].values() for loop in writes.loops}
 
-    def _guarantee(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
-        """Where a node lays out KV for the request that no rebuild here can write again, no drop can free the
-        request's pages, so the request is guaranteed in every paged KV cache of that node."""
-        for node_name, keys in self._kv_keys.items():
-            node_configs = [config for key in keys if isinstance(config := configs.get(key), KVReqConfig)]
-            layouts = [layout for config in node_configs for layout in (config.kv_layout or {}).values()]
-            if any(layout.spans or layout.growth for layout in layouts) and not self._rebuilds.can_rebuild(
-                node_name, layouts,
-            ):
-                for config in node_configs:
-                    config.guaranteed = True
+    def _guarantee(self, configs: dict[str, ResourceReqConfig]) -> None:
+        """A request is guaranteed in a paged KV cache where no drop here can free its pages."""
+        layouts = {
+            key: (config.kv_layout or {}).values() for key, config in configs.items() if isinstance(config, KVReqConfig)
+        }
+        for key, rebuildable in self._rebuilds.rebuildable(self._kv_writes, layouts).items():
+            if not rebuildable:
+                configs[key].guaranteed = True
 
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return

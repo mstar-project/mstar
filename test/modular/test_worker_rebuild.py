@@ -27,7 +27,7 @@ from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
+from mstar.worker.rebuild import KeptIds, NodeWrites, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -87,6 +87,7 @@ def _worker():
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
+    w._kv_writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
@@ -126,12 +127,15 @@ def test_a_rebuild_tells_the_node_what_its_row_writes_and_queues_the_row():
     assert w.scheduler.rebuild_queued(R), "the row would never reach a step"
 
 
-@pytest.mark.parametrize("shared", [False, True], ids=["own pool", "pool shared with a node with no rebuild policy"])
-def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeypatch, shared):
+@pytest.mark.parametrize("talker_walk", [None, "talk", PREFILL], ids=[
+    "own pool", "pool shared with a node that writes nothing for it",
+    "pool shared with a node with no rebuild policy that writes for it",
+])
+def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeypatch, talker_walk):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     w, _ = _worker()
-    if shared:
-        w._kv_keys["talker"] = ["kv"]
+    if talker_walk is not None:
+        w._kv_writes["kv"]["talker"] = NodeWrites(frozenset({talker_walk}), frozenset())
     kv, w._unprocessed_messages = _pool(), {}
     # neither the publish skip nor the streams bear on the class
     w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
@@ -152,7 +156,7 @@ def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeyp
         w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
                                            worker_graph_to_workers={}, initial_inputs=[], request_info=info))
     guaranteed = {rid for rid in configs if kv._overrides[rid].guaranteed}
-    assert guaranteed == ({R, 12, 13} if shared else {12, 13}), (
+    assert guaranteed == ({R, 12, 13} if talker_walk == PREFILL else {12, 13}), (
         "a request nothing can drop would reserve only its prompt"
     )
 

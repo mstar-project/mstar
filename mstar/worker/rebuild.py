@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from array import array
+from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
@@ -18,6 +19,7 @@ from mstar.model.rebuild import RebuildPolicy
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
+    from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
 
 
@@ -46,6 +48,30 @@ def policies_run_here(
         node: policy for node, policy in policies.items()
         if all((node, walk) in my_walks for walk in {policy.walk, *policy.loop_walks(node, graphs)})
     }
+
+
+class NodeWrites(NamedTuple):
+    """The walks a node runs on this worker, and the loops that grow its paged KV cache's labels in them."""
+    walks: frozenset[str]
+    loops: frozenset[str]
+
+    def writes(self, layout: StreamLayout) -> bool:
+        return any(span.walk in self.walks for span in layout.spans) or any(
+            loop in self.loops for loop, _ in layout.growth
+        )
+
+
+def node_writes(
+    labels: Mapping[str, KVLabel], nodes: Iterable[str], my_walks: Collection[tuple[str, str]],
+) -> dict[str, NodeWrites]:
+    """What each of a paged KV cache's ``nodes`` that runs here writes of the cache's ``labels``."""
+    writes = {}
+    for node in nodes:
+        walks = frozenset(walk for name, walk in my_walks if name == node)
+        if walks:
+            loops = frozenset(loop for label in labels.values() for walk, loop in label.growth if walk in walks)
+            writes[node] = NodeWrites(walks, loops)
+    return writes
 
 
 class Rebuilds:
@@ -78,6 +104,25 @@ class Rebuilds:
             and all(loop == policy.loop for layout in layouts for loop, _ in layout.growth)
             and all(span.walk == policy.walk for layout in layouts for span in layout.spans)
         )
+
+    def rebuildable(
+        self, writes: Mapping[str, Mapping[str, NodeWrites]], layouts: Mapping[str, Collection[StreamLayout]],
+    ) -> dict[str, bool]:
+        """For each paged KV cache in ``writes``, whether a drop here can free a request's pages there: every
+        node that writes the request's ``layouts`` in it can write again all that the node writes. A node that
+        writes nothing for the request isn't asked.
+
+        A drop takes every cache of its node, so a node is judged by what it writes in all of them."""
+        written: dict[str, list[StreamLayout]] = defaultdict(list)
+        writers: dict[str, list[str]] = defaultdict(list)
+        for key, nodes in writes.items():
+            for node, what in nodes.items():
+                laid_out = [layout for layout in layouts.get(key, ()) if what.writes(layout)]
+                if laid_out:
+                    written[node] += laid_out
+                    writers[key].append(node)
+        refused = {node for node, laid_out in written.items() if not self.can_rebuild(node, laid_out)}
+        return {key: refused.isdisjoint(writers[key]) for key in writes}
 
     def keep_prompts(
         self, node: str, graph_walk: str, request_walks: Mapping[int, str],

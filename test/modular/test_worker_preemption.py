@@ -262,7 +262,7 @@ def test_preemptions_after_metrics_start_are_reported():
 def test_a_pool_reserves_growth_only_for_the_loops_its_worker_runs(walks, loops):
     kv = _pool()
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
-    _worker(kv)._set_local_loops(model, walks)
+    _worker(kv)._set_kv_writes(model, walks)
     assert kv.local_loops == loops, "a guaranteed request would reserve growth its worker never runs"
 
 
