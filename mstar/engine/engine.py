@@ -42,6 +42,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
+from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
@@ -583,6 +584,7 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
+        self.host_allowance = StepAllowance()
 
     def load_model(
         self,
@@ -643,6 +645,7 @@ class Engine:
                     max_rows_in_combined=self._max_rows_in_combined(
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
+                    host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
                 ),
             )
@@ -1373,6 +1376,7 @@ class Engine:
     def after_output_copy(self, batch: ExecutingBatch) -> None:
         if batch.committed is not None:
             self._runner.after_output_copy(batch.committed)
+        self.host_allowance.refill()
 
     def step_finished(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],

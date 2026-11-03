@@ -761,6 +761,7 @@ class Worker:
         self._rebuilds = Rebuilds(
             policies, graphs,
             HostPool(host_mb << 20, self.device) if host_mb and policies else None, self._side_stream,
+            self.engine_manager.engine.host_allowance,
         )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
@@ -3837,6 +3838,7 @@ class Worker:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 

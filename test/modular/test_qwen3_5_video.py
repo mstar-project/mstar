@@ -912,6 +912,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     )
     w._rebuilds.keep_prompts(prefilled)
     w._rebuilds.keep_copies(prefilled)
+    w._rebuilds.flush()
     # the samples before 9 are in the KV, and 9 is the next decode step's input
     w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])
     eng.dropped.append(R)

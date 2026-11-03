@@ -65,15 +65,19 @@ class HostPool:
             start = self._free.pop(i).offset
         self._free.insert(i, HostSlice(start, end - start))
 
+    def view(self, into: HostSlice, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
+        """The start of ``into`` as a tensor of ``dtype`` and ``shape``."""
+        nbytes = shape.numel() * dtype.itemsize
+        assert nbytes <= into.nbytes, f"a copy of {nbytes} bytes doesn't fit the {into.nbytes} bytes it was given"
+        return self._memory[into.offset:into.offset + nbytes].view(dtype).view(shape)
+
     def copy_out(
         self, src: torch.Tensor, into: HostSlice, after: torch.Event | None, dtype: torch.dtype | None = None,
     ) -> HostCopy:
         """Copy ``src``, in ``dtype`` when given, to the start of ``into`` once ``after`` (the step that wrote it)
         completes."""
         dtype = src.dtype if dtype is None else dtype
-        nbytes = src.numel() * dtype.itemsize
-        assert nbytes <= into.nbytes, f"a copy of {nbytes} bytes doesn't fit the {into.nbytes} bytes it was given"
-        view = self._memory[into.offset:into.offset + nbytes].view(dtype).view(src.shape)
+        view = self.view(into, dtype, src.shape)
         if after is None:
             view.copy_(src)
             return HostCopy(view, None)

@@ -299,6 +299,7 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_
     step = _vision_step((R, A, B), {A: DECODE}, completion_event=None)
 
     rebuilds.keep_copies(step)
+    rebuilds.flush()
 
     copies = rebuilds._kept[NODE][R].copies
     assert list(copies.inputs) == ["embeds"] and copies.inputs["embeds"][0].tolist() == [R, R], (
@@ -329,6 +330,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     }
     rebuilds.keep_prompts(step)
     rebuilds.keep_copies(step)
+    rebuilds.flush()
 
     assert rebuilds._droppable[NODE][R].nbytes == 24 + 32, "the sentinels' room would stay taken for the request's life"
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
@@ -354,8 +356,11 @@ def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_m
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     side = torch.cuda.Stream()
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), side_stream=lambda: side)
-    rebuilds._kept[NODE][R] = _media([1], 5)
+    pool = HostPool(1 << 25, torch.device("cuda"))
+    # the pool's copies run on ``side``, so a busy ``side`` holds them back
+    pool._stream = side
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, side_stream=lambda: side)
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), pool.take(1 << 24)
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
@@ -368,6 +373,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     with side:
         torch.cuda._sleep(1 << 30)
     rebuilds.keep_copies(step)
+    rebuilds.flush()
 
     assert "haven't landed" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
         "the request could be dropped before its copy"

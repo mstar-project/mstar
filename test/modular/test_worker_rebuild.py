@@ -195,6 +195,8 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
     with pytest.raises(_ReachedRoutingError):
         w._postprocess_batch(pending, outputs)
+    # what the worker does once the step's outputs are sent
+    w._rebuilds.flush()
 
     assert w._rebuilds._kept[node][1].copies.inputs["embeds"][0].tolist() == embeds[1].tolist(), (
         "a rebuild would need the encoder to run again"
