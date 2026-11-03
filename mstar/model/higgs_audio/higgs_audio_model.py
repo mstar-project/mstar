@@ -126,9 +126,9 @@ class HiggsAudioModel(Model):
     def get_lora_specs(self) -> list[LoraSpec]:
         """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
         head (one row per request: the last token's), placed as the weight loader places
-        the checkpoint's own tensors. The embedding takes none: ``prefill_text`` embeds in
-        ``prepare_inputs``, outside the step. Adapters saved on a ``Qwen3ForCausalLM``
-        layout (``model.layers.*``) are read as the flat checkpoint's."""
+        the checkpoint's own tensors. The embedding takes none: ``prefill_audio`` embeds
+        its ChatML text in ``prepare_inputs``, outside the step. Adapters saved on a
+        ``Qwen3ForCausalLM`` layout (``model.layers.*``) are read as the flat checkpoint's."""
         from mstar.engine.resources.lora import LORA_RESOURCE_KEY
         from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
         from mstar.model.higgs_audio.components.llm import HiggsAudioLLM

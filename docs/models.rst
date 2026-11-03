@@ -288,10 +288,11 @@ Not yet: Whisper (its encoder node plans no step rows, and the decoder's cross-a
 K/V run over encoder rows, so the usual ``q_proj`` / ``v_proj`` adapters cannot be served
 whole), BAGEL and Cosmos3 (mixture-of-transformers weights chosen per row inside one
 forward, and guidance branches run as separate forwards), π0.5 (openpi's adapters are
-not PEFT), Nemotron VoiceChat (not yet validated), Fish Audio S2-Pro (declares no LoRA
-specs yet), and the diffusion and flow models
-(FLUX.2 [klein] merges a LoRA into its weights at load; the rest take none), Kokoro,
-Omnilingual ASR, OmniVoice and V-JEPA 2.
+not PEFT), FLUX.2 [klein] (merges a LoRA into its weights at load, not per request), and
+every other family, which declares no LoRA specs yet: Canary, Canary-Qwen, Command A+,
+CosyVoice3, Fish Audio S2-Pro, GLM-5.2, Kokoro, LingBot-World, LTX-2.5, Nemotron
+VoiceChat, Omnilingual ASR, OmniVoice, Parakeet and Nemotron ASR, Qwen3-ASR, V-JEPA 2,
+VoxCPM2, Wan2.2, Waypoint and Z-Image.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~
@@ -553,6 +554,7 @@ supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
+
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes
 from the ``adapter_config.json`` beside it). The OpenAI ``model`` field picks one,
@@ -645,6 +647,7 @@ config has one, so add the line to that size's serving config)::
 Under TP the LLM's targets split as its linears do (the 27B's single K/V head per rank
 at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
 on one GPU in every shipped config.
+
 LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
 block).
 

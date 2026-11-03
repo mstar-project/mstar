@@ -1107,17 +1107,17 @@ weights root. Orpheus is the reference (``OrpheusModel.get_lora_specs``):
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
 
    def get_lora_specs(self) -> list[LoraSpec]:
        # the module the node's weight loader fills, at one rank, on the meta device
-       with torch.device("meta"):
-           root = OrpheusForCausalLM(self.config, comm_group=CommGroup.trivial())
+       root = meta_root(lambda group: OrpheusForCausalLM(self.config, comm_group=group))
        return [module_lora_spec(
            root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"},
-           root_path="language_model",    # the root's attribute path in the node submodule
-           rows={"lm_head": PER_SEGMENT},  # rows that are not the step's tokens
-           embeddings=True,                # every embedding call is in the forward
+           root_path="language_model",      # the root's attribute path in the node submodule
+           adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
+           rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
+           embeddings=True,                  # every embedding call is in the forward
        )]
 
 The weights root states how the checkpoint lands on it once
