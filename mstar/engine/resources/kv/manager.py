@@ -2649,10 +2649,11 @@ class KVManager(AttentionResource):
         )
 
     def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple[tuple, tuple]:
-        """(segments, bucket), and the epochs a plan under that key holds for."""
+        """(segments, bucket, eager_write), and the epochs a plan under that key
+        holds for: an eager-write plan is never staged, so it isn't another's."""
         lease = ctx.slot_lease
         return (
-            (tuple(step.segments), lease.bucket if lease is not None else None),
+            (tuple(step.segments), lease.bucket if lease is not None else None, step.eager_write),
             (self._plan_epoch, self._readonly_epoch),
         )
 
@@ -2672,7 +2673,7 @@ class KVManager(AttentionResource):
                     )
         else:
             for g, outputs in enumerate(res.groups):
-                self._setup_plan_states(outputs, ctx, lease, g)
+                self._setup_plan_states(outputs, ctx, lease, g, eager_write=step.eager_write)
         self._mark_preplanned(step, ctx, res)
         return res
 
