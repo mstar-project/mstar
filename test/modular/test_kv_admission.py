@@ -230,7 +230,7 @@ def test_a_filed_page_tries_no_request_whose_output_cant_fit_beside_the_head(mon
 
 def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
     kv = _passing(free=3, head=5)
-    # its own three pages past what "r" holds don't fit beside its output, which would
+    # "p"'s output fits, but not beside its three own pages past what "r" holds
     _short_chat(kv, "p", list(range(7000, 7000 + 3 * PAGE_SIZE)))
     assert not _ready(kv, "p")
     measured = []

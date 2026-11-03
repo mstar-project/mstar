@@ -255,8 +255,8 @@ class Admission:
         return self._reserve(rid, published_of, passing) if passing else None
 
     def _blocked(self) -> set[str]:
-        """The requests first in a queue whose resource they didn't fit and that hasn't grown since, which
-        can't start now."""
+        """The requests that can't start now: each is first in a queue whose resource it didn't fit, and
+        that resource hasn't grown since."""
         return {self._queues[key][0] for key, mark in self._short.items() if not self._resources[key].grew_since(mark)}
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:

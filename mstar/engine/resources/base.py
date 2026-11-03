@@ -323,9 +323,9 @@ class Resource(ABC):
     def reserve_past(
         self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
     ) -> object | None:
-        """`reserve` for ``rid`` behind the first request in this resource's queue, which can't start:
-        take what ``rid`` asked for while leaving that request what it needs, or return a mark. The
-        base refuses, so a resource that doesn't override it keeps its queue in order."""
+        """`reserve` for ``rid`` ahead of an earlier request that can't start: take what ``rid`` asked
+        for while leaving that request what it needs, or return a mark. The base refuses, so a
+        resource that doesn't override it admits in order."""
         return 0
 
     def unreserve(self, rid: str) -> None:
