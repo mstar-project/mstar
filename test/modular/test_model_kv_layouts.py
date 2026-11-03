@@ -474,21 +474,38 @@ def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
-@pytest.mark.parametrize("talker_max_tokens", [0, 1, 2, 64])
-def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
+@pytest.mark.parametrize("talker_max_tokens", [2, 3, 64])
+def test_qwen3_omni_talker_cap_alone_gives_the_frame_budget(talker_max_tokens):
+    """talker_last_prefill streams the first frame and each decode iteration
+    one more. The loop's cap ends decode, and the stop check looks only for
+    codec_eos."""
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
 
     cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), talker_max_output_tokens=talker_max_tokens)
 
-    assert cap["talker_decode_loop"] == _stops_after(
+    assert 1 + cap["talker_decode_loop"] == talker_max_tokens
+    assert _stops_after(
         lambda *args: TalkerSubmodule.check_stop(_omni_submodule(), *args), "talker_decode_loop", "talker_decode",
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
-    ), "the cap and the stop check end decode on different iterations"
-    if talker_max_tokens > 1:
-        # talker_last_prefill streams the first frame to Code2Wav
-        assert 1 + cap["talker_decode_loop"] == talker_max_tokens
+    ) == 2048, "the stop check ended decode on a frame that is not codec_eos"
+
+
+def test_qwen3_omni_talker_last_prefill_stops_no_loop():
+    """The last prefill's frame comes before talker_decode_loop exists, so a
+    stop there would name a loop its walk doesn't have."""
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+
+    info = ForwardPassInfoWrapper(
+        info=CurrentForwardPassInfo(
+            request_id="r", graph_walk="talker_last_prefill", fwd_index=0, random_seed=0,
+            max_tokens=2048, step_metadata={"talker_max_tokens": 2},
+        ),
+        metadata=InputMetadata(),
+    )
+
+    assert not TalkerSubmodule.check_stop(_omni_submodule(), "r", info, {"layer0_codes": [torch.tensor([NOT_EOS])]})
 
 
 def _tiny_qwen3_tts_talker():
