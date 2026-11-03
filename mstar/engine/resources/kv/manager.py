@@ -1633,18 +1633,11 @@ class KVManager(AttentionResource):
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
         # or reset/remove on another thread (see `_lock`)
         with self._lock:
-            # Idempotent: the conductor sends one NewRequest per partition, all
-            # carrying the same rid, so a worker serving two partitions ingests
-            # twice. Replacing the streams here reset `stored_len` under a node
-            # that had already filled them, and the request's publish info then
-            # named more tokens than the stream held.
-            self._streams.setdefault(rid, {"main": self._new_stream()})
-            self._overrides.setdefault(rid, overrides)
-            for label, stream in self._streams[rid].items():
-                if stream.span_cursor is None:
-                    self._lay_out(rid, label, stream)
-                if stream.chain is None:
-                    self._seed_keys(rid, label, stream)
+            stream = self._new_stream()
+            self._streams[rid] = {"main": stream}
+            self._overrides[rid] = overrides
+            self._lay_out(rid, "main", stream)
+            self._seed_keys(rid, "main", stream)
 
     def _lay_out(self, rid: str, label: str, stream: CacheStream) -> None:
         """A label the request doesn't open gets a footprint of 0, so the pages a batch writes

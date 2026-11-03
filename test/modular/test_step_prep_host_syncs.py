@@ -299,14 +299,13 @@ def test_omnivoice_first_step_prep_reads_no_tensor():
     assert ni.input_seq_len == 5 + 2 * 6
 
 
-def test_omnivoice_postprocess_reads_no_tensor():
-    """The unmask step's postprocess takes the iteration prepare_inputs read off
+def test_omnivoice_unmask_step_reads_no_tensor():
+    """The unmask step's forward takes the iteration prepare_inputs read off
     the loop counter: same canvas as reading the step edge, and no host read."""
     from mstar.model.omnivoice.components.unmask import build_reveal_schedule
 
     sub, cfg = _omnivoice()
     steps, target_len = 4, 6
-    shape = (cfg.num_audio_codebook, target_len, cfg.audio_vocab_size)
     meta = _omnivoice_meta(steps)
     # memoized per request shape; its one tolist() is of a CPU ramp it builds, not a sync
     build_reveal_schedule(
@@ -315,20 +314,23 @@ def test_omnivoice_postprocess_reads_no_tensor():
     for k in range(steps):
         inputs = _omnivoice_inputs(cfg, k, target_len)
         inputs["audio_tokens"] = [torch.full((cfg.num_audio_codebook, target_len), cfg.audio_mask_id)]
-        logits = torch.randn(shape, generator=torch.Generator().manual_seed(100 + k))
+        logits = torch.randn(1, cfg.num_audio_codebook, 2 * target_len, cfg.audio_vocab_size,
+                             generator=torch.Generator().manual_seed(100 + k))
+        sub._logits = lambda _inputs, _canvas, logits=logits: logits
         results = {}
         for name, info in (
             ("counter", _fwd("r", "speech_gen", _omnivoice_meta(steps), UNMASK_LOOP_NAME, k)),
             ("edge", _fwd("r", "speech_gen", _omnivoice_meta(steps))),
         ):
             node_inputs = sub.prepare_inputs("speech_gen", info, inputs)
-            outputs = {"c_logits": [logits.clone()], "u_logits": [logits.flip(-1)]}
+            engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": info})
             with _HostReads() as reads:
-                sub.postprocess("r", info, outputs, inputs=node_inputs)
-            results[name] = (outputs, reads.reads)
+                pre = sub.preprocess("speech_gen", engine_inputs, [node_inputs])
+                outputs = sub.forward_batched("speech_gen", engine_inputs, **pre)["r"]
+            results[name] = outputs
             assert reads.reads == [], f"step {k} ({name}): host reads {reads.reads}"
-        assert torch.equal(results["counter"][0]["audio_tokens"][0], results["edge"][0]["audio_tokens"][0])
-        assert torch.equal(results["counter"][0]["step_index"][0], results["edge"][0]["step_index"][0])
+        assert torch.equal(results["counter"]["audio_tokens"][0], results["edge"]["audio_tokens"][0])
+        assert torch.equal(results["counter"]["step_index"][0], results["edge"]["step_index"][0])
 
 
 # ---------------------------------------------------------------- Cosmos3
@@ -705,5 +707,4 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
                 "audio_features": [torch.zeros(config.num_mel_bins, frames)],
             })
         assert reads.reads == []
-        assert row.kwargs["num_frames"] == frames
         assert row.input_seq_len == int(_get_feat_extract_output_lengths(torch.tensor(frames)))

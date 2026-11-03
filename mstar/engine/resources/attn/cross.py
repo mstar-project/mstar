@@ -9,7 +9,6 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
-    WorkspacePool,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -18,6 +17,7 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
     refuse_context_only,
 )
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -137,7 +137,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             backend=backend
         )
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
 
     def resident_refusal(self) -> str | None:
         if self._query_kv_cache_name == self._kv_cache_name:
@@ -419,7 +419,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
-    def _decode_wrapper(self, workspace: torch.Tensor, **kwargs) -> FlashInferDecodeWrapper:
+    def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
         kv = self._wrapper_kv_kwargs
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,
