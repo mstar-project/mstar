@@ -57,13 +57,18 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
-from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
+from mstar.model.qwen3_tts.components.conv_stack import (
+    ChannelsLastConvStack,
+    causal_receptive_field_frames,
+    channels_last_applies,
+    conv_stack,
+)
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
     Qwen3TTSMelFrontEnd,
     Qwen3TTSSpeakerEncoder,
 )
-from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel, blackwell_path_measured
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -171,6 +176,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
         self._prefill_ids: dict[tuple[int, ...], torch.Tensor] = {}
+        # Decided once, on the device the weights loaded to.
+        code_predictor.two_token_first_pass = blackwell_path_measured(self.get_device())
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -924,6 +931,9 @@ class CodecSubmodule(ARNodeSubmodule):
     # stateless engine, stated directly now that the v1 engine reads these.
     disable_torch_compile = True
     disable_autocast = True
+    # Nothing in the Talker reads the audio, so its decode steps need not queue
+    # behind a window; the serving config's ``side_stream`` turns it on
+    side_stream_walks = frozenset({"codec_chunk"})
 
     # The conv stack decodes at most chunk + conv_context frames (35 for the
     # 12 Hz decoder, 2.8 s of audio) whatever the window, so its activations stay small
@@ -963,6 +973,11 @@ class CodecSubmodule(ARNodeSubmodule):
         fuse_snake_activations(decoder)
         self.conv_context = self._split_conv_context(decoder, config) if config.codec.split_decode else None
         self.split_decode = self.conv_context is not None
+        self.channels_last_stack = (
+            ChannelsLastConvStack(decoder)
+            if self.split_decode and channels_last_applies(next(decoder.parameters()).device)
+            else None
+        )
         self._conv_start_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
 
     @staticmethod
@@ -1104,9 +1119,12 @@ class CodecSubmodule(ARNodeSubmodule):
             # that out of its audio.
             index = (conv_start.view(-1, 1) + torch.arange(length, device=hidden.device)).clamp_(max=width - 1)
             hidden = hidden.gather(2, index.unsqueeze(1).expand(-1, hidden.shape[1], -1))
-            for module in conv_stack(decoder):
-                hidden = module(hidden)
-            wav = hidden
+            if self.channels_last_stack is not None:
+                wav = self.channels_last_stack(hidden)
+            else:
+                wav = hidden
+                for module in conv_stack(decoder):
+                    wav = module(wav)
         return (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze(1)
 
     def forward(

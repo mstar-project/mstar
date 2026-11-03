@@ -826,6 +826,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+    # Walks whose steps may run beside the worker's main chain, on a second
+    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # the serving config sets ``side_stream: true``. For a stream-fed walk that
+    # no chain step waits on. Where the config asks, ``EngineManager.build``
+    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # worker, a device without streams, a node that also has chain walks or
+    # holds resources, and a side walk that is not the node's alone, is part
+    # of a combined walk, or has output spans or a stop check.
+    side_stream_walks: frozenset[str] = frozenset()
 
     # Float32 math for this node's forward, where the process default (TF32
     # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
@@ -1100,6 +1109,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         (the default) prepares row by row."""
         del graph_walk, has_loopback
         return None
+
+    def resident_walks(self) -> frozenset[str]:
+        """Walks whose captured steps may read their rows off the resident
+        tables (`mstar.engine.resources.resident`). A walk here runs, for each
+        resource, one stream that takes one token a row or one it only reads
+        (span 0), with no forks or retention, and its `preprocess` reads no
+        planned position or KV location: the forward's graph fills those in.
+        The engine still refuses if a resource can't."""
+        return frozenset()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs

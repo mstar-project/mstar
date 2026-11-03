@@ -1643,6 +1643,18 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
+A walk named in ``resident_walks()`` runs its captured steps off per-request tables on the
+device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``). The
+walk must declare, for each resource, one stream that takes one token per row, or one
+it only reads at span 0 (a cross-attention context), with no forks, retention or sink,
+and its ``preprocess`` must read no planned position or KV location, because the
+captured graph fills those in first. Each KV pool of the node keeps its own block table
+and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
+turns it on only if every resource of the node can (``Resource.resident_refusal``) and
+the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
+otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+stale, so the first resident step after them writes it.
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 
@@ -1954,6 +1966,21 @@ which is what the engine reads, and resources of one node must agree on a walk's
 ``prefill_walks``. The engine then orders that walk's steps with the ``prefill_walks``
 rows last, so the kernels read the decode rows as the step's first tokens, in place. Every
 other walk of the combined walk must be one token per row.
+
+**Steps beside the chain.** A worker's main loop runs one chain of steps, and any step on it
+costs a pass of the loop and holds the next one behind its kernels. A node that shares a
+worker with a heavier one can set ``side_stream_walks`` on its submodule to the walks that
+may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
+on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
+makes it yield, runs on a second stream, and the windows that come ready while it runs
+batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
+walk that nothing on the chain reads, such as a codec. Where the config asks,
+``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
+speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+alone on its worker, a device without streams, a node with chain walks or resources, and a
+side walk that is not the node's alone, sits in a combined walk, or has output spans or a
+stop check. A config without the field keeps the node on the chain, whatever it declares.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
@@ -2596,6 +2623,21 @@ To support it in a model:
 
 The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
 a node built from it stays TP-only.
+
+Tuned kernel configs
+~~~~~~~~~~~~~~~~~~~~
+
+Launch configs that depend on the GPU and the shapes, such as the fused MoE's tiles, are data,
+not code. Each kernel op (``mstar/kernels``) names the dimensions its configs are keyed by, and
+its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<op>/``. A model
+on a shared component gets them without code of its own: the component looks its shape up once
+per process and keeps the default config where no table has it, and the server logs the sweep
+command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+
+``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
+each against a reference output, and writes the winners with where they were measured.
+``--out DIR`` with ``MSTAR_KERNEL_TABLES=DIR`` serves a sweep before it is committed;
+``benchmark/kernels/README.md`` has the workflow and how to add an op.
 
 Worked example: Orpheus
 -----------------------

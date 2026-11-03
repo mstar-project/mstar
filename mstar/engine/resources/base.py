@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.resident_hooks import ResidentHooks
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
@@ -117,7 +118,7 @@ class KeyedWalks(NamedTuple):
     growth: tuple[str, ...] = ()
 
 
-class Resource(ABC):
+class Resource(ResidentHooks, ABC):
     @classmethod
     @abstractmethod
     def build(

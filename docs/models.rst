@@ -218,10 +218,10 @@ Notes
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
-- Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
-  from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
-  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
-  writes a table for the local GPU.
+- Models on the fused MoE kernel (Qwen3-Omni, Command A+) take their tiles from the
+  ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
+  the expert shape, and default tiles otherwise. The server logs the sweep command
+  for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
@@ -772,12 +772,22 @@ Qwen3-TTS notes
   It is the same component as Qwen3-Omni's code predictor
   (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
   the depth sequence opens with the Talker hidden state in a one-token pass
+  (on Blackwell, Qwen3-TTS only, one pass over it and group 0's embedding;
+  it was measured only there, ``blackwell_path_measured``)
   and takes one token per group after it, each layer's q/k norm, RoPE and KV write
   run in one launch and attention in ``cp_attention``, and the frame's 16 codec
   embeddings are summed in one launch per group. Each Talker keeps the sum it
   had before the two shared the component: Qwen3-TTS accumulates in the model
   dtype, rounding after every add (the reference sums in fp32 and rounds once),
   and Qwen3-Omni in fp32, rounded once.
+- The colocated configs run the Codec's windows beside the Talker's chain on a
+  second stream (``side_stream: true`` on the Codec's node group, see
+  :doc:`serving`), so decode neither takes turns with them nor queues behind
+  their kernels. On a B300, 1.7B: +16% audio-s/s at c=8 and +27% at c=32, with
+  lower ITL at both, but -6% at c=1, and at c=32 first audio is about 40 ms
+  later at p50 (p95 a little earlier). Drop the field from a deployment that
+  cares more about those. The Codec's graphs capture on a stream of their own,
+  since a prefill overlapping them shares state otherwise.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
@@ -785,11 +795,18 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
-- The codec decoder runs in float32 by default, reproducing the reference
-  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
-  B300 that is slower, not faster: cuDNN's heuristics run several of its
-  convs on a kernel without tensor cores, so measure before switching.
+- The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
+  KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
+  the position resource, which declares the checkpoint's.
+- The codec decoder runs in float32 by default. On CUDA its conv stack runs
+  channels-last (``ChannelsLastConvStack``), a fifth to a third off a captured
+  decode on a B300 at 80+ dB PSNR against the reference decoder; off CUDA it
+  runs the reference stack, bit for bit. ``model_kwargs: {codec_dtype:
+  bfloat16}`` in the deployment YAML selects a bf16 codec (the Talker is bf16
+  either way). Channels-last on a B300, bf16 is another 7-17% faster but
+  further off: 57 dB median and 36 dB worst PSNR against fp32 over 200
+  sentences. Off that stack it is slower, not faster, because cuDNN's
+  heuristics run several of its convs on a kernel without tensor cores.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
