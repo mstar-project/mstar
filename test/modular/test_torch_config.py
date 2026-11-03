@@ -1,9 +1,13 @@
+import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 import torch
 
-from mstar.engine import recompile_limit
+from mstar.engine import _default_compile_caches, recompile_limit
 from mstar.worker.worker import Worker
 
 
@@ -28,3 +32,54 @@ def test_recompile_limit_env(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("MSTAR_RECOMPILE_LIMIT", raw)
     assert recompile_limit() == expected
+
+
+# the API server's process, the module a spawned worker imports to find its target, and
+# `python -m mstar.integrations.dynamo`
+@pytest.mark.parametrize(
+    "entry", ["mstar.api_server.entrypoint", "mstar.conductor.conductor", "mstar.integrations.dynamo.worker"],
+)
+def test_compile_cache_defaults_under_the_user_cache(tmp_path, entry):
+    """torch writes its /tmp default into the environment when ``torch._dynamo``
+    is first imported, so mstar's default has to land before any import does."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "XDG_CACHE_HOME")}
+    env["XDG_CACHE_HOME"] = str(tmp_path)
+    code = f"import os, {entry}; print(os.environ['TORCHINDUCTOR_CACHE_DIR'], os.environ['TRITON_CACHE_DIR'])"
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300, check=True,
+    ).stdout.strip().splitlines()[-1]
+    inductor = tmp_path / "mstar" / "torchinductor"
+    assert out == f"{inductor} {inductor / 'triton'}"
+
+
+def _no_home(cls):
+    raise RuntimeError("Could not determine home directory.")
+
+
+@pytest.mark.parametrize("inductor, xdg, has_home", [
+    (None, "relative/cache", True),  # a relative XDG_CACHE_HOME is ignored, as the XDG spec says
+    (None, None, False),             # no home keeps torch's and Triton's defaults
+    ("exported", None, True),        # Triton's kernels follow an exported Inductor cache
+])
+def test_compile_cache_fallbacks(tmp_path, monkeypatch, inductor, xdg, has_home):
+    # a copy, so what _default_compile_caches writes can't outlive the test
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    if inductor is None:
+        monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / inductor))
+    if xdg is None:
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    else:
+        monkeypatch.setenv("XDG_CACHE_HOME", xdg)
+    if has_home:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    else:
+        monkeypatch.setattr(Path, "home", classmethod(_no_home))
+    _default_compile_caches()
+    want = tmp_path / (inductor or "home/.cache/mstar/torchinductor") if has_home else None
+    got = (os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"))
+    assert got == ((str(want), str(want / "triton")) if want else (None, None))

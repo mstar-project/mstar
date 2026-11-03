@@ -185,7 +185,7 @@ def test_the_generate_catch_all_answers_with_an_error_id(monkeypatch, caplog):
 def test_the_generate_catch_all_keeps_a_deliberate_refusal(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", _FailingServer(ValueError("Unsupported modality: 'smell'")))
     response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
-    assert response.status_code == 500
+    assert response.status_code == 400
     assert response.json() == {"detail": "Unsupported modality: 'smell'"}
 
 

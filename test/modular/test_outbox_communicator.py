@@ -11,10 +11,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput  # noqa: E402
 from mstar.communication.codec import default_codec  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
+from mstar.communication.event import EventWakeup  # noqa: E402
 from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
@@ -116,9 +117,10 @@ def _request(request_id, **model_kwargs):
 
 def _thread(peer, tensor_manager=None):
     queues = {name: queue.Queue() for name in (
-        "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
+        "in_queue", "result_tensor_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
+    queues["out_queue"], queues["profile_queue"] = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     out = OutboxCommunicator(peer)
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(), communicator=out,
@@ -232,7 +234,8 @@ def _factory(monkeypatch, choice, *, has_try_send):
     if has_try_send:
         _Zmq.try_send = lambda self, peer_id, data: True
     version = communicator.EXPECTED_MSTAR_RUST_VERSION if has_try_send else "0.1.0"
-    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(ZmqCommunicator=_Zmq, __version__=version))
+    monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(
+        ZmqCommunicator=_Zmq, __version__=version, __file__="mstar_rust.so"))
     monkeypatch.setattr(rust_communicator, "RustZMQCommunicator", lambda *args, **kwargs: "rust")
     monkeypatch.setattr(communicator, "ZMQCommunicator", lambda *args, **kwargs: "pyzmq")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", choice)

@@ -18,6 +18,42 @@ from mstar.engine.resources.step import ResourceStep
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
+# The sampler's ``step_host_rows`` entry: each row's sampled-token log-prob,
+# NaN in a row that did not ask for one.
+SAMPLED_LOGPROB = "sampled_logprob"
+
+
+# knob -> (rule text, predicate); the one copy, also applied at the API by normalize_generation_kwargs
+REAL_KNOB_RULES = {
+    "temperature": (">= 0 (0 is greedy)", lambda v: v >= 0),
+    "top_p": ("in (0, 1] (1 is off; greedy is temperature 0)", lambda v: 0 < v <= 1),
+    "min_p": ("in [0, 1] (0 is off)", lambda v: 0 <= v <= 1),
+    "repetition_penalty": ("> 0 (1 is off)", lambda v: v > 0),
+}
+INT_KNOB_RULES = {
+    "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
+}
+BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "return_logprobs")
+
+
+def check_real_knob(key: str, value, rule: str, ok) -> None:
+    """Raise ``ValueError`` unless ``value`` is a finite number satisfying ``ok``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number {rule}; got {value!r}")
+    if not math.isfinite(value) or not ok(value):
+        raise ValueError(f"{key} must be a finite number {rule}; got {value!r}")
+
+
+def check_int_knob(key: str, value, rule: str, ok) -> None:
+    """Raise ``ValueError`` unless ``value`` is an integer satisfying ``ok``."""
+    if isinstance(value, bool) or not isinstance(value, int) or not ok(value):
+        raise ValueError(f"{key} must be an integer {rule}; got {value!r}")
+
+
+def check_bool_knob(key: str, value) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+
 
 @dataclass(frozen=True)
 class LoopbackState:
@@ -62,6 +98,24 @@ class SamplerSpec(NodeResourceSpec):
     min_tokens_stop_ids: tuple[int, ...] = ()
     # Allows ``top_p_first`` / ``top_p_min_keep``.
     enable_top_p_first: bool = False
+    # Allows ``return_logprobs``. The captured sampler then scores every step,
+    # asked or not, so a deployment turns it on in its ``resources:`` block.
+    enable_logprobs: bool = False
+    # Allows ``logprobs_mode: "processed"``; the captured sampler then also
+    # renorms every step's distribution again (CUDA only).
+    enable_processed_logprobs: bool = False
+
+    def apply_yaml_overrides(
+        self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
+    ) -> None:
+        if enable_logprobs is not None:
+            check_bool_knob("enable_logprobs", enable_logprobs)
+            self.enable_logprobs = enable_logprobs
+        if enable_processed_logprobs is not None:
+            check_bool_knob("enable_processed_logprobs", enable_processed_logprobs)
+            self.enable_processed_logprobs = enable_processed_logprobs
+        if self.enable_processed_logprobs and not self.enable_logprobs:
+            raise ValueError("enable_processed_logprobs needs enable_logprobs")
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -97,6 +151,11 @@ class SamplingReqConfig(ResourceReqConfig):
     # A node whose step declares no ``prefill_tracked_tokens`` only ever has the
     # generated ones to count.
     penalize_prompt: bool = True
+    # Report each sampled token's log-prob. "raw" scores softmax(logits / T)
+    # before the penalty and filters, at T = 1 for greedy requests;
+    # "processed", the distribution it was drawn from (0 for greedy).
+    return_logprobs: bool = False
+    logprobs_mode: str = "raw"
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(
@@ -113,23 +172,26 @@ class SamplingReqConfig(ResourceReqConfig):
     def validate(self, spec: "SamplerSpec | None" = None) -> None:
         """Raise ``ValueError`` on a value outside the contract, or one ``spec``'s
         node cannot honour. None means the sampler's default."""
-        _check_real("temperature", self.temperature, lambda v: v >= 0, ">= 0")
-        _check_real("top_p", self.top_p, lambda v: 0 < v <= 1, "in (0, 1]")
-        _check_real("min_p", self.min_p, lambda v: 0 <= v <= 1, "in [0, 1]")
-        _check_real("repetition_penalty", self.repetition_penalty, lambda v: v > 0, "> 0")
-        if self.top_k is not None and (
-            isinstance(self.top_k, bool) or not isinstance(self.top_k, int) or self.top_k < 0
-        ):
-            raise ValueError(f"top_k must be an integer >= 0 (0 disables it); got {self.top_k!r}")
-        for name in ("ignore_eos", "penalize_prompt"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean; got {value!r}")
+        for name, (rule, ok) in REAL_KNOB_RULES.items():
+            if (value := getattr(self, name)) is not None:
+                check_real_knob(name, value, rule, ok)
+        for name, (rule, ok) in INT_KNOB_RULES.items():
+            if (value := getattr(self, name)) is not None:
+                check_int_knob(name, value, rule, ok)
+        for name in BOOL_KNOBS:
+            if (value := getattr(self, name)) is not None:
+                check_bool_knob(name, value)
+        if self.logprobs_mode not in (None, "raw", "processed"):
+            raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
+        if self.return_logprobs and not spec.enable_logprobs:
+            raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
+        if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:
+            raise ValueError("this deployment does not report processed logprobs; use logprobs_mode 'raw'")
         # a windowed penalty counts the generation history, not the seen-token mask
         windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
         if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
@@ -148,16 +210,6 @@ def derive_seed(seed: int, stream: str) -> int:
     return int.from_bytes(digest, "little") & (2**63 - 1)
 
 
-def _check_real(name: str, value, ok, rule: str) -> None:
-    """Raise ``ValueError`` unless ``value`` is None or a finite number satisfying ``ok``."""
-    if value is None:
-        return
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a number; got {value!r}")
-    if not math.isfinite(value) or not ok(value):
-        raise ValueError(f"{name} must be a finite number {rule}; got {value!r}")
-
-
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
@@ -172,3 +224,4 @@ class SamplerStep(ResourceStep):
     # The spec's loop-back states this step's forward stores
     # (``store_loopback_state``); commit persists them by slot.
     loopback_writes: frozenset[str] = frozenset()
+

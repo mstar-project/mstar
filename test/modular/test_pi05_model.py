@@ -69,7 +69,7 @@ def _pi05_cpu_threads():
 )
 def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
     from mstar.engine.accelerator_graph_runner import autocast_scope
-    from mstar.engine.engine import Engine
+    from mstar.engine.node_dtype import resolve_node_dtype
 
     class Encoder(torch.nn.Module):
         def __init__(self):
@@ -88,12 +88,11 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(range(batch_size)), per_request_info={},
         )
-        engine = Engine(graph_runtime=None, autocast_dtype=torch.bfloat16)
 
         with autocast_scope(None, "cpu"):
             reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
         with autocast_scope(torch.bfloat16, "cpu"):
-            with autocast_scope(engine._autocast_dtype_for(submodule), "cpu"):
+            with autocast_scope(resolve_node_dtype(submodule, torch.bfloat16), "cpu"):
                 if batched:
                     outputs = submodule.forward_batched("prefill", engine_inputs, images)
                     actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])

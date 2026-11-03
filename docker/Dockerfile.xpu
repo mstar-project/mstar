@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
 RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
-| sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version
+| sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
 ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} ${VIRTUAL_ENV}
@@ -79,6 +79,11 @@ WORKDIR /mstar-workspace
 ARG MSTAR_REPO=https://github.com/mstar-project/mstar.git
 ARG MSTAR_REF=main
 RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" ./mstar
+# The toolchain the checkout pins (rust-toolchain.toml), also as the default so
+# cargo works outside the clone.
+RUN cd ./mstar && rustup toolchain install \
+    && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && cd / && rustc --version && cargo --version
 
 # uv selects the XPU index for PyTorch and TorchCodec in the single install below.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.

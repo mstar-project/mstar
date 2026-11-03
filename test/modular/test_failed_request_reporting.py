@@ -29,7 +29,7 @@ def _pending(rids, failed):
             per_request_info={rid: object() for rid in rids},
             failed_requests=dict(failed),
             final_stream_rids=set(rids),
-            stream_partition_done_rids=set(rids),
+            partition_done_rids=set(rids),
         ),
     )
 
@@ -50,7 +50,7 @@ def test_a_handled_failure_leaves_the_batch():
     assert "r0" not in pending.batch.request_to_worker_graph
     assert "r0" not in pending.node_batch.per_request_info
     assert pending.node_batch.final_stream_rids == {"r1"}
-    assert pending.node_batch.stream_partition_done_rids == {"r1"}
+    assert pending.node_batch.partition_done_rids == {"r1"}
 
 
 def test_a_handled_failure_is_cleared_so_it_is_not_reported_again():

@@ -229,6 +229,15 @@ def waypoint_cases(size, smoke=False):
 WAYPOINT_PAIR = (("image_actions_to_frames_left", "image_actions_to_frames_right"),)
 
 
+def lingbot_rollout():
+    """Two chunks (13 + 16 frames) moving forward 0.05 per frame from a 480x832 scene, which the reference's
+    size rule outputs at 464x832."""
+    poses = [[[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0.05 * i], [0, 0, 0, 1.0]] for i in range(29)]
+    return generate("A quiet street at dusk, the camera moving slowly forward.", "video_frame",
+                    {"camera_poses": poses, "intrinsics": [500.0, 500.0, 416.0, 240.0], "num_frames": 29,
+                     "seed": 7}, lambda: ("scene.png", scene_png(832, 480)), streaming=True)
+
+
 def vjepa2_ac_case(name, scale):
     actions = [[scale * np.sin(i / 4 + j) for j in range(7)] for i in range(32)]
     states = [[0.1 * j for j in range(7)] for _ in range(32)]
@@ -340,6 +349,10 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
               must_differ=WAYPOINT_PAIR, requires=("taehv",), peak_vram_gb=18.1),
     ModelSpec("waypoint_360p", "configs/waypoint_360p.yaml", waypoint_cases((640, 360), smoke=True), "world",
               must_differ=WAYPOINT_PAIR, requires=("taehv",), peak_vram_gb=15.1),
+    ModelSpec("lingbot_world_1_3b", "configs/lingbot_world_1_3b.yaml", (
+        Case("image_camera_to_frames", "generate_stream", lingbot_rollout(),
+             Expect("frames", modality="video_frame", frames=29, size=(832, 464)), smoke=True),
+    ), "world", requires=("ftfy",)),
     ModelSpec("pi05", "configs/pi05.yaml", (
         Case("image_state_to_action", "generate", generate(
             "Pick up the red block", "action", {"robot_state": ROBOT_STATE, "seed": 7},

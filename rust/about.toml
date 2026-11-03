@@ -1,0 +1,77 @@
+# cargo-about config for the LICENSES-THIRD-PARTY-*.txt notices of the Rust
+# crates (and the C/C++ they vendor) compiled into the Linux wheels. The release
+# workflow runs it once per binary: on rust/ for the mstar_rust extension and on
+# rust/server for mstar-server, which share most crates but not pyo3's.
+# A crate under any license not listed here fails the wheel build.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+# mstar-rust and mstar-server are this project, covered by LICENSE; this skips
+# them because their Cargo.toml says `publish = false`.
+private = { ignore = true }
+workarounds = ["ring"]
+
+# The crate fields below cover only the Rust wrappers; these add the vendored
+# C/C++ sources that are compiled into the binaries. onig_sys and esaxx-rs are
+# only in rust/server's tree, so the rust/ run warns that they are absent.
+
+# libzmq 4.3.4: LGPL-3.0-or-later plus the static-linking exception appended to
+# its COPYING.LESSER ("SPECIAL EXCEPTION GRANTED BY COPYRIGHT HOLDERS"), and
+# the BSD-3-Clause SHA-1 it compiles. The exception is libzmq's own
+# Classpath-style text, which matches no SPDX exception id
+# (LGPL-3.0-linking-exception is different text), hence the AdditionRef. The
+# notice carries the whole COPYING.LESSER, exception included.
+[zeromq-src.clarify]
+license = "(MIT OR Apache-2.0) AND (LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception) AND BSD-3-Clause"
+[[zeromq-src.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+[[zeromq-src.clarify.files]]
+path = "vendor/COPYING.LESSER"
+license = "LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception"
+checksum = "83f32abe61ee58ffb1b007412c08415168c052501dbf56d7a47aaaac52b03ef6"
+[[zeromq-src.clarify.files]]
+path = "vendor/external/sha1/sha1.c"
+license = "BSD-3-Clause"
+checksum = "dfe129c5f0d705988c2d07cde42ce44772182e342773c76a0c386beaeeb0097e"
+end = "SUCH DAMAGE."
+
+# Oniguruma (BSD-2-Clause), the regex engine the tokenizers crate binds.
+[onig_sys.clarify]
+license = "MIT AND BSD-2-Clause"
+[[onig_sys.clarify.files]]
+path = "LICENSE.md"
+license = "MIT"
+checksum = "71f321038b088358004bee991635ac09e4c703bec467d3c30c06992c0595f189"
+[[onig_sys.clarify.files]]
+path = "oniguruma/COPYING"
+license = "BSD-2-Clause"
+checksum = "70ba5469ea0bab6e18a32d7009068f996503168d27be57747e08da34337ff26f"
+
+# esaxx (MIT), the C++ suffix-array code esaxx-rs compiles.
+[esaxx-rs.clarify]
+license = "Apache-2.0 AND MIT"
+[[esaxx-rs.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+[[esaxx-rs.clarify.files]]
+path = "src/esa.hxx"
+license = "MIT"
+checksum = "cdb4a78fc2d2738d8dd4af2e3b08531d858833822e2a2e968c353d3f40bdfe2d"
+end = "OTHER DEALINGS IN THE SOFTWARE."

@@ -37,7 +37,7 @@ torch.set_float32_matmul_precision("high")
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.components.camera import plucker_embedding  # noqa: E402
-from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel  # noqa: E402
+from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, first_frame_mask  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
@@ -163,7 +163,7 @@ def main():
     ref_video = torch.load(oracle / "video.pt")
     report: dict = {"oracle": meta, "float32_matmul_precision": torch.get_float32_matmul_precision()}
 
-    model = LingBotWorldModel()
+    model = LingBotWorldModel(**REFERENCE_MODEL_KWARGS)
     cfg = model.config
     cs = cfg.chunk_size
     poses = np.load(Path(args.example) / "poses.npy")

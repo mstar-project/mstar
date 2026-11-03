@@ -37,8 +37,9 @@ Edge checkpoints add the reasoner (the understanding tower served as a VLM):
 
 Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
     video_gen_ar - the denoise loop run window by window over a long clip.
-                 ``chained`` windows re-pin the previous window's tail as clean
-                 conditioning; ``kv`` windows attend block-causally over the
+                 ``chained`` windows pin the previous window's last frames,
+                 re-encoded as a clip of their own, as clean conditioning;
+                 ``kv`` windows attend block-causally over the
                  committed K/V of earlier windows (one commit iteration per
                  window appends the finished window's clean K/V; the pool's
                  retention policy releases frames past the context horizon at
@@ -88,6 +89,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -212,6 +214,8 @@ class Cosmos3Model(Model):
         # and the decoder submodule, so build it once. The transformer is
         # shared between the DiT and reasoner nodes likewise.
         self._vae = None
+        self._decoder_only_vaes: dict[str, torch.nn.Module] = {}
+        self._encode_vaes: dict[str, torch.nn.Module] = {}
         self._transformer = None
 
     # ------------------------------------------------------------------
@@ -264,6 +268,7 @@ class Cosmos3Model(Model):
                         "field; ignored.", k,
                     )
         cfg.check_streaming_decode()
+        cfg.check_compile()
         return cfg
 
     def _load_tokenizer(self):
@@ -494,7 +499,7 @@ class Cosmos3Model(Model):
         prefill_cond_video = _prefill_cond_walk("video_inputs")
 
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
-        # threads the latents + denoise-step index back to itself each iteration;
+        # threads the latents + the scheduler's state back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
         # upper bound — each request stops the loop at its own denoise-step count
         # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
@@ -519,11 +524,8 @@ class Cosmos3Model(Model):
                         # iteration (no per-step transfer).
                         section=GraphNode(
                             name=DIT_NODE,
-                            input_names=["latents", "time_index", "cond_latents"],
-                            outputs=[
-                                GraphEdge(next_node=DIT_NODE, name="latents"),
-                                GraphEdge(next_node=DIT_NODE, name="time_index"),
-                            ],
+                            input_names=self._denoise_inputs("latents"),
+                            outputs=self._denoise_loop_back("latents"),
                             enable_async_scheduling=True,
                         ),
                         max_iters=self.config.max_inference_steps,
@@ -559,12 +561,8 @@ class Cosmos3Model(Model):
                     name=VIDEO_SOUND_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "sound_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="sound_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "sound_latents"),
+                        outputs=self._denoise_loop_back("latents", "sound_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -613,12 +611,8 @@ class Cosmos3Model(Model):
                     name=ACTION_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -649,12 +643,8 @@ class Cosmos3Model(Model):
                     name=ACTION_VIDEO_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -695,6 +685,18 @@ class Cosmos3Model(Model):
             walks.update(self._windowed_walks())
         return walks
 
+    def _denoise_inputs(self, *bands: str) -> list[str]:
+        """A denoise loop body's inputs: what it advances, its scheduler's state and
+        the external ``cond_latents``."""
+        return [*bands, *self._solver_state(), "cond_latents"]
+
+    def _denoise_loop_back(self, *bands: str) -> list[GraphEdge]:
+        return [GraphEdge(next_node=DIT_NODE, name=name) for name in (*bands, *self._solver_state())]
+
+    def _solver_state(self) -> tuple[str, ...]:
+        # the distilled SDE sampler carries nothing between steps but the sample
+        return () if self.config.distilled_sigmas else SOLVER_STATE
+
     def _windowed_walks(self) -> dict[str, GraphSection]:
         """Windowed AR video: the same denoise loop, run window by window. On
         each window's last iteration the DiT emits the finished window's
@@ -707,10 +709,9 @@ class Cosmos3Model(Model):
                     name=VIDEO_GEN_AR_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "time_index", "cond_latents"],
+                        input_names=self._denoise_inputs("latents"),
                         outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                            *self._denoise_loop_back("latents"),
                             StreamingGraphEdge(
                                 next_node=VAE_DECODER_AR_NODE,
                                 name="window_latents",
@@ -851,10 +852,11 @@ class Cosmos3Model(Model):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
+        # The DiT prefill waits on text_inputs, so no prompt means the empty
+        # prompt (as in the reference), not a missing edge. /generate sends an
+        # empty text field as None.
         if prompt is None:
-            p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
-            layout = self._gen_layout(p, [], [], input_modalities, tensors or {})
-            return self._action_prompt_output({}, kwargs, {"kv_layout": {KV_CACHE: layout}})
+            prompt = ""
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
@@ -1128,10 +1130,11 @@ class Cosmos3Model(Model):
         if modality == "video":
             import os
 
-            # The decoder emits 8-bit frames [B, C, T, H, W]; encode all of them as
-            # an H.264 mp4. The frames already reflect the request fps (it modulates
-            # the temporal positions during generation), and the container carries
-            # that same rate so playback runs at the requested speed.
+            # The decoder emits 8-bit frames [T, C, H, W], torchcodec's layout;
+            # encode all of them as an H.264 mp4. The frames already reflect the
+            # request fps (it modulates the temporal positions during generation),
+            # and the container carries that same rate so playback runs at the
+            # requested speed.
             #
             # CRF 18 keeps the H.264 output near-visually-lossless; libx264
             # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
@@ -1139,14 +1142,13 @@ class Cosmos3Model(Model):
             # but encode several times faster than libx264's default "medium"
             # preset, which otherwise dominates the serving latency for a
             # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
-            x = output[0] if output.ndim == 5 else output  # [C, T, H, W] uint8
+            frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
                 # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
                 from torchcodec.encoders import VideoEncoder
 
-                frames = x.permute(1, 0, 2, 3).contiguous().cpu()  # [T, C, H, W] uint8
                 encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
                     "mp4",
                     codec="libx264",
@@ -1165,7 +1167,7 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                data = encode_mp4_pyav(x.permute(1, 2, 3, 0).cpu(), fps=fps, crf=18, preset=preset)
+                data = encode_mp4_pyav(frames.permute(0, 2, 3, 1), fps=fps, crf=18, preset=preset)
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
@@ -1480,12 +1482,9 @@ class Cosmos3Model(Model):
                 "Cosmos3 window_mode='kv' does not support overlap_frames; "
                 "cross-window conditioning comes from the committed context."
             )
-        overlap_units = min(max(round(overlap_frames / tf), 0), window_units - 1)
-        if overlap_frames > 0 and overlap_units == 0:
-            logger.warning(
-                "Cosmos3 overlap_frames=%d rounds to no latent frames (temporal scale %d); "
-                "windows will not overlap.", overlap_frames, tf,
-            )
+        # frames -> latent frames as the reference's pipelines map them: k
+        # latent frames pin 1 + (k - 1) * tf pixel frames
+        overlap_units = min((overlap_frames - 1) // tf + 1 if overlap_frames > 0 else 0, window_units - 1)
         if overlap_units:
             # Two clean latent frames are the conditioning floor (the V2V
             # recipe's pin count); a single frame visibly degrades the next
@@ -1768,17 +1767,15 @@ class Cosmos3Model(Model):
                 metadata.graph_walk = self.VIDEO_GEN_WALK
             else:
                 metadata.graph_walk = self.IMAGE_GEN_WALK
-            # The first denoise iteration's initial noise + step index are
+            # The first denoise iteration's initial noise and scheduler state are
             # sampled inside the DiT submodule's preprocess. Action and sound
             # walks also thread their extra latents through the loop.
-            inputs = [
-                GraphEdge(next_node=DIT_NODE, name="latents"),
-                GraphEdge(next_node=DIT_NODE, name="time_index"),
-            ]
             if joint_action:
-                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
+                inputs = self._denoise_loop_back("latents", "action_latents")
             elif metadata.graph_walk == self.VIDEO_SOUND_GEN_WALK:
-                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="sound_latents"))
+                inputs = self._denoise_loop_back("latents", "sound_latents")
+            else:
+                inputs = self._denoise_loop_back("latents")
             # The vae_encoder node's clean conditioning latents (persisted at
             # the conductor during the prefill walk) seed the loop's first
             # iteration; unconditioned requests carry an empty edge.
@@ -1828,25 +1825,28 @@ class Cosmos3Model(Model):
                 transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
+                # Chained windows re-encode the frames they continue from: the
+                # decode on the streaming decoder's VAE, the encode on the
+                # encoder node's fp32 one, both shared with those nodes when
+                # they are in this process.
+                head_decode_vae=self._build_streaming_decode_vae(device) if self._windowed_serving_enabled() else None,
+                head_encode_vae=self._build_encode_vae(device) if self._windowed_serving_enabled() else None,
             )
         if node_name == VAE_ENCODER_NODE:
             return Cosmos3VAEEncoderSubmodule(
                 vae=self._build_encode_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_NODE:
-            return Cosmos3VAEDecoderSubmodule(
-                vae=self._build_vae(device), config=self.config
-            )
-        if node_name == VAE_DECODER_AR_NODE:
-            # Shares the decoder VAE weights unless it decodes channels-last,
-            # which converts the VAE in place; only the streaming chunk state
-            # and compile wrapper are per-node.
+            # The fast decode converts its VAE to channels-last in place, so it
+            # takes the decoder-only copy rather than the shared instance.
             vae = (
                 self._build_decoder_only_vae(device)
-                if self.config.vae_decode_channels_last
+                if self.config.vae_decode_fast
                 else self._build_vae(device)
             )
-            return Cosmos3VAEDecoderARSubmodule(vae=vae, config=self.config)
+            return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config, fast=self.config.vae_decode_fast)
+        if node_name == VAE_DECODER_AR_NODE:
+            return Cosmos3VAEDecoderARSubmodule(vae=self._build_streaming_decode_vae(device), config=self.config)
         if node_name == AUDIO_DECODER_NODE:
             return Cosmos3AudioDecoderSubmodule(
                 sound_tokenizer=self._build_sound_tokenizer(device), config=self.config
@@ -1931,28 +1931,42 @@ class Cosmos3Model(Model):
         self._vae = vae.to(device).eval()
         return self._vae
 
+    def _build_streaming_decode_vae(self, device: str):
+        """The VAE the streaming decoder and a chained window's head decode
+        on: a decoder-only copy when the decode goes channels-last (the
+        conversion is in place), else the shared instance."""
+        if self.config.vae_decode_channels_last:
+            return self._build_decoder_only_vae(device)
+        return self._build_vae(device)
+
     def _build_decoder_only_vae(self, device: str):
-        # A separate instance (the decode needs no encoder), so converting it
-        # leaves the instance the whole-clip decoder uses untouched.
+        # A separate instance (the decode needs no encoder) per device, shared
+        # by the nodes on it that convert its layout in place, so the shared
+        # whole instance stays as loaded.
         if self.skip_weight_loading:
             return None
-        from diffusers import AutoencoderKLWan
+        if device not in self._decoder_only_vaes:
+            from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-        vae.encoder = None
-        return vae.to(device).eval()
+            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+            vae.encoder = None
+            self._decoder_only_vaes[device] = vae.to(device).eval()
+        return self._decoder_only_vaes[device]
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own fp32 instance instead of sharing the
         # decoder's: encode always runs fp32 while the decode dtype is
         # cuDNN-gated (bf16 from 9.16), so a shared instance would re-cast the
-        # full VAE weights on every encode/decode interleave.
+        # full VAE weights on every encode/decode interleave. One per device,
+        # shared with a chained window's head when the DiT is on it.
         if self.skip_weight_loading:
             return None
-        from diffusers import AutoencoderKLWan
+        if device not in self._encode_vaes:
+            from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-        return vae.float().to(device).eval()
+            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+            self._encode_vaes[device] = vae.float().to(device).eval()
+        return self._encode_vaes[device]
 
     def _build_vision_model(self, device: str):
         """The reasoner's vision tower + projector, from ``vision_encoder/``."""

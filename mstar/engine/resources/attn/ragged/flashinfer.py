@@ -29,9 +29,10 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str,
     ):
-        super().__init__(device=device, dtype=dtype, config=config)
-        self._workspaces = WorkspacePool(device)
+        super().__init__(device=device, dtype=dtype, config=config, key=key)
+        self._workspaces = WorkspacePool(device, config.workspace_mb)
         self._kwargs["backend"] = config.flashinfer_backend
 
     def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
@@ -59,9 +60,10 @@ class FlashInferRaggedBlockCausalManager(_FlashInferRaggedManagerBase, RaggedBlo
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str,
         block_size: int,
     ):
-        super().__init__(device=device, dtype=dtype, config=config)
+        super().__init__(device=device, dtype=dtype, config=config, key=key)
         self._kwargs["block_size"] = block_size
 
     def plan(self, step: AttentionStep, ctx: StepContext):

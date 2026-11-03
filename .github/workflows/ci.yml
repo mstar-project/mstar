@@ -85,7 +85,9 @@ jobs:
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
           python -m pip install diffusers==0.39.0
-          python -m pip install pytest-xdist==3.8.0
+          # pytest is pinned with the rest of the test stack, so a release can't
+          # change fixture behaviour under every PR at once.
+          python -m pip install pytest==9.2.0 pytest-xdist==3.8.0
           # The AudioSeal watermark streaming tests build its generator with
           # random weights (no download).
           python -m pip install "audioseal>=0.2,<0.3"
@@ -128,7 +130,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dynamo]" pytest
+          pip install -e ".[dynamo]" pytest==9.2.0
       - name: Bridge + registration tests
         env:
           HF_HUB_OFFLINE: "1"
@@ -139,7 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -152,13 +155,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
-        # Off with extension-module (see rust/Cargo.toml): the test binary is an
-        # executable, so it links libpython rather than resolving CPython
-        # symbols at import time. setup-python's interpreter is --enable-shared,
-        # so point the loader at its libdir for the run.
+        # The bindings without extension-module (see rust/Cargo.toml): the test
+        # binary is an executable, so it links libpython rather than resolving
+        # CPython symbols at import time. setup-python's interpreter is
+        # --enable-shared, so point the loader at its libdir for the run.
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
-        run: cargo test --release --no-default-features
+        run: cargo test --release --no-default-features --features python
       - run: cargo test --release --manifest-path rust/server/Cargo.toml
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
@@ -170,14 +173,12 @@ jobs:
           maturin build --release
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
-        env:
-          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
           # parity cases run the Python app through fastapi's TestClient
-          pip install pytest pyzmq msgpack numpy pyyaml prometheus-client \
+          pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml prometheus-client \
             fastapi uvicorn python-multipart httpx
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
