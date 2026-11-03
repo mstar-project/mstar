@@ -466,6 +466,9 @@ never splits. A value the node's storage can't take fails at load, at any SP siz
        min_tokens: 8192
        exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
 
+Ragged (cacheless) attentions keep the model's own ``sp_exchange``, whatever ``exchange`` says;
+a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
+
 A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
 so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
 for Qwen3-Omni's Thinker, estimated from its geometry and unmeasured). Chunked prefill stays off on SP ranks.

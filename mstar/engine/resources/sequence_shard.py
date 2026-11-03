@@ -81,7 +81,8 @@ class SeqShardSpec(NodeResourceSpec):
       stored position): split;
     - ``none``: never split.
 
-    A ragged attention's own ``sp_exchange`` is the model's.
+    A ragged attention's own ``sp_exchange`` is the model's, which ``exchange`` doesn't change;
+    a shard that never splits stops it splitting too.
 
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
