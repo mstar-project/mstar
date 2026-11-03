@@ -149,8 +149,10 @@ def _shipped_entries():
 @CUDA
 @pytest.mark.parametrize(("path", "index"), list(_shipped_entries()))
 def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(path, index, monkeypatch):
-    """An uncaptured step compiles fused_experts with a dynamic batch size, and every row of a
-    shipped table must trace that way, its launch options included."""
+    """An uncaptured step compiles the forward with dynamic=None, so the batch turns symbolic
+    from its second size, and every row of a shipped table must trace that way, its launch
+    options included. The lookup's keys must stay static: under dynamic=True top_k (read off
+    topk_ids) is symbolic and the lookup breaks the graph."""
     from mstar.utils.fused_moe import fused_experts
 
     entry = json.loads(path.read_text())["entries"][index]
@@ -161,15 +163,28 @@ def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(path, index, 
     registry.reset_lookups()
     torch._dynamo.reset()
     assert kernels._tile_rows(experts, two_inter, hidden, top_k, torch.bfloat16, torch.device("cuda", 0))
-    w1 = torch.randn(experts, two_inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
-    w2 = torch.randn(experts, hidden, two_inter // 2, device="cuda", dtype=torch.bfloat16) * 0.02
-    run = torch.compile(lambda x, w, i: fused_experts(x, w1, w2, w, i), dynamic=True)
+
+    class Experts(torch.nn.Module):
+        """As a model has them: expert shapes and top_k static, the token count symbolic."""
+
+        def __init__(self):
+            super().__init__()
+            self.w1 = torch.nn.Parameter(
+                torch.randn(experts, two_inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02)
+            self.w2 = torch.nn.Parameter(
+                torch.randn(experts, hidden, two_inter // 2, device="cuda", dtype=torch.bfloat16) * 0.02)
+
+        def forward(self, x, logits):
+            weights, ids = logits.topk(top_k, dim=-1)
+            return fused_experts(x, self.w1, self.w2, weights.to(x.dtype), ids)
+
+    run = torch.compile(Experts(), dynamic=None)
     # each row's largest batch and one past the last; 0 and 1 are specialized, never symbolic
     bounds = [int(key) for key in entry["rows"] if key != "*"]
-    for num_tokens in sorted({max(m, 2) for m in [*bounds, bounds[-1] + 1]}):
-        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
-        weights, ids = torch.rand(num_tokens, experts, device="cuda").topk(top_k, dim=-1)
-        run(x, weights.to(torch.bfloat16), ids)
+    with torch.no_grad():
+        for num_tokens in sorted({max(m, 2) for m in [*bounds, bounds[-1] + 1]}):
+            x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+            run(x, torch.rand(num_tokens, experts, device="cuda"))
     registry.reset_lookups()
 
 
