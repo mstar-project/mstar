@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphSection
+from mstar.model.submodule_base import chunk_tick_name
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,10 @@ class RebuildPolicy:
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> None:
         """Raise unless each prefill walk runs ``node``, which reads there only the ids and the inputs the
-        worker copies, and outputs ``sample_output``, and some walk runs ``node`` inside ``loop``."""
+        worker copies, and outputs ``sample_output``, and some walk runs ``node`` inside ``loop``.
+
+        The tick of ``node``'s chunk Loop in a walk is left out of what it reads, since the tick carries
+        no tensor."""
         for walk in sorted(self.prefill_walks):
             self._check_walk(node, graphs, walk, {self.ids_input, *self.copied_inputs.get(walk, ())})
         if not self.loop_walks(node, graphs):
@@ -51,10 +55,10 @@ class RebuildPolicy:
         graph_node = None if graph is None else graph.get_nodes().get(node)
         if graph_node is None:
             raise ValueError(f"{node}'s rebuild policy names walk {walk!r}, which doesn't run {node}")
-        if set(graph_node.input_names) != carried:
+        reads = set(graph_node.input_names) - {chunk_tick_name(node, walk)}
+        if reads != carried:
             raise ValueError(
-                f"{node}'s rebuild row carries {sorted(carried)} in {walk!r}, and {node} reads "
-                f"{sorted(graph_node.input_names)} there"
+                f"{node}'s rebuild row carries {sorted(carried)} in {walk!r}, and {node} reads {sorted(reads)} there"
             )
         if self.sample_output not in {edge.name for edge in graph_node.outputs}:
             raise ValueError(

@@ -38,7 +38,6 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
@@ -50,7 +49,7 @@ from mstar.model.lingbot_world.components.dit import (
 )
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule, StepOrder
 from mstar.model.wan22.submodules import _SingleRequestMixin
 
 logger = logging.getLogger(__name__)
@@ -208,15 +207,13 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
-            # cuDNN has fast bf16 conv3d from 9.16; before that bf16 is slower than fp32
-            cudnn = torch.backends.cudnn.version() or 0
-            if cudnn >= 91600:
-                self._decode_dtype = torch.bfloat16
+            self._decode_dtype = wan_vae.decode_dtype()
+            if self._decode_dtype == torch.bfloat16:
                 vae.to(torch.bfloat16)
             else:
-                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)", cudnn)
-            wan_vae.to_channels_last(vae)
-        self._decode_step = wan_vae.DecoderStep(vae, compile=fast, deterministic=True) if vae is not None else None
+                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
+                            torch.backends.cudnn.version())
+        self._decoder = wan_vae.FastDecoder(vae, channels_last=fast, compile=fast) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
             device = next(vae.parameters()).device
@@ -235,6 +232,12 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # float frames in the request state.
         self.keep_chunk_outputs = False
 
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Every rollout chunk emits frames to the client, so a session's
+        stream keeps moving while others run."""
+        del graph_walk
+        return StepOrder.TURNS
+
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
         self._attention = None
@@ -252,7 +255,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 self._attention = REFERENCE_ATTENTION
             else:
                 def on(kv_label):
-                    ragged = RaggedAttentionCallable(resource, cross_label(CHUNK_SPAN, kv_label))
+                    ragged = functools.partial(resource.run, label=cross_label(CHUNK_SPAN, kv_label))
                     return functools.partial(joint_attention, ragged=ragged)
                 self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
         return self._attention
@@ -418,10 +421,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         continuation of the request's stream."""
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
-        with torch.amp.autocast("cuda", enabled=False):
-            return wan_vae.decode_causal(
-                self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,
-            )
+        return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
 
     def check_stop(self, request_id, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
         done = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)

@@ -102,7 +102,7 @@ See https://github.com/mstar-project/mstar/pull/368 for some sources of overhead
 
 By default the worker speculates step N+1 through the graph while step N is still running (`enable_async_scheduling`, [mstar/graph/base.py](mstar/graph/base.py#L240), default `True`). It pre-plans it on a separate thread and stream. The full stage order, thread by thread, is in [.claude/skills/async-worker/SKILL.md](.claude/skills/async-worker/SKILL.md) — **read it before changing the worker's main loop, the GPU thread, the plan thread, speculation or postprocess.**
 
-(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `0` and is expected to flip on later)
+(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
 
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
@@ -157,7 +157,7 @@ Review any new early return, `continue`, or exception path in worker and engine 
 
 Lockstep is also about **when** something is run, not only whether. The main thread runs ahead of the GPU thread within a single step (invariant 7), so "one step in flight" does not mean "that step has admitted": admit is on the GPU thread while the main thread is already applying teardowns and scanning readiness, both of which move the state admit reads. A rank can then admit a step in a window that exists only between two of its own state changes, and a rank replaying those changes in order admits the same step from a different state. Every mutation of replicated state has to land before the step is broadcast or after that step has admitted, never between.
 
-**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, LRU orders on wall clock, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
+**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, the victim comes from stamps each rank's scheduler keeps for itself, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
 
 Some lessons learned from debugging KV cache symmetry across TP ranks:
 - **Ordered, not summarized.** A set of offloads plus a set of reloads cannot say whether a request ended up resident; the order of actions must be sent, and replayed verbatim.

@@ -29,7 +29,8 @@ from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.batch_builder import StepPick
+from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.rebuild import Rebuilds
 from mstar.worker.spec_rows import DeferredRowInputs
@@ -64,6 +65,7 @@ class _StubTM:
     dereference = TensorCommunicationManager.dereference
     dereference_batch = TensorCommunicationManager.dereference_batch
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
+    increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
 
     def __init__(self, bookkeeping):
@@ -74,6 +76,9 @@ class _StubTM:
 
     def get_tensor(self, uuid):
         return self.tensor_store.get_tensor(uuid)
+
+    def get_tensors(self, uuids):
+        return self.tensor_store.get_tensors(uuids)
 
     def _cleanup_by_uuid(self, uuid, registered=None):
         if self.tensor_store.check_uuid_presence(uuid):
@@ -93,8 +98,16 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def room_for_continuing(self, target):
-        return self.room
+    def pick_chain_step(self, state, target, continuing, mid_prefill=()):
+        # the chain keeps its rows up to the cap; the fresh rows come from the take
+        rows = list(continuing)
+        return ChainPick(target, StepPick(
+            taken=rows if self.room is None else rows[:self.room], continuing=rows, room=self.room,
+            held_back=set(), ordered=False,
+        ), [])
+
+    def take_chain_step(self, state, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
+        return self.get_next_batch()
 
     def _check_ready(self, node_name, rid, fwd_info):
         return True
@@ -273,7 +286,7 @@ def _view(spec, read_inputs: bool = True):
             r: (id(x.info), dict(x.dynamic_loop_iter_counts), x.max_tokens)
             for r, x in nb.per_request_info_wrapped.items()
         },
-        final=(set(nb.final_stream_rids), set(nb.stream_partition_done_rids)),
+        final=(set(nb.final_stream_rids), set(nb.partition_done_rids)),
         ctx=(
             tuple(nb.step_context.request_ids), nb.step_context.graph_walk,
             dict(nb.step_context.request_walks), nb.step_context.slot,

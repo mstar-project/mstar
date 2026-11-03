@@ -60,6 +60,9 @@ class _Model:
     def combined_walk_of(self):
         return {}
 
+    def chunking_policy_of(self):
+        return {}
+
     def checkpoint_path(self):
         return None
 

@@ -27,7 +27,7 @@ from mstar.communication.tensors import (
     TensorCommunicationManager,
 )
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
-from mstar.graph.runtime.base import FreedTensors, RouteOutput, SendInput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
@@ -50,6 +50,10 @@ class _Communicator(BaseCommunicator):
 
     def poll_for_messages(self, timeout_ms=20):
         return False
+
+
+class _StubRuntime(SimpleNamespace, PhasedPostprocess):
+    """Stubbed phase methods under the reference begin / resume."""
 
 
 class _Engine:
@@ -129,6 +133,7 @@ def test_the_worker_fails_only_the_refused_request():
         worker = Worker.__new__(Worker)
         worker._walk_drivers = {}
         worker._walk_driven_edges = {}
+        worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
         worker.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
         worker.tensor_manager = mgr
         worker.scheduler = SimpleNamespace(failed_rids=set())
@@ -181,6 +186,7 @@ def _postprocess_worker(refuse, follower=False):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
@@ -188,7 +194,6 @@ def _postprocess_worker(refuse, follower=False):
     w.worker_id = "w0"
     w.parallel_nodes = {"llm"} if follower else set()
     w.parallel_leader_nodes = set()
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._rebuilds = Rebuilds({}, {})
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
@@ -219,6 +224,7 @@ def _postprocess_worker(refuse, follower=False):
         materialize_publish=lambda *a: None,
         # like the engine's, reads each stopped rid's info
         finalize_stopped_requests=lambda nb, rids: [nb.per_request_info[r] for r in rids],
+        step_finished=lambda batch, outputs, **kwargs: None,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
 
@@ -258,7 +264,7 @@ def _postprocess_worker(refuse, follower=False):
         )
         return []
 
-    w._graph_runtime = SimpleNamespace(
+    w._graph_runtime = _StubRuntime(
         cleanup_consumed_inputs=lambda *a: FreedTensors.none(),
         clear_pending_loop_stops=lambda: None,
         stop_loops_batched=lambda **kw: list(kw["loop_names"].keys),
@@ -276,7 +282,7 @@ def _decode_step(rids, final_stream=()):
         node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
-        stream_partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
+        partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
         rebuild_rids=frozenset(),
     )
     batch = ScheduledBatch(
@@ -472,17 +478,17 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w.is_tp_follower = False
     w._rid = lambda wire: 3
     w._in_flight_rids = set()
     w._draining_rids, w._pending_drains, w._reads_done_sent = set(), set(), set()
     w._pending_removes = set()
-    w._last_active = {}
     w.streaming_buffers = {}
     w.tensor_manager = mgr
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid: None,
     )
     w.request_state = SimpleNamespace(remove_request=lambda rid: None)
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)

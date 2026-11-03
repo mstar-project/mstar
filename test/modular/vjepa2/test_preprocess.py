@@ -7,7 +7,10 @@ model keeps HF's resize-and-crop, which sees less of a non-square frame.
 import pytest
 import torch
 
-from mstar.model.vjepa2.vjepa2_model import _IMAGENET_MEAN, _IMAGENET_STD, _preprocess_video
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.graph.base import TensorPointerInfo
+from mstar.model.vjepa2.submodules import VJepa2EncoderSubmodule
+from mstar.model.vjepa2.vjepa2_model import _IMAGENET_MEAN, _IMAGENET_STD, VJepa2ACModel, _preprocess_video
 
 _MEAN = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
 _STD = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
@@ -67,3 +70,32 @@ def test_hf_crop_is_unchanged_and_narrower():
     assert out.shape == (2, 3, 256, 256)
     assert out[..., 0, :].min() > 0.4
     assert out[..., -1, :].max() < 0.6
+
+
+def _pointer(tensor: torch.Tensor) -> TensorPointerInfo:
+    return TensorPointerInfo(
+        dims=list(tensor.shape), dtype=tensor.dtype, nbytes=tensor.nbytes, address=0,
+        stride=list(tensor.stride()), uuid="u", source_session_id="", source_entity="api_server",
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_ac_rollout_request_replays_the_encoder_capture(stream):
+    """An AC rollout clip goes through the request's own trim and crop and lands
+    on the encoder capture's key; a clip of any other shape runs eager without a
+    word, so a change to either would quietly drop the capture."""
+    model = VJepa2ACModel("unused", skip_weight_loading=True)
+    kwargs = {"actions": [[0.1] * 7] * 4, "states": [[0.2] * 7] * 4, "rollout_horizon": 4, "stream_rollout": stream}
+    out = model.process_prompt(
+        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.rand(16, 3, 180, 320)]}, **kwargs,
+    ).new_input_tensors
+    signals = {name: [_pointer(t) for t in tensors] for name, tensors in out.items()}
+    args = model.get_initial_forward_pass_args("p0", ["video"], ["embedding"], signals, kwargs)
+    walk = args.full_metadata.graph_walk
+    info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=0)
+    info.step_metadata.update(args.step_metadata)
+
+    encoder = VJepa2EncoderSubmodule(encoder=None, config=model.config)
+    (capture,) = encoder.get_accelerator_graph_configs(torch.device("cpu"))
+    assert walk in capture.replay_graph_walks
+    assert encoder.cg_key_info(walk, {"r": info}) == capture.additional_key_info

@@ -138,6 +138,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     w._graph_runtime = SimpleNamespace(
         # The runtime mints the handle now; interning is still the whole of it.
         add_request=lambda request_id, **kw: t.intern(request_id),
+        register_stop_limits=lambda rid, info: None,
         get_rid_handle=t.handle, get_rid_string=t.name,
         get_sharding_config=lambda h: SimpleNamespace(groups=[]),
         remove_request=_runtime_remove,
@@ -169,13 +170,12 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._last_active = {}
     w._rebuilds = Rebuilds({}, {})
     w._rebuilds._kept = {"n": {a: None, b: None}}
     w.scheduler.queue_rebuild(a, RebuildRow("n", "prefill", {}))
     w._kv_keys, w._dropped, w._victims, w._preempted = {"n": ["kv"]}, {a: "n"}, {a: "kv"}, {a: None}
     w.streaming_buffers = {a: {}}
-    w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.streams._rids.add(a)
@@ -215,7 +215,7 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
         dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
     )
     w._handle_tensor_received(TensorReceived(
-        request_id="gone", successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
+        successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
     assert acked == [([1, 3], [2, 1])]
 
@@ -258,14 +258,12 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
-        evictable_nodes=lambda: [],
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: got.__setitem__("tensors", rid),
         start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids = set()
-    w._last_active = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
@@ -306,12 +304,12 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: None, evictable_nodes=lambda: [],
+        add_request=lambda rid, cfgs, info: None,
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
-    w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
+    w._draining_rids, w._unprocessed_messages = set(), {}
     w._rebuilds = Rebuilds({}, {})
     w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
