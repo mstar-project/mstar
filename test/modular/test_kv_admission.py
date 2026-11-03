@@ -239,6 +239,22 @@ def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the
     assert (NODE, "p") in started, "a request parked behind a head that still doesn't fit was never tried to pass"
 
 
+def test_only_the_request_an_out_of_date_mark_turned_away_is_tried_again(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    kv._index.filed += 1
+    _short_chat(kv, "p", [6000] * 8)
+    assert _runner(kv).admit_retrieve("p", NODE, WALK, None).queued
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert tried == ["p"], f"retrying one request turned away by the head's old mark tried {len(tried)} requests"
+
+
 def test_a_passer_finishing_tries_no_request_behind_the_head_again(monkeypatch):
     kv = _passing(free=3, head=5)
     _short_chat(kv, "p", [6000] * 8)

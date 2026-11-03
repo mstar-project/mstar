@@ -42,14 +42,15 @@ class Admission:
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
         # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
         # against, until that request leaves the front of the queue.
-        # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried, or a
-        # request waits to pass a first request whose resource has grown since it didn't fit.
+        # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried.
         # `_admitted` holds the nodes each request was admitted on, with the walk each was admitted for.
         # `_started` holds, for a request admitted during one node's check, the other nodes waiting on
         # it, which `admit_waiting` reports so their parked checks resume.
         # `_passes` holds the resources that override `Resource.reserve_past`, whose queues a request may pass.
         # `_pass_short` maps each resource that refused a request passing since the last pass sweep to the
         # distinct marks it refused against.
+        # `_unpassed` holds the requests not tried for passing because a first request's resource had grown
+        # since it didn't fit, which `admit_waiting` tries once that request has been measured again.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
         self._numbered: list[str] = []
@@ -61,6 +62,7 @@ class Admission:
         self._started: dict[str, set[str]] = {}
         self._passes = {key for key in ask_order if type(resources[key]).reserve_past is not Resource.reserve_past}
         self._pass_short: dict[str, list[object]] = {}
+        self._unpassed: set[str] = set()
 
     def set_arrival(self, rid: str, arrival: int) -> None:
         """Order ``rid`` by the conductor's arrival number. A worker serving two of the request's partitions
@@ -139,7 +141,8 @@ class Admission:
         `Resource.grew_since` for each such resource. After the in-order sweep, while a resource
         that lets requests pass has a first request that can't start, each later waiting request is
         tried, in arrival order, to pass it, but only once a queue has a new first request or a
-        resource that refused a passing request has grown since.
+        resource that refused a passing request has grown since. Otherwise only the requests in
+        `_unpassed` are tried.
         """
         started = []
         if self._started:
@@ -151,7 +154,7 @@ class Admission:
         passable = any(
             self._resources[key].grew_since(mark) for key, marks in self._pass_short.items() for mark in marks
         )
-        if not grown and not passable and not self._untried:
+        if not grown and not passable and not self._untried and not self._unpassed:
             return started
         for key in grown:
             del self._short[key]
@@ -171,15 +174,21 @@ class Admission:
                     admitted = True
         # the last sweep admitted nothing, so it tried every queue's first request
         passable, self._untried = passable or self._untried, False
-        if not passable:
+        unpassed, self._unpassed = self._unpassed, set()
+        if not passable and not unpassed:
             return started
-        self._pass_short.clear()
         blocked = self._blocked()
-        queues = [
-            queue[1:] for key, queue in self._queues.items() if key in self._passes and queue and queue[0] in blocked
-        ]
-        # every queue is in arrival order, and a request waiting in two of them is tried once
-        for rid in dict.fromkeys(heapq.merge(*queues, key=self._arrival.__getitem__)):
+        if passable:
+            self._pass_short.clear()
+            queues = [
+                queue[1:] for key, queue in self._queues.items()
+                if key in self._passes and queue and queue[0] in blocked
+            ]
+            # every queue is in arrival order, and a request waiting in two of them is tried once
+            waiting = dict.fromkeys(heapq.merge(*queues, key=self._arrival.__getitem__))
+        else:
+            waiting = sorted(unpassed, key=self._arrival.__getitem__)
+        for rid in waiting:
             if rid in self._waiting:
                 nodes = self._pass(rid, lambda node, rid=rid: published_of(rid, node), blocked)
                 started.extend((node, rid) for node in nodes or ())
@@ -191,6 +200,7 @@ class Admission:
             self._leave(rid, entry.asked)
         self._admitted.pop(rid, None)
         self._started.pop(rid, None)
+        self._unpassed.discard(rid)
         arrival = self._arrival.pop(rid, None)
         if arrival is not None and not arrival[0]:
             self._numbered.remove(rid)
@@ -252,8 +262,8 @@ class Admission:
             elif key in self._passes and first in blocked:
                 passing.append(key)
             else:
-                # a first request whose resource grew may fit now, and `admit_waiting` tries it before ``rid``
-                self._untried |= key in self._passes and key in self._short
+                if key in self._passes and key in self._short:
+                    self._unpassed.add(rid)
                 return None
         return self._reserve(rid, published_of, passing) if passing else None
 
