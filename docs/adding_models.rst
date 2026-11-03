@@ -663,7 +663,8 @@ The spec types are:
        instead of the label's plan, and ``k=None`` rotates one tensor. ``interleave``
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
        a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
-       kernel that rotates inside a larger fusion. A model with learned position
+       kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
+       kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``

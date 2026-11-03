@@ -148,9 +148,9 @@ class MLAAttention(nn.Module):
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key] if self.use_rope else None
-        if self.mla_fused_prep and self._pos.cos_sin_table is None:
-            # the fused prep rotates from the position resource's cos/sin table
-            # (PositionConfig.rope_table_dtype); without one the op-by-op path serves
+        if self.mla_fused_prep and (self._pos.cos_sin_table is None or not self._pos.interleave):
+            # the fused prep turns interleaved pairs from the position resource's cos/sin
+            # table (PositionConfig.rope_table_dtype); otherwise the op-by-op path serves
             self.mla_fused_prep = False
 
     def _rope(
