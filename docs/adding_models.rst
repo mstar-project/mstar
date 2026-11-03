@@ -562,6 +562,11 @@ The spec types are:
        A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
        parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
        worker's pool admits requests on its own.
+       ``correct_len(rid, label, delta)`` moves a stream's length between steps, never
+       between a step's admit and commit. A speculative verify step commits its whole block,
+       and its rejected tail is taken back (``delta < 0``) before the next step is declared;
+       the position resource's ``correct_len`` moves the position with it. GLM-5.2's MTP
+       is the user.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
