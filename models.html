@@ -1549,6 +1549,8 @@ Talker-width inputs through <code class="docutils literal notranslate"><span cla
 It is the same component as Qwen3-Omni’s code predictor
 (<code class="docutils literal notranslate"><span class="pre">ResidualCodePredictor</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar.model.components.code_predictor_kernels</span></code>):
 the depth sequence opens with the Talker hidden state in a one-token pass
+(on Blackwell, Qwen3-TTS only, one pass over it and group 0’s embedding;
+it was measured only there, <code class="docutils literal notranslate"><span class="pre">blackwell_path_measured</span></code>)
 and takes one token per group after it, each layer’s q/k norm, RoPE and KV write
 run in one launch and attention in <code class="docutils literal notranslate"><span class="pre">cp_attention</span></code>, and the frame’s 16 codec
 embeddings are summed in one launch per group. Each Talker keeps the sum it
@@ -1562,11 +1564,18 @@ On its own it lowers first-audio latency at high concurrency; with
 <code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code> in the YAML (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>; <code class="docutils literal notranslate"><span class="pre">qwen3tts_split.yaml</span></code> sets
 it) the two workers’ kernels also overlap, which raised c=32 throughput by
 about a fifth on an H100.</p></li>
-<li><p>The codec decoder runs in float32 by default, reproducing the reference
-decoder bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span> <span class="pre">bfloat16}</span></code> in the
-deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
-B300 that is slower, not faster: cuDNN’s heuristics run several of its
-convs on a kernel without tensor cores, so measure before switching.</p></li>
+<li><p>The Talker’s layers run <code class="docutils literal notranslate"><span class="pre">Qwen3Attention</span></code>, so each layer’s q/k norm, RoPE and
+KV write are one kernel (<code class="docutils literal notranslate"><span class="pre">qk_norm_rope_kv_write</span></code>). It reads the RoPE theta off
+the position resource, which declares the checkpoint’s.</p></li>
+<li><p>The codec decoder runs in float32 by default. On CUDA its conv stack runs
+channels-last (<code class="docutils literal notranslate"><span class="pre">ChannelsLastConvStack</span></code>), a fifth to a third off a captured
+decode on a B300 at 80+ dB PSNR against the reference decoder; off CUDA it
+runs the reference stack, bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span>
+<span class="pre">bfloat16}</span></code> in the deployment YAML selects a bf16 codec (the Talker is bf16
+either way). Channels-last on a B300, bf16 is another 7-17% faster but
+further off: 57 dB median and 36 dB worst PSNR against fp32 over 200
+sentences. Off that stack it is slower, not faster, because cuDNN’s
+heuristics run several of its convs on a kernel without tensor cores.</p></li>
 <li><p>Opt-in AudioSeal watermark on the codec’s output (off by default; install
 <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[audioseal]'</span></code>). Turn it on in the deployment YAML:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">model_kwargs</span><span class="p">:</span>
