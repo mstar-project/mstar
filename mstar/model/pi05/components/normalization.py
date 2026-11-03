@@ -60,11 +60,14 @@ def load_norm_stats(spec: dict | str | None) -> Pi05NormStats | None:
     ``spec`` is either a mapping laid out like openpi's ``norm_stats.json``
     (``state`` and/or ``actions``, each with ``q01`` and ``q99`` lists, other
     fields such as ``mean`` / ``std`` ignored, optionally under a top-level
-    ``norm_stats`` key) or the path of such a JSON file.
+    ``norm_stats`` key) or the path of such a JSON file. A file's trailing dims
+    with ``q01 == q99`` are openpi's padding and are dropped. Inline stats are
+    taken as written.
     """
     if spec is None:
         return None
-    if isinstance(spec, (str, Path)):
+    from_file = isinstance(spec, (str, Path))
+    if from_file:
         spec = json.loads(Path(spec).expanduser().read_text())
     if not isinstance(spec, dict):
         raise TypeError(f"norm_stats must be a mapping or a file path, got {type(spec).__name__}")
@@ -72,10 +75,10 @@ def load_norm_stats(spec: dict | str | None) -> Pi05NormStats | None:
     unknown = sorted(set(spec) - {"state", "actions"})
     if unknown or not spec:
         raise ValueError(f"norm_stats needs 'state' and/or 'actions' entries, got {sorted(spec)}")
-    return Pi05NormStats(state=_quantiles(spec, "state"), actions=_quantiles(spec, "actions"))
+    return Pi05NormStats(state=_quantiles(spec, "state", from_file), actions=_quantiles(spec, "actions", from_file))
 
 
-def _quantiles(spec: dict, key: str) -> QuantileStats | None:
+def _quantiles(spec: dict, key: str, trim_padding: bool) -> QuantileStats | None:
     entry = spec.get(key)
     if entry is None:
         return None
@@ -86,6 +89,9 @@ def _quantiles(spec: dict, key: str) -> QuantileStats | None:
     if q01.ndim != 1 or q01.shape != q99.shape or not q01.numel():
         raise ValueError(f"norm_stats.{key}: q01 and q99 must be lists of one length, got "
                          f"{tuple(q01.shape)} and {tuple(q99.shape)}")
+    if not trim_padding:
+        # a robot's own stats, where a joint whose q01 equals q99 is still a joint
+        return QuantileStats(q01, q99)
     # openpi's norm_stats.json pads every robot to the model width with q01 == q99 == 0.
     # Those dims are not the robot's, so drop them: a file then covers the dims the
     # inline stats list, and a padded state is refused the same way with either.
