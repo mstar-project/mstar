@@ -432,9 +432,7 @@ def build_stack(weights: dict[str, torch.Tensor], comm_group: CommGroup | None =
                 config: Qwen3_5Config | None = None):
     """The real Qwen3.5 text stack (``comm_group``: one rank's shard of it), loaded by
     the model's own rules. Sets the process-wide default dtype while it builds."""
-    from mstar.model.loader.base import load_weights_into
     from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-    from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
 
     torch.set_default_dtype(DTYPE)
     try:
@@ -444,11 +442,7 @@ def build_stack(weights: dict[str, torch.Tensor], comm_group: CommGroup | None =
     for i, kind in enumerate(LAYER_TYPES):
         if kind == LINEAR_ATTENTION:
             model.model.layers[i].self_attn.norm = _GatedNorm()
-    loaded = load_weights_into(
-        model, weights.items(), stacked_params=_STACKED_PARAMS, name_remapper=qwen3_5_name_remapper,
-    )
-    assert loaded == {n for n, _ in model.named_parameters()}
-    return model.requires_grad_(False).eval()
+    return _loaded(model, weights)
 
 
 def _stub_cores(model, rows: _Rows) -> None:
@@ -542,10 +536,10 @@ def _subset(modules, *ends):
     return {k: v for k, v in modules.items() if k.endswith(ends)}
 
 
-def _loaded(model, weights, **rules):
-    from mstar.model.loader import load_hf_weights
-
-    assert load_hf_weights(model, weights.items(), **rules) == {n for n, _ in model.named_parameters()}
+def _loaded(model, weights):
+    """``model`` loaded by its own ``checkpoint_rules()`` (``weights`` named below their
+    prefix), every parameter filled."""
+    assert model.checkpoint_rules().load(model, weights.items()) == {n for n, _ in model.named_parameters()}
     return model.requires_grad_(False).eval()
 
 
@@ -588,11 +582,10 @@ def _orpheus():
 
 
 def _higgs():
-    from mstar.model.higgs_audio.components.llm import HiggsAudioLLM, higgs_llm_remap
+    from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-    from mstar.model.loader import LLAMA_STACKED_PARAMS
 
     head = "audio_decoder_proj.text_lm_head"
     return Stack(
@@ -601,9 +594,7 @@ def _higgs():
             head_dim=4, intermediate_size=32, vocab_size=64,
         ),
         lora_spec=lambda c: model_object(HiggsAudioModel, c).get_lora_specs()[0],
-        build=lambda c, group, w: HiggsAudioLLMSubmodule(_loaded(
-            HiggsAudioLLM(c, comm_group=group).to(DTYPE), w, stacked_params=LLAMA_STACKED_PARAMS,
-            name_remapper=higgs_llm_remap), c),
+        build=lambda c, group, w: HiggsAudioLLMSubmodule(_loaded(HiggsAudioLLM(c, comm_group=group).to(DTYPE), w), c),
         weights=lambda c: llama_weights(c, "", head, qk_norm=True),
         a1=lambda c: {**llama_layers(c, ""), head: (c.vocab_size, c.hidden_size)},
         a2=lambda c: _subset(llama_layers(c, ""), "0.self_attn.k_proj", "1.mlp.up_proj", "1.self_attn.o_proj"),
@@ -656,10 +647,7 @@ def _omni(dense: bool):
             mlp_only_layers=[i for i in range(2) if i not in moe_layers],
         )),
         lora_spec=lambda c: model_object(Qwen3OmniModel, c).get_lora_specs()[0],
-        build=lambda c, group, w: ThinkerSubmodule(_loaded(
-            Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w,
-            stacked_params=model_object(Qwen3OmniModel, c)._get_thinker_stacked_params(),
-            name_remapper=Qwen3OmniModel._thinker_remap), c),
+        build=lambda c, group, w: ThinkerSubmodule(_loaded(Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w), c),
         weights=weights,
         a1=lambda c: {**adapted(c), "lm_head": (c.thinker_text.vocab_size, c.thinker_text.hidden_size)},
         a2=lambda c: _subset(adapted(c), "v_proj", "o_proj", "up_proj"),
@@ -675,7 +663,6 @@ def _omni(dense: bool):
 
 def _qwen3_tts():
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
-    from mstar.model.loader import LLAMA_STACKED_PARAMS
     from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.config import (
         Qwen3TTSCodePredictorConfig,
@@ -706,7 +693,7 @@ def _qwen3_tts():
         lora_spec=lambda c: model_object(Qwen3TTSModel, c).get_lora_specs()[0],
         # the code predictor sits beside the Talker, with relative paths of the same shape
         build=lambda c, group, w: TalkerSubmodule(
-            _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w, stacked_params=LLAMA_STACKED_PARAMS),
+            _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w),
             ResidualCodePredictor(c.code_predictor, c.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
                                   embed_sum_dtype=None).to(DTYPE), c),
         weights=weights,

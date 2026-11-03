@@ -1575,17 +1575,6 @@ class Qwen3OmniModel(Model):
             return self._create_vision_encoder_submodule(device, autocast_dtype)
         return None
 
-    @staticmethod
-    def _thinker_remap(name: str) -> str | None:
-        from mstar.model.qwen3_omni.components.thinker import thinker_remap
-
-        return thinker_remap(name)
-
-    def _get_thinker_stacked_params(self):
-        from mstar.model.qwen3_omni.components.thinker import thinker_stacked_params
-
-        return list(thinker_stacked_params(self.config.thinker_text.num_experts))
-
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -1630,6 +1619,7 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.components.talker import (
             Qwen3OmniTalkerModel,
         )
+        from mstar.model.qwen3_omni.components.thinker import thinker_remap, thinker_stacked_params
 
         with torch.device("meta"):
             # ``tp_group`` shards the Talker LLM's attention + MoE. The
@@ -1674,11 +1664,11 @@ class Qwen3OmniModel(Model):
         assert initialized_thinker_embed_tokens, \
             "thinker.model.embed_tokens not found to initialize talker TTS embeds"
 
-        stacked = self._get_thinker_stacked_params()
+        stacked = list(thinker_stacked_params(self.config.thinker_text.num_experts))
         load_hf_weights(
             talker_model, iter(talker_weights),
             stacked_params=stacked,
-            name_remapper=self._thinker_remap,
+            name_remapper=thinker_remap,
         )
         talker_model.eval()
 
@@ -1699,7 +1689,7 @@ class Qwen3OmniModel(Model):
         load_hf_weights(
             code_predictor, iter(code_pred_weights),
             stacked_params=stacked,
-            name_remapper=self._thinker_remap,
+            name_remapper=thinker_remap,
         )
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()

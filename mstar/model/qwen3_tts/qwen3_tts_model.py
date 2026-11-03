@@ -1190,17 +1190,10 @@ class Qwen3TTSModel(Model):
         talker.to_empty(device=device)
 
         # The top-level checkpoint interleaves Talker and CodePredictor under
-        # ``talker.*``. Stream only the non-CodePredictor keys into this model.
+        # ``talker.*``; the Talker's rules drop the CodePredictor's keys.
         rules = talker.checkpoint_rules()
-
-        def talker_weights():
-            for name, tensor in iter_safetensors_shards(
-                self.local_dir, device=device, prefix=rules.prefix
-            ):
-                if not name.startswith("talker.code_predictor."):
-                    yield name.removeprefix(rules.prefix), tensor
-
-        loaded = rules.load(talker, talker_weights())
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=rules.prefix)
+        loaded = rules.load(talker, ((name.removeprefix(rules.prefix), t) for name, t in weights))
         cp_prefix = "talker.code_predictor."
         talker_keys = {
             key for key in _checkpoint_keys(self.local_dir, "talker.")
