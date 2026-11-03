@@ -340,12 +340,12 @@ class Dropped(NamedTuple):
 
 @dataclass(slots=True)
 class Earmark:
-    """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``freed`` counts the room
-    made by the moves applied so far."""
+    """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``granted`` counts the pages
+    the moves applied so far added to ``rid``'s allotment."""
     rid: str
     pages: int
     victims: set[str]
-    freed: int = 0
+    granted: int = 0
 
 
 @dataclass
@@ -4504,18 +4504,19 @@ class KVManager(AttentionResource):
         return pages + sum(self._allotments[rid].remaining for rid in rids if rid in self._allotments)
 
     def _settle(self, rid: str, freed: int) -> None:
-        """Take ``rid`` off the earmark it is a victim of, now that its move or removal made ``freed`` room.
-        Once no victim is left, the allotment of the request that ran short grows by what the victims
-        freed, up to its shortage."""
+        """Take ``rid`` off the earmark it is a victim of, now that its move or removal made ``freed`` room, and
+        grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
+        victim that asks again at once is then measured against the room without it."""
         self._hosted.discard(rid)
         earmark = self._victims.pop(rid, None)
         if earmark is None:
             return
-        earmark.freed += freed
+        granted = min(earmark.pages - earmark.granted, freed)
+        earmark.granted += granted
         earmark.victims.discard(rid)
         if not earmark.victims:
             del self._earmarks[earmark.rid]
-            self._allot(earmark.rid, min(earmark.pages, earmark.freed))
+        self._allot(earmark.rid, granted)
 
     def _vacate(self, rid: str, room: int) -> None:
         """Release ``rid``'s leases and give up its allotment, so that ``rid`` asks again, once a drop or a move
