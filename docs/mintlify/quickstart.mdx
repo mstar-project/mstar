@@ -5,7 +5,7 @@ description: "Start a model server and send your first text, image, or speech re
 
 This page serves a model and sends a first request. If you haven't installed `mstar` yet, see [Installation](/installation).
 
-## 1. Start a server {#start-a-server}
+## 1\. Start a server {#start-a-server}
 
 The `mstar` CLI launches a server for a model with a sensible default config:
 
@@ -37,7 +37,7 @@ The **first request(s) on a fresh environment can be slow** — often tens of se
 
 </Note>
 
-## 2. Send a request {#send-a-request}
+## 2\. Send a request {#send-a-request}
 
 **Python SDK** — works for every model and modality. Each line below targets the model that supports it, so run the matching server first:
 
@@ -82,7 +82,7 @@ print(resp.choices[0].message.content)
 
 Runnable versions of all of these live in the repo's `examples/` directory (`sdk_chat.py`, `sdk_image.py`, `sdk_tts.py`, `openai_chat.py`, `openai_tts.py`, `curl.sh`). For the full client surface, see [Using a Server](/clients).
 
-## 3. Check health {#check-health}
+## 3\. Check health {#check-health}
 
 ```bash
 curl http://localhost:8000/health        # -> {"status": "healthy"}
