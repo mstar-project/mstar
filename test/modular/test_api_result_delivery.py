@@ -10,6 +10,7 @@ success.
 
 import asyncio
 import gc
+import json
 import queue
 import threading
 import time
@@ -23,6 +24,7 @@ from fastapi import HTTPException
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import PendingRequest
+from mstar.api_server.openai.serving_videos import _stream_ndjson as _stream_video_ndjson
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.event import EventWakeup
 from mstar.graph.base import GraphEdge
@@ -256,6 +258,27 @@ def test_stream_carries_error_as_final_chunk():
     chunks = asyncio.run(_collect())
     assert [c.modality for c in chunks] == ["text", "error"]
     assert chunks[-1].metadata["status"] == 500
+
+
+@pytest.mark.parametrize("route", ["generate", "videos"])
+def test_a_stream_that_times_out_mid_body_ends_with_an_error_line(route):
+    """The 200 is already sent, so the timeout has to arrive in band, on every
+    route that streams the request's chunks; the request is still aborted."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.timeout_seconds = 0.3
+    req = _pending_request()
+    req.chunks.append(ResultChunk(request_id="r3", modality="text", data=b"partial"))
+    _register(server, "r3", req)
+    stream = server.async_stream_results("r3") if route == "generate" else _stream_video_ndjson(server, "r3")
+
+    async def _collect():
+        return [json.loads(line) async for line in stream]
+
+    lines = asyncio.run(_collect())
+    assert [line["modality"] for line in lines] == ["text", "error"]
+    assert lines[-1]["metadata"]["status"] == 500
+    assert pw.aborted == ["r3"]
 
 
 def test_a_chunk_from_another_thread_wakes_the_stream_at_once():

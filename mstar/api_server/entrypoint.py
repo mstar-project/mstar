@@ -49,7 +49,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -1537,7 +1537,9 @@ class APIServer:
         ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
         already read from it (``open_result_stream``); None opens a fresh one.
         """
-        chunks = chunks if chunks is not None else self.iter_result_chunks(request_id)
+        chunks = errors_in_band(
+            request_id, chunks if chunks is not None else self.iter_result_chunks(request_id),
+        )
         if binary:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
