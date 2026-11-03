@@ -1700,9 +1700,12 @@ The DiT's 49 steps are ~73 s of a clip (~1.50 s each), and the GPUs run at their
 cap throughout. On the same four GPUs SGLang 0.5.21 (Ulysses 4, ``--performance-mode
 speed``) takes 76.0 s, and with two requests at a time finishes 47.5 clips an hour to
 M*'s 48.2 (the last row with #1118's packed Ulysses exchange). Busy neighbours on the
-node's other GPUs cost ~8%. Async scheduling for the DiT (``tp_async_sched: [dit]``)
-measured within noise and is left off. Not done: CUDA-graph capture, more than one request
-per step, tensor parallelism, an SP8 run, and the ``Ref2VA`` checkpoint.
+node's other GPUs cost ~8%. On all eight GPUs (``configs/minimax_h3_sp8.yaml``, the same
+layout at SP8) a clip takes 39.1 s, and two at a time finish 94.4 an hour; vllm-omni 0.32.0
+on the same GPUs, at the same 49 DiT forwards, takes 40.7 s and finishes 89.8. Async
+scheduling for the DiT (``tp_async_sched: [dit]``) measured within noise and is left off.
+Not done: CUDA-graph capture, more than one request per step, tensor parallelism, and the
+``Ref2VA`` checkpoint.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
