@@ -87,7 +87,7 @@ class SplitRows(NamedTuple):
     rows' slots and whether each carries state. ``run`` leading rows are one-token decode rows,
     which run copied. ``hand_off`` is the prompt rows' plan under ``state_passing``."""
 
-    range: SeqRange
+    seq_range: SeqRange
     pieces: np.ndarray
     halo: ConvHalo
     # the rows with a piece here, as the conv kernel lays them out, each from its scratch window
@@ -223,7 +223,7 @@ class LinearAttnManager(AttentionResource):
         rows, local = len(spans), len(host.rows)
         slots = addressing.slot_indices[:rows]
         return SplitRows(
-            range=r,
+            seq_range=r,
             pieces=pieces,
             halo=host.to(device),
             conv_cu=to_device_nonblocking(np.concatenate([[0], np.cumsum(host.spans)]), device, torch.int32),
@@ -267,7 +267,7 @@ class LinearAttnManager(AttentionResource):
             ).transpose(0, 1)
 
         stored = gather_rows(conv_layer, split.slots, split.has_state)
-        out, final = conv_halo(conv, x, stored, split.halo, split.range.group)
+        out, final = conv_halo(conv, x, stored, split.halo, split.seq_range.group)
         scatter_rows(conv_layer, split.slots, final)
         return out
 
@@ -275,12 +275,12 @@ class LinearAttnManager(AttentionResource):
         """The step's decode run, every rank's tokens of it gathered: the first tokens of each of
         ``xs``, this rank's, and the whole run back, one collective per dtype sized by the step."""
         counts = split.decode_tokens
-        mine = counts[split.range.group.rank]
+        mine = counts[split.seq_range.group.rank]
         out: list[torch.Tensor | None] = [None] * len(xs)
         for dtype in dict.fromkeys(x.dtype for x in xs):
             chosen = [i for i, x in enumerate(xs) if x.dtype == dtype]
             flat = torch.cat([xs[i][:mine].flatten(1) for i in chosen], dim=1)
-            whole = gather_sequence(split.range.group, flat, counts)
+            whole = gather_sequence(split.seq_range.group, flat, counts)
             parts = whole.split([xs[i][0].numel() for i in chosen], dim=1)
             for i, part in zip(chosen, parts, strict=True):
                 out[i] = part.unflatten(1, xs[i].shape[1:]).contiguous()

@@ -96,7 +96,8 @@ class AttentionManager(AttentionResource):
             return
         # stored by head, heads over every TP and SP rank: a split step's tokens trade for heads, a
         # copied step's heads are sliced. Stored by position, heads over TP: every rank attends a
-        # copied step, and a split step's tokens are gathered or passed round (`exchange`)
+        # copied step, and a split step's tokens are gathered or passed round. Copied over SP (MLA's
+        # latent), heads over TP: a copied step runs as is, a split one gathers its keys (`exchange`)
         shard = self._shard = resources[self._shard_key]
         kv.bind_sequence_shard(shard)
         split = self._split_exchange
@@ -106,7 +107,7 @@ class AttentionManager(AttentionResource):
         logger.info(
             "attention over KV %r takes split steps over %d SP ranks: split labels by %s, copied ones %s",
             self._kv_cache_name, shard.group.world_size, split,
-            "by head slice" if placement is None else "over the placed pool",
+            "as is" if split == "kv_gather" else "by head slice" if placement is None else "over the placed pool",
         )
 
     @torch.compiler.disable

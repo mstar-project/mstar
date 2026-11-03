@@ -108,6 +108,23 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+def gdn_kernel(name: str, device: torch.device):
+    """FlashInfer's GDN kernel ``name`` (its chunked prefill or its decode), or on a CPU tensor its
+    torch stand-in (`gdn_cpu`), so the resource's paths run in a test without a GPU; no CUDA tensor
+    reaches the stand-in."""
+    if device.type == "cpu":
+        from mstar.engine.resources.linear_attn import gdn_cpu
+
+        return getattr(gdn_cpu, name)
+    if name == "chunk_gated_delta_rule":
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        return chunk_gated_delta_rule
+    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+    return gated_delta_rule_decode_pretranspose
+
+
 def _conv_programs(spans: Sequence[int]) -> tuple[list[int], list[int]]:
     """The varlen conv kernel's programs over rows ``spans``: one per ``_CONV_BLOCK_M`` chunk of each
     row, as (row, chunk) pairs."""
@@ -419,10 +436,7 @@ class GDNPrefillWrapper(GDNWrapper):
         conv_layer.index_copy_(0, index[2], x[window].transpose(1, 2).to(conv_layer.dtype))
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
-        if q.device.type == "cpu":
-            from mstar.engine.resources.linear_attn.gdn_cpu import chunk_gated_delta_rule
-        else:
-            from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        chunk_gated_delta_rule = gdn_kernel("chunk_gated_delta_rule", q.device)
 
         slots = self._plan_state.slots.to(torch.int64)
 
@@ -594,10 +608,7 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
-        if q.device.type == "cpu":
-            from mstar.engine.resources.linear_attn.gdn_cpu import gated_delta_rule_decode_pretranspose
-        else:
-            from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+        gated_delta_rule_decode_pretranspose = gdn_kernel("gated_delta_rule_decode_pretranspose", q.device)
 
         # Uninitialized output: the kernel writes every row, except one whose
         # slot is -1 (only with the sink off), which it would leave as found.

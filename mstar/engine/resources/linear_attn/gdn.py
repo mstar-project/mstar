@@ -30,6 +30,7 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNWrapper,
+    gdn_kernel,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import (
@@ -392,7 +393,7 @@ class GDNManager(LinearAttnManager):
         out = exchange(prefill, split, q, k, v, a, b, state_layer, a_log, dt_bias)
         if decode is not None:
             # this rank's tokens of the run lead its share
-            rank, counts = split.range.group.rank, split.decode_tokens
+            rank, counts = split.seq_range.group.rank, split.decode_tokens
             start = sum(counts[:rank])
             out[: counts[rank]] = decode[start:start + counts[rank]].to(out.dtype)
         return out
@@ -402,7 +403,7 @@ class GDNManager(LinearAttnManager):
         of heads, the chunked half run on it over the replica's block of the state, and the
         block's final states gathered into every replica. The decode run's tokens ride the
         exchange; the chunked half (planned eagerly past the run) doesn't read them."""
-        group = split.range.group
+        group = split.seq_range.group
         heads = state_layer.shape[1] // group.world_size
         lo, hi = group.rank * heads, (group.rank + 1) * heads
         front, slots = split.run, split.prompt_slots
@@ -419,7 +420,7 @@ class GDNManager(LinearAttnManager):
             scatter_rows(state_layer, slots, finals)
             return torch.cat([out.new_zeros(front, *out.shape[1:]), out]) if front else out
 
-        return ulysses(run, q, k, v, a, b, r=split.range)
+        return ulysses(run, q, k, v, a, b, r=split.seq_range)
 
     def _state_passing(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
         """A split step's prompt rows by token (``sequence_shard.state_passing``), as planned
@@ -428,7 +429,7 @@ class GDNManager(LinearAttnManager):
         no values and its offset from zeros, which needs equal key and value dims), runs a row
         continuing into it from the state it gets, and every row's final state is gathered into
         every replica."""
-        group, plan = split.range.group, split.hand_off
+        group, plan = split.seq_range.group, split.hand_off
         alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
         beta = torch.sigmoid(b.float())
         heads, dim_v, dim_k = state_layer.shape[1:]
@@ -442,7 +443,7 @@ class GDNManager(LinearAttnManager):
             values = v.index_select(0, chunk.index)
             if zero_values:
                 values[values.shape[0] // 2:] = 0
-            got, final = _chunked_kernel(q.device)(
+            got, final = gdn_kernel("chunk_gated_delta_rule", q.device)(
                 q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
                 g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
                 scale=self.config.sm_scale, initial_state=initial.to(self._prefill_dtype), output_final_state=True,
@@ -518,11 +519,3 @@ class GDNManager(LinearAttnManager):
         self._split_rows.clear()
         self._checkpoints = None
 
-
-def _chunked_kernel(device: torch.device):
-    """FlashInfer's chunked GDN prefill, or its torch stand-in on a CPU tensor."""
-    if device.type == "cpu":
-        from mstar.engine.resources.linear_attn.gdn_cpu import chunk_gated_delta_rule
-    else:
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
-    return chunk_gated_delta_rule

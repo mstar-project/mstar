@@ -264,7 +264,7 @@ class Mamba2Manager(LinearAttnManager):
         rank where there are fewer than ranks), the scan over the replica's head block, the
         block's final states gathered into every replica, and the output back by token. It splits
         memory, not time: the scan is a loop over tokens."""
-        group = split.range.group
+        group = split.seq_range.group
         world = group.world_size
         heads = ssm_layer.shape[1] // world
         lo, hi = group.rank * heads, (group.rank + 1) * heads
@@ -281,7 +281,7 @@ class Mamba2Manager(LinearAttnManager):
             scatter_rows(ssm_layer, plan.slots, group.all_gather(mine, dim=1))
             return out
 
-        return ulysses(run, x, dt, b, c, r=split.range)
+        return ulysses(run, x, dt, b, c, r=split.seq_range)
 
     def _state_passing(self, plan: Mamba2Plan, split: SplitRows, x, dt, b, c, ssm_layer, a, d, dt_bias):
         """A split step by token (``sequence_shard.state_passing``), as planned (``HandOff``): each
@@ -291,7 +291,7 @@ class Mamba2Manager(LinearAttnManager):
         corrected in closed form for the state it enters with, ``y_t += C_t . (exp(sum_{s<=t} dt_s
         A) h0)`` and ``final += exp(sum dt A) h0``, and every row's final state is gathered into
         every replica."""
-        group, hand = split.range.group, split.hand_off
+        group, hand = split.seq_range.group, split.hand_off
         decay = _effective_dt(dt, dt_bias, True, self._time_step_limit) * a
         out = torch.zeros_like(x)
         finals: dict[int, torch.Tensor] = {}
