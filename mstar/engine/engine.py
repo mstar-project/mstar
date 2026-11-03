@@ -1360,6 +1360,12 @@ class Engine:
     def release_chunk_inputs(self, rid: int, node_name: str) -> None:
         self._chunking.release(rid, node_name)
 
+    def set_aside_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunking.set_aside(rid, node_name)
+
+    def restore_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunking.restore(rid, node_name)
+
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
