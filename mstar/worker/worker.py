@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property, partial
 from time import sleep
@@ -1218,14 +1218,7 @@ class Worker:
 
     def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
-        # a rebuild keys a label again only where the request's own keys cover it
-        layouts = {
-            key: [
-                layout if config.keys_of(label) else replace(layout, keyed_spans=0)
-                for label, layout in (config.kv_layout or {}).items()
-            ]
-            for key, config in kv_configs.items()
-        }
+        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
         for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:

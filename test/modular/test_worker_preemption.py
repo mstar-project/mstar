@@ -10,7 +10,6 @@ import logging
 import sys
 from array import array
 from collections import Counter
-from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -372,11 +371,14 @@ def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_pr
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
     w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
-    text = PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill")
-    layout = StreamLayout(spans=(text, replace(text, opens_step=False)), growth=(("decode", 1),), keyed_spans=1)
-    configs = {"kv": KVReqConfig(
-        kv_layout={"main": layout}, loop_caps={"decode": 64}, prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache,
-    )}
+    text = [4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill", 0, None, None]
+    # text in two spans of one step, keyed over the first, as the conductor sends a layout
+    layout = [[[*text, True, "ids"], [*text, False, "ids"]], [["decode", 1]], 0, None, 1]
+    config = KVReqConfig()
+    config.apply_conductor_config(
+        prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache, kv_layout={"main": layout}, loop_caps={"decode": 64},
+    )
+    configs = {"kv": config}
 
     w._set_rebuildable(1, configs)
 

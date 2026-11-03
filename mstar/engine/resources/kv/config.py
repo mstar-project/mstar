@@ -427,7 +427,8 @@ class KVReqConfig(ResourceReqConfig):
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
-                    keyed_spans=keyed_spans,
+                    # a request with the prefix cache off keys none of its spans
+                    keyed_spans=keyed_spans if self.prefix_cache else 0,
                     max_growth=max_growth[0] if max_growth else None,
                 )
                 # a row may leave out the growth bound, as a span row may leave out its later fields
@@ -557,8 +558,7 @@ def refuse_undeclared_labels(
 
 
 def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
-    """Why rebuild rows can't write a request's laid-out labels again, or None. ``keyed_spans`` is what the
-    request's own keys cover, none with the prefix cache off.
+    """Why rebuild rows can't write a request's laid-out labels again, or None.
 
     The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write
     every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.
