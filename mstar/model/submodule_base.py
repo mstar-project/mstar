@@ -64,8 +64,8 @@ class TokenStop:
     stop_ids: frozenset[int]
     # resource key of the sampler whose request config carries ``ignore_eos``
     sampler: str
-    # the only walk whose rows can stop the loop; None for every walk
-    walk: str | None = None
+    # the only walk, or walks, whose rows can stop the loop; None for every walk
+    walk: str | frozenset[str] | None = None
     # walks that sample the reply's first token before the loop exists. That
     # token counts toward the budget, so ``get_loop_caps`` gives the loop
     # ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one
@@ -87,6 +87,11 @@ class TokenStop:
         if self.withhold and self.runtime_check:
             # the runtime's check never calls check_stop, which is what withholds
             raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
+
+    def stops_on(self, graph_walk: str) -> bool:
+        """Whether a row of ``graph_walk`` can stop the loop."""
+        walk = self.walk
+        return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
 class DeviceLoopback(NamedTuple):
@@ -826,6 +831,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+    # Walks whose steps may run beside the worker's main chain, on a second
+    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # the serving config sets ``side_stream: true``. For a stream-fed walk that
+    # no chain step waits on. Where the config asks, ``EngineManager.build``
+    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # worker, a device without streams, a node that also has chain walks or
+    # holds resources, and a side walk that is not the node's alone, is part
+    # of a combined walk, or has output spans or a stop check.
+    side_stream_walks: frozenset[str] = frozenset()
 
     # Float32 math for this node's forward, where the process default (TF32
     # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
@@ -1100,6 +1114,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         (the default) prepares row by row."""
         del graph_walk, has_loopback
         return None
+
+    def resident_walks(self) -> frozenset[str]:
+        """Walks whose captured steps may read their rows off the resident
+        tables (`mstar.engine.resources.resident`). A walk here runs, for each
+        resource, one stream that takes one token a row or one it only reads
+        (span 0), with no forks or retention, and its `preprocess` reads no
+        planned position or KV location: the forward's graph fills those in.
+        The engine still refuses if a resource can't."""
+        return frozenset()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
@@ -1571,7 +1594,7 @@ class ARNodeSubmodule(NodeSubmodule):
         stop = self.token_stop
         if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
             return super().get_stop_policies(graph_walk)
-        if stop.walk is not None and graph_walk != stop.walk:
+        if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
         # the budget is the loop's cap, which the runtime enforces
         return {stop.loop: StopPolicy(
@@ -1633,7 +1656,7 @@ class ARNodeSubmodule(NodeSubmodule):
             if walk in prefill_walks:
                 return self._is_reply_token(info)
             # only a row of ``walk`` ends the loop
-            return stop.walk is None or walk == stop.walk
+            return stop.stops_on(walk)
         # the loop's cap is at least 1, so a one-token budget ends at the prefill
         return bool(prefill_walks) and info.max_tokens <= 1 and (
             info.graph_walk in prefill_walks and self._is_reply_token(info)
