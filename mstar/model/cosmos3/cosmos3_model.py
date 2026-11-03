@@ -1459,7 +1459,9 @@ class Cosmos3Model(Model):
             domain_name = mk.get("domain_name")
             if domain_name is None and mk.get("domain_id") is None and action_mode == ACTION_MODE_POLICY:
                 domain_name = self.config.policy_domain_name
-            params["domain_id"] = resolve_action_domain_id(mk.get("domain_id"), domain_name)
+            params["domain_id"] = resolve_action_domain_id(
+                mk.get("domain_id"), domain_name, self.config.num_embodiment_domains
+            )
             raw_dim = mk.get("raw_action_dim")
             if raw_dim is None and state_dim:
                 raw_dim = state_dim
