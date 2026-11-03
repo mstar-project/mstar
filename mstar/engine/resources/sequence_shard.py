@@ -14,8 +14,8 @@ The attention resources over the node depend on it (``shard_key``, taken in thei
 The exchanges are the functions at the bottom of this module, each wrapped around the resource's
 own ``run``:
 
-- ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
-  cacheless attention declaring ``sp_exchange="ulysses"``);
+- ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, a
+  cacheless attention declaring ``sp_exchange="ulysses"``, or a recurrent layer's prompt rows);
 - ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share
   of the output (KV stored by position, ``context_parallel``);
 - ``ring``: a striped label's own tokens, whose K/V this rank stores, ``run`` on them with their
@@ -26,10 +26,12 @@ own ``run``:
 - ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's
   partial with its log-sum-exp, merged;
 - ``kv_gather``: every rank's k and v gathered, ``run`` writes them and attends this rank's
-  queries (an MLA pool every rank stores whole).
+  queries (KV every rank stores whole: an MLA pool, or a sliding-window attention's layers of a
+  pool stored by position).
 
-A recurrent layer's resource runs its own two around its kernels: ``conv_halo``, the conv's left
-context from the earlier ranks, and ``state_passing``, the state a row enters a rank with.
+A recurrent layer's resource takes its conv's left context from the earlier ranks (``conv_halo``),
+and its prompt rows through ``ulysses`` (its ``sp_exchange``'s default) or ``state_passing``, the
+state a row enters a rank with.
 
 ``sequence_parallel_refusals`` is what a node on SP ranks may not declare; the engine and
 ``validate_deployment`` both run it.

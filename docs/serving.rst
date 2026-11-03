@@ -465,8 +465,8 @@ layers stay whole on each rank, so its decode needs no collective; CPU-tested on
 step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses``, or its own
 ``sp_exchange: state_passing`` (CPU-tested only, as Mamba-2's split is). A value the node's
 storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
-other than ``flashinfer`` (when the engine builds it), or beside a ``kv_gather`` attention or a
-recurrent layer:
+other than ``flashinfer`` (when the engine builds it); ``ring`` beside a ``kv_gather`` attention or
+a recurrent layer fails at load on SP ranks:
 
 .. code-block:: yaml
 

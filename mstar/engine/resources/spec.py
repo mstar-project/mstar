@@ -159,10 +159,10 @@ class NodeResourceSpec(ABC):
         return None
 
     def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":
-        """How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the
+        """How a split step's tokens reach this resource (``sequence_shard``): ``none`` (the
         default) for a resource that takes none. From raw fields, so the sequence shard's
-        ``derive`` can ask in any order; a node's steps split where any of its attentions answers
-        otherwise (``SeqShardSpec.splits``).
+        ``derive`` can ask in any order; a node's steps split where its shard's ``node_exchange``
+        isn't ``none`` and any of its resources answers otherwise (``SeqShardSpec.splits``).
 
         Every hook the sequence shard reads is computed from the spec's own raw fields and other
         specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
