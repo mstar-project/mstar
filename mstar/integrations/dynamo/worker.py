@@ -285,7 +285,8 @@ def _serve_until_shutdown(args) -> None:
         # before Dynamo can route here, as the native server runs them before it binds
         warmups = (server._model_config or {}).get("warmup_requests") or []
         if warmups:
-            _run_warmup_requests(server, warmups, _data_parallel_replicas(server.model, args.config))
+            _run_warmup_requests(server, warmups, _data_parallel_replicas(server.model, args.config),
+                                 cache_dir=args.cache_dir)
         serve(server, model_name, args)
     except KeyboardInterrupt:
         pass

@@ -1102,4 +1102,4 @@ def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
     monkeypatch.setattr(worker, "serve", lambda server, name, args: events.append("serve"))
     worker._serve_until_shutdown(SimpleNamespace(config="c.yaml", cache_dir="/models"))
-    assert events == ["setup", ("warmup", [{"text": "hi"}], {}), "serve"]
+    assert events == ["setup", ("warmup", [{"text": "hi"}], {"cache_dir": "/models"}), "serve"]
