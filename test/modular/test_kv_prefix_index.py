@@ -17,9 +17,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import PagedKVConfig
-from mstar.engine.resources.kv.manager import PageArena
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 PAGE_SIZE = 16

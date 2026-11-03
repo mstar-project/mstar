@@ -4,6 +4,7 @@ then the routed and shared experts, where the grouped-GEMM runner would mostly m
 Up to a per-GPU token count (``_Tuning.pair_max_tokens``) gate/up and down are GEMV kernels
 over (token, expert) pairs; above it experts repeat across the batch, and grouped kernels read
 each expert's weights once. ``swiglu_limit`` picks the clamped SwiGLU or the plain one.
+The router's top-k program, as ``router_topk``, also serves softmax routers (``TopKRouter``).
 """
 from __future__ import annotations
 
@@ -202,9 +203,11 @@ def _router_logits_kernel(x, w, part, T, E: tl.constexpr, H: tl.constexpr, TB: t
 @triton.jit
 def _router_topk_kernel(part, bias, w_out, id_out, T, scale,
                         E: tl.constexpr, EP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-                        S: tl.constexpr, NORM: tl.constexpr, PDL: tl.constexpr):
-    """One program per token: sum the S partials in a fixed order, then sigmoid -> + bias
-    -> top-K (ties to the lower expert) -> gather the unbiased scores -> normalize. The
+                        S: tl.constexpr, NORM: tl.constexpr, SOFTMAX: tl.constexpr,
+                        PDL: tl.constexpr):
+    """One program per token: sum the S partials in a fixed order and score them, then
+    top-K (ties to the lower expert) -> gather the scores -> normalize -> * scale. Sigmoid
+    scores are picked by score + bias, fp32 softmax scores (SOFTMAX) by themselves. The
     ``1e-20`` guards an all-zero top-K and rounds away for any sum above 2^-42."""
     if PDL:
         gdc_wait()
@@ -214,15 +217,21 @@ def _router_topk_kernel(part, bias, w_out, id_out, T, scale,
     valid = e < E
     logit = tl.zeros([EP], tl.float32)
     for s in tl.static_range(S):
-        logit += tl.load(part + (s * T + t) * E + e, mask=valid, other=0.0)
-    score = tl.sigmoid(logit)
-    biased = tl.where(valid, score + tl.load(bias + e, mask=valid, other=0.0), float("-inf"))
+        logit += tl.load(part + (s * T + t) * E + e, mask=valid, other=0.0).to(tl.float32)
+    if SOFTMAX:
+        x = tl.where(valid, logit, float("-inf"))
+        num = tl.where(valid, tl.exp(x - tl.max(x, 0)), 0.0)
+        score = num / tl.sum(num, 0)
+        rank = tl.where(valid, score, float("-inf"))
+    else:
+        score = tl.sigmoid(logit)
+        rank = tl.where(valid, score + tl.load(bias + e, mask=valid, other=0.0), float("-inf"))
     kk = tl.arange(0, KP)
     ids = tl.zeros([KP], tl.int32)
     for j in tl.static_range(K):
-        idx = tl.argmax(biased, 0)
+        idx = tl.argmax(rank, 0)
         ids = tl.where(kk == j, idx, ids)
-        biased = tl.where(e == idx, float("-inf"), biased)
+        rank = tl.where(e == idx, float("-inf"), rank)
     ws = tl.sum(tl.where(e[None, :] == ids[:, None], score[None, :], 0.0), 1)
     ws = tl.where(kk < K, ws, 0.0)
     if NORM:
@@ -489,8 +498,8 @@ def _launch_router(x, w, bias, part, topk_w, topk_ids, scale, normalize, pdl, tu
         num_warps=tuning.router["warps"])
     _router_topk_kernel[(T,)](
         part, bias, topk_w, topk_ids, T, float(scale), E=E, EP=triton.next_power_of_2(E),
-        K=K, KP=triton.next_power_of_2(K), S=splits, NORM=normalize, PDL=pdl, num_warps=1,
-        launch_pdl=pdl)
+        K=K, KP=triton.next_power_of_2(K), S=splits, NORM=normalize, SOFTMAX=False, PDL=pdl,
+        num_warps=1, launch_pdl=pdl)
 
 
 def _launch_gate_up(x, ids, w13, s13, sw13, act, block_size, limit, pdl, bj, bk, bjs, bks, warps):
@@ -646,26 +655,28 @@ def route(x, w, bias, *, top_k, scale, normalize):
 
 
 @torch.library.custom_op("mstar::moe_router_topk", mutates_args=())
-def router_topk(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scale: float,
-                normalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """``route``'s top-k program on precomputed fp32 ``logits (T, E)``. An op opaque to
-    dynamo, so a compiled gate keeps it whole."""
+def router_topk(logits: torch.Tensor, bias: torch.Tensor | None, top_k: int, scale: float,
+                normalize: bool, softmax: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """``route``'s top-k program on precomputed ``logits (T, E)`` of any float dtype, read in
+    fp32. ``softmax``: rank and weight by the fp32 softmax, with no ``bias``; otherwise by
+    the sigmoid router. An op opaque to dynamo, so a compiled gate keeps it whole."""
     T, E = logits.shape
-    assert logits.dtype == torch.float32 and logits.is_contiguous()
+    assert logits.is_contiguous() and (bias is None) == softmax
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=logits.device)
     topk_ids = torch.empty(T, top_k, dtype=torch.int64, device=logits.device)
     if T:
         _router_topk_kernel[(T,)](
-            logits, bias, topk_w, topk_ids, T, float(scale), E=E,
+            logits, logits if bias is None else bias, topk_w, topk_ids, T, float(scale), E=E,
             EP=triton.next_power_of_2(E), K=top_k, KP=triton.next_power_of_2(top_k), S=1,
-            NORM=normalize, PDL=False, num_warps=1)
+            NORM=normalize, SOFTMAX=softmax, PDL=False, num_warps=1)
     return topk_w, topk_ids
 
 
 @router_topk.register_fake
-def _(logits, bias, top_k, scale, normalize):
+def _(logits, bias, top_k, scale, normalize, softmax=False):
     T = logits.shape[0]
-    return logits.new_empty(T, top_k), logits.new_empty(T, top_k, dtype=torch.int64)
+    return (logits.new_empty(T, top_k, dtype=torch.float32),
+            logits.new_empty(T, top_k, dtype=torch.int64))
 
 
 def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,

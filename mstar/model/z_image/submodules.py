@@ -1,6 +1,6 @@
 """Z-Image-Turbo node submodules on the DiT scaffold.
 
-    text_encoder -> ZImageTextEncoderSubmodule  Qwen3-4B layer-35 hidden states, unpadded prompt length
+    text_encoder -> ZImageTextEncoderSubmodule  Qwen3-4B layer-35 hidden states (the shared Qwen3 node)
     dit          -> ZImageDenoiseSubmodule      DenoiseLoopSubmodule + the Z-Image transformer, fp32 Euler
     vae_decoder  -> ZImageVaeDecoderSubmodule   FLUX.1 VAE decode (scaling/shift latents) -> uint8 image
 
@@ -23,15 +23,17 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
-    VAE_DECODE_BATCH_SIZES,
+    VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
     decode_in_chunks,
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS, Qwen3TextEncoderSubmodule
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -46,7 +48,7 @@ from mstar.model.z_image.config import SEQ_MULTIPLE, ZImageConfig
 
 logger = logging.getLogger(__name__)
 
-TEXT_INPUTS, TEXT_EMBEDS, IMAGE_OUTPUT = "text_inputs", "text_embeds", "image_output"
+IMAGE_OUTPUT = "image_output"
 CAP_PAD_MASK = "cap_pad_mask"
 
 
@@ -85,61 +87,20 @@ def shape_from_metadata(config: ZImageConfig, step_metadata: dict) -> ZShape:
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class ZImageTextEncoderSubmodule(NodeSubmodule):
+class ZImageTextEncoderSubmodule(Qwen3TextEncoderSubmodule):
     """Caption features ``[1, cap_len, 2560]`` for one request: Qwen3 hidden states after
     layer 35 at the real token positions, zero elsewhere (the DiT swaps those rows for its
-    learned pad token). ``text_inputs`` arrives unpadded; rows are right-padded to the
-    encoder's ``max_sequence_length`` (512), as the reference pipeline pads them: the real
-    tokens' values do not depend on the padding mathematically, but the attention kernel's
-    accumulation order does, so the padded length is part of bit-exactness. Requests of any
-    length batch together."""
+    learned pad token), cut to the padded caption length. The batching, padding and capture
+    are the shared Qwen3 text-encoder node's."""
 
-    disable_torch_compile = True
+    def __init__(self, encoder: nn.Module, config: ZImageConfig, **kwargs):
+        super().__init__(encoder, config.text_encoder, **kwargs)
 
-    def __init__(self, encoder: nn.Module, config: ZImageConfig, max_batch_size: int = 16):
-        super().__init__()
-        self.encoder = encoder
-        self.config = config
-        self._max_batch_size = max_batch_size
-
-    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        ids = inputs[TEXT_INPUTS][0]
-        return NodeInputs(tensor_inputs={TEXT_INPUTS: ids}, input_seq_len=int(ids.shape[0]))
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return len(model_inputs) > 1
-
-    def max_batch_size(self, graph_walk: str):
-        return self._max_batch_size
-
-    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
-        lengths = [int(inp.tensor_inputs[TEXT_INPUTS].shape[0]) for inp in inputs]
-        width = self.config.text_encoder.max_sequence_length
-        pad_id = self.config.text_encoder.pad_token_id
-        ids = torch.full((len(inputs), width), pad_id, dtype=torch.long)
-        mask = torch.zeros((len(inputs), width), dtype=torch.long)
-        for row, inp in enumerate(inputs):
-            n = lengths[row]
-            ids[row, :n] = inp.tensor_inputs[TEXT_INPUTS].to(torch.long)
-            mask[row, :n] = 1
-        return {TEXT_INPUTS: ids, "text_mask": mask, "lengths": lengths}
-
-    def _encode(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        device = self.get_device()
-        hidden = self.encoder(ids.to(device), mask.to(device)).to(self.encoder.dtype)
+    def request_embeds(self, hidden: torch.Tensor, text_len: int) -> torch.Tensor:
+        cut = hidden[:, : padded_length(text_len)]
         # zero the pad rows: the DiT replaces them, and the parity tests compare real rows only
-        return hidden * mask.to(device=device, dtype=hidden.dtype)[..., None]
-
-    def forward(self, graph_walk, engine_inputs, text_inputs, text_mask, lengths, **kwargs):
-        hidden = self._encode(text_inputs, text_mask)
-        return {TEXT_EMBEDS: [hidden[:, : padded_length(lengths[0])]]}
-
-    def forward_batched(self, graph_walk, engine_inputs, text_inputs, text_mask, lengths, **kwargs):
-        hidden = self._encode(text_inputs, text_mask)
-        return {
-            rid: {TEXT_EMBEDS: [hidden[i : i + 1, : padded_length(lengths[i])]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        real = torch.arange(cut.shape[1], device=cut.device) < text_len
+        return cut * real.to(cut.dtype)[None, :, None]
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +231,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False,
-        warmup_grids: Sequence[tuple[int, int]] = (), decode_batch_sizes: Sequence[int] = VAE_DECODE_BATCH_SIZES,
+        warmup_grids: Sequence[tuple[int, int]] = (),
     ):
         super().__init__()
         self.vae = vae
@@ -279,7 +240,9 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
         # see KleinVaeDecoderSubmodule: static per-size compiles, warmed at load, larger batches split
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
-        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        self._decode_batch_sizes = (
+            tuple(geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH))) if compile_decode else ()
+        )
         self._warmed: set[tuple[int, int, int]] = set()  # shapes the compiled decode was warmed with
         # see KleinVaeDecoderSubmodule: clear requires_grad before warming, or dynamo
         # guards on it and the first served decode recompiles inside the request

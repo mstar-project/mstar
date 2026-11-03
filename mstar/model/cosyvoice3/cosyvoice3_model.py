@@ -107,6 +107,7 @@ from mstar.model.cosyvoice3.submodules import (
     reference_tokens,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -214,20 +215,7 @@ class CosyVoice3Model(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the LM KV pool cannot hold: nothing preempts a
         stream once the pool is full."""
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning("%s sets no max_concurrent_requests: a burst can fill the LM KV cache", config_path)
-            return
-        kv = next(s for s in self.get_node_resources() if s.resource_key == LM_KV).config
-        overrides = (config.get("resources") or {}).get(LM_KV) or {}
-        page_size = int(overrides.get("page_size", kv.page_size))
-        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        need = 1 + int(cap) * -(-self._max_seq_len() // page_size)
-        if need > max_num_pages:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests at {self._max_seq_len()} tokens each need "
-                f"{need} pages of resources.{LM_KV}, which has {max_num_pages}"
-            )
+        check_kv_pools_fit(self, config, config_path, logger)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         lm = self.config.lm

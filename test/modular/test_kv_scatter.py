@@ -53,7 +53,7 @@ def test_kv_scatter_matches_index_put(contiguous_indices, launches):
         slot = torch.stack([slot, slot], dim=1)[:, 0]
         assert not page.is_contiguous()
     expected = _expected(cache, 1, k, v, page, slot)
-    _kv_scatter_nhd_eager(cache, 1, k, v, page, slot)
+    _kv_scatter_nhd_eager(cache[1], k, v, page, slot)
     torch.testing.assert_close(cache, expected, atol=0, rtol=0)
     assert launches == ([(5,)] if contiguous_indices else [])
 
@@ -79,7 +79,7 @@ def test_kv_scatter_geometries(heads, head_dim, tokens, kv_dtype, launches):
     flat = torch.randperm(pages * page_size, device="cuda")[:tokens]
     page, slot = flat // page_size, flat % page_size
     expected = _expected(cache, 1, k, v, page, slot)
-    _kv_scatter_nhd_eager(cache, 1, k, v, page, slot)
+    _kv_scatter_nhd_eager(cache[1], k, v, page, slot)
     torch.testing.assert_close(cache, expected, atol=0, rtol=0)
     assert launches == [(tokens,)]
 
@@ -99,7 +99,7 @@ def test_kv_scatter_rejects_what_index_put_rejects(mismatch):
     else:
         page = page[:4]
     with pytest.raises((RuntimeError, IndexError)):
-        _kv_scatter_nhd_eager(cache, 1, k, v, page, slot)
+        _kv_scatter_nhd_eager(cache[1], k, v, page, slot)
 
 
 def test_kv_scatter_takes_int32_indices_and_no_tokens():
@@ -107,14 +107,14 @@ def test_kv_scatter_takes_int32_indices_and_no_tokens():
     expected = cache.clone()
     empty = torch.empty(0, 2, 128, device="cuda", dtype=torch.bfloat16)
     none = torch.empty(0, device="cuda", dtype=torch.int32)
-    _kv_scatter_nhd_eager(cache, 0, empty, empty, none, none)
+    _kv_scatter_nhd_eager(cache[0], empty, empty, none, none)
     assert torch.equal(cache, expected)
     k = torch.randn(2, 2, 128, device="cuda").to(torch.bfloat16)
     v = torch.randn(2, 2, 128, device="cuda").to(torch.bfloat16)
     page = torch.tensor([8, 3], device="cuda", dtype=torch.int32)
     slot = torch.tensor([15, 0], device="cuda", dtype=torch.int32)
     expected = _expected(cache, 2, k, v, page.long(), slot.long())
-    _kv_scatter_nhd_eager(cache, 2, k, v, page, slot)
+    _kv_scatter_nhd_eager(cache[2], k, v, page, slot)
     torch.testing.assert_close(cache, expected, atol=0, rtol=0)
 
 
@@ -125,11 +125,11 @@ def test_kv_scatter_replay_follows_its_index_buffers():
     v = torch.zeros_like(k)
     page = torch.zeros(4, device="cuda", dtype=torch.long)
     slot = torch.arange(4, device="cuda", dtype=torch.long)
-    _kv_scatter_nhd_eager(cache, 0, k, v, page, slot)  # warm the JIT
+    _kv_scatter_nhd_eager(cache[0], k, v, page, slot)  # warm the JIT
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _kv_scatter_nhd_eager(cache, 0, k, v, page, slot)
+        _kv_scatter_nhd_eager(cache[0], k, v, page, slot)
     k.copy_(torch.randn_like(k))
     v.copy_(torch.randn_like(v))
     page.copy_(torch.tensor([5, 5, 7, 1], device="cuda"))
