@@ -92,8 +92,8 @@ class Rebuilds:
                 kept[rid] = KeptIds(copy, prompt.dtype, array("i"))
 
     def keep_samples(
-        self, node_batch: ExecutingBatch, cpu_outputs, host_rows: HostRows | None,
-        skip_rids: Collection[int] = (),
+        self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
+        host_rows: HostRows | None, skip_rids: Collection[int] = (),
     ) -> None:
         """Append each kept row's sample, from the stop check's host copy, to its kept ids. ``skip_rids``
         are rows whose sample is not real, as for `Engine.step_finished`."""
@@ -116,7 +116,7 @@ class Rebuilds:
             pairs = []
             for rid in node_batch.request_ids:
                 out = cpu_outputs.get(rid)
-                if not isinstance(out, dict) or not out.get(name):
+                if not isinstance(out, Mapping) or not out.get(name):
                     continue
                 sample = out[name][0]
                 if sample.numel() != 1:
