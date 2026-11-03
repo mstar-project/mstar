@@ -16,7 +16,6 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
-    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +86,6 @@ class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # how a split step's labels reach this attention: a deployment's choice, set only by its
-    # `resources:` block (`apply_yaml_overrides`), never by a model. "ulysses" over KV stored by
-    # head, "all_gather" or "ring" over KV stored by position (`context_parallel`), "none" for no
-    # split steps; None takes the storage's default (`resolve_exchange`)
-    sp_exchange: SpExchange | None = field(default=None, init=False, repr=False)
-    # `sp_exchange` resolved against the pool's storage (`derive`)
-    split_exchange: SpExchange = field(default="ulysses", init=False, repr=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
@@ -106,33 +98,13 @@ class AttentionSpec(NodeResourceSpec):
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        problems = take_shard_edge(self, specs)
-        self.split_exchange = self.resolve_exchange(specs)
-        # a deployment's own setting, so refused at every SP size where it doesn't match the pool's
-        # storage, and where nothing reads it (`sequence_parallel_refusals`)
-        by_position = {"ulysses": False, "all_gather": True, "ring": True}.get(self.sp_exchange)
-        if by_position is not None and bool(specs[self.config.kv_cache].places_positions) != by_position:
-            storage = "by position (context_parallel: true)" if by_position else "by head (context_parallel off)"
-            problems.append(f"sp_exchange {self.sp_exchange!r} needs KV {self.config.kv_cache!r} stored {storage}")
-        return problems
+        return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
-        """``sp_exchange``, or where unset its pool's storage's default: ``ulysses`` by head, and
-        ``none`` by position, where splitting a step's tokens is the deployment's to opt into."""
-        if self.sp_exchange is not None:
-            return self.sp_exchange
-        return "none" if specs[self.config.kv_cache].places_positions else "ulysses"
+        """Its node's sequence shard's ``exchange`` over its pool's storage."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        # a paged pool serves whatever labels a step declares, so nothing rules out a split one
-        # reaching an attention that takes none
-        if self.split_exchange != "none":
-            return []
-        why = "sp_exchange unset, none over KV stored by position" if self.sp_exchange is None else "sp_exchange none"
-        return [
-            f"attention {self.resource_key!r} takes no split steps ({why}), and node {node!r}'s other attentions "
-            "split its steps: set its sp_exchange to all_gather or ring, or none on the others"
-        ]
+        return shard_exchange(self, specs, bool(specs[self.config.kv_cache].places_positions))
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
@@ -149,19 +121,13 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
-        sp_exchange: SpExchange | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
-        model's — an image that cannot build FA3 pins FA2 here. So is how a
-        split step reaches it over SP ranks (``sp_exchange``).
+        model's — an image that cannot build FA3 pins FA2 here.
 
         Cache geometry is not repeated here: it belongs to the KV resource
         this spec depends on, and is tuned under that resource's own block.
         """
-        if sp_exchange is not None:
-            if sp_exchange not in SP_EXCHANGES:
-                raise ValueError(f"sp_exchange must be one of {', '.join(SP_EXCHANGES)}; got {sp_exchange!r}")
-            self.sp_exchange = sp_exchange
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:

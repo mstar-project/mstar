@@ -383,10 +383,10 @@ def test_a_striped_shard_refuses_a_step_it_cant_stripe():
         _split(shard, [("r0", "main", 4), ("r0", "other", 4)], combined={("main", "other"): "cfg"})
 
 
-def test_a_node_whose_attentions_all_take_no_split_steps_plans_every_step_copied():
-    """sp_exchange none on every attention, set or unset over KV stored by position (a config from
-    before such a pool could split runs as it did): the shard derives that it splits nothing, so
-    the node runs copied (min_tokens 0 and all), as one without a shard; all_gather splits."""
+def test_a_shard_that_never_splits_plans_every_step_copied():
+    """Over KV stored by position the shard's exchange auto (a config from before such a pool could
+    split runs as it did) or none: the shard derives that it splits nothing, so the node runs
+    copied (min_tokens 0 and all), as one without a shard; all_gather splits."""
     for choice, splits in ((None, False), ("none", False), ("all_gather", True)):
         specs = [
             KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
@@ -394,7 +394,7 @@ def test_a_node_whose_attentions_all_take_no_split_steps_plans_every_step_copied
             AttentionSpec("attn", {"n"}, AttentionConfig(kv_cache="kv")),
             SeqShardSpec("shard", {"n"}, ("main",), 0),
         ]
-        apply_yaml_overrides(specs, {"resources": {} if choice is None else {"attn": {"sp_exchange": choice}}})
+        apply_yaml_overrides(specs, {"resources": {} if choice is None else {"shard": {"exchange": choice}}})
         spec = resolve_spec_dependencies(specs)["shard"]
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup(0, 0, [0, 1]))
         shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))

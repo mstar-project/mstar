@@ -305,8 +305,8 @@ class Qwen3OmniModel(Model):
                     kv_cache=THINKER_KV
                 )
             ),
-            # every walk may split; over KV stored by position only where the deployment sets an
-            # sp_exchange that splits. A decode step never does.
+            # every walk may split; over KV stored by position only where the deployment sets the
+            # shard's exchange to all_gather or ring. A decode step never does.
             SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0),
             PositionSpec(
                 resource_key=TALKER_POS,

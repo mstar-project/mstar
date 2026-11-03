@@ -423,11 +423,11 @@ class _Case:
 
 def _cp_attention(
     joint: JointGroups, device: torch.device, dtype: torch.dtype, mla=False, num_kv_heads=1, num_qo_heads=Q_HEADS,
-    shard: SequenceShard | None = None, sp_exchange: str | None = None, kv_resource=None, **attention,
+    shard: SequenceShard | None = None, exchange: str = "auto", kv_resource=None, **attention,
 ):
     """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool, and this
-    rank's placement; under ``shard`` (key ``"shard"``) with its ``sp_exchange``, bound to the KV
-    resource ``kv_resource(placement)`` builds (by default one holding only the placement)."""
+    rank's placement; under ``shard`` (key ``"shard"``) with its spec's ``exchange``, bound to the
+    KV resource ``kv_resource(placement)`` builds (by default one holding only the placement)."""
     layout = dict(head_dim=HEAD_DIM)
     if mla:
         layout = dict(head_dim=LATENT, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE)
@@ -436,14 +436,15 @@ def _cp_attention(
         num_layers=1, num_kv_heads=num_kv_heads, max_seq_len=64, num_qo_heads=num_qo_heads,
         max_num_pages=16, page_size=CP_PAGE, context_parallel=True, **layout,
     ))
-    info = EngineResourceInfo(
-        device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies={"kv": kv},
-        head_shards=joint.tp_group.world_size,
-    )
+    dependencies = {"kv": kv}
     spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
     if shard is not None:
-        spec.shard_key, spec.sp_exchange = "shard", sp_exchange
-        spec.split_exchange = spec.resolve_exchange({"kv": kv})
+        spec.shard_key = "shard"
+        dependencies["shard"] = SeqShardSpec("shard", {NODE}, ("main",), 0, exchange=exchange)
+    info = EngineResourceInfo(
+        device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies=dependencies,
+        head_shards=joint.tp_group.world_size,
+    )
     attn = AttentionManager.build(spec, info)
     placement = kv.config.place(joint, "kv")
     # by default the KV resource's one field attention reads
@@ -508,7 +509,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
     against one rank attending every key; every rank issues the same collectives, same shapes.
     ``captured`` (NCCL only) does what production does for a graph bucket: captures ``run`` with
     its collectives on a step of exactly the bucket's tokens on every rank, then plans the step and
-    replays it. ``causal`` is the step's. With ``split`` (an ``sp_exchange``, SP placement), the
+    replays it. ``causal`` is the step's. With ``split`` (the shard's ``exchange``, SP placement), the
     step runs through a sequence shard instead (``_split_step``), whose ring hops pair up rank by
     rank rather than match."""
     # FlashInfer's MLA plan needs ~17 MB on a GPU
@@ -625,7 +626,7 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         return kv
 
     kv = None
-    attn, _ = _cp_attention(joint, device, dtype, shard=shard, sp_exchange=split, kv_resource=placed_kv)
+    attn, _ = _cp_attention(joint, device, dtype, shard=shard, exchange=split, kv_resource=placed_kv)
     attend = AttentionCallable(kv, attn)
     attend.bind_step("main")
     attend.set_layer_idx(0)
@@ -692,7 +693,7 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world))
         shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
         attn, _ = _cp_attention(
-            joint, CPU, torch.float32, shard=shard, sp_exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
+            joint, CPU, torch.float32, shard=shard, exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
         )
         plans.clear()
         _plan(attn, case, shard=shard)
@@ -782,8 +783,8 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     # its decode lse base isn't known
     (dict(flashinfer_backend="cudnn"), "flashinfer_backend 'cudnn'"),
     # only FlashInfer's paged manager plans a ring
-    (dict(mla=True, shard=SequenceShard(("main",), 0, None, 0, CommGroup.trivial()), sp_exchange="ring"),
-     "sp_exchange 'ring' on backend 'flashinfer_mla'"),
+    (dict(mla=True, shard=SequenceShard(("main",), 0, None, 0, CommGroup.trivial()), exchange="ring"),
+     "sequence shard exchange 'ring' on backend 'flashinfer_mla'"),
 ])
 def test_attention_a_placed_pool_cannot_serve_is_refused_at_build(attention, refused):
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
@@ -886,7 +887,7 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
 
 
 def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_shard(monkeypatch):
-    """sp_exchange ring makes the sequence shard depend on the pool whose stored positions it
+    """The shard's exchange ring makes it depend on the pool whose stored positions it
     stripes by: the engine takes that edge to a pool stored by position, and plans the pool
     first whatever the keys' order."""
     # one rank of the two, with no group to connect
@@ -901,7 +902,7 @@ def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_
         AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
         SeqShardSpec("a_shard", {NODE}, ("main",), 0),
     ]
-    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}}})
+    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "a_shard": {"exchange": "ring"}}})
     engine = Engine(graph_runtime=None)
     engine.load_model({NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None)
     order = engine._runner.order
@@ -1508,7 +1509,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
         specs = [spec for spec in omni.get_node_resources() if spec.resource_key in keys]
         overrides = {
             THINKER_KV: dict(max_num_pages=32, page_size=CP_PAGE, max_seq_len=64, context_parallel=placed),
-            **({THINKER_ATTN: dict(sp_exchange=exchange)} if exchange else {}),
+            **({THINKER_SHARD: dict(exchange=exchange)} if exchange else {}),
         }
         apply_yaml_overrides(specs, {"resources": overrides})
         # the engine's order: derive, then the SP refusals

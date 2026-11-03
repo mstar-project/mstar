@@ -339,43 +339,32 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
 
 @pytest.mark.parametrize("specs, group, resources, pattern", [
     ([_shard()], dict(sp_size=2), {},
-     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and no attention there takes split steps"),
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and its steps never split"),
     ([_shard(), _attention()], dict(sp_size=4), {},
      r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
      r"head, which don't split 4 ways per TP rank"),
     # each row split over KV stored by position
     ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention()], dict(sp_size=2),
-     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
+     {"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}},
      r"node_groups\[0\]: node 'llm' splits each row of its steps \(axis 1\) over 2 SP ranks, and KV 'kv' stores "
      r"them by position"),
-    # sp_exchange against the pool's storage (at one SP rank any setting is refused, below)
-    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "ring"}},
-     r"resources.attn: sp_exchange 'ring' needs KV 'kv' stored by position \(context_parallel: true\)"),
-    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
-     r"resources.attn: sp_exchange 'all_gather' needs KV 'kv' stored by position"),
-    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ulysses"}},
-     r"resources.attn: sp_exchange 'ulysses' needs KV 'kv' stored by head \(context_parallel off\)"),
-    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "zigzag"}},
-     r"resources.attn: sp_exchange must be one of none, ulysses, all_gather, ring; got 'zigzag'"),
-    # a deployment's sp_exchange where the node's steps never split would be silently ignored
-    ([_attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
-     r"node_groups\[0\]: node 'llm' declares no SeqShardSpec, so its steps never split, and attention 'attn' "
-     r"sets sp_exchange 'all_gather'"),
-    ([_shard(), _attention()], dict(sp_size=1), {"attn": {"sp_exchange": "ulysses"}},
-     r"node_groups\[0\]: node 'llm' runs on one SP rank, so its steps never split, and attention 'attn' sets "
-     r"sp_exchange 'ulysses'"),
-    # every attention none over KV stored by head: its SP ranks would only share heads
-    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "none"}},
-     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and no attention there takes split steps"),
-    # a paged pool serves every label a step declares, so a split one would reach the attention
-    # taking none (unset over position storage)
-    ([_shard(), _attention(), AttentionSpec("attn2", {"llm"}, AttentionConfig(kv_cache="kv"))], dict(sp_size=2),
-     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
-     r"node_groups\[0\]: attention 'attn2' takes no split steps \(sp_exchange unset, none over KV stored by "
-     r"position\), and node 'llm''s other attentions split its steps"),
+    # the shard's exchange against the node's storage, at any SP size
+    ([_shard(), _attention()], dict(sp_size=1), {"shard": {"exchange": "ring"}},
+     r"resources.shard: exchange 'ring' attends split steps over KV stored by position, and no KV pool on nodes "
+     r"\['llm'\] sets context_parallel: true"),
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "all_gather"}},
+     r"resources.shard: exchange 'all_gather' attends split steps over KV stored by position"),
+    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "shard": {"exchange": "ulysses"}},
+     r"resources.shard: exchange 'ulysses' trades a split step's tokens for KV heads, and nodes \['llm'\] store KV "
+     r"by position"),
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "zigzag"}},
+     r"resources.shard: exchange must be one of auto, none, ulysses, all_gather, ring; got 'zigzag'"),
+    # never split over KV stored by head: its SP ranks would only share heads
+    ([_shard(), _attention()], dict(sp_size=2), {"shard": {"exchange": "none"}},
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and its steps never split"),
     # a ring stripes steps by stored position, which Ulysses' ragged plan doesn't read
     ([_shard(), _attention(), _ulysses(heads=2)], dict(sp_size=2),
-     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}},
+     {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}},
      r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', whose plan reads a split "
      r"label's tokens in step order, and node 'llm''s sequence shard stripes them by KV 'kv''s positions"),
     ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
@@ -389,9 +378,8 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
-        "ulysses_by_position", "unknown_exchange", "exchange_without_a_shard", "exchange_on_one_sp_rank",
-        "none_by_head", "none_beside_a_split", "ring_beside_ragged_ulysses", "ulysses_heads", "axis0_cross",
-        "shard_misses_a_node"])
+        "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
+        "axis0_cross", "shard_misses_a_node"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
@@ -401,17 +389,18 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
 @pytest.mark.parametrize("specs, resources", [
     ([_shard(), _attention()], {}),
     ([_attention()], {"kv": {"context_parallel": True}}),
+    ([_shard(), _attention()], {"shard": {"exchange": "ulysses"}}),
     # a strategy for split steps is a no-op on a node that never splits
     ([_ulysses(heads=3), _attention()], {"kv": {"context_parallel": True}}),
-    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}}),
-    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}}),
     # DCP alone: the node runs copied, as one without a shard
     ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
-    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "shard": {"exchange": "none"}}),
     # a model's shard over a node with no attention that takes split steps is a no-op too
     ([_shard()], {"kv": {"context_parallel": True}}),
-], ids=["heads", "positions_copied", "ulysses_without_a_shard", "all_gather", "ring", "positions_unset", "none",
-        "shard_without_an_attention"])
+], ids=["heads", "positions_copied", "ulysses", "ulysses_without_a_shard", "all_gather", "ring", "positions_auto",
+        "none", "shard_without_an_attention"])
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
@@ -423,8 +412,8 @@ def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
         "node 'llm' splits tokens over SP ranks, which expert parallelism (ep_config) can't",
     ]
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig()) == []
-    # a node whose attentions take no split steps runs copied, so it takes what one without a shard does
-    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}})
+    # a node that never splits (auto over KV stored by position) takes what one without a shard does
+    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}}})
     resolve_spec_dependencies(specs)
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == []
 
@@ -759,13 +748,13 @@ def test_a_lora_deployment_passes(tmp_path):
 
 @pytest.mark.parametrize("exchange", ["all_gather", "ring", None])
 def test_lora_over_kv_stored_by_position_is_refused_where_the_steps_split(exchange, tmp_path):
-    """Storing KV by position doesn't make a node's steps run copied: the attention's sp_exchange
-    decides, and a split step holds a shard of each row's tokens, which LoRA can't lay out."""
+    """Storing KV by position doesn't make a node's steps run copied: the shard's exchange decides,
+    and a split step holds a shard of each row's tokens, which LoRA can't lay out."""
     model = _paged_llm(_shard(), _attention())
     model = _LoraModel([_lora_spec()], specs=model._specs, kv_labels=model._kv_labels)
     resources = {"lora": {"max_slots": 2}, "kv": {"context_parallel": True}}
     if exchange is not None:
-        resources["attn"] = {"sp_exchange": exchange}
+        resources["shard"] = {"exchange": exchange}
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     if exchange is None:
         assert _validate(model, cfg).worker_graphs
