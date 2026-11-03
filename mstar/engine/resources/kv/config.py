@@ -382,8 +382,6 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
-    arrival: int | None = None
     # `unpausable`: the request streams an output that can't pause, set by the conductor.
     # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
     # A pool that decides admission reads both at the request's first `KVManager.ask`.
@@ -399,7 +397,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        arrival: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -431,8 +428,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if arrival is not None:
-            self.arrival = arrival
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):

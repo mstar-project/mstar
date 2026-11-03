@@ -122,12 +122,12 @@ Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-gra
 
 ```python
 @dataclass
-class KVReqConfig(ResourceReqConfig):
+class CurrentForwardPassInfo:
     ...
     arrival: int | None = None   # set by the conductor when it takes the request
 ```
 
-The conductor numbers each request from a single counter, in the order it takes them, and sets it on every pool's config. A dropped request keeps its number. Each pool's queue and its victim choice go by it.
+The conductor numbers each request from a single counter, in the order it takes them, and sends the number with the request. A dropped request keeps its number. The runner keeps the requests in that order, and each pool's queue and its victim choice go by it.
 
 A number set by each worker won't work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.
 
@@ -135,14 +135,14 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). One that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
 1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
 2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
-3. Otherwise, R waits until the pool's room grows past what its failed grant saw.
+3. Otherwise, R keeps its reservation and asks the pool for its shortage. It waits in the queue at its arrival, parked as a new prompt is, until the room covers the shortage.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
@@ -154,7 +154,7 @@ Why this shape:
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
 - **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
-- **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
+- **A waiting request waits in the queue.** It is measured again only when the room grows, and let go only once the room covers its whole shortage. Its arrival keeps newer prompts from taking that room first.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
 
@@ -243,8 +243,8 @@ Lifecycle:
 A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
 
 ```
-need(V) = for each label, the pages V's kept history fills, plus 1,
-          capped at V's footprint
+need(V) = the larger of V's prompt and, for each label, the pages
+          V's kept history fills, plus 1, capped at V's footprint
 
 return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
@@ -256,7 +256,7 @@ A request on the host asks again when it moves there, and is admitted the same w
 
 Why this shape:
 
-- **A whole history and a page, not the prompt.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again.
+- **A whole history and a page, not the prompt alone.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again. A victim dropped partway through its prompt still writes the rest of it, so it returns with the whole prompt at least.
 - **Capped at the footprint.** The ingest 400 bounds the footprint, not the history plus a page.
 - **Outside `check_ready`.** After a partial cache hit, `admit_retrieve` would move the position counter past what the rebuild restores, so no `admit_retrieve` runs on a request between its drop and the end of its rebuild.
 

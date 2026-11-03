@@ -712,10 +712,9 @@ class _Rank:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _is_tp_follower_node = Worker._is_tp_follower_node
     _push_back_batch = Worker._push_back_batch
-    _preempt = Worker._preempt
 
     def __init__(self, *, leader: bool):
-        self._kv_caches = {}
+        self._preemption = SimpleNamespace(preempt=lambda node_batch: False)
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
@@ -944,7 +943,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._rebuilds = Rebuilds({}, {})
-        self._kv_keys, self._kv_caches, self._dropped, self._preempted = {}, {}, {}, {}
+        self._dropped, self._preemption = {}, SimpleNamespace(remove_request=lambda rid: None)
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it

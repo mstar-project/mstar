@@ -68,6 +68,8 @@ class CPUPagePool:
         self.config = config
         self.arena = arena
         self.index = PrefixIndex(arena)
+        # the arena reports owner changes to the index, so `room` reads the evictable set
+        arena.index = self.index
 
         # same layout as the device cache, on pinned memory so the copies can
         # be async
@@ -299,7 +301,7 @@ class CPUPagePool:
 
     def room(self) -> int:
         """Free pages plus the cached pages `place` can evict, less the pages set aside for requests."""
-        return self.arena.num_free + self.index.freeable() - self._set_aside(None)
+        return self.arena.num_free + len(self.index.evictable()) - self._set_aside(None)
 
     def takes(self, pages: int, keys: list[bytes]) -> int:
         """How many pages `place` takes out of `room` for a stream ``pages`` long, filed under ``keys``. A page

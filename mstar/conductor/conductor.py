@@ -1386,7 +1386,6 @@ class Conductor:
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
-                arrival=arrival,
             )
         if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
             max_output_tokens, loop_caps = self._fit_loop_caps(
@@ -1490,7 +1489,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(

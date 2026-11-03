@@ -39,6 +39,10 @@ class CurrentForwardPassInfo:
     # arrives with its own.
     rid_handle: int = -1
 
+    # the request's place in the conductor's arrival order, the same on every
+    # worker, or None when the conductor gave it no number
+    arrival: int | None = None
+
     # resource label -> the config this request's resources were opened
     # with. Sampling params, whether it needs CFG, retention: a request's
     # knobs live here now, one entry per resource that has any.
