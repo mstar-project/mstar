@@ -350,6 +350,9 @@ class RustGraphRuntime(GraphRuntime):
         self._sharding.pop(rid, None)
         self._rust.remove_request(rid)
 
+    def set_weight_version(self, version: str | None) -> None:
+        self._rust.set_weight_version(version)
+
     def idle_counts(self) -> tuple[int, int, int]:
         return tuple(self._rust.idle_counts())
 

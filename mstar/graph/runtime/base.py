@@ -892,6 +892,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
+    def set_weight_version(self, version: str | None) -> None:
+        """Stamp ``version`` on every result frame from now on, as
+        ``metadata["weight_version"]``. The worker sets it once a reload
+        copies; None (the start) leaves the metadata empty."""
+        pass
+
+    @abstractmethod
     def idle_counts(self) -> tuple[int, int, int]:
         """``(requests, parked_routes, staged_specs)``: requests still
         registered, routing parked between ``complete_and_route_batch`` and

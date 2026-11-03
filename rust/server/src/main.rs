@@ -1286,7 +1286,13 @@ async fn generate_finish(
             .or_default()
             .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
     }
-    Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+    let mut body = json!({"request_id": request_id, "outputs": outputs});
+    // As the Python /generate: only once a reload named a version, which every
+    // chunk carries the same.
+    if let Some(v) = chunks.iter().find_map(|c| c.metadata.get("weight_version")) {
+        body["weight_version"] = v.clone();
+    }
+    Json(body).into_response()
 }
 
 /// The Python `/generate`'s refusals for `video_frame`, worded the same: raw

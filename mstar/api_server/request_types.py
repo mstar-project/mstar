@@ -60,6 +60,9 @@ class RequestComplete:
     # When the conductor took the request in (queued or admitted), in the same
     # clock as conductor_ingest_time. Only stamped while metrics are on.
     conductor_arrival_time: float | None = None
+    # The weight version the request was admitted under; None until a reload
+    # names one.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -72,6 +75,8 @@ class RequestFailed:
     request_id: str
     error_message: str
     status: int = 500
+    # As on RequestComplete; None also for a request never admitted.
+    weight_version: str | None = None
 
 
 @dataclass

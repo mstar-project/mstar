@@ -191,6 +191,8 @@ class PythonGraphRuntime(GraphRuntime):
         # Streaming ingests a prep staged, parked until commit_speculation
         # settles them: spec_id -> [(rid, node, into_signals, into_next_iter)].
         self._staged_specs: dict[int, list[tuple]] = {}
+        # every result frame's metadata; see set_weight_version
+        self._result_metadata: dict[str, str] = {}
         self._spec_counter = 0
 
         # worker graph info
@@ -333,6 +335,9 @@ class PythonGraphRuntime(GraphRuntime):
         # DIFFERENT request; see GraphRuntime.remove_request for what has to be
         # purged alongside this.
         self._rids.release(rid)
+
+    def set_weight_version(self, version: str | None) -> None:
+        self._result_metadata = {} if version is None else {"weight_version": version}
 
     def idle_counts(self) -> tuple[int, int, int]:
         return len(self._request_info), len(self._completions), len(self._staged_specs)
@@ -1690,7 +1695,12 @@ class PythonGraphRuntime(GraphRuntime):
                             modality=edge.output_modality,
                             graph_edge=edge,
                             loop_indices=nested_idxs.get(rid),
-                            metadata={} if logprob is None else {"logprobs": [logprob]},
+                            # a fresh dict: the api server keeps it per tensor;
+                            # logprobs first, as the Rust runtime writes them
+                            metadata=(
+                                dict(self._result_metadata) if logprob is None
+                                else {"logprobs": [logprob], **self._result_metadata}
+                            ),
                         ),
                     ))
 
@@ -1777,6 +1787,7 @@ class PythonGraphRuntime(GraphRuntime):
                 frame = frames[(signal, modality)] = ResultTokens(
                     request_ids=[], values=[], loop_indices=[],
                     signal=signal, modality=modality, logprobs=[] if completion.logprobs else None,
+                    metadata=dict(self._result_metadata),
                 )
             frame.request_ids.append(self.get_rid_string(rid))
             frame.values.append(value)

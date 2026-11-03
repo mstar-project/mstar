@@ -380,6 +380,9 @@ class RequestData:
     # when the conductor took it in (queued, or admitted on arrival); None
     # unless metrics are on
     conductor_arrival_time: float | None = None
+    # the committed weight version at admission: no request runs across a
+    # reload, so every output it gets was made by these weights
+    weight_version: str | None = None
     graph_timings: GraphTimings = field(default_factory=dict)
     # Tensor-transport profiling merged across workers. Keyed so repeated
     # WorkerGraphsDone updates (cumulative per worker) replace rather than
@@ -1023,6 +1026,7 @@ class Conductor:
                 continue  # completed or aborted, the client has already heard
             pending.append(request_id)
         for request_id in pending:
+            admitted = self.requests.get(request_id)  # None while queued
             self.communicator.send(
                 "api_server",
                 APIServerMessage(
@@ -1031,6 +1035,7 @@ class Conductor:
                         request_id=request_id,
                         error_message=error_message,
                         status=status,
+                        weight_version=None if admitted is None else admitted.weight_version,
                     ),
                 ),
             )
@@ -1463,6 +1468,7 @@ class Conductor:
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
+            weight_version=None if self._generation is None else self._generation.weight_version,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1655,6 +1661,7 @@ class Conductor:
                 ),
             )
         if dr.failure_error is not None:
+            admitted = self.requests.get(request_id)
             self._send_for_teardown(
                 request_id, "api_server",
                 APIServerMessage(
@@ -1663,6 +1670,7 @@ class Conductor:
                         request_id=request_id,
                         error_message=dr.failure_error,
                         status=dr.failure_status,
+                        weight_version=None if admitted is None else admitted.weight_version,
                     ),
                 ),
             )
@@ -1846,6 +1854,7 @@ class Conductor:
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
                     conductor_arrival_time=request_data.conductor_arrival_time,
+                    weight_version=request_data.weight_version,
                 )
             )
         )

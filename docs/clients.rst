@@ -65,6 +65,14 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
      }
    }
 
+Once a deployment has reloaded its weights in place (``weight_version`` set by the
+update), every output chunk's ``metadata`` carries ``weight_version``, the version its
+request was admitted under, and so does a non-streaming response at the top level. A
+request never runs across a reload, so all of a request's chunks carry the same one.
+An error chunk carries it when the request was admitted; one for a request refused
+before admission (for example while generation is paused) has none. Before any
+reload the field is absent.
+
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
 arrive. A request that fails after its stream has started ends it with one chunk of
 modality ``error`` (the HTTP status in ``metadata.status``); nothing follows it. A client that sends ``Accept: application/vnd.mstar.frames`` receives
