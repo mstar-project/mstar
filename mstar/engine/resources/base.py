@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -109,9 +110,17 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class Residency(IntEnum):
+    """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
+    from its ids. Ordered by how far the state is from the device."""
+    RESIDENT = 0
+    ON_HOST = 1
+    DROPPED = 2
+
+
 class Rebuild(NamedTuple):
-    """What a dropped request's rebuild rows write: ``ids`` without the last one, which the next decode
-    step reads. ``walk`` is the last row's, which writes the ids sampled since."""
+    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
+    The last id is the one the next decode step reads."""
     walk: str
     ids: Sequence[int]
 
@@ -447,8 +456,13 @@ class Resource(ABC):
     def supports_eviction(self):
         return False
 
-    def is_offloaded(self, rid: str) -> bool:
-        return False
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
+    def residency(self, rid: str) -> Residency:
+        return Residency.RESIDENT
 
     def offload(self, rid: str) -> int:
         """Move the request's state off-device. Returns what was reclaimed."""
@@ -463,20 +477,21 @@ class Resource(ABC):
         ids, and keep the rest. Returns what was reclaimed."""
         return 0
 
-    def is_resident(self, rid: str) -> bool:
-        """False while the request's state is off the device, offloaded or dropped."""
-        return True
-
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Take in what the dropped request's rebuild rows write, before the first is queued."""
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's last rebuild row has run."""
+        """The dropped request's rebuild has run its last chunk."""
         return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def can_offload(self, rid: str) -> bool:
+        """Whether the request may be moved off the device to free room. If this is False, the request is no
+        eviction candidate however much it holds."""
         return True
 
     def can_reload(self, rid: str) -> bool:
@@ -493,11 +508,6 @@ class Resource(ABC):
         `get_offload_priority`, which orders candidates rather than sizing them.
         """
         return 0
-
-    def frees_on_remove(self, rid: str) -> int:
-        """What a teardown of the request hands back, which is `reclaimable` unless a resource keeps some
-        requests from the offload."""
-        return self.reclaimable(rid)
 
     def get_offload_priority(self, rid: str) -> float:
         """How much this resource wants ``rid`` gone, higher being more.

@@ -6,7 +6,6 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
-from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
 
 
@@ -31,9 +30,6 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         enable_nvtx=False,
         _phase_period=0,
         request_state=None,
-        _rebuilds=Rebuilds({}, {}),
-        _dropped={},
-        _preempted={},
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
@@ -46,7 +42,7 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
 
 def _pending():
     return SimpleNamespace(
-        batch=SimpleNamespace(request_to_worker_graph={0: 0}), node_name="LLM", graph_walk="mixed",
+        batch=object(), node_name="LLM", graph_walk="mixed",
         node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
     )
 

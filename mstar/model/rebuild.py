@@ -9,17 +9,17 @@ from mstar.model.submodule_base import chunk_tick_name
 
 @dataclass(frozen=True)
 class RebuildPolicy:
-    """Rebuild rows recompute a request's prompt and every id it has sampled since, but the last, which
-    the next decode step reads. Each row runs one of the request's prefill steps again, in order.
+    """One row of the walk a request prefilled in recomputes its prompt and every id it has sampled
+    since, but the last, which the next decode step reads.
 
-    ``walk`` prefills a prompt of ids. ``copied_inputs`` maps each other walk that prefills a prompt or
-    part of one, such as an image, to the inputs besides the ids that the node reads there. The worker
-    copies those inputs to the host when the walk prefills a request, and the request's rebuild row reads
-    them again.
+    ``walk`` prefills a prompt of ids. ``copied_inputs`` maps each other walk that prefills a prompt,
+    such as one with images, to the inputs besides the ids that the node reads there. The worker copies
+    those inputs to the host when the walk prefills a request, and the request's rebuild row reads them
+    again.
 
-    ``ids_input`` is the input that carries the prompt's ids, and a row's ids go under it.
-    ``sample_output`` is the output that carries the one id the prefill samples, and ``loop`` the loop
-    each of whose iterations samples one.
+    ``ids_input`` is the input that carries the prompt's ids, and the row's ids go under it.
+    ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of
+    whose iterations samples one.
     """
     walk: str
     ids_input: str
@@ -40,40 +40,28 @@ class RebuildPolicy:
         )
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> None:
-        """Raise when the policy names a walk, input, output or loop that ``node`` doesn't have in ``graphs``,
-        or when a walk that reads the ids doesn't output the sample, since such a walk can end a prompt.
+        """Raise unless each prefill walk runs ``node``, which reads there only the ids and the inputs the
+        worker copies, and outputs ``sample_output``, and some walk runs ``node`` inside ``loop``.
 
         The tick of ``node``'s chunk Loop in a walk is left out of what it reads, since the tick carries
         no tensor."""
-        reads = self._reads(node, graphs, self.walk)
-        if reads != {self.ids_input}:
-            raise ValueError(
-                f"{node}'s rebuild row carries only {self.ids_input!r} in {self.walk!r}, and {node} reads "
-                f"{sorted(reads)} there"
-            )
-        for walk, copied in sorted(self.copied_inputs.items()):
-            reads = self._reads(node, graphs, walk)
-            if reads - {self.ids_input} != set(copied):
-                raise ValueError(
-                    f"{node}'s rebuild row carries {sorted(copied)}, with or without the ids, in {walk!r}, and "
-                    f"{node} reads {sorted(reads)} there"
-                )
         for walk in sorted(self.prefill_walks):
-            graph_node = graphs[walk].get_nodes()[node]
-            if self.ids_input in graph_node.input_names and self.sample_output not in {
-                edge.name for edge in graph_node.outputs
-            }:
-                raise ValueError(
-                    f"{node}'s rebuild policy keeps samples from {self.sample_output!r}, which {node} doesn't "
-                    f"output in {walk!r}, where it reads {self.ids_input!r}"
-                )
+            self._check_walk(node, graphs, walk, {self.ids_input, *self.copied_inputs.get(walk, ())})
         if not self.loop_walks(node, graphs):
             raise ValueError(f"{node}'s rebuild policy names loop {self.loop!r}, which runs {node} in no walk")
 
-    @staticmethod
-    def _reads(node: str, graphs: Mapping[str, GraphSection], walk: str) -> set[str]:
+    def _check_walk(self, node: str, graphs: Mapping[str, GraphSection], walk: str, carried: set[str]) -> None:
         graph = graphs.get(walk)
         graph_node = None if graph is None else graph.get_nodes().get(node)
         if graph_node is None:
             raise ValueError(f"{node}'s rebuild policy names walk {walk!r}, which doesn't run {node}")
-        return set(graph_node.input_names) - {chunk_tick_name(node, walk)}
+        reads = set(graph_node.input_names) - {chunk_tick_name(node, walk)}
+        if reads != carried:
+            raise ValueError(
+                f"{node}'s rebuild row carries {sorted(carried)} in {walk!r}, and {node} reads {sorted(reads)} there"
+            )
+        if self.sample_output not in {edge.name for edge in graph_node.outputs}:
+            raise ValueError(
+                f"{node}'s rebuild policy keeps samples from {self.sample_output!r}, which {node} doesn't output "
+                f"in {walk!r}"
+            )

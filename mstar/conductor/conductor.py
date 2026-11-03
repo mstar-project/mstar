@@ -2,6 +2,7 @@ import atexit
 import hashlib
 import itertools
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -34,7 +35,7 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import mark_guaranteed, refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import mark_unpausable, refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.lora.config import (
     LORA_ADAPTER_KWARG,
     LORA_RESOURCE_KEY,
@@ -504,6 +505,7 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        self._unpausable_outputs = frozenset(self.model_config.get("unpausable_outputs", model.UNPAUSABLE_OUTPUTS))
         self._settle_lora_adapters(lora_adapter_digests)
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
@@ -1385,7 +1387,6 @@ class Conductor:
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
-                arrival=arrival,
             )
         if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
             max_output_tokens, loop_caps = self._fit_loop_caps(
@@ -1393,7 +1394,10 @@ class Conductor:
             )
             for key, cfg in resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        mark_guaranteed(resource_configs, body.streaming, body.initial_output_modalities)
+        mark_unpausable(
+            resource_configs,
+            body.streaming and not self._unpausable_outputs.isdisjoint(body.initial_output_modalities),
+        )
         for specs in self._resource_specs():
             for key, cfg in resource_configs.items():
                 cfg.validate(specs.get(key))
@@ -1486,7 +1490,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(
@@ -1605,8 +1610,8 @@ class Conductor:
     def _send_for_teardown(self, request_id: str, entity: str, message):
         """Send one teardown message; a send that raises is logged so it can't
         skip the sends, drain record or free that follow it. A dead peer does
-        not raise on either transport (the send queues, then blocks at the
-        high-water mark), so this is only a backstop."""
+        not raise (the send queues, then blocks at the high-water mark), so
+        this is only a backstop."""
         try:
             self.communicator.send(entity, message)
         except Exception:
@@ -2312,6 +2317,23 @@ class Conductor:
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])
 
+    def _ms_to_next_timed_check(self) -> int:
+        """How long the run loop can wait for a message: until the liveness
+        check, the earliest expiry deadline or the metrics status.
+
+        At least 1 ms. The transports read a negative timeout as forever or as
+        an error, and a check left due by a pass that raised before reaching it
+        must not turn the loop into a spin."""
+        due = self._next_liveness_check
+        if self._status_interval_s is not None:
+            due = min(due, self._next_status)
+        for deadlines in (
+            self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
+        ):
+            if deadlines:
+                due = min(due, deadlines[0][0])
+        return max(1, math.ceil((due - time.perf_counter()) * 1000))
+
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
 
@@ -2379,4 +2401,6 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            time.sleep(0.001)
+            # No wakeup event is registered: nothing in this process makes work
+            # outside a message, and what isn't a message is a timed check.
+            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())

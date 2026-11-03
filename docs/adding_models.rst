@@ -201,8 +201,9 @@ You must implement these abstract methods:
    value that ``process_prompt`` moves onto a tensor edge must not travel there
    too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
    originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
-   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
-   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   lists ``robot_state``, and Cosmos3 lists ``action`` and ``robot_state`` (it passes
+   only their sizes on, as ``action_shape`` and ``robot_state_dim`` metadata). A tensor
+   left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
 
 .. note::
@@ -359,46 +360,39 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request with a ``"rows"`` span can't be rebuilt, so in a pool that decides
-  admission it reserves its whole footprint and is never preempted. A request with ``"digest"``
-  spans can be rebuilt at one rank when the node's ``RebuildPolicy`` names their walks in
-  ``copied_inputs``: the worker keeps host copies of the inputs listed there, and a rebuild row runs
-  each prefill step again from them. The last span must be an ``"ids"`` span, and a label that
-  carries prefix keys must key every span. It is guaranteed otherwise. A row gives its walk the
-  step's ids as the step read them, the last row with the samples appended to its last tensor. A row
-  with host copies runs under its step's metadata, and a row of ids alone under the request's own, so
-  the walk must read its prompt in that shape.
+  admission it can only move to the host, into room set aside at its first ask, and reserves its
+  whole footprint when the host can't set it aside. A request with ``"digest"`` spans can be
+  rebuilt at one rank when the node's ``RebuildPolicy`` names its walk in ``copied_inputs``: the
+  worker keeps host copies of the inputs listed there, and the rebuild row reads them again. Every
+  span of the label must be on that walk, the last must be an ``"ids"`` span, and the label must
+  key none of them for the prefix cache. It is treated as a ``"rows"`` span otherwise. The rebuild
+  row gives the walk its ids as the prefill row read them, with the samples appended to the last
+  tensor, under the prefill row's step metadata, so the walk must read its prompt in that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
 - ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
+- ``max_growth``: the most slots ``growth`` writes in all, for loops that end before their
+  caps, as Nemotron's do.
 - ``scratch``: the most KV slots one non-committing step writes past the committed length.
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
+The footprint adds the spans, the growth at each loop's iterations up to ``max_growth`` and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
 is bigger than its pool with a 400 at intake, and ``KVReqConfig.loop_room`` cuts the default
 length of a request that asks for none until it fits. With every loop at 0 iterations, the
 same sum is the prompt a request reserves when its pool admits it.
-
-A node whose requests can be dropped and rebuilt returns a
-:class:`mstar.model.rebuild.RebuildPolicy` for it from ``rebuild_policies()``: the walk that
-prefills a prompt of ids, the input that carries the ids, the output that carries each sampled
-id, the loop that samples, and under ``copied_inputs`` each other prefill walk with the inputs
-the node reads there besides the ids. The worker checks the policy against the graphs at boot,
-and a walk that reads the ids must output the sample. The worker records a request's prefill
-steps until its first kept sample, so only the last prefill step may keep one. A node without a
-policy never drops a request.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
@@ -1525,6 +1519,11 @@ methods are:
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
    row whose token is a stop id (the Qwen3-TTS Talker).
+   Only an output that leaves by a streaming edge can be withheld (any other consumer
+   would wait for an item that never comes), and not one that a node this worker
+   speculates into reads, nor the loop-back signal. Startup refuses a
+   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
+   checked.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of

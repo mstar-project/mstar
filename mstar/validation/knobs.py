@@ -1,30 +1,19 @@
-"""The environment knobs each worker reads at startup to pick its graph runtime,
-transport and wire codec. Workers inherit the conductor's environment."""
+"""What each worker checks in its environment at startup: the Rust extension
+and the knob that picks its wire codec. Workers inherit the conductor's
+environment, so the conductor checks these once, before any rank starts."""
 
 from collections.abc import Iterator
 
 from mstar.communication.codec import default_codec
-from mstar.communication.communicator import requested_transport
-from mstar.graph.runtime.utils import requested_graph_runtime
+from mstar.graph.runtime.utils import require_rust_extension
 
 
 def check_knobs() -> Iterator[str]:
-    runtime = transport = None
     try:
-        runtime = requested_graph_runtime()
-    except ValueError as e:
-        yield str(e)
-    try:
-        transport = requested_transport()
-    except ValueError as e:
+        require_rust_extension()
+    except ImportError as e:
         yield str(e)
     try:
         default_codec()
     except ValueError as e:
         yield str(e)
-    if runtime == "1" and transport == "0":
-        # AUTO falls back to the Python runtime here; an explicit 1 is a contradiction
-        yield (
-            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but MSTAR_RUST_ZMQ=0 "
-            "pins pyzmq. Set MSTAR_RUST_ZMQ to 1 or AUTO, or MSTAR_RUST_GRAPH to 0 or AUTO."
-        )

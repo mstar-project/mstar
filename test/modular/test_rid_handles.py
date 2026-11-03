@@ -17,7 +17,8 @@ from mstar.utils.ipc_format import (
     TensorReceived,
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
-from mstar.worker.rebuild import RebuildRow, Rebuilds
+from mstar.worker.preemption import Preempted, Preemption
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -171,9 +172,13 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._rebuilds = Rebuilds({}, {})
-    w._rebuilds._kept = {"n": {a: None, b: None}}
-    w.scheduler.queue_rebuild(a, RebuildRow("n", "prefill", {}))
-    w._kv_keys, w._dropped, w._victims, w._preempted = {"n": ["kv"]}, {a: "n"}, {a: "kv"}, {a: None}
+    w._rebuilds._kept, w._rebuilds._droppable = {"n": {a: None, b: None}}, {"n": {a, b}}
+    w._rebuilds._cursors[("n", a)] = None
+    w._preemption = Preemption(
+        SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)), w._rebuilds, w.scheduler, w.request_state,
+        w._log_throttled, w._rid_str,
+    )
+    w._preemption._preempted[a] = Preempted()
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -191,8 +196,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
-    assert not (w.scheduler.rebuilds or w._dropped or w._victims or w._preempted), (
-        "the next request would run this one's rebuild row, or be taken for its victim"
+    assert w._rebuilds._droppable == {"n": {b}}, "the next request would keep ids it can't be dropped with"
+    assert not (w._rebuilds._cursors or w._preemption._preempted), (
+        "the next request would run this one's rebuild, or be counted as preempted"
     )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
@@ -220,31 +226,6 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
     assert acked == [([1, 3], [2, 1])]
 
 
-# ── handles never leave the process in text ────────────────────────────────
-
-def test_worker_graph_errors_name_the_wire_rid_not_the_handle():
-    """A FAIL_REQUESTS body becomes the client's HTTP error detail. Handles
-    are worker-internal and recycled, so one in that text names whatever
-    request holds it by the time anyone reads it."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    assert _rid_name(t.name, a) == "req-abc"
-
-
-def test_rendering_a_released_handle_does_not_raise():
-    """These messages report a rid the worker could not find, so the render
-    is as likely to fail as the lookup that got there."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    t.release(a)
-    assert "released" in _rid_name(t.name, a)
-    assert "unresolved" in _rid_name(None, a)
-
-
 def test_add_new_request_hands_the_handle_to_every_subsystem():
     """The one place a handle is minted. Nothing below NEW_REQUEST sees the
     wire string, so a subsystem handed ``body.request_id`` instead would key
@@ -266,7 +247,8 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w._draining_rids = set()
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -311,7 +293,8 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     )
     w._draining_rids, w._unprocessed_messages = set(), {}
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",

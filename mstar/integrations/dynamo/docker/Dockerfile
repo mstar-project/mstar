@@ -43,10 +43,13 @@ ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/downl
 ARG MOONCAKE_PACKAGE=mooncake-transfer-engine-cuda13
 
 # libibverbs1, ibverbs-providers (libmlx5) and libcurl4: Mooncake's engine
-# links them, and the CUDA base image ships none of them.
+# links them, and the CUDA base image ships none of them. g++: the Rust
+# extension links with cc and compiles libzmq (zeromq-src).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         ffmpeg \
+        g++ \
         ibverbs-providers \
         libcurl4 \
         libibverbs1 \
@@ -91,6 +94,17 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
 # Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
 # transformers==4.57.3 pin out of the environment (docs/installation.rst).
 RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
+
+# The graph runtime is Rust, and an editable install does not compile it. The
+# toolchain rust-toolchain.toml pins goes away again once the extension is in
+# the venv.
+RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo PATH=/tmp/cargo/bin:$PATH \
+    && curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && rustup toolchain install \
+    && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && uv pip install --python /opt/mstar/venv/bin/python ./rust \
+    && rm -rf /tmp/rustup /tmp/cargo rust/target
 
 # Mooncake's default wheel is built for CUDA 12 (it links libcudart.so.12), so
 # a CUDA 13 image swaps it for the -cuda13 build of the version the extras

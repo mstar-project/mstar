@@ -391,10 +391,11 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
-    arrival: int | None = None
-    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
-    guaranteed: bool = False
+    # `unpausable`: the request streams an output that can't pause, set by the conductor.
+    # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
+    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    unpausable: bool = False
+    rebuildable: bool = True
 
     def apply_conductor_config(
         self,
@@ -405,7 +406,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        arrival: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -428,8 +428,10 @@ class KVReqConfig(ResourceReqConfig):
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
                     keyed_spans=keyed_spans,
+                    max_growth=max_growth[0] if max_growth else None,
                 )
-                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                # a row may leave out the growth bound, as a span row may leave out its later fields
+                for label, (spans, growth, scratch, retention, keyed_spans, *max_growth) in kv_layout.items()
                 if label in opened
             }
         if loop_caps is not None and self.kv_layout is not None:
@@ -437,8 +439,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if arrival is not None:
-            self.arrival = arrival
 
     def keys_of(self, label: str) -> list[bytes] | None:
         """``label``'s prefix keys, or None when the request keys nothing there, as with ``prefix_cache`` off."""
@@ -556,43 +556,35 @@ def refuse_undeclared_labels(
             raise RuntimeError(f"{model} returned no kv_layout for {key!r}/{missing[0]!r}, which the request opens")
 
 
-def rebuild_refusal(configs: Iterable[KVReqConfig]) -> str | None:
-    """Why a request's rebuild rows can't write the labels its ``configs`` lay out again, or None.
+def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
+    """Why one rebuild row can't write a request's laid-out labels again, or None.
 
-    The rows write one label, grown by one loop, running its prefill steps again in order. They write the ids
-    spans from the request's kept ids, a digest span from host copies of what its step read, and the ids
-    sampled since at the end of the last span, which must be ids. A label that carries prefix keys is keyed
-    again, which needs every span keyed.
+    The row writes one label, grown by one loop, in the one step of one walk that wrote its spans. It writes the
+    ids spans from the request's kept ids, a digest span from host copies of what that walk read, and the ids
+    sampled since at the end of the last span, which must be ids.
     """
-    laid_out = [
-        (config, label, layout) for config in configs
-        for label, layout in (config.kv_layout or {}).items() if layout.spans
-    ]
-    if any(span.kind == SpanKind.ROWS for _, _, layout in laid_out for span in layout.spans):
+    laid_out = [layout for layout in layouts if layout.spans]
+    if any(span.kind == SpanKind.ROWS for layout in laid_out for span in layout.spans):
         return "it holds KV made from another node's outputs, which no rebuild recomputes"
-    if len(laid_out) > 1 or any(len(layout.growth) != 1 for _, _, layout in laid_out):
-        return "it writes more than one label or growth loop, which its rebuild rows can't lay out again"
-    for config, label, layout in laid_out:
+    if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label or growth loop, which one rebuild row can't lay out again"
+    for layout in laid_out:
+        if len({span.walk for span in layout.spans}) > 1:
+            return "its prompt was written in more than one walk, which one rebuild row can't run"
+        if any(span.opens_step for span in layout.spans[1:]):
+            return "its prompt was written in more than one step, which one rebuild row can't run"
         if layout.spans[-1].kind != SpanKind.IDS:
             return "its prompt ends on a digest span, where the ids it sampled can't follow"
-        if config.keys_of(label) and layout.keyed_spans != len(layout.spans):
-            return "it keys only part of its prompt, which a rebuild can't key again"
+        if len(layout.spans) > 1 and layout.keyed_spans:
+            return "it keys a prompt of more than one span, which a rebuild can't key again"
     return None
 
 
-def mark_guaranteed(
-    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
-) -> None:
-    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
-    playback, or when any of them lays out rows, which no rebuild recomputes. A digest span is left to the
-    worker, which guarantees the request on a node that keeps no host copies for its rebuild."""
-    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
-    guaranteed = (streaming and "audio" in output_modalities) or any(
-        span.kind == SpanKind.ROWS
-        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
-    )
-    for config in kv_configs:
-        config.guaranteed = guaranteed
+def mark_unpausable(configs: Mapping[str, ResourceReqConfig], unpausable: bool) -> None:
+    """Mark every KV config in ``configs``, since a pause in any pool is heard."""
+    for config in configs.values():
+        if isinstance(config, KVReqConfig):
+            config.unpausable = unpausable
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
@@ -771,16 +763,17 @@ class StreamLayout:
     scratch: int = 0
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
+    max_growth: int | None = None
 
     def slots(self, caps: Mapping[str, int]) -> int:
-        return sum(span.length for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.length for span in self.spans) + self._grown(caps)
 
     def positions(self, caps: Mapping[str, int]) -> int:
-        return sum(span.advance for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.advance for span in self.spans) + self._grown(caps)
+
+    def _grown(self, caps: Mapping[str, int]) -> int:
+        grown = sum(slots * caps[loop] for loop, slots in self.growth)
+        return grown if self.max_growth is None else min(grown, self.max_growth)
 
     def steps(self) -> tuple[tuple[PrefixSpan, ...], ...]:
         """The spans grouped by the step that writes them (`step_end`), in walk order."""
@@ -792,7 +785,7 @@ class StreamLayout:
         return tuple(steps)
 
     def rebuilt(self, ids: int) -> "StreamLayout":
-        """This layout once its rebuild rows have written ``ids`` ids into it: the last span, which
+        """This layout once a rebuild row has written ``ids`` ids into it: the last span, which
         `rebuild_refusal` requires to be ids, grows by the ids sampled since the layout was laid out."""
         grown = ids - sum(span.length for span in self.spans if span.kind == SpanKind.IDS)
         *spans, last = self.spans

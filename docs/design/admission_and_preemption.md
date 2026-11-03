@@ -6,8 +6,8 @@ Earlier PR (#400) proposed admission control that reserves each request's worst 
 
 This design adds slim version of admission control by default (A1). A request reserves only its prompt's pages and waits in a queue until they fit. On top of it, the requests are classified as either:
 
-1. **Guaranteed.** A request that streams audio, or whose KV can't be rebuilt from token ids, also reserves pages for the most it can generate, and is never preempted.
-2. **Preemptible.** When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids.
+1. **Guaranteed.** A request that streams an output that can't pause, such as audio, or whose pages nothing could take back, also reserves pages for the most it can generate, and is never preempted.
+2. **Preemptible.** When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids. A request that can't be rebuilt moves only to the host, into room the host set aside for it.
 
 A host tier for the prefix cache, which was on the roadmap regardless, is built alongside, and aims to cut that recompute by copying pages between host and device asynchronously, hiding the offload and reload cost.
 
@@ -27,12 +27,13 @@ A host tier for the prefix cache, which was on the roadmap regardless, is built 
 @dataclass
 class KVReqConfig(ResourceReqConfig):
     ...
-    guaranteed: bool = False   # reserves its whole footprint and is never dropped
+    unpausable: bool = False   # streams an output that can't pause, set by the conductor
+    rebuildable: bool = True   # a drop on this worker can free its pages, set by the worker
 ```
 
-A dropped request keeps only its token ids, so a request can be preempted only if its node can rebuild all of its KV from them.
+A dropped request keeps only its token ids, so a request can be dropped only if its node can rebuild all of its KV from them. One that can't be dropped can still move to the host.
 
-A request that can't be rebuilt must never run short. It reserves its whole footprint up front, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.
+A request that nothing can take pages back from must never run short. It reserves its whole footprint up front, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.
 
 The model declares the footprint as KV spans (#832). A span's kind says what its KV is made from:
 
@@ -40,14 +41,14 @@ The model declares the footprint as KV spans (#832). A span's kind says what its
 - `digest`: an encoder's output
 - `rows`: another node's outputs
 
-The conductor sets the class at ingest for rows 1 and 2, and that class holds in every pool. The worker then guarantees a request in the pools of a node where it can't keep what a rebuild needs (rows 3 and 4).
+Each pool decides the class once, at the request's first `ask`, from two facts. The conductor marks a request that streams an output that can't pause, and that mark holds in every pool. The worker marks whether a drop there can free the request's pages: every node of the pool that writes the request's KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible when the host pool can set its footprint aside, and guaranteed otherwise.
 
 | # | A request with | Class | Why |
 |---|---|---|---|
-| 1 | Audio it streams out | guaranteed | a pause is a gap in playback |
-| 2 | A `rows` span | guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
-| 3 | A `digest` span | preemptible at one rank where the node's rebuild policy copies the walk's inputs, guaranteed elsewhere | its KV comes from an encoder's output, freed after prefill, so a rebuild needs a host copy of it |
-| 4 | No rebuild policy on its node | guaranteed there | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
+| 1 | An output it streams that can't pause, audio unless the model or the deployment says otherwise | guaranteed | a pause is a gap in playback |
+| 2 | A `rows` span | moves only to the host there, or guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
+| 3 | A `digest` span | preemptible at one rank where the node's rebuild policy copies the walk's inputs, and elsewhere moves only to the host there, or guaranteed | its KV comes from an encoder's output, freed after prefill, so a rebuild needs a host copy of it |
+| 4 | No rebuild policy on the node that writes its KV | moves only to the host there, or guaranteed | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
 R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
@@ -57,8 +58,9 @@ On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTF
 Why this shape:
 
 - **The class comes from the request.** A priority or a per-request flag would be one more input to tune, when the footprint and the output can be used to make the decision.
-- **The conductor sets it.** It is the one place that sees every resource's layout. A Qwen3-Omni request with audio out has `rows` only on the Talker's worker, so a class each worker set from its own pools would let the Thinker's worker drop a request whose Talker is speaking.
-- **Only streamed audio.** A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.
+- **An output that can't pause holds in every pool.** A Qwen3-Omni request with streamed audio out must not be dropped by the Thinker's worker while its Talker is speaking, so the conductor marks it. A span no rebuild can write again holds only in its node's pools: for an unstreamed reply, a Thinker rebuild only delays the Talker's rows.
+- **Only streamed outputs that can't pause.** The model declares them (`Model.UNPAUSABLE_OUTPUTS`, audio by default), and a deployment overrides them with `unpausable_outputs`, as an Orpheus deployment may to keep a fast first chunk. A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.
+- **Room on the host is set aside, not assumed.** A request that can only move to the host must be able to move when it is the oldest one short (§5.5). Room counted at that moment is whatever other moves left, so a full host pool would leave it holding its pages, and a pool of such requests stalls as in #307. Its footprint set aside at its first ask makes its move fit. Past `cpu_offload_pages`, the rest are guaranteed.
 - **Not the worst case for every request.** With 32 Bagel text chats beside 16 image chats on 64 pages, chat TTFT p50 was 559 ms with every request guaranteed and 69.7 ms with two classes.
 - **Seeded requests stay preemptible.** Guaranteeing them would charge the worst case to every request that sets a seed. A rebuilt seeded request may not repeat its output (§5.4).
 
@@ -97,8 +99,8 @@ What a cache hit costs:
 
 | A hit on | Costs |
 |---|---|
-| a page only the index holds | a fresh page |
-| a page another request holds | nothing, lent to a preemptible request |
+| a page only the index holds | a fresh page, out of the room alone for a guaranteed request until it adopts its lease |
+| a page another request holds | nothing, lent |
 | a cached prefix copied from the host at readiness | a grant within the request's reservation |
 
 Why this shape:
@@ -106,6 +108,7 @@ Why this shape:
 - **The rule lives in `_alloc`.** Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request's next grant would fail.
 - **Only the head is admitted.** Nothing newer passes the oldest request, so it can't wait forever behind a stream of small ones (§5.5).
 - **Evictable hits are charged as fresh.** Eviction could hand such a page to another request before the probe leases it.
+- **A guaranteed request is charged for no hit until it adopts its lease.** A cut lease leaves the walk to write the cut pages, and a cut page another request still holds frees no room, so its reservation keeps every page until then.
 
 ---
 
@@ -120,12 +123,12 @@ Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-gra
 
 ```python
 @dataclass
-class KVReqConfig(ResourceReqConfig):
+class CurrentForwardPassInfo:
     ...
     arrival: int | None = None   # set by the conductor when it takes the request
 ```
 
-The conductor numbers each request from a single counter, in the order it takes them, and sets it on every pool's config. A dropped request keeps its number. Each pool's queue and its victim choice go by it.
+The conductor numbers each request from a single counter, in the order it takes them, and sends the number with the request. A dropped request keeps its number. The runner keeps the requests in that order, and each pool's queue and its victim choice go by it.
 
 A number set by each worker won't work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.
 
@@ -133,14 +136,14 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R and aren't already victims, newest first. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). One that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
 1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
 2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
-3. Otherwise, R waits until the pool's room grows past what its failed grant saw.
+3. Otherwise, R keeps its reservation and asks the pool for its shortage. It waits in the queue at its arrival, parked as a new prompt is, until the room covers the shortage.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
@@ -150,8 +153,9 @@ Why this shape:
 
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
+- **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
-- **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
+- **A waiting request waits in the queue.** It is measured again only when the room grows, and let go only once the room covers its whole shortage. Its arrival keeps newer prompts from taking that room first.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
 
@@ -165,14 +169,14 @@ class Earmark:
     victims: set[str]   # the victims whose moves cover it
 ```
 
-When the victims' moves land, the earmark joins R's reservation, so R's next grant can't fail again. Without it, the head of the queue could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
-A victim with a step or a KV read in flight moves or is dropped once that lands, and the worker composes it into no further step until then.
+Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
 Lifecycle:
 
 1. Created with its victims when the worker handles R's failed grant.
-2. Joins R's reservation when its victims' moves land.
+2. Grows R's reservation as each victim's move lands, and closes once the last one has.
 3. Removed with R.
 
 ---
@@ -186,9 +190,9 @@ class KVManager:
         of pages that reach the free list. Keyed pages stay in the index as
         evictable pages. Needs no host pool."""
 
-    def is_resident(self, rid: str) -> bool:
-        """False while rid is offloaded, and from its drop until its rebuild
-        step lands."""
+    def residency(self, rid: str) -> Residency:
+        """ON_HOST while rid is offloaded, DROPPED from its drop until its
+        rebuild lands, and RESIDENT otherwise."""
 ```
 
 A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
@@ -206,7 +210,9 @@ At a drop, the other resources:
 | Sampler | kept, since its RNG offset and repetition mask can't be recomputed |
 | Position counter | reset, and the rebuild moves it back to the end of the history |
 | Qwen3.5's recurrent state | zeroed in place, and the request keeps its slot, so its rebuild never waits for one |
-| Everything else | kept, as an offload keeps it |
+| Attention | kept, since it holds no state a rebuild writes again |
+| LoRA adapter pool | kept, so the rebuild runs under the request's adapter, which keeps its slot |
+| Anything else | refused at load: a node with a rebuild policy needs every resource it holds to support a drop (`Resource.supports_drop`) |
 
 Why this shape:
 
@@ -226,35 +232,34 @@ Why this shape:
 | running | resident, out of the queue |
 | on the host | its pages on the host, in the queue at its arrival position, no reservation |
 | dropped | not resident, in the queue at its arrival position, no reservation |
-| rebuilding | not resident, out of the queue, holding its return reservation, its next rebuild row queued or in a step |
+| rebuilding | not resident, out of the queue, holding its return reservation, its rebuild under way in the worker's log |
 
-No field holds the state: residency, the host pool, the queue and the rebuild queue tell the four apart.
+No field holds the state: residency, the host pool, the queue and the log's rebuilds tell the four apart.
 
 Lifecycle:
 
-- A rebuilding request can be chosen again. Its queued row leaves the queue, and it gives up its return reservation and waits in the queue again.
-- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.
+- A request that was dropped or moved to the host is never chosen again, since it comes back guaranteed (§5.2).
+- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check
 
 A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
 
 ```
-need(V) = for each label, the pages V's kept history fills, plus 1,
-          capped at V's footprint
+need(V) = V's footprint
 
 return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
 ```
 
-When it passes, V reserves `need(V)`, and the worker queues its rebuild rows, one per prefill step V ran, which run in order. The drop counts the history from the tokens V's KV held and the sample its next step writes.
+When it passes, V reserves `need(V)` as a guaranteed request and readiness starts its rebuild.
 
-A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes, plus one page per stream, capped at its footprint, or its queued prompt if that is larger. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
+A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes and the rest of its footprint. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
 
 Why this shape:
 
-- **A whole history and a page, not the prompt.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again.
-- **Capped at the footprint.** The ingest 400 bounds the footprint, not the history plus a page.
+- **Its whole footprint, not its pages and one more.** With room for one page, its next page finds none, and as the newest request holding pages it moves itself again, so each round trip copies all its pages both ways for a page of decode. The footprint is the one amount after which it never needs room it didn't reserve, and the ingest 400 bounds it.
+- **Guaranteed once back.** As a preemptible request its unused reservation would count toward the next older request's shortage, and it would be that request's first victim. So each request is preempted at most once.
 - **Outside `check_ready`.** After a partial cache hit, `admit_retrieve` would move the position counter past what the rebuild restores, so no `admit_retrieve` runs on a request between its drop and the end of its rebuild.
 
 ### 5.3 The rebuild row
@@ -272,18 +277,23 @@ class RebuildPolicy:
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-The rebuild runs each of the request's prefill steps again, in order, as one row of the engine's batch in a step of its own: one row per step the request's prefill ran, until its first kept sample, such as three for a Bagel image chat. Each row reads its step's kept ids, and the last row reads the ids sampled since but the last. A row's sample is discarded, it sends nothing, and the decode loop doesn't advance. Decoding resumes from the last kept id once the last row lands.
+A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, opens the rebuild in the worker's log, and parks the request's decode row, as it parks a row waiting for capacity, until the rebuild lands.
 
-The worker records each prefill step once it has run, with the ids it read from the policy's input as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and that step's rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, only for a request a rebuild could write again, and lists it in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
+The rebuild prefills the kept ids minus the last, under the walk the request prefilled in, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
+
+A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk parks until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
+
+The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
 
 Why this shape:
 
-- **The graph runtime never sees the row.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back.
+- **The graph runtime never sees the rows.** Switching the request's runtime walk for one step would touch the runtime, the output edges, `WORKER_GRAPHS_DONE` and the loop-back. Every call that hands a step's rows to the runtime takes `ScheduledBatch.graph_rows`, which leaves them out.
 - **The prefill walk.** Each model's decode walk breaks a multi-token row in its own way. Bagel's declares a span of 1, the Qwen3-Omni Thinker's embeds every id at one position, and Qwen3.5's with device loop-back reads one token off the sampler.
-- **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids when the step runs. The copy stays on the device, and only a rebuild waits on a copy to the host. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
+- **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids after the step that read them, on a stream of the pool's own. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
 - **Not a remove and re-ingest.** The sampler's RNG offset and repetition mask would be lost.
+- **A prompt mid-prefill reruns its own chunks.** Restarting it at chunk 0 would move its chunk Loop back, which only the graph runtime can do.
 
-> Note: the row's cache probe serves the kept ids' cached prefix first, so a rebuild recomputes only what the GPU index doesn't hold. Qwen3.5 rebuilds its whole history until its prefix caching (P2) lands.
+> Note: a rebuild's first chunk starts past its cached prefix, measured as a fresh prompt's is on each try, so it recomputes only what the GPU index doesn't hold, and Qwen3.5 restores a recurrent snapshot for the prefix.
 
 ### 5.4 Tokens after a rebuild
 
@@ -297,14 +307,14 @@ A guaranteed request reserves its whole footprint and is never preempted, so it 
 
 Take the oldest preemptible request:
 
-1. When it runs short, newer requests move to the host or are dropped first, and it gives up its own pages only when none of them can free a page for it.
+1. When it runs short, newer requests move to the host or are dropped first, and it gives up its own pages only when none of them can free a page for it. It always can: it is dropped, or moves into the room the host set aside for it (§1).
 2. It then waits at the head of its queue, where nothing newer is admitted past it.
-3. It returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
-4. Its footprint fits the pool, so it finishes after a bounded number of returns.
+3. It returns guaranteed once its whole footprint fits, so it is never preempted again.
+4. Its footprint fits the pool, so it returns once the older requests finish, and then finishes.
 
 The next oldest request then takes its place in the argument.
 
-For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
+For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs its whole footprint to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
 
 ---
 
@@ -352,10 +362,10 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 ## 8. Trade-offs
 
-- **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
-- **Rebuild steps.** A rebuild row runs in a step of its own, so the node's decode rows wait one step per row. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
-- **Kept ids.** A node with a rebuild policy keeps each request's prompt ids on the device, in the walk's input dtype, until the request finishes: 256 KB for a 32K-token request of int64 ids. A rebuild waits on one copy of them to the host.
-- **Media copies.** A node whose policy copies a walk's inputs keeps a pinned host copy of each media prefill step's input for the request's whole life, whether or not it is ever dropped: 17.6 MB per Bagel image at p50, about 240 KB per audio clip, and a video's copy grows with its length. Nothing bounds the total yet.
+- **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt, once at most, since it comes back guaranteed.
+- **A request comes back late.** A request moved off the device waits at the head of its queue for its whole footprint, and the prompts behind it wait with it.
+- **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 128 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

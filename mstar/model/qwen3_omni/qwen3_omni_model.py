@@ -440,15 +440,9 @@ class Qwen3OmniModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # Audio, images and video are rebuilt from host copies of the encoders' outputs. The Talker's KV is built
-        # from the Thinker's states, which no rebuild recomputes.
-        return {"Thinker": RebuildPolicy(
-            walk="prefill_text", ids_input="text_inputs", sample_output="new_token", loop="thinker_decode_loop",
-            copied_inputs={
-                "prefill_audio": ("audio_embeds",),
-                "prefill_vision": ("vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"),
-            },
-        )}
+        # the Talker's KV is built from the Thinker's states, which no ids recompute
+        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                         loop="thinker_decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -1447,9 +1441,11 @@ class Qwen3OmniModel(Model):
         }
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the Thinker's last prefill emits its first text token and
+        # talker_last_prefill its first codec frame, so each loop runs one fewer
         return {
-            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
-            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+            "thinker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs) - 1),
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
