@@ -7,12 +7,45 @@ FlashInfer wrappers live here; FA3 is in ``dense_wrappers.py``.
 from abc import ABC, abstractmethod
 
 import torch
+import triton
+import triton.language as tl
 
 from mstar.engine.resources.attn.workspace import Workspace
 
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
 # one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
+
+
+_ZERO_BLOCK = 4096
+
+
+@triton.jit
+def _zero_rows_from(out_ptr, first_row_ptr, numel, row_numel, BLOCK: tl.constexpr):
+    """Zero a contiguous tensor in place from row ``*first_row_ptr`` onward.
+    Chunks that land entirely before that row return immediately."""
+    start = tl.program_id(0).to(tl.int64) * BLOCK
+    first = tl.load(first_row_ptr).to(tl.int64) * row_numel
+    if start + BLOCK > first:
+        offs = start + tl.arange(0, BLOCK)
+        tl.store(out_ptr + offs, 0.0, mask=(offs >= first) & (offs < numel))
+
+
+def zero_unplanned_rows(out: torch.Tensor, qo_indptr: torch.Tensor) -> torch.Tensor:
+    """``out`` with its rows from the planned total, ``qo_indptr[-1]`` on the
+    device, zeroed in place, so inside a graph on every replay.
+
+    A graph-mode kernel writes only the planned rows, so the rest hold whatever
+    the graph pool had there (a previous replay's, possibly NaN), and the next
+    layer's KV built from this output is read past the total to the last
+    segment's tile boundary under an additive mask, which a NaN/Inf survives."""
+    assert out.is_contiguous(), "the tail is zeroed by flat offset"
+    numel = out.numel()
+    if numel:
+        _zero_rows_from[(triton.cdiv(numel, _ZERO_BLOCK),)](
+            out, qo_indptr[-1:], numel, out.stride(0), BLOCK=_ZERO_BLOCK,
+        )
+    return out
 
 
 def padded_head_dim(head_dim: int) -> int:
@@ -325,14 +358,12 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             out = self.attn_wrapper.run(qp, kp, vp, **lse_kwargs)
         else:
             self._check_rows(qp.shape[0])
-            # Zeroed in the graph on every replay: the kernel writes only the
-            # planned rows, and the next layer's KV built from this output is read
-            # past cu_seqlens[-1] to the last segment's tile boundary under an
-            # additive mask, which a NaN/Inf left in the tail would survive.
             out = self.attn_wrapper.run(
-                qp, kp, vp, out=torch.zeros_like(qp, memory_format=torch.contiguous_format), **lse_kwargs,
+                qp, kp, vp, out=torch.empty_like(qp, memory_format=torch.contiguous_format), **lse_kwargs,
             )
         out, lse = out if return_lse else (out, None)
+        if self.accelerator_graph:
+            zero_unplanned_rows(out, self._qo_indptr_buf)
         if self.padded_head_dim != self.head_dim and not padded_in:
             out = out[..., : self.head_dim].contiguous()
         return (out, lse) if return_lse else out
