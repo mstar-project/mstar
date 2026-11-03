@@ -617,7 +617,8 @@ builds no pool, unless the YAML lists the ones to keep::
     resources:
       lora:
         targets: [qkv_proj, o_proj, in_proj_fused, out_proj, gate_up_proj, down_proj,
-                  attn_qkv, attn_proj, mlp_fc1, mlp_fc2, merger_fc1, merger_fc2, patch_embed]
+                  qkv, attn_proj, mlp_linear_fc1, mlp_linear_fc2, merger_linear_fc1,
+                  merger_linear_fc2, patch_embed_proj]
 
 An adapter deployment captures and compiles the LLM node as one without adapters does,
 each bucket twice: with the LoRA kernels, and base-only for steps none of whose rows names

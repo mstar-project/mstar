@@ -13,12 +13,11 @@ states is what the modules cannot:
 * the layouts adapters on the Hub write the towers under (``adapter_roots``), Tinker's
   split delta-net ``in_proj_q/k/v`` and its ``unembed_tokens`` head
   (``adapter_stacked_params``, ``aliases``), and the MTP head, which is never run
-  (``ignore``);
-* the vision targets' names, kept as the shipped serving configs spell them (``names``).
+  (``ignore``).
 
 Adapters land where the roots' ``checkpoint_rules()`` load the checkpoint. Every
-embedding call is in the step (a vision prompt's ids are embedded in
-``preprocess``), so the token embedding is an ordinary target.
+embedding call is in the step (a vision prompt's ids are embedded in ``preprocess``),
+so the token embedding is an ordinary target.
 """
 
 from __future__ import annotations
@@ -44,16 +43,6 @@ VISION_ROOTS = (AdapterRoot("model.visual.", "model.visual."), AdapterRoot("visu
 SPLIT_QKV_RULES = tuple(
     StackedParamRule(".in_proj_fused.", f".in_proj_{shard}.", shard) for shard in ("q", "k", "v")
 )
-
-VISION_NAMES = {
-    "patch_embed.proj": "patch_embed",
-    "attn.qkv": "attn_qkv",
-    "attn.proj": "attn_proj",
-    "mlp.linear_fc1": "mlp_fc1",
-    "mlp.linear_fc2": "mlp_fc2",
-    "merger.linear_fc1": "merger_fc1",
-    "merger.linear_fc2": "merger_fc2",
-}
 
 
 def qwen3_5_lora_spec(config: Qwen3_5Config) -> LoraSpec:
@@ -83,7 +72,6 @@ def qwen3_5_vision_lora_spec(config: Qwen3_5VisionConfig) -> LoraSpec:
         root, resource_key=VISION_LORA, nodes={"vision_encoder"}, root_path="model",
         adapter_roots=VISION_ROOTS,
         rows={"merger.*": config.merge_unit},
-        names=VISION_NAMES,
     )
 
 
