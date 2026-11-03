@@ -3100,8 +3100,8 @@ class Engine:
             resource.prepare_rebuild(request_id, rebuild)
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild row has run. A TP follower does this when it
-        replays rank 0's move instead, so every rank lands the rebuild between the same two of rank 0's steps."""
+        """Make the dropped request resident again, once its rebuild row has run. On a TP follower the rebuild lands
+        when the follower replays rank 0's LAND move, so every rank lands it between the same two of rank 0's steps."""
         if node_name in self._tp_follower_nodes:
             return
         self._land_rebuild(node_name, request_id)
