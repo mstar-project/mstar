@@ -42,6 +42,7 @@ mstar.model.cosmos3.tests
    test_edge_video_parity
    test_engine_cache
    test_loader
+   test_loop_dtype
    test_rotary_table
    test_serving
    test_sessions
