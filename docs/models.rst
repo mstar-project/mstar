@@ -218,10 +218,10 @@ Notes
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
-- Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
-  from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
-  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
-  writes a table for the local GPU.
+- Models on the fused MoE kernel (Qwen3-Omni, Command A+) take their tiles from the
+  ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
+  the expert shape, and default tiles otherwise. The server logs the sweep command
+  for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
@@ -780,6 +780,14 @@ Qwen3-TTS notes
   had before the two shared the component: Qwen3-TTS accumulates in the model
   dtype, rounding after every add (the reference sums in fp32 and rounds once),
   and Qwen3-Omni in fp32, rounded once.
+- The colocated configs run the Codec's windows beside the Talker's chain on a
+  second stream (``side_stream: true`` on the Codec's node group, see
+  :doc:`serving`), so decode neither takes turns with them nor queues behind
+  their kernels. On a B300, 1.7B: +16% audio-s/s at c=8 and +27% at c=32, with
+  lower ITL at both, but -6% at c=1, and at c=32 first audio is about 40 ms
+  later at p50 (p95 a little earlier). Drop the field from a deployment that
+  cares more about those. The Codec's graphs capture on a stream of their own,
+  since a prefill overlapping them shares state otherwise.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.

@@ -19,7 +19,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
 from mstar.utils.ipc_format import ConductorMessageType
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler
 from mstar.worker.worker import Worker
 
 USER = getpass.getuser()
@@ -119,7 +119,7 @@ def _worker(rids=("r1",)):
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
-    w._in_flight_rids = set(rids)
+    w._hold_rows(CHAIN_LANE, rids)
     return w
 
 

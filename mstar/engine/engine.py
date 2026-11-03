@@ -554,12 +554,15 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
+        side_stream_nodes: Collection[str] = (),
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
+        # nodes whose steps run beside the worker's chain (``EngineManager.build``)
+        self._side_stream_nodes = frozenset(side_stream_nodes)
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -837,6 +840,7 @@ class Engine:
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
+            capture_stream = self._capture_stream_for(node_name)
             runner = ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
@@ -848,10 +852,11 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
             )
             self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
-                node_name, submodule_mgmt
+                node_name, submodule_mgmt, capture_stream,
             )
 
         # Every runner claims its static buffers before any of them captures:
@@ -1005,8 +1010,22 @@ class Engine:
             took / 2**20, plan.predicted[pool] / 2**20,
         )
 
+    def _capture_stream_for(self, node_name: str) -> Any:
+        """The stream a node captures on; None for the backend's shared one.
+
+        Graphs captured on one stream share what the capture ties to it, so two
+        of them must never run at once. On the chain they can't, but a node
+        whose steps run beside it can overlap any graph of any other node, and
+        with a shared capture stream that silently changes the other graph's
+        result.
+        """
+        backend = self.device_capability.graph_backend
+        if node_name not in self._side_stream_nodes or backend is None or not backend.is_available():
+            return None
+        return backend.new_stream()
+
     def _build_piecewise_runners(
-        self, node_name: str, submodule_mgmt: SubmoduleManagement,
+        self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
     ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
         """One runner per region the submodule declares, not yet captured.
 
@@ -1042,6 +1061,7 @@ class Engine:
                 node_name=node_name,
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
                 lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner

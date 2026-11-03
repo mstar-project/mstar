@@ -20,7 +20,7 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -98,7 +98,7 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     the plan future is drained, the stage dropped through the engine, the
     fresh rid goes back to its queue and the continuing rid fails with N."""
     w = _fake_worker()
-    w._in_flight_rids = {"a"}
+    w._hold_rows(CHAIN_LANE, {"a"})
     spec = _speculation(_done_future(), "a", "b", continuing=("a",))
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [spec.node_batch]
