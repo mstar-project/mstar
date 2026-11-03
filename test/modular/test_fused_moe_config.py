@@ -70,7 +70,7 @@ def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(table, monkey
 
     experts, two_inter, hidden = (int(v) for v in re.match(r"E=(\d+),N=(\d+),K=(\d+)", table.name).groups())
     monkeypatch.setattr(kernels, "config_path", lambda E, N, K: table)
-    kernels._tuned_configs.cache_clear()
+    monkeypatch.setattr(kernels, "_tuned_tables", {})
     torch._dynamo.reset()
     w1 = torch.randn(experts, two_inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
     w2 = torch.randn(experts, hidden, two_inter // 2, device="cuda", dtype=torch.bfloat16) * 0.02
@@ -80,7 +80,6 @@ def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(table, monkey
         x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
         weights, ids = torch.rand(num_tokens, experts, device="cuda").topk(8, dim=-1)
         run(x, weights.to(torch.bfloat16), ids)
-    kernels._tuned_configs.cache_clear()
 
 
 @CUDA
