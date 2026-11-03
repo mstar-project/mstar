@@ -2919,8 +2919,10 @@ def create_tensor_communication_manager(
 
     The SHM protocol is the Rust shared-memory arena
     (``ArenaShmCommunicationManager``), which spills a tensor it has no room
-    for to a per-uuid file. ``copy_workers`` is the width of the arena's CPU
-    reads (``host_copy.HostCopier``).
+    for to a per-uuid file. An entity on a device other than CPU or CUDA, or
+    one whose first segment cannot be created, has no arena and sends every
+    tensor that way. ``copy_workers`` is the width of the arena's CPU reads
+    (``host_copy.HostCopier``).
     """
     if protocol == CommProtocol.SHM:
         # Imported here: arena.py builds on this module's file manager.
