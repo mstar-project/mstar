@@ -380,7 +380,7 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def set_side_stream(self, keys: Collection[str], stream: Any) -> None:
-        """Tear ``keys`` down on ``stream``, the side lane's they step on."""
+        """Tear ``keys`` down on ``stream``, the side lane's stream their steps run on."""
         self._side_streams.update(dict.fromkeys(keys, stream))
 
     def remove_request(self, rid: str) -> None:
