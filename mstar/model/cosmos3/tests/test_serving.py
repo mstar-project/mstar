@@ -105,9 +105,14 @@ def test_gen_params_and_step_metadata() -> None:
         "num_inference_steps"
     ] == model.config.num_inference_steps_video
 
-    # i2v conditioning is inferred from the input modalities.
-    p = model._resolve_gen_params({}, ["image", "text"], ["image"])
+    # i2v conditioning is inferred from the input modalities; a single latent
+    # frame would leave nothing to denoise but the pinned image.
+    p = model._resolve_gen_params({}, ["image", "text"], ["video"])
     assert p["has_image_condition"] is True
+    with pytest.raises(ValueError, match="image conditioning requires a video"):
+        model._resolve_gen_params({}, ["image", "text"], ["image"])
+    with pytest.raises(ValueError, match="image conditioning requires a video"):
+        model._resolve_gen_params({"num_frames": 4}, ["image", "text"], ["video"])
 
     fpa = model.get_initial_forward_pass_args(
         "p0", ["text"], ["image"], {"text_inputs": []},
