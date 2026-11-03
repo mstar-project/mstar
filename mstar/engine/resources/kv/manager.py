@@ -3687,12 +3687,9 @@ class KVManager(AttentionResource):
         return needed
 
     def _return_pages(self, rid: str) -> int:
-        """Pages a request returning from the host may take beyond its reload, 0 for any other: the footprint the
-        request asks for, less its pages on the host."""
-        footprint = self._asks.get(rid)
-        if footprint is None:
-            return 0
-        return max(0, footprint - sum(len(state.host_pages) for state in self._cpu_pool.offloaded[rid].values()))
+        """Pages a request asking to return from the host may take beyond its reload: the footprint it asks for,
+        less its pages on the host."""
+        return max(0, self._asks[rid] - sum(len(state.host_pages) for state in self._cpu_pool.offloaded[rid].values()))
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
