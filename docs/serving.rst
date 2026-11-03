@@ -454,7 +454,8 @@ from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV 
 and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
 position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
 this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
-never splits. A value the node's storage can't take fails at load:
+never splits. A value the node's storage can't take fails at load, at any SP size, and so does
+``ring`` over an attention backend other than ``flashinfer`` (when the engine builds it):
 
 .. code-block:: yaml
 

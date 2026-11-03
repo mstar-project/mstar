@@ -297,7 +297,7 @@ class AttentionManager(AttentionResource):
                 (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
                 (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
                 # only FlashInfer's paged manager plans a ring (`FlashInferManager._ring_wrapper`); dense is
-                # refused above
+                # refused above. At any SP size, as `SeqShardSpec.derive` checks the exchange
                 (
                     f"sequence shard exchange 'ring' on backend {backend.value!r}",
                     spec.resolve_exchange(info.dependencies) == "ring"
