@@ -1,5 +1,5 @@
-"""The attention resource's shared machinery: the spec-time factory, the
-custom op every backend attends through, and the workspace pool.
+"""The attention resource's shared machinery: the spec-time factory and the
+custom op every backend attends through.
 
 The backends themselves live beside this — `flashinfer`, `cross`, `dense`,
 `flex` — and `AttentionManager.build` reaches them by deferred import, so
@@ -7,7 +7,6 @@ naming a backend in a spec does not load the others.
 """
 
 import logging
-import os
 from typing import NamedTuple
 
 import torch
@@ -295,29 +294,3 @@ def captured_page_capacity(
     if len(kv_config.groups) > 1:
         return kv_config.num_units + step_pages + num_rows
     return max(num_rows * kv_config.max_num_pages, step_pages + num_rows)
-
-
-def workspace_bytes() -> int:
-    """Size of one FlashInfer workspace buffer (``MSTAR_WORKSPACE_BUFFER_MB``)."""
-    return int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024
-
-
-class WorkspacePool:
-    """FlashInfer workspace buffers, one per (plan label, cg slot).
-
-    Persistent: a wrapper is planned against the buffer it was built with, so
-    these outlive any single step.
-    """
-
-    def __init__(self, device: torch.device, size_mb: int | None = None):
-        self._device = device
-        self._size = workspace_bytes() if size_mb is None else size_mb * 1024 * 1024
-        self._buffers: dict[str, torch.Tensor] = {}
-
-    def get(self, label: str, cg_slot: int | None = None) -> torch.Tensor:
-        key = label if cg_slot is None else f"{label}_{cg_slot}"
-        if key not in self._buffers:
-            self._buffers[key] = torch.empty(
-                self._size, dtype=torch.uint8, device=self._device
-            )
-        return self._buffers[key]

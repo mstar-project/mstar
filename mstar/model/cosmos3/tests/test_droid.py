@@ -57,6 +57,12 @@ def test_droid_registry_and_config_wiring() -> None:
     assert mk["enable_sound"] is False
     assert mk["num_inference_steps_action"] == 4
     assert mk["guidance_scale_action"] == 3.0
+    # The policy request defaults the empty checkpoint.json leaves out, and the
+    # policy's 1 - gripper, as NVIDIA's RoboLab server serves it.
+    assert mk["policy_action_chunk_size"] == 32 and mk["policy_conditioning_fps"] == 15.0
+    assert mk["policy_domain_name"] == "droid_lerobot" and mk["inverted_action_dims"] == [7]
+    # Every key is a config field (the model drops the others with a warning).
+    assert set(mk) <= set(Cosmos3Config.__dataclass_fields__)
     node_names = {n for g in cfg["node_groups"] for n in g["node_names"]}
     assert "audio_decoder" not in node_names
     assert {"dit", "vae_encoder", "vae_decoder"} <= node_names

@@ -15,6 +15,7 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -324,7 +325,7 @@ def test_flashinfer_wrappers_forward_explicit_kernel_backend(monkeypatch):
         ),
     )
     common = {
-        "workspace_buffer": torch.empty(1),
+        "workspace_buffer": Workspace(torch.empty(1), "test"),
         "num_qo_heads": 2,
         "num_kv_heads": 1,
         "head_dim": 8,

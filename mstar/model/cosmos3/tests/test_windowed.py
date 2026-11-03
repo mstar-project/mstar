@@ -295,6 +295,22 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     assert not torch.allclose(head, window[:, :, -2:])
 
 
+def test_chained_window_head_encodes_in_the_encode_vaes_dtype(monkeypatch) -> None:
+    """The head encodes in the encode VAE's own dtype (bf16 as built) and never
+    casts it: the instance is the encoder node's when the two share a process."""
+    from mstar.model.cosmos3.submodules import ChainedWindowHead
+
+    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    encode_vae = _CausalVAE(cfg.latent_channel).to(torch.bfloat16)
+    window = torch.zeros(1, cfg.latent_channel, 8, 4, 4)
+    head = ChainedWindowHead(_CausalVAE(cfg.latent_channel), encode_vae, cfg)(window, 2)
+    assert encode_vae.encoded[0].dtype == torch.bfloat16
+    assert encode_vae.weight.dtype == torch.bfloat16
+    assert head.dtype == window.dtype
+
+
 def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     """A kv request runs steps + 1 loop iterations per window (the +1 is the
     commit pass); the prefill records the pacing, the schedule and the
