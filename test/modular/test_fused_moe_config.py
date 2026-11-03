@@ -171,3 +171,63 @@ def test_the_mi325x_thinker_runs_the_default_tile_at_512_tokens(monkeypatch):
         assert kernels.get_config(M=m, E=shape[0], N=shape[1], K=shape[2], top_k=8) == (untuned, untuned), m
     assert kernels.get_config(M=256, E=shape[0], N=shape[1], K=shape[2], top_k=8)[0] != untuned
     assert kernels.get_config(M=1024, E=shape[0], N=shape[1], K=shape[2], top_k=8)[0] != untuned
+
+
+def _launch(monkeypatch, config):
+    """Run invoke_fused_moe_kernel on CPU tensors with Triton's launches
+    recorded rather than run: (kernel object, its launch keywords)."""
+    from triton.runtime.autotuner import Autotuner
+    from triton.runtime.jit import JITFunction
+
+    launches = []
+    for cls in (Autotuner, JITFunction):
+        monkeypatch.setattr(cls, "run", lambda self, *args, **kw: launches.append((self, kw)))
+    tokens, top_k, experts, n, k = 4, 2, 8, 64, 32
+    ids = torch.zeros(tokens, top_k, dtype=torch.int32)
+    kernels.invoke_fused_moe_kernel(
+        A=torch.zeros(tokens, k), B=torch.zeros(experts, n, k), C=torch.zeros(tokens * top_k, n),
+        topk_weights=torch.zeros(tokens, top_k), topk_ids=ids, sorted_token_ids=torch.zeros(64, dtype=torch.int32),
+        expert_ids=torch.zeros(4, dtype=torch.int32), num_tokens_post_padded=torch.zeros(1, dtype=torch.int32),
+        mul_routed_weight=False, top_k=top_k, config=config, compute_type=None,
+    )
+    (launch,) = launches
+    return launch
+
+
+def test_amd_compiler_options_ride_in_the_kernels_config(monkeypatch):
+    """Launch keywords other than num_warps / num_stages and the kernel's own
+    arguments are dropped when the launch runs inside a compiled frame, so the
+    AMD options go in the config of a one-config autotuner, which Inductor
+    forwards to the compiler."""
+    tile = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1}
+    amd = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    kernel, kw = _launch(monkeypatch, {**tile, "num_warps": 8, "num_stages": 2, **amd})
+    assert not (set(kw) & (AMD_KEYS | {"num_warps", "num_stages"})), kw
+    assert {k: kw[k] for k in tile} == tile
+    (config,) = kernel.configs
+    assert kernel.fn is kernels.fused_moe_kernel
+    assert config.kwargs == amd and (config.num_warps, config.num_stages) == (8, 2)
+
+
+def test_a_config_without_amd_options_launches_the_kernel_itself(monkeypatch):
+    config = {**kernels.get_default_config(4, 8, 64, 32, 2), "num_warps": 4, "num_stages": 3}
+    kernel, kw = _launch(monkeypatch, config)
+    assert kernel is kernels.fused_moe_kernel
+    assert {k: kw[k] for k in config} == config
+
+
+def test_a_table_builds_its_kernels_when_it_loads(monkeypatch):
+    """A compiled frame only looks its kernels up: one built while tracing
+    would not be a Triton kernel to dynamo."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "AMD Instinct MI325X VF")
+    monkeypatch.setattr(kernels, "current_platform", _Platform(True))
+    monkeypatch.setattr(kernels, "_KERNELS_WITH_OPTIONS", {})
+    for shape in [(128, 1536, 2048), (128, 768, 1024)]:
+        tuned = kernels.tuned_configs(*shape)
+        built = dict(kernels._KERNELS_WITH_OPTIONS)
+        for m in tuned:
+            for config in kernels.nearest_config(tuned, m):
+                kernel, _ = kernels.kernel_for(config)
+                assert kernel is kernels.fused_moe_kernel or kernel in built.values(), (shape, m)
+        assert kernels._KERNELS_WITH_OPTIONS == built
