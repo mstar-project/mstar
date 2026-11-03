@@ -929,8 +929,9 @@ the Dynamo frontend will silently lose it.</p>
 value that <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> moves onto a tensor edge must not travel there
 too. List those kwargs in <code class="docutils literal notranslate"><span class="pre">PREPROCESS_ONLY_KWARGS</span></code>: the data worker keeps the
 originals for <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and leaves them out of the conductor’s copy. Pi0.5
-lists <code class="docutils literal notranslate"><span class="pre">robot_state</span></code>, and Cosmos3 lists <code class="docutils literal notranslate"><span class="pre">action</span></code> (it passes only the shape on as
-<code class="docutils literal notranslate"><span class="pre">action_shape</span></code> metadata). A tensor left in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> fails at send
+lists <code class="docutils literal notranslate"><span class="pre">robot_state</span></code>, and Cosmos3 lists <code class="docutils literal notranslate"><span class="pre">action</span></code> and <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> (it passes
+only their sizes on, as <code class="docutils literal notranslate"><span class="pre">action_shape</span></code> and <code class="docutils literal notranslate"><span class="pre">robot_state_dim</span></code> metadata). A tensor
+left in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> fails at send
 with an error that names the kwarg.</p>
 </div>
 <div class="admonition note">

@@ -1112,7 +1112,8 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#   * inverse_dynamics  -- video is the condition (all latent frames clean);</span>
 <span class="c1">#                          every action token is predicted.</span>
 <span class="c1">#   * policy            -- video frame 0 is clean (the rest predicted) and every</span>
-<span class="c1">#                          action token is predicted.</span>
+<span class="c1">#                          action token is predicted, except an optional leading</span>
+<span class="c1">#                          state row (the robot's current state, at video frame 0).</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 
 <span class="n">ACTION_MODE_FORWARD_DYNAMICS</span> <span class="o">=</span> <span class="s2">"forward_dynamics"</span>
@@ -1123,11 +1124,14 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="action_condition_frame_indexes">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_condition_frame_indexes">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Clean (conditioning) action tokens for ``mode``."""</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">state_rows</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Clean (conditioning) action tokens for ``mode``. A policy request's first</span>
+<span class="sd">    ``state_rows`` tokens carry the robot's current state."""</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">action_length</span><span class="p">))</span>
-    <span class="k">if</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">state_rows</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[]</span>
     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 
@@ -1559,6 +1563,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">action_fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
     <span class="n">action_start_offset</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">device</span><span class="p">,</span>
+    <span class="n">state_rows</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Assemble the static transformer inputs for joint video+action generation.</span>
 
@@ -1587,7 +1592,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
     <span class="n">curr</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"num_vision_tokens"</span><span class="p">]</span>
-    <span class="n">action_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">action_chunk_size</span><span class="p">))</span>
+    <span class="n">action_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">action_chunk_size</span><span class="p">,</span> <span class="n">state_rows</span><span class="p">))</span>
     <span class="n">action_noisy</span> <span class="o">=</span> <span class="p">[</span><span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">action_chunk_size</span><span class="p">)</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">action_clean</span><span class="p">]</span>
     <span class="n">effective_action_fps</span> <span class="o">=</span> <span class="n">action_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="n">action_mrope_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_action_tokens</span><span class="p">(</span>

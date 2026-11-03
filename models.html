@@ -767,7 +767,7 @@ sliding-window attention. Tested on 4x GB200 at TP4; see the notes below.</p></t
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3_droid</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano-Policy-DROID</span></code></p></td>
 <td><p>Cosmos3 action-policy fine-tune for the DROID platform (<code class="docutils literal notranslate"><span class="pre">domain_name</span></code>
-<code class="docutils literal notranslate"><span class="pre">droid_lerobot</span></code>, 10-dim raw actions); no sound pathway. The config
+<code class="docutils literal notranslate"><span class="pre">droid_lerobot</span></code>, 8-dim raw actions); no sound pathway. The config
 serves the released policy sampling defaults (4 steps, guidance 3.0).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3_edge</span></code></p></td>
@@ -2074,12 +2074,30 @@ steps: batching keeps requests in step rather than adding throughput.</p>
 <p>The action policy (<code class="docutils literal notranslate"><span class="pre">cosmos3_edge_droid</span></code>, or <code class="docutils literal notranslate"><span class="pre">cosmos3_edge</span></code> with an action
 <code class="docutils literal notranslate"><span class="pre">domain_name</span></code>) predicts a chunk of robot actions from the current observation:
 <code class="docutils literal notranslate"><span class="pre">output_modalities=action</span></code> with <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
-<code class="docutils literal notranslate"><span class="pre">{&quot;action_mode&quot;:</span> <span class="pre">&quot;policy&quot;,</span> <span class="pre">&quot;domain_name&quot;:</span> <span class="pre">&quot;droid_lerobot&quot;,</span> <span class="pre">&quot;raw_action_dim&quot;:</span> <span class="pre">10,</span>
+<code class="docutils literal notranslate"><span class="pre">{&quot;action_mode&quot;:</span> <span class="pre">&quot;policy&quot;,</span> <span class="pre">&quot;domain_name&quot;:</span> <span class="pre">&quot;droid_lerobot&quot;,</span> <span class="pre">&quot;raw_action_dim&quot;:</span> <span class="pre">8,</span>
 <span class="pre">&quot;action_chunk_size&quot;:</span> <span class="pre">32}</span></code>; the reply’s <code class="docutils literal notranslate"><span class="pre">action</span></code> payload is float32
 <code class="docutils literal notranslate"><span class="pre">[chunk,</span> <span class="pre">action_dim_padded]</span></code> and the first <code class="docutils literal notranslate"><span class="pre">raw_action_dim</span></code> columns are the
-embodiment’s actions. For a control loop use <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> (one connection,
-pipelined observations): <code class="docutils literal notranslate"><span class="pre">examples/cosmos3_action_ws_client.py</span></code> runs it and
-reports chunks/s, actions/s and latency percentiles.</p>
+embodiment’s actions. A policy request may also send the robot’s current state
+as <code class="docutils literal notranslate"><span class="pre">robot_state</span></code>, one row of <code class="docutils literal notranslate"><span class="pre">raw_action_dim</span></code> finite numbers (a NaN or inf is
+a 400), as pi0.5 takes it. The state is one more action token, kept clean at
+video frame 0 in front of the chunk, so <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> is <code class="docutils literal notranslate"><span class="pre">action_chunk_size</span> <span class="pre">+</span> <span class="pre">1</span></code>
+and the reply carries only the predicted rows. The released DROID policies were
+trained this way. A request that sends a <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> is a policy request, and
+its chunk, fps and domain default to the checkpoint’s <code class="docutils literal notranslate"><span class="pre">checkpoint.json</span></code> (Edge
+DROID: 32 rows, 15 fps, <code class="docutils literal notranslate"><span class="pre">droid_lerobot</span></code>; <code class="docutils literal notranslate"><span class="pre">configs/cosmos3_droid.yaml</span></code> sets the
+same for Nano, whose file is empty), so NVIDIA’s RoboLab request is the image, the
+prompt, the state and <code class="docutils literal notranslate"><span class="pre">size=&quot;736x544&quot;</span></code>: the wrist frame above the two exterior
+frames reflection-padded to 736x544, the 7 joint positions and the gripper as
+DROID records them, and the task with view, duration and resolution text (a JSON
+caption for Edge). The DROID configs map the gripper to the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">gripper</span></code> in every action a request sends and back in every action it
+gets (<code class="docutils literal notranslate"><span class="pre">inverted_action_dims</span></code>),
+and <code class="docutils literal notranslate"><span class="pre">cosmos3_edge_droid</span></code> guides only inside the cookbook’s interval
+<code class="docutils literal notranslate"><span class="pre">[960,</span> <span class="pre">1001]</span></code> (<code class="docutils literal notranslate"><span class="pre">guidance_interval_action</span></code>; outside it the conditional branch
+runs alone, batched requests too). For a control loop use <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> (one
+connection, pipelined observations): <code class="docutils literal notranslate"><span class="pre">examples/cosmos3_action_ws_client.py</span></code>
+builds that request, runs the loop and reports chunks/s, actions/s and latency
+percentiles.</p>
 </section>
 <section id="cosmos3-streaming-rollout-windowed-video">
 <h2>Cosmos3 streaming rollout (windowed video)<a class="headerlink" href="#cosmos3-streaming-rollout-windowed-video" title="Link to this heading">#</a></h2>

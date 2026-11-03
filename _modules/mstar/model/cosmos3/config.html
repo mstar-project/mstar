@@ -1320,6 +1320,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">action_gen</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">max_action_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
     <span class="n">num_embodiment_domains</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span>
+    <span class="c1"># Action dims the served checkpoint takes as 1 - x: DROID's gripper (7) for</span>
+    <span class="c1"># the released DROID policies. Every action a request sends (a policy's</span>
+    <span class="c1"># robot_state, a forward-dynamics action) is mapped on the way in and every</span>
+    <span class="c1"># predicted action on the way out, so a client sends and reads the robot's</span>
+    <span class="c1"># own values (the same robot_state a pi0.5 DROID policy takes).</span>
+    <span class="n">inverted_action_dims</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="n">sound_gen</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">sound_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">64</span>
     <span class="n">sound_latent_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">25.0</span>
@@ -1457,6 +1463,19 @@ window.runMermaid = runMermaid;</script>
     <span class="n">num_inference_steps_action</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">30</span>
     <span class="n">guidance_scale_action</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="n">flow_shift_action</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">5.0</span>
+    <span class="c1"># The timestep interval [lo, hi] outside which an action request's step runs</span>
+    <span class="c1"># the conditional branch alone; None guides every step. A request's</span>
+    <span class="c1"># ``guidance_interval`` wins.</span>
+    <span class="n">guidance_interval_action</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Policy-request defaults a policy checkpoint ships in ``checkpoint.json``</span>
+    <span class="c1"># (its "policy" section): the chunk the reply carries, the observation fps</span>
+    <span class="c1"># and the embodiment, so a client sends only the observation, the prompt</span>
+    <span class="c1"># and the robot_state. None keeps the generic action defaults (16 rows,</span>
+    <span class="c1"># ``fps``, and a domain the request must name). The Nano DROID checkpoint's</span>
+    <span class="c1"># file is empty, so its yaml sets them.</span>
+    <span class="n">policy_action_chunk_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">policy_conditioning_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">policy_domain_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Default output size (width, height) for image and video requests that</span>
     <span class="c1"># send no ``size``: Nano/Super serve 1024^2 images and the same square for</span>
     <span class="c1"># video unless the deployment says otherwise; Edge is 480p-native (the</span>
@@ -1686,6 +1705,17 @@ window.runMermaid = runMermaid;</script>
             <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">EDGE_RECIPE_DEFAULTS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
                 <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">defaults</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
                     <span class="nb">setattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+        <span class="n">ckpt_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"checkpoint.json"</span>
+        <span class="k">if</span> <span class="n">ckpt_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">policy</span> <span class="o">=</span> <span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"policy"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+            <span class="k">if</span> <span class="n">policy</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"action_chunk_size"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">policy_action_chunk_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">policy</span><span class="p">[</span><span class="s2">"action_chunk_size"</span><span class="p">])</span>
+            <span class="k">if</span> <span class="n">policy</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"conditioning_fps"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">policy_conditioning_fps</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">policy</span><span class="p">[</span><span class="s2">"conditioning_fps"</span><span class="p">])</span>
+            <span class="k">if</span> <span class="n">policy</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"domain_name"</span><span class="p">):</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">policy_domain_name</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">policy</span><span class="p">[</span><span class="s2">"domain_name"</span><span class="p">])</span>
 
         <span class="n">modular_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"modular_model_index.json"</span>
         <span class="k">if</span> <span class="n">modular_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
