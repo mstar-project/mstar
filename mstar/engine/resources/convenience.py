@@ -176,6 +176,7 @@ class KDACallable:
         self._layer_idx = layer_idx
         self.attn.set_default_layer_idx(layer_idx)
 
+    @torch.compiler.disable
     def current_plan(self) -> KDAPlan:
         """This step's plan under the bound label: whether it decodes or verifies."""
         return self.attn.current_plan()
