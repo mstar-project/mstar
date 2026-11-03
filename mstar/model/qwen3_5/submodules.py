@@ -708,7 +708,10 @@ class LLMSubmodule(ARNodeSubmodule):
         hidden = self.decode_hidden(graph_walk, engine_inputs, True, input_ids=input_ids)
         logits = self.model.lm_head(hidden)
         new_tokens = engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
-        return self._batched_output(new_tokens)
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+        )
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
@@ -738,10 +741,6 @@ class LLMSubmodule(ARNodeSubmodule):
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
-        return self._batched_output(new_tokens)
-
-    @staticmethod
-    def _batched_output(new_tokens: torch.Tensor) -> BatchedModelOutput:
         # Row i is request i: one clone and one D2H copy per step instead of
         # one per request.
         return BatchedModelOutput(

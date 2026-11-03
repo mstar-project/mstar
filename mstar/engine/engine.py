@@ -736,7 +736,9 @@ class Engine:
         submodule_mgmt = self._submodules[node_name]
         submodule = submodule_mgmt.submodule
         group = submodule_mgmt.joint_comm_group
-        configs = submodule.get_fused_decode_configs(self._device, group.world_size)
+        # the engine drives duck-typed submodules too
+        declared = getattr(submodule, "get_fused_decode_configs", None)
+        configs = declared(self._device, group.world_size) if declared is not None else []
         if not configs:
             return
         if knobs.fused_decode() == "off":

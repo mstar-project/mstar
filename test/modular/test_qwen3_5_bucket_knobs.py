@@ -185,4 +185,5 @@ def test_only_qwen3_5_text_walks_read_the_switch():
         for fn in cls.body if isinstance(fn, ast.FunctionDef)
         and any(isinstance(n, ast.Name) and n.id == "compile_deterministic" for n in ast.walk(fn))
     ]
-    assert methods == ["LLMSubmodule.get_accelerator_graph_configs"]
+    # the decode capture's compile mode, and the fused decode kernels it rules out
+    assert methods == ["LLMSubmodule.get_accelerator_graph_configs", "LLMSubmodule.prepare_fused_decode"]

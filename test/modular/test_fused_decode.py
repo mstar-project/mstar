@@ -246,6 +246,8 @@ class _FlowRunner:
 
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
     warmup_and_capture = AcceleratorGraphRunner.warmup_and_capture
+    _capture_one = AcceleratorGraphRunner._capture_one
+    fused_buckets = AcceleratorGraphRunner.fused_buckets
     _register_slot = AcceleratorGraphRunner._register_slot
     _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
     _report_dropped = AcceleratorGraphRunner._report_dropped
@@ -264,7 +266,7 @@ class _FlowRunner:
         self._capture_costs = {spec.bucket: CaptureCost(0, 0, 0, 2) for spec in specs}
         self._buckets, self._executables, self._blocked_buckets = {}, {}, []
         self._memory_pool = None
-        self._fused, self.fused_buckets = {}, set()
+        self._fused = {}
         self._fused_fails = set(fused_fails)
         group = CommGroup.trivial()
         self._comm_group = JointGroups(tp_group=group, sp_group=group)
@@ -274,14 +276,14 @@ class _FlowRunner:
     def prepare_for_capture(self):
         return self._specs
 
-    def _capture_one(self, spec, forwards):
-        return f"graph:{spec.bucket.bs}:{spec.slot}"
+    def _capture_graph(self, spec, forwards):
+        return SimpleNamespace(name=f"graph:{spec.bucket.bs}:{spec.slot}", fused=False)
 
     def _capture_fused(self, spec, fused, graph_slot):
-        self.fused_calls.append((spec.bucket.bs, spec.slot, graph_slot))
+        self.fused_calls.append((spec.bucket.bs, spec.slot, graph_slot.name))
         if (spec.bucket.bs, spec.slot) in self._fused_fails:
             return graph_slot
-        return f"fused:{spec.bucket.bs}:{spec.slot}"
+        return SimpleNamespace(name=f"fused:{spec.bucket.bs}:{spec.slot}", fused=True)
 
     def _get_addtl_slot_specs(self, spec):
         return []
@@ -297,7 +299,7 @@ def test_declared_buckets_register_the_fused_capture_and_the_rest_their_graph():
     runner = _FlowRunner([_spec(bs, slot) for bs in (1, 2, 4) for slot in (0, 1)])
     runner.bind_fused_decode([FusedDecodeConfig(walk="decode", batch_sizes=(1, 2))])
     runner.warmup_and_capture(None)
-    slots = {key.bs: bucket.slots for key, bucket in runner._buckets.items()}
+    slots = {key.bs: [slot.name for slot in bucket.slots] for key, bucket in runner._buckets.items()}
     assert slots == {1: ["fused:1:0", "fused:1:1"], 2: ["fused:2:0", "fused:2:1"], 4: ["graph:4:0", "graph:4:1"]}
     assert {key.bs for key in runner.fused_buckets} == {1, 2}
     # the fused capture comes after the bucket's own graph, which it falls back to
@@ -309,7 +311,9 @@ def test_a_fused_capture_that_falls_back_leaves_its_graph_registered():
     runner.bind_fused_decode([FusedDecodeConfig(walk="decode", batch_sizes=(1,))])
     runner.warmup_and_capture(None)
     (bucket,) = runner._buckets.values()
-    assert bucket.slots == ["fused:1:0", "graph:1:1"]
+    assert [slot.name for slot in bucket.slots] == ["fused:1:0", "graph:1:1"]
+    # a bucket some of whose slots kept the graph isn't counted as fused
+    assert runner.fused_buckets == set()
 
 
 # -- the parity step --------------------------------------------------------------------------

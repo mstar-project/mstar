@@ -659,6 +659,8 @@ class AcceleratorGraphSlot:
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
+    # the graph replays the submodule's fused forward (`FusedDecodeConfig`)
+    fused: bool = False
 
 
 @dataclass
@@ -777,10 +779,9 @@ class AcceleratorGraphRunner:
         self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
 
         # (walk, bs) -> the fused forward that captures in that bucket's place
-        # (`bind_fused_decode`); the buckets that replay it once captured; one
-        # scratch set per captured (bucket, slot); config_idx -> compiled fused forward
+        # (`bind_fused_decode`); one scratch set per captured (bucket, slot);
+        # config_idx -> compiled fused forward
         self._fused: dict[tuple[str, int], FusedDecodeConfig] = {}
-        self.fused_buckets: set[BucketKey] = set()
         self._fused_scratch: dict[tuple[BucketKey, int], FusedScratch] = {}
         self._compiled_fused: dict[int, Any] = {}
 
@@ -792,6 +793,14 @@ class AcceleratorGraphRunner:
     @property
     def any_graphs(self):
         return bool(self._buckets)
+
+    @property
+    def fused_buckets(self) -> set[BucketKey]:
+        """Registered buckets every slot of which replays the fused forward."""
+        return {
+            key for key, bucket in self._buckets.items()
+            if bucket.slots and all(getattr(slot, "fused", False) for slot in bucket.slots)
+        }
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
@@ -1045,12 +1054,6 @@ class AcceleratorGraphRunner:
                     self._submodule_name, spec, exc_info=True
                 )
                 continue
-            fused = self._fused_config(spec)
-            if fused is not None:
-                graph_slot = slot
-                slot = self._capture_fused(spec, fused, graph_slot)
-                if slot is not graph_slot:
-                    self.fused_buckets.add(spec.bucket)
 
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
             if  len(captured[spec.bucket]) == self._num_slots:
@@ -1159,6 +1162,13 @@ class AcceleratorGraphRunner:
         )
 
     def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
+        """The slot ``spec`` replays: its graph, or the fused forward captured
+        after it where the submodule declares the bucket and it holds up."""
+        slot = self._capture_graph(spec, forwards)
+        fused = self._fused_config(spec)
+        return slot if fused is None else self._capture_fused(spec, fused, slot)
+
+    def _capture_graph(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
         # no forward after sizing, which already ran this spec's
         with self._warmed(spec, forwards) as warmed:
             # what preparing it left cached in the allocator is out of the
@@ -1360,7 +1370,7 @@ class AcceleratorGraphRunner:
             )
             return graph_slot
         logger.info("fused decode: %s replays the fused forward. Parity: %s", name, format_errors(errors))
-        return self._build_slot_from_capture(
+        return replace(self._build_slot_from_capture(
             output=BatchedModelOutput.coerce(output),
             graph=graph,
             static_inputs=warmed.static_inputs,
@@ -1368,7 +1378,7 @@ class AcceleratorGraphRunner:
             dummy_rids=warmed.dummy_rids,
             dummy_metadata=warmed.dummy_metadata,
             config_idx=spec.config_idx,
-        )
+        ), fused=True)
 
     def _fused_parity(self, spec: CGSlotSpec, warmed: WarmedSpec) -> dict[str, float]:
         """``fused_parity`` over the capture's rows, on the capture's lease and
