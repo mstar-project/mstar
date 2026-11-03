@@ -9,8 +9,9 @@ from mstar.model.submodule_base import chunk_tick_name
 
 @dataclass(frozen=True)
 class RebuildPolicy:
-    """A request that prefilled in ``walks`` is rebuilt by one row per prefill step, each in its step's walk, which
-    recompute its prompt and every id it has sampled since, but the last, which the next decode step reads.
+    """A request that prefilled in ``walks`` is rebuilt by one row per prefill step, each run in its step's walk.
+    The rows recompute the request's prompt and every id it has sampled since, except the last, which the next
+    decode step reads.
 
     ``ids_input`` is the input that carries the prompt's ids, and a row's ids go under it. Whatever else the node
     reads in a walk, such as the encoder's output a prompt with images reads, the worker copies to the host when the
@@ -38,8 +39,9 @@ class RebuildPolicy:
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> dict[str, frozenset[str]]:
         """What ``node`` reads in each of ``walks`` besides ``ids_input``, which the worker copies. Raise unless
-        each walk runs ``node``, which outputs ``sample_output`` in a walk where it reads ``ids_input``, since such
-        a walk can end a prompt, some walk reads ``ids_input``, and some walk runs ``node`` inside ``loop``."""
+        every walk runs ``node``, some walk reads ``ids_input``, and some walk runs ``node`` inside ``loop``. Also
+        raise when ``node`` reads ``ids_input`` in a walk without outputting ``sample_output`` there, since such a
+        walk can end a prompt."""
         if not self.ids_walks(node, graphs):
             raise ValueError(
                 f"{node}'s rebuild row carries its ids as {self.ids_input!r}, which {node} reads in none of its walks"
