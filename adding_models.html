@@ -725,6 +725,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuned-kernel-configs">Tuned kernel configs</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
@@ -3245,6 +3246,19 @@ as a static input, so a replay can update it; fill it from
 <p>The shared-expert block (<code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlockWithSharedExpert</span></code>) has no EP variant, so
 a node built from it stays TP-only.</p>
 </section>
+<section id="tuned-kernel-configs">
+<h3>Tuned kernel configs<a class="headerlink" href="#tuned-kernel-configs" title="Link to this heading">#</a></h3>
+<p>Launch configs that depend on the GPU and the shapes, such as the fused MoE’s tiles, are data,
+not code. Each kernel op (<code class="docutils literal notranslate"><span class="pre">mstar/kernels</span></code>) names the dimensions its configs are keyed by, and
+its tuned configs live in one JSON table per GPU under <code class="docutils literal notranslate"><span class="pre">mstar/kernels/tables/&lt;op&gt;/</span></code>. A model
+on a shared component gets them without code of its own: the component looks its shape up once
+per process and keeps the default config where no table has it, and the server logs the sweep
+command for that shape (<code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">table:</span> <span class="pre">no</span> <span class="pre">moe_gemm</span> <span class="pre">bfloat16</span> <span class="pre">E=128,N=1536,K=2048,top_k=8</span> <span class="pre">...</span></code>).</p>
+<p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.kernels.sweep</span></code> times the candidates at those shapes on one GPU, checks
+each against a reference output, and writes the winners with where they were measured.
+<code class="docutils literal notranslate"><span class="pre">--out</span> <span class="pre">DIR</span></code> with <code class="docutils literal notranslate"><span class="pre">MSTAR_KERNEL_TABLES=DIR</span></code> serves a sweep before it is committed;
+<code class="docutils literal notranslate"><span class="pre">benchmark/kernels/README.md</span></code> has the workflow and how to add an op.</p>
+</section>
 </section>
 <section id="worked-example-orpheus">
 <h2>Worked example: Orpheus<a class="headerlink" href="#worked-example-orpheus" title="Link to this heading">#</a></h2>
@@ -3857,6 +3871,7 @@ for a full omni-modal model.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuned-kernel-configs">Tuned kernel configs</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>

@@ -1569,7 +1569,16 @@ footprint at removal. Tests and debugging only.</p></td>
 <td><p>Dynamo’s recompile limit, clamped to [8, 256]. Raise it if the logs
 show <code class="docutils literal notranslate"><span class="pre">hit</span> <span class="pre">config.recompile_limit</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KERNEL_TABLES</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Directories of tuned kernel-config tables (<code class="docutils literal notranslate"><span class="pre">os.pathsep</span></code>-separated),
+searched before the package’s <code class="docutils literal notranslate"><span class="pre">mstar/kernels/tables</span></code> (read by
+<code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.kernels.table.table_dirs()</span></code>). <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.kernels.sweep</span>
+<span class="pre">...</span> <span class="pre">--out</span> <span class="pre">DIR</span></code> writes one, so a sweep can be served and measured before it
+is committed. Set it the same way on every node, so every rank of a lockstep
+instance picks the same configs.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>How much a captured forward’s compile tunes; <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code> sets it
 (read by <code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.engine.accelerator_graph_runner.compile_level()</span></code>).
@@ -1577,7 +1586,7 @@ show <code class="docutils literal notranslate"><span class="pre">hit</span> <sp
 <code class="docutils literal notranslate"><span class="pre">2</span></code>: <code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. A capture config that names its
 own <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> keeps it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_DETERMINISTIC</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_DETERMINISTIC</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">compile_deterministic</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: Qwen3.5’s decode capture compiles in Inductor’s deterministic
 mode, as its prefill, mixed and vision captures always do, so greedy
@@ -1585,7 +1594,7 @@ output reproduces across server processes and the cold start shrinks,
 at the cost of one-row decode speed. Only Qwen3.5’s text walks read it
 (<code class="docutils literal notranslate"><span class="pre">knobs.compile_deterministic</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_PTXAS_BLACKWELL_PATH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_PTXAS_BLACKWELL_PATH</span></code></p></td>
 <td><p>torch’s ptxas, when needed</p></td>
 <td><p>Triton’s own variable: the ptxas it runs for sm_100 and up. ptxas
 before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
@@ -1601,7 +1610,7 @@ is kept, and the cache tag then names the ptxas you chose, so a cache
 another ptxas wrote is not reused. A <code class="docutils literal notranslate"><span class="pre">TORCH_COMPILE_CACHE_KEY_TAG</span></code>
 you set gets <code class="docutils literal notranslate"><span class="pre">-ptxas-blackwell-&lt;version&gt;</span></code> appended.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME/mstar/torchinductor</span></code> (<code class="docutils literal notranslate"><span class="pre">~/.cache/mstar/torchinductor</span></code> when unset)</p></td>
 <td><p>torch’s own variable; M* sets this default when importing
 <a class="reference internal" href="_autosummary/mstar.engine.html#module-mstar.engine" title="mstar.engine"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.engine</span></code></a> (<code class="docutils literal notranslate"><span class="pre">_default_compile_caches</span></code>), so compiled graphs and
@@ -1612,7 +1621,7 @@ start (Triton’s kernels follow it unless <code class="docutils literal notrans
 FlashInfer’s JIT cache stays warm). See
 <a class="reference internal" href="serving.html#restarts-and-the-compile-cache"><span class="std std-ref">Restarts and the compile cache</span></a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">$TORCHINDUCTOR_CACHE_DIR/triton</span></code></p></td>
 <td><p>Triton’s own variable, defaulted by the same function once
 <code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code> is resolved (exported or M*’s default; left unset
