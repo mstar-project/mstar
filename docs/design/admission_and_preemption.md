@@ -268,14 +268,14 @@ Why this shape:
 @dataclass(frozen=True)
 class RebuildPolicy:
     """How a node rebuilds a dropped request's KV, as its model declares it."""
-    walk: str            # the prefill walk a rebuild row runs
-    ids_input: str       # the walk's input that carries the prompt's ids
-    sample_output: str   # the output that carries each sampled id
-    loop: str            # the loop each of whose iterations samples one id
-    copied_inputs: Mapping[str, tuple[str, ...]]   # another prefill walk -> what it reads besides the ids
+    walks: frozenset[str]   # the prefill walks a rebuild row runs, the one the request prefilled in
+    ids_input: str          # the input that carries the prompt's ids
+    sample_output: str      # the output that carries each sampled id
+    loop: str               # the loop each of whose iterations samples one id
+    copy_bytes_per_slot: Mapping[str, int]   # a walk that reads more than the ids -> host bytes per KV slot
 ```
 
-A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
+A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup and reads off them what the node reads in each walk besides the ids. A node without one never drops a request.
 
 A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, opens the rebuild in the worker's log, and parks the request's decode row, as it parks a row waiting for capacity, until the rebuild lands.
 
@@ -283,7 +283,7 @@ The rebuild prefills the kept ids minus the last, under the walk the request pre
 
 A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk parks until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. A walk of `copied_inputs` reads more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
+The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. A walk can read more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs and the step's metadata to the host, and the rebuild row reads them back under that metadata. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
 
 Why this shape:
 
