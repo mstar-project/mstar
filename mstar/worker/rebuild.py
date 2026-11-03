@@ -23,17 +23,16 @@ if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.model.submodule_base import HostRows
 
-# The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
-# at 4 B each.
+# The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
+# at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
 
 
 @dataclass(slots=True)
 class KeptIds:
-    """A request's ids on one node: its prompt copied to the host as int32, the dtype the policy's walk read
-    it in, and each id sampled since."""
+    """A request's ids on one node: its prompt copied to the host as the policy's walk read it, and each id
+    sampled since."""
     prompt: HostCopy
-    dtype: torch.dtype
     sampled: array
 
 
@@ -87,9 +86,9 @@ class Rebuilds:
             if not row or rid in kept or walks.get(rid, walk) != policy.walk:
                 continue
             prompt = row[policy.ids_input][0]
-            copy = self._pool.copy_out(prompt, node_batch.completion_event, torch.int32)
+            copy = self._pool.copy_out(prompt, node_batch.completion_event)
             if copy is not None:
-                kept[rid] = KeptIds(copy, prompt.dtype, array("i"))
+                kept[rid] = KeptIds(copy, array("i"))
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -157,9 +156,9 @@ class Rebuilds:
         """Open ``rid``'s rebuild on ``node``, and return what it writes."""
         assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
         kept, walk = self._kept[node][rid], self._policies[node].walk
-        ids = array("i", kept.prompt.view.numpy().tobytes())
+        ids = array("i", kept.prompt.view.to(torch.int32).numpy().tobytes())
         ids.extend(kept.sampled)
-        self._cursors[(node, rid)] = RebuildCursor(walk, ids, kept.dtype)
+        self._cursors[(node, rid)] = RebuildCursor(walk, ids, kept.prompt.view.dtype)
         return Rebuild(walk, ids)
 
     def rebuilding(self, rid: int, node: str) -> bool:

@@ -96,9 +96,9 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
 
 
 def _kept(prompt, *sampled: int) -> KeptIds:
-    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as the walk read it."""
+    view = torch.tensor(prompt, dtype=torch.long)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", sampled))
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -114,12 +114,14 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     assert kept[R].prompt.view.tolist() == [7, 8, 9] and kept[A].prompt.view.tolist() == [8, 9, 10], (
         "it kept another row's ids"
     )
-    assert kept[R].dtype == torch.long, "the rebuild row would read its ids in another dtype than the walk's"
+    assert kept[R].prompt.view.dtype == torch.long, (
+        "the rebuild row would read its ids in another dtype than the walk's"
+    )
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
 def test_a_full_pool_keeps_no_ids():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
 
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
 
@@ -127,7 +129,7 @@ def test_a_full_pool_keeps_no_ids():
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
     rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
 
     rebuilds.remove_request(R)
@@ -198,9 +200,9 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
 
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
-    prompt = torch.tensor([1, 2], dtype=torch.int32)
+    prompt = torch.tensor([1, 2], dtype=torch.long)
     copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
-    rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
+    rebuilds._kept[NODE][R] = KeptIds(copying, array("i", [5]))
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}), (
         "a rebuild would read ids the copy hasn't written yet"
