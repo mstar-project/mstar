@@ -835,17 +835,41 @@ def test_an_eager_step_marks_its_rows():
     _assert_row(planner, live, 1)
 
 
-def test_qwen35_decode_needs_the_rope_inside_the_graph(monkeypatch):
+def _qwen35_llm():
     from mstar.model.qwen3_5 import submodules
 
-    monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: False)
-    llm = next(
+    return submodules, next(
         cls for cls in vars(submodules).values()
         if isinstance(cls, type) and cls.__module__ == submodules.__name__ and "resident_walks" in vars(cls)
     )
-    assert llm.resident_walks(None) == frozenset()
-    monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: True)
+
+
+@pytest.mark.parametrize("knob", [False, True])
+def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
+    submodules, llm = _qwen35_llm()
+    monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
     assert llm.resident_walks(None) == {"decode"}
+    assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
+    assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
+
+
+@pytest.mark.parametrize("rows", ["loopback", "own_ids"])
+def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
+    """The graph fills positions and write locations, after `preprocess`."""
+    submodules, llm = _qwen35_llm()
+    token = torch.tensor([5, 6])
+    inputs = [
+        SimpleNamespace(input_embeds=None, input_ids=None if rows == "loopback" else token[:1], custom_pos_ids=None,
+                        input_seq_len=0 if rows == "loopback" else 1)
+        for _ in range(2)
+    ]
+    stub = SimpleNamespace(
+        _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
+    )
+    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
+    out = llm.preprocess(stub, "decode", engine_inputs, inputs)
+    assert set(out) == {"input_ids"}
 
 
 # ---- the knob ----

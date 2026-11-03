@@ -380,8 +380,9 @@ class LLMSubmodule(ARNodeSubmodule):
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def resident_walks(self) -> frozenset[str]:
-        # with the tables staged outside the graph, `preprocess` reads positions
-        return frozenset({"decode"}) if ingraph_decode_rope() else frozenset()
+        # a captured decode step builds its rope inside the graph on every config
+        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
+        return frozenset({"decode"})
 
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
