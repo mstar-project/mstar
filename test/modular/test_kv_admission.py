@@ -214,6 +214,35 @@ def test_a_passer_pays_for_its_output_and_for_each_page_of_its_hit_eviction_can_
     assert kv._allotments["partly"].pages == 2, "the passer's hit page eviction can take wasn't charged as fresh"
 
 
+def test_a_filed_page_tries_no_request_whose_output_cant_fit_beside_the_head(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv._index.filed += 1  # a page filed on no waiting request's chain, as a decode key files one
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, f"one filed page tried {len(tried)} requests whose output doesn't fit whatever their hit"
+
+
+def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
+    kv = _passing(free=3, head=5)
+    # its own three pages past what "r" holds don't fit beside its output, which would
+    _short_chat(kv, "p", list(range(7000, 7000 + 3 * PAGE_SIZE)))
+    assert not _ready(kv, "p")
+    measured = []
+    hit = KVManager._hit
+    monkeypatch.setattr(KVManager, "_hit", lambda self, rid, *args: measured.append(rid) or hit(self, rid, *args))
+    kv._index.filed += 1
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert "p" in measured, "a filed page could have raised the hit of a request refused on it, and it wasn't measured"
+
+
 def _with_snapshots(kv) -> RecurrentStatePool:
     """A Qwen3.5-shaped node: ``kv`` beside a recurrent pool whose snapshots key off ``kv``'s chains."""
     state = RecurrentStatePool(device=torch.device("cpu"), name="state", config=RecurrentStateConfig(

@@ -94,6 +94,14 @@ class RoomMark(NamedTuple):
     taken: int
 
 
+class PassMark(NamedTuple):
+    """What `reserve_past` refused a request against: the room, and the index counts when the refusal read
+    the index. A refusal on the request's growth alone reads none, so a filed page doesn't retry it."""
+    room: int
+    filed: int | None
+    taken: int | None
+
+
 @dataclass
 class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
@@ -677,6 +685,7 @@ class KVManager(AttentionResource):
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
         #   first `ask` or when a drop or a move takes them off the device.
         # `_snapshots` holds the pools that restore a hit's recurrent state, which a prefill hit can't run past.
+        # `_footprints` holds each request's `_footprint`, which stays the one at intake.
         # `_kept` counts the pages requests that passed the head freed while a request waited. No later passer is
         #   admitted into them, though admitted requests can still take them, and the head's allotment takes them all.
         self._nodes = nodes
@@ -686,6 +695,7 @@ class KVManager(AttentionResource):
         self._unused = 0
         self._guaranteed: set[str] = set()
         self._snapshots: list["RecurrentStatePool"] = []
+        self._footprints: dict[str, int] = {}
         self._kept = 0
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
@@ -4121,6 +4131,7 @@ class KVManager(AttentionResource):
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
             self._guaranteed.discard(rid)
+            self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
@@ -4370,9 +4381,11 @@ class KVManager(AttentionResource):
 
     def _footprint(self, rid: str) -> int:
         """The pages ``rid`` would hold once the loops this worker runs reach their caps."""
-        overrides = self._overrides[rid]
-        caps = {loop: cap if loop in self.local_loops else 0 for loop, cap in (overrides.loop_caps or {}).items()}
-        return overrides.pages(self._nodes, caps, self.config)
+        if rid not in self._footprints:
+            overrides = self._overrides[rid]
+            caps = {loop: cap if loop in self.local_loops else 0 for loop, cap in (overrides.loop_caps or {}).items()}
+            self._footprints[rid] = overrides.pages(self._nodes, caps, self.config)
+        return self._footprints[rid]
 
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -4401,7 +4414,7 @@ class KVManager(AttentionResource):
 
     def reserve_past(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
-    ) -> RoomMark | None:
+    ) -> PassMark | None:
         """Allot ``rid`` past the first request in the queue, when what its own admission would take and the
         growth that admission leaves to the room fit in the room less `_kept`.
 
@@ -4411,9 +4424,8 @@ class KVManager(AttentionResource):
         """
         with self._lock:
             room = self._room()
-            refused = RoomMark(rid, node_name, graph_walk, published, room, 0, 0)
-            if room <= self._kept or rid in self._allotments:
-                return refused
+            if rid in self._allotments or self._footprint(rid) - self._asks[rid] > room - self._kept:
+                return PassMark(room, None, None)
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
@@ -4422,8 +4434,9 @@ class KVManager(AttentionResource):
             self._root_chain(prefix_chain)
         with self._lock:
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
-            if pages > self._room() - self._kept:
-                return refused
+            room = self._room()
+            if pages > room - self._kept:
+                return PassMark(room, *self._index_counts())
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
             self._reserve(rid, pages, passed=True)
@@ -4453,7 +4466,7 @@ class KVManager(AttentionResource):
             if self.journal is not None:
                 self.journal(MoveKind.UNRESERVE, rid, 0)
 
-    def grew_since(self, mark: RoomMark) -> bool:
+    def grew_since(self, mark: RoomMark | PassMark) -> bool:
         """A newly filed page can raise a waiting request's hit, and a hit page another request
         takes from the evictable set comes out of that request's allotment, not this one's. Neither
         moves the room, so the index counts both. The counts only rise, so two changes between passes
@@ -4463,7 +4476,7 @@ class KVManager(AttentionResource):
         # under the lock, so a page freed on the GPU thread between the two reads can't trip it
         with self._lock:
             grew = self._grew_since(mark)
-            if not grew and mark.rid in self._asks:
+            if not grew and isinstance(mark, RoomMark) and mark.rid in self._asks:
                 pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
                 assert pages > self._room(), (
                     f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
@@ -4471,9 +4484,10 @@ class KVManager(AttentionResource):
                 )
             return grew
 
-    def _grew_since(self, mark: RoomMark) -> bool:
-        filed, taken = self._index_counts()
-        return self._room() > mark.room or filed != mark.filed or taken != mark.taken
+    def _grew_since(self, mark: RoomMark | PassMark) -> bool:
+        if self._room() > mark.room:
+            return True
+        return mark.filed is not None and (mark.filed, mark.taken) != self._index_counts()
 
     def _need(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
