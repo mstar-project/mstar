@@ -3430,8 +3430,8 @@ class KVManager(AttentionResource):
         """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
         one, keyed as a prompt of those ids would be.
 
-        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
-        the one at intake. The decode step that samples an id keys it, so a label that keys
+        The growth loop's cap and the layout's growth bound drop by what the span now covers, so the
+        footprint stays the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
         overrides = self._overrides[rid]
@@ -3463,7 +3463,10 @@ class KVManager(AttentionResource):
                 overrides,
                 kv_layout={
                     **overrides.kv_layout,
-                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
+                    label: replace(
+                        layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed),
+                        max_growth=None if layout.max_growth is None else layout.max_growth - grown,
+                    ),
                 },
                 loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
                 **changes,

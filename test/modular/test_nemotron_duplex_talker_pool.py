@@ -13,12 +13,13 @@ from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVReqConfig, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
+    NANO_KV,
     TALKER_ATTN,
     TALKER_CFG_LABEL,
     TALKER_KV,
@@ -264,27 +265,48 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     assert cfg.additional_key_info == sub.DECODE_KEY
 
 
-def test_every_session_of_the_longest_length_fits_the_talker_pool_at_once(monkeypatch):
+POOLS = pytest.mark.parametrize("key, labels, loop", [
+    (TALKER_KV, ("main", "uncond"), "talker_decode_loop"), (NANO_KV, ("main",), "decode_loop"),
+], ids=["talker", "nano"])
+
+
+def _sessions(monkeypatch, key: str, labels: tuple[str, ...], loop: str):
+    """DEFAULT_SESSIONS sessions with the longest system prompt, laid out as `process_prompt` lays them out, on
+    the pool of ``key`` the model sizes. Returns the model, the pool and whether each session was admitted."""
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     model = NemotronDuplexModel.__new__(NemotronDuplexModel)
     model.config = NemotronDuplexConfig()
-    page_size = DEFAULT_PAGE_SIZE
+    ids = torch.zeros(1, model.max_prompt_tokens, dtype=torch.long)
+    model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=ids)
+    layouts = model.process_prompt(
+        "a prompt", ["audio", "text"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(16000)]},
+    ).metadata["kv_layout"][key]
+    pages = model.talker_kv_pages if key == TALKER_KV else model.nano_kv_pages
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-                          max_num_pages=model.talker_kv_pages(page_size), page_size=page_size),
-        name=TALKER_KV, joint_comm_group=None, transfer_engine_info=None,
+                          max_num_pages=pages(DEFAULT_PAGE_SIZE), page_size=DEFAULT_PAGE_SIZE),
+        name=key, joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    kv.local_loops = {"talker_decode_loop"}
-    stream = StreamLayout(spans=(PrefixSpan(P, P, "talker_decode", kind="rows"),), growth=(("talker_decode_loop", 1),))
-    runner = StepRunner({TALKER_KV: kv}, node_resources={"talker": [TALKER_KV]})
+    kv.local_loops = {loop}
+    runner = StepRunner({key: kv}, node_resources={"node": [key]})
     for session in range(model.DEFAULT_SESSIONS):
-        runner.ingest_request(f"s{session}", {TALKER_KV: KVReqConfig(
-            kv_layout={"main": stream, "uncond": stream}, needed_labels=["main", "uncond"],
-            loop_caps={"talker_decode_loop": model.get_max_output_tokens()}, unpausable=True,
-        )}, session)
+        config = KVReqConfig(needed_labels=list(labels), unpausable=True)
+        config.apply_conductor_config(
+            kv_layout={label: layouts[label].row() for label in labels},
+            loop_caps={loop: model.get_max_output_tokens()},
+        )
+        runner.ingest_request(f"s{session}", {key: config}, session)
+    admitted = [
+        runner.admit_retrieve(f"s{session}", "node", "decode").ready for session in range(model.DEFAULT_SESSIONS)
+    ]
+    return model, kv, admitted
 
-    admitted = [runner.admit_retrieve(f"s{session}", "talker", "talker_decode").ready
-                for session in range(model.DEFAULT_SESSIONS)]
+
+@POOLS
+def test_every_session_of_the_longest_length_fits_its_pool_at_once(monkeypatch, key, labels, loop):
+    """A session's audio can't pause, so the pool reserves each of its streams at the loop caps."""
+    _, _, admitted = _sessions(monkeypatch, key, labels, loop)
 
     assert all(admitted), f"{admitted.count(False)} sessions wait for a stream's loop cap the pool wasn't sized for"
+

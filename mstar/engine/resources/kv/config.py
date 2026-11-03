@@ -419,8 +419,10 @@ class KVReqConfig(ResourceReqConfig):
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
                     keyed_spans=keyed_spans,
+                    max_growth=max_growth[0] if max_growth else None,
                 )
-                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                # the growth bound is optional, as a span row's later fields are
+                for label, (spans, growth, scratch, retention, keyed_spans, *max_growth) in kv_layout.items()
                 if label in opened
             }
         if loop_caps is not None and self.kv_layout is not None:
@@ -734,16 +736,17 @@ class StreamLayout:
     scratch: int = 0
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
+    max_growth: int | None = None
 
     def slots(self, caps: Mapping[str, int]) -> int:
-        return sum(span.length for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.length for span in self.spans) + self._grown(caps)
 
     def positions(self, caps: Mapping[str, int]) -> int:
-        return sum(span.advance for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.advance for span in self.spans) + self._grown(caps)
+
+    def _grown(self, caps: Mapping[str, int]) -> int:
+        grown = sum(slots * caps[loop] for loop, slots in self.growth)
+        return grown if self.max_growth is None else min(grown, self.max_growth)
 
     def pages(
         self, caps: Mapping[str, int], page_size: int, retention: "RetentionPolicy | None" = None,
