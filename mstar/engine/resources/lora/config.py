@@ -348,7 +348,8 @@ class LoraSpec(NodeResourceSpec):
 
     def split_step_refusals(self, node: str, shard: SeqShardSpec, tp: int, sp: int) -> list[str]:
         # only a node whose steps split gets here (`SeqShardSpec.splits`); one whose steps run
-        # copied, e.g. over KV stored by position with sp_exchange none, runs every row on every rank
+        # copied, e.g. over KV stored by position with its shard's exchange auto, runs every row on
+        # every rank
         return [
             f"LoRA resource {self.resource_key!r} serves node {node!r}, which splits tokens over {sp} SP "
             f"ranks (SeqShardSpec {shard.resource_key!r}): LoRA lays its rows out per request, while each "

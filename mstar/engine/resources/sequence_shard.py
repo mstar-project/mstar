@@ -9,9 +9,10 @@ runs the ring, striped by KV position. A model brackets its layer stack with ``s
 ``gather`` on that resource; nothing else in model code changes.
 
 The attention resources over the node depend on it (``shard_key``, taken in their specs'
-``derive``) and pick an exchange per label from its plan: what their storage needs to attend a
-split label's tokens, or a copied label's at the node's head geometry. The exchanges are the
-functions at the bottom of this module, each wrapped around the resource's own ``run``:
+``derive``) and pick an exchange per label from its plan: for a split label, the shard's
+``exchange`` over their storage; for a copied one, what attends it at the node's head geometry.
+The exchanges are the functions at the bottom of this module, each wrapped around the resource's
+own ``run``:
 
 - ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
   cacheless attention declaring ``sp_exchange="ulysses"``);
@@ -39,7 +40,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ from mstar.engine.resources.step import ResourceStep, StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.attn.config import SpExchange
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 
@@ -75,22 +77,34 @@ class SeqShardSpec(NodeResourceSpec):
     at least ``max(sp, min_tokens)``, and every listed label has at least ``sp`` tokens (a row,
     for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override.
 
+    ``exchange``, also a ``resources:`` override, is how a split step's tokens reach the node's
+    paged attentions, from the storage of their KV:
+
+    - ``auto`` (the default): Ulysses over KV stored by head; over KV stored by position
+      (``context_parallel``) the node runs copied, so splitting there is the deployment's to opt into;
+    - ``ulysses`` (by head), ``all_gather`` or ``ring`` (by position; the ring stripes each step by
+      stored position): split;
+    - ``none``: never split.
+
+    A ragged attention's own ``sp_exchange`` is the model's, which ``exchange`` doesn't change;
+    a shard that never splits stops it splitting too.
+
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
     SP rank it plans copied at no cost.
 
-    Three fields are derived from the resources on its nodes as configured (``derive``), from
-    their hooks alone: ``splits``, whether any of them takes split steps (every one's
-    ``resolve_exchange`` ``none``, as every attention's ``sp_exchange`` set to or defaulting to
-    ``none`` over KV stored by position, makes the node run copied, as one without a shard);
-    ``eager_splits``, whether one of them runs split steps eagerly only
-    (``captures_split_steps``), so a leased step plans copied; and ``stripe_pool``, the pool a
-    ring attention reads, by whose stored positions each step is striped."""
+    Three fields are derived from ``exchange`` and the resources on its nodes (``derive``), from
+    their hooks alone: ``splits``, whether the node's steps may split (not where ``exchange``
+    resolves to ``none``, or where no resource there takes split steps); ``eager_splits``,
+    whether one of them runs split steps eagerly only (``captures_split_steps``), so a leased
+    step plans copied; and ``stripe_pool``, the pool a ring attention reads, by whose stored
+    positions each step is striped."""
 
     labels: tuple[str, ...]
     axis: int
     walks: Collection[str] | None = None
     min_tokens: int = field(default=0, kw_only=True)
+    exchange: SpExchange | Literal["auto"] = field(default="auto", kw_only=True)
     splits: bool = field(default=True, init=False, repr=False)
     eager_splits: bool = field(default=False, init=False, repr=False)
     stripe_pool: str | None = field(default=None, init=False, repr=False)
@@ -104,11 +118,15 @@ class SeqShardSpec(NodeResourceSpec):
             raise ValueError(f"sequence shard {self.resource_key!r}: axis must be 0 or 1, not {self.axis!r}")
         if self.walks is not None:
             self.walks = frozenset(self.walks)
-        self._check_min_tokens()
+        self._check_overrides()
 
-    def _check_min_tokens(self) -> None:
+    def _check_overrides(self) -> None:
+        from mstar.engine.resources.attn.config import SP_EXCHANGES
+
         if type(self.min_tokens) is not int or self.min_tokens < 0:
             raise ValueError(f"min_tokens must be a non-negative integer, got {self.min_tokens!r}")
+        if self.exchange not in ("auto", *SP_EXCHANGES):
+            raise ValueError(f"exchange must be one of auto, {', '.join(SP_EXCHANGES)}; got {self.exchange!r}")
 
     @property
     def resource_class(self) -> type[Resource]:
@@ -120,31 +138,67 @@ class SeqShardSpec(NodeResourceSpec):
         # (`opening_prefix_caches` reads a cache keeper's own dependencies alone)
         return set() if self.stripe_pool is None else {self.stripe_pool}
 
+    def exchange_over(self, by_position: bool) -> SpExchange:
+        """``exchange`` for KV stored by position or by head, ``auto`` resolved."""
+        if self.exchange != "auto":
+            return self.exchange
+        return "none" if by_position else "ulysses"
+
+    def node_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+        """``exchange`` over the storage of the pools on its nodes, from raw fields."""
+        return self.exchange_over(any(spec.places_positions for spec in specs.values() if spec.nodes & self.nodes))
+
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # from raw fields alone, so it doesn't matter which spec derives first
         ours = [spec for spec in specs.values() if spec.nodes & self.nodes]
+        by_position = any(spec.places_positions for spec in ours)
         exchanges = [(spec, spec.resolve_exchange(specs)) for spec in ours]
-        self.splits = any(exchange != "none" for _, exchange in exchanges)
+        self.splits = self.node_exchange(specs) != "none" and any(e != "none" for _, e in exchanges)
         self.eager_splits = self.splits and not all(spec.captures_split_steps(specs) for spec in ours)
         pools = sorted({spec.config.kv_cache for spec, exchange in exchanges if exchange == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
+        nodes = sorted(self.nodes)
+        if self.exchange in ("all_gather", "ring") and not by_position:
+            return [
+                f"exchange {self.exchange!r} attends split steps over KV stored by position, and no KV pool on "
+                f"nodes {nodes} sets context_parallel: true; over KV stored by head, split by ulysses (or auto)"
+            ]
+        if self.exchange == "ulysses" and by_position:
+            return [
+                f"exchange 'ulysses' trades a split step's tokens for KV heads, and nodes {nodes} store KV by "
+                "position (context_parallel: true): split by all_gather or ring (auto runs copied)"
+            ]
         if len(pools) > 1:
             return [f"its ring attentions read KV pools {pools}, whose stored positions would stripe a step two ways"]
         return []
 
-    def apply_yaml_overrides(self, min_tokens: int | None = None):
-        """The step size below which a node runs copied: a deployment's trade between the
-        exchanges' cost and the token-local layers' saving."""
+    def apply_yaml_overrides(self, min_tokens: int | None = None, exchange: str | None = None):
+        """The step size below which a node runs copied (``min_tokens``), a deployment's trade
+        between the exchanges' cost and the token-local layers' saving; and how a split step
+        reaches its attentions (``exchange``)."""
         if min_tokens is not None:
             self.min_tokens = min_tokens
-            self._check_min_tokens()
+        if exchange is not None:
+            self.exchange = exchange
+        self._check_overrides()
+
+
+def _shards_over(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> list[SeqShardSpec]:
+    return [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
+
+
+def shard_exchange(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+    """How a split step reaches ``spec``'s node: its ``SeqShardSpec.node_exchange``, from raw
+    fields; ``none`` without one shard (two are refused, ``take_shard_edge``)."""
+    shards = _shards_over(spec, specs)
+    return shards[0].node_exchange(specs) if len(shards) == 1 else "none"
 
 
 def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
     """Set ``spec.shard_key`` to the ``SeqShardSpec`` over its nodes, if any (a ``derive``).
     A shard sharing only some of ``spec``'s nodes is a problem: the spec would split on some of
     its nodes and not others."""
-    shards = [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
+    shards = _shards_over(spec, specs)
     spec.shard_key = None
     if not shards:
         return []
@@ -742,51 +796,35 @@ def sequence_parallel_refusals(
     moe_parallel: MoeParallelConfig | None = None,
 ) -> list[str]:
     """What ``node``, on ``tp`` TP and ``sp`` SP ranks, declares that its SP ranks can't run; each
-    a sentence. At one SP rank or with no ``SeqShardSpec``, also an ``sp_exchange`` set there. Each
-    resource answers for itself (``NodeResourceSpec.split_step_refusals``); the checks on built
-    objects (``supports_split_steps``, ``check_captures``) are the engine's."""
+    a sentence. Each resource answers for itself (``NodeResourceSpec.split_step_refusals``); the
+    checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""
+    if sp == 1:
+        return []
     specs = [spec for spec in specs if node in spec.nodes]
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
-    refusals = []
-    if sp == 1 or shard is None:
-        from mstar.engine.resources.attn.config import AttentionSpec
-        from mstar.engine.resources.linear_attn.config import LinearAttnSpec
-
-        # the node's steps never split, so a deployment's sp_exchange would be silently ignored (the
-        # paged and linear specs' field is the deployment's; a ragged spec's is the model's)
-        never = "runs on one SP rank" if sp == 1 else "declares no SeqShardSpec"
-        refusals = [
-            f"node {node!r} {never}, so its steps never split, and resource {spec.resource_key!r} sets "
-            f"sp_exchange {spec.sp_exchange!r}, which picks how a split step reaches it: drop it"
-            for spec in specs if isinstance(spec, (AttentionSpec, LinearAttnSpec)) and spec.sp_exchange is not None
-        ]
-    if sp == 1:
-        return refusals
     try:
         placed = any(position_pools(specs, node).values())
     except ValueError as e:
-        return [*refusals, str(e)]
+        return [str(e)]
     if shard is None or not shard.splits:
         # as a node without a shard: its steps run copied (`SeqShardSpec.splits`), so a model's
-        # shard is a no-op where no attention takes split steps
+        # shard is a no-op where they never split
         if placed:
-            return refusals
+            return []
         if shard is not None:
             return [
-                f"node {node!r} runs on {sp} SP ranks, and no resource there takes split steps (a paged "
-                "attention with sp_exchange none, a ragged one without sp_exchange 'ulysses', a linear one "
-                "without sp_exchange ulysses or state_passing and no other resource splitting), so its steps "
-                "never split and its SP ranks would only share heads: store its KV by position "
-                "(context_parallel) or run it on TP ranks"
+                f"node {node!r} runs on {sp} SP ranks, and its steps never split (its sequence shard's exchange "
+                "none, or no resource there takes split steps: a ragged attention without sp_exchange "
+                "'ulysses'), so its SP ranks would only share heads: store its KV by position (context_parallel) "
+                "or run it on TP ranks"
             ]
         return [
-            *refusals,
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
             "KV by position (context_parallel on its paged KV pools)",
         ]
+    refusals = []
     for spec in specs:
         refusals += spec.split_step_refusals(node, shard, tp, sp)
     if moe_parallel is not None and moe_parallel.parallel == "ep":
         refusals.append(f"node {node!r} splits tokens over SP ranks, which expert parallelism (ep_config) can't")
     return refusals
-

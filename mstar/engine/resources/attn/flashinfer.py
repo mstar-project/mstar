@@ -233,9 +233,9 @@ class FlashInferManager(AttentionManager):
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
     def _ring_wrapper(self, label: str, slot: int):
-        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under
-        ``sp_exchange`` ring: one context wrapper per partner, over the label's workspace (they run
-        one after another on one stream). FlashInfer is the one backend that takes both split
+        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under the
+        sequence shard's ``exchange: ring``: one context wrapper per partner, over the label's
+        workspace (they run one after another on one stream). FlashInfer is the one backend that takes both split
         steps and a placed pool, which a ring needs."""
         key = EagerSlotKey(label=label, slot=slot, ring=True)
         wrapper = self._eager_plan_states.get(key)

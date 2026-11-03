@@ -8,7 +8,7 @@ geometry is read off its blocks rather than declared here.
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Literal
 
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
@@ -61,9 +61,10 @@ class LinearAttnConfig:
 
 
 # How a split step's prompt rows reach the recurrence: "ulysses" trades tokens for heads,
-# "state_passing" hands each rank's state on to the next (`linear_attn.sequence_parallel`)
+# "state_passing" hands each rank's state on to the next (`linear_attn.base`); "none" where the
+# node never splits
 LinearSpExchange = Literal["none", "ulysses", "state_passing"]
-LINEAR_SP_EXCHANGES: tuple[LinearSpExchange, ...] = get_args(LinearSpExchange)
+LINEAR_SP_EXCHANGES: tuple[LinearSpExchange, ...] = ("ulysses", "state_passing")
 
 
 @dataclass
@@ -72,7 +73,7 @@ class LinearAttnSpec(NodeResourceSpec):
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
     # how a split step reaches the recurrence: a deployment's choice, set only by its `resources:`
-    # block, as `AttentionSpec.sp_exchange`; None follows the node (`resolve_exchange`)
+    # block; None takes ulysses wherever the node splits (`resolve_exchange`)
     sp_exchange: LinearSpExchange | None = field(default=None, init=False, repr=False)
     # `sp_exchange` resolved (`derive`), and the pool's config, which the refusals read
     split_exchange: LinearSpExchange = field(default="none", init=False, repr=False)
@@ -93,18 +94,13 @@ class LinearAttnSpec(NodeResourceSpec):
         return problems
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> LinearSpExchange:
-        """``sp_exchange``, or where unset the node's: ``ulysses`` where another resource on its
-        nodes takes split steps, ``none`` otherwise, so a recurrent layer never makes a node split
-        on its own. Another linear spec answers only with its own setting, so this doesn't recurse."""
-        if self.sp_exchange is not None:
-            return self.sp_exchange
-        for spec in specs.values():
-            if spec is self or not spec.nodes & self.nodes:
-                continue
-            exchange = spec.sp_exchange if isinstance(spec, LinearAttnSpec) else spec.resolve_exchange(specs)
-            if exchange not in (None, "none"):
-                return "ulysses"
-        return "none"
+        """``sp_exchange``, or where unset ``ulysses``, wherever its node's sequence shard splits
+        (``shard_exchange``); ``none`` where it doesn't, which the setting doesn't change."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        if shard_exchange(self, specs) == "none":
+            return "none"
+        return self.sp_exchange or "ulysses"
 
     def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
         # both exchanges plan their halo and hand-off per rank on the host, eager only
@@ -113,11 +109,6 @@ class LinearAttnSpec(NodeResourceSpec):
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         exchange = self.split_exchange
         name = f"linear attention {self.resource_key!r}"
-        if exchange == "none":
-            return [
-                f"{name} takes no split steps (sp_exchange none), and node {node!r}'s other resources split its "
-                "steps: set its sp_exchange to ulysses or state_passing, or none on the others"
-            ]
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
             return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]

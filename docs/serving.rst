@@ -414,15 +414,14 @@ them by that name:
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp,
                                 # context_parallel
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
-                                # sp_exchange
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
      seq_shard:                 # a node's sequence shard (SP ranks)
-       min_tokens: 2048         # steps below this run copied on every SP rank
+       min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
      linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
-       sp_exchange: ulysses     # also: backend; ulysses / state_passing / none
+       sp_exchange: ulysses     # also: backend; ulysses / state_passing
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
@@ -452,24 +451,28 @@ heads, the TP ranks that share a KV head or the node's SP ranks, which is how a 
 attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
 factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
-With both, a paged attention's ``sp_exchange`` picks how a split step reaches it: unset, it
-takes the storage's default, ``ulysses`` by head and ``none`` by position (the node's steps run
-copied, KV capacity alone); by position, ``all_gather`` splits them, and ``ring`` also bounds the
-attention phase's memory to this rank's tokens and runs eager only. An MLA pool stored by head
-takes ``kv_gather``. A recurrent layer's resource (``linear_attn``) follows the node unset
-(``ulysses`` where its steps split); ``state_passing`` serves head counts that don't divide. A
-value that doesn't match the storage, or set where the node never splits its steps (no sequence
-shard, or one SP rank), fails at load:
+The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
+from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV stored by head,
+and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
+position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
+this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
+never splits. An MLA pool stored by head, whose one latent every rank holds whole, takes
+``kv_gather`` wherever the node splits. A recurrent layer's resource (``linear_attn``) takes
+``ulysses`` wherever the node splits, or its own ``sp_exchange: state_passing``. A value the
+node's storage can't take fails at load, at any SP size, and so does ``ring`` over an attention
+backend other than ``flashinfer`` (when the engine builds it):
 
 .. code-block:: yaml
 
    resources:
      kv_cache:
        context_parallel: true   # store K/V by position over the SP ranks
-     attn:
-       sp_exchange: all_gather  # none / ulysses / kv_gather (MLA) (by head) / all_gather / ring (by position)
      seq_shard:
        min_tokens: 8192
+       exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
+
+Ragged (cacheless) attentions keep the model's own ``sp_exchange``, whatever ``exchange`` says;
+a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
 
 A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
 so ring lowers it only where attention is the larger, which comes with more SP ranks (about four

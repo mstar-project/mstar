@@ -53,8 +53,11 @@ def resolve_ragged_attn_backend(
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
     joint = info.joint_comm_group
-    # Ulysses hands each rank 1/P of the heads; any other ragged attention splits them over TP
-    ulysses = spec.sp_exchange == "ulysses" and spec.shard_key is not None
+    # Ulysses hands each rank 1/P of the heads; any other ragged attention, or one whose node never
+    # splits (`SeqShardSpec.splits`, so it runs copied), splits them over TP
+    ulysses = (
+        spec.sp_exchange == "ulysses" and spec.shard_key is not None and info.dependency(spec.shard_key).splits
+    )
     if joint is None:
         config.shard(1)
     else:

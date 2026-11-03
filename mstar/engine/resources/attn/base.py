@@ -67,7 +67,7 @@ class AttentionManager(AttentionResource):
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
-    # how split steps reach it (`AttentionSpec.split_exchange`), set by `build`
+    # how split steps reach it (`AttentionSpec.resolve_exchange`), set by `build`
     _split_exchange: SpExchange = "ulysses"
 
     @property
@@ -239,7 +239,7 @@ class AttentionManager(AttentionResource):
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         manager = cls._build_backend(spec, info)
         manager._shard_key = spec.shard_key
-        manager._split_exchange = spec.split_exchange
+        manager._split_exchange = spec.resolve_exchange(info.dependencies)
         return manager
 
     @classmethod
@@ -305,10 +305,11 @@ class AttentionManager(AttentionResource):
                 (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
                 (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
                 # only FlashInfer's paged manager plans a ring (`FlashInferManager._ring_wrapper`); dense is
-                # refused above
+                # refused above. At any SP size, as `SeqShardSpec.derive` checks the exchange
                 (
-                    f"sp_exchange 'ring' on backend {backend.value!r}",
-                    spec.split_exchange == "ring" and backend not in (AttnBackend.FLASHINFER, AttnBackend.DENSE),
+                    f"sequence shard exchange 'ring' on backend {backend.value!r}",
+                    spec.resolve_exchange(info.dependencies) == "ring"
+                    and backend not in (AttnBackend.FLASHINFER, AttnBackend.DENSE),
                 ),
             ) if refused]
             if unsupported:

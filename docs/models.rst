@@ -452,10 +452,10 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``). With
-its KV pool stored by position (``kv_cache: {context_parallel: true}``) and no
-``sp_exchange``, every step runs copied, each rank attending its share of the
-stored context (more KV capacity, no faster prefill). With ``attn:
-{sp_exchange: all_gather}`` a prefill of at least ``llm_shard.min_tokens``
+its KV pool stored by position (``kv_cache: {context_parallel: true}``) and the
+shard's default ``exchange``, every step runs copied, each rank attending its share of the
+stored context (more KV capacity, no faster prefill). With ``llm_shard:
+{exchange: all_gather}`` a prefill of at least ``llm_shard.min_tokens``
 tokens splits over the SP ranks: each runs the layers on its part of the
 prompt, attention gathers the step's queries, keys and values, and the gated
 DeltaNet layers trade tokens for heads (``ulysses``; ``linear_attn:
@@ -635,8 +635,8 @@ Qwen3-Omni notes
   is stored by position over each SP pair (``context_parallel``). A prefill of
   at least ``min_tokens`` tokens (on the ``thinker_shard`` resource) splits over
   the pair: each rank runs the layers on its half of the tokens, and attention
-  gathers the step's queries, keys and values (``sp_exchange: all_gather`` on
-  ``thinker_attn``; without it the Thinker runs every step copied). Decode and
+  gathers the step's queries, keys and values (``exchange: all_gather`` on
+  ``thinker_shard``; with its default, ``auto``, the Thinker runs every step copied). Decode and
   shorter prefills run copied on both ranks, each attending its half of the
   stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
   ``min_tokens`` is a placeholder until measured. Chunked prefill is off on SP

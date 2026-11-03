@@ -212,7 +212,7 @@ class RaggedAttentionSpec(_RaggedSpecBase):
             return [
                 f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', whose plan reads a split "
                 f"label's tokens in step order, and node {node!r}'s sequence shard stripes them by KV "
-                f"{shard.stripe_pool!r}'s positions (a ring attention there)"
+                f"{shard.stripe_pool!r}'s positions (its exchange ring)"
             ]
         if q % (tp * sp) or kv % (tp * sp):
             return [

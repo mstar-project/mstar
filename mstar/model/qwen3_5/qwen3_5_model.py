@@ -271,8 +271,8 @@ class Qwen3_5DenseModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
-            # a step split over the LLM's SP ranks, where a deployment's attention takes split
-            # steps; one SP rank, or KV stored by position with no sp_exchange, runs every step copied
+            # a step split over the LLM's SP ranks; one SP rank, or KV stored by position under the
+            # shard's default exchange (auto), runs every step copied
             SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0),
             *self._vision_resources(),
         ]
