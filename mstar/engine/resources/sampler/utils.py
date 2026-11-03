@@ -653,11 +653,11 @@ def _fused_filter_kernel(
     mass_first = tl.sum(tl.where(in_first, p, 0.0), axis=0)
     # top-p keeps token i iff the mass strictly above it is < p * mass. That mass
     # falls as i's value rises, so the kept tokens are those >= the smallest
-    # threshold t with mass(> t) < p * mass: search for it on the bits
+    # threshold t with mass(> t) < p * mass: search for it on the bits, at most 1.0's
     target = top_p * mass_first
     lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
+    hi = 0x3F800000
+    for _ in range(30):
         mid = lo + (hi - lo) // 2
         above = tl.sum(tl.where(in_first & (bits > mid), p, 0.0), axis=0)
         ok = above < target
