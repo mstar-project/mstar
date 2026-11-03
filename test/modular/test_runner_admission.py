@@ -66,7 +66,7 @@ class _StubPool(Resource):
 
 
 class _PassingPool(_StubPool):
-    """A `_StubPool` that lets a request pass while a unit is left for the first request."""
+    """Lets a request pass only while a unit is left for the first request."""
 
     def reserve_past(self, rid, node_name, graph_walk, published):
         if self.needs.get(rid, 1) + 1 > self.free:
@@ -219,3 +219,14 @@ def test_a_request_turned_away_by_an_out_of_date_mark_can_leave_before_it_is_tri
     runner.remove_request("p")
 
     assert runner.admit_waiting(_nothing) == [], "a request that left was tried again"
+
+
+def test_a_request_turned_away_by_an_out_of_date_mark_passes_once_that_head_is_measured_again():
+    kv, slots = _PassingPool(1, needs={"x": 3}), _PassingPool(2, needs={"g": 3})
+    runner = _runner({"one": ["kv", "slots"], "two": ["slots"]}, kv=kv, slots=slots)
+    for rid, node in (("g", "two"), ("x", "one")):
+        assert runner.admit_retrieve(rid, node, WALK).queued
+    kv.free = 2  # x's mark is out of date, and x still doesn't fit
+    assert runner.admit_retrieve("p", "one", WALK).queued
+
+    assert ("one", "p") in runner.admit_waiting(_nothing), "p waits a pass more, though x was just refused again"

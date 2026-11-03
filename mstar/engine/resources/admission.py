@@ -142,7 +142,7 @@ class Admission:
         that lets requests pass has a first request that can't start, each later waiting request is
         tried, in arrival order, to pass it, but only once a queue has a new first request or a
         resource that refused a passing request has grown since. Otherwise only the requests in
-        `_unpassed` are tried.
+        `_unpassed` and the first requests of the queues that grew are tried.
         """
         started = []
         if self._started:
@@ -158,8 +158,11 @@ class Admission:
             return started
         for key in grown:
             del self._short[key]
-        # a first request whose resource grew may now pass in a queue where it isn't first
-        unpassed = self._unpassed.union(self._queues[key][0] for key in grown)
+        # a first request whose resource grew may now pass in a queue where it waits behind another
+        heads = {self._queues[key][0] for key in grown}
+        unpassed = self._unpassed.union(
+            rid for rid in heads if any(self._queues[key][0] != rid for key in self._waiting[rid].asked)
+        )
         self._unpassed = set()
         admitted = True
         while admitted:
@@ -249,11 +252,12 @@ class Admission:
         return entry.nodes
 
     def _pass(
-        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: Collection[str],
+        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: set[str],
     ) -> dict[str, str] | None:
         """Admit ``rid`` past the first request of each queue it waits behind, when that request is in
         ``blocked`` and the queue's resource lets requests pass, and ``rid`` is first wherever else it
-        waits. Return the nodes waiting on it, or None."""
+        waits. Return the nodes waiting on it, or None, adding ``rid`` to ``blocked`` when a queue it is
+        first in just refused it."""
         passing = []
         for key in self._waiting[rid].asked:
             first = self._queues[key][0]
@@ -266,7 +270,12 @@ class Admission:
                 if key in self._passes and key in self._short:
                     self._unpassed.add(rid)
                 return None
-        return self._reserve(rid, published_of, passing) if passing else None
+        if not passing:
+            return None
+        nodes = self._reserve(rid, published_of, passing)
+        if nodes is None and any(self._queues[key][0] == rid for key in self._short):
+            blocked.add(rid)
+        return nodes
 
     def _blocked(self) -> set[str]:
         """The requests that can't start now: each is first in a queue whose resource it didn't fit, and
