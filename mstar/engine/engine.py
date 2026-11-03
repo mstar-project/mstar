@@ -2765,10 +2765,12 @@ class Engine:
 
         An offloaded request is brought back first; it stays not-ready until
         that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). A dropped request is not ready: the caller
-        rebuilds it from its token ids. Then each resource takes in whatever
-        the request published elsewhere — a KV transfer from a prefill worker,
-        say — and reports whether that has landed.
+        on OOM, to evict). Then each resource takes in whatever the request
+        published elsewhere — a KV transfer from a prefill worker, say — and
+        reports whether that has landed.
+
+        A dropped request is not ready: the caller rebuilds it from its token
+        ids.
 
         The outcome, not a bool: a resource can report the request
         unservable (``AdmitRuntimeError``), and the caller has to fail it

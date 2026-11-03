@@ -2886,11 +2886,12 @@ class Worker:
     def _choose_spec_target(self, batch: ScheduledBatch) -> SpeculationTarget | None:
         """The (node, walk) the step after ``batch`` speculates into, with the
         rids of ``batch`` on that walk; None when nothing can be speculated."""
-        # Every row the runtime holds, grouped by real walk: the runtime filters
-        # eligibility per walk and drops a loop-back no row can take;
-        # prep_spec_rids the loop completion per rid.
+        # Every row, grouped by real walk: the runtime filters eligibility per
+        # walk and drops a loop-back no row can take; prep_spec_rids the loop
+        # completion per rid.
         groups = batch.rids_by_walk()
         if batch.rebuild_rids:
+            # but the rebuild rows, which the runtime holds no node of
             rebuild = batch.rebuild_rids
             groups = {walk: kept for walk, rids in groups.items() if (kept := [r for r in rids if r not in rebuild])}
             if not groups:

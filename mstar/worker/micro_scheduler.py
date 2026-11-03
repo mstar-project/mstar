@@ -119,11 +119,11 @@ class ScheduledBatch:
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
     # Set once scheduled: rid -> the part of a chunked row's input this step
-    # runs; the rows whose node needs at least one more chunk; and the rows
-    # that rebuild their request from its kept ids, which the graph runtime
-    # holds no node of.
+    # runs; and the rows whose node needs at least one more chunk.
     chunk_ranges: dict[int, ChunkRange] = field(default_factory=dict)
     incomplete_node_rids: set[int] = field(default_factory=set)
+    # Set once scheduled too: the rows that rebuild their request from its
+    # kept ids, which the graph runtime holds no node of.
     rebuild_rids: frozenset[int] = frozenset()
     # This node's walks that run as a chunk Loop on this worker, stamped when
     # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
@@ -720,9 +720,9 @@ class MicroScheduler:
         and holding the blamed one is what makes the retry smaller.
 
         Asked of the graph, not the engine: an engine readiness check would
-        start reloading an offloaded row. Rows not resident are left out; they
-        come back only once their pages fit or their rebuild lands. Refusal
-        path only.
+        start reloading an offloaded row. Rows not resident are left out, since
+        they come back only once their pages fit or their rebuild lands.
+        Refusal path only.
         """
         key = self._key(node_name, graph_walk)
         if self._live_backlog(key) - batch_rids:
@@ -1466,7 +1466,7 @@ class MicroScheduler:
         group, a walk the step can't mix) are popped and parked, so the chain
         yields to them (``backlog_splits_from``) rather than run past them.
         The chain's rows mid-prefill and the rebuilds that it took join without
-        a pop; the chain's own ``pre_existing_batch_size`` rows count against a
+        a pop. The chain's own ``pre_existing_batch_size`` rows count against a
         token budget (``_build_step``)."""
         key = chain.key
         own = set(chain.pick.continuing)
@@ -2178,8 +2178,8 @@ class MicroScheduler:
         """Per node this rank schedules, rows ready for a step but not in one:
         its backlog, and graph-ready rows still on the queues. Read-only and
         graph-level (no engine readiness check, which can reload), so a held
-        or not yet reloaded row counts; a failed or removed one does not. A
-        rebuild counts while no step holds it."""
+        or not yet reloaded row counts; a failed or removed one does not.
+        A rebuild counts while no step holds it."""
         exclude = self.failed_rids.union(self.pending_removes)
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
