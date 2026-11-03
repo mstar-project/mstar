@@ -110,6 +110,14 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+@dataclass
+class CachedLease:
+    """Rank 0's lease of a stream's cached prefix, which a TP follower takes as given: its ``pages``, and the
+    ones it ``lent``, which another request holds and so take no room."""
+    pages: list[int]
+    lent: list[int]
+
+
 class Rebuild(NamedTuple):
     """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
     The last id is the one the next decode step reads."""
@@ -216,15 +224,15 @@ class Resource(ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
         """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
-        return the pages, or None."""
+        return the lease, or None."""
         return None
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
     ) -> bool:
-        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        """On a TP follower, take rank 0's ``lease``. False until this rank holds its pages too, and
         raises if it still lacks them once ``caught_up``."""
         return True
 
@@ -232,9 +240,10 @@ class Resource(ABC):
         """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
         return
 
-    def page_trail(self) -> tuple[int, int] | None:
-        """How many page allocations this resource has made and a hash of their pages in
-        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+    def page_trail(self) -> tuple[int, ...] | None:
+        """What a TP follower checks against rank 0's before each step, such as how many page
+        allocations this resource has made and a hash of their pages in order. None where it
+        keeps no trail."""
         return None
 
     @classmethod

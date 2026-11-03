@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
-from mstar.engine.resources.base import MoveKind
+from mstar.engine.resources.base import CachedLease, MoveKind
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
@@ -293,8 +293,8 @@ class ScheduleTPNode(MessageBody):
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
-    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
-    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    prefix_hits: dict[str, dict[str, CachedLease]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # the step's rebuild rows, which run ahead of ``request_ids`` and aren't taken from a ready queue
     rebuild_ids: list[str] = field(default_factory=list)
     # A row of the step takes an input a follower reads from elsewhere: every

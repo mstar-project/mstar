@@ -40,7 +40,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -1409,7 +1409,7 @@ class Engine:
                     keys=keys,
                 )
 
-    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, CachedLease]]:
         """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
         followers can take the same pages before they build it."""
         keyed = self._keyed_walks.get(batch.node_name)
@@ -1462,18 +1462,18 @@ class Engine:
                 walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
                 yield rid, walk, leases
 
-    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, ...]]:
         return self._runner.page_trails(node_name)
 
     def check_page_trails(
-        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, ...]],
     ) -> None:
-        """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
+        """On a TP follower, raise if a resource's page trail differs from rank 0's when it
         sent this step."""
         for pool, mine in self._runner.page_trails(node_name).items():
             if trails.get(pool, mine) != mine:
                 raise RuntimeError(
-                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"KV {pool}: this rank's page trail {mine} differs from "
                     f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
                 )
 

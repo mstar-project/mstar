@@ -710,7 +710,6 @@ class Worker:
             self._kv_caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
-        self._logged_pools = [kv.cache for kv in self._kv_caches.values() if kv.cache.logs_counts]
         self._rebuilding: frozenset[int] = frozenset()
         self._dropped: dict[int, str] = {}
         self._victims: dict[int, Victim] = {}
@@ -2129,8 +2128,9 @@ class Worker:
         if self._victims:
             self._move_victims(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
-        prefix_hits = engine.decide_cached_prefix(node_batch)
+        # taken before the leases, since a follower checks it before it adopts them
         page_trails = engine.page_trails(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
         read_check = self._step_reads(node_batch)
         if read_check:
             node_batch.read_check_rids = tuple(node_batch.request_ids)
@@ -5353,10 +5353,6 @@ class Worker:
                 self._await_admit_settled(pending)
                 self._count_turn(pending)
                 laps.skip()
-                if self._logged_pools and pending is not None and pending.tp_seq >= 0:
-                    # after the step's admit, and before this pass moves a page, on every rank
-                    for cache in self._logged_pools:
-                        cache.log_counts(pending.tp_seq)
                 if self._victims:
                     # A pass that raised may still owe the followers a victim's drop. Send it before any removal
                     # applies.

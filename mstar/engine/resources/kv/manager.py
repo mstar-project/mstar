@@ -14,6 +14,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
+    CachedLease,
     CachedPrefix,
     CGSlotSpec,
     EngineResourceInfo,
@@ -657,7 +658,7 @@ class KVManager(AttentionResource):
         # so each rank admits a step from the same counts.
         self._counts = leads
         self._decides = leads and self._rank == 0
-        self.logs_counts = _DEBUG_ASSERTS and leads and self._world_size > 1
+        self._trails_counts = _DEBUG_ASSERTS and leads and self._world_size > 1
         # set by the engine on rank 0 of a TP node
         self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
@@ -938,7 +939,7 @@ class KVManager(AttentionResource):
         with self._lock:
             chain.rooted, chain.rooted_ends = rooted, ends
 
-    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> CachedLease | None:
         """Returns the same lease with every step until `admit` converts it."""
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -947,7 +948,7 @@ class KVManager(AttentionResource):
             stream = self._ensure_label(rid, label)
             chain, cursor = stream.chain, stream.span_cursor
             if stream.lease is not None:
-                return stream.lease
+                return self._lease_of(stream)
             if (
                 chain is None or cursor.done == len(chain.spans)
                 or chain.spans[cursor.done].walk != graph_walk
@@ -957,10 +958,16 @@ class KVManager(AttentionResource):
         if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
-            return stream.lease
+            return self._lease_of(stream)
+
+    @staticmethod
+    def _lease_of(stream: CacheStream) -> CachedLease | None:
+        if stream.lease is None:
+            return None
+        return CachedLease(stream.lease, [page for page in stream.lease if page in stream.lent])
 
     def adopt_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+        self, rid: str, node_name: str, graph_walk: str, lease: CachedLease, caught_up: bool,
     ) -> bool:
         """False while some pages are missing and ``caught_up`` is False, since this rank's commit of
         the step that wrote them can lag rank 0's. Once ``caught_up`` nothing will index a missing
@@ -976,10 +983,11 @@ class KVManager(AttentionResource):
                 return True
             if chain is None or stream.stored_len:
                 raise RuntimeError(
-                    f"KV {self.name}: rank 0 leased {len(pages)} cached pages for {rid}/{label}, "
+                    f"KV {self.name}: rank 0 leased {len(lease.pages)} cached pages for {rid}/{label}, "
                     "whose stream here already holds tokens or has no keys"
                 )
         self._root_chain(chain)
+        pages = lease.pages
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
@@ -991,10 +999,7 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
                     f"pages {matched[:4]}... here ({len(matched)}), {pages[:4]}... there ({len(pages)})"
                 )
-            if self._counts and not self._overrides[rid].guaranteed:
-                # lent as in rank 0's `_retain_cached`
-                evictable = self._index.evictable()
-                stream.lent.update(page for page in matched if page not in evictable)
+            stream.lent.update(lease.lent)
             self._arena.retain(matched)
             stream.lease, stream.lease_len = matched, len(matched) * self.config.tokens_per_page
             self._recount(rid)
@@ -1011,9 +1016,14 @@ class KVManager(AttentionResource):
                 self._release_lease(rid, stream)
                 self._recount(rid)
 
-    def page_trail(self) -> tuple[int, int] | None:
+    def page_trail(self) -> tuple[int, ...] | None:
+        """The arena's trail when it keeps one, then, when it carries the counts, the pages allotted and not yet
+        used, the pages earmarked and the requests dropped, which every rank admits a step from."""
         with self._lock:
-            return self._arena.trail
+            if not self._trails_counts:
+                return self._arena.trail
+            earmarked = sum(earmark.pages for earmark in self._earmarks.values())
+            return (*(self._arena.trail or ()), self._unused, earmarked, len(self._dropped))
 
     def _check_positions(
         self, step: tuple[PrefixSpan, ...], span: PrefixSpan, graph_walk: str, inputs,
@@ -4495,17 +4505,6 @@ class KVManager(AttentionResource):
         self._hosted.update(victims)
         if self.journal is not None and victims:
             self.journal(MoveKind.OFFLOAD, rid, 0, victims)
-
-    def log_counts(self, tp_seq: int) -> None:
-        """Called after a step's admit, for comparing with the other ranks' lines. The cached count can move
-        with the step's commit, so compare it across ranks only once they are idle."""
-        with self._lock:
-            counts = self.page_counts()
-            logger.info(
-                "KV %s counts after tp seq %d: %d allotted unused, %d earmarked, %d dropped, %d used, %d cached",
-                self.name, tp_seq, self._unused, sum(earmark.pages for earmark in self._earmarks.values()),
-                len(self._dropped), counts.used, counts.cached,
-            )
 
     def is_victim(self, rid: str) -> bool:
         return rid in self._victims

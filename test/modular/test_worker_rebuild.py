@@ -90,7 +90,6 @@ def _worker():
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
-    w._logged_pools = []
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     w.parallel_nodes = w.parallel_leader_nodes = set()
     # holds no row, so any routing, stop or loop-count call fails the test

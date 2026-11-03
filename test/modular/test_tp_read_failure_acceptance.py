@@ -693,7 +693,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
-    w._kv_keys, w._kv_caches, w._logged_pools = defaultdict(list), {}, []
+    w._kv_keys, w._kv_caches = defaultdict(list), {}
     w._rebuilding, w._dropped, w._victims = frozenset(), {}, {}
     w._preempted, w._preemptions, w._drop_logged = {}, defaultdict(PreemptionCounts), {}
     for setup in _DESIGN_SETUP:
@@ -713,7 +713,7 @@ def _probe(engine, rid, tokens):
     )
     hits = engine.decide_cached_prefix(batch)
     leases = hits.get(rid, {})
-    return {label: list(pages) for label, pages in leases.items()}
+    return {label: list(lease.pages) for label, lease in leases.items()}
 
 
 def _rank_main(rank, scenario, inbox, outbox):
