@@ -171,10 +171,18 @@ def test_pi05_vision_letterboxes_each_camera_at_its_own_resolution():
     assert torch.equal(pixels[1], submodule._prepare_one(tall)[0])
 
 
-def test_pi05_vision_refuses_more_cameras_than_its_slots():
-    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
-    with pytest.raises(ValueError, match="takes at most 2"):
-        submodule.prepare_inputs("prefill", None, {"image_inputs": [torch.zeros(3, 4, 4)] * 3})
+def test_pi05_vision_postprocess_keeps_the_images_its_inputs_name():
+    """postprocess trims by the num_images prepare_inputs recorded, which the KV layout
+    was counted for, and has no fallback to keeping every slot."""
+    from mstar.model.submodule_base import NodeInputs
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    emb = torch.arange(6.0).reshape(6, 1)  # two tokens per camera slot
+    outputs = {"img_emb": [emb]}
+    submodule.postprocess("r", None, outputs, inputs=NodeInputs(kwargs={"num_images": 2}))
+    assert torch.equal(outputs["img_emb"][0], emb[:4])
+    with pytest.raises(KeyError):
+        submodule.postprocess("r", None, {"img_emb": [emb]}, inputs=NodeInputs())
 
 
 def test_pi05_refuses_more_images_than_cameras_before_decoding():
@@ -201,6 +209,25 @@ def test_pi05_prefix_scaling_follows_openpi():
         prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
         assert torch.equal(prefix[:6], img)
         assert torch.allclose(prefix[6:], embed(ids) * 4.0)
+
+
+def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
+    """Cameras travel to the worker as uint8 and normalize to the same ViT
+    input as the base class's float [0, 1] encoding."""
+    from torchvision.io import write_png
+
+    pixels = torch.arange(3 * 6 * 10, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(3, 6, 10)
+    path = tmp_path / "cam.png"
+    write_png(pixels, str(path))
+
+    loaded = _make_model().load_image(str(path), "cpu").data
+    assert loaded.dtype == torch.uint8
+    assert torch.equal(loaded, pixels)
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=8, num_cameras=1))
+    from_uint8 = submodule._prepare_one(loaded.unsqueeze(0))
+    from_float = submodule._prepare_one(loaded.unsqueeze(0).float() / 255.0)
+    torch.testing.assert_close(from_uint8, from_float, rtol=0, atol=1e-6)
 
 
 # ----------------------------------------------------------------------
@@ -419,6 +446,21 @@ class _StubTokenizer:
         # Return a deterministic tensor of length 1; the test only inspects
         # last_prompt.
         return torch.tensor([0], dtype=torch.long)
+
+
+def test_pi05_refuses_to_start_without_a_tokenizer(monkeypatch):
+    """A served model that can't load a tokenizer must fail at load, not take
+    the dummy-mode path and fail every request at ingest."""
+    import transformers
+
+    def unavailable(repo, **kwargs):
+        raise OSError(f"{repo} is gated")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", unavailable)
+    model = _make_model()
+    model.skip_weight_loading = False
+    with pytest.raises(ValueError, match="google/paligemma-3b-pt-224 is gated"):
+        model._load_tokenizer()
 
 
 def test_pi05_process_prompt_formats_state_into_text():

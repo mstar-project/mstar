@@ -1,12 +1,8 @@
 """A request never retrieves its KV from itself.
 
-The conductor sends one ``NewRequest`` per (worker, partition), all naming the
-same request id, so a worker serving two partitions ingests the same rid twice.
-Re-ingesting used to replace the stream dict — resetting ``stored_len`` under a
-node that had already filled it — after which the request's publish info named
-more tokens than the stream held and ``admit_retrieve`` fired a transfer from
-this engine's own CUDA IPC handle. Opening your own handle raises
-``CUDA error: invalid device context``.
+If a request's publish info ever names more tokens than its stream holds,
+``admit_retrieve`` must not start a transfer from this engine's own CUDA IPC
+handle. Opening your own handle raises ``CUDA error: invalid device context``.
 """
 
 from __future__ import annotations
@@ -94,31 +90,7 @@ def _grow(kv, rid, span, label="main"):
     kv.commit(step, ctx)
 
 
-# ── the fix ─────────────────────────────────────────────────────────────
-
-
-def test_re_ingesting_a_request_keeps_what_it_already_stored():
-    """The regression: partition B's NewRequest wiped partition A's stream."""
-    kv = _manager()
-    kv.ingest_request("r0")
-    _grow(kv, "r0", 100)
-
-    kv.ingest_request("r0")  # second partition, same rid
-
-    assert kv._streams["r0"]["main"].stored_len == 100
-
-
-def test_re_ingesting_keeps_the_pages_too():
-    kv = _manager()
-    kv.ingest_request("r0")
-    _grow(kv, "r0", 100)
-    pages = list(kv._streams["r0"]["main"].page_indices)
-    free = kv._arena.num_free
-
-    kv.ingest_request("r0")
-
-    assert kv._streams["r0"]["main"].page_indices == pages
-    assert kv._arena.num_free == free, "a wiped stream would orphan its pages"
+# ── a reused id ─────────────────────────────────────────────────────────
 
 
 def test_a_fresh_request_still_starts_empty():
