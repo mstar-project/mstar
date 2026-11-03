@@ -185,6 +185,25 @@ def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     assert w._dropped == {"v": NODE} and _step(kv, "r", 1).ok, "v waited for a step that never ran to clear"
 
 
+def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_older_one_drops():
+    """Without a host pool, a newer request admitted but not yet prefilled holds an allotment and no pages. It
+    keeps no ids, so it can't be dropped, and the older decode dropped itself for a page the newer one could give
+    back by asking again."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _request(kv, "n", 5, arrival=2)
+    assert _ready(kv, "n") and kv._allotments["n"].remaining == 5
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.is_resident("r") and "n" not in kv._allotments, (
+        "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
+
+
 def test_a_dropped_request_returns_once_its_history_and_a_page_fit():
     kv, w = _preempting()
     assert _step(kv, "r", 1).ok

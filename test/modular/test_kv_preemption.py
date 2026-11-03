@@ -303,6 +303,16 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
 
 
+def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_prompt():
+    kv = _pool()
+    _request(kv, "v", 5, arrival=1)
+    assert _ready(kv, "v") and _step(kv, "v", 2 * PAGE_SIZE).ok
+
+    kv.drop("v")
+
+    assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
+
+
 def test_victims_that_share_pages_are_preempted_together():
     kv = _pool()
     shared, tokens = list(range(3 * PAGE_SIZE)), {"a": range(100, 116), "b": range(200, 216)}
