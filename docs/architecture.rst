@@ -163,9 +163,10 @@ field (norms, RoPE, sampling) pick their kernel by platform on first call.
      - M*'s Triton fused-MoE kernels, with a launch config tuned for the GPU when
        ``mstar/utils/fused_moe/configs/`` has one
      - The same Triton kernels (the align op is hipified when it builds). MI300X and
-       MI325X tables ship for Qwen3-Omni's experts. AITER's fused MoE is opt-in (``moe_backend:
-       aiter``) because its output isn't bitwise reproducible, see
-       :ref:`models:Qwen3-Omni notes`.
+       MI325X tables ship for Qwen3-Omni's experts. ``auto`` runs AITER's fused MoE for the
+       expert sizes and GPUs where it measured faster (``AITER_PROBLEMS`` in
+       ``mstar/utils/fused_moe/backend.py``: Qwen3-Omni's Thinker on MI325X); its output isn't
+       bitwise reproducible, see :ref:`models:Qwen3-Omni notes`.
    * - Media decoding (``Model.load_audio`` / ``load_video``, the API server)
      - torchcodec
      - PyAV, and soundfile for plain PCM/FLAC audio. torchcodec has no ROCm build. The
