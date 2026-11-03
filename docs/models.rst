@@ -248,12 +248,14 @@ OmniVoice notes
   rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
   runs the same layer loop eagerly, and ``backbone_token_buckets`` sets the
   packed-token buckets (256 to 4096 by default).
-- ``configs/omnivoice_split.yaml`` runs code2wav (codec decode and the
-  host-side silence trim) on a second worker sharing GPU 0, so the unmask loop
-  no longer stops for each finished request, and sets ``mps: true`` (see
+- ``configs/omnivoice_split.yaml`` runs code2wav (the codec decode) on a
+  second worker sharing GPU 0, so the unmask loop no longer stops for each
+  finished request's decode; the silence trim and the rest of the output
+  shaping run on the API side in either config. It sets ``mps: true`` (see
   :doc:`serving`) so the two workers' kernels overlap. On an H200 it raised
   concurrency-32 throughput from ~153 to 176-184 audio-s/s and cut TTFA p95
-  from ~9 s to ~3 s; concurrency 1 is ~10% slower.
+  from ~9 s to ~3 s, measured while code2wav still did the shaping on its
+  worker; concurrency 1 was ~10% slower.
 
 Higgs Audio notes
 ~~~~~~~~~~~~~~~~~
