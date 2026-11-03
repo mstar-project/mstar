@@ -1150,7 +1150,11 @@ class LTX25Adapter(OpenAIAdapter):
         if getattr(req, "image", None) or getattr(req, "video", None):
             raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
         mk = _passthrough(req)
-        with_audio = mk.pop("audio", True)
+        with_audio = mk.pop("audio", None)
+        if with_audio is None:  # unset: sound, the model's default
+            with_audio = True
+        if not isinstance(with_audio, bool):  # "false" is truthy
+            raise ValueError(f"audio must be true or false, got {with_audio!r}")
         if getattr(req, "size", None):
             try:
                 width, height = (int(v) for v in req.size.lower().split("x"))

@@ -13,6 +13,7 @@ from mstar.api_server.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ImageGenerationRequest,
     SpeechRequest,
+    VideoGenerationRequest,
 )
 
 
@@ -280,6 +281,16 @@ def test_bagel_image_edit(tmp_path):
     assert sa.input_modalities == ["image", "text"]
     assert sa.output_modalities == ["image"]
     assert sa.model_kwargs == {"cfg_img_scale": 2.0}
+
+
+@pytest.mark.parametrize("audio", ["false", 0])
+def test_ltx2_5_refuses_an_audio_toggle_that_is_not_a_boolean(tmp_path, audio):
+    req = VideoGenerationRequest(prompt="a cat", audio=audio)
+    with pytest.raises(ValueError, match="audio must be true or false"):
+        adapters.LTX25Adapter().video_to_request(req, tmp_path)
+    # null is unset: the default, sound
+    req = VideoGenerationRequest(prompt="a cat", audio=None)
+    assert adapters.LTX25Adapter().video_to_request(req, tmp_path).output_modalities == ["video", "audio"]
 
 
 def test_registry():
