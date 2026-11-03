@@ -449,6 +449,10 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # The timestep interval [lo, hi] outside which an action request's step runs
+    # the conditional branch alone; None guides every step. A request's
+    # ``guidance_interval`` wins.
+    guidance_interval_action: tuple[float, float] | None = None
     # Policy-request defaults a policy checkpoint ships in ``checkpoint.json``
     # (its "policy" section): the chunk the reply carries, the observation fps
     # and the embodiment, so a client sends only the observation, the prompt
