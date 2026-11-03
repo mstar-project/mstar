@@ -22,7 +22,14 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo, Rebuild
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
+    rebuild_refusal,
+)
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -159,6 +166,15 @@ def test_a_drop_is_refused_when_its_rows_couldnt_write_the_request_again(layout,
     with pytest.raises(RuntimeError, match=why):
         kv.drop("r")
     assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
+
+
+def test_a_request_with_the_prefix_cache_off_is_never_refused_for_its_keys():
+    config = _config(list(range(PAGE_SIZE)))
+    (text,) = config.kv_layout["main"].spans
+    config.kv_layout["main"] = replace(config.kv_layout["main"], spans=(text, IMAGE, text), keyed_spans=1)
+    config.prefix_cache = False
+
+    assert rebuild_refusal([config]) is None, "a request would be refused a drop for keys nothing reads"
 
 
 class _Recording:
