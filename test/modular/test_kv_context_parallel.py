@@ -427,12 +427,12 @@ class _Case:
         q, k, v, cache = inputs
         return lambda: attn.run(q, "main", kv_cache_layer=cache, k=k, v=v)
 
-    def want(self, causal: bool = True) -> torch.Tensor:
+    def want(self, causal: bool = True, window_left: int = -1) -> torch.Tensor:
         outs = []
         qo = 0
         for kv, (_, new) in zip(self.keys, self.rows, strict=True):
             k, v = (kv[:, None], kv[:, None]) if self.mla else (kv[:, 0], kv[:, 1])
-            out = reference_attention(self.q[qo:qo + new], k, v, causal)[0]
+            out = reference_attention(self.q[qo:qo + new], k, v, causal, window_left)[0]
             outs.append(out[..., :CKV] if self.mla else out)
             qo += new
         return torch.cat(outs)
@@ -694,14 +694,15 @@ class _LatentKV:
         self.cache[self._where] = latent
 
 
-def _mla_split_step(rank, world, store, placed):
+def _on_sp_ranks(rank, world, store, body, *args):
+    """``body(group, *args)`` on one of ``world`` gloo ranks, over FlashInfer's CPU reference."""
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
     sys.modules["flashinfer"] = reference_flashinfer()
     group = _group(rank, world)
     group.device_group, group.initialized = dist.group.WORLD, True
     try:
-        _mla_split(group, placed)
+        body(group, *args)
     finally:
         group.device_group = None
         dist.destroy_process_group()
@@ -747,7 +748,83 @@ def _mla_split(group: CommGroup, placed: bool) -> None:
 
 @pytest.mark.parametrize("placed", [False, True], ids=["kv_gather", "all_gather"])
 def test_sp_ranks_split_an_mla_step_like_one_rank(tmp_path, placed):
-    mp.spawn(_mla_split_step, args=(P, str(tmp_path / "store"), placed), nprocs=P)
+    mp.spawn(_on_sp_ranks, args=(P, str(tmp_path / "store"), _mla_split, placed), nprocs=P)
+
+
+WINDOW = 3
+
+
+def _window_split(group: CommGroup) -> None:
+    """``PREFILL_ROWS`` (rows longer than the window) through a sliding-window attention over a
+    pool placed by position over SP ranks, which keeps the window layer whole on every rank
+    (`PagedKVConfig.placed_groups`), so a split step gathers its keys (``kv_gather``): split, then
+    copied, then a copied decode. Each against one rank's windowed attention; the split step's
+    sampler rows are each row's last token of the whole step, and every rank holds the step's K/V.
+    The attention is built before the pool places its groups and reads the window group's plan."""
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+    # both groups' pages are 2 * CP_PAGE tokens unplaced; placed, the window's are CP_PAGE
+    kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+        max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
+    ))
+    specs = resolve_spec_dependencies([
+        kv,
+        AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+        AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+            kv_cache="kv", sliding_window=WINDOW, layers=(1,),
+        )),
+        SeqShardSpec("shard", {NODE}, ("main",), 0, exchange="all_gather"),
+    ])
+    window = specs["window"]
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, head_shards=1)
+    attn = AttentionManager.build(window, replace(info, dependencies={k: specs[k] for k in window.depends_on()}))
+    assert attn._split_exchange == "kv_gather"
+    shard = SequenceShard.build(specs["shard"], info)
+    placement = kv.config.place(joint, "kv")
+    attn.bind_dependencies({"kv": types.SimpleNamespace(placement=placement, bind_sequence_shard=lambda s: None),
+                            "shard": shard})
+    whole = ContextParallel(1, 0, CommGroup.trivial(), True, (0,))
+
+    def step(rows):
+        """A case of ``rows``; the case as the pool plans it, its first group's pages (which the
+        window attention mustn't read) before the window group's, the case's own; and the step's
+        slots in the window group."""
+        case = _Case.build(rows, CPU, torch.float32)
+        first, page = [], 64
+        for view in case.plan["main"].views:
+            pages = -(-view.length // (2 * CP_PAGE))
+            first.append(view._replace(page_idxs=list(range(page, page + pages))))
+            page += pages
+        plan = KVPlanOutputs({"main": KVPlanOutput(build_paged_indptrs(first, 2 * CP_PAGE), first)},
+                             later_groups=(dict(case.plan),))
+        slots = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
+                 for pos in range(view.length - view.to_compute, view.length)]
+        return case, replace(case, plan=plan), tuple(torch.tensor(a) for a in zip(*slots, strict=True))
+
+    for rows, split_it in ((PREFILL_ROWS, True), (PREFILL_ROWS, False), (DECODE_ROWS, False)):
+        case, planned, (pages, offsets) = step(rows)
+        cache = case.cache(whole, stored_only=True)
+
+        def run(q, k, v, cache=cache, where=(pages, offsets)):
+            # the whole step's K/V, on every rank
+            cache[where[0], 0, where[1]], cache[where[0], 1, where[1]] = k, v
+            return attn.run(q, "main", kv_cache_layer=cache, layer_idx=1)
+
+        q, (k, v) = case.q, case.new_keys()
+        n = q.shape[0]
+        shard.min_tokens = 0 if split_it else n + 1
+        _plan(attn, planned, shard=shard)
+        assert (shard.split_range("main") is not None) == split_it
+        out = shard.gather("main", attn.exchange(run, *shard.scatter("main", q, k, v)))
+        torch.testing.assert_close(out, case.want(window_left=WINDOW - 1))
+        torch.testing.assert_close(cache, case.cache(whole), equal_nan=True)
+        if split_it:
+            last = attn.select_last_hidden(torch.arange(n)[:, None])
+            assert last.flatten().tolist() == (np.cumsum([new for _, new in rows]) - 1).tolist()
+
+
+def test_sp_ranks_split_a_sliding_window_step_over_a_placed_pool_like_one_rank(tmp_path):
+    mp.spawn(_on_sp_ranks, args=(P, str(tmp_path / "store"), _window_split), nprocs=P)
 
 
 def _assert_paired(everyone: list) -> None:

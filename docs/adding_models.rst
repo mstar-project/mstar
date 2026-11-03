@@ -2473,7 +2473,8 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   every SP rank (``PagedKVConfig.placed_groups``) while the full layers' slots stripe: its copied
   steps (decode included) attend as on one rank, with no collective, and its split steps gather
   the step's keys (``kv_gather``), eagerly. Its pages hold ``1/sp_size`` the tokens they would
-  unplaced, so each window page must split ``sp_size`` ways.
+  unplaced, so each window page must split ``sp_size`` ways. Its split, copied and decode steps
+  are tested on CPU only, over FlashInfer's reference.
 
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
 the KV pool, paged FlashInfer, MLA and dense attention, ragged self and cross attention,
@@ -2559,7 +2560,7 @@ And for the copied resources, under any ``exchange`` that splits:
      - TP heads, no collective
      - always (its one latent can't split by head)
    * - sliding-window attention over KV stored by position
-     - ``kv_gather``, eager only
+     - ``kv_gather``, eager only (CPU-tested only)
      - as on one rank, no collective
      - always; its window pages must split ``sp_size`` ways
    * - recurrent layer, ``sp_exchange: ulysses`` (the default)

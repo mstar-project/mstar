@@ -461,8 +461,8 @@ position, ``all_gather`` splits them, and ``ring`` also bounds the attention pha
 this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
 never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
 an MLA pool's attention, and a sliding-window attention over KV stored by position (whose window
-layers stay whole on each rank, so its decode needs no collective), gather the step's keys
-(``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses``, or its own
+layers stay whole on each rank, so its decode needs no collective; CPU-tested only), gather the
+step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses``, or its own
 ``sp_exchange: state_passing`` (CPU-tested only, as Mamba-2's split is). A value the node's
 storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
 other than ``flashinfer`` (when the engine builds it), or beside a ``kv_gather`` attention or a
