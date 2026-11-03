@@ -396,6 +396,26 @@ def test_a_failed_message_wait_releases_pending_requests_and_stops_the_server():
     assert server.fatal_error is not None
 
 
+def test_failing_passes_log_one_traceback(caplog):
+    """A pass that keeps failing (a message it can't route) logs its traceback
+    once, not once a pass, and the loop goes on."""
+    server = _api_server(_Proc(5))
+    passes = []
+
+    def messages():
+        passes.append(True)
+        if len(passes) > 3:
+            server.running = False
+            return []
+        raise RuntimeError("a message it can't route")
+    server.communicator.get_all_new_messages = messages
+    server._process_messages()
+
+    assert len(passes) == 4
+    assert sum(r.exc_info is not None for r in caplog.records) == 1
+    assert server.fatal_error is None
+
+
 def test_dead_conductor_releases_pending_requests_and_stops_the_server():
     stopped = []
     server = _api_server(_Proc(5, alive=False, exitcode=-9))

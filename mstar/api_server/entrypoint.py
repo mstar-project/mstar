@@ -1068,6 +1068,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1303,11 +1304,19 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
                 # one pass's error (a message it can't route) is logged and the
-                # loop goes on; a prune it skipped runs by the next liveness check
+                # loop goes on; a prune it skipped runs by the next liveness check.
+                # Passes that keep failing log one traceback, then a count.
                 if self.running:
-                    logger.exception("Error in message processing loop")
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
             # Everything else that changes what a pass reads signals the poll:
             # a message, the data worker's flush (``ResultQueue``) and a
             # request handler (``_wake_message_loop``). Only the liveness
