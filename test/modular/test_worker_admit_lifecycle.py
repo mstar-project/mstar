@@ -200,7 +200,7 @@ def test_a_second_partition_opens_nothing_twice():
     # each partition still gets its own forward-pass info and worker graph
     assert w.request_state.get_fwd_info(rid, "Thinker").graph_walk == "thinker"
     assert w.request_state.get_fwd_info(rid, "Talker").graph_walk == "talker"
-    assert all(rid in w._graph_runtime._queues[wg].per_request_queues for wg in (0, 1))
+    assert all(w._graph_runtime.is_partition_idle(rid, p) for p in ("Thinker", "Talker"))
 
     # the next request to get the handle opens it again
     w._remove_request(RemoveRequest(request_id="r1"))
