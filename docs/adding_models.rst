@@ -366,9 +366,15 @@ A layout has six fields:
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
-  node's outputs. A request with a ``"digest"`` or ``"rows"`` span can't be rebuilt from
-  its token ids, so in a pool that decides admission it can only move to the host, into room
-  set aside at its first ask, and reserves its whole footprint when the host can't set it aside.
+  node's outputs. A request whose spans are not all ``"ids"`` can be rebuilt at one rank when the
+  node's ``RebuildPolicy`` names their walks in ``walks``, whatever their kind: the worker keeps
+  host copies of what the node reads in each prefill step, and a rebuild row runs each step again
+  from them, in the order the layout's steps say (``opens_step``). The last span must be an
+  ``"ids"`` span, and a label the request keys must be keyed over every span. Otherwise, in a pool
+  that decides admission, the request can only move to the host, into room set aside at its first
+  ask, and reserves its whole footprint when the host can't set it aside. A rebuild row gives its
+  walk what the step read, under the step's metadata, and the last row's ids tensor gets the samples
+  appended, so the walk must read its prompt in that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.

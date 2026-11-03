@@ -36,7 +36,7 @@ def test_kept_ids_copy_after_the_steps_completion_event():
     step_done = torch.Event(device=device)
     step_done.record()
 
-    copy = pool.copy_out(ids, step_done, torch.int32)
+    copy = pool.copy_out(ids, pool.take(1 << 10), step_done, torch.int32)
     copy.landed.synchronize()
 
     assert copy.view.dtype == torch.int32 and copy.view.tolist() == [7] * 256, (

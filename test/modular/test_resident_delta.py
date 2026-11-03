@@ -1305,12 +1305,12 @@ def _preempt(kv, rid: str, droppable: bool):
     return kv.preempt(rid, 1, _ENGINES[id(kv)]._runner.newer_than(rid), lambda other: droppable)
 
 
-# v's rebuild: its 5-page prompt and the id its next decode reads
-_REBUILD = Rebuild("prefill", [0] * (5 * PAGE_SIZE + 1))
+# v's rebuild: the id its next decode reads, past its 5-page prompt
+_REBUILD = Rebuild([0])
 
 
 def _kept(node, rid):
-    return len(_REBUILD.ids)
+    return 5 * PAGE_SIZE + len(_REBUILD.sampled)
 
 
 def _both_short_then_drop(monkeypatch, kept=_kept):

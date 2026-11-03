@@ -40,16 +40,16 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
-from mstar.worker.host_pool import HostCopy, HostSlice
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, LayoutRow, Prefilling, Rebuilds, RowRecord, policies_run_here
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE = "LLM"
-POLICY = RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token", loop="decode")
+POLICY = RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token", loop="decode")
 
 
 def _graphs(node_name: str = NODE) -> dict:
@@ -65,9 +65,10 @@ class _Engine(SimpleNamespace):
 
 
 def _kept(tokens: int) -> KeptIds:
-    """A request's prompt of ``tokens`` ids on the host, and one sample."""
-    view = torch.arange(tokens, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", [0]))
+    """A request's prompt of ``tokens`` ids, recorded in its one prefill step, and one sample."""
+    ids = torch.arange(tokens, dtype=torch.int32)
+    record = RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {})
+    return KeptIds((LayoutRow("prefill", tokens),), [record], array("i", [0]))
 
 
 def _worker(kv):
@@ -82,7 +83,7 @@ def _worker(kv):
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
-    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 20, torch.device("cpu")))
     w._rebuilds._kept[NODE] = {rid: _kept(5 * PAGE_SIZE) for rid in "rv"}
     w._in_flight_rids, w._hold_logged, w._rid_str = set(), {}, str
     w.held, w.tried, w.failed = [], [], {}
@@ -170,7 +171,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
     pytest.param({(NODE, "decode")}, False, id="a node whose prefill walk runs on another worker"),
 ])
 def test_a_policy_runs_here_only_where_the_worker_runs_its_prefill_and_loop_walks(my_walks, rebuilds):
-    assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks)) == rebuilds
+    assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks, ())) == rebuilds
 
 
 def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_that_ran_short():
@@ -233,8 +234,8 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     _running(kv, "v", 5, arrival=2)
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
-    del w._rebuilds._kept[NODE]["v"]
-    w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
+    w._rebuilds._kept[NODE]["v"].sampled = array("i")
+    w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
         rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
@@ -363,11 +364,32 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
     assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
-    """A drop lays the pool's one label out again as one span of the policy's walk. In the two labels case, the
-    second label is written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses
-    the request."""
+@pytest.mark.parametrize("prefix_cache", [True, False])
+def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
+    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
+    the way of a rebuild."""
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    text = [4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill", 0, None, None]
+    # text in two spans of one step, keyed over the first, as the conductor sends a layout
+    layout = [[[*text, True, "ids"], [*text, False, "ids"]], [["decode", 1]], 0, None, 1]
+    config = KVReqConfig()
+    config.apply_conductor_config(
+        prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache, kv_layout={"main": layout}, loop_caps={"decode": 64},
+    )
+    configs = {"kv": config}
+
+    w._set_rebuildable(1, configs)
+
+    assert configs["kv"].rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
+
+
+@pytest.mark.parametrize("layout", ["two labels", "two loops"])
+def test_a_pool_whose_layout_its_rebuild_rows_cant_write_again_isnt_rebuildable(layout):
+    """A drop lays the pool's one label out again, grown by one loop. In the two labels case, the second label is
+    written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses the request."""
     kv = _pool()
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
@@ -376,8 +398,6 @@ def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(l
     layouts = {"main": StreamLayout(spans=(span,), growth=growth)}
     if layout == "two labels":
         layouts["uncond"] = StreamLayout(spans=(PrefixSpan(4, 4, "cfg_text"),), growth=(("cfg_loop", 1),))
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        layouts["main"] = StreamLayout(spans=(span, PrefixSpan(4, 4, "prefill")), growth=growth)
     else:
         layouts["main"] = StreamLayout(spans=(span,), growth=(*growth, ("other_loop", 1)))
     configs = {"kv": KVReqConfig(kv_layout=layouts, loop_caps={"decode": 64, "cfg_loop": 4, "other_loop": 4})}

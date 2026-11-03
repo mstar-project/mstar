@@ -119,7 +119,13 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
+from mstar.worker.rebuild import (
+    DEFAULT_REBUILD_HOST_MB,
+    DEFAULT_REBUILD_MEDIA_HOST_MB,
+    Rebuilds,
+    node_writes,
+    policies_run_here,
+)
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -443,6 +449,12 @@ class _LazyHostRow(Mapping):
         return len(self._row)
 
 
+def _serving_mb(model_config: dict | None, key: str, default: int) -> int:
+    value = (model_config or {}).get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key}: {value!r} is not a non-negative int")
+    return value
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -743,13 +755,17 @@ class Worker:
         # What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this
         # worker runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
         graphs = model.get_graph_walk_graphs() if model is not None else {}
-        policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
-        host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-        if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-            raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+        policies = {} if model is None else policies_run_here(
+            model.rebuild_policies(), graphs, my_walks, self.parallel_nodes,
+        )
+        host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+        if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
+            host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
         self._rebuilds = Rebuilds(
             policies, graphs,
             HostPool(host_mb << 20, self.device) if host_mb and policies else None,
+            self.engine_manager.engine.host_allowance,
+            {node: dtype for node in policies if (dtype := self.engine_manager.engine.node_dtype(node)) is not None},
         )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
@@ -3778,7 +3794,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        self._rebuilds.record(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
@@ -3869,12 +3885,13 @@ class Worker:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
-        lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
+        the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:
@@ -3888,19 +3905,25 @@ class Worker:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = {
-            rid: cursor for rid in rebuild
-            if rid in ran and (cursor := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        ended = {
+            rid: run for rid in rebuild
+            if rid in ran and (run := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
         }
-        if landed:
+        if ended:
             # the step's kernels read the prepared input released here
             self._wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid, cursor in landed.items():
-                if not cursor.resumes_prefill:
+            for rid, run in ended.items():
+                self._preemption.rebuilt(rid, node, run.ran)
+                # A row from a record prepared its own input. A prompt's step in progress goes on from the
+                # input the engine keeps for the prompt, which waited aside while the rows before it ran.
+                if run.row.record is not None:
                     engine.release_chunk_inputs(rid, node)
+                if self._rebuilds.rebuilding(rid, node):
+                    if self._rebuilds.cursor(rid, node).resumes_prefill:
+                        engine.restore_chunk_inputs(rid, node)
+                    continue
                 engine.land_rebuild(node, rid)
-                self._preemption.rebuilt(rid, node, cursor.total)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)

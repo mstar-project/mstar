@@ -12,6 +12,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -27,16 +28,25 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import (
+    KeptIds,
+    LayoutRow,
+    NodeWrites,
+    PlannedRow,
+    Prefilling,
+    RebuildCursor,
+    Rebuilds,
+    RowRecord,
+)
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
-POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="loop")
+POLICY = RebuildPolicy(walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="loop")
 
 
 def _graphs() -> dict:
@@ -49,9 +59,15 @@ def _graphs() -> dict:
     }
 
 
+def _record(prompt=(1, 2, 3)) -> RowRecord:
+    """A prefill step that read ``prompt`` as int64 ids."""
+    ids = torch.tensor(prompt, dtype=torch.int32)
+    return RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {"is_prefill": True})
+
+
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+    """A log of one prefill step that read ``prompt``, and ``sampled``."""
+    return KeptIds((LayoutRow(PREFILL, len(prompt)),), [_record(prompt)], array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -151,7 +167,8 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     eng.land_rebuild = lambda node, rid: landed.append(rid)
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies, w._rebuilds._kept = {node: POLICY}, {node: {1: _kept()}}
-    w._rebuilds._cursors[(node, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long)
+    w._rebuilds._prefilling = {node: set()}
+    w._rebuilds._cursors[(node, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, _record()),), array("i"))
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, 1: 0, 2: 0}, rebuild_rids=frozenset({R})), batch, node,
@@ -161,6 +178,54 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
         w._postprocess_batch(pending, outputs)
     assert list(w._rebuilds._kept[node][1].sampled) == [5], "a drop would find no samples and refuse"
     assert landed == [R], "the rebuilt request would never be ready to decode again"
+
+
+@pytest.mark.parametrize("build", ["executing", "speculative"])
+def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_ids(build):
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng = _engine(_Sub())
+    eng.land_rebuild = lambda node, rid: None
+    w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
+    w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
+    w._rebuilds._copied, w._rebuilds._ids_walks = {node: {walk: frozenset({"embeds"})}}, {node: frozenset({walk})}
+    w._rebuilds._kept = {node: {1: KeptIds((LayoutRow(walk, 4),))}}
+    w._rebuilds._prefilling = {node: {1}}
+    w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
+    w._rebuilds._droppable = {node: {1: pool.take(64)}}
+    embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
+    batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
+        rid: {"embeds": [] if build == "speculative" else [t], "text_inputs": [t]} for rid, t in embeds.items()
+    })
+    if build == "speculative":
+        # a speculated step gets its embeds only once the encoder has run
+        spec = Speculation(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, {("embeds", node)}, {R, 1, 2}, "p",
+                           is_new_iter=False, is_same_node=False)
+        w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
+    for rid, info in batch.per_request_info.items():
+        info.graph_walk, info.step_metadata = walk, {"prefill_order": (rid,)}
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
+    outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
+    with pytest.raises(_ReachedRoutingError):
+        w._postprocess_batch(pending, outputs)
+    # what the worker does once the step's outputs are sent
+    w._rebuilds.flush()
+
+    assert w._rebuilds._kept[node][1].records[0].inputs["embeds"][0].tolist() == embeds[1].tolist(), (
+        "a rebuild would need the encoder to run again"
+    )
+
+
+def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
+    w, _ = _worker()
+    w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
+    record = replace(_record(), step_metadata={})
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, record),), array("i"))
+
+    node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})))
+
+    assert node_batch.per_request_info[R].step_metadata == {}, "the rebuild row would run under decode's metadata"
 
 
 @pytest.mark.parametrize("why", ["no ids", "backlog", "prefill walk", "samples short"])
@@ -205,6 +270,8 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
 def test_a_prompts_rebuild_lands_and_leaves_the_prompts_input_to_its_last_chunk():
     w, eng = _worker()
     w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    # its one prefill step was recorded on its first chunk
+    w._rebuilds._kept[NODE][R] = _kept()
     eng.dropped.append(R)
     w._rebuilds.start(R, NODE, Prefilling(PREFILL, 4, 10))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
@@ -236,6 +303,36 @@ def test_a_rebuild_rows_ids_go_to_the_device_on_its_first_chunk_only(chunk):
         assert inputs["text_inputs"][0].tolist() == [1, 2, 3, 4]
     else:
         assert not inputs, "a later chunk is cut from the input the engine prepared on the first"
+
+
+def test_a_request_dropped_in_its_second_prompt_step_reruns_both_and_its_prompt_goes_on_from_its_own_input():
+    """The first row prepares its own input from the log, where the engine keeps the prompt's, so the prompt's input
+    waits aside until the row that resumes it, and the rebuild lands only after that row."""
+    w, eng = _worker()
+    eng.restored = []
+    eng.restore_chunk_inputs = lambda rid, node: eng.restored.append(rid)
+    w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    rows = (LayoutRow(PREFILL, 3), LayoutRow(PREFILL, 5))
+    w._rebuilds._kept[NODE][R] = KeptIds(rows, [_record(), _record((4, 5, 6, 7, 8))])
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE, Prefilling(PREFILL, 2, 5))
+
+    def run(chunk=None):
+        batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+        if chunk is not None:
+            batch.chunk_ranges[R] = chunk
+        node_batch = w._build_executing_batch(batch)
+        w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+        return node_batch.per_request_input_tensors.get(R, {})
+
+    first = run()
+    assert first["text_inputs"][0].tolist() == [1, 2, 3], "the first row would read the prompt step's input"
+    assert eng.released == eng.restored == [R] and not eng.landed, (
+        "the first row's input would stay on the device, or the prompt's next chunk would find none"
+    )
+    assert not run(ChunkRange(0, 2, 2, 2)), "the prompt's row would prepare an input the engine already keeps"
+
+    assert eng.landed == [R] and eng.released == [R], "the prompt's next chunk would find no input to be cut from"
 
 
 def test_a_skipped_rebuild_row_fails_its_request():

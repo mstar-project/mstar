@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.kv.host_writes import StepAllowance
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -80,6 +81,8 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # what each step may still copy to the host once its outputs are sent
+    host_allowance: "StepAllowance | None" = None
 
     @property
     def head_shards(self) -> int:
@@ -127,10 +130,9 @@ class Residency(IntEnum):
 
 
 class Rebuild(NamedTuple):
-    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
-    The last id is the one the next decode step reads."""
-    walk: str
-    ids: Sequence[int]
+    """What a dropped request's rebuild writes past its prompt: the ids it ``sampled`` since, but the newest,
+    which the next decode step reads."""
+    sampled: Sequence[int]
 
 
 class KeyedWalks(NamedTuple):

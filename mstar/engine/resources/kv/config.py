@@ -352,6 +352,15 @@ class PrefixSpan:
         object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
+def step_end(spans: Sequence[PrefixSpan], start: int) -> int:
+    """Where the step that writes ``spans[start]`` stops. One step writes a span and each span after it in the
+    same walk that doesn't open a step, in one row, as text around an attachment is written."""
+    end = start + 1
+    while end < len(spans) and spans[end].walk == spans[start].walk and not spans[end].opens_step:
+        end += 1
+    return end
+
+
 @dataclass
 class KVReqConfig(ResourceReqConfig):
     # NOTE: this may need to be refined
@@ -418,7 +427,8 @@ class KVReqConfig(ResourceReqConfig):
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
-                    keyed_spans=keyed_spans,
+                    # a request with the prefix cache off keys none of its spans
+                    keyed_spans=keyed_spans if self.prefix_cache else 0,
                     max_growth=max_growth[0] if max_growth else None,
                 )
                 # a row may leave out the growth bound, as a span row may leave out its later fields
@@ -430,6 +440,10 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
+
+    def keys_of(self, label: str) -> list[bytes] | None:
+        """``label``'s prefix keys, or None when the request keys nothing there, as with ``prefix_cache`` off."""
+        return (self.prefix_keys or {}).get(label) if self.prefix_cache else None
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
@@ -544,12 +558,20 @@ def refuse_undeclared_labels(
 
 
 def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
-    """Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""
+    """Why rebuild rows can't write a request's laid-out labels again, or None.
+
+    The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write
+    every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.
+    A keyed label is keyed again by extending its keys, which needs them to cover every span.
+    """
     laid_out = [layout for layout in layouts if layout.spans]
-    if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
-        return "it holds KV that can't be recomputed from token ids"
-    if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
-        return "it writes more than one label, span or growth loop, which one rebuild row can't lay out again"
+    if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label or growth loop, which its rebuild rows can't lay out again"
+    for layout in laid_out:
+        if layout.spans[-1].kind != SpanKind.IDS:
+            return "its prompt ends on a span of no ids, where the ids it sampled can't follow"
+        if 0 < layout.keyed_spans < len(layout.spans):
+            return "it keys only part of its prompt, which a rebuild can't key again"
     return None
 
 
@@ -747,6 +769,21 @@ class StreamLayout:
     def _grown(self, caps: Mapping[str, int]) -> int:
         grown = sum(slots * caps[loop] for loop, slots in self.growth)
         return grown if self.max_growth is None else min(grown, self.max_growth)
+
+    def steps(self) -> tuple[tuple[PrefixSpan, ...], ...]:
+        """The spans grouped by the step that writes them (`step_end`), in walk order."""
+        steps, start = [], 0
+        while start < len(self.spans):
+            end = step_end(self.spans, start)
+            steps.append(self.spans[start:end])
+            start = end
+        return tuple(steps)
+
+    def rebuilt(self, grown: int) -> "StreamLayout":
+        """This layout once a rebuild has written ``grown`` ids sampled since it was laid out at the end of its
+        last span, which `rebuild_refusal` requires to be ids."""
+        *spans, last = self.spans
+        return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 
     def pages(
         self, caps: Mapping[str, int], page_size: int, retention: "RetentionPolicy | None" = None,

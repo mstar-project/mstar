@@ -344,9 +344,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
-       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
-       keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
+       which a request dropped from the KV cache is rebuilt from. A request takes its room when it
+       arrives, and one the pool can't hold then is never dropped on that node, though it can
+       still move to the host with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
+   * - ``rebuild_media_host_mb``
+     - *(optional, default 1024)* MiB added to that pool on a worker where a node's rebuild policy
+       copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
+       with images or video, at one rank. A request takes room for its ids and copies together,
+       at the values per slot the policy declares in the node's dtype, and gives back what its copies didn't use once
+       they are taken. A non-negative int, and 0 with ``rebuild_host_mb: 0`` keeps nothing.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -467,12 +473,18 @@ pages copied back, and a dropped one recomputes its KV in prefill chunks cut by 
 chunk budget. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
-are never preempted mid-stream. A request no drop can free, because it holds KV made from media
-or another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
-when it is admitted the host pool sets room for its whole footprint aside, and it reserves only
-its prompt. When the host pool can't, it reserves its whole footprint in that pool, as a voice
-request does. So ``cpu_offload_pages`` also sets how many such requests run at once with only
-their prompt reserved.
+are never preempted mid-stream. A request with images, video or audio can be dropped at one rank
+when its node's rebuild policy names the walks its prompt runs in: the worker keeps a host copy of
+what each prefill step read, the encoder's output included, and rebuilds the request by running
+those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image chat, a
+Qwen3-Omni request with audio, images or video in and text out, or a Higgs Audio transcription. A
+request no drop can free, because it holds KV made from another node's outputs or from media it
+keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
+it is admitted the host pool sets room for its whole footprint aside, and it reserves only its
+prompt. Bagel generations, which write a label per guidance, and requests with media above one rank
+are such requests. When the host pool can't set the room aside, the
+request reserves its whole footprint in that pool, as a voice request does. So
+``cpu_offload_pages`` also sets how many such requests run at once with only their prompt reserved.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
 step that follows, so every rank admits each step from the same reservations. On a node with a

@@ -43,6 +43,7 @@ def _bagel():
         cfg_renorm_type="global", cfg_renorm_min=0.0, vit_config=SimpleNamespace(patch_size=14),
         vit_max_num_patch_per_side=70, latent_downsample=16, max_latent_size=64,
         temperature=0.0, top_k=-1, top_p=1.0, repetition_penalty=1.0, ignore_eos=False, vocab_size=1000,
+        hidden_size=64,
     )
     model.tokenizer = _StubTokenizer()
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
@@ -464,10 +465,13 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
         "main", ["audio"], ["text"], {name: tensors[name] for name in tensors}, output.metadata,
     )
 
-    assert [span.walk for span in layout.spans] == [args.full_metadata.graph_walk]
+    walk = args.full_metadata.graph_walk
     audio = sum(model.config.encoder_output_length(n) for n in output.metadata["audio_feature_lens"])
-    text = sum(ids.numel() for ids in tensors["text_inputs"])
-    assert sum(span.length for span in layout.spans) == text + audio
+    pre, post = (ids.numel() for ids in tensors["text_inputs"])
+    assert [(span.kind, span.walk, span.length, span.opens_step) for span in layout.spans] == [
+        ("ids", walk, pre, True), ("rows", walk, audio, False), ("ids", walk, post, False),
+    ], "the layout would say another step writes the text after the audio than the one that runs"
+    assert layout.keyed_count() == 0, "a step that mixes text and audio would be keyed"
 
 
 def _omni_submodule():

@@ -43,6 +43,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import CachedLease, EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
+from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
@@ -396,6 +397,8 @@ class ExecutingBatch:
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
+    # events the step waits on, recorded once its inputs copied to the device have landed
+    input_ready: tuple[torch.Event, ...] = ()
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
@@ -586,6 +589,7 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
+        self.host_allowance = StepAllowance()
 
     def load_model(
         self,
@@ -646,6 +650,7 @@ class Engine:
                     max_rows_in_combined=self._max_rows_in_combined(
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
+                    host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
                 ),
             )
@@ -718,7 +723,7 @@ class Engine:
                     f"{type(model).__name__}: {node!r} declares a rebuild policy, but {refusing} can't drop a "
                     "request's state"
                 )
-            walks = {policy.walk, combined.get((node, policy.walk), policy.walk)}
+            walks = {*policy.walks, *(combined.get((node, walk), walk) for walk in policy.walks)}
             split = sorted(walk for walk in walks if mgmt.submodule.split_batches_by_capture_key(walk))
             if split:
                 raise ValueError(
@@ -726,6 +731,10 @@ class Engine:
                     "capture key, which the scheduler reads from a request's forward-pass info, and that names "
                     "the decode walk while the request is rebuilt"
                 )
+
+    def node_dtype(self, node_name: str) -> torch.dtype | None:
+        """The dtype ``node_name`` was cast to and runs in, or None if it keeps its own (``disable_autocast``)."""
+        return resolve_node_dtype(self._submodules[node_name].submodule, self._autocast_dtype)
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -1158,6 +1167,8 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
+        for ready in batch.input_ready:
+            torch.accelerator.current_stream(self._device).wait_event(ready)
         try:
             self._prepare_inputs(batch)
         finally:
@@ -1367,6 +1378,12 @@ class Engine:
     def release_chunk_inputs(self, rid: int, node_name: str) -> None:
         self._chunking.release(rid, node_name)
 
+    def set_aside_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunking.set_aside(rid, node_name)
+
+    def restore_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunking.restore(rid, node_name)
+
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
@@ -1380,6 +1397,7 @@ class Engine:
     def after_output_copy(self, batch: ExecutingBatch) -> None:
         if batch.committed is not None:
             self._runner.after_output_copy(batch.committed)
+        self.host_allowance.refill()
 
     def step_finished(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],

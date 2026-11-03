@@ -46,12 +46,12 @@ Each pool decides the class once, at the request's first `ask`, from two facts. 
 | # | A request with | Class | Why |
 |---|---|---|---|
 | 1 | An output it streams that can't pause, audio unless the model or the deployment says otherwise | guaranteed | a pause is a gap in playback |
-| 2 | A `rows` span | moves only to the host there, or guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
-| 3 | A `digest` span | moves only to the host there, or guaranteed | its KV comes from an encoder's output, freed after prefill |
+| 2 | A `rows` span from another node's outputs | moves only to the host there, or guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads, and no policy on its node rebuilds it |
+| 3 | A `digest` or `rows` span on a walk of its node's rebuild policy | preemptible at one rank, and elsewhere moves only to the host there, or guaranteed | its KV comes from an encoder's output, freed after prefill, such as a Qwen3.5 image's or video's, so a rebuild needs a host copy of it |
 | 4 | No rebuild policy on the node that writes its KV | moves only to the host there, or guaranteed | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
-Row 3 becomes preemptible with a followup, R5, which keeps a host copy of the encoder's output for the rebuild. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Until then, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker.
+R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
 
 On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTFT under pressure. On a 48-page pool at c16, Qwen3.5 image requests' TTFT p50 fell from 3.48 s to 3.18 s once R5a made them preemptible.
 
@@ -271,21 +271,22 @@ Why this shape:
 @dataclass(frozen=True)
 class RebuildPolicy:
     """How a node rebuilds a dropped request's KV, as its model declares it."""
-    walk: str            # the prefill walk a rebuild row runs
-    ids_input: str       # the walk's input that carries the prompt's ids
-    sample_output: str   # the output that carries each sampled id
-    loop: str            # the loop each of whose iterations samples one id
+    walks: frozenset[str]   # the prefill walks its rebuild rows run, those the request prefilled in
+    ids_input: str          # the input that carries the prompt's ids
+    sample_output: str      # the output that carries each sampled id
+    loop: str               # the loop each of whose iterations samples one id
+    copy_width: Mapping[str, int]           # a walk that reads more than the ids -> values its copies hold per KV slot
 ```
 
-A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
+A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup and reads off them what the node reads in each walk besides the ids. A node without one never drops a request.
 
 A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, and opens the rebuild in the worker's log. Readiness answers the request's decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.
 
-The rebuild prefills the kept ids minus the last, under the policy's walk, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
+The rebuild runs one row per prefill step the request's layout lays out (`StreamLayout.steps`), in order, the last also writing the ids sampled since minus the last, as rows mid-prefill that nothing popped. Each row runs in its step's walk, cut by that walk's budget, and a walk the model doesn't chunk rebuilds whole. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
 
-A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
+A request dropped between two chunks of a prompt step reruns the steps before it from the log, then that step's chunks up to where it stood. Its chunk Loop still stands there, and the engine still holds the input it prepared for the step, which waits aside while the earlier rows prepare theirs, so the last row is cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
+The worker records each prefill step of a request on the step's first chunk, which carries its whole input: the ids, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, every other input the node reads there, such as the encoder's output a Qwen3.5 prompt with images reads (`rebuild_media_host_mb` more, after the step's outputs and within the bytes #876 lets a step copy to the host), and the step's metadata, which the step's rebuild row runs under. A step other than the one the layout says comes next leaves the request with nothing kept, so it is never dropped. Once the last step is recorded, the worker appends each sample from the stop check's host copy. They go back to the device when the row's step is built, on the pool's stream, and only that step waits for them. A request takes one slice of the pool for all of it when it arrives, sized from its layout and the values per slot the policy declares in the node's dtype, so a request the pool can't hold is known before it is admitted and takes the class of one no drop can free. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
 
 Why this shape:
 
