@@ -169,3 +169,31 @@ def test_only_a_step_policy_raises_the_transformers_recompile_limit(monkeypatch,
         Flux2DiT(TINY), config, loop_name="denoise_loop", attn_resource_key=None, step_dtypes=step_dtypes,
     )
     assert seen["recompile_limit"] == limit
+
+
+@pytest.mark.parametrize("limit", [None, 100])
+def test_a_torch_without_a_per_compile_limit_keeps_the_process_wide_one(monkeypatch, limit):
+    """torch 2.10's ``torch.compile`` has no ``recompile_limit`` and refuses the keyword, even as None."""
+    from mstar.model.components.diffusion import compile_utils
+
+    def compile_without_limit(fn, *, fullgraph=False, dynamic=None):
+        return fn
+
+    monkeypatch.setattr(compile_utils.torch, "compile", compile_without_limit)
+    dit = Flux2DiT(TINY)
+    compile_transformer_forward(dit, recompile_limit=limit)
+    assert callable(dit.forward)
+
+
+def test_a_torch_with_a_per_compile_limit_gets_it(monkeypatch):
+    from mstar.model.components.diffusion import compile_utils
+
+    seen = []
+
+    def compile_with_limit(fn, *, fullgraph=False, dynamic=None, recompile_limit=None):
+        seen.append(recompile_limit)
+        return fn
+
+    monkeypatch.setattr(compile_utils.torch, "compile", compile_with_limit)
+    compile_transformer_forward(Flux2DiT(TINY), recompile_limit=100)
+    assert seen == [100]
