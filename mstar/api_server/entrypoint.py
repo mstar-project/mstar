@@ -2381,11 +2381,11 @@ async def generate_ws(websocket: WebSocket):
                     # iterator's last chunk, so the loop ends here; the error
                     # is the reply and no finish follows.
                     failed = True
-                    await send({
+                    await send(_with_weight_version({
                         "request_id": request_id,
                         "error": bytes(chunk.data).decode("utf-8", "replace"),
                         "status": chunk.metadata.get("status", 500),
-                    }, binary)
+                    }, chunk.metadata.get("weight_version")), binary)
                     continue
                 await send({
                     "request_id": request_id, "modality": chunk.modality,

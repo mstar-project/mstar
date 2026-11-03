@@ -200,8 +200,9 @@ def test_the_message_loop_keeps_the_admitted_version():
     from mstar.api_server.request_types import ResultChunk
 
     worker = PreprocessWorker.__new__(PreprocessWorker)
-    worker.received_chunk_counts = {"ok": {}, "bad": {}, "live": {}}
-    worker.per_request_reading_tensors = {"ok": 0, "bad": 0, "live": 0}
+    worker.received_chunk_counts = {"ok": {}, "bad": {}, "live": {}, "tok": {}}
+    worker.per_request_reading_tensors = {"ok": 0, "bad": 0, "live": 0, "tok": 0}
+    worker.result_tensor_input_queue = queue.Queue()
     worker.output_queue = queue.Queue()
     # a live call streams a versioned output, then its input fails: no output
     # names the error, so it takes the version the request's chunks carried,
@@ -216,7 +217,7 @@ def test_the_message_loop_keeps_the_admitted_version():
     reqs = {
         rid: PendingRequest(streaming=False, input_modalities=["text"],
                             output_modalities=["text"], profile=RequestProfile(rid=rid))
-        for rid in ("ok", "bad", "live")
+        for rid in ("ok", "bad", "live", "tok")
     }
     server.pending_requests = dict(reqs)
     batches = [[
@@ -226,6 +227,10 @@ def test_the_message_loop_keeps_the_admitted_version():
         APIServerMessage("request_failed", RequestFailed(
             request_id="bad", error_message="generation was paused", status=503,
             weight_version="v5")),
+        # an inline frame: its metadata goes to the data worker with its values
+        APIServerMessage("result_tokens", ResultTokens(
+            request_ids=["tok"], values=[7], loop_indices=[None], signal="new_token",
+            modality="text", metadata={"weight_version": "v5"})),
     ], []]
     class _Comm(_ScriptedApiComm):
         def get_all_new_messages(self):
@@ -241,6 +246,8 @@ def test_the_message_loop_keeps_the_admitted_version():
     assert reqs["ok"].weight_version == "v5" and reqs["bad"].weight_version == "v5"
     assert reqs["bad"].error_status == 503
     assert [c.metadata for c in reqs["live"].chunks] == [{"status": 400, "weight_version": "v6"}]
+    queued = worker.result_tensor_input_queue.get_nowait()
+    assert (queued.request_ids, queued.metadata) == (["tok"], {"weight_version": "v5"})
 
 
 def test_a_request_with_no_answer_takes_the_version_its_chunks_carry():

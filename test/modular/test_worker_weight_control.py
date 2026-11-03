@@ -236,7 +236,10 @@ def test_a_follower_that_fails_mid_copy_keeps_the_deployment_paused(ckpts):
     assert answer.ranks["worker_1"].startswith("OSError: read error partway")
     assert answer.rank_versions == {"worker_0": "v1", "worker_1": None}
     assert d.workers["worker_1"]._weights_dirty
-    # a failed copy stamps nothing; the one that copied does, but stays paused
+    # a failed copy changes no stamp: here, the first reload, the follower still
+    # stamps nothing (after an earlier reload it would keep that one's version,
+    # harmless since a dirty rank never serves); the rank that copied stamps
+    # the new one, but stays paused
     assert d.workers["worker_1"]._graph_runtime.weight_version is None
     assert d.workers["worker_0"]._graph_runtime.weight_version == "v1"
     assert d.control.weight_version is None
