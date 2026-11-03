@@ -333,7 +333,7 @@ def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
     return buf.reshape(buf.shape[0], -1)[:, 0]
 
 
-class _LazyPerRid:
+class _LazyPerRid(Mapping):
     """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
     the first time a consumer reads them. The batched stop check, the row store
     and the inline emit read the rows directly, so in the common decode step
@@ -351,14 +351,8 @@ class _LazyPerRid:
             self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
         return self._built
 
-    def get(self, key, default=None):
-        return self._dict().get(key, default)
-
     def __getitem__(self, key):
         return self._dict()[key]
-
-    def __contains__(self, key) -> bool:
-        return key in self._dict()
 
     def __iter__(self):
         return iter(self._dict())
@@ -366,9 +360,7 @@ class _LazyPerRid:
     def __len__(self) -> int:
         return len(self._request_ids)
 
-    def __bool__(self) -> bool:
-        return bool(self._request_ids)
-
+    # the built dict's own views, rather than Mapping's per-key lookups
     def items(self):
         return self._dict().items()
 
@@ -379,6 +371,81 @@ class _LazyPerRid:
         return self._dict().values()
 
 
+class _LazyHostOutputs(Mapping):
+    """Per-rid host copies of a step's outputs, copied by output name on first
+    read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
+
+    The stop check reads at most the sampled token, and a loop that stops on
+    its iteration count reads nothing, so copying every output down each step
+    paid for transfers nobody read. Outputs that leave by a host transport are
+    copied by the send instead; ``landed`` hands it what was copied here.
+    """
+
+    __slots__ = ("_source", "_copy_names", "_landed")
+
+    def __init__(self, source: dict, copy_names: Callable[[list[str]], dict]):
+        self._source = source
+        self._copy_names = copy_names
+        self._landed: dict[str, dict] = {}
+
+    def _copy(self, names) -> None:
+        missing = [n for n in dict.fromkeys(names) if n not in self._landed]
+        if missing:
+            self._landed.update(self._copy_names(missing))
+
+    def _host(self, name: str) -> dict:
+        self._copy((name,))
+        return self._landed[name]
+
+    def landed(self, names=()) -> dict[int, NameToTensorList]:
+        """What was copied, ``names`` first copied too, in one batched copy
+        and one sync for a host transport, which would otherwise copy each
+        tensor on its own."""
+        self._copy(names)
+        out: dict[int, NameToTensorList] = {}
+        for name, by_rid in self._landed.items():
+            for rid, value in by_rid.items():
+                out.setdefault(rid, {})[name] = value
+        return out
+
+    def get(self, rid, default=None):
+        row = self._source.get(rid)
+        if row is None:
+            return default
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __getitem__(self, rid):
+        row = self._source[rid]
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __iter__(self):
+        return iter(self._source)
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+
+class _LazyHostRow(Mapping):
+    """One request's view of ``_LazyHostOutputs``: reading a name copies it."""
+
+    __slots__ = ("_parent", "_rid", "_row")
+
+    def __init__(self, parent: _LazyHostOutputs, rid, row: dict):
+        self._parent, self._rid, self._row = parent, rid, row
+
+    def __getitem__(self, name):
+        value = self._row[name]
+        # only a list of tensors has anything to copy
+        return self._parent._host(name)[self._rid] if isinstance(value, list) else value
+
+    def __contains__(self, name) -> bool:
+        return name in self._row
+
+    def __iter__(self):
+        return iter(self._row)
+
+    def __len__(self) -> int:
+        return len(self._row)
 
 
 class Worker:
@@ -4034,7 +4101,10 @@ class Worker:
                     node_name=batch_N.node_name,
                     graph_walk=graph_walk,
                     skip_cuda_sync=True,
-                    cpu_tensors=cpu_outputs,
+                    cpu_tensors=(
+                        cpu_outputs.landed(signals if self.tensor_manager.needs_cpu_tensor else ())
+                        if isinstance(cpu_outputs, _LazyHostOutputs) else cpu_outputs
+                    ),
                     ready_event=batch_N.node_batch.completion_event,
                 )
             return stored
@@ -4501,22 +4571,20 @@ class Worker:
         outputs: "BatchedModelOutput",
         completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
-    ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+    ) -> tuple[Mapping[int, Mapping[str, list[torch.Tensor]]], HostRows | None]:
+        """Side-stream D→H of the CUDA tensors in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
-        copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
-
-        AR engines emit small per-rid output dicts (sampled token + maybe
-        a code) so the cost is negligible. If a future engine emits large
-        tensors here (e.g. activations), revisit.
+        Returns per-rid host outputs, plus ``HostRows`` when the submodule
+        handed over row-addressed buffers, for a batched stop check. Without
+        those, the outputs are a ``_LazyHostOutputs``, which copies an output
+        name for every rid the first time it is read. Skipped (returns
+        ``outputs`` unchanged) when there's no completion event (CPU execution)
+        or when CUDA is unavailable.
 
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
@@ -4561,36 +4629,41 @@ class Worker:
                 HostRows(tuple(row_rids), host),
             )
 
-        cpu_per_rid: dict = {}
+        # Shared by every name copied this step, so two names never land in
+        # one pinned buffer.
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with side:
-            for rid, name_to_list in source.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
-                    continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.device.type == self.device.type:
-                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
-                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
-        side.synchronize()
 
-        return cpu_per_rid, None
+        def copy_names(names: list[str]) -> dict[str, dict]:
+            host: dict[str, dict] = {name: {} for name in names}
+            with side:
+                for name in names:
+                    for rid, name_to_list in source.items():
+                        if not isinstance(name_to_list, dict) or name not in name_to_list:
+                            continue
+                        tensors = name_to_list[name]
+                        if not isinstance(tensors, list):
+                            host[name][rid] = tensors
+                            continue
+                        new_list = []
+                        for t in tensors:
+                            if torch.is_tensor(t) and t.device.type == self.device.type:
+                                # by size class, not shape: a per-shape count gives
+                                # two shapes in one class the same buffer
+                                key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
+                                idx = buffer_indices[key]
+                                buffer_indices[key] += 1
+                                cpu_t = self._get_pinned_d2h_buffer(
+                                    "check_stop", t.shape, t.dtype, idx,
+                                )
+                                cpu_t.copy_(t, non_blocking=True)
+                                new_list.append(cpu_t)
+                            else:
+                                new_list.append(t)
+                        host[name][rid] = new_list
+            side.synchronize()
+            return host
+
+        return _LazyHostOutputs(source, copy_names), None
 
     def _removal_step_reached(self, body: RemoveRequest) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages
