@@ -1,5 +1,5 @@
-"""The attention resource's shared machinery: the spec-time factory, the
-custom op every backend attends through, and the workspace pool.
+"""The attention resource's shared machinery: the spec-time factory and the
+custom op every backend attends through.
 
 The backends themselves live beside this — `flashinfer`, `cross`, `dense`,
 `flex` — and `AttentionManager.build` reaches them by deferred import, so
@@ -7,7 +7,6 @@ naming a backend in a spec does not load the others.
 """
 
 import logging
-import os
 from typing import NamedTuple
 
 import torch
@@ -242,6 +241,20 @@ class AttentionManager(AttentionResource):
         """
         return True
 
+    def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
+        """The current plan's query offsets per request, for backends that plan them."""
+        raise NotImplementedError(f"{type(self).__name__} plans no query offsets (qo_indptr_buf)")
+
+    # Eager as a whole: a break inside it leaves a compiled frame that holds the
+    # bucket's static token count beside its row count, which captured forwards
+    # recompile per prefill bucket until Dynamo's recompile limit.
+    @torch.compiler.disable
+    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
+        """Each request's last row of ``hidden``, used for sampling from prefill,
+        for a backend whose ``qo_indptr_buf`` holds the plan's query offsets."""
+        last = (self.qo_indptr_buf(label)[1:] - 1).long()
+        return hidden.index_select(0, last)
+
 
 class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
@@ -281,29 +294,3 @@ def captured_page_capacity(
     if len(kv_config.groups) > 1:
         return kv_config.num_units + step_pages + num_rows
     return max(num_rows * kv_config.max_num_pages, step_pages + num_rows)
-
-
-def workspace_bytes() -> int:
-    """Size of one FlashInfer workspace buffer (``MSTAR_WORKSPACE_BUFFER_MB``)."""
-    return int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024
-
-
-class WorkspacePool:
-    """FlashInfer workspace buffers, one per (plan label, cg slot).
-
-    Persistent: a wrapper is planned against the buffer it was built with, so
-    these outlive any single step.
-    """
-
-    def __init__(self, device: torch.device, size_mb: int | None = None):
-        self._device = device
-        self._size = workspace_bytes() if size_mb is None else size_mb * 1024 * 1024
-        self._buffers: dict[str, torch.Tensor] = {}
-
-    def get(self, label: str, cg_slot: int | None = None) -> torch.Tensor:
-        key = label if cg_slot is None else f"{label}_{cg_slot}"
-        if key not in self._buffers:
-            self._buffers[key] = torch.empty(
-                self._size, dtype=torch.uint8, device=self._device
-            )
-        return self._buffers[key]

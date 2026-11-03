@@ -86,9 +86,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         resolution.
 
         Accepted input encodings (auto-detected by dtype + value range):
-          * ``uint8`` in ``[0, 255]`` — typical raw decoded image
-          * ``float`` in ``[0, 1]`` — what mstar's ``data_worker`` hands over
-            after dividing decoded uint8 frames by 255
+          * ``uint8`` in ``[0, 255]`` — what ``Pi05Model.load_image`` hands over
+          * ``float`` in ``[0, 1]`` — the base ``Model.load_image`` encoding
           * ``float`` in ``[-1, 1]`` — already-normalized form used by the
             unit/integration tests that bypass the data_worker
         Anything else falls back to a simple float32 cast and assumes the
