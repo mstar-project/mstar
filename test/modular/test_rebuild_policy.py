@@ -380,6 +380,35 @@ def test_a_media_copy_split_across_two_steps_lands_whole():
     assert copies.ready() and torch.equal(copies.inputs["embeds"][0], embeds.cpu()), "the second half never landed"
 
 
+class _CountingPool(HostPool):
+    """Counts the copies back to the device."""
+
+    def __init__(self) -> None:
+        super().__init__(1 << 10, torch.device("cpu"))
+        self.copied_in = 0
+
+    def copy_in(self, view):
+        self.copied_in += 1
+        return view.clone(), SimpleNamespace()
+
+
+def test_the_copy_back_waits_for_the_step_that_reads_it():
+    """The copy back to the device ran when the rebuild was queued and made the current stream wait then, so a step
+    still being enqueued stalled behind it, and the copy held device memory outside the KV pool while the row
+    waited. It runs when the row's step is built, and only that step waits for it."""
+    pool = _CountingPool()
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
+    copies = HostCopies({"embeds": [torch.ones(6, 2)]}, {"prefill_order": ("text", "image", "text")})
+    rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, copies=copies), lengths=(3, 2))
+
+    rebuilds.start(R, NODE, None)
+    assert not pool.copied_in, "starting the rebuild copied the image back to the device before any step reads it"
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
+    ready = rebuilds.fill(NODE, {R}, {}, inputs, infos)
+
+    assert pool.copied_in == 1 and len(ready) == 1, "the row's step wouldn't wait for its image"
+
+
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
