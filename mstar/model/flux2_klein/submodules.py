@@ -254,10 +254,11 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
-        # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
-        # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
-        # the compiled decode is not launch-bound (measured), so the node declares no captures.
+        # torch.compile (max-autotune, no cudagraphs) took the 1024^2 decode from 89 to 29 ms on an
+        # H100, moving the image by <= 5.6e-2 in [-1, 1] (~56 dB), before the folded upsample and the
+        # split GroupNorm (compile_vae_decode). Not bit-exact, so it is a deployment knob and stays off
+        # for the bit-exact parity path. CUDA graphs would add nothing: the compiled decode is not
+        # launch-bound (measured), so the node declares no captures.
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         # compiled: only these batch sizes are ever decoded (larger batches are split into them)
