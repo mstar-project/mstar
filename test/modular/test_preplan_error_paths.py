@@ -308,3 +308,30 @@ def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> No
     fake._pre_plan_done.update(enc="e1", dec="e2")
     Engine._order_after_pre_plans(fake)
     assert waits == ["e1", "e2"]
+
+
+def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() -> None:
+    # the resident stage copies into the bucket's cells and slots, which a
+    # dropped pre-plan may still be copying into on its plan stream
+    from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep
+
+    calls = []
+
+    def plan(step, phase):
+        calls.append("runner")
+        raise NotImplementedError("reached plan")
+
+    engine = object.__new__(Engine)
+    engine._enable_nvtx = False
+    engine._runner = SimpleNamespace(plan=plan)
+    engine._order_after_pre_plans = lambda: calls.append("wait")
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
+    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
+    ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))
+    mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)
+    with pytest.raises(NotImplementedError, match="reached plan"):
+        engine._drive_step(
+            SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},
+            ctx, lease, True, SubmoduleStep(steps={}, cg_key_info=None), False,
+        )
+    assert calls == ["wait", "resident", "runner"]

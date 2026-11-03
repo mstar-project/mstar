@@ -1984,6 +1984,8 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # before any copy this plan issues, the resident stage's included
+            self._order_after_pre_plans()
             # promoted and inline plans per resource, apart
             plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
             if ctx.resident is not None:
@@ -2001,7 +2003,6 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                self._order_after_pre_plans()
                 self._runner.plan(step, plan_phase)
             finally:
                 phase_end(
