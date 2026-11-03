@@ -91,6 +91,7 @@ class OrpheusLanguageModel(nn.Module):
 class OrpheusForCausalLM(nn.Module):
     def __init__(self, config: OrpheusModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
+        self.config = config
         self.model = OrpheusLanguageModel(config, comm_group=comm_group)
         # LM head is column-parallel over vocab: each rank computes
         # ``[B, V/tp]``; ``gather_output=True`` runs an all-gather on the
@@ -103,6 +104,9 @@ class OrpheusForCausalLM(nn.Module):
             output_size=config.vocab_size,
             bias=False,
             gather_output=True,
+            # Orpheus only ever emits ``<custom_token_*>`` ids (SNAC codes and
+            # the speech/turn markers), about 18% of the head
+            output_start=config.custom_token_base_id,
         )
 
     def forward(
@@ -114,8 +118,24 @@ class OrpheusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, label=label)
 
-    def load_weights(self, weights):
-        """Load HF Llama-style weights into the fused parameters."""
+    def load_weights(self, weights) -> set[str]:
+        """Load HF Llama-style weights into the fused parameters; tie the
+        head to the embedding when the checkpoint does and stores no head
+        (``save_pretrained`` drops a tied ``lm_head.weight``); raise on
+        anything left unloaded."""
         from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 
-        return load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+        loaded = load_hf_weights(self, weights, stacked_params=LLAMA_STACKED_PARAMS)
+        if "lm_head.weight" not in loaded and "model.embed_tokens.weight" in loaded:
+            if not self.config.tie_word_embeddings:
+                raise RuntimeError("Orpheus checkpoint has no lm_head.weight and does not tie embeddings")
+            # Both shard the vocab dim by TP rank over the same rows, so the
+            # local embedding shard is this rank's head shard.
+            self.lm_head.weight.data.copy_(self.model.embed_tokens.weight.data)
+            loaded.add("lm_head.weight")
+        missing = sorted(set(dict(self.named_parameters())) - loaded)
+        if missing:
+            raise RuntimeError(
+                f"Orpheus checkpoint left {len(missing)} parameter(s) unloaded, e.g. {missing[:5]}"
+            )
+        return loaded

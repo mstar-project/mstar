@@ -173,7 +173,7 @@ class WaypointConfig:
 
     # Attempt fixed-shape CUDA graph capture for encoder/DiT/decoder prime and
     # rollout paths; disabled or failed capture falls back to eager forwards.
-    cuda_graph: bool = True
+    accelerator_graph: bool = True
 
     # Extra (H, W) seed shapes the vae_encoder captures a graph for; others run eager.
     seed_capture_sizes: tuple[tuple[int, int], ...] = ()

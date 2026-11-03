@@ -13,8 +13,9 @@ land. Segments are mapped once and never move, so the one-time
 holds for its lifetime and keeps the side-stream copies truly async.
 
 Capacity degrades in layers: grow by segments up to
-``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for
-consumer ACKs; then spill the tensor to the per-uuid file protocol
+``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another
+segment: segments commit their pages when created); at the cap, briefly
+backpressure for consumer ACKs; then spill the tensor to the per-uuid file protocol
 (``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old
 transport at saturation. ``stats_summary()`` exposes occupancy and the
 fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it
@@ -45,6 +46,7 @@ import weakref
 from concurrent.futures import Future
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
@@ -58,6 +60,8 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.host_copy import HostCopier
+from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
@@ -122,17 +126,21 @@ def _cudart():
     """libcudart via ctypes: unlike the torch binding, a ctypes call
     RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the
     send path cannot stall the process's other Python threads (serve loop,
-    stream relays, the wake watcher)."""
+    stream relays, the wake watcher). Loaded by the soname of torch's CUDA
+    major, which reaches the copy torch already loaded even where it is not
+    on the loader path (a pip install of torch)."""
     global _CUDART
     if _CUDART is None:
         import ctypes
-        import ctypes.util
 
-        name = ctypes.util.find_library("cudart") or "libcudart.so"
-        lib = ctypes.CDLL(name)
+        if not torch.version.cuda:
+            raise OSError("torch is not built with CUDA")
+        lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
         lib.cudaHostRegister.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
         lib.cudaHostRegister.restype = ctypes.c_int
+        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        lib.cudaHostUnregister.restype = ctypes.c_int
         _CUDART = lib
     return _CUDART
 
@@ -157,14 +165,32 @@ def _unpin(ptr: int) -> bool:
         return False
     try:
         lib = _cudart()
-        import ctypes
-
-        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
-        lib.cudaHostUnregister.restype = ctypes.c_int
-        rc = lib.cudaHostUnregister(ptr)
     except OSError:
-        rc = torch.cuda.cudart().cudaHostUnregister(ptr)
+        return False
+    rc = lib.cudaHostUnregister(ptr)
+    if rc != 0:
+        # Left set, the thread's next torch kernel launch raises it.
+        lib.cudaGetLastError()
     return rc == 0
+
+
+def _unpin_live(own_pinned: list, peers: dict) -> None:
+    """Unregister every pinned own and peer segment (weakref.finalize
+    target -- must not reference the manager). Runs before the arena
+    objects unmap: a mapping torn down while still registered leaves the
+    registration behind, and a later mapping at the same address then gets
+    ``cudaHostRegister`` rc 712."""
+    for ptr in own_pinned:
+        if not _unpin(ptr):
+            logger.warning("ARENA: cudaHostUnregister failed for own "
+                           "segment %#x", ptr)
+    own_pinned.clear()
+    for name, (arena, view, pinned) in list(peers.items()):
+        if pinned:
+            if not _unpin(arena.ptr_len()[0]):
+                logger.warning("ARENA: cudaHostUnregister failed for peer "
+                               "%s", name)
+            peers[name] = (arena, view, 0)
 
 
 def _pin(ptr: int, nbytes: int) -> bool:
@@ -173,9 +199,15 @@ def _pin(ptr: int, nbytes: int) -> bool:
     if not torch.cuda.is_available():
         return False
     try:
-        rc = _cudart().cudaHostRegister(ptr, nbytes, 0)
-    except OSError:  # no loadable libcudart: fall back to the torch binding
-        rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+        lib = _cudart()
+    except OSError as e:
+        logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
+                       "to pageable bandwidth", e)
+        return False
+    rc = lib.cudaHostRegister(ptr, nbytes, 0)
+    if rc != 0:
+        # Set by an already-registered range (accepted below) too.
+        lib.cudaGetLastError()
     ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
     if not ok:
         logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
@@ -183,8 +215,27 @@ def _pin(ptr: int, nbytes: int) -> bool:
     return ok
 
 
+def _gather(view, starts: list[int], nbytes: int, dst: np.ndarray, *,
+            words_max_bytes: int) -> None:
+    """``nbytes`` from each of ``starts`` in ``view``, back to back into ``dst``."""
+    if (
+        nbytes <= words_max_bytes and nbytes % 8 == 0 and len(view) % 8 == 0
+        and all(s % 8 == 0 for s in starts)
+    ):
+        words = np.frombuffer(view, dtype=np.int64)
+        w = nbytes // 8
+        at = np.asarray(starts, dtype=np.int64) // 8
+        np.take(words, (at[:, None] + np.arange(w)).ravel(), out=dst.view(np.int64))
+        return
+    seg = np.frombuffer(view, dtype=np.uint8)
+    for i, s in enumerate(starts):
+        dst[i * nbytes:(i + 1) * nbytes] = seg[s:s + nbytes]
+
+
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
+
+    _namespace_file_dirs = ("/dev/shm",)
 
     # Staging writes the segment and offset onto the descriptor the store
     # holds, which routing may already have copied -- so every outgoing edge
@@ -200,6 +251,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         communicator: BaseCommunicator,
         shm_dir: str | None = None,
         enable_prof: bool = False,
+        copy_workers: int = 1,
     ):
         super().__init__(
             my_entity_id=my_entity_id, hostname=hostname, device=device,
@@ -207,6 +259,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             enable_prof=enable_prof,
         )
         from mstar_rust import SegmentedShmArena, ShmArena
+
+        # A CPU consumer's reads (the API server's outputs) copy on these.
+        self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
         segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
@@ -225,6 +280,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # one-shot transfer doesn't amortize the registration cost.
         self._pin_budget = int(
             os.getenv("MSTAR_SHM_ARENA_PIN_MAX_MB", "4096")) << 20
+        # _read_many_from_arena's gather limits: the crossovers depend on the host
+        self._gather_item_bytes = int(
+            os.getenv("MSTAR_SHM_ARENA_GATHER_MAX_BYTES", "16384"))
+        self._gather_words_bytes = int(
+            os.getenv("MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES", "512"))
         self._pinned_bytes = 0
         self._pin_budget_warned = False
         self._segment_bytes = segment_mb << 20
@@ -242,6 +302,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._spill_after_s = float(
             os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0"))
         self._frag_warned = False
+        self._spill_warned = False
         # h2d completion watcher: turns a CUDA event into a real Future so
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
         self._wake_q: queue.Queue | None = None
@@ -307,12 +368,17 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # and across users (permission-denied at startup). pid + random
         # token makes each instance's names unique; wire-compatibility is
         # free because consumers open whatever segment name the descriptor
-        # carries. The pid embedded in the name also enables the orphan
-        # sweep below.
+        # carries. Under a deployment namespace the segments are named like
+        # its tensor files, so its lock marks them live and the dead-
+        # namespace sweep reclaims them; a pid cannot, since /proc is per
+        # PID namespace and containers can share /dev/shm. Without one, the
+        # pid in the name drives the orphan sweep below.
         import secrets
 
         self._sweep_orphans()
-        base = (f"mstar_arena_{my_entity_id}_{os.getpid()}_"
+        ns = self._shm_namespace
+        base = (f"mstar_{ns}_arena_{my_entity_id}_{secrets.token_hex(4)}"
+                if ns else f"mstar_arena_{my_entity_id}_{os.getpid()}_"
                 f"{secrets.token_hex(4)}")
         self._arena = SegmentedShmArena.create(
             base, segment_mb << 20, max_segments)
@@ -336,6 +402,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # cannot resolve.
         self._segments_named_to = None
         self._pinned_segments = 0
+        # Base pointers of own segments that are registered, for the
+        # unregister finalizer below.
+        self._own_pinned: list[int] = []
         self._sync_segments()
         # uuid -> (segment_idx, offset) for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
@@ -362,6 +431,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # bound on any long-lived consumer.
         self._peer_segments: dict[str, tuple[object, memoryview, int]] = {}
         self._peer_evict_last = 0.0
+        # Unregister before the arenas unmap (close(), or when the manager
+        # is collected). Not at interpreter exit: the driver drops every
+        # registration with the process.
+        self._unpin_finalizer = weakref.finalize(
+            self, _unpin_live, self._own_pinned, self._peer_segments)
+        self._unpin_finalizer.atexit = False
 
     # -- segments --------------------------------------------------------
 
@@ -391,16 +466,22 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> int:
-        """Pin within budget; returns the bytes actually pinned (0 if
-        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so
-        budget check + register + accounting must be one atomic unit."""
+        """Pin an own segment within budget; returns the bytes actually
+        pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases
+        the GIL, so budget check + register + accounting must be one atomic
+        unit, and close() must see the segment either unpinned or tracked."""
         # Oversized dedicated segments ARE pinned (within budget): freed
         # segments are reused for later large tensors, so the registration
         # amortizes over the segment's lifetime, not one transfer.
         if not self._pin_segments:
             return 0
         with self._pin_lock:
-            return self._pin_locked(ptr, nbytes)
+            if not self._pin_segments:
+                return 0
+            pinned = self._pin_locked(ptr, nbytes)
+            if pinned:
+                self._own_pinned.append(ptr)
+            return pinned
 
     def _pin_locked(self, ptr: int, nbytes: int) -> int:
         if self._pinned_bytes + nbytes > self._pin_budget:
@@ -572,7 +653,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         while True:
             try:
                 seg, off = self._arena.reserve(max(nbytes, 1))
-            except RuntimeError:
+            # Both the segment cap and a failed growth (no room in
+            # /dev/shm for a new segment) land here as "full".
+            except RuntimeError as e:
                 if self._reclaim_expired():
                     continue   # expired slots freed: retry the reserve
                 total, free, largest = self._arena.stats()
@@ -587,12 +670,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     self._frag_warned = True
                 if time.monotonic() > deadline:
                     if self._spill:
+                        if not self._spill_warned:
+                            logger.warning(
+                                "ARENA: spilling sends to the file "
+                                "transport (%s)", e)
+                            self._spill_warned = True
                         return None
                     raise RuntimeError(
                         f"SHM arena full for >{self._full_timeout_s}s "
-                        f"({self._arena.num_segments} segments); raise "
-                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB or check "
-                        "for consumers not ACKing") from None
+                        f"({self._arena.num_segments} segments: {e}); raise "
+                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB, free "
+                        "/dev/shm space, or check for consumers not "
+                        "ACKing") from None
                 if not warned:
                     logger.warning(
                         "SHM arena at capacity; backpressuring sends until "
@@ -670,20 +759,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         queued = False
         try:
             if nbytes:
-                host = torch.frombuffer(
+                flat = torch.frombuffer(
                     self._seg_views[seg][off:off + nbytes],
                     dtype=torch.uint8,
-                ).view(t.dtype).reshape(t.shape)
+                )
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
                 if t.is_cuda:
-                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    flat.view(t.dtype).reshape(t.shape).copy_(
+                        t, non_blocking=self._d2h_stream is not None)
                     queued = True
+                elif t.device.type == "cpu":
+                    # A stored host copy: one memcpy, nothing for the stream
+                    # sync to wait on. numpy, not Tensor.copy_: torch splits a
+                    # CPU copy of more than 32K elements over its intra-op
+                    # OpenMP pool, whose threads then spin on the cores the
+                    # worker's own threads need.
+                    np.copyto(flat.numpy(),
+                              t.reshape(-1).view(torch.uint8).numpy())
                 else:
-                    # a stored host copy: a memcpy, nothing for the stream
-                    # sync to wait on
-                    host.copy_(t)
+                    flat.view(t.dtype).reshape(t.shape).copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:
@@ -781,61 +877,101 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
+        return self._start_reads([(request_id, graph_edges)], graph_walk)
+
+    def start_read_tensors_multi(self, reads):
+        """One stream context, peer sweep, event and wake for every request's
+        reads, not one each."""
+        return self._start_reads(reads, None)
+
+    def _start_reads(self, requests, graph_walk):
         # Increment races are benign here: a torn count can only make
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
-            return self._start_read_tensors(request_id, graph_edges,
-                                            graph_walk)
+            if not any(e.tensor_info for _rid, edges in requests for e in edges):
+                # signal-only edges: no stream context to pay for, but the
+                # (time-gated) sweep of dead peers' segments still runs here
+                self._evict_dead_peers()
+                return []
+            return self._start_read_tensors(requests, graph_walk)
         finally:
             self._reads_active -= 1
 
-    def _start_read_tensors(self, request_id, graph_edges, graph_walk):
+    def _start_read_tensors(self, requests, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
-        read_edges: list[tuple[GraphEdge, float]] = []
+        stats = self.transfer_stats
+        # one per edge read; the future is filled in once every copy is queued
+        reads: list[FutureAndPointers] = []
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
             else _nullcontext()
         )
+        # arena items are read and stored together after the loop; one met
+        # again before then takes the extra reference after the put
+        staged: list[tuple] = []
+        taken: dict[int, TensorPointerInfo] = {}
+        again: list[int] = []
+        t0 = time.perf_counter()
         with ctx:
-            for graph_edge in graph_edges:
-                if len(graph_edge.tensor_info) == 0:
-                    continue
-                rx_t0 = time.perf_counter()
-                for info in graph_edge.tensor_info:
-                    if info.source_entity == self.my_entity_id:
-                        self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
-                            next_node=graph_edge.next_node,
-                            graph_walk=graph_walk, info=info,
-                        )
-                        self.tensor_store.increment_ref(info.uuid, 1)
+            for request_id, graph_edges in requests:
+                for graph_edge in graph_edges:
+                    if len(graph_edge.tensor_info) == 0:
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
-                        continue
-                    if info.shm_segment is None:
-                        # Spilled at the producer (arena saturated): read the
-                        # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, info.uuid)
-                        with open(path, "rb") as f:
-                            f.seek(info.offset)
-                            data = f.read(info.nbytes)
-                        tensor = _deserialize_tensor(
-                            data, self.device, tensor_info=info)
-                    else:
-                        tensor = self._read_from_arena(info)
-                    h2d_did_work = h2d_did_work or tensor.numel() > 0
-                    self.tensor_store.put_tensor(
-                        request_id, info.uuid, tensor, info)
-                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
-                    # +1 transit (released by get_ready_tensors), +1 usage
-                    # (released by _cleanup_consumed_inputs).
-                    self.tensor_store.increment_ref(info.uuid, 2)
-                read_edges.append(
-                    (graph_edge, time.perf_counter() - rx_t0))
+                    fp = FutureAndPointers(
+                        future=None, graph_edges=[graph_edge], request_id=request_id,
+                    )
+                    for info in graph_edge.tensor_info:
+                        if info.source_entity == self.my_entity_id:
+                            self._slice_existing_tensor(
+                                request_id=request_id, name=graph_edge.name,
+                                next_node=graph_edge.next_node,
+                                graph_walk=graph_walk, info=info,
+                            )
+                            self.tensor_store.increment_ref(info.uuid, 1)
+                            continue
+                        producer_uuid = info.uuid
+                        if self._take_cached_read(request_id, info, taken, again):
+                            continue
+                        if info.shm_segment is None:
+                            # Spilled at the producer (arena saturated): read the
+                            # per-uuid file, the old protocol's path.
+                            path = self._shm_path(info.source_entity, producer_uuid)
+                            with open(path, "rb") as f:
+                                f.seek(info.offset)
+                                data = f.read(info.nbytes)
+                            tensor = _deserialize_tensor(
+                                data, self.device, tensor_info=info)
+                            h2d_did_work = h2d_did_work or tensor.numel() > 0
+                            self.tensor_store.put_tensor(
+                                request_id, info.uuid, tensor, info)
+                            self.tensor_store.set_metadata(info.uuid, mem_registered=False)
+                            self.tensor_store.increment_ref(info.uuid, 2)
+                        else:
+                            staged.append((request_id, info))
+                            taken[info.uuid] = info
+                        if stats is not None:
+                            fp.count_read(info)
+                    reads.append(fp)
+            if staged:
+                infos = [info for _, info in staged]
+                uuids = [info.uuid for info in infos]
+                tensors = self._read_many_from_arena(infos)
+                h2d_did_work = h2d_did_work or any(t.numel() > 0 for t in tensors)
+                self.tensor_store.put_tensor_batch_multi(
+                    [rid for rid, _ in staged], uuids, tensors, infos,
+                )
+                # +1 transit (released by get_ready_tensors), +1 usage
+                # (released by _cleanup_consumed_inputs).
+                self.tensor_store.increment_ref_batch_uniform(uuids, 2)
+            if again:
+                self.tensor_store.increment_ref_batch_uniform(again, 1)
+        # profiling attributes the call's time to its reads evenly
+        rx = (time.perf_counter() - t0) / max(len(reads), 1)
+        for fp in reads:
+            fp.rx_time = rx
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
@@ -848,13 +984,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             # queued on the h2d stream in program order. get_ready_tensors
             # polls it — no host block here.
             future = _CudaEventFuture(self._h2d_stream)
-        for graph_edge, rx_time in read_edges:
-            self.pending.append(
-                FutureAndPointers(
-                    future=future, graph_edges=[graph_edge],
-                    request_id=request_id, rx_time=rx_time,
-                )
-            )
+        for fp in reads:
+            fp.future = future
+        self.pending.extend(reads)
         if future is None:
             return []
         # A real Future for the worker's eventfd (EventWakeup.register_
@@ -871,7 +1003,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # staticmethod target closing over ONLY the queue: a bound
                 # method would pin the whole manager (and its arena — so
                 # segments never unlink) for the daemon thread's lifetime.
-                threading.Thread(
+                Thread(
                     target=self._watch_wakes, args=(self._wake_q,),
                     daemon=True,
                     name=f"arena-h2d-wake-{self.my_entity_id}").start()
@@ -901,6 +1033,35 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     except Exception:  # noqa: BLE001
                         pass
 
+    # Small items of one shape, dtype and segment (a step's streamed tokens)
+    # are gathered on the host into one pinned buffer, copied once and split
+    # on the device: one copy call instead of a copy per item (~7 us each).
+    # The default limits were measured on an H200 host, reading k items of n
+    # bytes: the gather wins from k=2 up to n=16 KB and breaks even at 64 KB.
+    # Up to 512 B an index of 8-byte words is fastest; above it, one slice
+    # copy per item.
+    def _read_many_from_arena(self, infos: list[TensorPointerInfo]) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(infos)
+        if self.device != "cpu":
+            groups: dict[tuple, list[int]] = {}
+            for k, info in enumerate(infos):
+                if 0 < info.nbytes <= self._gather_item_bytes:
+                    key = (info.shm_segment, info.nbytes, info.dtype, tuple(info.dims))
+                    groups.setdefault(key, []).append(k)
+            for (segment, nbytes, dtype, dims), ks in groups.items():
+                if len(ks) < 2:
+                    continue
+                starts = [infos[k].shm_offset + infos[k].offset for k in ks]
+                # pinned, so the copy is a true async DMA; the caching host
+                # allocator holds the block until the copy is done
+                host = torch.empty(len(ks) * nbytes, dtype=torch.uint8, pin_memory=True)
+                _gather(self._peer_view(segment), starts, nbytes, host.numpy(),
+                        words_max_bytes=self._gather_words_bytes)
+                rows = host.to(self.device, non_blocking=True).view(dtype).reshape(len(ks), *dims)
+                for k, t in zip(ks, rows.unbind(0), strict=True):
+                    out[k] = t
+        return [t if t is not None else self._read_from_arena(i) for t, i in zip(out, infos, strict=True)]
+
     def _read_from_arena(self, info: TensorPointerInfo) -> torch.Tensor:
         if info.nbytes == 0:
             t = torch.empty(
@@ -908,22 +1069,42 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             return t.to(self.device) if self.device != "cpu" else t
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
+        if self.device == "cpu":
+            # A CPU consumer owns a copy past reclaim. clone() would split it
+            # over torch's intra-op pool, sized for small ops; the copier keeps
+            # an image one memcpy and slices a video over threads of its own.
+            flat = self._host_copier.copy(
+                np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start))
+            return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)
         t = flat.view(info.dtype).reshape(info.dims)
-        if self.device != "cpu":
-            return t.to(self.device, non_blocking=True)
-        return t.clone()  # CPU consumer: own the bytes past reclaim
+        return t.to(self.device, non_blocking=True)
 
     # -- reclaim ----------------------------------------------------------
 
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
+
     def close(self) -> None:
-        """Stop the wake watcher (segments/pins release with the arena's
-        Drop once the manager is garbage collected)."""
+        """Stop the wake watcher and unregister every pinned segment (the
+        segments themselves unmap with the arena's Drop once the manager is
+        garbage collected). Segments mapped after this stay unpinned."""
         with self._wake_lock:
             if self._wake_q is not None:
                 self._wake_q.put(None)
                 self._wake_q = None
+        with self._pin_lock:
+            self._pin_segments = False
+            self._unpin_finalizer()
+            self._pinned_bytes = 0
+            self._pinned_segments = 0
 
     def cleanup_collectable(
         self, collectable: list[int], registered: list[bool],

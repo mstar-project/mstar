@@ -719,3 +719,118 @@ def test_duplex_suite_end_to_end(tmp_path, fake_cmd):
     assert 0.30 <= m["stop_latency_s_p50"] <= 0.50  # and stops 5 frames after the barge-in frame
     assert m["text_latency_s_p50"] == pytest.approx(m["response_latency_s_p50"], abs=0.1)
     assert m["barge_in_applicable_rate"] == 1.0 and m["on_time_rate"] is not None
+
+
+def test_serve_python_puts_its_own_bin_dir_first_on_the_server_path(tmp_path):
+    from benchmark.eval.server import ManagedServer
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    srv = ManagedServer("m", python=str(venv_bin / "python"), env={"PATH": "/usr/bin"})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), "/usr/bin"])
+    assert ManagedServer("m", env={"PATH": "/usr/bin"}).environment()["PATH"] == "/usr/bin"
+    custom = ManagedServer("m", python=str(venv_bin / "python"), command=["x"], env={"PATH": "/usr/bin"})
+    assert custom.environment()["PATH"] == "/usr/bin"
+
+
+def test_a_bare_serve_python_name_is_found_on_path_not_in_the_cwd(tmp_path, monkeypatch):
+    from benchmark.eval.server import ManagedServer
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "eval-test-python").symlink_to(sys.executable)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    path = os.pathsep.join([str(tmp_path / "missing"), str(venv_bin)])
+    srv = ManagedServer("m", python="eval-test-python", env={"PATH": path})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), path])
+    # not on PATH either: Popen will not find it, and the cwd stays off PATH
+    absent = ManagedServer("m", python="no-such-eval-python", env={"PATH": "/usr/bin"})
+    assert absent.environment()["PATH"] == "/usr/bin"
+
+
+def test_server_info_names_the_tree_the_server_python_imports(tmp_path, monkeypatch):
+    from benchmark.eval.schema import collect_metadata
+    from benchmark.eval.server import ManagedServer
+
+    other = tmp_path / "other"
+    (other / "mstar").mkdir(parents=True)
+    (other / "mstar" / "__init__.py").write_text("")
+    (other / "pyproject.toml").write_text("[project]\nname = 'mstar-ai'\n")
+    git = ["git", "-C", str(other), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "served tree"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f'#!/bin/sh\nPYTHONPATH={other} exec {sys.executable} "$@"\n')
+    python.chmod(0o755)
+    eval_commit = collect_metadata()["git"].get("commit")
+    monkeypatch.chdir(tmp_path)  # the server's cwd comes first on its sys.path
+
+    info = ManagedServer("m", python=str(python)).info()
+    assert info["git"]["commit"] == head and info["git"]["describe"].endswith("served tree")
+    assert info["git"]["commit"] != eval_commit
+    assert set(info["versions"]) == {"mstar-ai", "torch", "transformers"}
+    assert str(tmp_path) not in json.dumps(info)
+    assert ManagedServer("m", command=["x"]).info()["git"] == {}
+
+
+@pytest.mark.parametrize("clone", [False, True])
+def test_speaker_similarity_is_scored_only_for_cloned_requests(tmp_path, monkeypatch, clone):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.audio import write_wav
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    class FakeSim:
+        calls = 0
+
+        def similarity(self, out, ref):
+            FakeSim.calls += 1
+            return 0.5
+
+    monkeypatch.setattr(judges, "sim_judge", lambda *a, **k: FakeSim())
+    write_wav(tmp_path / "ref.wav", np.zeros(1600, dtype=np.float32), 16000)
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--asr-judge", "none"] + (["--clone"] if clone else []))
+    items = [Item(id="a", text="hi", ref_audio=str(tmp_path / "ref.wav"), ref_text="hi")]
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0, "rtf": 0.5,
+           "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    metrics = TTSSuite(args).score(items, [row], 1.0, None)
+    assert (metrics.get("sim_mean") == 0.5) is clone and FakeSim.calls == int(clone)
+    assert ("sim" in row) is clone
+
+
+def test_a_server_with_its_own_cwd_resolves_a_relative_python_and_its_tree_there(tmp_path, monkeypatch):
+    """The e2e compare starts each arm's server in that arm's checkout; a relative
+    ``python`` runs from there, so PATH and the recorded tree come from there too."""
+    from benchmark.eval.server import ManagedServer
+
+    arm = tmp_path / "arm"
+    (arm / "mstar").mkdir(parents=True)
+    (arm / "mstar" / "__init__.py").write_text("")
+    (arm / "pyproject.toml").write_text("[project]\nname = 'mstar-ai'\n")
+    git = ["git", "-C", str(arm), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(arm)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "arm tree"], check=True)
+    venv_bin = arm / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    srv = ManagedServer("m", python="venv/bin/python", cwd=arm, env={"PATH": "/usr/bin"})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), "/usr/bin"])
+    assert srv.info()["git"]["describe"].endswith("arm tree")

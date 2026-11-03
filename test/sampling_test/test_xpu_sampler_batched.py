@@ -1,9 +1,14 @@
 """XPU parity, batching and graph replay for the released per-row RNG API."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.utils import Sampler, sample_tokens
+from mstar.engine.resources.step import SlotLease, StepContext
 
 pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
 
@@ -139,3 +144,64 @@ def test_explicit_rng_sampling_captures_and_advances_in_xpu_graph(device, top_k,
             torch.xpu.synchronize(device)
             torch.testing.assert_close(tokens, reference, atol=0, rtol=0)
         torch.testing.assert_close(offsets, start + 3 * stride, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("top_ks", [(0, 32, 0, 32), (0, 0, 0, 0)])
+def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(device, top_ks):
+    logits, _, _ = _inputs(device, batch=8)
+    rids = tuple(range(4))
+    padded_rids = [*rids, -1, -2, -3, -4]
+    eager = SamplerResource(
+        logits.shape[1], enable_repetion_penalty=True, device=device, enable_min_p=True,
+    )
+    captured = SamplerResource(
+        logits.shape[1], enable_repetion_penalty=True, device=device, enable_min_p=True,
+    )
+    captured.build_accelerator_graph_buffers(
+        [SimpleNamespace(slot=0)], max_bs=8, max_seq_len=1,
+    )
+    for resource in (eager, captured):
+        for rid in rids:
+            resource.ingest_request(
+                rid, SamplingReqConfig(
+                    temperature=0. if rid == 0 else 0.8,
+                    top_k=top_ks[rid],
+                    top_p=0.9, min_p=0. if rid == 0 else 0.05,
+                    repetition_penalty=1.3, _seed=777 + rid,
+                ),
+            )
+    eager_ctx = StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False)
+    captured_ctx = StepContext(
+        request_ids=rids, graph_walk="decode", slot=0, capture=False,
+        slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=8)),
+    )
+    prompt = SamplerStep(prefill_tracked_tokens={
+        rid: torch.tensor([1, 2], device=device) for rid in rids
+    })
+    eager.plan(prompt, eager_ctx)
+    captured.plan(prompt, captured_ctx)
+    for _ in range(2):
+        captured.sample(padded_rids, logits)
+    captured.plan(SamplerStep(), captured_ctx)
+    torch.xpu.synchronize(device)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        tokens = captured.sample(padded_rids, logits)
+
+    for kept in (None, frozenset({0, 2}), frozenset(), None):
+        step = SamplerStep(kept_rids=kept)
+        eager.plan(step, eager_ctx)
+        expected = eager.sample(list(rids), logits[:len(rids)])
+        captured.plan(step, captured_ctx)
+        graph.replay()
+        captured.commit(step, captured_ctx)
+        torch.xpu.synchronize(device)
+        torch.testing.assert_close(tokens[:len(rids)], expected, atol=0, rtol=0)
+        for rid in rids:
+            slot = captured._cg_buffers._rid_to_slot[rid]
+            assert captured._cg_buffers.offset.master[slot].item() == eager._sampler._step_offset[rid]
+            torch.testing.assert_close(
+                captured._sampler.get_token_mask(rid)._seen_token_mask,
+                eager._sampler.get_token_mask(rid)._seen_token_mask,
+                atol=0, rtol=0,
+            )

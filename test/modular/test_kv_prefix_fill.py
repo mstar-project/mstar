@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -82,8 +82,8 @@ def _keys(n_tokens: int, first: int = 0) -> list[bytes]:
     ])
 
 
-def _layout(n_tokens: int) -> dict[str, list[PrefixSpan]]:
-    return {"main": [PrefixSpan(n_tokens, n_tokens, WALK)]}
+def _layout(n_tokens: int) -> dict[str, StreamLayout]:
+    return {"main": StreamLayout(spans=(PrefixSpan(n_tokens, n_tokens, WALK),), keyed_spans=1)}
 
 
 def _step(
@@ -110,7 +110,7 @@ def _indexed(kv: KVManager) -> int:
 
 def test_a_chunked_prefill_indexes_the_page_the_second_chunk_completes():
     kv = _manager()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(128)}, prefix_layout=_layout(128)))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(128)}, kv_layout=_layout(128)))
 
     _step(kv, "r0", 100)
     after_first = _indexed(kv)
@@ -125,7 +125,7 @@ def test_only_whole_pages_are_offered():
     kv = _manager()
     # The prompt is three pages and this step writes part of it, so the chain
     # names page 2 while that page is still partial.
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(384)}, prefix_layout=_layout(384)))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(384)}, kv_layout=_layout(384)))
 
     _step(kv, "r0", 300)
 
@@ -136,10 +136,10 @@ def test_only_whole_pages_are_offered():
 def test_a_second_request_with_the_same_prompt_matches_what_was_indexed():
     kv = _manager()
     keys = _keys(512)
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(512)))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(512)))
     _step(kv, "r0", 512)
 
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(512)))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(512)))
 
     assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=512)).tokens == 3 * PAGE_SIZE, (
         "the four indexed pages did not turn into a match of three"
@@ -150,11 +150,11 @@ def test_a_second_request_with_the_same_prompt_matches_what_was_indexed():
 def test_a_request_that_was_served_from_the_cache_does_not_reindex_it():
     kv = _manager()
     keys = _keys(512)
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(512)))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(512)))
     _step(kv, "r0", 512)
     indexed = _indexed(kv)
 
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(512)))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(512)))
     matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=512)).tokens
     _step(kv, "r1", 512 - matched)
 
@@ -168,7 +168,7 @@ def test_the_first_request_to_fill_a_page_is_the_one_the_index_names():
     kv = _manager()
     keys = _keys(256)
     for rid in ("r0", "r1"):
-        kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(256)))
+        kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(256)))
     _step(kv, "r0", 256)
     winner = list(kv._index.pages())
 
@@ -185,7 +185,7 @@ def test_the_first_request_to_fill_a_page_is_the_one_the_index_names():
 
 def test_a_rewound_stream_indexes_its_rerun_from_page_zero():
     kv = _manager()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(512)}, prefix_layout=_layout(512)))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(512)}, kv_layout=_layout(512)))
     _step(kv, "r0", 512)
     kv.reset_request("r0")
     # nothing left from the first run, so the rerun is the only thing to index
@@ -205,7 +205,7 @@ def test_a_rewound_stream_indexes_its_rerun_from_page_zero():
 
 def test_a_capture_step_indexes_nothing():
     kv = _manager()
-    kv.ingest_request("d0", KVReqConfig(prefix_keys={"main": _keys(256)}, prefix_layout=_layout(256)))
+    kv.ingest_request("d0", KVReqConfig(prefix_keys={"main": _keys(256)}, kv_layout=_layout(256)))
 
     # the rid is in the batch, so only the capture itself can keep it out
     _step(kv, "d0", 256, capture=True)
@@ -219,7 +219,7 @@ def test_a_capture_step_indexes_nothing():
 
 def test_a_padded_row_indexes_nothing():
     kv = _manager()
-    kv.ingest_request("pad", KVReqConfig(prefix_keys={"main": _keys(256)}, prefix_layout=_layout(256)))
+    kv.ingest_request("pad", KVReqConfig(prefix_keys={"main": _keys(256)}, kv_layout=_layout(256)))
 
     _step(kv, "pad", 256, padded=True)
     padded = _indexed(kv)
@@ -232,7 +232,10 @@ def test_a_padded_row_indexes_nothing():
 
 def test_a_label_the_request_never_keyed_indexes_nothing():
     kv = _manager()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(256)}, prefix_layout=_layout(256)))
+    kv.ingest_request("r0", KVReqConfig(
+        prefix_keys={"main": _keys(256)},
+        kv_layout={**_layout(256), "cfg_text": StreamLayout(spans=(PrefixSpan(256, 256, WALK),))},
+    ))
 
     _step(kv, "r0", 256, label="cfg_text")
     unkeyed = _indexed(kv)
@@ -246,9 +249,9 @@ def test_a_label_the_request_never_keyed_indexes_nothing():
 def test_a_request_that_opted_out_indexes_nothing():
     kv = _manager()
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": _keys(256)}, prefix_layout=_layout(256), prefix_cache=False,
+        prefix_keys={"main": _keys(256)}, kv_layout=_layout(256), prefix_cache=False,
     ))
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(256)}, prefix_layout=_layout(256)))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(256)}, kv_layout=_layout(256)))
 
     _step(kv, "r0", 256)
     opted_out = _indexed(kv)

@@ -1,6 +1,6 @@
 ---
 name: add-mstar-model
-description: End-to-end workflow for adding a model to M* — reconnaissance on the reference implementation, decomposing it into walks and nodes, deciding resources vs submodules, registration, eager parity against an oracle, batching and CUDA graphs, human verification of media output, competitor benchmarking and performance tuning. Use when porting a reference or Hugging Face model, or adding a model package, registry entry, serving config or model-specific API adapter.
+description: End-to-end workflow for adding a model to M* — reconnaissance on the reference implementation, decomposing it into walks and nodes, deciding resources vs submodules, registration, eager parity against an oracle, batching and accelerator graphs, human verification of media output, competitor benchmarking and performance tuning. Use when porting a reference or Hugging Face model, or adding a model package, registry entry, serving config or model-specific API adapter.
 ---
 
 # Adding a model to M*
@@ -112,7 +112,7 @@ Make the weight loader raise if any parameter goes unfilled. A silently half-loa
 
 **Prove the parity gate can fail.** Next to every parity pass, run at least one negative control that must diverge: another seed, the reference resampled with another noise field, or one mechanism switched off (a rolling K/V window turned off diverges only from the first chunk that evicts, which also shows the eviction path ran). A gate that passes its controls measures nothing. For media, report an automatic judge next to the human check in Phase 6: ASR word error rate over several samples per prompt, and PESQ or SNR against an fp64 run, with the reference-against-itself spread and a resample-with-another-seed row as the scale.
 
-Record the oracle once and keep the parity suite; rerun it after every performance commit, and add a parity test per performance commit. Do not add CUDA-graph configs while chasing parity — capture makes every discrepancy harder to localize and the two kinds of debugging do not mix.
+Record the oracle once and keep the parity suite; rerun it after every performance commit, and add a parity test per performance commit. Do not add accelerator graph configs while chasing parity — capture makes every discrepancy harder to localize and the two kinds of debugging do not mix.
 
 The oracle and the server are two sides of an A/B, so they must never share a GPU at the same time: run them on different GPUs when nothing is being timed, and back to back when something is. Record every oracle input you expect to need in one session up front, so you don't stop the server to re-record later.
 
@@ -130,9 +130,9 @@ Each of these is a one-line convention that a reference implementation states so
 - **Key per-request submodule state by `fwd_info.rid_handle` in `prepare_inputs`**, not `request_id`: the forward and the engine's cleanup use the handle.
 - **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
-## Phase 5 — Batching and CUDA graphs
+## Phase 5 — Batching and accelerator graphs
 
-Add `can_batch` / `forward_batched` and the graph declarations. If only part of the forward is capturable, use piecewise graphs (`PiecewiseBatchedConfig` / `PiecewisePackedConfig`) rather than abandoning capture for the node. `unpack_packed_output` and `postprocess` are the hooks for work on the tail end of a graphed forward.
+Add `can_batch` / `forward_batched` and declare capture recipes through `get_accelerator_graph_configs` / `get_piecewise_accelerator_graph_configs`. If only part of the forward is capturable, use piecewise graphs (`PiecewiseBatchedConfig` / `PiecewisePackedConfig`) rather than abandoning capture for the node. `unpack_packed_output` and `postprocess` are the hooks for work on the tail end of a graphed forward.
 
 Take the shape ledger from Phase 1 and give **every varying dimension exactly one treatment**: its own bucket, normalized before the graph, or eager behind an explicit gate. Declare varying dims in the graph config — engine code that infers them from tensor shapes is model-specific and gets rejected. Normalizing an input before a graph changes numerics, so the parity test comes before shipping it. Buckets are not free: each costs startup through a Dynamo re-trace, and batch buckets are geometric. Per-request facts the engine needs for bucketing travel via step metadata into the key-info hook; model-side branching on request shape does not reach the graph selector.
 

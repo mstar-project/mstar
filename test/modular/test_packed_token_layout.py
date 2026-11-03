@@ -3,8 +3,8 @@ spread evenly, and a mixed step's layout is one-token rows then a prompt."""
 
 import torch
 
-from mstar.engine.cuda_graph_config import (
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    PackedAcceleratorGraphConfig,
     decode_rows_then_prompt,
     distribute_tokens,
 )
@@ -21,7 +21,7 @@ def test_fewer_tokens_than_rows_spread_as_usual():
 
 
 def test_the_capture_rows_take_the_layout():
-    cfg = PackedCudaGraphConfig(
+    cfg = PackedAcceleratorGraphConfig(
         capture_graph_walk="mixed",
         capture_token_lengths=[64],
         make_node_input=lambda n: ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long), input_seq_len=n),

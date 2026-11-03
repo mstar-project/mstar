@@ -21,8 +21,10 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -79,26 +81,27 @@ def _worker():
     )
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: [NODE],
-        add_request=lambda rid, cfgs: None,
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+        add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
     )
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=lambda rid_str: None,
+        note_arrival=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._my_consumer_connections = []
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._draining_rids = set()
     w._pending_drains = set()
     w._reads_done_sent = set()
     w._in_flight_rids = set()
-    w._pending_removes = set()
-    w._last_active = {}
+    w._pending_removes = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
+    w._removed_rids = RecentSet(16)
     w.enable_nvtx = False
     return w
 
@@ -113,6 +116,7 @@ def _new_request(request_id="r1"):
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers={WG_ID: [WORKER]},
         initial_inputs=[],
+        loop_caps={},
     )
 
 
@@ -160,10 +164,11 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
 
 
 def test_admit_is_refused_after_a_drain():
-    """A NEW can arrive after the DRAIN that tears the rid down; admitting it
-    would leave state behind that no REMOVE will ever collect."""
+    """A NEW that arrives after this rank sent READS_DONE for the rid is
+    refused: the drain is complete, so nothing may be read for it any more."""
     w = _worker()
     w._draining_rids.add("r1")
+    w._reads_done_sent.add("r1")
     w._add_new_request(_new_request("r1"))
     assert w._rid("r1") is None
     assert w.tensor_manager.registered == []

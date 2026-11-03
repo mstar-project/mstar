@@ -41,8 +41,9 @@ def main():
 
                 if msg.get("modality") == "text":
                     decoded = base64.b64decode(msg.get("data", ""))
-                    sys.stdout.write(decoded.decode("utf-8", errors="replace"))
-                    sys.stdout.flush()
+                    # raw bytes: a character can span two chunks
+                    sys.stdout.buffer.write(decoded)
+                    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

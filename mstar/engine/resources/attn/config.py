@@ -4,15 +4,20 @@ Kept free of the managers and their kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from mstar.engine.resources.kv.config import KVConfig, KVLayout, PagedKVConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+
+logger = logging.getLogger(__name__)
 
 
 class AttnBackend(Enum):
@@ -22,6 +27,9 @@ class AttnBackend(Enum):
     DENSE = "dense"
     FLEX = "flex"
     XPU_PAGED = "xpu_paged"
+    # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
+    # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
+    FLASHINFER_MLA = "flashinfer_mla"
 
 
 @dataclass
@@ -29,10 +37,44 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
-    # FlashInfer only: combined walks whose captured steps plan their
-    # one-token rows on the decode wrapper and their prompt rows on a prefill
-    # wrapper sized to them (`FlashInferMixedWrapper`)
+    # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
+    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
+    # backend reads it; the others refuse it at build
+    sm_scale: float | None = None
+    # FlashInfer only: combined walks whose captured steps run their leading
+    # one-token rows on a decode half and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
+    # every step of those walks decode first
     splits: tuple[CombinedSplit, ...] = ()
+    # FlashInfer only: run one-token decode rows on the tensor-core kernel.
+    # False picks the CUDA-core decode kernel, which can win for MHA and
+    # narrow GQA, where the tensor-core kernel pads few query heads per KV
+    # head out to a tile.
+    decode_tensor_cores: bool = True
+    # FlashInfer only: run captured one-token decode rows on trtllm-gen's fmha
+    # kernel where one exists for this GPU and geometry (`FmhaDecodeWrapper`),
+    # which also drops the paged kernel's per-step plan. Eager steps and prompt
+    # rows stay on the paged kernels.
+    decode_fmha: bool = False
+    # Each query attends to the last ``sliding_window`` positions, its own included, and the
+    # pool keeps about that window of K/V per request for this attention's layers and frees
+    # the rest (`derive_kv_groups`).
+    sliding_window: int | None = None
+    # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
+    # ``max_seq_len`` needs; the pool's other layers keep every token.
+    layers: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.sliding_window is not None and (
+            type(self.sliding_window) is not int or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")
+        if self.layers is not None:
+            self.layers = tuple(self.layers)
+            if self.sliding_window is None:
+                raise ValueError("layers names the layers a sliding_window keeps; it needs one")
+            if not self.layers or len(set(self.layers)) != len(self.layers):
+                raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
 @dataclass
@@ -44,6 +86,9 @@ class AttentionSpec(NodeResourceSpec):
         # be the same KVConfig the KV resource holds
         return {self.config.kv_cache}
 
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.base import AttentionManager
@@ -54,6 +99,8 @@ class AttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
+        decode_fmha: bool | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -65,6 +112,73 @@ class AttentionSpec(NodeResourceSpec):
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+        if decode_fmha is not None:
+            self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+
+
+def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+    """Pool ``name``'s groups (`PagedKVConfig.keep_window`), from the attentions over it whose
+    ``sliding_window`` is shorter than its ``max_seq_len`` (a longer one keeps every token),
+    and what about them no pool can serve, before anything builds or sizes from it; a pool
+    with a problem keeps every token. A pool that keeps a window doesn't prefix cache yet, so
+    its ``prefix_cache`` goes off. Run by `KVSpec.derive`."""
+    readers = {key: spec for key, spec in specs.items()
+               if isinstance(spec, (AttentionSpec, CrossAttentionSpec)) and spec.config.kv_cache == name}
+    paged = isinstance(cfg, PagedKVConfig) and cfg.layout == KVLayout.NHD
+    problems: list[str] = []
+    window_of: dict[int, int] = {}  # layer -> its window
+    reads_full = False
+    for key, reader in readers.items():
+        window = getattr(reader.config, "sliding_window", None)
+        if window is not None and not paged:
+            problems.append(f"attention {key!r} declares a sliding_window, which only a paged NHD pool keeps")
+        elif isinstance(reader, AttentionSpec) and (window is None or window >= cfg.max_seq_len):
+            reads_full = True
+        elif window is not None and reader.config.layers is None:
+            problems.append(
+                f"attention {key!r} declares a sliding_window without the layers it runs (AttentionConfig.layers)"
+            )
+        elif window is not None:
+            for layer in reader.config.layers:
+                if not 0 <= layer < cfg.num_layers:
+                    problems.append(f"attention {key!r} declares layer {layer}, past the pool's {cfg.num_layers}")
+                elif layer in window_of:
+                    problems.append(f"layer {layer} is declared by two attentions")
+                else:
+                    window_of[layer] = window
+    if window_of:
+        windows = sorted(set(window_of.values()))
+        if len(windows) > 1:
+            # a derived page is whole for one window's layers and the rest
+            problems.append(f"keeps one window, not the {windows} its attentions declare")
+        if not reads_full and len(window_of) < cfg.num_layers:
+            problems.append("keeps every token of the layers outside its window, which no attention reads")
+        for key, reader in readers.items():
+            if isinstance(reader, CrossAttentionSpec):
+                problems.append(f"keeps a window, whose pages cross attention {key!r} doesn't read")
+            elif reader.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
+                problems.append(
+                    f"keeps a window, whose pages only the flashinfer backend reads, "
+                    f"not attention {key!r}'s {reader.config.backend.value}"
+                )
+    if not paged:
+        return problems
+    window, layers = (windows[0], tuple(sorted(window_of))) if window_of and not problems else (None, ())
+    try:
+        cfg.keep_window(window, layers)
+    except ValueError as e:
+        problems.append(str(e))
+        cfg.keep_window(None, ())
+        return problems
+    if window is not None and cfg.prefix_cache:
+        if cfg.prefix_cache_given:
+            problems.append("keeps a sliding window, which doesn't prefix cache yet; drop its prefix_cache: true")
+            return problems
+        logger.info("KV %s keeps a sliding window, which doesn't prefix cache yet: its prefix cache is off", name)
+        cfg.prefix_cache = False
+    return problems
 
 
 @dataclass
@@ -88,6 +202,10 @@ class CrossAttentionConfig:
     context_label: str = "context"
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # FlashInfer only: a step whose rows each query one token runs the decode
+    # kernel; this picks its tensor-core or CUDA-core variant (see
+    # ``AttentionConfig``)
+    decode_tensor_cores: bool = True
 
 
 @dataclass
@@ -111,14 +229,39 @@ class CrossAttentionSpec(NodeResourceSpec):
         self,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
+        decode_tensor_cores: bool | None = None,
     ):
         """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
+        if decode_tensor_cores is not None:
+            self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+
+
+def _yaml_bool(name: str, value) -> bool:
+    # the string "false" would otherwise read as true
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # queries attend to the stream's stored context only, not to the tokens this step appends
+    # (a draft block over the context the target has produced so far); the step's own
+    # `segments` then carry the query counts, the cache's segments the appended counts.
+    # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
+    context_only: bool = False
+
+
+def refuse_context_only(step: AttentionStep, manager: str) -> None:
+    """For the attention resources that don't read ``context_only``: planned without it,
+    the step's queries would attend to the tokens it appends as well."""
+    if step.context_only:
+        raise ValueError(
+            f"{manager} does not read AttentionStep.context_only; only the "
+            f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
+        )

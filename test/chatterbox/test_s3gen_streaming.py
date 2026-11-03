@@ -21,7 +21,9 @@ from mstar.model.chatterbox.loader import iter_weights, resolve_snapshot
 from mstar.model.chatterbox.submodules import S3GenSubmodule, StreamState
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
-pytest.importorskip("chatterbox")
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 
 
 @pytest.fixture(scope="module")

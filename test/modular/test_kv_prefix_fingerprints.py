@@ -147,13 +147,20 @@ def test_a_position_fingerprint_changes_with_any_config_field(overrides):
 
 def test_an_attention_fingerprint_names_the_backend_that_was_built():
     from mstar.engine.resources.attn.dense import DenseAttentionManager
+    from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
+    from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 
     paged = AttentionManager.__new__(AttentionManager)
     dense = DenseAttentionManager.__new__(DenseAttentionManager)
+    dense._wrapper_class, dense._flashinfer_backend = DensePrefixedPrefillWrapper, None
 
     assert paged.fingerprint() != dense.fingerprint(), (
         "a dense build that degraded to paged would keep the root it had"
     )
+    # and the kernel: FA3 and each FlashInfer backend differ in the last bits
+    ragged = DenseAttentionManager.__new__(DenseAttentionManager)
+    ragged._wrapper_class, ragged._flashinfer_backend = FlashInferPrefixedPrefillWrapper, "cutlass"
+    assert ragged.fingerprint() != dense.fingerprint()
 
 
 # ── preprocessing ───────────────────────────────────────────────────────

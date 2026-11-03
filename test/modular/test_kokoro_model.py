@@ -79,6 +79,7 @@ def tiny_config() -> KokoroModelConfig:
 def tiny_model(seed: int = 0) -> KokoroTTS:
     torch.manual_seed(seed)
     model = KokoroTTS(tiny_config()).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     return model
 
@@ -103,9 +104,14 @@ def test_masked_bilstm_matches_packed_bidirectional():
     lengths = torch.tensor([7, 4, 1])
     packed = torch.nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
     expected, _ = torch.nn.utils.rnn.pad_packed_sequence(ref(packed)[0], batch_first=True, total_length=7)
+    # both directions run as one block-diagonal LSTM
+    ours.fuse()
     out = ours(x, lengths)
     assert torch.allclose(out, expected, atol=1e-6)
     assert out[1, 4:].abs().sum() == 0 and out[2, 1:].abs().sum() == 0
+    # the fused LSTM is in the module tree, so a later dtype or device move reaches it
+    ours.double()
+    assert torch.allclose(ours(x.double(), lengths), expected.double(), atol=1e-6)
 
 
 def test_real_stft_inverse_matches_torch_istft_per_row():
@@ -212,7 +218,8 @@ def test_remap_name(checkpoint_key, expected):
 def test_remapped_checkpoint_names_cover_every_parameter():
     """Every parameter of the M* module is reachable from a checkpoint key
     written in the upstream naming, and vice versa (modulo the pooler)."""
-    model = tiny_model()
+    # the checkpoint loads before the LSTM directions fuse
+    model = KokoroTTS(tiny_config())
     params = set(dict(model.named_parameters()))
     # Invert the mapping for the names that differ, then check round trip.
     inverse = {
@@ -526,7 +533,8 @@ def test_missing_language_backend_is_reported_once(monkeypatch):
     assert frontend.available("j") is False  # cached: not retried
     with pytest.raises(ImportError, match="misaki\\[ja\\]"):
         frontend.backend("j")
-    assert frontend.available("a") is (importlib.util.find_spec("misaki.en") is not None)
+    has_misaki_en = importlib.util.find_spec("misaki") is not None and importlib.util.find_spec("misaki.en") is not None
+    assert frontend.available("a") is has_misaki_en
 
 
 def test_warmup_builds_the_default_language_backend(voices_dir):
@@ -665,6 +673,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
     config.decoder_dtype = "bfloat16"
     torch.manual_seed(0)
     model = KokoroTTS(config).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     ids = torch.tensor([[0, 1, 5, 3, 9, 2, 0]])
     lengths = torch.tensor([7])
@@ -673,6 +682,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
         audio, frame_lengths, _ = model(ids, lengths, style, torch.tensor([1.0]))
         config32 = tiny_config()
         ref = KokoroTTS(config32).eval()
+        ref.fuse_lstm_directions()
         ref.load_state_dict(model.state_dict())
         ref.decoder.generator.m_source.deterministic = True
         audio32, _, _ = ref(ids, lengths, style, torch.tensor([1.0]))
@@ -686,7 +696,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
 def test_piecewise_regions_match_the_eager_halves():
     """Each captured half, run as the runner would run it (padded to its bucket,
     padding rows zeroed), reproduces the eager computation on the real rows."""
-    from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+    from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
     from mstar.model.kokoro.submodules import frame_region, text_region
     from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -696,7 +706,7 @@ def test_piecewise_regions_match_the_eager_halves():
     config.capture_batch_sizes = [1, 2, 4]
     config.max_batch_frames = 128
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert set(regions) == {text_region(8), text_region(16)} | {frame_region(f) for f in (16, 32, 64)}
     assert regions[text_region(16)].seq_len == 16 and regions[text_region(16)].capture_batch_sizes == [1, 2, 4]
     # bs * frames <= max_batch_frames caps the decoder's batch per bucket
@@ -752,7 +762,7 @@ def test_synthesize_uses_runners_when_they_fit():
     config.text_buckets = [8]
     config.frame_buckets = [16, 64]
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
 
     class FakeRunner:
         def __init__(self, config):
@@ -763,7 +773,7 @@ def test_synthesize_uses_runners_when_they_fit():
             return bs <= max(self.config.capture_batch_sizes)
 
         def run(self, static_inputs, real_bs):
-            from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+            from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
 
             bs = next(b for b in self.config.capture_batch_sizes if b >= real_bs)
             seq_len = self.config.seq_len

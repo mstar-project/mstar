@@ -12,6 +12,10 @@ after the flat ``[q|k|v]`` is shared.
 
 Head counts are whatever the caller passes; ``ParallelGatedDeltaNet`` passes
 one rank's share, so this module has no distributed import.
+
+Per-request LoRA, when bound (``module_lora_spec``), lands in ``in_proj_fused``'s
+whole output before the split, so the conv and the kernels read adapted views,
+and in ``out_proj``'s (partial, under TP) output.
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ class GDNProjLayout(Enum):
 
 # bf16 elements in the 32-byte alignment FlashInfer's bf16 GDN decode kernel
 # checks on every call (the default kernel when K = V = 128).
-_ALIGN = 16
+GATE_ALIGN = 16
 
 
 def gate_pad(num_v_heads: int) -> int:
@@ -42,7 +46,7 @@ def gate_pad(num_v_heads: int) -> int:
     so this pad realigns it. Never loaded or read. Sized per rank under TP
     (16 v-heads at TP2 leaves 8, only half a 32-byte line).
     """
-    return -num_v_heads % _ALIGN
+    return -num_v_heads % GATE_ALIGN
 
 
 # Blocks of the fused SPLIT projection, [q|k|v|z|a|pad|b], per checkpoint
@@ -53,6 +57,9 @@ SPLIT_SHARD_BLOCKS: dict[str, tuple[int, ...]] = {
     "a": (4,),
     "b": (6,),
 }
+# each block's name as a LoRA slice (adapters may also split `qkv` into these);
+# None is the pad
+SPLIT_BLOCK_NAMES: tuple[str | None, ...] = ("q", "k", "v", "z", "a", None, "b")
 
 
 class GatedDeltaNet(nn.Module):

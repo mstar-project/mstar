@@ -71,16 +71,45 @@ def transcribe(audio_paths: list[Path], model_id: str, device: str, batch_size: 
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
     processor = WhisperProcessor.from_pretrained(model_id)
     model = WhisperForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+    window = processor.feature_extractor.n_samples
     texts: list[str] = []
     for start in range(0, len(audio_paths), batch_size):
         clips = [load_for_asr(p)["raw"] for p in audio_paths[start:start + batch_size]]
-        features = processor(
-            clips, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt",
-        ).input_features.to(device=device, dtype=dtype)
-        with torch.inference_mode():
-            generated = model.generate(features, language="en", task="transcribe", max_new_tokens=440)
-        texts.extend(processor.batch_decode(generated, skip_special_tokens=True))
+        batch_texts = [""] * len(clips)
+        for long_form in (False, True):
+            rows = [i for i, clip in enumerate(clips) if (len(clip) > window) == long_form]
+            if rows:
+                decoded = _transcribe_batch(model, processor, [clips[i] for i in rows], device, dtype, long_form)
+                for i, text in zip(rows, decoded, strict=True):
+                    batch_texts[i] = text
+        texts.extend(batch_texts)
     return [t.strip() for t in texts]
+
+
+def _transcribe_batch(model, processor, clips: list, device: str, dtype, long_form: bool) -> list[str]:
+    """One ``generate`` call over clips that all fit Whisper's 30 s window, or all exceed it.
+
+    The default features pad or truncate every clip to one window, so a longer
+    clip would lose its tail. Those go through transformers' sequential
+    long-form decoding instead, which needs the untruncated features, their
+    attention mask and timestamp tokens. Clips that fit keep the single-window
+    path, so their scores match earlier runs.
+    """
+    import torch
+
+    if long_form:
+        inputs = processor(
+            clips, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt",
+            truncation=False, padding="longest", return_attention_mask=True,
+        )
+        extra = {"attention_mask": inputs.attention_mask.to(device), "return_timestamps": True}
+    else:
+        inputs = processor(clips, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt")
+        extra = {}
+    features = inputs.input_features.to(device=device, dtype=dtype)
+    with torch.inference_mode():
+        generated = model.generate(features, language="en", task="transcribe", max_new_tokens=440, **extra)
+    return processor.batch_decode(generated, skip_special_tokens=True)
 
 
 def main(argv: list[str] | None = None) -> None:

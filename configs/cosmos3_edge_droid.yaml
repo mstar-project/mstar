@@ -7,7 +7,7 @@ resources:
   kv:
     max_num_pages: 1024
 model_kwargs:
-  cuda_graph: true
+  accelerator_graph: true
   graph_max_latent_area: 2000
   image_size_default: [640, 640]
   video_size_default: [832, 480]

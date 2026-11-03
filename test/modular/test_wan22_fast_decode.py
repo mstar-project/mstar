@@ -63,7 +63,10 @@ def _decoder(monkeypatch, vae, *, fast: bool, dtype=torch.float32, tiling: str =
 
 
 def _forward(sub, latents: torch.Tensor) -> torch.Tensor:
-    return sub.forward("video_gen", engine_inputs=None, latents=latents)["video_output"][0]
+    """The node's emitted ``[F, H, W, 3]`` frames, as the decode's ``[1, 3, F, H, W]``."""
+    frames = sub.forward("video_gen", engine_inputs=None, latents=latents)["video_output"][0]
+    assert frames.is_contiguous() and frames.shape[-1] == 3
+    return frames.permute(3, 0, 1, 2)[None]
 
 
 def _stock(vae, latents: torch.Tensor, dtype=torch.float32, tiled: bool = False) -> torch.Tensor:
@@ -94,7 +97,7 @@ def _spy_eager_calls(step) -> list[int]:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_off_switch_is_stock_vae_decode(monkeypatch, vae, dtype) -> None:
     sub = _decoder(monkeypatch, vae, fast=False, dtype=dtype)
-    assert sub._fast_step is None
+    assert sub._fast is None
     assert not wan_vae.is_channels_last(sub.vae)
     assert {type(m) for m in sub.vae.modules()} == {type(m) for m in vae.modules()}
     z = _latents()
@@ -105,9 +108,8 @@ def test_eager_default_layout_is_stock_vae_decode(monkeypatch, vae) -> None:
     """The fast path's wiring with an eager step on the default layout issues
     ``vae.decode``'s decoder calls, one latent each, and its frames bit for bit."""
     sub = _decoder(monkeypatch, vae, fast=False)
-    sub._fast_step = wan_vae.DecoderStep(sub.vae, compile=False)
-    monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: None)
-    calls = _spy_eager_calls(sub._fast_step)
+    sub._fast = wan_vae.FastDecoder(sub.vae, channels_last=False, compile=False)
+    calls = _spy_eager_calls(sub._fast.step)
     z = _latents()
     assert torch.equal(_forward(sub, z), _stock(vae, z))
     assert calls == [1] * z.shape[2]
@@ -121,7 +123,7 @@ def test_default_fast_path_is_stock_to_rounding(monkeypatch, vae, dtype) -> None
     step's warm-up) return the same frames."""
     sub = _decoder(monkeypatch, vae, fast=True, dtype=dtype)
     assert Wan22Config().vae_decode_fast
-    assert wan_vae.is_channels_last(sub.vae) and sub._fast_step.compiled
+    assert wan_vae.is_channels_last(sub.vae) and sub._fast.step.compiled
     z = _latents()
     first = _forward(sub, z)
     if dtype == torch.float32:
@@ -137,7 +139,7 @@ def test_compiled_calls_see_one_layout_whatever_the_clip_length(monkeypatch, vae
     """The compiled step's inputs have the same shape and strides for every
     clip length at one resolution, so a new frame count does not recompile."""
     sub = _decoder(monkeypatch, vae, fast=True)
-    step = sub._fast_step
+    step = sub._fast.step
     seen = []
 
     def spy(x, **kw):
@@ -153,8 +155,7 @@ def test_compiled_calls_see_one_layout_whatever_the_clip_length(monkeypatch, vae
 
 def test_channels_last_eager_is_stock_to_rounding(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae, fast=False)
-    wan_vae.to_channels_last(sub.vae)
-    sub._fast_step = wan_vae.DecoderStep(sub.vae, compile=False)
+    sub._fast = wan_vae.FastDecoder(sub.vae, compile=False)
     z = _latents()
     _u8_close(_forward(sub, z), _stock(vae, z), 1)
 
@@ -166,7 +167,7 @@ def test_tiled_fallback_is_stock_tiled_decode(monkeypatch, vae) -> None:
     ref = _stock(vae, z, tiled=True)
     assert torch.equal(_forward(_decoder(monkeypatch, vae, fast=False, tiling="tiled"), z), ref)
     sub = _decoder(monkeypatch, vae, fast=True, tiling="tiled")
-    calls = _spy_eager_calls(sub._fast_step)
+    calls = _spy_eager_calls(sub._fast.step)
     assert torch.equal(_forward(sub, z), ref)
     assert calls == [] and not wan_vae.is_channels_last(sub.vae)
 
@@ -237,8 +238,10 @@ def test_the_fast_decode_compiles_in_deterministic_mode(monkeypatch, vae) -> Non
     seen = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
     _decoder(monkeypatch, vae, fast=True)
-    expected = {"deterministic": True} if hasattr(inductor_config, "deterministic") else None
-    assert [kw.get("options") for kw in seen] == [expected]
+    expected = {"comprehensive_padding": False} if hasattr(inductor_config, "comprehensive_padding") else {}
+    if hasattr(inductor_config, "deterministic"):
+        expected["deterministic"] = True
+    assert [kw.get("options") for kw in seen] == [expected or None]
 
 
 def test_default_layout_undoes_channels_last_exactly(vae) -> None:

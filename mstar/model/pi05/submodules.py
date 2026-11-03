@@ -19,10 +19,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
@@ -45,6 +45,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     runs SigLIP, and emits ``img_emb`` of shape
     ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
     """
+
+    disable_autocast = True
 
     def __init__(self, encoder: Pi05SiglipEncoder, config: Pi05Config):
         super().__init__()
@@ -149,7 +151,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             for inp in model_inputs
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
         """CUDA graph capture config for the SigLIP encoder.
 
         Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
@@ -164,7 +166,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         H = W = self.config.vit_image_size
         num_cameras = self.config.num_cameras
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=0,  # not used by StatelessCudaGraphRunner
@@ -401,14 +403,16 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(ids)
         return emb * self._text_embed_scale
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         return [
             # Action generation always has latents of the same size, so it is a
             # similar paradigm to AR decode and can use the batched cuda graphs.
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=self.config.action_horizon,
@@ -421,7 +425,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,

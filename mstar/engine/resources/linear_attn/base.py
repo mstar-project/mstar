@@ -24,8 +24,7 @@ class LinearAttnManager(AttentionResource):
         # the pool's own config, not a copy; `shard` is idempotent so both
         # builders can call it
         pool_config = info.dependency(spec.config.recurrent_state).config
-        if info.joint_comm_group is not None:
-            pool_config.shard(info.joint_comm_group.world_size)
+        pool_config.shard(info.head_shards)
 
         backend = spec.config.backend
         if backend is not LinearAttnBackend.FLASHINFER:
@@ -40,7 +39,7 @@ class LinearAttnManager(AttentionResource):
                 config=spec.config,
                 geometry=Mamba2Geometry.from_blocks(pool_config.blocks),
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["ssm"].dtype,
+                state_dtype=pool_config.blocks["ssm"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )
@@ -55,7 +54,7 @@ class LinearAttnManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["state"].dtype,
+                state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )

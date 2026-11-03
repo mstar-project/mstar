@@ -7,9 +7,11 @@ extension is installed and the server binary is built
 import contextlib
 import json
 import socket
+import sysconfig
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -18,9 +20,11 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
     find_server_binary,
     launch_rust_server,
+    openai_adapter_class,
 )
 
 try:
@@ -45,6 +49,11 @@ class _StubAPIServer:
     def __init__(self):
         self.submitted = []
         self.aborted = []
+        # APIServer.metrics: None until --enable-metrics turns them on.
+        self.metrics = None
+        self.texts = {}
+        # rid -> (sink, tag), from relay_chunks_to
+        self.sinks = {}
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -52,6 +61,7 @@ class _StubAPIServer:
                        request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
+        self.texts[request_id] = text
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
@@ -61,8 +71,19 @@ class _StubAPIServer:
         return request_id
 
     async def iter_result_chunks(self, request_id):
+        if "relay" in (self.texts.get(request_id) or ""):
+            # as the message thread does: some chunks reach the sink in one
+            # batch, the handler yields the rest. "é" and "🙂" are split
+            # across chunks, as byte-level BPE tokens split them.
+            sink, tag = self.sinks[request_id]
+            sink.relay([tag, tag, tag], [_Chunk("text", b) for b in (b"caf\xc3", b"\xa9 ", b"\xf0\x9f")])
+            yield _Chunk("text", b"\x99\x82")
+            return
         yield _Chunk("text", b"Hello ")
         yield _Chunk("text", b"world")
+
+    def relay_chunks_to(self, key, sink, tag):
+        self.sinks[key] = (sink, tag)
 
     def abort_request(self, request_id):
         self.aborted.append(request_id)
@@ -93,13 +114,13 @@ def _wait_healthy(port, timeout=15):
     return False
 
 
-@pytest.fixture()
-def stack():
+@contextlib.contextmanager
+def _running_stack(api_key=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_test_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_up_")
     proc = launch_rust_server(BINARY, "qwen3_omni", port, bridge_dir,
-                              upload_dir)
+                              upload_dir, api_key=api_key)
     stub = _StubAPIServer()
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
@@ -108,11 +129,19 @@ def stack():
     if not _wait_healthy(port):
         proc.terminate()
         raise RuntimeError("server never became healthy")
-    yield port, stub, bridge, proc
-    bridge.stop()
-    if proc.poll() is None:
-        proc.terminate()
-        proc.wait(timeout=10)
+    try:
+        yield port, stub, bridge, proc
+    finally:
+        bridge.stop()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+
+@pytest.fixture()
+def stack():
+    with _running_stack() as s:
+        yield s
 
 
 def _chat(port, content, timeout=30):
@@ -133,6 +162,48 @@ def test_chat_roundtrip(stack):
     (sub,) = stub.submitted
     assert "Say hello." in sub["text"]
     assert sub["out"] == ["text"]
+
+
+def test_batched_chunks_and_split_characters_reach_the_client(stack):
+    """Chunks the API server relays in one ``chunks`` message arrive in
+    order with the handler's own, and a character split across chunks
+    arrives whole, streamed or not."""
+    port, _stub, _bridge, _proc = stack
+    assert _chat(port, "relay")["choices"][0]["message"]["content"] == "café 🙂"
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "relay"}]}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        lines = r.read().decode().splitlines()
+    deltas = [json.loads(ln[6:])["choices"][0]["delta"] for ln in lines if ln.startswith("data: {")]
+    assert "".join(d.get("content", "") for d in deltas) == "café 🙂"
+
+
+def test_only_a_frontend_that_accepts_chunks_messages_gets_them():
+    """An older mstar-server binary never says ``accepts_chunks``: its
+    submissions keep one ``chunk`` message per chunk."""
+    import asyncio
+
+    stub = _StubAPIServer()
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.server, bridge._keys, bridge.loop = stub, {}, None
+    sent = []
+    bridge._send = sent.append
+
+    async def run():
+        for sub, accepts in ((1, None), (2, True)):
+            msg = {"t": "submit", "rid": f"r{sub}", "sub": sub, "text": "hi",
+                   "output_modalities": ["text"]}
+            if accepts is not None:
+                msg["accepts_chunks"] = accepts
+            bridge._submit(msg)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert set(stub.sinks) == {"r2"}
+    assert [m["t"] for m in sent if m["sub"] == 1] == ["chunk", "chunk", "done"]
 
 
 def test_a_chats_roles_reach_the_bridge(stack):
@@ -166,12 +237,12 @@ def test_generate_arrives_without_parts(stack):
     assert sub["parts"] is None, "a /generate submit carried chat parts"
 
 
-def _post_raw(port, path, raw_bytes, timeout=15):
-    """POST a raw body (possibly malformed) as application/json; return
-    (status, parsed_json_or_None)."""
+def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
+    """POST a raw body (possibly malformed), application/json by default;
+    return (status, parsed_json_or_None)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=raw_bytes,
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": content_type})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
@@ -183,28 +254,29 @@ def _post_raw(port, path, raw_bytes, timeout=15):
             return e.code, None
 
 
-def test_malformed_json_body_is_422_with_detail(stack):
-    """A malformed / schema-invalid JSON body returns FastAPI's 422 +
-    {"detail": [{...}]} shape, not axum's default 400 + text/plain."""
+def test_malformed_json_body_is_400_in_the_openai_envelope(stack):
+    """A malformed / schema-invalid JSON body is a 400 in the OpenAI error
+    envelope, as on the Python frontend, not axum's default 400 + text/plain."""
     port, _stub, _bridge, _proc = stack
     # Broken JSON syntax.
     code, body = _post_raw(port, "/v1/chat/completions", b"{not json")
-    assert code == 422, (code, body)
-    assert isinstance(body["detail"], list) and body["detail"]
+    assert code == 400, (code, body)
+    assert body["error"]["type"] == "invalid_request_error"
     # Missing required field `role` (Python's pydantic ChatMessage requires it).
     code, body = _post_raw(
         port, "/v1/chat/completions",
         json.dumps({"model": "qwen3_omni",
                     "messages": [{"content": "hi"}]}).encode())
-    assert code == 422, (code, body)
-    assert isinstance(body["detail"], list) and body["detail"]
+    assert code == 400, (code, body)
+    assert body["error"]["type"] == "invalid_request_error"
 
 
-def test_ingest_failure_is_a_500_not_a_hang(stack):
+def test_refused_ingest_is_a_400_not_a_hang(stack):
     port, stub, _bridge, _proc = stack
     with pytest.raises(urllib.error.HTTPError) as e:
         _chat(port, "boom", timeout=15)
-    assert e.value.code == 500
+    # a ValueError from submit is a refused input, as on the Python frontend
+    assert e.value.code == 400
     # and the server keeps serving afterwards
     assert _chat(port, "again")["choices"][0]["message"]["content"] == \
         "Hello world"
@@ -219,6 +291,67 @@ def test_health_goes_red_when_the_bridge_dies(stack):
     assert e.value.code == 503
 
 
+def _get(port, path, headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def _without_status_age(text: bytes) -> list[bytes]:
+    return [line for line in text.splitlines()
+            if not line.startswith(b"mstar_conductor_status_age_seconds{")]
+
+
+def test_metrics_relay_the_api_server_registry_open_like_health():
+    """``/metrics`` on ``mstar-server`` is the text the API server's registry
+    renders, with its content type, and needs no key while the request
+    routes keep it."""
+    pytest.importorskip("prometheus_client")
+    from mstar.observability.metrics import ServingMetrics
+    from mstar.profile.format import RequestTiming
+
+    with _running_stack(api_key="s3cret") as (port, stub, _bridge, _proc):
+        stub.metrics = ServingMetrics(
+            "qwen3_omni", in_flight=lambda: 3, data_worker_queue_depth=lambda: 0,
+        )
+        now = time.perf_counter()
+        timing = RequestTiming(recv_time=now - 0.4, first_chunk_time=now - 0.3)
+        stub.metrics.record(types.SimpleNamespace(
+            output_modalities=["text"], profile=types.SimpleNamespace(timing=timing),
+            first_chunk_times={"text": now - 0.3},
+        ), "success")
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            status, resp_headers, body = _get(port, "/metrics", headers)
+            assert status == 200, body
+            assert resp_headers["Content-Type"] == stub.metrics.content_type
+            # The status age is computed at scrape, so it differs between renders.
+            assert _without_status_age(body) == _without_status_age(stub.metrics.render())
+        from prometheus_client.parser import text_string_to_metric_families
+
+        samples = {(s.name, tuple(sorted(s.labels.items()))): s.value
+                   for f in text_string_to_metric_families(body.decode()) for s in f.samples}
+        model = ("model_name", "qwen3_omni")
+        assert samples[("mstar_requests_in_flight", (model,))] == 3
+        assert samples[("mstar_requests_total", (model, ("outcome", "success"),
+                                                 ("output_modalities", "text")))] == 1
+        assert samples[("mstar_e2e_request_latency_seconds_count",
+                        (model, ("output_modalities", "text")))] == 1
+        assert _get(port, "/v1/models")[0] == 401
+
+
+def test_metrics_are_404_when_off_and_503_when_the_bridge_dies(stack):
+    port, _stub, bridge, _proc = stack
+    status, _, body = _get(port, "/metrics")
+    assert status == 404
+    assert "--enable-metrics" in json.loads(body)["detail"]
+    bridge.stop()
+    time.sleep(0.1)  # let the loop exit
+    assert _get(port, "/metrics")[0] == 503
+
+
 def test_sigterm_drains_and_exits(stack):
     import signal
 
@@ -229,8 +362,9 @@ def test_sigterm_drains_and_exits(stack):
 
 
 class _GatedStub(_StubAPIServer):
-    """Holds each request open until a shared gate is released, so a request's
-    admission permit is observably held for its whole (streaming) body."""
+    """Sends the first chunk, then holds each request open until a shared gate
+    is released, so a request's admission permit is observably held for its
+    whole (streaming) body."""
 
     def __init__(self, gate):
         super().__init__()
@@ -238,9 +372,9 @@ class _GatedStub(_StubAPIServer):
 
     async def iter_result_chunks(self, request_id):
         import asyncio
+        yield _Chunk("text", b"Hello ")
         while not self.gate.is_set():
             await asyncio.sleep(0.02)
-        yield _Chunk("text", b"Hello ")
         yield _Chunk("text", b"world")
 
 
@@ -258,18 +392,23 @@ def test_admission_permit_is_held_through_streaming_body():
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_adm_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_admup_")
-    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1",
+               **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
+    # What the bridge reads of APIServer.metrics.
+    stub.metrics = types.SimpleNamespace(
+        render=lambda: b"mstar_up 1\n", content_type="text/plain; version=0.0.4",
+        refusals=types.SimpleNamespace(update_rust=lambda routes, statuses, counts: None))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
     resp_a = None
     try:
         assert _wait_healthy(port)
-        # A: a streaming chat. The role-delta head event flushes immediately;
-        # the body then blocks on the gate, so A holds its permit open.
+        # A: a streaming chat. Its first delta flushes immediately; the body
+        # then blocks on the gate, so A holds its permit open.
         body = {"model": "qwen3_omni", "stream": True,
                 "messages": [{"role": "user", "content": "hi"}]}
         req_a = urllib.request.Request(
@@ -277,11 +416,14 @@ def test_admission_permit_is_held_through_streaming_body():
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         resp_a = urllib.request.urlopen(req_a, timeout=15)
-        assert resp_a.readline()  # head event received: A is being served
+        # Not just any line: an SSE keep-alive comment would also be one.
+        assert b"Hello" in resp_a.readline()  # first delta: A is being served
         # B: A holds the only permit, so B is refused with 503.
         with pytest.raises(urllib.error.HTTPError) as e:
             _chat(port, "second", timeout=5)
         assert e.value.code == 503
+        # A saturated server is still scrapeable: /metrics bypasses the cap.
+        assert _get(port, "/metrics")[:3:2] == (200, b"mstar_up 1\n")
         # Release A; its permit frees and a subsequent request succeeds.
         gate.set()
         assert b"world" in resp_a.read()
@@ -294,6 +436,53 @@ def test_admission_permit_is_held_through_streaming_body():
         bridge.stop()
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def _status(port, method, path, headers=None, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", method=method, data=body,
+        headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers  # case-insensitive lookups
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers
+
+
+def test_api_key_guards_every_route_but_health(monkeypatch):
+    """The launcher hands the key to mstar-server, which then refuses every
+    route but /health (passing ``_wait_healthy`` keyless proves that one)
+    without ``Authorization: Bearer <key>``."""
+    key = "s3cret-key"
+    # The launcher passes the resolved key, not whatever the parent inherited.
+    monkeypatch.setenv("MSTAR_API_KEY", "inherited-and-ignored")
+    chat = json.dumps({"model": "qwen3_omni",
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    with _running_stack(api_key=key) as (port, stub, _bridge, _proc):
+        for headers in ({}, {"Authorization": "Bearer wrong"},
+                        {"Authorization": "Bearer inherited-and-ignored"},
+                        {"Authorization": f"Basic {key}"}):
+            assert _status(port, "GET", "/v1/models", headers)[0] == 401
+            status, resp_headers = _status(port, "POST", "/v1/chat/completions", headers, chat)
+            assert status == 401
+            assert resp_headers.get("www-authenticate") == "Bearer"
+        assert not stub.submitted, "a request without the key reached the backend"
+        good = {"Authorization": f"Bearer {key}"}
+        assert _status(port, "GET", "/v1/models", good)[0] == 200
+        assert _status(port, "POST", "/v1/chat/completions", good, chat)[0] == 200
+        assert len(stub.submitted) == 1
+        # CORS answers a browser preflight, which carries no credentials.
+        status, resp_headers = _status(port, "OPTIONS", "/v1/chat/completions", {
+            "Origin": "https://app.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type"})
+        assert status == 200 and "access-control-allow-origin" in resp_headers
+
+
+def test_no_api_key_ignores_an_inherited_env_key(monkeypatch):
+    monkeypatch.setenv("MSTAR_API_KEY", "inherited")
+    with _running_stack(api_key=None) as (port, _stub, _bridge, _proc):
+        assert _status(port, "GET", "/v1/models")[0] == 200
 
 
 def test_tokenizer_env_fails_fast(tmp_path, monkeypatch):
@@ -322,12 +511,13 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     assert ".." not in os.path.basename(path)
 
 
-def _generate(port, urlencoded: bool, timeout=30):
+def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse
 
-    fields = {"text": "hi", "output_modalities": "text",
-              "streaming": "false", "model_kwargs": '{"foo": 1}'}
+    if fields is None:
+        fields = {"text": "hi", "output_modalities": "text",
+                  "streaming": "false", "model_kwargs": '{"foo": 1}'}
     if urlencoded:
         data = urllib.parse.urlencode(fields).encode()
         ctype = "application/x-www-form-urlencoded"
@@ -344,6 +534,32 @@ def _generate(port, urlencoded: bool, timeout=30):
         return r.status, r.read()
 
 
+# The Python /generate's 400s (test_video_frame_protocol checks the same text there).
+_STREAMING_ONLY = ("Output modality video_frame requires streaming=true; raw frame "
+                   "chunks cannot be returned as an aggregated response.")
+_OUTPUT_ONLY = "'video_frame' is an output-only modality"
+
+
+@pytest.mark.parametrize("fields,detail", [
+    ({"output_modalities": "video_frame", "streaming": "false"}, _STREAMING_ONLY),
+    ({"input_modalities": "video_frame", "output_modalities": "text"}, _OUTPUT_ONLY),
+], ids=["output-not-streamed", "input"])
+def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields, detail):
+    """The API server's own check would raise a ValueError, which reaches
+    the client as a 500."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", **fields}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert (e.value.code, json.loads(e.value.read())) == (400, {"detail": detail})
+    assert stub.submitted == []
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the
@@ -356,6 +572,18 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_treats_an_empty_request_id_as_none(stack, urlencoded):
+    """Like the Python /generate: each request gets a fresh id, so two with
+    ``request_id=""`` never collide on ``""``."""
+    port, stub, _bridge, _proc = stack
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": ""}
+        assert _generate(port, urlencoded, fields)[0] == 200
+    rids = [s["rid"] for s in stub.submitted]
+    assert len(rids) == 2 and "" not in rids and rids[0] != rids[1]
 
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"
@@ -384,8 +612,9 @@ def _model_stack(model, stub, env=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
+    env = {OPENAI_ADAPTER_ENV: openai_adapter_class(model), **(env or {})}
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **env))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -567,6 +796,39 @@ def _error_of(port, path, body):
 _CHAT = {"messages": [{"role": "user", "content": "hi"}]}
 
 
+def test_body_over_limit_is_413_like_the_python_frontend(monkeypatch):
+    """MSTAR_MAX_BODY_MB: a JSON body and a multipart upload over the limit
+    both get a 413 naming it, as `mstar/api_server/body_limit.py` answers
+    (axum's own rejections were a 422 and a 400)."""
+    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
+    big = b"x" * (2 * 2**20)
+    message = "request body is larger than the 1 MiB limit (MSTAR_MAX_BODY_MB)"
+
+    def post(port, path, data, ctype):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=data, headers={"Content-Type": ctype})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=30)
+        return e.value.code, json.loads(e.value.read())
+
+    boundary = "----limitboundary"
+
+    def form(name, filename):
+        return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+                f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode() \
+            + big + f"\r\n--{boundary}--\r\n".encode()
+
+    ctype = f"multipart/form-data; boundary={boundary}"
+    with _model_stack("bagel", _ImageStubAPIServer()) as (port, _up):
+        chat = json.dumps({"model": "bagel", "messages": [{"role": "user", "content": "a" * len(big)}]})
+        code, body = post(port, "/v1/chat/completions", chat.encode(), "application/json")
+        assert code == 413 and body["error"]["message"] == message
+        code, body = post(port, "/v1/images/edits", form("image", "a.png"), ctype)
+        assert code == 413 and body["error"]["message"] == message
+        code, body = post(port, "/generate", form("files", "a.wav"), ctype)
+        assert code == 413 and body["detail"] == message
+
+
 @pytest.mark.parametrize("status,error_type", [(400, "invalid_request_error"), (500, "server_error")])
 @pytest.mark.parametrize("model,path,body", [
     ("qwen3_omni", "/v1/chat/completions", {"model": "qwen3_omni", **_CHAT}),
@@ -599,6 +861,127 @@ def test_images_generations_on_cosmos3():
         assert len(stub.submitted) == 2
         assert len(out["data"]) == 2
         assert base64.b64decode(out["data"][0]["b64_json"]) == b"\x89PNG\r\n\x1a\nFAKE"
+
+
+def _generate_stream(port, timeout=15):
+    import urllib.parse
+    data = urllib.parse.urlencode(
+        {"text": "hi", "output_modalities": "text", "streaming": "true"}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, [json.loads(line) for line in r.read().splitlines() if line]
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_refused_streaming_generate_gets_its_status_not_a_200():
+    """A request refused before its first chunk answers with its status, as
+    the Python frontend's open_result_stream does."""
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        code, body = _generate_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["detail"]
+
+
+class _FailsMidStreamStub(_StubAPIServer):
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("text", b"Hello ")
+        yield _Chunk("error", b"Error in worker: boom", {"status": 503})
+
+
+def test_streaming_generate_carries_a_late_errors_status_in_band():
+    with _model_stack("qwen3_omni", _FailsMidStreamStub()) as (port, _up):
+        code, lines = _generate_stream(port)
+    assert code == 200
+    assert lines[0]["modality"] == "text"
+    assert lines[-1] == {"error": "Error in worker: boom", "status": 503}
+
+
+def test_bagel_images_map_size_onto_width_and_height():
+    """Generations and edits both, as the Python BagelAdapter."""
+    stub = _ImageStubAPIServer()
+    with _model_stack("bagel", stub) as (port, _up):
+        _post_json(port, "/v1/images/generations",
+                   {"model": "bagel", "prompt": "a cat", "size": "512x768"})
+        boundary = "mstarboundary"
+        fields = {"prompt": "make it neon", "size": "640x480"}
+        data = (
+            "".join(f'--{boundary}\r\nContent-Disposition: form-data; '
+                    f'name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items())
+            + f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+              'filename="in.png"\r\nContent-Type: image/png\r\n\r\n'
+        ).encode() + b"\x89PNGinput\r\n" + f"--{boundary}--\r\n".encode()
+        code, _ = _post_raw(port, "/v1/images/edits", data,
+                            f"multipart/form-data; boundary={boundary}")
+        assert code == 200
+        code, body = _post_raw(port, "/v1/images/generations", json.dumps(
+            {"model": "bagel", "prompt": "a cat", "size": "big"}).encode())
+        assert code == 400 and "WxH" in body["error"]["message"]
+    gen, edit = stub.submitted
+    assert (gen["mk"]["width"], gen["mk"]["height"]) == (512, 768)
+    assert (edit["mk"]["width"], edit["mk"]["height"]) == (640, 480)
+    assert "size" not in gen["mk"] and "size" not in edit["mk"]
+
+
+class _AudioStub(_StubAPIServer):
+    """Two PCM pieces, then optionally a late failure."""
+
+    def __init__(self, fail_after=False):
+        super().__init__()
+        self.fail_after = fail_after
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("audio", b"\x01\x00" * 4)
+        yield _Chunk("audio", b"\x02\x00" * 4)
+        if self.fail_after:
+            yield _Chunk("error", b"Error in worker: boom", {"status": 500})
+
+
+def _speech_stream(port, fmt="wav", timeout=15):
+    """(status, content_type, body) of a streaming /v1/audio/speech request."""
+    body = {"model": "orpheus", "input": "hi", "voice": "tara",
+            "stream": True, "response_format": fmt}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/audio/speech", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers["Content-Type"], r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers["Content-Type"], json.loads(e.read())
+
+
+def test_refused_streaming_speech_gets_its_status_not_a_200():
+    with _model_stack("orpheus", _ErrorChunkStub(400)) as (port, _up):
+        code, _ctype, body = _speech_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["error"]["message"]
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_streaming_speech_wav_and_pcm():
+    pcm = b"\x01\x00" * 4 + b"\x02\x00" * 4
+    with _model_stack("orpheus", _AudioStub()) as (port, _up):
+        code, ctype, wav = _speech_stream(port, "wav")
+        assert (code, ctype) == (200, "audio/wav")
+        assert wav[:4] == b"RIFF" and wav.endswith(pcm) and len(wav) == 44 + len(pcm)
+        # pcm is the bare samples, as the Python frontend serves it
+        code, ctype, raw = _speech_stream(port, "pcm")
+        assert (code, ctype, raw) == (200, "audio/pcm", pcm)
+
+
+def test_streaming_speech_aborts_the_body_on_a_late_error():
+    """A cleanly ended stream would pass for a complete answer, so the read
+    must fail: a truncated body, or a dropped connection when the error lands
+    before the headers are flushed (both are http.client.HTTPException)."""
+    import http.client
+
+    with _model_stack("orpheus", _AudioStub(fail_after=True)) as (port, _up):
+        with pytest.raises(http.client.HTTPException):
+            _speech_stream(port)
 
 
 class _RefusedError(Exception):
@@ -729,6 +1112,108 @@ def test_a_duplicate_of_a_running_id_gets_a_409_and_the_running_one_completes(st
     assert stub.aborted == []
 
 
+class _GatedKeyedStub(_KeyedStub):
+    """``_KeyedStub`` whose streams wait for ``gate``; a prompt of ``fail``
+    gets the backend's 400 once it was submitted."""
+
+    def __init__(self, gate):
+        super().__init__(tokens=1)
+        self.gate = gate
+        self.texts = {}
+
+    def submit_request(self, *, request_id=None, text=None, **kwargs):
+        request_id = super().submit_request(request_id=request_id, text=text, **kwargs)
+        self.texts[self.live[request_id]] = text
+        return request_id
+
+    async def _stream(self, key):
+        import asyncio
+
+        if self.texts[key] == "fail":
+            self.running.discard(key)
+            yield _Chunk("error", b"bad input", {"status": 400})
+            return
+        # the first chunk opens the stream (its 200); the request stays in flight until the gate
+        chunks = super()._stream(key)
+        yield await anext(chunks)
+        while not self.gate.is_set():
+            await asyncio.sleep(0.01)
+        async for chunk in chunks:
+            yield chunk
+
+
+def test_refusals_reach_the_api_server_registry():
+    """Requests ``mstar-server`` refuses before submitting them (no key, body
+    over the limit, invalid JSON, a bad form, a ``request_id`` in flight,
+    the admission cap, an unknown route, a wrong method) are counted by route
+    template and status and exported by the API server's registry through
+    the bridge; a request the backend fails after submission is not."""
+    pytest.importorskip("prometheus_client")
+    import urllib.parse
+
+    from mstar.observability.metrics import ServingMetrics
+
+    key = {"Authorization": "Bearer s3cret"}
+    gate = threading.Event()
+    stub = _GatedKeyedStub(gate)
+    stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 0, data_worker_queue_depth=lambda: 0)
+    env = {"MSTAR_API_KEY": "s3cret", "MSTAR_MAX_CONCURRENT_REQUESTS": "2", "MSTAR_MAX_BODY_MB": "1"}
+    chat = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    def call(method, path, body=None, headers=key, ctype="application/json"):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=body,
+                                     headers={"Content-Type": ctype, **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def generate(request_id, text="hi", streaming="true", **fields):
+        return urllib.parse.urlencode({"text": text, "request_id": request_id,
+                                       "streaming": streaming, **fields}).encode()
+
+    def open_stream(request_id):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=generate(request_id),
+                                     headers={"Content-Type": "application/x-www-form-urlencoded", **key})
+        return urllib.request.urlopen(req, timeout=15)
+
+    form = "application/x-www-form-urlencoded"
+    with _model_stack("qwen3_omni", stub, env=env) as (port, _up):
+        assert call("POST", "/v1/chat/completions", chat, headers={}) == 401
+        assert call("GET", "/no/such/route", headers={}) == 401
+        assert call("GET", "/no/such/route") == 404
+        assert call("GET", "/generate") == 405
+        assert call("POST", "/v1/chat/completions", b"x" * 2**21) == 413
+        assert call("POST", "/v1/chat/completions", b"{not json") == 400
+        assert call("POST", "/generate", generate("B", model_kwargs="{"), ctype=form) == 400
+        assert call("POST", "/generate", generate("F", text="fail", streaming="false"), ctype=form) == 400
+        streams = [open_stream("X")]
+        try:
+            assert call("POST", "/generate", generate("X"), ctype=form) == 409
+            streams.append(open_stream("Y"))
+            assert call("POST", "/v1/chat/completions", chat) == 503
+        finally:
+            gate.set()
+            for s in streams:
+                s.read()
+                s.close()
+        status, _, body = _get(port, "/metrics")
+
+    assert status == 200, body
+    from prometheus_client.parser import text_string_to_metric_families
+
+    refusals = {(s.labels["route"], s.labels["status"]): s.value
+                for f in text_string_to_metric_families(body.decode()) for s in f.samples
+                if s.name == "mstar_http_refusals_total" and s.labels["model_name"] == "qwen3_omni"}
+    assert refusals == {
+        ("/v1/chat/completions", "401"): 1, ("unmatched", "401"): 1, ("unmatched", "404"): 1,
+        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "400"): 1,
+        ("/generate", "400"): 1, ("/generate", "409"): 1, ("/v1/chat/completions", "503"): 1,
+    }
+    assert stub.n == 3, "a refused request reached the backend"
+
+
 def _image_n_error(port, n):
     return _error_of(port, "/v1/images/generations", {"model": "cosmos3", "prompt": "x", "n": n})
 
@@ -756,3 +1241,16 @@ def test_images_n_cap_follows_the_env():
         out = _post_json(port, "/v1/images/generations",
                          {"model": "cosmos3", "prompt": "x", "n": 2})
         assert len(out["data"]) == 2
+
+
+def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkeypatch):
+    # An unactivated venv's python must not launch an older mstar-server that
+    # happens to be on $PATH against its own bridge code.
+    scripts, elsewhere = tmp_path / "venv-bin", tmp_path / "on-path"
+    for d in (scripts, elsewhere):
+        d.mkdir()
+        (d / "mstar-server").touch(mode=0o755)
+    monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(elsewhere))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
+    assert find_server_binary() == str(scripts / "mstar-server")

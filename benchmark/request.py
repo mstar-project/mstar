@@ -116,7 +116,8 @@ class RequestMetrics:
     _last_audio_chunk_duration: Optional[float] = field(default=None, repr=False)
 
     # For storing outputs of different modalities
-    _text_chunks: list[str] = field(default_factory=list, repr=False)
+    # raw bytes: a character can span two chunks
+    _text_chunks: list[bytes] = field(default_factory=list, repr=False)
     _image_chunks: list[bytes] = field(default_factory=list, repr=False)
     _audio_pcm: io.BytesIO = field(default_factory=io.BytesIO, repr=False)
     # Robotics outputs: raw float32 bytes per chunk
@@ -169,7 +170,7 @@ class RequestMetrics:
         )
 
         if modality == "text":
-            self._text_chunks.append(data.decode("utf-8", errors="replace"))
+            self._text_chunks.append(data)
         elif modality == "image":
             self._image_chunks.append(data)
         elif modality == "audio":
@@ -253,7 +254,7 @@ class RequestMetrics:
         n_outputs = 0
         if self._text_chunks:
             path = os.path.join(output_dir, f"req_{self.request_id}.txt")
-            output_content = "".join(self._text_chunks)
+            output_content = b"".join(self._text_chunks).decode("utf-8", errors="replace")
             with open(path, "w") as f:
                 f.write(output_content)
             n_outputs += 1
@@ -346,7 +347,7 @@ class RequestMetrics:
             chunk_idx = i + 1
             if chunk_idx >= len(self._text_chunks):
                 continue
-            chunk_text = self._text_chunks[chunk_idx]
+            chunk_text = self._text_chunks[chunk_idx].decode("utf-8", errors="replace")
             try:
                 n_tokens = len(tokenizer.encode(chunk_text, add_special_tokens=False))
             except Exception:

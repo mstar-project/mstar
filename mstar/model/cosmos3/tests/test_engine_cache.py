@@ -647,9 +647,9 @@ def test_anchor_encode_matches_full() -> None:
         print("  (skipped anchor-encode parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     device = base["device"]
-    # [C, H, W] in [0, 1] on the 8-bit grid, like load_image: the aspect-crop
-    # conditioning recipe (Edge) rounds to 8 bits, the stretch/action path does
-    # not, so an off-grid image would reach the two encodes as different pixels.
+    # [C, H, W] in [0, 1] on the 8-bit grid, like load_image: the i2v
+    # conditioning recipe rounds to 8 bits, the action path does not, so an
+    # off-grid image would reach the two encodes as different pixels.
     img = torch.randint(0, 256, (3, H, W), device=device).float() / 255.0
     md = {"height": H, "width": W, "num_frames": VIDEO_FRAMES, "has_image_condition": True}
     anchor = _encode_cond(base["model"], md, {"image_inputs": [img]}, "prefill_cond")
@@ -989,7 +989,7 @@ def test_windowed_kv_engine_release_and_psnr() -> None:
         ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
     )
 
-    page_size = kv.config.page_size
+    page_size = kv.config.tokens_per_page
     frame_tokens = ctx["md"]["total_latent_units"] * 64  # 64 tokens/unit at 256p
     for label, ids in (("main", ctx["cond"]), ("uncond", ctx["uncond"])):
         stream = kv._streams["r0"][label]
@@ -1063,13 +1063,13 @@ def test_windowed_kv_dense_matches_paged() -> None:
 
 
 @torch.no_grad()
-def _run_cuda_graph_denoise(ctx):
+def _run_accelerator_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
     CudaGraphRunner (one captured forward per step covering both guidance
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.engine.cuda_graph_runner import CudaGraphRunner
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]
@@ -1094,7 +1094,7 @@ def _run_cuda_graph_denoise(ctx):
     )
     # The runner's autocast scope is the engine's: none for a node that pins
     # its own precision (the DiT forwards run native bf16), else the model's.
-    cg_runner = CudaGraphRunner(
+    cg_runner = AcceleratorGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev,
         autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
@@ -1121,7 +1121,7 @@ def _run_cuda_graph_denoise(ctx):
 
 
 @torch.no_grad()
-def test_cuda_graph_matches_eager() -> None:
+def test_accelerator_graph_matches_eager() -> None:
     """The captured-graph denoise step is the served path's accelerator: both
     guidance branches run in one captured forward (~2x faster than the eager
     step). Each captured forward matches eager to within bf16 (the first step
@@ -1133,7 +1133,7 @@ def test_cuda_graph_matches_eager() -> None:
         print("  (skipped cuda-graph parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     try:
-        lat_graph = _run_cuda_graph_denoise(ctx)
+        lat_graph = _run_accelerator_graph_denoise(ctx)
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped cuda-graph parity: FlashInfer/capture unavailable: {exc})")
         return
@@ -1161,7 +1161,7 @@ def _main() -> None:
         ("anchor_encode_matches_full", test_anchor_encode_matches_full),
         ("compile_vae_matches_eager", test_compile_vae_matches_eager),
         ("compile_vae_matches_eager_t2v", test_compile_vae_matches_eager_t2v),
-        ("cuda_graph_matches_eager", test_cuda_graph_matches_eager),
+        ("accelerator_graph_matches_eager", test_accelerator_graph_matches_eager),
         ("cross_request_batch_matches_individual", test_cross_request_batch_matches_individual),
     ]:
         try:

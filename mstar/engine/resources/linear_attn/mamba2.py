@@ -240,7 +240,7 @@ class Mamba2Manager(LinearAttnManager):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len

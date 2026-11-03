@@ -32,7 +32,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import DummyRowPool
+from mstar.engine.accelerator_graph_runner import DummyRowPool
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVSpec,
@@ -279,10 +279,11 @@ def test_an_empty_yaml_block_is_not_an_override():
 
 def test_a_real_override_still_raises_through_the_yaml_entry_point():
     """The counterweight to the above, on the same path: a block that does
-    carry a key must still be refused where a deployment would hit it."""
+    carry a key must still be refused where a deployment would hit it, as the
+    ValueError a bad config is, naming the block."""
     spec = KVSpec(resource_key="kv", nodes={"dit"}, config=_ring_config())
 
-    with pytest.raises(TypeError, match="checkpoint fact"):
+    with pytest.raises(ValueError, match=r"resources\.kv: .*checkpoint fact"):
         apply_yaml_overrides([spec], {"resources": {"kv": {"tokens_per_frame": 256}}})
 
 
@@ -860,7 +861,7 @@ def test_post_warmup_validate_catches_a_committed_frame():
 
     kv.commit(_step("a", frame=4), _ctx("a"))  # a commit capture should never have made
 
-    with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="during accelerator graph capture"):
         kv.post_warmup_validate()
 
 
@@ -952,11 +953,11 @@ def test_a_reused_world_starts_empty():
         assert not bool(layer.written[: layer.ring_len].any())
 
 
-def test_build_cuda_graph_buffers_allocates_nothing():
+def test_build_accelerator_graph_buffers_allocates_nothing():
     kv = _manager()
     before = _ptrs(kv)
 
-    kv.build_cuda_graph_buffers([], max_bs=1, max_seq_len=4096)
+    kv.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=4096)
 
     assert _ptrs(kv) == before
 

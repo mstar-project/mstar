@@ -9,7 +9,7 @@ output must match each of them).
 import pytest
 import torch
 
-pytest.importorskip("transformers")
+transformers = pytest.importorskip("transformers")
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (  # noqa: E402
     Qwen3OmniMoeAudioEncoderConfig,
@@ -25,6 +25,12 @@ TINY = dict(
     d_model=64, encoder_layers=2, encoder_attention_heads=4, encoder_ffn_dim=128,
     num_mel_bins=16, n_window=50, n_window_infer=200, conv_chunksize=3,
     downsample_hidden_size=8, output_dim=48, max_source_positions=1500,
+)
+
+hf_forward_on_transformers_4 = pytest.mark.skipif(
+    int(transformers.__version__.split(".")[0]) >= 5,
+    reason="under transformers 5.x the windowed-mask fixture passes attention_mask twice "
+    "to sdpa_attention_forward; passes on 4.57.3",
 )
 
 
@@ -70,6 +76,10 @@ def test_token_arithmetic_matches_hf_formula():
     cfg = AuTEncoderConfig()
     for n in [1, 37, 99, 100, 101, 230, 1000, 3000, 30017]:
         assert cfg.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n)))
+    # chunks of the checkpoint's own n_window, as HF counts them
+    wide = AuTEncoderConfig(n_window=52)
+    for n in [104, 164, 1000]:
+        assert wide.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n), n_window=52))
     assert cfg.chunk_frames == 100 and cfg.tokens_per_chunk == 13 and cfg.window_tokens == 104
     assert cfg.window_lengths(30) == [30]
     assert cfg.window_lengths(104 * 3 + 5) == [104, 104, 104, 5]
@@ -96,6 +106,7 @@ def test_loads_completely_and_rejects_partial_checkpoints():
         AuTEncoder(AuTEncoderConfig.from_hf(TINY)).load_weights(partial)
 
 
+@hf_forward_on_transformers_4
 @pytest.mark.parametrize("num_frames", [230, 100, 350, 61])
 def test_single_request_matches_hf(num_frames):
     hf, ours = _pair()
@@ -109,6 +120,7 @@ def test_single_request_matches_hf(num_frames):
     assert torch.allclose(actual, expected, atol=1e-4), (actual - expected).abs().max()
 
 
+@hf_forward_on_transformers_4
 def test_packed_requests_match_hf_one_by_one():
     hf, ours = _pair()
     torch.manual_seed(2)

@@ -231,7 +231,7 @@ def test_no_window_size_falls_back_to_eager(overrides):
     hands SNAC a step without a graph."""
     config = OrpheusModelConfig(**overrides)
     submodule = SNACDecoderSubmodule(_NeighbourDecoder(), config)
-    configs = submodule.get_cuda_graph_configs(torch.device("cpu"))
+    configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
     captured = {cfg.additional_key_info for cfg in configs}
     assert submodule.split_batches_by_capture_key("snac_chunk")
     assert not any(cfg.compile for cfg in configs)
@@ -254,7 +254,7 @@ def test_no_window_size_falls_back_to_eager(overrides):
                                                 input_metadata=meta)
                 assert key in captured, (frames, eos, chunk.info)
                 assert item.input_ids.shape[0] == key
-                assert submodule.can_use_cuda_graphs(SimpleNamespace(graph_walk="snac_chunk"), [item, item])
+                assert submodule.can_use_accelerator_graphs(SimpleNamespace(graph_walk="snac_chunk"), [item, item])
 
 
 def test_model_kwargs_override_the_window(monkeypatch):
@@ -313,7 +313,7 @@ def test_no_context_geometry_captures_only_decodable_windows():
                                 snac_right_context_frames=0)
     assert config.snac_window_frames() == [1, 2, 3, 4]
     submodule = SNACDecoderSubmodule(_tiny_snac(), config)
-    for cfg in submodule.get_cuda_graph_configs(torch.device("cpu")):
+    for cfg in submodule.get_accelerator_graph_configs(torch.device("cpu")):
         assert cfg.additional_key_info == cfg.single_request_inputs.input_ids.shape[0] >= 1
         codes = submodule.preprocess("snac_chunk", None, [cfg.single_request_inputs])
         audio = submodule._decode(codes["codes_0"], codes["codes_1"], codes["codes_2"])
@@ -349,7 +349,7 @@ def test_the_widest_supported_window_bounds_the_captures():
     config = OrpheusModelConfig(snac_chunk_frames=11)  # 3 + 2 + 11 frames
     windows = config.snac_window_frames()
     assert max(windows) <= 16 and len(windows) <= 16
-    configs = SNACDecoderSubmodule(_NeighbourDecoder(), config).get_cuda_graph_configs(torch.device("cpu"))
+    configs = SNACDecoderSubmodule(_NeighbourDecoder(), config).get_accelerator_graph_configs(torch.device("cpu"))
     assert len(configs) == len(windows)
 
 

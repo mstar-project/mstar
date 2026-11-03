@@ -1,0 +1,15 @@
+model: "omnilingual_asr_ctc_1b"
+# No KV cache; 40 s at 50 encoder frames/s is 2000 frames.
+max_seq_len: 2048
+node_groups:
+  - node_names: [encoder]
+    ranks: [0]
+    graph_walks: [transcribe]
+# Constructor options (forwarded to OmnilingualASRModel.__init__):
+# model_kwargs:
+#   weights_version: v1        # facebook/omniASR-CTC-* on the Hub instead of Meta's v2 CDN checkpoints
+#   checkpoint_path: /models/omniASR-CTC-1B-v2.pt   # local files instead of a download
+#   tokenizer_path: /models/omniASR_tokenizer_written_v2.model
+#   dtype: float32             # the reference's fp32 numerics (default bfloat16)
+#   max_batch_size: 16         # requests per encoder batch
+#   max_batch_seconds: 320     # padded audio per batch (batch size x longest clip)

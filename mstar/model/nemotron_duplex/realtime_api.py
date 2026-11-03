@@ -68,6 +68,7 @@ class RealtimeConnection:
         self.stream = None
         self._response_open = False
         self._consumed_audio = False           # any user audio fed yet?
+        self._odd_byte = b""                   # first byte of a sample split across appends
 
     def _open_stream(self):
         """(Re)create the duplex stream, priming the current system prompt."""
@@ -100,7 +101,21 @@ class RealtimeConnection:
                         "started is applied on the next input_audio_buffer.clear"}})
             await self.send_json({"type": "session.updated", "session": self.cfg})
         elif et == "input_audio_buffer.append":
-            pcm = base64.b64decode(event["audio"])
+            try:
+                # whitespace is allowed (base64.encodebytes wraps lines), as on the API server
+                # not `or ""`: a null is an error, not an empty append, on every realtime path
+                audio = event.get("audio", "").encode("ascii").translate(None, b" \t\n\r\v\f")
+                pcm = self._odd_byte + base64.b64decode(audio, validate=True)
+            except (ValueError, TypeError, AttributeError):
+                await self.send_json({"type": "error",
+                                      "error": {"message": "audio is not base64", "code": "invalid_audio"}})
+                return
+            # the stream takes whole int16 samples; an odd trailing byte waits
+            # for the rest of its sample in the next append
+            whole = len(pcm) - len(pcm) % 2
+            pcm, self._odd_byte = pcm[:whole], pcm[whole:]
+            if not pcm:
+                return
             self._consumed_audio = True
             await self._consume(self.stream.append_audio(pcm))
         elif et == "input_audio_buffer.commit":
@@ -108,6 +123,7 @@ class RealtimeConnection:
             await self._finish_response()
         elif et == "input_audio_buffer.clear":
             self._open_stream()  # fresh turn — re-prime the current system prompt
+            self._odd_byte = b""  # only clear drops it: a cancel or update does not end the byte stream
         elif et == "response.cancel":
             self._open_stream()
             await self._finish_response()
@@ -137,11 +153,15 @@ class RealtimeConnection:
             self._response_open = False
 
 
-def build_app(model):
-    """Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model."""
+def build_app(model, api_key: str | None = None):
+    """Build a FastAPI app exposing ``/v1/realtime`` for the given loaded model.
+    With ``api_key``, the handshake needs ``Authorization: Bearer <key>``."""
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+    from mstar.api_server.auth import APIKeyGuard, APIKeyMiddleware
+
     app = FastAPI()
+    app.add_middleware(APIKeyMiddleware, guard=APIKeyGuard(api_key))
 
     @app.websocket("/v1/realtime")
     async def realtime(ws: WebSocket):
@@ -164,14 +184,18 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--api-key", default=None, help="bearer key for /v1/realtime (default: MSTAR_API_KEY)")
     args = ap.parse_args()
 
     import uvicorn
 
+    from mstar.api_server.auth import resolve_api_key, warn_if_no_api_key
     from mstar.model.registry import HF_MODELS, get_model_class
+    api_key = resolve_api_key(args.api_key)
     model = get_model_class(args.model)(**HF_MODELS[args.model])
     model.prepare_streaming(device=args.device)  # warm the submodules (Phase B)
-    uvicorn.run(build_app(model), host=args.host, port=args.port)
+    warn_if_no_api_key(api_key, args.host, args.port)
+    uvicorn.run(build_app(model, api_key=api_key), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

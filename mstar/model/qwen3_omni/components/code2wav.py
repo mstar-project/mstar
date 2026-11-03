@@ -504,8 +504,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         full batched input and then trims ``left_context_size[i] * total_upsample``
         samples from the start of request ``i``'s waveform.
 
-        Mirrors vllm-omni's ``Qwen3OmniMoeCode2Wav.chunked_decode_streaming``:
-        the model forward is unchanged, trimming is per-request on the output.
+        The model forward is unchanged; trimming is per-request on the output.
 
         Args:
             codes: ``[batch, num_quantizers, T]`` RVQ codes where ``T`` is

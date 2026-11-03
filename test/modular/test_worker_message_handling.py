@@ -12,6 +12,7 @@ parked as out-of-order and never delivered.
 import threading
 import types
 
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
@@ -34,6 +35,7 @@ def _stub_worker(active_rids):
         per_request_info={h: object() for h in handles.values()}
     )
     stub._unprocessed_messages = {}
+    stub._removed_rids = RecentSet(16)
     stub._rid = handles.get
     stub.delivered = []
 

@@ -1,0 +1,23 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+
+node_groups:
+  # Thinker routed experts run expert-parallel: each rank holds 64 of the
+  # 128 experts at full width. Attention stays TP.
+  - node_names: [Thinker]
+    ranks: [0, 1]
+    tp_size: 2
+    ep_config:
+      parallel: ep                # tp | ep
+      ep_group: tp                # EP spans the group's TP ranks (only option today)
+      log_expert_load_every: 0    # N > 0 logs per-rank slot counts every N steps
+      mask_padding: false         # measured no throughput gain at P=8, TP or EP
+
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+
+  - node_names: [Talker]
+    ranks: [2]
+
+  - node_names: [Code2Wav]
+    ranks: [2]

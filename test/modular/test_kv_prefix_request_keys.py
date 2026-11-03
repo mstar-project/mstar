@@ -18,16 +18,31 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_ingest_unpersist import _conductor, _ToyModel
 
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
-from mstar.model.base import PrefixStream, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.graph.base import GraphEdge, GraphNode, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    keyed_labels,
+)
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.streaming.topology import PartitionTopology, StreamingGraphEdge
+from mstar.utils.ipc_format import NewRequestConductor
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -60,22 +75,33 @@ class _StubTensorManager:
 
 
 class _Model:
-    """A model that declares one id-keyed stream, or none when asked not to."""
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
-        decode_walk: str | None = None,
+        decode_walk: str | None = None, lays_out: bool = True,
     ):
         self._declares = declares
         self._metadata = metadata
         self._decode_walk = decode_walk
+        self._lays_out = lays_out
 
-    def prefix_key_streams(self):
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
+    def kv_labels(self):
         if not self._declares:
             return {}
-        return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill", self._decode_walk,
-        )}}
+        growth = () if self._decode_walk is None else ((self._decode_walk, "decode_loop"),)
+        return {"kv": {"main": KVLabel(growth=growth, keys=PrefixKeys(
+            "text_inputs", ("prefill",), growth=self._decode_walk is not None,
+        ))}}
+
+    def max_input_files(self):
+        return {}
+
+    def checkpoint_path(self):
+        # a model that names no checkpoint and sets no salt keys nothing
+        return "/a/checkpoint"
 
     def get_node_resources(self):
         return [KVSpec(
@@ -90,9 +116,10 @@ class _Model:
 
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.tensor(PROMPT, dtype=torch.long)]}
-        if self._metadata is None:
+        if not self._lays_out:
             return tensors
-        return ProcessPromptOutput(tensors, self._metadata)
+        layout = LabelLayout(spans=(Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs"),))
+        return ProcessPromptOutput(tensors, {"kv_layout": {"kv": {"main": layout}}, **(self._metadata or {})})
 
 
 def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
@@ -108,7 +135,10 @@ def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
 
 
 def _deployment(page_size: int = PAGE_SIZE) -> dict:
-    return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
+    return {
+        "model": "stub", "resources": {"kv": {"page_size": page_size}},
+        "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
+    }
 
 
 def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
@@ -280,13 +310,13 @@ def test_the_metadata_fold_leaves_the_requests_own_kwargs_alone():
     assert kwargs["from_process_prompt"] == 1, "the metadata never arrived"
 
 
-def test_a_model_returning_only_tensors_still_carries_its_keys():
-    worker = _worker(_Model(metadata=None), _deployment())
+def test_a_declared_label_with_no_layout_sends_no_keys():
+    worker = _worker(_Model(lays_out=False), _deployment())
 
     kwargs = _run(worker, {"voice": "tara"})
 
     assert kwargs["voice"] == "tara", "the request's own kwargs were dropped"
-    assert "prefix_keys" in kwargs, "the plain-dict return lost the keys"
+    assert "prefix_keys" not in kwargs, "keys were guessed for a label its request never laid out"
 
 
 # ── the handover to the resource config ─────────────────────────────────
@@ -306,6 +336,30 @@ def test_each_resource_config_is_handed_only_its_own_chain():
     )
     assert configs["other_kv"].prefix_keys is None, (
         "a resource was handed another resource's chain"
+    )
+
+
+def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
+    class _Thinker:
+        """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
+
+        def get_node_resources(self):
+            return [KVSpec("kv", {"Thinker"}, PagedKVConfig(
+                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=PAGE_SIZE,
+            ))]
+
+        def checkpoint_path(self):
+            return "/a/checkpoint"
+
+    # qwen3omni_thinker_tp2's placement: rank 2 holds none of the cache's nodes
+    config = {"node_groups": [
+        {"node_names": ["Thinker"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["audio_encoder", "vision_encoder"], "ranks": [0]},
+        {"node_names": ["Talker"], "ranks": [2]},
+        {"node_names": ["Code2Wav"], "ranks": [2]},
+    ]}
+    assert _kv_page_sizes(_Thinker(), config) == {}, (
+        "every prompt was keyed and its media hashed for a cache no engine opens"
     )
 
 
@@ -334,6 +388,70 @@ def test_a_request_that_says_nothing_is_still_cached():
     )
 
 
+class _Talking(_ToyModel):
+    """Keys a layout on an LLM that streams every prefill walk to a talker,
+    which runs only when the request asks for audio."""
+
+    def __init__(self):
+        def llm():
+            return GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                StreamingGraphEdge(next_node="talker", name="hidden", target_partition="Talker"),
+            ])
+
+        vit = GraphNode(name="vit", input_names=["pixels"], outputs=[GraphEdge(next_node="LLM", name="text_inputs")])
+        talker = GraphNode(name="talker", input_names=["hidden"], outputs=[
+            GraphEdge(next_node=EMIT_TO_CLIENT, name="audio", output_modality="audio"),
+        ])
+        super().__init__(
+            {"prefill": llm(), "prefill_image": Sequential([vit, llm()]), "talk": talker}, None,
+            partitions=[
+                PartitionDefinition("LLM", {"prefill", "prefill_image"}, "prefill"),
+                PartitionDefinition("Talker", {"talk"}, "talk", ["LLM"]),
+            ],
+        )
+
+    def get_node_resources(self):
+        return [KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+        ))]
+
+    def kv_labels(self):
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill", "prefill_image")))}}
+
+    def get_initial_forward_pass_args(
+        self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None,
+    ):
+        walk = "prefill" if partition_name == "LLM" else "talk"
+        return ForwardPassArgs(
+            full_metadata=CurrentForwardConductorMetadata(
+                input_modalities=input_modalities, output_modalities=output_modalities,
+                graph_walk=walk, is_prefill=True,
+            ),
+            inputs=[], unpersist_tensors=[],
+            request_done=partition_name == "Talker" and "audio" not in output_modalities,
+        )
+
+
+def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
+    conductor = _conductor(_Talking(), [{"node_names": ["vit", "LLM", "talker"], "ranks": [0]}], tmp_path, monkeypatch)
+
+    layout = LabelLayout(spans=(Span("ids", "prefill", 4, 4, "text_inputs"),))
+    cached = {}
+    for out in ("audio", "text"):
+        conductor._do_ingest_request(NewRequestConductor(
+            request_id=out, initial_signals={}, initial_input_modalities=["text"],
+            initial_output_modalities=[out], input_metadata={},
+            model_kwargs={"kv_layout": {"kv": {"main": layout.row()}}},
+        ))
+        cached[out] = conductor.requests[out].resource_configs["kv"].prefix_cache
+
+    assert cached == {"audio": False, "text": True}, (
+        "a request whose prefill streams to a running talker was cached, so a "
+        "walk the cache serves would leave the talker short of rows"
+    )
+
+
 # ── a config for every resource that declared a stream ──────────────────
 
 
@@ -349,8 +467,9 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     """The configs a request is opened with, as the conductor resolves them:
     the model's own, a default for anything it declared a stream for, and then
     each handed its own chain."""
+    declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs, {},
+        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
@@ -375,7 +494,7 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
 
     configs = _conductor_configs(orpheus)
 
-    assert set(orpheus.prefix_key_streams()) <= set(configs), (
+    assert set(keyed_labels(orpheus)) <= set(configs), (
         "orpheus returns a sampler config alone, so the resource it declared "
         "a stream for had nothing to carry its chain"
     )
@@ -392,11 +511,12 @@ class _LaidOut(_Model):
 
     def __init__(self, image: Span, rewrites: bytes | None = None):
         text = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
-        super().__init__(metadata={"prefix_layout": {"kv": {"main": [text, image]}}})
+        super().__init__(metadata={"kv_layout": {"kv": {"main": LabelLayout(spans=(text, image))}}})
         self._rewrites = rewrites
 
-    def prefix_key_streams(self):
-        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))}}
+    def kv_labels(self):
+        walks = ("prefill", "prefill_image")
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", walks))}}
 
     def preprocess_fingerprint(self):
         return "stub"
