@@ -30,6 +30,7 @@ from torch import nn
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
 from mstar.model.components.diffusion.compile_utils import kept_exact
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.z_image.components.qk_norm_rope import fits as qk_norm_rope_fits
 from mstar.model.z_image.components.qk_norm_rope import qk_norm_rope
 from mstar.model.z_image.config import ZImageTransformerConfig
@@ -130,6 +131,26 @@ class ZImageFeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.w13(x).split(self.hidden, dim=-1)
         return self.w2(self.act(gate) * up)
+
+
+# ``linear_dtype``: the blocks' attention and feed-forward linears may go low precision. The linears that set the
+# modulation and take the latents and the caption in and out carry little of the step's FLOPs, and have biases.
+# ``input_amax``: the feed-forward outputs above what NVFP4 holds at a unit tensor scale (2688), as measured over the
+# 100 protocol prompts' 8 steps on Z-Image-Turbo (rounded up to three digits); every other input stays under 1800.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=("*.*.attn.qkv", "*.*.attn.out", "*.*.ff.w13", "*.*.ff.w2"),
+    keep_bf16=("*.*.adaln", "time_in", "time_out", "x_embedder", "cap_proj", "final_mod", "final_proj"),
+    input_amax={
+        "layers.0.ff.w2": 340000, "layers.1.ff.w2": 21300, "layers.2.ff.w2": 4840, "layers.3.ff.w2": 2790,
+        "layers.7.ff.w2": 14400, "layers.8.ff.w2": 36900, "layers.9.ff.w2": 11500, "layers.10.ff.w2": 39200,
+        "layers.11.ff.w2": 26800, "layers.12.ff.w2": 18100, "layers.13.ff.w2": 33800, "layers.14.ff.w2": 66100,
+        "layers.15.ff.w2": 10900, "layers.16.ff.w2": 21300, "layers.17.ff.w2": 30400, "layers.18.ff.w2": 6630,
+        "layers.19.ff.w2": 8900, "layers.20.ff.w2": 9030, "layers.21.ff.w2": 3240, "layers.22.ff.w2": 7270,
+        "layers.23.ff.w2": 4160, "layers.24.ff.w2": 3360, "layers.25.ff.w2": 8260, "layers.26.ff.w2": 5060,
+        "layers.27.ff.w2": 9350, "layers.28.ff.w2": 2950, "noise_refiner.0.ff.w2": 26700,
+        "noise_refiner.1.ff.w2": 39700,
+    },
+)
 
 
 # The three spans a forward attends over: the noise refiner over the (padded) image tokens
