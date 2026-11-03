@@ -154,8 +154,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
     if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
+    if model in ("flux2_klein", "flux2_klein_9b"):  # Z-Image is text-to-image only
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
-        lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
     if model == "ltx2_5":
         lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
         lines.append("                          output_modalities=(\"video\", \"audio\"),")
