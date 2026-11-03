@@ -1,125 +1,264 @@
-"""Rebuild rows are the micro-scheduler's work.
+"""A rebuild runs as rows mid-prefill that the worker's log holds, offered where a chunk in flight is.
 
-A dropped request comes back through a row of its node's rebuild walk, which the graph runtime never sees. The
-scheduler takes a node's queued rows ahead of anything new, as it takes a backlog, and fills the step's room with
-that walk's ready rows. A speculation chain yields to them like to any other ready work, since it never merges one.
+Readiness answers a dropped request with a rebuild. The scheduler parks the request's decode row, as it parks a
+row waiting for capacity, and opens the rebuild in the log. From then on the log offers the rebuild's next chunk
+the way the scheduler offers a speculation's chunk in flight, so the walk's caps, token budget and pick treat it
+as a prompt mid-prefill. Nothing popped it, so nothing pushes it back or parks it in a backlog, and a chunk in
+flight is offered again only as its step's continuation.
 """
 
 from __future__ import annotations
 
 import sys
+from array import array
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
-from types import SimpleNamespace
-
 import pytest
-from test_scheduler_room import NODE, _Engine, _rids, _Runtime, _setup, _State
+import torch
+from test_rebuild_policy import POLICY, _graphs
+from test_scheduler_room import NODE, _rids, _Runtime
+from test_scheduler_room import _Engine as _RoomEngine
+from test_scheduler_room import _State as _RoomState
 
-from mstar.worker.micro_scheduler import MicroScheduler
-from mstar.worker.rebuild import RebuildRow
+from mstar.engine.chunking import ChunkRange
+from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
+from mstar.model.submodule_base import InputSeqLenInfo
+from mstar.worker.host_pool import HostCopy, HostSlice
+from mstar.worker.micro_scheduler import MicroScheduler, MidPrefillRow
+from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
 
-PREFILL, DECODE = "prefill", "decode"
+PREFILL, DECODE, MIXED = POLICY.walk, "decode", "mixed"
+R = "r"
 
 
-def _queue(sched, *rids, walk=PREFILL):
-    for rid in rids:
-        sched.queue_rebuild(rid, RebuildRow(NODE, walk, {}))
+class _State(_RoomState):
+    """Forward-pass infos that name each request's walk, which a rebuild starts from."""
+
+    def get_fwd_info(self, rid, partition):
+        return SimpleNamespace(graph_walk=self.runtime.walks.get(rid))
 
 
-def test_rebuild_rows_go_first_and_the_walks_ready_rows_fill_the_room_left():
-    sched, runtime, state = _setup({"p0": PREFILL, "p1": PREFILL, "d0": DECODE}, max_bs=3)
-    _queue(sched, "r0")
+class _Engine(_RoomEngine):
+    """Readiness that answers ``dropped`` with a rebuild, a token budget, and ``cached`` tokens of every rebuild
+    in the prefix cache."""
+
+    def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=()):
+        super().__init__(max_bs)
+        self.budget, self.chunkable, self.cached, self.dropped = budget, chunkable, cached, set(dropped)
+        self.asked, self.prepared = [], []
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        return self.budget
+
+    def supports_chunked_prefill(self, node_name, graph_walk):
+        return self.chunkable
+
+    def min_chunk_tokens(self, budget):
+        return 1
+
+    def walk_token_caps(self, node_name, graph_walk):
+        return None
+
+    def unserved_len(self, node_name, graph_walk, info, rid, length, end):
+        return InputSeqLenInfo(end - self.cached, cached_prefix=self.cached)
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        self.asked.append(rid)
+        return FULL_ADMIT_REBUILD if rid in self.dropped else FULL_ADMIT_OK
+
+    def prepare_rebuild(self, node_name, rid, rebuild):
+        self.prepared.append((rid, list(rebuild.ids)))
+
+    def admit_waiting(self, published_of):
+        return []
+
+
+def _scheduler(walks, combined=False, **engine):
+    engine = _Engine(**engine)
+    runtime = _Runtime(walks)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
+        combined_walk_of={(NODE, PREFILL): MIXED, (NODE, DECODE): MIXED} if combined else None,
+    )
+    sched.runtime, sched.rebuilds = runtime, Rebuilds({NODE: POLICY}, _graphs())
+    return sched, runtime, _State(runtime), engine
+
+
+def _rebuilding(sched, rid=R, total=20, done=0):
+    """``rid``'s rebuild on ``NODE``, ``done`` of its ``total`` tokens in."""
+    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(
+        PREFILL, total, total, array("i", range(total + 1)), torch.int64, done,
+    )
+
+
+def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
+    sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
+    sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 12), prompt, None), torch.int64, array("i", [4]))
+
+    sched.get_next_batch(state)
+    sched.get_next_batch(state)
+
+    assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
+    assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
+    assert engine.asked.count("d0") == 1, "a parked decode row asks the engine on every pass"
+
+
+def test_a_parked_decode_row_runs_once_its_rebuild_lands():
+    sched, runtime, state, engine = _scheduler({"d0": DECODE})
+    sched.parked[NODE] = {"d0"}
+
+    assert sched.get_next_batch(state) is None and not engine.asked
+    sched.note_rebuilt(NODE, "d0")
+
+    assert _rids(sched.get_next_batch(state)) == ["d0"], "the rebuilt request would never decode again"
+
+
+def test_a_rebuild_row_shares_a_step_with_its_walks_decode_rows():
+    sched, runtime, state, _ = _scheduler({"d0": DECODE}, combined=True)
+    _rebuilding(sched)
 
     batch = sched.get_next_batch(state)
 
-    assert (batch.graph_walk, list(batch.rebuild_rows)) == (PREFILL, ["r0"]), "the rebuild waited behind new work"
-    assert _rids(batch) == ["p0", "p1"], "the rebuild row's walk left room the ready prompts didn't get"
-    assert "d0" in runtime.ready, "a decode row would run under the rebuild's prefill walk"
+    assert _rids(batch) == [R, "d0"] and batch.rebuild_rids == {R}, "the rebuild would take a step of its own"
+    assert batch.graph_rows() == {"d0": "wg0"}, "the graph runtime would be handed a row it holds no node of"
 
 
-class _CombinedRuntime(_Runtime):
-    """Prefill and decode share the combined walk ``mixed``, and a scan names either walk or both."""
-    COMBINED = {(NODE, PREFILL): "mixed", (NODE, DECODE): "mixed"}
+def test_a_long_rebuild_is_cut_by_the_walks_budget_and_resumes_where_it_stopped():
+    sched, _, state, _ = _scheduler({}, budget=8)
+    _rebuilding(sched, total=20)
 
-    def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
-        def named(walk):
-            return target is None or target[1] in (walk, self.COMBINED[(NODE, walk)])
-        return [spec for spec in super().get_ready_nodes(exclude_rids) if named(spec.graph_walk)]
+    first = sched.get_next_batch(state)
+    sched.rebuilds.land_chunk(R, NODE, first.chunk_ranges[R])
+    second = sched.get_next_batch(state)
 
-
-def test_a_rebuild_step_under_a_combined_walk_asks_the_engine_about_none_of_the_other_walks_rows():
-    asked = []
-
-    class Engine(_Engine):
-        def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
-            asked.append(rid)
-            return super().check_ready(node_name, rid, fwd_info, allow_reload)
-
-    runtime, engine = _CombinedRuntime({"p0": PREFILL, "d0": DECODE}), Engine(4)
-    sched = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine),
-                           parallel_leader_nodes={NODE}, combined_walk_of=_CombinedRuntime.COMBINED)
-    sched.runtime = runtime
-    _queue(sched, "r0")
-
-    batch = sched.get_next_batch(_State(runtime))
-
-    assert (list(batch.rebuild_rows), _rids(batch)) == (["r0"], ["p0"])
-    assert asked == ["p0"], "a decode row's readiness check could read its request back in, for a step it can't join"
+    assert first.chunk_ranges[R] == ChunkRange(0, 8, 20, 8) and first.incomplete_node_rids == {R}
+    assert second.chunk_ranges[R] == ChunkRange(8, 16, 20, 8), "the rebuild would run past the budget, or again"
 
 
-def test_a_walks_cap_bounds_its_rebuild_rows_first():
-    sched, runtime, state = _setup({"p0": PREFILL}, max_bs=2)
-    _queue(sched, "r0", "r1", "r2")
+@pytest.mark.parametrize("engine", [{"budget": None}, {"budget": 8, "chunkable": False}])
+def test_a_rebuild_of_a_walk_the_deployment_doesnt_chunk_runs_whole(engine):
+    sched, _, state, _ = _scheduler({}, **engine)
+    _rebuilding(sched, total=20)
 
     batch = sched.get_next_batch(state)
 
-    assert list(batch.rebuild_rows) == ["r0", "r1"] and not _rids(batch), "the step outgrew the walk's cap"
-    assert "p0" in runtime.ready, "a prompt row would be popped with no room to run"
+    assert _rids(batch) == [R] and not batch.chunk_ranges, "a walk that can't be cut would be split"
+
+
+def test_a_rebuild_starts_past_its_cached_prefix():
+    sched, _, state, _ = _scheduler({}, budget=8, cached=8)
+    _rebuilding(sched, total=20)
+
+    batch = sched.get_next_batch(state)
+
+    assert batch.chunk_ranges[R] == ChunkRange(8, 16, 20, 16), "the rebuild would recompute what the cache holds"
+
+
+class _Prefilling(_Runtime):
+    """Every prompt stands 4 tokens into its 10 on its chunk Loop."""
+
+    def loop_progress(self, node_name, rids, graph_walks, loop_names):
+        return [4] * len(rids), [10] * len(rids)
+
+
+def test_a_prompt_dropped_mid_prefill_runs_its_chunks_again_up_to_where_its_loop_stands():
+    sched, _, _, engine = _scheduler({}, budget=8, dropped={R})
+    sched.runtime = runtime = _Prefilling({R: PREFILL})
+    sched.chunk_loop_walks = {NODE: frozenset({PREFILL})}
+    state = _State(runtime)
+
+    rebuild = sched.get_next_batch(state)
+
+    assert R in sched.parked[NODE] and not engine.prepared, "the KV would lay the prompt out again over unkept ids"
+    assert rebuild.rebuild_rids == {R} and rebuild.chunk_ranges[R] == ChunkRange(0, 4, 4, 4), (
+        "the rebuild would run past where the prompt stood, or whole, with no input of its own"
+    )
+    assert (R, NODE) in sched.chunk_started, "the prompt's next chunk would lose its place ahead of newer prompts"
+
+
+def test_a_chunk_in_flight_is_offered_only_as_its_steps_continuation():
+    sched, _, state, _ = _scheduler({}, budget=8)
+    _rebuilding(sched, total=20, done=8)
+    sched.in_flight_rids.add(R)
+
+    assert sched.get_next_batch(state) is None, "a chunk in flight would run a second time"
+    chain = sched.pick_chain_step(state, (NODE, PREFILL), [], [MidPrefillRow(R, "wg0", PREFILL, 16, 20)])
+    batch = sched.take_chain_step(state, chain)
+
+    assert batch.chunk_ranges[R] == ChunkRange(16, 20, 20, 4) and batch.rebuild_rids == {R}
 
 
 @pytest.mark.parametrize("why", ["held", "failed", "removing"])
-def test_a_rebuild_row_the_scheduler_wouldnt_run_waits(why):
-    sched, _, state = _setup({"d0": DECODE}, max_bs=4)
-    _queue(sched, "r0")
+def test_a_rebuild_whose_request_the_scheduler_wouldnt_run_waits(why):
+    sched, _, state, _ = _scheduler({})
+    _rebuilding(sched)
     if why == "held":
-        sched.hold_requests(["r0"])
+        sched.hold_requests([R])
     elif why == "failed":
-        sched.failed_rids.add("r0")
+        sched.failed_rids.add(R)
     else:
-        sched.pending_removes["r0"] = None
+        sched.pending_removes[R] = None
 
-    batch = sched.get_next_batch(state)
-
-    assert batch.graph_walk == DECODE and not batch.rebuild_rows, "a torn-down or held request would prefill again"
-    assert sched.rebuild_queued("r0"), "the row left its queue before anything decided its request"
+    assert sched.get_next_batch(state) is None, "a torn-down or held request would prefill again"
+    assert sched.rebuilds.rebuilding(R, NODE), "the rebuild left the log before anything decided its request"
 
 
-def test_a_row_stays_queued_until_its_step_goes_out_or_its_request_is_removed():
-    sched, _, state = _setup({}, max_bs=4)
-    _queue(sched, "r0", "r1")
+def test_a_rebuild_left_out_of_a_full_step_stays_in_the_log():
+    sched, _, state, _ = _scheduler({"p0": PREFILL}, max_bs=1)
+    sched.note_arrival("p0")
+    sched.note_arrival(R)
+    _rebuilding(sched)
 
-    assert list(sched.get_next_batch(state).rebuild_rows) == ["r0", "r1"]
-    assert list(sched.get_next_batch(state).rebuild_rows) == ["r0", "r1"], "a step built and never launched lost rows"
-    sched.take_rebuilds({"r0"})
-    sched.clear_rid("r1", "r1")
-    assert sched.get_next_batch(state) is None and not sched.rebuilds, "a row would run twice, or after its removal"
-
-
-@pytest.mark.parametrize("chain_walk", [DECODE, PREFILL])
-def test_a_speculation_chain_yields_to_a_rebuild_row_whatever_its_walk(chain_walk):
-    sched, runtime, state = _setup({}, max_bs=4)
-    runtime.has_ready_excluding = lambda exclude, exclude_target: False  # nothing else is ready
-    assert not sched.has_ready_excluding(state, (NODE, chain_walk))
-    _queue(sched, "r0")
-
-    assert sched.has_ready_excluding(state, (NODE, chain_walk)), "a chain would speculate past the rebuild row"
-    sched.hold_requests(["r0"])
-    assert not sched.has_ready_excluding(state, (NODE, chain_walk)), "a chain would yield to a row that can't run"
+    assert _rids(sched.get_next_batch(state)) == ["p0"]
+    assert not any(R in batch.request_to_worker_graph for batch in sched.backlog.values()), (
+        "a backlog would hold a row no queue gave it"
+    )
+    assert _rids(sched.get_next_batch(state)) == [R], "the rebuild would never run"
 
 
-def test_pending_rows_count_the_rebuild_rows():
-    sched, _, _ = _setup({"p0": PREFILL}, max_bs=4)
-    _queue(sched, "r0", "r1")
+def test_a_mixing_chain_takes_a_waiting_rebuild_row():
+    sched, _, state, _ = _scheduler({}, combined=True, budget=64)
+    _rebuilding(sched)
 
-    assert sched.pending_rows()[NODE] == 3, "the worker would report its node idle with rebuild rows waiting"
+    chain = sched.pick_chain_step(state, (NODE, DECODE), ["c0"])
+    batch = sched.take_chain_step(state, chain, pre_existing_batch_size=1)
+
+    assert [row.request_id for row in chain.rebuilds] == [R] and batch.rebuild_rids == {R}, (
+        "decode would sit out every chunk of the rebuild"
+    )
+
+
+def test_a_chain_that_doesnt_mix_yields_to_a_rebuild_of_another_walk():
+    sched, runtime, state, _ = _scheduler({})
+    runtime.has_ready_excluding = lambda exclude, exclude_target: False  # nothing on the queues
+    _rebuilding(sched)
+
+    assert sched.has_ready_excluding(state, (NODE, DECODE)), "a decode chain would speculate past the rebuild"
+    assert not sched.has_ready_excluding(state, (NODE, PREFILL)), "a chain of the rebuild's walk takes it itself"
+    sched.in_flight_rids.add(R)
+    assert not sched.has_ready_excluding(state, (NODE, DECODE)), "a chain would yield to a chunk in flight"
+
+
+def test_no_chunk_loop_is_capped_for_a_rebuild_row():
+    sched, runtime, state, _ = _scheduler({}, budget=8)
+    sched.chunk_loop_walks = {NODE: frozenset({PREFILL})}
+    capped = []
+    runtime.set_loop_caps = lambda node, rids, walks, loops, caps: capped.extend(rids)
+    _rebuilding(sched)
+
+    sched.get_next_batch(state)
+
+    assert not capped, "the walk's chunk Loop would be capped for a request that left it"
+
+
+def test_pending_rows_and_a_refill_count_waiting_rebuilds():
+    sched, _, state, _ = _scheduler({"p0": PREFILL})
+    _rebuilding(sched)
+    _rebuilding(sched, "r1")
+    sched.in_flight_rids.add("r1")
+
+    assert sched.pending_rows()[NODE] == 2, "the worker would report its node idle with a rebuild waiting"
+    assert sched.could_refill(NODE, PREFILL, {"p0"}), "a refused step would hold its row though the rebuild refills it"

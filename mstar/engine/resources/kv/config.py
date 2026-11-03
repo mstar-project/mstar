@@ -382,10 +382,11 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
-    arrival: int | None = None
-    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
-    guaranteed: bool = False
+    # `unpausable`: the request streams an output that can't pause, set by the conductor.
+    # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
+    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    unpausable: bool = False
+    rebuildable: bool = True
 
     def apply_conductor_config(
         self,
@@ -396,7 +397,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        arrival: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -419,8 +419,10 @@ class KVReqConfig(ResourceReqConfig):
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
                     keyed_spans=keyed_spans,
+                    max_growth=max_growth[0] if max_growth else None,
                 )
-                for label, (spans, growth, scratch, retention, keyed_spans) in kv_layout.items()
+                # a row may leave out the growth bound, as a span row may leave out its later fields
+                for label, (spans, growth, scratch, retention, keyed_spans, *max_growth) in kv_layout.items()
                 if label in opened
             }
         if loop_caps is not None and self.kv_layout is not None:
@@ -428,8 +430,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if arrival is not None:
-            self.arrival = arrival
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
@@ -546,8 +546,8 @@ def refuse_undeclared_labels(
 def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     """Why one rebuild row can't write a request's laid-out labels again, or None.
 
-    The row writes one label, grown by one loop, in the one walk its spans were written in. It writes the ids
-    spans from the request's kept ids, a digest span from host copies of what that walk read, and the ids
+    The row writes one label, grown by one loop, in the one step of one walk that wrote its spans. It writes the
+    ids spans from the request's kept ids, a digest span from host copies of what that walk read, and the ids
     sampled since at the end of the last span, which must be ids.
     """
     laid_out = [layout for layout in layouts if layout.spans]
@@ -558,6 +558,8 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     for layout in laid_out:
         if len({span.walk for span in layout.spans}) > 1:
             return "its prompt was written in more than one walk, which one rebuild row can't run"
+        if any(span.opens_step for span in layout.spans[1:]):
+            return "its prompt was written in more than one step, which one rebuild row can't run"
         if layout.spans[-1].kind != SpanKind.IDS:
             return "its prompt ends on a digest span, where the ids it sampled can't follow"
         if len(layout.spans) > 1 and layout.keyed_spans:
@@ -565,19 +567,11 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     return None
 
 
-def mark_guaranteed(
-    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
-) -> None:
-    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
-    playback, or when any of them lays out rows, which no rebuild recomputes. A digest span is left to the
-    worker, which guarantees the request on a node that keeps no host copies for its rebuild."""
-    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
-    guaranteed = (streaming and "audio" in output_modalities) or any(
-        span.kind == SpanKind.ROWS
-        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
-    )
-    for config in kv_configs:
-        config.guaranteed = guaranteed
+def mark_unpausable(configs: Mapping[str, ResourceReqConfig], unpausable: bool) -> None:
+    """Mark every KV config in ``configs``, since a pause in any pool is heard."""
+    for config in configs.values():
+        if isinstance(config, KVReqConfig):
+            config.unpausable = unpausable
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
@@ -756,16 +750,17 @@ class StreamLayout:
     scratch: int = 0
     retention: RetentionPolicy | None = None
     keyed_spans: int = 0
+    max_growth: int | None = None
 
     def slots(self, caps: Mapping[str, int]) -> int:
-        return sum(span.length for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.length for span in self.spans) + self._grown(caps)
 
     def positions(self, caps: Mapping[str, int]) -> int:
-        return sum(span.advance for span in self.spans) + sum(
-            slots * caps[loop] for loop, slots in self.growth
-        )
+        return sum(span.advance for span in self.spans) + self._grown(caps)
+
+    def _grown(self, caps: Mapping[str, int]) -> int:
+        grown = sum(slots * caps[loop] for loop, slots in self.growth)
+        return grown if self.max_growth is None else min(grown, self.max_growth)
 
     def rebuilt(self, ids: int) -> "StreamLayout":
         """This layout once a rebuild row has written ``ids`` ids into it: the last span, which

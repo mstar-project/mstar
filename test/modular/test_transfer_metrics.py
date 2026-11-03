@@ -323,7 +323,7 @@ def _bare_worker(tmp_path):
     worker.engine_manager = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
     worker.communicator = _Sink()
     worker.tensor_manager = _shm("worker_1", tmp_path)
-    worker._preemptions = {}
+    worker._preemption = SimpleNamespace(counts={})
     return worker
 
 

@@ -15,7 +15,6 @@ from mstar.engine.chunking import ChunkRange
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -54,7 +53,6 @@ def _follower(head: ScheduleTPNode) -> Worker:
     )
     worker.request_state = SimpleNamespace(per_request_info={})
     worker._in_flight_rids = set()
-    worker._rebuilds = Rebuilds({}, {})
     worker._poll_stream_buffers_for_speculation = lambda rid, node: []
     worker.assembled = {}
 
@@ -67,11 +65,7 @@ def _follower(head: ScheduleTPNode) -> Worker:
             node_name=NODE, graph_walk=MIXED, request_to_worker_graph=dict(rid_to_wg),
             request_walks=kwargs["request_walks"] or {}, chunk_ranges=kwargs["chunk_ranges"],
         )
-        node_batch = SimpleNamespace(
-            node_name=NODE, step_context=SimpleNamespace(graph_walk=MIXED, request_walks=batch.request_walks),
-            per_request_input_tensors=inputs,
-        )
-        return SimpleNamespace(continuing_rids=set(continuing), node_batch=node_batch, scheduled_batch=batch)
+        return SimpleNamespace(continuing_rids=set(continuing), node_batch=SimpleNamespace(), scheduled_batch=batch)
 
     worker._spec_builder = SimpleNamespace(assemble=assemble)
     return worker

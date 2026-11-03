@@ -254,7 +254,7 @@ class StepRunner:
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
-                if isinstance(per_rid, dict):
+                if isinstance(per_rid, Mapping):
                     resource.extend_prefix_chain(
                         rid, node_name,
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
@@ -346,15 +346,10 @@ class StepRunner:
     def ingest_request(
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        arrival: int | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource. All or
-        nothing: a resource that raises leaves the request on none of them."""
-        arrival = next((
-            config.arrival for config in (overrides or {}).values()
-            if getattr(config, "arrival", None) is not None
-        ), None)
-        if arrival is not None:
-            self._admission.set_arrival(rid, arrival)
+        """open state on all resources; `overrides` are per-resource, and ``arrival`` is the conductor's number
+        for the request. All or nothing: a resource that raises leaves the request on none of them."""
         for i, key in enumerate(self._order):
             try:
                 self._resources[key].ingest_request(
@@ -370,6 +365,8 @@ class StepRunner:
                             "rolling back request %s on resource %s failed", rid, done,
                         )
                 raise
+        if arrival is not None:
+            self._admission.set_arrival(rid, arrival)
 
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
@@ -461,6 +458,9 @@ class StepRunner:
 
     def readmit(self, rid: str, node_name: str) -> None:
         self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name))
+
+    def newer_than(self, rid: str) -> list[str] | None:
+        return self._admission.newer_than(rid)
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],

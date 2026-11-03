@@ -296,6 +296,8 @@ class Qwen3_5DenseModel(Model):
                     max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
+                    # the tower's compiled block loop keeps attention in its graph
+                    compile_op=True,
                 ),
             ),
         ]
@@ -638,8 +640,12 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
+        first, *rest = prompt_spans(plan, segments, walk, media)
+        if walk == "prefill_vision":
+            # one prefill_vision row writes the whole prompt
+            rest = [span._replace(opens_step=False) for span in rest]
         layout = LabelLayout(
-            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            spans=(first, *rest), growth=(("decode_loop", 1),),
             # The keys name `prefill_text` alone, and the preprocess worker refuses
             # a keyed span in any other walk.
             keyed_spans=0 if walk == "prefill_vision" else None,

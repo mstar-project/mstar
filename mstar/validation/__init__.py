@@ -78,6 +78,9 @@ def validate_deployment(
         problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")
+    unpausable = config.get("unpausable_outputs", [])
+    if not isinstance(unpausable, list) or not all(isinstance(output, str) for output in unpausable):
+        problems.append(f"unpausable_outputs must be a list of output modalities, got {unpausable!r}")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
     resources_readable = resources_shape_problem(config) is None
     if resources_readable:

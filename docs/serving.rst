@@ -248,6 +248,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``unpausable_outputs``
+     - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
+       that streams one of them reserves its whole KV footprint and is never preempted (see
+       below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]`` unless the
+       model declares otherwise. ``[]`` gives a voice deployment a fast first chunk under KV
+       pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
@@ -335,6 +341,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -383,7 +395,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Requests the data worker prepares at once, for a model that
        declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
        beside the API server's intra-op threads (``preprocess_torch_threads``),
-       at most 8; ``1`` prepares inline. See :doc:`adding_models`.
+       at most 8; ``1`` prepares inline. It must be a positive integer, for any
+       model: the server refuses to start on another value. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
@@ -446,31 +459,37 @@ from the newest requests, those that arrived after the request that ran short, u
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
 its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
-request on the host waits at its place in the queue until its pages and one more page fit, and
-its pages are then copied back. A dropped request waits until its history and one more page
-fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
-made from another node's outputs, reserves its whole footprint in every pool, with every cache
-hit counted, and is never dropped or moved to the host. So does a request in the pools of a
-node that keeps no token ids to rebuild it. A request with images whose whole prompt runs on
-one prefill walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker
-keeps a host copy of what that walk read besides the token ids, the encoder's output included,
-and rebuilds the request from it. Bagel and Qwen3-Omni requests with media, whose prompts run on
-several walks, Higgs Audio requests, whose node declares no rebuild policy, and requests with
-images above one rank keep no copies and stay guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
-pool is short and are never preempted mid-stream.
+request on the host or dropped waits at its place in the queue until its whole footprint fits,
+and comes back guaranteed, so it is never preempted again. A request on the host then has its
+pages copied back, and a dropped one recomputes its KV in prefill chunks cut by its walk's
+chunk budget. A request that streams an output in
+``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
+and is never dropped or moved to the host. Voice requests then queue when the pool is short and
+are never preempted mid-stream. A request with images whose whole prompt runs on one prefill
+walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker keeps a host copy
+of what that walk read besides the token ids, the encoder's output included, and rebuilds the
+request from it. A request no drop can free, because it holds KV made from another node's outputs
+or from media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only
+to the host: when it is admitted the host pool sets room for its whole footprint aside, and it
+reserves only its prompt. Bagel and Qwen3-Omni requests with media, whose prompts run on several
+walks, Higgs Audio requests, whose node declares no rebuild policy, requests with images above
+one rank, and Qwen3.5 videos are such requests. When the host pool can't set the room aside, the
+request reserves its whole footprint in that pool, as a voice request does. So
+``cpu_offload_pages`` also sets how many such requests run at once with only their prompt reserved.
 
-Above one rank, a decode step that finds no page and nothing to offload holds its requests
-until they time out. At one rank, a request that runs short and can neither move to the host
-nor be dropped waits for room when moving or dropping the newer requests wouldn't cover its
-shortage. Several such requests can wait on each other. ``max_concurrent_requests`` prevents
-both. It caps how many requests run at once, and the pool's pages divided by the pages one
-request needs, prompt and output together, is a safe value. ``cpu_offload_pages`` lets a full pool move a request to
-the host instead of dropping it. An offload frees only the device pages no other running
-request reads, though, so a request that shares most of its prompt frees little. Offload helps
-a pool that runs short now and then. It doesn't replace the cap. With a host pool and the prefix
-cache on, a cached page is copied to the host once no request holds it, and a later request
-whose prefix the device evicted copies it back from there. So the host pool should hold more
-pages than the device's prefix cache.
+Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
+step that finds no page and nothing to offload holds its requests until they time out. Elsewhere
+at one rank, a request that runs short and can neither move to the host nor be dropped waits in
+its pool's queue, at its arrival, until its shortage fits, when moving or dropping the newer
+requests wouldn't cover it. Several such requests can wait on each other.
+``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the pool's
+pages divided by the pages one request needs, prompt and output together, is a safe value.
+``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping it. An
+offload frees only the device pages no other running request reads, though, so a request that
+shares most of its prompt frees little. Offload helps a pool that runs short now and then. It
+doesn't replace the cap. With a host pool and the prefix cache on, a cached page is copied to the
+host once no request holds it, and a later request whose prefix the device evicted copies it back
+from there. So the host pool should hold more pages than the device's prefix cache.
 
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
@@ -707,7 +726,9 @@ Pi0.5 DROID variant fixes the action horizon:
      - {node_names: [LLM], ranks: [0]}
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`.
+client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
+it is batched with, so requests sent with the same seed and settings sample the same
+tokens; give each request its own seed for independent samples.
 
 Restarts and the compile cache
 ------------------------------
@@ -996,9 +1017,8 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
-Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
-report the same series. A tensor already on the reader (one it made, or one it read once
+``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers
