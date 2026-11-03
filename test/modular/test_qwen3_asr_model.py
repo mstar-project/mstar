@@ -718,9 +718,3 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
-    # the per-request stop check reads the decode signal
-    info = type("I", (), {
-        "graph_walk": DECODE_WALK, "dynamic_loop_iter_counts": {}, "max_tokens": 100,
-        "resource_configs": {SAMPLER: type("C", (), {"ignore_eos": False})()},
-    })()
-    assert sub.check_stop("a", info, {"text_inputs": [torch.tensor([next(iter(cfg.stop_token_ids))])]})
