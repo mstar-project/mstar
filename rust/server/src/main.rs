@@ -495,6 +495,10 @@ async fn chat_completions(
         Ok(a) => a,
         Err(r) => return r,
     };
+    let audio_format = match chat_audio_format(&req) {
+        Ok(fmt) => fmt,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let mut args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
@@ -518,7 +522,7 @@ async fn chat_completions(
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(build_chat_response(
-            &st.model_name, &request_id, chunks, st.sample_rate,
+            &st.model_name, &request_id, chunks, st.sample_rate, audio_format,
         ))
         .into_response(),
         Err((status, msg)) => error(status, &msg, error_type(status)),
@@ -634,13 +638,42 @@ fn chunk_json(id: &str, created: i64, model: &str, delta: Value, finish: Option<
     .to_string()
 }
 
-/// Non-streaming chat: text into `content`, audio into `message.audio` (b64
-/// WAV), images into `image_url` data-URL content parts (matching serving_chat).
+/// The container `message.audio` is sent in, from OpenAI's `audio.format`, as
+/// `serving_chat._audio_format` reads it (`pcm16` names raw PCM), or the 400's
+/// text. Stream deltas are raw PCM16, so a stream takes only that. The
+/// compressed containers the Python frontend encodes with soundfile have no
+/// encoder here, so its list is the one Python gives without them.
+fn chat_audio_format(req: &ChatCompletionRequest) -> Result<&'static str, String> {
+    let stream = req.stream.unwrap_or(false);
+    // `str(format or default).lower()`
+    let fmt = match req.audio.as_ref().and_then(|a| a.get("format")) {
+        Some(v) if !adapters::truthy(v) => String::new(),
+        Some(Value::String(s)) => s.to_lowercase(),
+        Some(v) => v.to_string().to_lowercase(),
+        None => String::new(),
+    };
+    let fmt = if fmt.is_empty() { if stream { "pcm16" } else { "wav" }.to_string() } else { fmt };
+    let allowed: &[&str] = if stream { &["pcm16"] } else { &["wav", "pcm16"] };
+    if !allowed.contains(&fmt.as_str()) {
+        let how = if stream { "streamed" } else { "produced" };
+        return Err(format!(
+            "audio.format {} cannot be {how} by this server; use one of: {}",
+            media::py_repr(&fmt),
+            allowed.join(", ")
+        ));
+    }
+    Ok(if fmt == "pcm16" { "pcm" } else { "wav" })
+}
+
+/// Non-streaming chat: text into `content`, audio into `message.audio` (b64,
+/// in `audio_format`), images into `image_url` data-URL content parts
+/// (matching serving_chat).
 fn build_chat_response(
     model: &str,
     request_id: &str,
     chunks: Vec<ResultChunk>,
     sample_rate: u32,
+    audio_format: &str,
 ) -> Value {
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
@@ -658,10 +691,10 @@ fn build_chat_response(
     let mut message = json!({"role": "assistant", "content": text.clone()});
 
     if !audio_pcm.is_empty() {
-        let wav = media::pcm16_to_wav_bytes(&audio_pcm, sample_rate, 1);
+        let (audio, _) = media::pcm16_to_container(&audio_pcm, sample_rate, audio_format);
         message["audio"] = json!({
             "id": rid("audio"),
-            "data": media::b64(&wav),
+            "data": media::b64(&audio),
             "expires_at": now() + 86400,
             "transcript": text.clone(),
         });
@@ -1774,6 +1807,39 @@ mod tests {
     }
 
     #[test]
+    fn chat_audio_is_sent_in_the_format_serving_chat_sends() {
+        let check = |fields: Value| {
+            let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
+            req.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            chat_audio_format(&serde_json::from_value(req).unwrap())
+        };
+        for (fields, want) in [
+            (json!({"audio": {"voice": "Ethan"}}), "wav"),
+            (json!({"audio": {"format": ""}}), "wav"),
+            (json!({"audio": {"format": "WAV"}}), "wav"),
+            // raw PCM whole, as the Python frontend sends it
+            (json!({"audio": {"format": "pcm16"}}), "pcm"),
+            (json!({"stream": true}), "pcm"),
+            (json!({"audio": {"format": "pcm16"}, "stream": true}), "pcm"),
+        ] {
+            assert_eq!(check(fields.clone()), Ok(want), "{fields}");
+        }
+        for (fields, err) in [
+            (json!({"audio": {"format": "mp3"}}), "audio.format 'mp3' cannot be produced by this server; use one of: wav, pcm16"),
+            (json!({"audio": {"format": "pcm"}}), "audio.format 'pcm' cannot be produced by this server; use one of: wav, pcm16"),
+            (json!({"audio": {"format": 5}}), "audio.format '5' cannot be produced by this server; use one of: wav, pcm16"),
+            (json!({"audio": {"format": "wav"}, "stream": true}), "audio.format 'wav' cannot be streamed by this server; use one of: pcm16"),
+            (json!({"audio": {"format": "it's"}}), "audio.format \"it's\" cannot be produced by this server; use one of: wav, pcm16"),
+        ] {
+            assert_eq!(check(fields.clone()), Err(err.to_string()), "{fields}");
+        }
+        let pcm = vec![1u8, 0, 2, 0];
+        let chunks = vec![ResultChunk { modality: "audio".into(), data: pcm.clone(), metadata: Value::Null }];
+        let resp = build_chat_response("m", "r", chunks, 24000, "pcm");
+        assert_eq!(resp["choices"][0]["message"]["audio"]["data"], media::b64(&pcm));
+    }
+
+    #[test]
     fn max_images_parses_as_python_does() {
         for (raw, cap) in [
             (None, 10), (Some("2"), 2), (Some(" 2 "), 2), (Some("2\n"), 2), (Some("+3"), 3),
@@ -1831,7 +1897,7 @@ mod tests {
 
     #[test]
     fn chat_response_joins_text_before_decoding() {
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000);
+        let resp = build_chat_response("m", "r", split_text_chunks(), 24000, "wav");
         assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
     }
 

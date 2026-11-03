@@ -381,7 +381,7 @@ The Rust frontend serves no ``/generate/ws``, so a model's live client input
 over ``/generate`` such a model's input ends when the request is submitted.
 
 It also carries no audio encoder or media muxer (the Python frontend
-uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
+uses ``soundfile`` / ``ffmpeg``), so these surfaces degrade:
 
 * ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
   ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
@@ -390,6 +390,8 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
 * ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
   400: the Python frontend decodes the clip and checks its length before
   submitting it, and the Rust frontend has no decoder to do that with.
+* ``/v1/chat/completions`` sends speech (``message.audio``) only as ``wav`` or
+  ``pcm16``; another ``audio.format`` is a 400.
 * ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
   request sets ``generate_sound``, Cosmos3 generates a separate audio track that
   mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so

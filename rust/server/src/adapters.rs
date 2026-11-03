@@ -720,7 +720,7 @@ fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<bool>, Stri
 }
 
 /// Python's `bool()` of a JSON value.
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,

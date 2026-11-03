@@ -279,6 +279,23 @@ def test_chat_audio_output(client_and_stub):
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
 
 
+def test_chat_audio_output_is_in_the_requested_format(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_omni"
+    pcm = _pcm([0, 16000, -16000])
+    stub.next_chunks = [_Chunk("audio", pcm)]
+    body = {"messages": [{"role": "user", "content": "x"}], "modalities": ["text", "audio"],
+            "audio": {"voice": "Ethan", "format": "pcm16"}}
+    reply = client.post("/v1/chat/completions", json=body).json()
+    assert base64.b64decode(reply["choices"][0]["message"]["audio"]["data"]) == pcm
+    # stream deltas are raw PCM16, so any other container is refused rather than mislabeled
+    r = client.post("/v1/chat/completions", json={**body, "stream": True, "audio": {"format": "wav"}})
+    assert r.status_code == 400 and "pcm16" in r.json()["error"]["message"]
+    # the refusal names the chat field and its formats, not the speech route's
+    r = client.post("/v1/chat/completions", json={**body, "audio": {"format": "pcm"}})
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith("audio.format 'pcm' cannot be produced")
+
+
 def test_audio_speech(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"
