@@ -174,6 +174,8 @@ class RecurrentStatePool(Resource):
             )
             for name, block in config.blocks.items()
         }
+        # slot -> its views of every block, a list per dtype (`_zero_slot`)
+        self._slot_views: dict[int, list[list[torch.Tensor]]] = {}
 
         # rid -> label -> slot. Mirrors `KVManager._streams`.
         self._slots: dict[str, dict[str, SlotState]] = {}
@@ -379,8 +381,21 @@ class RecurrentStatePool(Resource):
             self._version += 1
 
     def _zero_slot(self, index: int) -> None:
-        for tensor in self._blocks.values():
-            tensor[:, index].zero_()
+        # One _foreach_zero_ call per dtype rather than a Python zero_ per
+        # block, over views built once per slot: a Qwen3-TTS codec stream's
+        # state is 38 blocks, and zeroing them one by one cost ~0.25 ms of the
+        # main thread per teardown. The fused kernel takes only dense views of
+        # one dtype; a block of more than one layer (GDN's conv and ssm) gives
+        # a strided ``[:, index]`` view, which still launches once per block,
+        # just from C++.
+        groups = self._slot_views.get(index)
+        if groups is None:
+            by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+            for tensor in self._blocks.values():
+                by_dtype.setdefault(tensor.dtype, []).append(tensor[:, index])
+            groups = self._slot_views[index] = list(by_dtype.values())
+        for views in groups:
+            torch._foreach_zero_(views)
 
     def _alloc(self, rid: str, label: str) -> SlotState | None:
         with self._lock:
@@ -1114,6 +1129,7 @@ class RecurrentStatePool(Resource):
 
     def cleanup(self):
         self._blocks.clear()
+        self._slot_views.clear()
         self._cg_addressing.clear()
         self._cg_mirrors.clear()
         self._eager_addressing.clear()
