@@ -668,6 +668,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return False
 
+    def capture_group_order(self, graph_walk: str) -> tuple:
+        """``cg_key_info`` groups the scheduler runs in this order, ahead of any
+        others of this walk, instead of oldest row first. Only read when
+        ``split_batches_by_capture_key`` is on. A speculation merge still takes
+        its own rows' group, and a backlog that fills a step runs before any
+        fresh row is looked at, so groups late in the order are not starved.
+        """
+        del graph_walk
+        return ()
+
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""
         state = self.request_states.get(request_id)

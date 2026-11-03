@@ -259,6 +259,7 @@ class MicroScheduler:
             speculation_mixes_walks or {},
         )
         self._max_bs: dict[tuple[str, str], int | None] = {}
+        self._group_order_of_key: dict[tuple[str, str], tuple] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
         self.batch_builder = make_batch_builder(batch_builder_type)
@@ -1063,6 +1064,16 @@ class MicroScheduler:
             return None
         return max(max(caps) - pre_existing_batch_size, 0)
 
+    def _group_order(self, key: tuple[str, str]) -> tuple:
+        """The capture groups ``key`` runs first, if it splits by them. Fixed
+        once the graphs are captured, so asked once."""
+        order = self._group_order_of_key.get(key)
+        if order is None:
+            engine = self.engine_manager.get_engine(key[0])
+            order = engine.capture_group_order(*key) if engine.splits_by_capture_key(*key) else ()
+            self._group_order_of_key[key] = order
+        return order
+
     def _capture_group(
         self, request_state: RequestStateManager,
         node_name: str, graph_walk: str, rid: int,
@@ -1167,7 +1178,14 @@ class MicroScheduler:
         not_ready_rids: set[int] = set(waiting)
         off_group: set[int] = set()
         taken = 0
-        for rid in batch.request_to_worker_graph:
+        rows = batch.request_to_worker_graph
+        order = () if anchored else self._group_order((batch.node_name, batch.graph_walk))
+        if order:
+            # Scanned in group order, so a row parked behind older rows of a
+            # later group still sets the group.
+            rank = {key: i for i, key in enumerate(order)}
+            rows = sorted(rows, key=lambda rid: rank.get(group(rid), len(order)))
+        for rid in rows:
             if taken >= limit:
                 break
             if rid in waiting:
@@ -1214,6 +1232,7 @@ class MicroScheduler:
         request.capture_group = functools.partial(
             self._capture_group, request_state, *node_walk,
         )
+        request.group_order = self._group_order(node_walk)
         # Read before the build: `_merged` folds `fresh` into `backlog` in place.
         expected = set()
         if request.backlog is not None:
