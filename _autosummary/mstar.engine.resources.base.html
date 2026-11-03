@@ -1585,9 +1585,8 @@ resource to ask; LRU never calls it.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.ingest_request">
 <span class="sig-name descname"><span class="pre">ingest_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overrides</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.ingest_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.ingest_request" title="Link to this definition">#</a></dt>
-<dd><p>Must be idempotent: the conductor sends one NewRequest per partition,
-so a worker serving several partitions of a request ingests it once
-for each, possibly after a node has already run a step for it.</p>
+<dd><p>Open the request’s state. The worker calls this once per request, on
+its first NewRequest, though one comes per partition it serves.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
