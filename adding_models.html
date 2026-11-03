@@ -1168,7 +1168,8 @@ request that re-sends the reply matches it too.</p></li>
 </ul>
 <p>The keys cover the label’s first <code class="docutils literal notranslate"><span class="pre">keyed_spans</span></code> spans. An ids span is keyed by its
 token ids, a digest span by its file. Each span is its own step unless it sets
-<code class="docutils literal notranslate"><span class="pre">opens_step=False</span></code>, which puts it in one row with the span before it: a match cuts the
+<code class="docutils literal notranslate"><span class="pre">opens_step=False</span></code>, which puts it in one row with the span before it, of the same walk
+(<code class="docutils literal notranslate"><span class="pre">LabelLayout.row()</span></code> fails a layout where it isn’t): a match cuts the
 row, and the row keeps placing its own positions, so its walk declares the advance of the
 whole row whatever the cut left (Qwen3-Omni’s prefill of text around an attachment).</p>
 <p>BAGEL keys its text and ViT walks and the decode that follows them:</p>
