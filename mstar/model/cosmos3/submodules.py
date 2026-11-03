@@ -1209,13 +1209,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self, fwd_info, md, inputs, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
     ) -> ARNodeInputs:
         mode = md["action_mode"]
-        action_chunk = int(md["action_chunk_size"])
+        # The action band: the chunk the reply carries, behind a policy
+        # request's robot_state token (clean, at video frame 0).
+        state_rows = int(md.get("action_state_rows", 0))
+        action_chunk = int(md["action_chunk_size"]) + state_rows
         num_frames = int(md.get("num_frames") or action_chunk + 1)
         raw_action_dim = int(md["raw_action_dim"])
         domain_id = int(md.get("domain_id", 0))
         action_fps = float(md.get("action_fps", fps))
         action_offset = action_start_frame_offset(action_chunk, num_frames)
-        state_rows = int(md.get("action_state_rows", 0))
 
         cond = self._build_action_static(
             cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
@@ -1248,8 +1250,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # latent frames are kept clean from it.
 
         # Forward-dynamics conditions on a clean action chunk supplied with the
-        # request, and a policy request may send the robot's current state as
-        # its first row. Everything else is predicted (clean values are zero).
+        # request, and a policy request's robot_state (in the policy's
+        # convention, see Cosmos3Model._action_prompt_output) is the band's
+        # first row. Everything else is predicted (clean values are zero).
         clean_action = torch.zeros((1, action_chunk, action_dim), device=device, dtype=dtype)
         action_inputs = (inputs or {}).get("action_inputs")
         raw_act = action_inputs[0] if action_inputs else None

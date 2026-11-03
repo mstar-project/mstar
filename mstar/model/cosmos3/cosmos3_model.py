@@ -173,7 +173,10 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
-    PREPROCESS_ONLY_KWARGS = ("action",)
+    PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
+    # The width of a policy request's robot_state, which process_prompt hands
+    # the conductor (the values themselves ride the action_inputs edge).
+    INTERNAL_KWARGS = ("robot_state_dim",)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -932,8 +935,10 @@ class Cosmos3Model(Model):
             else:
                 scratch = max(plan.units for plan in schedule.windows()) * per_frame
         elif p.get("action_mode") is not None:
-            action_chunk = int(p["action_chunk_size"])
-            scratch = latent_frames(int(p.get("num_frames") or action_chunk + 1), config) * per_frame + action_chunk
+            # the action band is the chunk plus a policy request's robot_state token
+            action_tokens = int(p["action_chunk_size"]) + int(p.get("action_state_rows", 0))
+            num_frames = int(p.get("num_frames") or int(p["action_chunk_size"]) + 1)
+            scratch = latent_frames(num_frames, config) * per_frame + action_tokens
         else:
             scratch = latent_frames(p["num_frames"], config) * per_frame
             if p.get("generate_sound"):
@@ -947,38 +952,72 @@ class Cosmos3Model(Model):
             )
         return layouts
 
-    @staticmethod
-    def _action_prompt_output(tensors: NameToTensorList, kwargs: dict, metadata: dict | None = None):
+    def _action_prompt_output(self, tensors: NameToTensorList, kwargs: dict, metadata: dict | None = None):
         """Put conditioning values on a tensor edge; only their shape is metadata.
-        Forward dynamics sends the action chunk, a policy request may send the
-        robot's current state as one row."""
+        Forward dynamics sends the action chunk as ``action``; a policy request
+        may send the robot's current state as ``robot_state``, which rides the
+        same edge in the policy's convention (``inverted_action_dims``)."""
         metadata = dict(metadata or {})
         mode = str(kwargs.get("action_mode", "")).strip().lower()
-        if mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_POLICY) and kwargs.get("action") is not None:
+        if mode == ACTION_MODE_FORWARD_DYNAMICS and kwargs.get("action") is not None:
             action = torch.as_tensor(kwargs["action"])
-            if mode == ACTION_MODE_POLICY and action.ndim == 1:
-                action = action.unsqueeze(0)
             tensors["action_inputs"] = [action]
             metadata["action_shape"] = list(action.shape)
+        state = self._robot_state(kwargs)
+        if state is not None:
+            tensors["action_inputs"] = [self._invert_action_dims(state.unsqueeze(0), state.numel())]
+            metadata["robot_state_dim"] = state.numel()
         return ProcessPromptOutput(tensors, metadata) if metadata else tensors
 
     @staticmethod
-    def _policy_state_rows(mk: dict) -> int:
-        """Leading action rows a policy request sent as the robot's current state:
-        0 or 1. They condition the chunk and are left out of the reply."""
-        if str(mk.get("action_mode", "")).strip().lower() != ACTION_MODE_POLICY:
-            return 0
-        shape = mk.get("action_shape")
-        if shape is None and mk.get("action") is not None:
-            shape = list(torch.as_tensor(mk["action"]).shape)
-        if shape is None:
-            return 0
-        if len(shape) not in (1, 2) or (len(shape) == 2 and shape[0] != 1):
-            raise ValueError(
-                "A Cosmos3 policy request's 'action' is the robot's current state, one row of "
-                f"raw_action_dim values; got an array of size {list(shape)}."
-            )
-        return 1
+    def _robot_state(mk: dict) -> torch.Tensor | None:
+        """A request's ``robot_state`` as a float32 row of finite numbers, or None;
+        anything else is a ValueError, which the client gets as a 400. A NaN or
+        inf would reach every predicted row, since they all attend to it."""
+        raw = mk.get("robot_state")
+        if raw is None:
+            return None
+        values = raw.tolist() if hasattr(raw, "tolist") else raw  # a tensor or a numpy array
+        if not isinstance(values, (list, tuple)) or any(isinstance(v, (bool, str, bytes)) for v in values):
+            raise ValueError(f"Cosmos3 robot_state must be a list of numbers; got {raw!r}.")
+        try:
+            state = torch.tensor(values, dtype=torch.float32)
+        except (TypeError, ValueError, RuntimeError):
+            raise ValueError(f"Cosmos3 robot_state must be a list of numbers; got {raw!r}.") from None
+        if state.dim() != 1 or state.numel() == 0:
+            raise ValueError(f"Cosmos3 robot_state must be one row of numbers; got shape {list(state.shape)}.")
+        if not torch.isfinite(state).all():
+            raise ValueError("Cosmos3 robot_state values must be finite.")
+        return state
+
+    def _robot_state_dim(self, mk: dict) -> int:
+        """The width of a request's robot_state, 0 without one: from process_prompt's
+        metadata on the conductor (the values stay on the data worker)."""
+        if mk.get("robot_state_dim"):
+            return int(mk["robot_state_dim"])
+        state = self._robot_state(mk)
+        return 0 if state is None else state.numel()
+
+    @staticmethod
+    def _is_policy(mk: dict) -> bool:
+        """A policy request: one that says so, or one that sends a robot_state
+        without naming a mode."""
+        mode = mk.get("action_mode")
+        if mode is None:
+            return mk.get("robot_state") is not None or bool(mk.get("robot_state_dim"))
+        return str(mode).strip().lower() == ACTION_MODE_POLICY
+
+    def _invert_action_dims(self, rows: torch.Tensor, raw_action_dim: int) -> torch.Tensor:
+        """``rows`` with the deployment's ``inverted_action_dims`` mapped to 1 - x, the
+        convention its policy was trained in (DROID's 1 - gripper); the map is its
+        own inverse, so it serves the state on the way in and the reply on the way
+        out. Padding columns past ``raw_action_dim`` stay zero."""
+        dims = [d for d in self.config.inverted_action_dims if d < raw_action_dim]
+        if not dims:
+            return rows
+        rows = rows.clone()
+        rows[..., dims] = 1.0 - rows[..., dims]
+        return rows
 
     def _process_reasoner_prompt(
         self, prompt, input_modalities, tensors, prompt_parts, input_metadata, model_kwargs,
@@ -1201,10 +1240,15 @@ class Cosmos3Model(Model):
             # action_dim] float32 bytes. Columns beyond the request's
             # raw_action_dim are zero padding (the client keeps the first
             # raw_action_dim, the real action width for its embodiment). A
-            # policy state row is the request's own input, so it is dropped.
+            # policy request's robot_state token is its own input, so it is
+            # dropped, and the rows go back to the robot's convention.
+            mk = request_kwargs or {}
             x = output[0] if output.ndim == 3 else output
-            x = x[self._policy_state_rows(request_kwargs or {}):]
-            return x.detach().to(torch.float32).cpu().numpy().tobytes()
+            x = x.detach().to(torch.float32)
+            if self._is_policy(mk):
+                state_dim = self._robot_state_dim(mk)
+                x = self._invert_action_dims(x[1 if state_dim else 0:], int(mk.get("raw_action_dim") or state_dim))
+            return x.cpu().numpy().tobytes()
         if modality == "audio":
             # The audio decoder emits a [channels, samples] waveform in [-1, 1];
             # the serving convention for audio is headerless interleaved 16-bit
@@ -1247,7 +1291,11 @@ class Cosmos3Model(Model):
 
         # Action requests resolve their mode up front: it switches the frame,
         # step, guidance and flow-shift defaulting below to the action recipe.
+        # A request that sends the robot's state without a mode is a policy request.
+        state_dim = self._robot_state_dim(mk)
         action_mode = mk.get("action_mode")
+        if action_mode is None and state_dim and "action" in (output_modalities or []):
+            action_mode = ACTION_MODE_POLICY
         if action_mode is not None:
             action_mode = str(action_mode).strip().lower()
             if action_mode not in ACTION_MODES:
@@ -1255,35 +1303,35 @@ class Cosmos3Model(Model):
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
                     f"expected one of {sorted(ACTION_MODES)}."
                 )
+        if state_dim and action_mode != ACTION_MODE_POLICY:
+            raise ValueError("Cosmos3 robot_state is the input of a policy request (action_mode=policy).")
 
         if action_mode is not None:
             # An action request predicts one action token per frame, so the
             # frame count and the chunk length are coupled (num_frames = chunk
             # or chunk + 1) and default off each other; 16 predicted rows when
-            # neither is sent (the reference action default). A policy state
-            # row is an extra token at frame 0, so then num_frames = chunk.
-            state_rows = self._policy_state_rows(mk)
+            # neither is sent (the reference action default). The chunk is the
+            # rows the reply carries: a policy request's robot_state is one
+            # more token, clean in front of them at frame 0, so then
+            # num_frames = chunk + 1.
             raw_chunk = mk.get("action_chunk_size")
             raw_frames = mk.get("num_frames")
             if raw_chunk is not None:
                 action_chunk = int(raw_chunk)
             elif raw_frames is not None:
-                action_chunk = int(raw_frames) - 1 + state_rows
+                action_chunk = int(raw_frames) - 1
             else:
-                action_chunk = 16 + state_rows
+                action_chunk = 16
             if action_chunk <= 0:
                 raise ValueError(
                     f"Cosmos3 action_chunk_size must be positive, got {action_chunk}."
                 )
-            if action_chunk <= state_rows:
+            num_frames = int(raw_frames) if raw_frames is not None else action_chunk + 1
+            if state_dim and num_frames != action_chunk + 1:
                 raise ValueError(
-                    f"Cosmos3 action_chunk_size must leave a row to predict after the state, got {action_chunk}."
-                )
-            num_frames = int(raw_frames) if raw_frames is not None else action_chunk + 1 - state_rows
-            if state_rows and num_frames != action_chunk:
-                raise ValueError(
-                    "A Cosmos3 policy request with a state row requires num_frames to equal "
-                    f"action_chunk_size; got num_frames={num_frames}, action_chunk_size={action_chunk}."
+                    "A Cosmos3 policy request with a robot_state requires num_frames to be "
+                    f"action_chunk_size + 1 (the state is a token at frame 0); got num_frames={num_frames}, "
+                    f"action_chunk_size={action_chunk}."
                 )
             if num_frames not in (action_chunk, action_chunk + 1):
                 raise ValueError(
@@ -1405,18 +1453,20 @@ class Cosmos3Model(Model):
                 mk.get("domain_id"), mk.get("domain_name")
             )
             raw_dim = mk.get("raw_action_dim")
-            sends_action = action_mode == ACTION_MODE_FORWARD_DYNAMICS or state_rows > 0
-            if raw_dim is None and sends_action and mk.get("action_shape"):
+            if raw_dim is None and state_dim:
+                raw_dim = state_dim
+            is_fd = action_mode == ACTION_MODE_FORWARD_DYNAMICS
+            if raw_dim is None and is_fd and mk.get("action_shape"):
                 raw_dim = int(mk["action_shape"][-1])
-            if raw_dim is None and sends_action and mk.get("action") is not None:
+            if raw_dim is None and is_fd and mk.get("action") is not None:
                 try:
                     raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
                 except (TypeError, ValueError, RuntimeError):
                     raw_dim = None
             if raw_dim is None:
                 raise ValueError(
-                    "Cosmos3 action requests require 'raw_action_dim' (it may be left out "
-                    "when an 'action' array is sent, which carries the width)."
+                    "Cosmos3 action requests require 'raw_action_dim' (it may be left out when "
+                    "a robot_state or a forward-dynamics 'action' array is sent, which carries the width)."
                 )
             raw_dim = int(raw_dim)
             if not 1 <= raw_dim <= self.config.max_action_dim:
@@ -1425,13 +1475,12 @@ class Cosmos3Model(Model):
                     f"got {raw_dim}."
                 )
             params["raw_action_dim"] = raw_dim
-            if state_rows:
-                width = (mk.get("action_shape") or list(torch.as_tensor(mk["action"]).shape))[-1]
-                if int(width) != raw_dim:
+            if state_dim:
+                if state_dim != raw_dim:
                     raise ValueError(
-                        f"A Cosmos3 policy state row must have raw_action_dim={raw_dim} values, got {width}."
+                        f"A Cosmos3 robot_state must have raw_action_dim={raw_dim} values, got {state_dim}."
                     )
-                params["action_state_rows"] = state_rows
+                params["action_state_rows"] = 1
             if "action_fps" in mk:
                 params["action_fps"] = mk["action_fps"]
         # Opt-in sound generation: video-only (image and action requests carry
