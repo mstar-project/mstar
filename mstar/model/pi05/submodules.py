@@ -189,14 +189,11 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         # Each camera is letterboxed on its own, since cameras may differ in resolution.
         # Free camera slots get blank frames whose tokens postprocess drops, the same as
-        # openpi's image mask (masked tokens get no attention and no positions).
+        # openpi's image mask (masked tokens get no attention and no positions). More
+        # images than slots never get here, max_input_files refuses them.
         pixels = torch.cat([self._prepare_one(image) for image in inputs["image_inputs"]])
         num_images, missing = pixels.shape[0], self.config.num_cameras - pixels.shape[0]
-        if missing < 0:
-            raise ValueError(
-                f"{num_images} camera images, but this deployment takes at most {self.config.num_cameras}"
-            )
-        if missing:
+        if missing > 0:
             pixels = torch.cat([pixels, pixels.new_full((missing, *pixels.shape[1:]), -1.0)])
         return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs={"num_images": num_images})
 
@@ -208,10 +205,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NodeInputs | None = None,
         **kwargs,
     ):
-        """Drop the tokens of the blank frames ``prepare_inputs`` padded the request with."""
-        cameras = self.config.num_cameras
-        num_images = cameras if inputs is None else inputs.kwargs.get("num_images", cameras)
-        if num_images < cameras and "img_emb" in outputs:
+        """Drop the tokens of the blank frames ``prepare_inputs`` padded the request with,
+        so the prefix holds the images the KV layout was counted for."""
+        cameras, num_images = self.config.num_cameras, inputs.kwargs["num_images"]
+        if num_images < cameras:
             emb = outputs["img_emb"][0]
             outputs["img_emb"] = [emb[: emb.shape[0] // cameras * num_images]]
 
