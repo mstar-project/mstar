@@ -504,15 +504,18 @@ class FlashInferMLAManager(AttentionManager):
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
         # a captured step's own-token plans are padded to its bucket's tokens, and bounded so at plan
-        if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens):
+        walk = ctx.graph_walk
+        if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens, walk):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
                 f"{self._planned_over()} {self._kv_cache_name!r}"
         # sized by the real rows: a capture's padding rows (no queries, but they move the planner's
         # tile) go with the bucket, so each retry is strictly smaller
         real = [rid for rid in rows if not ctx.is_padding_row(rid)]
-        alone = frozenset(rid for rid in real if not self._fits([rows[rid]]))
-        fit = next((n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]])), None)
+        alone = frozenset(rid for rid in real if not self._fits([rows[rid]], walk=walk))
+        fit = next(
+            (n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]], walk=walk)), None,
+        )
         if alone or fit is None:
             # (no fit: one real row, which its capture's padding takes past the cap)
             return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
@@ -530,12 +533,16 @@ class FlashInferMLAManager(AttentionManager):
             rows_sized=len(real),
         ))
 
-    def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None) -> bool:
+    def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None, walk: str | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
         the FA planner's work-item cap: its context's; under SP placement every partner's zigzag
         share of its own tokens, padded as a capture of ``captured_tokens`` pads it; and under
-        ``kv_gather`` every partner's own queries, should the step split (a leased one doesn't)."""
+        ``kv_gather`` every partner's own queries, where a step of ``walk`` may split
+        (``SequenceShard.may_split``; a leased one doesn't)."""
         heads, placement = self._wrapper_kwargs["num_qo_heads"], self._placement
+        gathers = placement is None and captured_tokens is None and self._shard.may_split(
+            walk, sum(n for row in rows for n in row.values()),
+        )
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
             plans = [qo]
@@ -546,7 +553,7 @@ class FlashInferMLAManager(AttentionManager):
                     shape = zigzag_capture(size, len(qo) - 1, captured_tokens)
                     shares = [padded_share(share, *shape) for share in shares]
                 plans += shares
-            elif placement is None and captured_tokens is None:
+            elif gathers:
                 group = self._shard.group
                 r = SeqRange(group, tuple(sp_seq_split(int(qo[-1]), group.world_size)), None)
                 plans += partner_queries(r.row_pieces(np.diff(qo).tolist()))

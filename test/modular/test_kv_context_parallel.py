@@ -1610,11 +1610,13 @@ def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partner
     """Under ``kv_gather`` (a pool stored by head, on SP ranks whose steps split) each rank plans its
     contiguous pieces of the step's rows, which can take the FA planner past its cap where the whole
     step fits: rows of 8 and 1 queries split 5 | 3, 1, and 16 heads put the step on two-tile
-    clusters and partner 1 on one-tile ones. Admission counts them, as it does a placed pool's."""
+    clusters and partner 1 on one-tile ones. Admission counts them, as it does a placed pool's, and
+    only where the step may split: one the shard runs copied plans its whole rows alone."""
     _fa_kernel(monkeypatch)
     joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
     attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=16, flashinfer_backend="fa2",
-                            placed=False, shard=SequenceShard(("main",), 0, None, 0, joint.sp_group))
+                            placed=False, shard=shard)
     assert attn._split_exchange == "kv_gather" and attn._placement is None
     step = AttentionStep(segments=(Segment("r0", "main", 8), Segment("r1", "main", 1)))
     ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
@@ -1623,6 +1625,11 @@ def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partner
     monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", context)
     refused = attn.admit(step, ctx).reason
     assert refused is not None and "the gathered latents of KV pool 'kv'" in refused.message
+    # copied: fewer tokens than the shard's min_tokens, or a walk it never splits
+    shard.min_tokens = 10
+    assert attn.admit(step, ctx).ok
+    shard.min_tokens, shard.walks = 0, frozenset({"other"})
+    assert attn.admit(step, ctx).ok
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):

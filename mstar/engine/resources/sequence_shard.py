@@ -530,19 +530,26 @@ class SequenceShard(Resource):
         ``walk``, the step's walk where the caller's frame is compiled per walk: a walk the shard
         never splits (outside ``walks``) traces straight through, as at one SP rank, rather than
         breaking the frame."""
-        if not self._may_split(walk):
+        if not self.may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=True)
 
     def gather(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """``scatter``'s inverse: every rank's share of each of ``xs`` back whole."""
-        if not self._may_split(walk):
+        if not self.may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=False)
 
-    def _may_split(self, walk: str | None) -> bool:
-        # from what is fixed at bind and the frame's walk, so a compiled frame specializes on it
-        return self.can_split and (walk is None or self.walks is None or walk in self.walks)
+    def may_split(self, walk: str | None, tokens: int | None = None) -> bool:
+        """Whether a step of ``walk`` with ``tokens`` listed tokens may split (None: any walk, any
+        count), though ``_decide`` may still plan it copied. In O(1) from what is fixed at bind and
+        what every rank shares, so a compiled frame specializes on its walk and an admission bound
+        skips the steps that run copied."""
+        return (
+            self.can_split
+            and (walk is None or self.walks is None or walk in self.walks)
+            and (tokens is None or tokens >= max(self.group.world_size, self.min_tokens))
+        )
 
     @torch.compiler.disable
     def _bracket(self, label: str, xs: tuple, dim: int | None, scatter: bool):
