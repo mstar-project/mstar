@@ -91,8 +91,9 @@ def _worker():
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
-    w._in_flight_rids, w._last_active = set(), {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
+    w._in_flight_rids = set()
+    w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
+    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
@@ -105,7 +106,6 @@ def _worker():
     w.scheduler = _Scheduler(w.held)
     w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: w.infos[r])
-    w.tensor_manager = SimpleNamespace(get_tensor=None, cleanup_collectable=lambda *a: None)
     w._fail_requests = w.failed.update
     return w, eng
 
@@ -146,7 +146,8 @@ def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeyp
     # neither the publish skip nor the streams bear on the class
     w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
     w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
-    w.engine_manager.evictable_nodes = list
+    w._reads_done_sent, w.scheduler.note_arrival = set(), lambda rid: None
+    w._graph_runtime.register_stop_limits = lambda rid, info: None
     w.engine_manager.add_request = lambda rid, configs, info=None: kv.ingest_request(rid, configs["kv"])
     w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
     w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
@@ -478,7 +479,6 @@ def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
 
     assert eng.landed == [R], "the request would never be ready to decode again"
     assert w.infos[R].graph_walk == DECODE, "the runtime's view of the request left its decode walk"
-    assert (R, NODE) in w._last_active, "the rebuilt request would be the coldest eviction victim"
 
 
 def test_a_rebuild_row_leads_its_step_and_stays_out_of_the_runtime():

@@ -13,7 +13,7 @@ from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVReqConfig, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
@@ -268,7 +268,7 @@ def test_every_session_of_the_longest_length_fits_the_talker_pool_at_once(monkey
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     model = NemotronDuplexModel.__new__(NemotronDuplexModel)
     model.config = NemotronDuplexConfig()
-    page_size = PagedKVConfig.page_size
+    page_size = DEFAULT_PAGE_SIZE
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
                           max_num_pages=model.talker_kv_pages(page_size), page_size=page_size),

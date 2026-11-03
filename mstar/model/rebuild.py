@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphSection
+from mstar.model.submodule_base import chunk_tick_name
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,10 @@ class RebuildPolicy:
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> None:
         """Raise when the policy names a walk, input, output or loop that ``node`` doesn't have in ``graphs``,
-        or when a walk that reads the ids doesn't output the sample, since such a walk can end a prompt."""
+        or when a walk that reads the ids doesn't output the sample, since such a walk can end a prompt.
+
+        The tick of ``node``'s chunk Loop in a walk is left out of what it reads, since the tick carries
+        no tensor."""
         reads = self._reads(node, graphs, self.walk)
         if reads != {self.ids_input}:
             raise ValueError(
@@ -72,4 +76,4 @@ class RebuildPolicy:
         graph_node = None if graph is None else graph.get_nodes().get(node)
         if graph_node is None:
             raise ValueError(f"{node}'s rebuild policy names walk {walk!r}, which doesn't run {node}")
-        return set(graph_node.input_names)
+        return set(graph_node.input_names) - {chunk_tick_name(node, walk)}

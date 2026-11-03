@@ -163,13 +163,13 @@ class WorkerGraphQueues:
             queue.register_loop_finish_signal(name)
 
     def mark_node_complete(
-        self, request_id: int, node_name: str
+        self, request_id: int, node_name: str, loop_stride: int = 1,
     ) -> NodeCompletionOutput:
         """Complete a node in this worker graph's per-request io and return
         the registry's NodeCompletionOutput (output_edges + filtered_signals)."""
         assert request_id in self.per_request_queues, \
             f"Tried to complete node {node_name!r} for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        return self.per_request_queues[request_id].mark_node_complete(node_name)
+        return self.per_request_queues[request_id].mark_node_complete(node_name, loop_stride)
 
     def get_dynamic_loop_iters(self, request_id: int) -> dict[str, int]:
         assert request_id in self.per_request_queues, \
@@ -194,9 +194,7 @@ class PerRequestInfo:
 
     Everything graph-shaped -- node/loop routing, the sharding config, the
     worker graph ids, the live queues -- belongs to PythonGraphRuntime. What
-    is left is the forward-pass info (a wire object) and the stream buffers
-    (which hold real tensors), neither of which can live behind the runtime's
-    contract.
+    is left is the forward-pass info (a wire object) and the stream buffers.
     """
     # edge_name -> StreamBuffer
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)

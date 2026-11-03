@@ -639,7 +639,7 @@ class _Leader:
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), chunk_ranges={},
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),
@@ -737,8 +737,8 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
-        del batch_ids, affected_resources, inside_only
+    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+        del graph_walk, batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -943,7 +943,6 @@ class _ForwardingLeader:
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
-        self._last_active: dict = {}
         self._rebuilds = Rebuilds({}, {})
         self._kv_keys, self._kv_caches, self._dropped, self._victims, self._preempted = {}, {}, {}, {}, {}
         self.streaming_buffers: dict = {}
@@ -966,7 +965,7 @@ class _ForwardingLeader:
         )
         self.request_state = SimpleNamespace(remove_request=lambda rid: None)
         self.engine_manager = SimpleNamespace(
-            remove_request=lambda rid: None, evictable_nodes=lambda: (),
+            remove_request=lambda rid: None,
         )
         self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
         self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
@@ -1120,6 +1119,7 @@ class _SpecParent:
 
         class _Batch:
             node_name = "node"
+            incomplete_node_rids = frozenset()
 
             @property
             def request_to_worker_graph(self):

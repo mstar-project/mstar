@@ -22,8 +22,12 @@ from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayo
 from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.rebuild import HostCopies, KeptIds, PrefillStep, Rebuilds, policies_run_here
 
 NODE, PREFILL, VISION, VIT, DECODE = "LLM", "prefill", "vision", "vit", "decode"
@@ -140,6 +144,26 @@ def test_only_a_request_whose_layout_its_rebuild_rows_can_write_again_keeps_its_
         "a request no rebuild can write again would be preemptible, or the reverse"
     )
     assert (R in rebuilds._accepted[NODE]) == keeps, "a request would record prefill steps no rebuild reads"
+
+
+@pytest.mark.parametrize("model_class, attrs", [
+    (Qwen3_5DenseModel, {"config": SimpleNamespace(max_position_embeddings=4096), "vision_config": None}),
+    (OrpheusModel, {"config": SimpleNamespace(max_position_embeddings=4096)}),
+    (BagelModel, {
+        "config": SimpleNamespace(max_position_embeddings=4096, num_timesteps=50),
+        "_has_cfg_parallel": False, "_image_gen_remote_handoff": False,
+    }),
+    (Qwen3OmniModel, {"config": SimpleNamespace(thinker_text=SimpleNamespace(max_position_embeddings=4096))}),
+], ids=["qwen3_5", "orpheus", "bagel", "qwen3_omni"])
+def test_a_policy_passes_its_check_on_a_walk_that_chunks(model_class, attrs):
+    """A chunkable node runs its walk inside a chunk Loop, which adds the Loop's tick to the node's inputs."""
+    model = model_class.__new__(model_class)
+    vars(model).update(attrs)
+    graphs = model.get_graph_walk_graphs()
+
+    for node, policy in model.rebuild_policies().items():
+        assert chunk_loop_name(node, policy.walk) in graphs[policy.walk].get_loops(), "the walk runs no chunk Loop"
+        policy.check(node, graphs)
 
 
 def test_each_prefill_step_is_kept_once_it_has_run_and_its_rows_share_one_copy():
