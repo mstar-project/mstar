@@ -423,7 +423,7 @@ def test_glm5next_model_constructs_from_config():
     # NoPE: no rope slot in the cache unless MTP needs it
     assert (kv.kv_lora_rank, kv.qk_rope_head_dim, kv.head_dim) == (512, 0, 512)
     assert kv.max_seq_len == model.config.index_topk == 2048
-    assert kv.page_size == 128  # the FlashInfer MLA kernel's page size
+    assert kv.tokens_per_page == 128  # the FlashInfer MLA kernel's page size
     attn = specs[ATTN].config
     assert attn.backend == AttnBackend.FLASHINFER_MLA
     assert attn.sm_scale == pytest.approx(256 ** -0.5)
@@ -690,9 +690,9 @@ class _LinearScanMatcher:
         self.rules = rules
 
     def __call__(self, name):
-        from mstar.model.loader.base import _apply_stacked
+        from mstar.model.loader.base import apply_stacked
 
-        return _apply_stacked(name, self.rules)
+        return apply_stacked(name, self.rules)
 
 
 @torch.no_grad()

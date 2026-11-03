@@ -149,6 +149,7 @@ class Runtime:
         from mstar.engine.resources.base import EngineResourceInfo, build_resource
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.runner import StepRunner
+        from mstar.engine.resources.spec import apply_yaml_overrides
         from mstar.model.command_a_plus.config import KV_CACHE
 
         self.model = CommandAPlusModel(str(args.checkpoint), max_seq_len=args.context)
@@ -162,13 +163,13 @@ class Runtime:
         self.vision = self.model.get_submodule("vision_encoder", device=torch.device("cuda", group.rank),
                                                autocast_dtype=torch.bfloat16) if args.images else None
         specs = {spec.resource_key: spec for spec in self.model.get_node_resources()}
-        specs[KV_CACHE].config.max_num_pages = 256
-        specs[KV_CACHE].config.page_size = 128
+        # as a server resolves them, so the pool keeps the local layers' window
+        apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"max_num_pages": 256}}})
         transfer = TransferEngineInfo(f"validation_{group.rank}", "validation", LocalTransferEngine("localhost"))
         self.resources = {key: build_resource(spec, EngineResourceInfo(
             device=torch.device("cuda", group.rank), kv_dtype=torch.bfloat16,
             joint_comm_group=JointGroups(group, CommGroup.trivial()), transfer_engine_info=transfer,
-            dependencies={dep: specs[dep] for dep in spec.depends_on()},
+            needs_remote_transfer=False, dependencies={dep: specs[dep] for dep in spec.depends_on()},
         )) for key, spec in specs.items()}
         self.runner = StepRunner(self.resources)
         self.node.bind_node_resources(self.resources)

@@ -14,10 +14,10 @@ from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 
 
 def _submodule(config) -> Glm52LLMSubmodule:
-    # get_accelerator_graph_configs reads only self.config
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = config
-    return sub
+    # get_accelerator_graph_configs reads the config and the ladder, not the weights
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    return Glm52LLMSubmodule(language_model, config)
 
 
 def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
@@ -43,6 +43,15 @@ def test_prefill_buckets_default_without_kwargs():
     packed = _prefill_config(_submodule(model.config))
     assert packed.get_total_tokens(1) == Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS
     assert packed.capture_batch_sizes == Glm52LLMSubmodule.PREFILL_CAPTURE_BATCH_SIZES
+
+
+@pytest.mark.parametrize("buckets", [[], [64, 64]])
+def test_a_bad_prefill_ladder_is_refused(buckets):
+    """Checked as Qwen3.5's and Qwen3-Omni's ladders are: an empty ladder is
+    not the default, and a repeat is not captured twice."""
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced", prefill_token_buckets=buckets)
+    with pytest.raises(ValueError, match="prefill_token_buckets"):
+        _submodule(model.config)
 
 
 def test_config_default_buckets_unchanged():

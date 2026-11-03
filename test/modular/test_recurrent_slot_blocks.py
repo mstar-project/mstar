@@ -38,7 +38,8 @@ def build_pool() -> RecurrentStatePool:
 def run(pool: RecurrentStatePool, step: RecurrentStep, rids) -> None:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False)
     for rid in rids:
-        pool.ingest_request(rid)
+        if rid not in pool._slots:  # once per request, as the worker does (#725)
+            pool.ingest_request(rid)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
     pool.commit(step, ctx)

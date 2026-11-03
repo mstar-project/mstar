@@ -85,6 +85,13 @@ def _shard_best(local: torch.Tensor, first_id: int) -> torch.Tensor:
     return torch.cat([val, (idx + first_id).to(torch.int32)], -1)
 
 
+
+def _upload(stager: PinnedStager, values: list, device: torch.device) -> torch.Tensor:
+    """``values`` on ``device`` in ``stager``'s dtype: one non-blocking copy out of its pinned ring."""
+    out = torch.empty(len(values), dtype=stager.dtype, device=device)
+    stager.copy_(out, values)
+    return out
+
 class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
@@ -375,7 +382,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 keep[start] = 0.0
             start += inp.input_seq_len
         # staged in fp32 (no bf16 host view), cast on the device
-        return self._keep_stager.to_device(keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
+        return _upload(self._keep_stager, keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
 
     def _mailbox_key(self, engine_inputs: ModelInputsFromEngine) -> int | None:
         """A captured step's capture slot, None eager: each has its own mailbox, which a
@@ -404,7 +411,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
                     self.request_state(rid).add("mtp_pending", (seq, key, row))
-        return self._long_stager.to_device([seq], self.lm_head.weight.device)
+        return _upload(self._long_stager, [seq], self.lm_head.weight.device)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -413,7 +420,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         for inp in inputs:
             end += inp.input_seq_len
             last.append(max(end - 1, 0))  # a padding row repeats the one before
-        return self._int_stager.to_device(last, self.lm_head.weight.device)
+        return _upload(self._int_stager, last, self.lm_head.weight.device)
 
     def _forward(
         self,

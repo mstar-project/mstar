@@ -41,11 +41,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from test_flux2_klein_reference_equivalence import _encode_rows
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.z_image.config import DENOISE_LOOP, ZImageConfig, resolve_snapshot_dir
-from mstar.model.z_image.submodules import CAP_PAD_MASK, LATENTS, TEXT_EMBEDS, TEXT_INPUTS, padded_length
+from mstar.model.z_image.submodules import CAP_PAD_MASK, LATENTS, TEXT_EMBEDS, padded_length
 from mstar.model.z_image.z_image_model import IMAGE_GEN_WALK, ZImageModel
 
 MODEL_REPO = "Tongyi-MAI/Z-Image-Turbo"
@@ -134,13 +136,10 @@ def _encode(subs, prompts, batched: bool) -> list[torch.Tensor]:
     text = subs["text_encoder"]
     rows = [text.prepare_inputs(IMAGE_GEN_WALK, _info(f"t{i}", 0, 0, int(ids.shape[0])), {TEXT_INPUTS: [ids]})
             for i, (_, ids) in enumerate(prompts)]
-    rids = [f"t{i}" for i in range(len(prompts))]
     with torch.inference_mode():
         if batched:
-            out = text.forward_batched(IMAGE_GEN_WALK, _eng(rids), **text.preprocess(IMAGE_GEN_WALK, _eng(rids), rows))
-            return [out[rid][TEXT_EMBEDS][0] for rid in rids]
-        return [text.forward(IMAGE_GEN_WALK, _eng([rid]), **text.preprocess(IMAGE_GEN_WALK, _eng([rid]), [row]))
-                [TEXT_EMBEDS][0] for rid, row in zip(rids, rows, strict=True)]
+            return _encode_rows(text, IMAGE_GEN_WALK, rows)
+        return [_encode_rows(text, IMAGE_GEN_WALK, [row])[0] for row in rows]
 
 
 def _trajectory(subs, prompts, embeds, prefix: str, batched: bool, seeds=SEEDS) -> list[list[torch.Tensor]]:

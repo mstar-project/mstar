@@ -14,6 +14,10 @@ mod bindings;
 pub mod communicator;
 #[cfg(feature = "python")]
 pub mod graph;
+#[cfg(feature = "python")]
+pub mod kv_plan;
+#[cfg(feature = "python")]
+pub mod page_arena;
 pub mod shm;
 #[cfg(feature = "python")]
 pub mod tensors;

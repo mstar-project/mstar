@@ -355,6 +355,9 @@ class Glm5NextModel(Model):
         if kwargs.get("min_p", 0) > 0:
             # the node's sampler is built without min-p, and the request configs do not pass it on
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
+        if kwargs.get("return_logprobs"):
+            # the sampler configs carry none, which the conductor refuses too
+            raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
 
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax; refused here, it is the client's 400 rather than a
