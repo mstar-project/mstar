@@ -288,6 +288,29 @@ def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
     assert ("forward", "idle", 0) in log, log
 
 
+def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_builds_the_next_step():
+    """Rank 0 sent a step with no rows, tore "gone" down stamped with it, and then sent N+1 into the room "gone"
+    freed. A follower whose first try at a step away from its own chain takes the step with no rows tears "gone"
+    down before its second try builds N+1, as rank 0 did before it sent N+1."""
+    log = []
+    w = Worker.__new__(Worker)
+    w.request_state, w._removes_awaiting_step = None, {0: ["gone"]}
+    w._remove_request = lambda body: log.append(("teardown", body.request_id))
+
+    def _get_next_batch(request_state, exclude_target=None):
+        if exclude_target is not None:
+            w.scheduler.last_consumed_tp_seq = 0
+            log.append(("took", 0))
+            return None
+        log.append(("built", 1))
+        return "N+1"
+
+    w.scheduler = SimpleNamespace(get_next_batch=_get_next_batch, last_consumed_tp_seq=-1)
+
+    assert Worker._next_batch(w, (NODE, WALK)) == "N+1"
+    assert log == [("took", 0), ("teardown", "gone"), ("built", 1)], "N+1 would admit with gone's pages held here"
+
+
 def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
     """Here before this rank has even popped N+1: held until it has, then torn down behind
     the admit fence of the next pass."""
