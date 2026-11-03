@@ -86,4 +86,12 @@ def _quantiles(spec: dict, key: str) -> QuantileStats | None:
     if q01.ndim != 1 or q01.shape != q99.shape or not q01.numel():
         raise ValueError(f"norm_stats.{key}: q01 and q99 must be lists of one length, got "
                          f"{tuple(q01.shape)} and {tuple(q99.shape)}")
-    return QuantileStats(q01, q99)
+    # openpi's norm_stats.json pads every robot to the model width with q01 == q99 == 0.
+    # Those dims are not the robot's, so drop them: a file then covers the dims the
+    # inline stats list, and a padded state is refused the same way with either.
+    width = q01.numel()
+    while width and q01[width - 1] == q99[width - 1]:
+        width -= 1
+    if not width:
+        raise ValueError(f"norm_stats.{key}: q01 equals q99 in every dim")
+    return QuantileStats(q01[:width], q99[:width])
