@@ -109,12 +109,12 @@ def one_cpu_cluster(cpu: int) -> frozenset[int]:
 
 
 def _plan(setting, addresses, mask, root, usable=None, idle=None, reachable=(), siblings=smt, cluster=one_cpu_cluster,
-          idle_hold="off"):
+          idle_hold="off", own=(), slot=0):
     # placement is what most of this file is about, so a host with deep idle unless a test says otherwise
     cpu_root = idle if idle is not None else _idle(root.parent / "deep", [min(mask)], XEON)
     return deployment_plan(setting, addresses, mask=mask, usable=usable or len(mask), pci_root=root,
                            siblings=siblings, cluster=cluster, cpu_root=cpu_root, reachable=reachable,
-                           idle_hold=idle_hold)
+                           idle_hold=idle_hold, own=own, slot=slot)
 
 
 def _one(cpu) -> StepCpus:
@@ -166,6 +166,14 @@ def test_pci_addresses_come_from_torch_on_cuda_and_rocm(monkeypatch):
         assert platform.pci_address(0) == "0000:40:00.0"
         assert platform.pci_address(5) is None
     assert CpuPlatform().pci_address(0) is None
+
+
+def test_a_processs_own_gpus_are_the_devices_torch_counts(monkeypatch):
+    """``--gpus 7`` leaves torch one device, whatever device nodes the container has."""
+    monkeypatch.setattr(interface.torch.accelerator, "device_count", lambda: 2)
+    monkeypatch.setattr(CudaPlatform, "pci_address", lambda self, i: ["0000:fa:00.0", None][i])
+    assert CudaPlatform().visible_pci_addresses() == {"0000:fa:00.0"}
+    assert CpuPlatform().visible_pci_addresses() == frozenset()
 
 
 # ── always: three cores a worker, one hardware thread of each ───────────────
@@ -837,10 +845,12 @@ sys.stdin.read()
 def gpu_locks(tmp_path, monkeypatch):
     """Locks in a directory of the test's, held by this process until it ends."""
     held: dict[str, int] = {}
+    cores: dict[Path, int] = {}
     monkeypatch.setattr(cpus, "_GPU_LOCK_DIR", tmp_path)
     monkeypatch.setattr(cpus, "_gpu_locks", held)
+    monkeypatch.setattr(cpus, "_core_locks", cores)
     yield tmp_path
-    for fd in held.values():
+    for fd in [*held.values(), *cores.values()]:
         os.close(fd)
 
 
@@ -1022,6 +1032,222 @@ def test_only_a_placed_plan_that_pins_takes_the_lock(api_plan, monkeypatch, gpu_
     assert api_plan().pinned == frozenset()
     monkeypatch.setattr(cpus, "deployment_plan", real)
     assert cpus._gpu_locks == {} and not list(gpu_locks.glob("mstar-gpu-*"))
+
+
+# ── one server per core ─────────────────────────────────────────────────────
+
+# a node of four GPUs, as on an 8-GPU host with two sockets, and a job's 8 cores on it
+NODE4 = {"0000:18:00.0": 0, "0000:2a:00.0": 0, "0000:3a:00.0": 0, "0000:5d:00.0": 0,
+         "0000:9a:00.0": 1, "0000:ab:00.0": 1, "0000:ba:00.0": 1, "0000:db:00.0": 1}
+ON_NODE = ("0000:9a:00.0", "0000:ab:00.0", "0000:ba:00.0", "0000:db:00.0")
+JOB = "32-39,160-167"
+
+# another server in this container: plan from the fake host, claim the cores, say how that went, stay up until told
+_CORE_SERVER = """
+import json, sys
+from pathlib import Path
+from mstar.utils import cpus
+lock_dir, root, setting, mask, address = sys.argv[1:6]
+cpus._GPU_LOCK_DIR = Path(lock_dir)
+def smt(cpu):
+    return frozenset({cpu % 128, cpu % 128 + 128})
+def build(slot):
+    return cpus.deployment_plan(int(setting) if setting.isdigit() else setting, [address],
+                                mask=cpus.parse_cpu_list(mask), usable=64, pci_root=Path(root), siblings=smt,
+                                cluster=lambda cpu: frozenset({cpu}), reachable=sys.argv[6:], own=[address], slot=slot)
+plan = cpus.claim_cores(build(0), build, siblings=smt)
+print(json.dumps({"pinned": sorted(plan.pinned), "why": plan.why}), flush=True)
+sys.stdin.read()
+"""
+
+
+def _node4(tmp_path, setting, address, mask=JOB, slot=0, own=None):
+    base = tmp_path / "node4"
+    root = base / "pci" if base.exists() else _sysfs(base, NODE4)
+    return _plan(setting, [address], parse_cpu_list(mask), root,
+                 reachable=tuple(NODE4), own=(address,) if own is None else own, slot=slot)
+
+
+@pytest.fixture
+def core_server(gpu_locks, tmp_path):
+    """Starts a server process on the fake 4-GPU node that claims its cores;
+    gives back the process and what it pinned."""
+    import json
+
+    root = _sysfs(tmp_path / "other", NODE4)
+    started = []
+
+    def start(address, setting="always", mask=JOB):
+        p = subprocess.Popen(
+            [sys.executable, "-c", _CORE_SERVER, str(gpu_locks), str(root), setting, mask, address, *NODE4],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "PYTHONPATH": str(REPO)},
+        )
+        started.append(p)
+        return p, json.loads(p.stdout.readline())
+
+    yield start
+    for p in started:
+        p.kill()
+        p.communicate()
+
+
+def _claim(tmp_path, setting, address, mask=JOB):
+    def build(slot):
+        return _node4(tmp_path, setting, address, mask, slot)
+
+    return cpus.claim_cores(build(0), build, siblings=smt)
+
+
+def test_a_mask_too_small_for_every_reachable_gpu_is_sized_by_the_processs_own(tmp_path):
+    """Eight cores can't give each of the node's four reachable GPUs four, but
+    this process uses one of them: three cores and an API core, and the mask
+    holds a second such set."""
+    before = _node4(tmp_path, "always", ON_NODE[3], own=())
+    assert before.pinned == frozenset() and "GPU 4 of 4 on its NUMA node" in before.why
+    assert "8 core(s) there for 4 GPU(s)" in before.why
+    plan = _node4(tmp_path, "always", ON_NODE[3])
+    assert plan.workers[0].cpus == {32, 33, 34} and plan.result == 39 and (plan.sets, plan.slot) == (2, 0)
+    assert plan.why.endswith("sized by the GPUs this process uses, set 1 of 2")
+    assert "sized by the GPUs this process uses" in plan.workers[0].why
+    second = _node4(tmp_path, "always", ON_NODE[3], slot=1)
+    assert second.workers[0].cpus == {35, 36, 37} and second.result == 38
+    assert "set 3 asked for" in _node4(tmp_path, "always", ON_NODE[3], slot=2).why
+    # a GPU the process wasn't given doesn't size it
+    assert _node4(tmp_path, "always", ON_NODE[3], own=ON_NODE[:3]).pinned == frozenset()
+
+
+def test_a_mask_every_reachable_gpu_fits_places_as_before_whatever_the_process_uses(tmp_path):
+    for own in ((), (ON_NODE[3],)):
+        plan = _node4(tmp_path, "always", ON_NODE[3], mask="32-47,160-175", own=own)
+        assert plan.workers[0].cpus == {41, 42, 43} and plan.result == 44 and plan.sets == 1
+        assert plan.why.endswith("every reachable GPU fits")
+    # the same in a container that opens two GPUs
+    plan = _plan("always", [POD[0]], parse_cpu_list("32-39"), _sysfs(tmp_path / "pod"), reachable=POD, own=POD[:1])
+    assert plan.pinned == {32, 33, 34, 39} and plan.sets == 1 and plan.why.endswith("every reachable GPU fits")
+
+
+def test_two_servers_in_one_container_take_disjoint_cores_then_a_third_is_refused(core_server, tmp_path, caplog):
+    first, placed = core_server(ON_NODE[0])
+    assert placed["pinned"] == [32, 33, 34, 39]
+    with caplog.at_level(logging.INFO, logger="mstar.utils.cpus"):
+        plan = _claim(tmp_path, "always", ON_NODE[3])
+    assert plan.workers[0].cpus == {35, 36, 37} and plan.result == 38 and plan.slot == 1 and plan.locked == "35-38"
+    assert f"set 1 of 2: core 32 is held by pid {first.pid}" in caplog.text and "trying the next set" in caplog.text
+    _, refused = core_server(ON_NODE[1])
+    assert refused["pinned"] == [] and refused["why"].startswith("not pinned: no core set left in the mask")
+    assert f"core 32 is held by pid {first.pid}" in refused["why"]
+    assert f"core 35 is held by pid {os.getpid()}" in refused["why"]
+
+
+def test_a_core_lock_goes_with_its_server_and_a_dead_pid_is_taken_over(core_server, tmp_path, gpu_locks, caplog):
+    for stop in ("exit", "kill"):
+        first, placed = core_server(ON_NODE[0])
+        assert placed["pinned"] == [32, 33, 34, 39]
+        if stop == "exit":
+            first.communicate("")
+        else:
+            first.kill()
+            first.communicate()
+        with caplog.at_level(logging.INFO, logger="mstar.utils.cpus"):
+            plan = _claim(tmp_path, "always", ON_NODE[3])
+        assert plan.pinned == {32, 33, 34, 39} and plan.slot == 0
+        assert f"mstar-core-32.lock names pid {first.pid}, which has exited; taking it over" in caplog.text
+        assert (gpu_locks / "mstar-core-32.lock").read_text() == f"{os.getpid()}\n"
+        for fd in cpus._core_locks.values():
+            os.close(fd)
+        cpus._core_locks.clear()
+        caplog.clear()
+    # this process's own pid left in a file is no takeover
+    with caplog.at_level(logging.INFO, logger="mstar.utils.cpus"):
+        assert _claim(tmp_path, "always", ON_NODE[3]).slot == 0
+    assert "taking it over" not in caplog.text
+
+
+def test_one_server_locks_its_cores_once_and_a_refusal_holds_none(core_server, tmp_path, gpu_locks):
+    plan = _claim(tmp_path, "always", ON_NODE[3])
+    held = dict(cpus._core_locks)
+    assert sorted(p.name for p in held) == [f"mstar-core-{c}.lock" for c in (32, 33, 34, 39)]
+    assert all(not os.get_inheritable(fd) for fd in held.values())
+    assert cpus.claim_cores(plan, None, siblings=smt).locked == "32-34,39" and cpus._core_locks == held
+    mode = (gpu_locks / "mstar-core-32.lock").stat().st_mode & 0o777
+    assert mode == 0o666, "another user's server couldn't write its pid"
+    # a set one of whose cores is held is let go whole
+    for fd in held.values():
+        os.close(fd)
+    cpus._core_locks.clear()
+    other, placed = core_server(ON_NODE[0], mask="34-39,162-167")
+    assert 34 in placed["pinned"]
+    assert "core 34 is held" in cpus._lock_cores([32, 33, 34]) and cpus._core_locks == {}
+    assert cpus._lock_cores([32, 33]) is None
+
+
+def test_siblings_and_a_cpu_number_go_through_the_lock(core_server, tmp_path):
+    # six cores: short of two for each of the node's four GPUs, three sets for this process's one
+    first, placed = core_server(ON_NODE[0], "siblings", "32-37,160-165")
+    assert placed["pinned"] == [32, 37, 160]
+    plan = _claim(tmp_path, "siblings", ON_NODE[3], "32-37,160-165")
+    assert plan.workers[0].cpus == {33, 161} and plan.result == 36 and (plan.sets, plan.slot) == (3, 1)
+    # a number names one set: the second server to name it pins nothing
+    numbered, placed = core_server(ON_NODE[0], "40", "40-47,168-175")
+    assert placed["pinned"] == [40, 47, 168]
+    refused = _claim(tmp_path, 40, ON_NODE[3], "40-47,168-175")
+    assert refused.pinned == frozenset() and f"core 40 is held by pid {numbered.pid}" in refused.why
+
+
+def test_the_api_server_takes_the_next_free_set_and_its_workers_follow(core_server, tmp_path, monkeypatch, caplog):
+    """The workers rebuild the plan, so they learn which set their API server
+    locked from the environment it starts them with."""
+    from mstar.api_server import entrypoint
+
+    root = _sysfs(tmp_path / "api", NODE4)
+    plan = deployment_plan
+
+    def placed(setting, addresses, **kw):
+        kw.update(reachable=tuple(NODE4), own=[ON_NODE[3]])
+        return plan(setting, addresses, mask=parse_cpu_list(JOB), usable=16, pci_root=root, siblings=smt,
+                    cluster=one_cpu_cluster, cpu_root=_idle(root.parent / "deep", [32], XEON), **kw)
+
+    monkeypatch.setattr(cpus, "device_addresses", lambda devices: [ON_NODE[3]] * len(devices))
+    monkeypatch.setattr(cpus, "deployment_plan", placed)
+    monkeypatch.setattr(cpus, "smt_siblings", smt)
+    monkeypatch.setattr(entrypoint, "accelerator_type", lambda: "cuda")
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
+    monkeypatch.delenv(cpus.CORE_SET_ENV, raising=False)
+    config = {"node_groups": [{"node_names": ["llm"], "ranks": [0]}]}
+    other, _ = core_server(ON_NODE[0])
+    api = entrypoint.deployment_cpu_plan(config)
+    assert api.workers[0].cpus == {35, 36, 37} and api.result == 38 and os.environ[cpus.CORE_SET_ENV] == "1"
+    worker = _bare_worker("worker_0", "cuda:0")
+    worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    assert cpus.plan() == api and worker._step_cpus.cpus == {35, 36, 37}
+    from api_server_helpers import make_test_api_server
+
+    cpus.install(api)
+    with caplog.at_level(logging.INFO, logger="mstar.api_server.entrypoint"):
+        make_test_api_server()._take_result_cpu()
+    assert ("on CPU 38 (always: GPU 1 of 1 on its NUMA node, over its allowed CPUs 32-39,160-167 (the first "
+            "worker's device), from the top; sized by the GPUs this process uses, set 2 of 2; lock held on cores "
+            "35-38; mask 32-39,160-167)") in caplog.text
+    # once another server has set 2 as well, it pins nothing, and nor do its workers
+    for fd in cpus._core_locks.values():
+        os.close(fd)
+    cpus._core_locks.clear()
+    third, placed_third = core_server(ON_NODE[1])
+    assert placed_third["pinned"] == [35, 36, 37, 38]
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        refused = entrypoint.deployment_cpu_plan(config)
+    assert refused.pinned == frozenset() and os.environ["MSTAR_STEP_THREAD_CORE"] == "off"
+    assert f"core 32 is held by pid {other.pid}" in caplog.text and f"core 35 is held by pid {third.pid}" in caplog.text
+    # a number goes through the same lock
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "32")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        assert entrypoint.deployment_cpu_plan(config).pinned == frozenset()
+    assert f"step_thread_core 32: nothing pinned, no core set left in the mask (set 1 of 1: core 32 is held by pid " \
+           f"{other.pid}" in caplog.text
+    cpus.install(None)
+    entrypoint.knobs.configure(None)
 
 
 # ── worker ──────────────────────────────────────────────────────────────────
