@@ -317,8 +317,8 @@ class KVPageCounts(NamedTuple):
 @dataclass(slots=True)
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: the pages it asked for, less the
-    cache hits another request holds, and less what a window doesn't hold once its prompt is written. No
-    cache hit is taken off for a guaranteed request. ``remaining`` is its share of `KVManager._unused`, and
+    cache hits another request holds, and less what a window doesn't hold once its prompt is written. A
+    guaranteed request's hits come off when it adopts its lease. ``remaining`` is its share of `KVManager._unused`, and
     ``prompt`` is the pages it asked for, which `unreserve` puts back in `_asks`. An allotment for a request
     on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload."""
@@ -894,7 +894,7 @@ class KVManager(AttentionResource):
                 image_end = self._image_end(ends, held, total)
                 if image_end is not None:
                     end, key = image_end
-                    cached = self._retain_cached(rid, stream, self._index.lookup([key]), counted=False)
+                    cached = self._retain_cached(rid, stream, self._index.lookup([key]))
                     if cached:
                         # The lease isn't on the stream yet, so ``remaining`` still counts its pages as unused.
                         # Check this page against the whole allowance rather than ``remaining``.
@@ -1635,12 +1635,15 @@ class KVManager(AttentionResource):
             stream.chain.extend(col[i].tolist(), page_size)
 
     def _adopt(self, rid: str, stream: CacheStream, pages: list[int]) -> None:
-        """Make ``pages`` the whole of a stream that has written nothing yet.
+        """Make ``pages`` the whole of a stream that has written nothing yet. The lent ones come off a
+        guaranteed request's allotment, since no cut can release them now.
 
         Any pages the stream already holds are empty ones a refused admit left, so they are released.
         """
         empty, stream.page_indices = stream.page_indices, list(pages)
         self._release(rid, stream, empty)
+        if rid in self._guaranteed:
+            self._allotments[rid].pages -= len(stream.lent.intersection(pages))
         self._plan_epoch += 1
         stream.stored_len = len(pages) * self.config.tokens_per_page
 
@@ -4623,32 +4626,29 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         return (0 if allotment is None else allotment.remaining) + self._room()
 
-    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int], counted: bool = True) -> list[int]:
+    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.
 
         A page that isn't evictable is lent and takes no room. An evictable one comes out
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        ``counted`` is False for pages ``rid``'s allotment doesn't count, such as an image end. A
-        guaranteed request is charged for a page its allotment counts, even one another request holds,
-        and its allotment grows by each evictable page it doesn't count.
+        A guaranteed request's allotment keeps every page its walks write until its lease becomes its pages,
+        since a cut leaves the walk to write them again. So an evictable page comes out of the room alone,
+        and every page is lent.
         """
         if self._decides:
             evictable = self._index.evictable()
             guaranteed = rid in self._guaranteed
-            borrow = guaranteed and not counted
-            allowance = self._room() if borrow else self._allowance(rid)
+            allowance = self._room() if guaranteed else self._allowance(rid)
             for at, page in enumerate(pages):
-                if page not in evictable and not (guaranteed and counted):
-                    stream.lent.add(page)
-                elif allowance > 0:
+                if page in evictable:
+                    if allowance <= 0:
+                        pages = pages[:at]
+                        break
                     allowance -= 1
-                    if borrow:
-                        self._allotments[rid].pages += 1
-                else:
-                    pages = pages[:at]
-                    break
+                if guaranteed or page not in evictable:
+                    stream.lent.add(page)
         self._arena.retain(pages)
         return pages
 

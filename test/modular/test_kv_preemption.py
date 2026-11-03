@@ -386,6 +386,7 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
 
     kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
     leased = len(kv._streams["g"]["main"].lease or ())
+    assert _step(kv, "g", PAGE_SIZE).ok
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
 
 
