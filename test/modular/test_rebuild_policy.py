@@ -235,9 +235,7 @@ def test_removing_a_request_gives_its_slice_back():
 
 
 def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
-    """A slice held 4 B for each prompt id, the int32 the pool's stream cast the prompt to. That cast made every later
-    step slower on the device, so the prompt is now kept as its walk read it, as int64, which a slice of 4 B per id
-    can't hold."""
+    """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     assert _ingest(rebuilds, R, (PrefixSpan(5, 5, PREFILL),))
     assert rebuilds._droppable[NODE][R].piece.nbytes == 40, "keeping the prompt would overflow its slice"

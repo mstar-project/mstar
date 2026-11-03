@@ -216,8 +216,9 @@ class Rebuilds:
         copies for its spans other than ids. None when the pool can't hold it, or when the request has spans other
         than ids and the node's dtype is unknown.
 
-        The ids' dtype isn't known until a step reads them, so each takes 8 B, as int64, the widest an embedding
-        reads. When the walk reads them in fewer bytes, the rest goes back to the pool once they are kept."""
+        The ids' dtype isn't known until a step reads them, so each takes 8 B, enough for int64, the widest dtype a
+        step reads ids in. When the walk reads the ids in fewer bytes, the unused room goes back to the pool once the
+        prompt is kept."""
         spans = [span for layout in layouts for span in layout.spans]
         ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
         others = [span for span in spans if span.kind != SpanKind.IDS]
