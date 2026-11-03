@@ -1172,6 +1172,9 @@ uses <code class="docutils literal notranslate"><span class="pre">soundfile</spa
 <code class="docutils literal notranslate"><span class="pre">response_format</span></code> (<code class="docutils literal notranslate"><span class="pre">mp3</span></code>, <code class="docutils literal notranslate"><span class="pre">opus</span></code>, <code class="docutils literal notranslate"><span class="pre">flac</span></code>, …) is rejected with a 400
 rather than silently returned as WAV. Run the Python frontend for compressed
 containers.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> refuses <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (Qwen3-TTS voice cloning) with a
+400: the Python frontend decodes the clip and checks its length before
+submitting it, and the Rust frontend has no decoder to do that with.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code> (Cosmos3) returns the <strong>video-only</strong> mp4. When a
 request sets <code class="docutils literal notranslate"><span class="pre">generate_sound</span></code>, Cosmos3 generates a separate audio track that
 mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so

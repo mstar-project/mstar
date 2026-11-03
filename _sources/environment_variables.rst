@@ -387,6 +387,9 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
   rather than silently returned as WAV. Run the Python frontend for compressed
   containers.
+* ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
+  400: the Python frontend decodes the clip and checks its length before
+  submitting it, and the Rust frontend has no decoder to do that with.
 * ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
   request sets ``generate_sound``, Cosmos3 generates a separate audio track that
   mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
