@@ -1,6 +1,7 @@
 
 
 import logging
+import math
 import os
 import threading
 import time
@@ -567,6 +568,8 @@ class Engine:
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
+        # node -> `chunk_alignment`, filled on first ask
+        self._chunk_alignment: dict[str, int] = {}
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
@@ -2747,6 +2750,16 @@ class Engine:
 
     def min_chunk_tokens(self, budget: int) -> int:
         return self._chunking.min_chunk_tokens(budget)
+
+    def chunk_alignment(self, node_name: str) -> int:
+        """What a cut chunk of a ``node_name`` row is a multiple of: the alignments its
+        resources declare (`Resource.chunk_alignment`). Set once the caches are open."""
+        align = self._chunk_alignment.get(node_name)
+        if align is None:
+            mgmt = self._submodules.get(node_name)
+            align = math.lcm(1, *(r.chunk_alignment for r in mgmt.resources.values())) if mgmt else 1
+            self._chunk_alignment[node_name] = align
+        return align
 
     def set_chunking_policies(
         self, policies: Mapping[tuple[str, str], ChunkingPolicy],

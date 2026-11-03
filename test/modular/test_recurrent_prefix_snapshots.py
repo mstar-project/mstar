@@ -583,6 +583,48 @@ def test_a_prefill_hands_its_kept_states_to_the_backend_and_commit_files_them():
     assert pool._slots["a"]["main"].tokens == 19, "later boundaries would be placed from the wrong length"
 
 
+def _chunks(pool: RecurrentStatePool, rid: str, tokens: list[int], spans: list[int]) -> None:
+    """Prefill ``tokens`` from token 0 in chunks of ``spans``, each its own step."""
+    pool.ingest_request(rid)
+    pool._kv.add(rid, tokens)
+    pool.resolve_cached_prefix(rid, NODE, WALK, None)
+    for span in spans:
+        step, ctx = _step(rid, span), _ctx(rid)
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        pool.commit(step, ctx)
+
+
+def test_a_chunked_prompt_keeps_its_last_boundary_so_a_resend_restores_past_its_first_chunk():
+    """A step budget cuts a long prompt into chunks. With only the first chunk's boundary kept,
+    every resend restores there and runs the rest of the prompt again."""
+    pool = _pool(prefix_slots=3)
+    _chunks(pool, "a", A[:19], [8, 11])
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+    assert pool.chunk_alignment == PAGE, "the scheduler would cut chunks off the page grid"
+
+
+def test_a_later_chunk_makes_the_earlier_chunks_snapshot_the_first_to_evict():
+    """Two snapshots a chunked prompt would hold half as many prompts as slots, and a resend
+    cycle longer than the slots then restores nothing."""
+    pool = _pool(prefix_slots=4)
+    prompts = {"x": (A[:19], [8, 11]), "y": (list(range(100, 119)), [8, 11]),
+               "z1": (list(range(200, 219)), [19]), "z2": (list(range(300, 319)), [19])}
+    for rid, (tokens, spans) in prompts.items():
+        _chunks(pool, rid, tokens, spans)
+        pool.remove_request(rid)
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+
+
+def test_a_chunk_that_starts_off_the_page_grid_keeps_no_boundary():
+    """Its checkpoints fall a page apart from where it starts, so none is on a page."""
+    pool = _pool(prefix_slots=3)
+    _chunks(pool, "a", A[:19], [7])
+    step = _step("a", 12)
+    assert pool.admit(step, _ctx("a")).ok
+    assert not pool._snap_writes
+
+
 @pytest.mark.parametrize("release", ["rollback", "removal"])
 def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
     """A forward that raises gets neither commit nor rollback, only the request's removal.

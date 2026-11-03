@@ -99,6 +99,9 @@ class BatchBuildRequest:
     # The fewest tokens a cut row runs (the node's floor for its configured
     # budget; ``max_batch_tokens`` above is what is left of that budget).
     min_chunk_tokens: int = 1
+    # A cut row takes a multiple of this, the alignment the node's resources
+    # declare (`Engine.chunk_alignment`), so its next chunk starts on it.
+    chunk_alignment: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
 
@@ -312,12 +315,13 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         take, dropped = self.share_token_budget(
             list(scheduled.request_to_worker_graph), request.row_tokens,
             request.chunkable, request.max_batch_tokens, request.min_chunk_tokens,
-            request.start_order,
+            request.start_order, request.chunk_alignment,
         )
         if request.walk_max_tokens:
             _cap_walks(
                 scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
                 self.share_token_budget, request.min_chunk_tokens, request.start_order,
+                request.chunk_alignment,
             )
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
@@ -333,12 +337,12 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     @staticmethod
     def share_token_budget(
         rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-        min_chunk: int, start_order: dict[int, int],
+        min_chunk: int, start_order: dict[int, int], align: int = 1,
     ) -> tuple[dict[int, int], set[int]]:
         """How the step's rows share its token budget: (rid -> tokens taken,
         rids left out)."""
         return fill_token_budget_in_start_order(
-            rids, tokens, chunkable, budget, min_chunk, start_order,
+            rids, tokens, chunkable, budget, min_chunk, start_order, align,
         )
 
 
@@ -350,9 +354,9 @@ class FairShareBatchBuilder(FIFOBatchBuilder):
     @staticmethod
     def share_token_budget(
         rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-        min_chunk: int, start_order: dict[int, int],
+        min_chunk: int, start_order: dict[int, int], align: int = 1,
     ) -> tuple[dict[int, int], set[int]]:
-        return fill_token_budget(rids, tokens, chunkable, budget, min_chunk)
+        return fill_token_budget(rids, tokens, chunkable, budget, min_chunk, align)
 
 
 def _take_whole(
@@ -378,7 +382,7 @@ def _take_whole(
 
 def _run_head(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-    min_chunk: int, take: dict[int, int], dropped: set[int],
+    min_chunk: int, take: dict[int, int], dropped: set[int], align: int = 1,
 ) -> None:
     """Never an empty step while a row exists: the first of ``rids`` runs
     over budget if it must. Updates ``take`` and ``dropped`` in place."""
@@ -386,13 +390,17 @@ def _run_head(
         return
     head = rids[0]
     need = tokens.get(head, 0)
-    take[head] = min(need, max(budget, min_chunk, 1)) if head in chunkable else need
+    if head in chunkable:
+        cap = max(budget, min_chunk, 1)
+        take[head] = min(need, max(cap - cap % align, align))
+    else:
+        take[head] = need
     dropped.discard(head)
 
 
 def fill_token_budget_in_start_order(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-    min_chunk: int = 1, start_order: dict[int, int] | None = None,
+    min_chunk: int = 1, start_order: dict[int, int] | None = None, align: int = 1,
 ) -> tuple[dict[int, int], set[int]]:
     """``budget`` over ``rids`` first come, first served. Rows under an equal
     share go in whole, and then any row that can finish in what is left,
@@ -401,10 +409,11 @@ def fill_token_budget_in_start_order(
     (``start_order``), then the others as listed -- each taking all it needs
     of what is left, so a prompt finishes before the next one starts and its
     first token does not wait on every other prompt's prefill. The first that
-    does not fit is cut to what is left if that is at least ``min_chunk``
-    tokens, and otherwise waits for the next step; one that cannot be cut sits
-    out without holding up the rows behind it. Never empty while a row
-    exists: the first row runs over budget if it must.
+    does not fit is cut to what is left, rounded down to a multiple of
+    ``align``, if that is at least ``min_chunk`` tokens, and otherwise waits
+    for the next step; one that cannot be cut sits out without holding up the
+    rows behind it. Never empty while a row exists: the first row runs over
+    budget if it must.
 
     The oldest prompt mid-prefill keeps ``min_chunk`` of the budget out of
     the finishing pass, so a steady stream of short prompts cannot starve it.
@@ -434,21 +443,21 @@ def fill_token_budget_in_start_order(
         if need <= left:
             take[rid] = need
             left -= need
-        elif rid in chunkable and not cut and left >= min_chunk:
+        elif rid in chunkable and not cut and left - left % align >= max(min_chunk, 1):
             # the one row cut. Not to the floor past the budget: a step over
             # its budget pays for the next capture bucket up
             cut = True
-            take[rid] = left
-            left = 0
+            take[rid] = left - left % align
+            left %= align
         else:
             dropped.add(rid)
-    _run_head(order, tokens, chunkable, budget, min_chunk, take, dropped)
+    _run_head(order, tokens, chunkable, budget, min_chunk, take, dropped, align)
     return take, dropped
 
 
 def fill_token_budget(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
-    min_chunk: int = 1,
+    min_chunk: int = 1, align: int = 1,
 ) -> tuple[dict[int, int], set[int]]:
     """Max-min fair share of ``budget`` over ``rids``: rows under an equal share
     go in whole, the rest split what is left (chunkable rows) or sit out.
@@ -467,11 +476,13 @@ def fill_token_budget(
         dropped.update(cut[n:])
         cut = cut[:n]
     for rid in cut:
-        if share >= 1:
-            take[rid] = min(tokens.get(rid, 0), share)
+        need = tokens.get(rid, 0)
+        n = need if need <= share else share - share % align
+        if n >= 1:
+            take[rid] = n
         else:
             dropped.add(rid)
-    _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped)
+    _run_head(rids, tokens, chunkable, budget, min_chunk, take, dropped, align)
     return take, dropped
 
 
@@ -479,7 +490,7 @@ def _cap_walks(
     batch: "ScheduledBatch", take: dict[int, int], dropped: set[int],
     chunkable: set[int], caps: dict[str, int],
     share: Callable[..., tuple[dict[int, int], set[int]]],
-    min_chunk: int = 1, start_order: dict[int, int] | None = None,
+    min_chunk: int = 1, start_order: dict[int, int] | None = None, align: int = 1,
 ) -> None:
     """Hold each capped walk's rows to its cap as well as the step's budget:
     those rows share the cap as ``share`` (the builder's) shares a budget,
@@ -491,7 +502,7 @@ def _cap_walks(
             continue
         walk_take, walk_dropped = share(
             rids, {rid: take[rid] for rid in rids}, chunkable, cap, min(min_chunk, cap),
-            start_order or {},
+            start_order or {}, align,
         )
         for rid in rids:
             del take[rid]

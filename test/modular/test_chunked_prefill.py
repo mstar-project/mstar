@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.chunking import ChunkRange
@@ -193,6 +194,26 @@ def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget_in_start_order(["d0", "p0"], {"d0": 3, "p0": 100}, {"p0"}, 0, 4)
     assert take == {"d0": 3}
     assert dropped == {"p0"}
+
+
+@pytest.mark.parametrize("fill, cut", [
+    (fill_token_budget_in_start_order, {"a": 1500, "b": 512}),
+    (fill_token_budget, {"a": 896, "b": 896}),
+])
+def test_a_cut_row_takes_a_multiple_of_the_alignment_so_its_next_chunk_starts_on_it(fill, cut):
+    """A recurrent pool keeps state only on its page grid, counted from where a chunk starts;
+    a chunk cut off the grid leaves every later chunk of its prompt off it too."""
+    decodes = _decodes(31)
+    take, dropped = fill(
+        [*decodes, "a", "b"], decodes | {"a": 1500, "b": 1500}, {"a", "b"}, 2048, 128, align=128,
+    )
+    assert take == decodes | cut
+    assert not dropped
+
+
+def test_the_head_cut_over_its_budget_takes_a_multiple_of_the_alignment():
+    take, _ = fill_token_budget_in_start_order(["p"], {"p": 5000}, {"p"}, 300, 128, align=128)
+    assert take == {"p": 256}
 
 
 # ── engine: prepare once, cut per chunk ─────────────────────────────────

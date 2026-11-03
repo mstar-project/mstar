@@ -94,10 +94,12 @@ class SnapshotLease(NamedTuple):
 
 class SnapshotWrite(NamedTuple):
     """A snapshot slot that admit reserved for a prefill row's state at
-    ``offset`` tokens into the row. Commit files it under ``key``."""
+    ``offset`` tokens into the row. Commit files it under ``key``. ``row_end``
+    marks the row's last boundary, which a later chunk's supersedes."""
     slot: int
     offset: int
     key: bytes
+    row_end: bool = False
 
 
 class SnapshotTarget(NamedTuple):
@@ -253,12 +255,15 @@ class RecurrentStatePool(Resource):
         # by (rid, label, boundary), until commit files them.
         # `_decode` holds each stream's newest decode snapshot, and `_unkeyed`
         # those whose page the KV chain doesn't key yet.
+        # `_chunk_ends` holds each stream's last filed row-end snapshot (slot, key),
+        # which the stream's next chunk supersedes.
         self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
         self._snap_writes: dict[tuple[str, str, int], SnapshotWrite] = {}
         self._decode: dict[tuple[str, str], DecodeSnapshot] = {}
         self._unkeyed: set[tuple[str, str]] = set()
+        self._chunk_ends: dict[tuple[str, str], tuple[int, bytes]] = {}
         # what admits took for prefix reuse, for `rollback_admit`
         self._admit_restores: list[tuple[str, str]] = []
         self._admit_snaps: list[tuple[str, str, int]] = []
@@ -364,6 +369,8 @@ class RecurrentStatePool(Resource):
                     self._unkeyed.discard(key)
                     self._snap_free.append(decode.slot)
             self._keyed -= {k for k in self._keyed if k[0] == rid}
+            for key in [k for k in self._chunk_ends if k[0] == rid]:
+                del self._chunk_ends[key]
             self._forget_prefix_admit(lambda key: key[0] == rid)
             self._version += 1
 
@@ -375,6 +382,8 @@ class RecurrentStatePool(Resource):
         """
         with self._lock:
             self._forget_taken(lambda r: r == rid)
+            for key in [k for k in self._chunk_ends if k[0] == rid]:
+                del self._chunk_ends[key]
             labels = self._slots.get(rid)
             if not labels:
                 return
@@ -716,6 +725,12 @@ class RecurrentStatePool(Resource):
     def close_prefix_cache(self) -> None:
         self._kv = None
 
+    @property
+    def chunk_alignment(self) -> int:
+        """A page while snapshots are kept: checkpoints fall every page from a segment's
+        start, so only a chunk that starts on a page can keep its boundaries."""
+        return self._kv.config.tokens_per_page if self._kv is not None else 1
+
     def fingerprint(self) -> bytes:
         """The blocks' shapes and dtypes. The state's dtype changes what the
         recurrent layers output, and so every KV page written after them."""
@@ -824,8 +839,9 @@ class RecurrentStatePool(Resource):
         """Turn a hit's lease into a restore for plan to copy in, and reserve
         snapshot slots for the boundaries a prefill row keeps: the row's last
         boundary, and the KV hit's last boundary when the hit runs past the
-        restored length, both on the step's checkpoint interval ``every``. A row
-        that starts past token 0 and restores nothing keeps none. A pre-plan
+        restored length, both on the step's checkpoint interval ``every``. A
+        later chunk of a prompt keeps its last boundary too, when it starts on a
+        page (`chunk_alignment`); a decode row keeps none here. A pre-plan
         stages only an unprepared speculative step, which takes neither, and
         `clear_preplan` gives nothing back."""
         page = self._kv.config.tokens_per_page
@@ -841,22 +857,26 @@ class RecurrentStatePool(Resource):
                     self._admit_restores.append((rid, label))
                     start = lease.tokens
             elif self._slots[rid][label].has_state:
-                return
+                # a later chunk: its checkpoints sit on pages only from a page
+                start = self._slots[rid][label].tokens
+                if preplan or start % page:
+                    return
             if span < page or (rid, label) not in self._keyed:
                 return
-            for boundary in sorted({start + (span - 1) // every * every, start + (hit - start) // every * every}):
+            end = start + (span - 1) // every * every
+            for boundary in sorted({end, start + (hit - start) // every * every}):
                 if start < boundary <= start + span:
                     assert not preplan, "a pre-plan reserved a snapshot write"
-                    self._reserve_write(rid, label, boundary, boundary - start)
+                    self._reserve_write(rid, label, boundary, boundary - start, boundary == end)
 
-    def _reserve_write(self, rid: str, label: str, boundary: int, offset: int) -> None:
+    def _reserve_write(self, rid: str, label: str, boundary: int, offset: int, row_end: bool = False) -> None:
         """Caller holds the lock."""
         key = self._kv.chain_key(rid, label, boundary // self._kv.config.tokens_per_page)
         if key is None or key in self._snap_by_key or (rid, label, boundary) in self._snap_writes:
             return
         snap = self._reserve_snapshot()
         if snap is not None:
-            self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key)
+            self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key, row_end)
             self._admit_snaps.append((rid, label, boundary))
 
     def _file_writes(self, step: RecurrentStep) -> None:
@@ -870,7 +890,17 @@ class RecurrentStatePool(Resource):
                     f"recurrent state: the snapshot of {key[0]}/{key[1]} at {key[2]} tokens is keyed "
                     "apart from the KV chain's key there"
                 )
-            self._index(write.slot, write.key)
+            if self._index(write.slot, write.key) and write.row_end:
+                self._supersede(key[:2], write)
+
+    def _supersede(self, stream: tuple[str, str], write: SnapshotWrite) -> None:
+        """Make ``stream``'s previous row-end snapshot, an earlier chunk's, the
+        first to evict, as a reply's is: a resend restores the later one. Caller
+        holds the lock."""
+        previous = self._chunk_ends.get(stream)
+        if previous is not None and self._snap_by_key.get(previous[1]) == previous[0]:
+            self._snap_meta[previous[0]] = (previous[1], True)
+        self._chunk_ends[stream] = (write.slot, write.key)
 
     def _apply_restores(self, step: RecurrentStep) -> None:
         """Copy each restore's snapshot into its slot before the step reads it,

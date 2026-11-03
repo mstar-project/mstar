@@ -1318,6 +1318,7 @@ class MicroScheduler:
             row_tokens=row_tokens,
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
+            chunk_alignment=engine.chunk_alignment(node_walk[0]) if budgeted else 1,
             start_order=started,
         ), starts, resumed)
 

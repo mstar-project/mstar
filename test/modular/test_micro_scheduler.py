@@ -2282,6 +2282,10 @@ class _SizedEngine(_Engine):
     def min_chunk_tokens(self, budget):
         return self._chunking.min_chunk_tokens(budget)
 
+    def chunk_alignment(self, node_name):
+        del node_name
+        return 1
+
     def walk_token_caps(self, node_name, graph_walk):
         del node_name, graph_walk
 

@@ -17,8 +17,8 @@ and StreamBufferManager._rids (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
-_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
-_admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,
+_leases, _restores, _snap_writes, _decode, _unkeyed, _chunk_ends,
+_admit_restores, _admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,
 _moved} (purged by release), SamplerCells._cells (purged by the sampler's
 remove_request), and WorkerProfileInfo.
 
