@@ -67,8 +67,10 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
 
 Once a deployment has reloaded its weights in place (``weight_version`` set by the
 update), every output chunk's ``metadata`` carries ``weight_version``, the version its
-request was admitted under, and so does a non-streaming response at the top level. A
-request never runs across a reload, so all of a request's chunks carry the same one.
+request was admitted under, and so does a non-streaming response at the top level,
+taken from its first chunk that carries one, so a request that completed with no output
+chunks has none there on either frontend. A request never runs across a reload, so all
+of a request's chunks carry the same one.
 An error chunk carries it when the engine answered for an admitted request, or, failing
 that, when the request had already sent a versioned chunk. It has none for a request
 refused before admission (for example while generation is paused), nor for an error the

@@ -273,6 +273,19 @@ def test_generate_adds_the_version_only_once_there_is_one():
     assert _with_weight_version({"request_id": "r"}, "v1") == {"request_id": "r", "weight_version": "v1"}
 
 
+def test_the_top_level_version_is_the_first_chunk_that_carries_one():
+    """As the Rust frontend reads it: a request that completed with no output
+    chunks has no top-level version on either frontend."""
+    from mstar.api_server.entrypoint import _chunks_weight_version
+    from mstar.api_server.request_types import ResultChunk
+
+    assert _chunks_weight_version([]) is None
+    assert _chunks_weight_version([ResultChunk("r", "text", b"a", {})]) is None
+    chunks = [ResultChunk("r", "text", b"a", {}), ResultChunk("r", "text", b"b", {"weight_version": "v3"}),
+              ResultChunk("r", "text", b"c", {"weight_version": "v3"})]
+    assert _chunks_weight_version(chunks) == "v3"
+
+
 # -- 1,000 requests through the real conductor, a reload every 100 ----------------
 
 

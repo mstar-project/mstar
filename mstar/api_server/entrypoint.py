@@ -266,6 +266,15 @@ def _with_weight_version(body: dict, weight_version: str | None) -> dict:
     return body
 
 
+def _chunks_weight_version(chunks: list[ResultChunk]) -> str | None:
+    """The top-level ``weight_version`` of a non-streaming ``/generate``: the
+    first chunk that carries one, as the Rust frontend reads it, so a request
+    that completed with no output chunks has none on either frontend."""
+    return next(
+        (c.metadata["weight_version"] for c in chunks if c.metadata and "weight_version" in c.metadata), None,
+    )
+
+
 def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
     """``chunks`` up to and including the first error chunk, which ends the
     response, and whether there was one."""
@@ -1658,13 +1667,10 @@ class APIServer:
     # ----------------------------------------------------------
 
     async def collect_results(
-        self, request_id: str, raw_request: Request | None = None,
-        meta: dict | None = None,
+        self, request_id: str, raw_request: Request | None = None
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
-        return its chunks. Disconnecting or timing out releases engine state.
-        ``meta``, if given, gets the request's ``weight_version`` once it
-        finished."""
+        return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
@@ -1708,8 +1714,6 @@ class APIServer:
             self._retire(key)
         if req is None:
             return []
-        if meta is not None:
-            meta["weight_version"] = req.weight_version
         self._record_end(req, "success")
         if req.error is not None:
             raise HTTPException(
@@ -2730,8 +2734,7 @@ async def generate(
                 headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )
 
-        meta: dict = {}
-        chunks = await api_server.collect_results(request_id, request, meta=meta)
+        chunks = await api_server.collect_results(request_id, request)
         outputs: dict[str, list[dict]] = {}
         for chunk in chunks:
             outputs.setdefault(chunk.modality, []).append({
@@ -2739,7 +2742,7 @@ async def generate(
                 "metadata": chunk.metadata,
             })
         return JSONResponse(_with_weight_version(
-            {"request_id": request_id, "outputs": outputs}, meta.get("weight_version"),
+            {"request_id": request_id, "outputs": outputs}, _chunks_weight_version(chunks),
         ))
 
     except HTTPException:
