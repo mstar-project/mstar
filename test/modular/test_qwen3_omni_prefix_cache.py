@@ -197,6 +197,23 @@ def test_an_images_span_is_what_its_positions_place():
     )
 
 
+@pytest.mark.parametrize("grid, seconds_per_grid", [((1, 8, 12), None), ((4, 8, 12), 2.0)], ids=["image", "video"])
+def test_vision_positions_match_transformers(grid, seconds_per_grid):
+    hf = pytest.importorskip("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe")
+    start, per_second = 37, 13.0
+    ours = get_rope_index_vision(
+        torch.tensor(grid), start, per_second, spatial_merge_size=2, seconds_per_grid=seconds_per_grid,
+    )
+
+    # transformers' get_rope_index: a frame group's temporal index is its time, every axis offset by the start
+    t_index = torch.arange(grid[0]).float() * (seconds_per_grid or 1) * per_second
+    grids = torch.tensor([grid])
+    reference = hf.Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_llm_pos_ids_for_vision(
+        None, start, 0, 2, t_index, grids[:, 1], grids[:, 2],
+    )
+    assert torch.equal(ours, reference)
+
+
 _SPECIALS = {
     "<|vision_start|>": 151652, "<|vision_end|>": 151653, "<|image_pad|>": 151655, "<|video_pad|>": 151656,
     "<|audio_start|>": 151669, "<|audio_end|>": 151670, "<|audio_pad|>": 151675,
