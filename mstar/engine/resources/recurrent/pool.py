@@ -330,9 +330,7 @@ class RecurrentStatePool(Resource):
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None):
         del overrides
         with self._lock:
-            # Idempotent: the conductor sends one NewRequest per partition, so
-            # a worker serving two ingests twice.
-            self._slots.setdefault(rid, {})
+            self._slots[rid] = {}
             self._version += 1
 
     def remove_request(self, rid: str):
