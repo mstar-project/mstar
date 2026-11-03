@@ -118,6 +118,8 @@ def leased(real, padded, bs, tokens, walk="prefill", slot=0):
     ctx = StepContext(
         request_ids=tuple(real), graph_walk=walk, slot=slot, capture=False,
         slot_lease=SlotLease(slot=slot, bucket=BucketKey(walk, bs, tokens)),
+        # the prefill buckets here are packed, which the engine marks so
+        force_prefill=walk == "prefill",
     )
     ctx.set_padded_rids(tuple(padded))
     return ctx
@@ -192,8 +194,8 @@ def test_a_captured_prefill_keeps_one_layout_buffer():
 
 
 def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
-    """Under a lease the walk picks the kernels, not the spans: a replay runs what its
-    bucket captured."""
+    """A packed bucket replays uneven spans, so it runs the prefill kernels even when it
+    captures one token per row; a batched decode bucket decodes."""
     pool, kda = build()
     kda.kernels = _Recorder()
     capture = plan(pool, kda, ["a", "b"], [1, 1], leased(["a", "b"], ["a", "b"], bs=2, tokens=2))
