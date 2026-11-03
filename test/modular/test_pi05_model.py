@@ -620,6 +620,91 @@ def test_pi05_norm_stats_come_from_model_kwargs(tmp_path):
         Pi05Model("unused", skip_weight_loading=True, norm_stats=str(tmp_path / "missing.json"))
 
 
+def _openpi_padded(stats: dict, width: int = 32) -> dict:
+    """openpi's norm_stats.json pads every entry to the model width with zeros."""
+    pad = lambda v: list(v) + [0.0] * (width - len(v))  # noqa: E731
+    return {"norm_stats": {k: {q: pad(v[q]) for q in ("q01", "q99")} for k, v in stats.items()}}
+
+
+def test_norm_stats_file_padded_like_openpi_covers_only_the_robot_dims(tmp_path):
+    """openpi's own norm_stats.json has q01 == q99 == 0 past the robot's dims, so a
+    32-value padded state is refused as it is with the inline stats, and the reply's
+    padding dims pass through either way."""
+    import json
+
+    import numpy as np
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    inline = {k: {q: v[q] for q in ("q01", "q99")} for k, v in _TINY_STATS["norm_stats"].items()}
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_openpi_padded(inline)))
+    from_file, from_inline = load_norm_stats(str(path)), load_norm_stats(inline)
+    for a, b in ((from_file.state, from_inline.state), (from_file.actions, from_inline.actions)):
+        assert torch.equal(a.q01, b.q01) and torch.equal(a.q99, b.q99)
+
+    for spec in (str(path), inline):
+        model = _model_with_stats(spec)
+        with pytest.raises(ValueError, match="robot_state has 32 values"):
+            model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.1] * 32)
+        model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.1, -1.0, 0.5])
+        bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+        assert len(bins) == 3
+        actions = torch.rand(model.config.action_horizon, model.config.action_dim) * 2 - 1
+        out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+        np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
+
+
+def test_norm_stats_with_no_robot_dims_are_refused():
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    with pytest.raises(ValueError, match="q01 equals q99 in every dim"):
+        load_norm_stats({"state": {"q01": [0.0, 0.0], "q99": [0.0, 0.0]}})
+
+
+def test_load_pi05_config_takes_the_action_horizon_from_lerobot_chunk_size():
+    from mstar.model.pi05.config import load_pi05_config
+
+    # the scalar keys of lerobot/pi05_droid's config.json that touch the action chunk
+    cfg = load_pi05_config({"type": "pi05", "chunk_size": 15, "n_action_steps": 15, "max_action_dim": 32,
+                            "max_state_dim": 32, "num_inference_steps": 10, "dtype": "float32"})
+    assert (cfg.action_horizon, cfg.action_dim, cfg.num_flow_steps) == (15, 32, 10)
+    assert load_pi05_config({"chunk_size": 50}).action_horizon == 50
+
+
+def _unloaded_model(model_path_hf: str, overrides: dict) -> Pi05Model:
+    model = object.__new__(Pi05Model)
+    model.model_path_hf, model.cache_dir, model.skip_weight_loading = model_path_hf, None, False
+    model._yaml_config_overrides = dict(overrides)
+    return model
+
+
+def test_pi05_droid_yaml_takes_its_horizon_from_the_checkpoint_config(tmp_path, monkeypatch):
+    """configs/pi05_droid.yaml sets no action_horizon: lerobot/pi05_droid's config.json
+    says chunk_size 15, and a config.json that cannot be read stops the server rather
+    than leaving it on the default 50 steps."""
+    import json
+
+    import huggingface_hub
+    import yaml
+
+    kwargs = yaml.safe_load((Path(CONFIG_PATH).parent / "pi05_droid.yaml").read_text())["model_kwargs"]
+    assert "action_horizon" not in kwargs
+    repo = kwargs.pop("model_path_hf")
+    config_json = tmp_path / "config.json"
+    config_json.write_text(json.dumps({"type": "pi05", "chunk_size": 15, "n_action_steps": 15}))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda repo_id, filename, cache_dir=None: str(config_json))
+    cfg = _unloaded_model(repo, kwargs)._load_config()
+    assert (cfg.action_horizon, cfg.num_cameras) == (15, 2)
+
+    def offline(repo_id, filename, cache_dir=None):
+        raise OSError("not in the cache")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
+    with pytest.raises(RuntimeError, match="config.json of lerobot/pi05_droid"):
+        _unloaded_model(repo, kwargs)._load_config()
+
+
 @pytest.mark.parametrize("num_images", [1, 2, 3])
 def test_pi05_kv_layout_counts_the_cameras_the_request_sent(num_images):
     """The ViT drops the tokens of empty camera slots, so the prefix the KV layout
@@ -740,7 +825,8 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     cfg = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_droid.yaml").read_text())
     model = Pi05Model(skip_weight_loading=True, **cfg["model_kwargs"])
     assert model.model_path_hf == "lerobot/pi05_droid"
-    assert (model.config.action_horizon, model.config.num_cameras) == (15, 2)
+    # the 15-step horizon comes from the checkpoint's config.json, which dummy mode skips
+    assert model.config.num_cameras == 2
     # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
     assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
