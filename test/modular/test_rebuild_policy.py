@@ -402,6 +402,28 @@ def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
     assert infos[R].step_metadata == {"is_prefill": True}, "a row of ids alone runs under the request's decode metadata"
 
 
+def test_rebuild_tokens_count_the_slots_a_rebuild_runs():
+    """`rebuild_tokens` counted only text ids, so the slots of an image the rebuild recomputes were left out, and it
+    counted a cached prefix the rebuild never ran."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    _ingest(rebuilds, R, IMAGE_CHAT)
+    rebuilds.keep_prompts(_ran(VISION, {R: {"text_inputs": [torch.arange(3), torch.arange(2)]}}))
+    rebuilds._kept[NODE][R].sampled.append(6)
+    rebuilds._kept[NODE][R].copies.inputs = {}
+
+    rebuilds.start(R, NODE, None)
+    image = rebuilds.land_chunk(R, NODE, None)
+
+    assert image.ran == 3 + 6 + 2, f"the counter says {image.ran} tokens for a rebuild that recomputes 11 slots"
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept(range(9), 9)
+    rebuilds.start(R, NODE, None)
+    # the first 4 tokens were a cached prefix
+    rebuilds.land_chunk(R, NODE, ChunkRange(4, 6, 9, 6))
+    text = rebuilds.land_chunk(R, NODE, ChunkRange(6, 9, 9, 3))
+    assert text.ran == 5, "the counter would count the cached prefix the rebuild skipped"
+
+
 class _CountingPool(HostPool):
     """Counts the copies back to the device."""
 
