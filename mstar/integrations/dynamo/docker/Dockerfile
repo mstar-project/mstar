@@ -43,11 +43,13 @@ ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/downl
 ARG MOONCAKE_PACKAGE=mooncake-transfer-engine-cuda13
 
 # libibverbs1, ibverbs-providers (libmlx5) and libcurl4: Mooncake's engine
-# links them, and the CUDA base image ships none of them.
+# links them, and the CUDA base image ships none of them. g++: the Rust
+# extension links with cc and compiles libzmq (zeromq-src).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
+        g++ \
         ibverbs-providers \
         libcurl4 \
         libibverbs1 \

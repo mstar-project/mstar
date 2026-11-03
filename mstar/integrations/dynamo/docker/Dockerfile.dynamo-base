@@ -32,10 +32,12 @@ ARG MOONCAKE_PACKAGE=mooncake-transfer-engine-cuda13
 
 USER root
 
+# g++: the Rust extension links with cc and compiles libzmq (zeromq-src).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
+        g++ \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 

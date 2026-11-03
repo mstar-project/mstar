@@ -1,13 +1,20 @@
-"""The environment knobs each worker reads at startup to pick its transport and
-wire codec. Workers inherit the conductor's environment."""
+"""What each worker checks in its environment at startup: the Rust extension,
+and the knobs that pick its transport and wire codec. Workers inherit the
+conductor's environment, so the conductor checks these once, before any rank
+starts."""
 
 from collections.abc import Iterator
 
 from mstar.communication.codec import default_codec
 from mstar.communication.communicator import requested_transport
+from mstar.graph.runtime.utils import require_rust_extension
 
 
 def check_knobs() -> Iterator[str]:
+    try:
+        require_rust_extension()
+    except ImportError as e:
+        yield str(e)
     transport = None
     try:
         transport = requested_transport()

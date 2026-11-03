@@ -477,7 +477,7 @@ Rust extension
 --------------
 
 Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
-runtime is Rust, and a worker raises at startup without it. Importing ``mstar``
+runtime is Rust, and the conductor refuses to start without it. Importing ``mstar``
 does not need it. The extension carries (see :doc:`environment_variables` for
 the flags):
 

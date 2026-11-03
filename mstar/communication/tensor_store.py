@@ -559,7 +559,12 @@ def _build_tensor_bookkeeping() -> TensorBookkeeping:
     """
     try:
         return RustTensorBookkeeping()
-    except ImportError:
+    except ModuleNotFoundError as e:
+        # Only a missing extension falls back. One that imports but lacks
+        # TensorBookkeeping is a stale build, which should fail here rather
+        # than as the worker's "needs the Rust TensorBookkeeping" guard.
+        if e.name != "mstar_rust":
+            raise
         return PythonTensorBookkeeping()
 
 

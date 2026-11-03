@@ -287,8 +287,8 @@ def _wide(n):
 
 @pytest.mark.parametrize("n", [MAX_NODE_INPUTS, MAX_NODE_INPUTS + 1])
 def test_input_limit_matches_the_rust_runtime(n, tmp_path):
-    """Both runtimes take the same nodes: the Python one used to accept a node
-    the Rust one refused when a worker compiled its graph."""
+    """The conductor refuses a node the graph runtime would refuse when a
+    worker compiled its graph."""
     model = _Model(_wide(n))
     cfg = _cfg(tmp_path, [{"node_names": ["wide"], "ranks": [0]}])
     if n > MAX_NODE_INPUTS:
