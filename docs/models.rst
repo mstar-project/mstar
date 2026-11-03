@@ -1302,17 +1302,25 @@ The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 "action_chunk_size": 32}``; the reply's ``action`` payload is float32
 ``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
 embodiment's actions. A policy request may also send the robot's current state
-as ``action``, one row of ``raw_action_dim`` values. It is kept clean at video
-frame 0, so ``num_frames`` equals ``action_chunk_size`` (the state counts as a
-row), and the reply leaves it out. The released DROID policies were trained this
-way, and NVIDIA's RoboLab server sends ``action_chunk_size=33``, ``num_frames=33``,
-``fps=15``, the 7 joint positions plus ``1 - gripper`` as the state, the wrist frame
-above the two exterior frames reflection-padded to 736x544 (``size="736x544"``), and
-the task with view, duration and resolution text (a JSON caption for Edge, whose
-cookbook command also sets ``guidance_interval=[960, 1001]``). For a control loop
-use ``/generate/ws`` (one connection, pipelined observations):
-``examples/cosmos3_action_ws_client.py`` builds that request, runs the loop and
-reports chunks/s, actions/s and latency percentiles.
+as ``robot_state``, one row of ``raw_action_dim`` finite numbers (a NaN or inf is
+a 400), as pi0.5 takes it. The state is one more action token, kept clean at
+video frame 0 in front of the chunk, so ``num_frames`` is ``action_chunk_size + 1``
+and the reply carries only the predicted rows. The released DROID policies were
+trained this way. A request that sends a ``robot_state`` is a policy request, and
+its chunk, fps and domain default to the checkpoint's ``checkpoint.json`` (Edge
+DROID: 32 rows, 15 fps, ``droid_lerobot``; ``configs/cosmos3_droid.yaml`` sets the
+same for Nano, whose file is empty), so NVIDIA's RoboLab request is the image, the
+prompt, the state and ``size="736x544"``: the wrist frame above the two exterior
+frames reflection-padded to 736x544, the 7 joint positions and the gripper as
+DROID records them, and the task with view, duration and resolution text (a JSON
+caption for Edge). The DROID configs map the gripper to the policy's
+``1 - gripper`` on the way in and back on the way out (``inverted_action_dims``),
+and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
+``[960, 1001]`` (``guidance_interval_action``; outside it the conditional branch
+runs alone, batched requests too). For a control loop use ``/generate/ws`` (one
+connection, pipelined observations): ``examples/cosmos3_action_ws_client.py``
+builds that request, runs the loop and reports chunks/s, actions/s and latency
+percentiles.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------
