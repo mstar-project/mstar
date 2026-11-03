@@ -196,24 +196,15 @@ def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, sid
         assert keys == side
 
 
-def test_the_side_lane_refuses_the_codec_for_its_state_pool():
-    """The codec's windows read and write ``codec_state``, which the side lane
-    can't admit or plan ahead, so asking for it fails at startup."""
-    from mstar.distributed.communication import WorkerParallelGroups
-    from mstar.worker.engine_manager import _side_lane_keys, side_stream_nodes
+def test_the_codec_holds_only_what_the_side_lane_admits():
+    """The lane takes a node's recurrent state pools of its own and nothing
+    else, so a resource added to the Codec would turn the colocated configs'
+    ``side_stream`` into a startup error."""
+    from mstar.worker.engine_manager import _lane_holds
 
-    model = _make_model()
-    groups = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_1p7b.yaml").read_text(encoding="utf-8"))["node_groups"]
-    for group in groups:
-        if "Codec" in group["node_names"]:
-            group["side_stream"] = True
-    nodes = [n for g in groups for n in g["node_names"]]
-    with pytest.raises(ValueError, match="codec_state"):
-        _side_lane_keys(
-            {n: CodecSubmodule.__new__(CodecSubmodule) if n == "Codec" else object() for n in nodes},
-            model.get_node_resources(), model, nodes, side_stream_nodes(groups),
-            WorkerParallelGroups(num_workers=1, global_rank=0), True,
-        )
+    held = [spec for spec in _make_model().get_node_resources() if "Codec" in spec.nodes]
+    assert [spec.resource_key for spec in held] == ["codec_state"]
+    assert all(_lane_holds(spec, "Codec") for spec in held)
 
 
 def test_qwen3_tts_declares_talker_and_codec_graphs():

@@ -12,6 +12,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.recurrent import RecurrentStateSpec
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
@@ -147,8 +148,9 @@ def _side_lane_keys(
 
     A side step is admitted and planned inline on the GPU thread, never
     speculated or planned ahead, and lands between two chain steps, so the
-    lane takes a stream-fed walk of one node with no resources and no stop
-    check, beside another node's chain.
+    lane takes a stream-fed walk of one node with no stop check, beside
+    another node's chain. Of resources it takes only recurrent state pools of
+    the node's own (``_lane_holds``).
     """
     walks = model.get_graph_walk_graphs()
     combined = model.combined_walk_of()
@@ -173,9 +175,13 @@ def _side_lane_keys(
         if on_chain:
             raise refuse(f"it also runs {on_chain} on the chain, whose graphs would share its capture "
                          "stream and pool with the side walks' and could run beside them")
-        held = sorted(spec.resource_key for spec in specs if name in spec.nodes)
+        held = sorted(spec.resource_key for spec in specs if name in spec.nodes and not _lane_holds(spec, name))
         if held:
-            raise refuse(f"it holds resources {held}, and the lane neither admits nor plans a step ahead")
+            raise refuse(f"it holds resources {held}: the lane admits and plans only a recurrent state "
+                         "pool of the node's own with no prefix snapshots, so a KV cache, attention, "
+                         "positions, a sampler or a pool another node shares still refuse")
+        if submodule.resident_walks():
+            raise refuse("it plans walks on resident tables, which the lane doesn't")
         for walk in sorted(side):
             graph = walks.get(walk)
             if not isinstance(graph, GraphNode) or graph.name != name:
@@ -191,6 +197,15 @@ def _side_lane_keys(
         raise ValueError(f"{type(model).__name__}: side_stream is set on {sorted({n for n, _ in keys})}; "
                          "a worker runs one side lane, for one node")
     return tuple(keys)
+
+
+def _lane_holds(spec, name: str) -> bool:
+    """Whether a side lane can hold ``spec`` for node ``name``: a recurrent
+    state pool only that node declares and that keys no prefix snapshots on a
+    KV cache. Its slots are then touched by the lane's steps alone, which
+    admit and plan inline, never ahead, so the chain's pre-plan never stages
+    it (``StepRunner._beside_stage``)."""
+    return isinstance(spec, RecurrentStateSpec) and spec.nodes == {name} and not spec.depends_on()
 
 
 def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
