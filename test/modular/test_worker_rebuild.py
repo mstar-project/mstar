@@ -31,7 +31,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import HostCopies, KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
@@ -52,7 +52,7 @@ def _graphs() -> dict:
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled))
+    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
 
 
 def _cleanup(node, rids, wgs):
@@ -178,7 +178,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
     w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
     w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
-    w._rebuilds._droppable = {node: {1: pool.take(64)}}
+    w._rebuilds._droppable = {node: {1: LogRoom(pool.take(64), 0)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
@@ -195,13 +195,15 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
     with pytest.raises(_ReachedRoutingError):
         w._postprocess_batch(pending, outputs)
+    # what the worker does once the step's outputs are sent
+    w._rebuilds.flush()
 
     assert w._rebuilds._kept[node][1].copies.inputs["embeds"][0].tolist() == embeds[1].tolist(), (
         "a rebuild would need the encoder to run again"
     )
 
 
-def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
+def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
     w, _ = _worker()
     w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
     w._rebuilds._cursors[(NODE, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, step_metadata={})

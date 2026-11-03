@@ -760,7 +760,8 @@ class Worker:
             host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
         self._rebuilds = Rebuilds(
             policies, graphs,
-            HostPool(host_mb << 20, self.device) if host_mb and policies else None, self._side_stream,
+            HostPool(host_mb << 20, self.device) if host_mb and policies else None,
+            self.engine_manager.engine.host_allowance,
         )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
@@ -3837,6 +3838,7 @@ class Worker:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
@@ -3869,7 +3871,7 @@ class Worker:
                     engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
                 self.scheduler.note_rebuilt(node, rid)
-                self._preemption.rebuilt(rid, node, cursor.total)
+                self._preemption.rebuilt(rid, node, cursor.ran)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)
@@ -4509,14 +4511,6 @@ class Worker:
         return 1 << max(numel - 1, 0).bit_length()
 
 
-    def _side_stream(self) -> torch.Stream | None:
-        """The stream host copies queue on, behind a step's own output copy, or None without a device."""
-        if not self.device_capability.is_available:
-            return None
-        if self._d2h_stream is None:
-            self._d2h_stream = torch.Stream(device=self.device)
-        return self._d2h_stream
-
     def _d2h_batched(
         self, buffers: dict, side: torch.Stream,
     ) -> dict[str, torch.Tensor]:
@@ -4621,7 +4615,9 @@ class Worker:
         if not source:
             return source, None
 
-        side = self._side_stream()
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.Stream(device=self.device)
+        side = self._d2h_stream
         side.wait_event(completion_event)
 
         if outputs.check_stop_buffers is not None and row_rids is not None:

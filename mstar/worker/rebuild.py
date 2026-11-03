@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 from array import array
-from collections import defaultdict
-from collections.abc import Callable, Collection, ItemsView, Iterable, Mapping, MutableMapping
+from collections import defaultdict, deque
+from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -16,6 +16,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild
 from mstar.engine.resources.kv.config import SpanKind, StreamLayout, rebuild_refusal
+from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 from mstar.utils.h2d import to_device_nonblocking
@@ -36,42 +37,46 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 @dataclass(slots=True)
 class HostCopies:
-    """Host copies of what a request's prefill walk read besides its ids, and of that row's step metadata, for
-    the request's rebuild row. Empty until the row's step has run. ``landed`` is recorded after the last copy, and
-    stays None where the copies were made in place."""
+    """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
+    ``slots`` of its KV. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
+    started, and ``landed`` is recorded after the last copy that has, None where the copies run in place."""
+    slots: int = 0
     inputs: NameToTensorList | None = None
-    step_metadata: dict | None = None
+    queued: int = 0
     landed: torch.Event | None = None
 
     def ready(self) -> bool:
-        return self.inputs is not None and (self.landed is None or self.landed.query())
-
-    def to_device(self, device: torch.device, stream: torch.Stream | None) -> NameToTensorList:
-        """Copy the inputs back to ``device`` on ``stream`` once they have landed on the host, and make the
-        current stream wait for that copy. The wait is issued now, so a step still being enqueued can stall
-        behind the copy."""
-        if self.landed is None:
-            return self.inputs
-        stream.wait_event(self.landed)
-        with stream:
-            inputs = {name: [t.to(device, non_blocking=True) for t in ts] for name, ts in self.inputs.items()}
-        ready = torch.Event(device=device)
-        ready.record(stream)
-        torch.accelerator.current_stream(device).wait_event(ready)
-        return inputs
+        return self.inputs is not None and not self.queued and (self.landed is None or self.landed.query())
 
 
 @dataclass(slots=True)
 class KeptIds:
     """A request's ids on one node: its prompt copied to the host as int32, the ``walk`` it prefilled in and the
-    dtype that walk read it in, and each id sampled since. ``lengths`` splits the prompt into the tensors the walk
-    read, and is None for one tensor. A walk that read more than the ids has its other inputs in ``copies``."""
+    dtype that walk read it in, each id sampled since, and the prefill row's step metadata, which its rebuild row
+    runs under. ``lengths`` splits the prompt into the tensors the walk read, and is None for one tensor. A walk
+    that read more than the ids has its other inputs in ``copies``."""
     prompt: HostCopy
     walk: str
     dtype: torch.dtype
     sampled: array
+    step_metadata: dict
     lengths: tuple[int, ...] | None = None
     copies: HostCopies | None = None
+
+
+class LogRoom(NamedTuple):
+    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and the slots of
+    its spans other than ids, which its rebuild writes from the host copies."""
+    piece: HostSlice
+    copied_slots: int
+
+
+class QueuedCopy(NamedTuple):
+    """A device tensor's bytes still to be copied into ``into`` once ``after`` completes, for ``copies``."""
+    src: torch.Tensor
+    into: HostSlice
+    after: torch.Event | None
+    copies: HostCopies
 
 
 class Prefilling(NamedTuple):
@@ -83,12 +88,13 @@ class Prefilling(NamedTuple):
 
 @dataclass(slots=True)
 class RebuildCursor:
-    """A rebuild under way: the walk its rows run, the tokens it writes (``total``) of an input ``length`` long,
-    and the end of its chunks that have landed, 0 before the first.
+    """A rebuild under way: the walk its rows run, the slots it writes (``total``) of an input ``length`` long,
+    the end of its chunks that have landed, 0 before the first, and the slots those chunks ran (``ran``), which
+    leave out a cached prefix.
 
-    A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and writes every id but
-    the last, which the next decode step reads. A rebuild from host copies also reads ``copied`` and runs under
-    ``step_metadata``. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut
+    A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and any host ``copies``,
+    runs under its prefill's ``step_metadata``, and writes every id but the last, which the next decode step
+    reads. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut
     from the input the engine keeps for the prompt, up to where the prompt stood."""
     walk: str
     total: int
@@ -96,9 +102,10 @@ class RebuildCursor:
     ids: array | None = None
     dtype: torch.dtype | None = None
     lengths: tuple[int, ...] | None = None
-    copied: NameToTensorList | None = None
+    copies: HostCopies | None = None
     step_metadata: dict | None = None
     done: int = 0
+    ran: int = 0
 
     @property
     def resumes_prefill(self) -> bool:
@@ -155,28 +162,29 @@ def node_writes(
 
 class Rebuilds:
     """The kept ids of each request on the nodes that declare a `RebuildPolicy`, checked against the
-    graph when the worker starts, and the rebuilds under way. ``side_stream`` gives the stream host copies
-    queue on, behind a step's own output copy, and None on a CPU device."""
+    graph when the worker starts, and the rebuilds under way. Host copies of what a walk read besides the ids
+    spend the step's ``allowance`` (`flush`)."""
 
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
-        pool: HostPool | None = None, side_stream: Callable[[], torch.Stream | None] = lambda: None,
+        pool: HostPool | None = None, allowance: StepAllowance | None = None,
     ) -> None:
         # node -> walk -> what the node reads there besides the ids, which the worker copies to the host
         self._copied = {node: policy.check(node, graphs) for node, policy in policies.items()}
         self._policies = dict(policies)
-        self._side_stream = side_stream
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
         self._pool = pool
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free, each with the slice of the pool its ids and host
-        # copies go to. Only these keep them.
-        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
+        # node -> the handles whose pages a drop there can free, each with its `LogRoom`. Only these keep ids.
+        self._droppable: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
+        self._allowance = StepAllowance() if allowance is None else allowance
+        # the copies to the host not yet started, oldest first
+        self._queued: deque[QueuedCopy] = deque()
 
     @property
     def nodes(self) -> frozenset[str]:
@@ -199,15 +207,15 @@ class Rebuilds:
             )
         )
 
-    def _log_bytes(self, node: str, layouts: Iterable[StreamLayout]) -> int:
-        """The host bytes ``node``'s log takes for a request of ``layouts``: its prompt's ids as int32, and the
-        host copies of what each other span's walk read."""
+    def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
+        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
+        and the host copies of what each other span's walk read, or None when the pool can't hold it."""
+        spans = [span for layout in layouts for span in layout.spans]
+        ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
         per_slot = self._policies[node].copy_bytes_per_slot
-        ids = sum(span.length for layout in layouts for span in layout.spans if span.kind == SpanKind.IDS)
-        return aligned(4 * ids) + sum(
-            span.length * per_slot[span.walk]
-            for layout in layouts for span in layout.spans if span.kind != SpanKind.IDS
-        )
+        others = [span for span in spans if span.kind != SpanKind.IDS]
+        piece = self._pool.take(aligned(4 * ids) + sum(span.length * per_slot[span.walk] for span in others))
+        return None if piece is None else LogRoom(piece, sum(span.length for span in others))
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -233,19 +241,19 @@ class Rebuilds:
         taken = {}
         if not unpausable:
             for node in written.keys() - refused:
-                piece = None if self._pool is None else self._pool.take(self._log_bytes(node, written[node]))
-                if piece is None:
+                room = None if self._pool is None else self._log_room(node, written[node])
+                if room is None:
                     refused.add(node)
                 else:
-                    taken[node] = piece
+                    taken[node] = room
         rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
-        for node, piece in taken.items():
+        for node, room in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = piece
+                self._droppable[node][rid] = room
             else:
-                self._pool.give(piece)
+                self._pool.give(room.piece)
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
@@ -266,19 +274,20 @@ class Rebuilds:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
             prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, droppable[rid], node_batch.completion_event, torch.int32)
+            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event, torch.int32)
             copies = bool(self._copied[node_batch.node_name][row_walk])
             kept[rid] = KeptIds(
-                copy, row_walk, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies() if copies else None,
+                copy, row_walk, prompt.dtype, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
+                tuple(map(len, tensors)) if len(tensors) > 1 else None,
+                HostCopies(droppable[rid].copied_slots) if copies else None,
             )
             if not copies:
                 self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
-        """Copy what each row of a copied walk read besides its ids, as the step received it, into its request's
-        slice after the ids, once the step completes, and keep its step metadata. A request whose copies don't fit
-        its slice, which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
+        """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
+        request's slice after the ids. A request whose copies don't fit its slice,
+        which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
         node = node_batch.node_name
         copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
         walks = {walk for walk, names in copied.items() if names}
@@ -298,7 +307,7 @@ class Rebuilds:
             ):
                 rows.append((rid, kept))
         for rid, kept in rows:
-            piece, inputs = self._droppable[node][rid], node_batch.per_request_input_tensors[rid]
+            piece, inputs = self._droppable[node][rid].piece, node_batch.per_request_input_tensors[rid]
             tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
             used = aligned(kept.prompt.view.nbytes)
             if used + sum(aligned(tensor.nbytes) for _, tensor in tensors) > piece.nbytes:
@@ -306,27 +315,49 @@ class Rebuilds:
                 continue
             kept.copies.inputs = {name: [] for name in copied[kept.walk]}
             for name, tensor in tensors:
-                copy = self._pool.copy_out(
-                    tensor, HostSlice(piece.offset + used, piece.nbytes - used), node_batch.completion_event,
-                )
-                kept.copies.inputs[name].append(copy.view)
-                kept.copies.landed, used = copy.landed, used + aligned(tensor.nbytes)
-            kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
+                into = HostSlice(piece.offset + used, tensor.nbytes)
+                kept.copies.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
+                src = tensor.reshape(-1).view(torch.uint8)
+                self._queued.append(QueuedCopy(src, into, node_batch.completion_event, kept.copies))
+                kept.copies.queued += 1
+                used += aligned(tensor.nbytes)
             self._trim(node, rid, used)
+
+    def flush(self) -> None:
+        """Start the queued copies to the host, oldest first, up to what the step's allowance has left, once the
+        step's outputs are sent. A copy that runs past the allowance is split there, and the rest waits for the next
+        step's. The device tensor a queued copy reads stays held until its copy starts."""
+        while self._queued:
+            queued = self._queued[0]
+            nbytes = self._allowance.spend(queued.src.numel())
+            if not nbytes:
+                return
+            copy = self._pool.copy_out(queued.src[:nbytes], HostSlice(queued.into.offset, nbytes), queued.after)
+            queued.copies.landed = copy.landed
+            if nbytes < queued.src.numel():
+                self._queued[0] = queued._replace(
+                    src=queued.src[nbytes:], into=HostSlice(queued.into.offset + nbytes, queued.into.nbytes - nbytes),
+                )
+                return
+            self._queued.popleft()
+            queued.copies.queued -= 1
 
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
         keeps."""
-        piece = self._droppable[node][rid]
-        if used < piece.nbytes:
-            self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
-            self._droppable[node][rid] = HostSlice(piece.offset, used)
+        room = self._droppable[node][rid]
+        if used < room.piece.nbytes:
+            self._pool.give(HostSlice(room.piece.offset + used, room.piece.nbytes - used))
+            self._droppable[node][rid] = room._replace(piece=HostSlice(room.piece.offset, used))
 
     def _forget(self, node: str, rid: int) -> None:
-        self._kept[node].pop(rid, None)
-        piece = self._droppable[node].pop(rid, None)
-        if piece is not None:
-            self._pool.give(piece)
+        kept = self._kept[node].pop(rid, None)
+        if kept is not None and kept.copies is not None and kept.copies.queued:
+            # its slice goes back to the pool, so no copy may start into it
+            self._queued = deque(queued for queued in self._queued if queued.copies is not kept.copies)
+        room = self._droppable[node].pop(rid, None)
+        if room is not None:
+            self._pool.give(room.piece)
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -407,10 +438,11 @@ class Rebuilds:
         kept = self._kept[node][rid]
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        cursor = RebuildCursor(kept.walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths)
-        if kept.copies is not None:
-            cursor.step_metadata = kept.copies.step_metadata
-            cursor.copied = kept.copies.to_device(self._pool.device, self._side_stream())
+        # the row writes every id but the last, and the slots its host copies fill
+        slots = len(ids) - 1 + (0 if kept.copies is None else kept.copies.slots)
+        cursor = RebuildCursor(
+            kept.walk, slots, slots, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
+        )
         self._cursors[(node, rid)] = cursor
         return Rebuild(kept.sampled)
 
@@ -426,29 +458,38 @@ class Rebuilds:
     def fill(
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
-    ) -> None:
-        """Give each rebuild row of ``rids`` its walk, and its kept ids and host copies on the device when it runs
-        its first chunk or runs whole. The ids are split as its prefill row read them, with the ids sampled since
-        appended to the last tensor. A later chunk is cut from the input the engine prepared on the first, and
-        every chunk of a prompt's rebuild from the input the engine keeps for the prompt."""
-        ids_input = self._policies[node].ids_input
+    ) -> list[torch.Event]:
+        """Give each rebuild row of ``rids`` its walk, a row from kept ids its prefill's step metadata, and its kept
+        ids and host copies on the device when it runs its first chunk or runs whole, and return the events the step
+        waits on before it reads the copies. The ids
+        are split as its prefill row read them, with the ids sampled since appended to the last tensor. A later
+        chunk is cut from the input the engine prepared on the first, and every chunk of a prompt's rebuild from
+        the input the engine keeps for the prompt."""
+        ids_input, ready = self._policies[node].ids_input, []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
-            info = infos[rid]
-            infos[rid] = replace(
-                info, graph_walk=cursor.walk,
-                step_metadata=info.step_metadata if cursor.step_metadata is None else cursor.step_metadata,
-            )
+            copies = cursor.copies
+            infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
+            if cursor.ids is not None:
+                infos[rid] = replace(infos[rid], step_metadata=cursor.step_metadata)
             chunk = chunk_ranges.get(rid)
             if cursor.ids is not None and (chunk is None or chunk.is_first):
                 ids = to_device_nonblocking(_row_ids(cursor).to(cursor.dtype), self._pool.device)
                 head = cursor.lengths[:-1] if cursor.lengths else ()
-                inputs[rid] = {ids_input: list(ids.split([*head, len(ids) - sum(head)])), **(cursor.copied or {})}
+                inputs[rid] = {ids_input: list(ids.split([*head, len(ids) - sum(head)]))}
+                for name, views in (copies.inputs if copies is not None else {}).items():
+                    inputs[rid][name] = []
+                    for view in views:
+                        tensor, landed = self._pool.copy_in(view)
+                        inputs[rid][name].append(tensor)
+                        ready += [landed] if landed is not None else []
+        return ready
 
     def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RebuildCursor | None:
         """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its
         cursor once the rebuild has finished."""
         cursor = self._cursors[(node, rid)]
+        cursor.ran += cursor.total - cursor.done if chunk is None else chunk.end - chunk.start
         cursor.done = cursor.total if chunk is None else chunk.end
         if cursor.done < cursor.total:
             return None

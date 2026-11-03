@@ -36,6 +36,7 @@ from test_kv_host_index import (
 from test_kv_prefix_offload import _commit, _step
 
 from mstar.engine.resources.kv.config import KVReqConfig
+from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -197,13 +198,14 @@ def test_writes_land_once_a_step_and_never_in_a_readiness_check(monkeypatch):
 
 def test_a_step_writes_at_most_its_share_and_the_rest_waits_for_later_steps():
     kv = _manager()
-    kv._host_writes._per_step = 2
+    kv._host_writes._allowance = allowance = StepAllowance(2 * kv.kv_cache.tensor[:, 0].nbytes)
     _serve(kv, "a", A_PROMPT + [1, 2])
     pages = _pages(kv, "a")[:6]
     kv.remove_request("a")
     _step(kv)
     assert kv._cpu_pool.written_out == pages[:2], "a step wrote more than its share"
 
+    allowance.refill()
     _step(kv)
 
     assert kv._cpu_pool.written_out == pages[:4], "the pages over a step's share didn't wait for the next step"
@@ -226,12 +228,13 @@ def test_a_page_is_copied_only_once_a_step_committed_after_it_has_finished():
 
 def test_a_queued_key_released_again_keeps_its_place_and_its_commit():
     kv = _manager()
-    kv._host_writes._per_step = 1
+    kv._host_writes._allowance = allowance = StepAllowance(kv.kv_cache.tensor[:, 0].nbytes)
     _serve(kv, "a", A_PROMPT + [1, 2])
     pages = _pages(kv, "a")[:6]
     kv.remove_request("a")
     step = _commit(kv)
     kv.after_output_copy(step)
+    allowance.refill()
     kv.after_output_copy(step)
     assert kv._cpu_pool.written_out == pages[:2]
     # b leases the queued pages and drops them after a commit the device hasn't finished
@@ -239,6 +242,7 @@ def test_a_queued_key_released_again_keeps_its_place_and_its_commit():
     _commit(kv)
     kv.remove_request("b")
 
+    allowance.refill()
     kv.after_output_copy(step)
 
     assert kv._cpu_pool.written_out == pages[:3], "a key released again waited for the newest commit"

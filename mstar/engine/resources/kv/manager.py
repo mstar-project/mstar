@@ -37,7 +37,7 @@ from mstar.engine.resources.kv.config import (
     step_end,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
-from mstar.engine.resources.kv.host_writes import HostWrites
+from mstar.engine.resources.kv.host_writes import HostWrites, StepAllowance
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -542,8 +542,10 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
         leads: bool = True,
         nodes: Collection[str] | None = None,
+        host_allowance: StepAllowance | None = None,
     ):
         self.config = cfg
+        self._host_allowance = StepAllowance() if host_allowance is None else host_allowance
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -757,6 +759,7 @@ class KVManager(AttentionResource):
             needs_remote_transfer=info.needs_remote_transfer,
             leads=spec.leader is None or spec.leader in info.nodes,
             nodes=info.nodes,
+            host_allowance=info.host_allowance,
         )
 
     def build_accelerator_graph_buffers(
@@ -803,7 +806,9 @@ class KVManager(AttentionResource):
             self._open_host_writes()
 
     def _open_host_writes(self) -> None:
-        self._host_writes = HostWrites(self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes)
+        self._host_writes = HostWrites(
+            self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes, self._host_allowance,
+        )
         self._arena.writes = self._host_writes
 
     def close_prefix_cache(self) -> None:
