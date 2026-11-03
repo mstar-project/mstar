@@ -382,6 +382,24 @@ def test_a_media_copy_split_across_two_steps_lands_whole():
     assert copies.ready() and torch.equal(copies.inputs["embeds"][0], embeds.cpu()), "the second half never landed"
 
 
+def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
+    """A row of ids alone ran under the request's decode step's metadata and a row with images under its prefill's,
+    so the model and the sampler saw the two differently. Every kept request records its prefill row's metadata,
+    and a copy of it, since a later step may change the live one."""
+    rebuilds = _rebuilds()
+    prefill = _ran(PREFILL, _rows(R))
+    rebuilds.keep_prompts(prefill)
+    prefill.per_request_info[R].step_metadata["is_prefill"] = False
+    rebuilds._kept[NODE][R].sampled.append(4)
+
+    rebuilds.start(R, NODE, None)
+    infos = {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
+    infos[R].step_metadata = {"is_prefill": False}
+    rebuilds.fill(NODE, {R}, {}, {R: {}}, infos)
+
+    assert infos[R].step_metadata == {"is_prefill": True}, "a row of ids alone runs under the request's decode metadata"
+
+
 class _CountingPool(HostPool):
     """Counts the copies back to the device."""
 
