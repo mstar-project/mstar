@@ -113,6 +113,13 @@ def test_inverse_dynamics_needs_a_clip_as_long_as_num_frames() -> None:
                              **mk)
 
 
+def test_domain_id_must_name_a_trained_domain() -> None:
+    """The domain id indexes the action embedding table on the GPU; past its 32 rows it device-asserted
+    the worker for every later request."""
+    with pytest.raises(ValueError, match="domain_id"):
+        _model()._resolve_gen_params({**POLICY, "domain_id": 32, "robot_state": STATE}, *MODALITIES)
+
+
 def _policy_checkpoint(root, policy):
     (root / "transformer").mkdir(parents=True)
     (root / "transformer" / "config.json").write_text(json.dumps({"_class_name": "Cosmos3OmniTransformer"}))
@@ -129,7 +136,7 @@ def test_policy_defaults_come_from_the_checkpoint(tmp_path) -> None:
     )
     p = model._resolve_gen_params({"size": "736x544", "robot_state": STATE}, *MODALITIES)
     assert p["action_mode"] == "policy" and p["action_chunk_size"] == 32 and p["num_frames"] == 33
-    assert p["fps"] == 15.0 and p["domain_id"] == resolve_action_domain_id(None, "droid_lerobot")
+    assert p["fps"] == 15.0 and p["domain_id"] == resolve_action_domain_id(None, "droid_lerobot", 32)
     assert p["raw_action_dim"] == 8 and p["action_state_rows"] == 1
     # The request wins.
     p = model._resolve_gen_params(
