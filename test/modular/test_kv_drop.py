@@ -192,13 +192,6 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     assert not pool._blocks["state"][:, slot.index].any(), "the recompute would start from the old state"
 
 
-def test_a_sampler_that_scatters_in_its_graph_refuses_a_drop():
-    sampler = SamplerResource(vocab_size=64, enable_repetion_penalty=False, device=CPU)
-    sampler._cg_buffers = SimpleNamespace(ingraph_scatter=True)
-    with pytest.raises(RuntimeError):
-        _engine({"sampler": sampler}).drop_request(NODE, "r")
-
-
 def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     # as Whisper's decoder lays out its self-attention KV from ids and its cross-attention KV from rows
     kv, cross, rope = _manager(), _manager(), RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)

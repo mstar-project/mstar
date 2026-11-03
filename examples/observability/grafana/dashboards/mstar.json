@@ -2041,12 +2041,70 @@
       ]
     },
     {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Predicted routing saving",
+      "description": "Per term of the replica cost, the saving the data-parallel replica pick predicted on the replica each request went to, in request-equivalents per second (for prefix, the predicted share of each prompt cached there). Empty unless a node group has replicas and a resource mirror.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (term) (rate(mstar_routing_predicted_saving_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{term}}",
+          "range": true
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Engine workers",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 108,
+        "y": 116,
         "w": 24,
         "h": 1
       },
@@ -2063,7 +2121,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       },
@@ -2151,7 +2209,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       },
@@ -2219,7 +2277,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       },
@@ -2277,7 +2335,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       },
@@ -2358,7 +2416,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2453,7 +2511,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },

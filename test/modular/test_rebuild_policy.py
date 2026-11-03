@@ -18,8 +18,12 @@ from mstar.engine.resources import Rebuild, SamplerStep, StepContext
 from mstar.engine.resources.sampler.config import discard_samples
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.rebuild import KeptIds, Rebuilds
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
@@ -53,6 +57,26 @@ def test_a_walk_whose_node_reads_more_than_the_ids_is_refused_at_load():
 
     with pytest.raises(ValueError, match="carries only"):
         Rebuilds({NODE: POLICY}, graphs)
+
+
+@pytest.mark.parametrize("model_class, attrs", [
+    (Qwen3_5DenseModel, {"config": SimpleNamespace(max_position_embeddings=4096), "vision_config": None}),
+    (OrpheusModel, {"config": SimpleNamespace(max_position_embeddings=4096)}),
+    (BagelModel, {
+        "config": SimpleNamespace(max_position_embeddings=4096, num_timesteps=50),
+        "_has_cfg_parallel": False, "_image_gen_remote_handoff": False,
+    }),
+    (Qwen3OmniModel, {"config": SimpleNamespace(thinker_text=SimpleNamespace(max_position_embeddings=4096))}),
+], ids=["qwen3_5", "orpheus", "bagel", "qwen3_omni"])
+def test_a_policy_passes_its_check_on_a_walk_that_chunks(model_class, attrs):
+    """A chunkable node runs its walk inside a chunk Loop, which adds the Loop's tick to the node's inputs."""
+    model = model_class.__new__(model_class)
+    vars(model).update(attrs)
+    graphs = model.get_graph_walk_graphs()
+
+    for node, policy in model.rebuild_policies().items():
+        assert chunk_loop_name(node, policy.walk) in graphs[policy.walk].get_loops(), "the walk runs no chunk Loop"
+        policy.check(node, graphs)
 
 
 def _rows(*rids: int) -> dict:

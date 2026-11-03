@@ -21,6 +21,7 @@ from test_kv_admission import _remove, _runner
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import AdmitOutcome, Segment
 from mstar.model.submodule_base import ARNodeInputs
@@ -253,7 +254,7 @@ def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     cpu.retain_run(keys[2:])
     room = cpu.room()
 
-    assert cpu.place("v", "main", list(range(room)), [], room * PAGE_SIZE, room * PAGE_SIZE) is not None, (
+    assert cpu.place("v", "main", (GroupPages(list(range(room))),), [], position=0) is not None, (
         f"the host counted {room} pages of room and couldn't place them"
     )
 

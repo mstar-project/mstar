@@ -84,7 +84,7 @@ Rules:
 - **Size.** A preemptible request reserves its prompt. A guaranteed one also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
-- **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
+- **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot and the sampler's in-graph row included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
 
 ```
 room = free + evictable - _unused
@@ -113,7 +113,7 @@ Why this shape:
 
 Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, moves or drops the request itself, or makes it wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
-Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
+Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 
 
 ### 3.1 Arrival numbers
@@ -152,7 +152,7 @@ Why this shape:
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
-- **Not the least recently active request.** Today's offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.
+- **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
 
 ### 3.3 Earmarks
@@ -211,7 +211,7 @@ At a drop, the other resources:
 Why this shape:
 
 - **A drop needs no host pool.** `cpu_offload_pages` is 0 by default, and a full host pool would stall preemption as it stalls offload today.
-- **The whole reservation goes.** Keeping its unused part, as the offload of the least recently active request does, would leave pages counted that nothing can use until the victim returns.
+- **The whole reservation goes.** Keeping its unused part, as the offload of the row last in line does, would leave pages counted that nothing can use until the victim returns.
 
 > Note: a dropped request's keyed pages stay in the index as evictable cache. With write-ahead (H1b) and a host pool, they reach the host once no request holds them, so a later request with that prefix copies them back. A rebuild row doesn't read the host index, though, so it recomputes what only the host holds.
 

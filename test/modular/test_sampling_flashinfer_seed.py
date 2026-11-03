@@ -10,7 +10,8 @@ This requires a FlashInfer build whose ``*_sampling_from_probs`` binding accepts
 tensor seed/offset under graph capture. FlashInfer 0.6.3 rejected tensors at the
 C/TVM-FFI layer ("Mismatched type on argument #7"); the binding was reworked in
 0.6.4 (verified: 0.6.3 rejects; 0.6.4 / 0.6.5 / 0.6.7.post3 accept and advance
-the RNG under capture), which ``pyproject.toml`` now pins as the floor. These
+the RNG under capture), so the exact version ``pyproject.toml`` pins has to be
+0.6.4 or later. These
 tests fail fast on a too-old build and pin the fact the design depends on: a
 captured tensor ``offset`` ADVANCES the RNG per replay, so stochastic sampling
 actually varies step to step.
@@ -87,7 +88,7 @@ def test_tensor_seed_offset_accepted_under_capture():
         pytest.fail(
             "Pinned FlashInfer must accept tensor seed/offset under CUDA-graph "
             f"capture, but capture raised: {exc!r}. Check the flashinfer-python "
-            "pin in pyproject.toml (>=0.6.4)."
+            "pin in pyproject.toml (0.6.4 is the first version that accepts them)."
         )
 
     tokens = []
