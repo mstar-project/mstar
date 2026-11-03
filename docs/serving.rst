@@ -335,6 +335,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,

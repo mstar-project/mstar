@@ -21,6 +21,7 @@ from mstar.engine.resources import AllocationFailed, Residency, StepContext
 from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -42,7 +43,8 @@ def _graphs() -> dict:
 
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    return KeptIds(torch.tensor(prompt), array("i", sampled))
+    view = torch.tensor(prompt, dtype=torch.int32)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -80,7 +82,7 @@ def _worker():
     w._in_flight_rids = set()
     w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
-    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,

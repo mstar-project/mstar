@@ -110,6 +110,7 @@ from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
     ScheduledBatch,
@@ -117,7 +118,7 @@ from mstar.worker.micro_scheduler import (
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.rebuild import Rebuilds
+from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -677,9 +678,13 @@ class Worker:
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
         # What a dropped request is rebuilt from, on each node whose model declares how.
-        self._rebuilds = (
-            Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs()) if model is not None
-            else Rebuilds({}, {})
+        policies = model.rebuild_policies() if model is not None else {}
+        host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+        if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
+            raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+        self._rebuilds = Rebuilds(
+            policies, model.get_graph_walk_graphs() if model is not None else {},
+            HostPool(host_mb << 20, self.device) if host_mb and policies.keys() & node_names else None,
         )
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
@@ -1145,7 +1150,7 @@ class Worker:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
         if self.scheduler.rebuild_queued(request_id) or request_id in self._in_flight_rids:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
-        rebuild, row = self._rebuilds.rebuild(request_id, node_name, self.device)
+        rebuild, row = self._rebuilds.rebuild(request_id, node_name)
         engine.prepare_rebuild(node_name, request_id, rebuild)
         self.scheduler.queue_rebuild(request_id, row)
 
@@ -1886,7 +1891,6 @@ class Worker:
             chunk_ranges=batch.chunk_ranges,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
         )
-        self._rebuilds.keep_prompts(batch.node_name, batch.graph_walk, batch.request_walks, per_request_inputs)
         if rebuild:
             node_batch.step_context.rebuild_rids = frozenset(rebuild)
         node_batch.read_check_rids = batch.read_check_rids
@@ -3107,11 +3111,6 @@ class Worker:
             chunk_ranges=None if fresh_batch is None else fresh_batch.chunk_ranges,
             incomplete_node_rids=None if fresh_batch is None else fresh_batch.incomplete_node_rids,
         )
-        spec = speculation.node_batch
-        self._rebuilds.keep_prompts(
-            spec.node_name, spec.step_context.graph_walk, spec.step_context.request_walks,
-            spec.per_request_input_tensors,
-        )
         # N's rows, not fresh ones: a cleared speculation must not ready their
         # nodes while N's chunk is in flight; N's settle does that
         spec_rows = speculation.scheduled_batch.request_to_worker_graph
@@ -3415,11 +3414,6 @@ class Worker:
             chunk_ranges=chunk_ranges,
             incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
-        spec = speculation.node_batch
-        self._rebuilds.keep_prompts(
-            spec.node_name, spec.step_context.graph_walk, spec.step_context.request_walks,
-            spec.per_request_input_tensors,
-        )
         # N's rows, as on the leader: N's settle readies them, not a cleared speculation
         speculation.continuing_rids.update(mid_prefill)
         if chunk_ranges:
@@ -3710,6 +3704,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
+        self._rebuilds.keep_prompts(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(

@@ -14,17 +14,24 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.engine.resources import Rebuild
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
+from mstar.utils.h2d import to_device_nonblocking
+from mstar.worker.host_pool import HostCopy, HostPool
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.model.submodule_base import HostRows
 
+# The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
+# at 4 B each.
+DEFAULT_REBUILD_HOST_MB = 64
+
 
 @dataclass(slots=True)
 class KeptIds:
-    """A request's ids on one node: its prompt as the policy's walk read it, and each id sampled since,
-    as int32."""
-    prompt: torch.Tensor
+    """A request's ids on one node: its prompt copied to the host as int32, the dtype the policy's walk read
+    it in, and each id sampled since."""
+    prompt: HostCopy
+    dtype: torch.dtype
     sampled: array
 
 
@@ -40,37 +47,38 @@ class Rebuilds:
     """The kept ids of each request on the nodes that declare a `RebuildPolicy`, checked against the
     graph when the worker starts."""
 
-    def __init__(self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection]) -> None:
+    def __init__(
+        self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
+        pool: HostPool | None = None,
+    ) -> None:
         for node, policy in policies.items():
             policy.check(node, graphs)
         self._policies = dict(policies)
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
+        # without one no request keeps ids, so none is dropped
+        self._pool = pool
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
 
-    def keep_prompts(
-        self, node: str, graph_walk: str, request_walks: Mapping[int, str],
-        inputs: Mapping[int, NameToTensorList],
-    ) -> None:
-        """Keep the ids of each row of the policy's walk whose request keeps none yet. The rows share
-        one copy of the step's ids, each keeping a view of it."""
-        policy = self._policies.get(node)
-        if policy is None or (graph_walk != policy.walk and policy.walk not in request_walks.values()):
+    def keep_prompts(self, node_batch: ExecutingBatch) -> None:
+        """Copy the prompt of each row of the policy's walk whose request keeps no ids yet to the host, once
+        the step that read it completes. A row the pool can't hold keeps none."""
+        policy = self._policies.get(node_batch.node_name)
+        if self._pool is None or policy is None:
             return
-        kept = self._kept[node]
-        # a TP follower's unread row has no inputs, and the step fails it
-        rows = [
-            rid for rid, row in inputs.items()
-            if row and rid not in kept and request_walks.get(rid, graph_walk) == policy.walk
-        ]
-        if not rows:
+        walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
+        if walk != policy.walk and policy.walk not in walks.values():
             return
-        per_row = [[tensor.reshape(-1) for tensor in inputs[rid][policy.ids_input]] for rid in rows]
-        copy = torch.cat([tensor for tensors in per_row for tensor in tensors])
-        lengths = [sum(tensor.numel() for tensor in tensors) for tensors in per_row]
-        for rid, prompt in zip(rows, copy.split(lengths), strict=True):
-            kept[rid] = KeptIds(prompt, array("i"))
+        kept = self._kept[node_batch.node_name]
+        for rid, row in node_batch.per_request_input_tensors.items():
+            # a TP follower's unread row has no inputs, and the step fails it
+            if not row or rid in kept or walks.get(rid, walk) != policy.walk:
+                continue
+            prompt = row[policy.ids_input][0]
+            copy = self._pool.copy_out(prompt, node_batch.completion_event, torch.int32)
+            if copy is not None:
+                kept[rid] = KeptIds(copy, prompt.dtype, array("i"))
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs, host_rows: HostRows | None,
@@ -126,22 +134,26 @@ class Rebuilds:
         kept = self._kept[node].get(rid)
         if kept is None:
             return f"it keeps no ids on {node}"
+        if not kept.prompt.has_landed():
+            return "its ids haven't reached the host"
         if walk not in self._loop_walks[node]:
             return f"it is in walk {walk!r}, where loop {policy.loop!r} doesn't run {node}"
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def rebuild(self, rid: int, node: str, device: torch.device) -> tuple[Rebuild, RebuildRow]:
+    def rebuild(self, rid: int, node: str) -> tuple[Rebuild, RebuildRow]:
         """What ``rid``'s rebuild row on ``node`` writes, and the row."""
         policy = self._policies[node]
         kept = self._kept[node][rid]
-        # the one copy of the prompt to the host, made once per rebuild
-        ids = array("i", kept.prompt.tolist())
+        ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(device, dtype=kept.prompt.dtype)
-        return Rebuild(policy.walk, ids), RebuildRow(node, policy.walk, {policy.ids_input: [tokens]})
+        tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(kept.dtype)
+        row = RebuildRow(node, policy.walk, {policy.ids_input: [to_device_nonblocking(tokens, self._pool.device)]})
+        return Rebuild(policy.walk, ids), row
 
     def remove_request(self, rid: int) -> None:
         for kept in self._kept.values():
-            kept.pop(rid, None)
+            ids = kept.pop(rid, None)
+            if ids is not None:
+                self._pool.give(ids.prompt.slice)

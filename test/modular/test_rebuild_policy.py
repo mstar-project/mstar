@@ -23,6 +23,7 @@ from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.rebuild import KeptIds, Rebuilds
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
@@ -82,21 +83,37 @@ def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
 
-def test_a_prompt_rows_ids_are_kept_once_and_its_steps_share_one_copy():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+def _rebuilds() -> Rebuilds:
+    return Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
 
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R, A))
-    rebuilds.keep_prompts(NODE, PREFILL, {}, {R: {"text_inputs": [torch.tensor([0])]}})  # its rebuild row
-    rebuilds.keep_prompts(NODE, MIXED, {A: PREFILL, B: DECODE}, _rows(A, B))
-    rebuilds.keep_prompts(NODE, DECODE, {}, _rows(B))
-    rebuilds.keep_prompts(NODE, PREFILL, {}, {B: {}})  # a TP follower's unread row
+
+def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNamespace:
+    """A step of ``walk`` that read ``inputs``, run on the host."""
+    ctx = SimpleNamespace(graph_walk=walk, request_walks=request_walks or {})
+    return SimpleNamespace(node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, completion_event=None)
+
+
+def _kept(prompt, *sampled: int) -> KeptIds:
+    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
+    view = torch.tensor(prompt, dtype=torch.int32)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+
+
+def test_a_prompt_rows_ids_are_kept_once_on_the_host():
+    rebuilds = _rebuilds()
+
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A)))
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.tensor([0])]}}))  # its rebuild row
+    rebuilds.keep_prompts(_ran(MIXED, _rows(A, B), {A: PREFILL, B: DECODE}))
+    rebuilds.keep_prompts(_ran(DECODE, _rows(B)))
+    rebuilds.keep_prompts(_ran(PREFILL, {B: {}}))  # a TP follower's unread row
 
     kept = rebuilds._kept[NODE]
-    assert kept[R].prompt.tolist() == [7, 8, 9] and kept[A].prompt.tolist() == [8, 9, 10], "it kept another row's ids"
-    assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
-    assert kept[R].prompt.untyped_storage().data_ptr() == kept[A].prompt.untyped_storage().data_ptr(), (
-        "each row would pay a copy of its own"
+    assert kept[R].prompt.view.tolist() == [7, 8, 9] and kept[A].prompt.view.tolist() == [8, 9, 10], (
+        "it kept another row's ids"
     )
+    assert kept[R].dtype == torch.long, "the rebuild row would read its ids in another dtype than the walk's"
+    assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
 def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
@@ -106,8 +123,8 @@ def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
 
 @pytest.mark.parametrize("sampled", [[4, 5, 6], [[4], [5], [6]]])  # the sampler's [B] output, and a [B, 1] one
 def test_only_a_rows_kept_sample_is_appended(sampled):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R, A, B))
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A, B)))
     # A runs a chunk short of its prompt's end, and B is a rebuild row
     batch = _batch((R, A, B), rebuild=frozenset({B}))
 
@@ -121,8 +138,8 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
 
 @pytest.mark.parametrize("host", [True, False])
 def test_a_sample_of_more_than_one_id_is_refused(host):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R))
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
     codes = torch.tensor([[4, 5, 6]])  # as a talker samples several codebooks
 
     with pytest.raises(ValueError, match="hold 3 ids"):
@@ -139,20 +156,20 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
     ("don't cover its KV", NODE, DECODE, 1, 1),
 ])
 def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sampled, iters):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    rebuilds = _rebuilds()
     if sampled is not None:
-        rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2]), array("i", [5] * sampled))
+        rebuilds._kept[NODE][R] = _kept([1, 2], *[5] * sampled)
 
     assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters})
-    rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2]), array("i", [5, 6]))
+    rebuilds._kept[NODE][R] = _kept([1, 2], 5, 6)
     assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}) is None, "a request its ids cover was refused"
 
 
 def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_last():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2, 3]), array("i", [4, 5]))
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
 
-    rebuild, row = rebuilds.rebuild(R, NODE, torch.device("cpu"))
+    rebuild, row = rebuilds.rebuild(R, NODE)
 
     assert rebuild == Rebuild(PREFILL, array("i", [1, 2, 3, 4, 5])), "the KV would lay out other ids"
     assert (row.node, row.walk) == (NODE, PREFILL) and list(row.inputs) == ["text_inputs"]
