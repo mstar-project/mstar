@@ -407,6 +407,14 @@ def test_sincos_timestep_embedding_shape_and_range():
     assert torch.all(emb.abs() <= 1.0 + 1e-6)
 
 
+def test_pi05_action_gen_time_embedding_fits_an_eager_batch_past_the_capture_sizes():
+    """The buffer was sized to the largest captured batch (4), so an eager batch of 5 got 4 rows and crashed."""
+    llm = object.__new__(Pi05LLMSubmodule)
+    llm._time_emb_buffer, llm.config = None, Pi05Config()
+    llm.get_device = lambda: torch.device("cpu")
+    assert llm._get_time_emb_buffer(5).shape == (5, llm.config.action_hidden_size)
+
+
 def test_euler_step_shapes():
     x = torch.zeros(50, 32)
     v = torch.ones(50, 32)
