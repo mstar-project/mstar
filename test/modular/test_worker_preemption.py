@@ -72,7 +72,7 @@ def _worker(kv):
     w._kv_caches, w._kv_keys = {"kv": PagedKVCache("kv", frozenset({NODE}), kv)}, {NODE: ["kv"]}
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
-    w._in_flight_rids, w._victims, w._dropped, w._hold_logged = set(), {}, {}, {}
+    w._in_flight_rids, w._dropped, w._hold_logged = set(), {}, {}
     w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
     w.held, w.tried, w.failed = [], [], {}
     w._is_tearing_down, w._fail_requests = lambda rid: False, w.failed.update
@@ -177,14 +177,10 @@ def test_a_request_that_can_only_wait_holds_nothing_and_is_logged(caplog):
     assert "r waits for room" in caplog.text, "a request that can only wait left no line"
 
 
-def test_a_victim_in_the_refused_step_drops_once_the_step_clears():
+def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     kv, w = _preempting(in_flight=("r", "v"))
-    assert not w._dropped and kv.is_resident("v"), "v dropped while its step was in flight"
 
-    w._in_flight_rids = set()
-    Worker._move_victims(w)
-
-    assert w._dropped == {"v": NODE} and _step(kv, "r", 1).ok, "v didn't drop once its step cleared"
+    assert w._dropped == {"v": NODE} and _step(kv, "r", 1).ok, "v waited for a step that never ran to clear"
 
 
 def test_a_dropped_request_returns_once_its_history_and_a_page_fit():

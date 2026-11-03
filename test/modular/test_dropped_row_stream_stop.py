@@ -155,7 +155,7 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w.enable_prof = False
     w.device = torch.device("cpu")
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._kv_keys, w._kv_caches, w._dropped, w._preempted = {}, {}, {}, {}
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(

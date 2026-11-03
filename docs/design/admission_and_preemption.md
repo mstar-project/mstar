@@ -133,7 +133,7 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R and aren't already victims, newest first. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
@@ -150,6 +150,7 @@ Why this shape:
 
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
+- **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
@@ -165,14 +166,14 @@ class Earmark:
     victims: set[str]   # the victims whose moves cover it
 ```
 
-When the victims' moves land, the earmark joins R's reservation, so R's next grant can't fail again. Without it, the head of the queue could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
-A victim with a step or a KV read in flight moves or is dropped once that lands, and the worker composes it into no further step until then.
+Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
 Lifecycle:
 
 1. Created with its victims when the worker handles R's failed grant.
-2. Joins R's reservation when its victims' moves land.
+2. Grows R's reservation as each victim's move lands, and closes once the last one has.
 3. Removed with R.
 
 ---

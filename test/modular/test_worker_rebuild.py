@@ -88,7 +88,7 @@ def _worker():
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
     w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
     w._kv_writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
-    w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
+    w._dropped, w._preempted, w._preemptions = {}, {}, defaultdict(PreemptionCounts)
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # holds no row, so any routing, stop or loop-count call fails the test
     w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,
@@ -178,11 +178,10 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     assert landed == [R], "the rebuilt request would never be ready to decode again"
 
 
-@pytest.mark.parametrize("why", ["no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short"])
+@pytest.mark.parametrize("why", ["no ids", "backlog", "rebuild queued", "prefill walk", "samples short"])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
     w._rebuilds._kept[NODE].update({} if why == "no ids" else {R: _kept(5)})
-    w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w.scheduler.rows.update({R: RebuildRow(NODE, PREFILL, {})} if why == "rebuild queued" else {})
     w.infos[R].graph_walk = PREFILL if why == "prefill walk" else DECODE

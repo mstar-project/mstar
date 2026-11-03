@@ -694,7 +694,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
     w._kv_keys, w._kv_caches, w._kv_writes = defaultdict(list), {}, {}
-    w._rebuilding, w._dropped, w._victims = frozenset(), {}, {}
+    w._rebuilding, w._dropped = frozenset(), {}
     w._preempted, w._preemptions, w._drop_logged = {}, defaultdict(PreemptionCounts), {}
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
