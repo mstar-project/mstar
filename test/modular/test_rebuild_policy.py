@@ -26,6 +26,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.rebuild import KeptIds, Rebuilds
+from mstar.worker.worker import _LazyHostOutputs
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
 R, A, B = 7, 8, 9
@@ -153,6 +154,17 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
     kept = rebuilds._kept[NODE]
     assert list(kept[R].sampled) == [4, 9], "a rebuild would prefill other ids than the request's"
     assert not (kept[A].sampled or kept[B].sampled), "it kept a discarded sample"
+
+
+def test_a_sample_is_kept_from_the_host_outputs_the_worker_copies_on_read():
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
+    row = {"new_token": [torch.tensor([9])]}
+    outputs = _LazyHostOutputs({R: row}, lambda names: {name: {R: row[name]} for name in names})
+
+    rebuilds.keep_samples(_batch((R,)), outputs, None)
+
+    assert list(rebuilds._kept[NODE][R].sampled) == [9], "every drop would be refused for the samples it missed"
 
 
 @pytest.mark.parametrize("host", [True, False])
