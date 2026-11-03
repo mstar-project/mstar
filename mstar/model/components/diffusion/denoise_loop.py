@@ -346,12 +346,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """
         return int(fwd_info.dynamic_loop_iter_counts[self.loop_name])
 
-    def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> Hashable:
-        """What this step batches and captures on: ``bucket_key``, with the step's dtype under a step schedule.
-        ``prepare_inputs`` and ``cg_key_info`` both take it from here, so a step's rows and its graph agree."""
+    def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> Hashable:
+        """What step ``step`` (default: ``fwd_info``'s) batches and captures on: ``bucket_key``, with the step's dtype
+        under a step schedule. ``prepare_inputs`` and ``cg_key_info`` both take it from here, so a step's rows and its
+        graph agree."""
         if self.step_dtypes is None:
             return bucket_key
-        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info)))
+        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info) if step is None else step))
 
     def _bucket_of(self, step_key: Hashable) -> Hashable:
         return step_key.bucket if isinstance(step_key, StepBucket) else step_key
@@ -545,13 +546,23 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         per_request_input_metadata=None,
         **kwargs,
     ):
-        del per_request_input_metadata, kwargs
+        del kwargs
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
         keys = [
-            self.step_key(info, self.bucket_key_for(info)) for info in per_request_info.values() if info.step_metadata
+            self.step_key(info, self.bucket_key_for(info), self._step_of(rid, per_request_input_metadata))
+            for rid, info in per_request_info.items() if info.step_metadata
         ]
         return self._uniform_key(keys) if keys else None
+
+    def _step_of(self, rid, per_request_input_metadata) -> int | None:
+        """The row's step from its input metadata, which the scheduler advances for a speculated step whose request
+        info still holds the step in flight's; None when it has none."""
+        if self.step_dtypes is None or not per_request_input_metadata:
+            return None
+        metadata = per_request_input_metadata.get(rid)
+        loops = metadata.dynamic_loop_iter_counts if metadata is not None else {}
+        return int(loops[self.loop_name]) if self.loop_name in loops else None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         # a step mixing dtypes matches no capture and would run a row at a time

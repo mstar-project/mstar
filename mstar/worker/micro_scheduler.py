@@ -1328,7 +1328,7 @@ class MicroScheduler:
     def pick_chain_step(
         self, request_state: RequestStateManager,
         target: tuple[str, str], continuing: Sequence[int],
-        mid_prefill: Collection[MidPrefillRow] = (),
+        mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -1345,6 +1345,10 @@ class MicroScheduler:
         Their nodes are off the ready queue until it lands, so without them
         the next chunk would wait a step. They wait first in line, ahead of
         the backlog, and are never popped.
+
+        ``next_iter_of``: the loop the chain's step runs its rows one
+        iteration on in, if it does; their capture group is the one they have
+        there (``_chain_capture_group``).
         """
         self._let_rows_back(request_state)
         key = self._key(*target)
@@ -1385,7 +1389,7 @@ class MicroScheduler:
             request_state, key, backlog=live, queued=queued, walk_of=walk_of,
             ready=ready,
             continuing=continuing, own_walk=target[1],
-            one_walk=own_walk,
+            one_walk=own_walk, next_iter_of=next_iter_of,
         ))
         if mid:
             took = set(pick.taken)
@@ -1436,12 +1440,15 @@ class MicroScheduler:
         backlog: Sequence[int], queued: Sequence[int],
         walk_of: Callable[[int], str] | None, ready: Callable[[int], bool],
         continuing: Sequence[int] = (), own_walk: str | None = None,
-        one_walk: str | None = None,
+        one_walk: str | None = None, next_iter_of: str | None = None,
     ) -> StepCandidates:
         node, walk = key
         if key not in self._walks_of_key:
             one_walk = walk
         engine = self.engine_manager.get_engine(node)
+        capture_group = None
+        if engine.splits_by_capture_key(node, walk):
+            capture_group = self._chain_capture_group(request_state, node, walk, continuing, next_iter_of)
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1449,10 +1456,7 @@ class MicroScheduler:
             walk_of=walk_of or (lambda _: walk),
             one_walk=one_walk,
             ready=ready,
-            capture_group=(
-                functools.partial(self._capture_group, request_state, node, walk)
-                if engine.splits_by_capture_key(node, walk) else None
-            ),
+            capture_group=capture_group,
             walk_caps=self._walk_caps(key),
             walk_row_caps=self._walk_row_caps(key),
             line_order=functools.partial(self._line_order, key),
@@ -1469,8 +1473,10 @@ class MicroScheduler:
 
     def _capture_group(
         self, request_state: RequestStateManager,
-        node_name: str, graph_walk: str, rid: int,
+        node_name: str, graph_walk: str, rid: int, next_iter_of: str | None = None,
     ) -> Any | None:
+        """``rid``'s capture group at ``graph_walk``; with ``next_iter_of``, at
+        the next iteration of that loop."""
         engine = self.engine_manager.get_engine(node_name)
         if not engine.splits_by_capture_key(node_name, graph_walk):
             return None
@@ -1479,18 +1485,39 @@ class MicroScheduler:
         )
         # a streamed input's chunk can decide the capture (a codec's window size)
         chunks = request_state.ingested_stream_chunks(rid, node_name)
-        return engine.capture_group(
-            node_name, graph_walk, rid, fwd_info,
-            input_metadata=InputMetadata(stream_chunks=chunks) if chunks else None,
+        if next_iter_of is None:
+            metadata = InputMetadata(stream_chunks=chunks) if chunks else None
+        else:
+            loops = dict(fwd_info.dynamic_loop_iter_counts)
+            loops[next_iter_of] = loops.get(next_iter_of, 0) + 1
+            metadata = InputMetadata(stream_chunks=chunks or {}, dynamic_loop_iter_counts=loops)
+        return engine.capture_group(node_name, graph_walk, rid, fwd_info, input_metadata=metadata)
+
+    def _chain_capture_group(
+        self, request_state: RequestStateManager, node_name: str, graph_walk: str,
+        chain: Collection[int], next_iter_of: str | None,
+    ) -> Callable[[int], Any]:
+        """``_capture_group`` for the rows of a speculation chain's step. The
+        chain's own rows run it one iteration on in ``next_iter_of`` (as the
+        step's input metadata has them), while their stored loop counters are
+        still the step in flight's; a group that changes with the iteration
+        (a step schedule's dtype) is the one they'll run in. Other rows run
+        the step where they stand."""
+        if next_iter_of is None or not chain:
+            return functools.partial(self._capture_group, request_state, node_name, graph_walk)
+        chain = frozenset(chain)
+        return lambda rid: self._capture_group(
+            request_state, node_name, graph_walk, rid, next_iter_of if rid in chain else None,
         )
 
     def backlog_splits_from(
         self, request_state: RequestStateManager,
-        target: tuple[str, str], rid: int,
+        target: tuple[str, str], rid: int, next_iter_of: str | None = None,
     ) -> bool:
         """Whether ``target``'s backlog holds a live rid a speculation chain
         anchored at ``rid`` would never merge (``chain_must_yield``), so the
-        chain has to yield for it to run.
+        chain has to yield for it to run. ``next_iter_of`` as in
+        ``pick_chain_step``.
         """
         target = self._key(*target)
         live = self._live_backlog(target)
@@ -1498,7 +1525,7 @@ class MicroScheduler:
             return False
         return self.batch_builder.chain_must_yield(
             self.backlog[target], live, rid,
-            functools.partial(self._capture_group, request_state, *target),
+            self._chain_capture_group(request_state, *target, (rid,), next_iter_of),
         )
 
     def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:

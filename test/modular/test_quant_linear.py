@@ -518,6 +518,19 @@ def test_a_steps_key_is_the_same_from_prepare_inputs_and_cg_key_info():
     assert loop.split_batches_by_capture_key("gen")
 
 
+
+def test_cg_key_info_takes_the_step_from_the_input_metadata_when_it_has_one():
+    """The scheduler groups a speculation chain's rows at the step they run next, while their request info still
+    holds the step in flight's; the lease reads the step's own metadata the same way."""
+    from mstar.model.submodule_base import InputMetadata
+
+    loop = _Loop(StepDtypes(("bf16", "mxfp8")))
+    ahead = {0: InputMetadata(dynamic_loop_iter_counts={"denoise_loop": 1})}
+    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata=ahead) == StepBucket(4, "mxfp8")
+    assert loop.cg_key_info("gen", {0: _info(0)}, per_request_input_metadata={0: InputMetadata()}) == StepBucket(
+        4, "bf16",
+    )
+
 def test_without_a_schedule_the_step_key_is_the_requests():
     loop = _Loop()
     info = _info(0)
