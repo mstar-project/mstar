@@ -186,15 +186,19 @@ def _passing(free: int, head: int, kv=None):
     return kv
 
 
-def _short_chat(kv, rid: str, own: list[int], cap: int = 16) -> None:
-    """A request on ``HELD``, which "r" holds, plus ``own``, decoding up to ``cap`` tokens."""
-    tokens = HELD + own
+def _decoding(kv, rid: str, tokens: list[int], cap: int) -> None:
+    """A request on ``tokens``, decoding up to ``cap`` tokens."""
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": _keys(tokens)}, loop_caps={"decode_loop": cap},
         kv_layout={"main": StreamLayout(
             (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
         )},
     ))
+
+
+def _short_chat(kv, rid: str, own: list[int], cap: int = 16) -> None:
+    """A request on ``HELD``, which "r" holds, plus ``own``, decoding up to ``cap`` tokens."""
+    _decoding(kv, rid, HELD + own, cap)
 
 
 def test_a_passer_pays_for_its_output_and_for_each_page_of_its_hit_eviction_can_take():
@@ -386,7 +390,10 @@ def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
     _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "zgate": gate}, node_resources={NODE: ["kv", "zgate"]}))
     _prefill(kv, "r", HELD + list(range(1000, 1008)))
     _prefill(kv, "x", list(range(6000, 6064)))
-    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - 1) * PAGE_SIZE)))
+    fill = list(range(2000, 2000 + (kv._room() - 1) * PAGE_SIZE))
+    _decoding(kv, "fill", fill, cap=4 * PAGE_SIZE)
+    assert _ready(kv, "fill")
+    _grow(kv, "fill", len(fill))
     _laid_out(kv, "head", list(range(3000, 3000 + 5 * PAGE_SIZE)))
     assert not _ready(kv, "head")
     # "p" passes into the one free page, writes it and finishes, so that page is kept for the head
