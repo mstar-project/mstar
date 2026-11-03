@@ -175,6 +175,44 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     assert _step(kv, "r2", 1).ok, "r2 didn't get a page from the room v's move made"
 
 
+def test_a_request_waiting_on_its_own_victims_isnt_chosen_as_a_victim():
+    kv = _pool()
+    _running(kv, "r", 3, arrival=1)
+    _running(kv, "m", 3, arrival=2)
+    _running(kv, "v", 4, arrival=3)
+    assert kv.preempt("m", _short(kv, "m"), droppable=lambda rid: True) == ["v"]
+
+    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True)
+
+    assert "m" not in victims, "m, which waits on the room its own victim frees, was chosen as a victim"
+
+
+@pytest.mark.parametrize("flight", ["step_in_flight", "read_pending"])
+def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    setattr(kv._streams["v"]["main"], flight, True)
+
+    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: False)
+
+    assert "v" not in victims, f"v was chosen with its {flight}, so its move would be refused"
+
+
+def test_a_victim_whose_move_fails_comes_off_the_earmark():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: False) == ["v"]
+    # the host fills before v moves
+    kv._cpu_pool.arena.acquire(kv._cpu_pool.arena.num_free)
+
+    assert _offload(kv, "v") == 0
+    assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
+
+
 @pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
 def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     kv = _pool()
