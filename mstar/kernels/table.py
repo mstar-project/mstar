@@ -99,7 +99,13 @@ def device_key(device: torch.device | int | None = None) -> DeviceKey | None:
         device = device.index
     if not (current_platform.is_cuda() or current_platform.is_rocm()):
         return None
-    return DeviceKey(torch.cuda.get_device_name(device), current_platform.arch(device))
+    name = torch.cuda.get_device_name(device)
+    if current_platform.is_rocm():
+        # An AMD GPU passed to a VM through SR-IOV reports its name with " VF"
+        # appended ("AMD Instinct MI325X VF"). It is the same silicon, so it
+        # reads the table tuned for the bare GPU's name.
+        name = name.removesuffix(" VF")
+    return DeviceKey(name, current_platform.arch(device))
 
 
 @dataclass(frozen=True)
