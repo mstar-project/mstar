@@ -216,7 +216,17 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 
 
 @pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("fields", [{"n": 2}, {"stop": "."}, {"stop": ["END"]}], ids=str)
+def test_a_chat_asking_for_choices_or_stop_strings_is_refused(tmp_path, adapter, fields):
+    """Every chat adapter returns one choice and has no stop strings; dropping them was a 200."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    with pytest.raises(ValueError, match="n=2" if "n" in fields else "stop sequences"):
+        adapter().chat_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
+    {"n": 1}, {"n": None}, {"stop": None}, {"stop": []},
     {"tools": []}, {"tools": None}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tool_choice": None},
     {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
     {"function_call": None},

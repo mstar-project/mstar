@@ -188,16 +188,22 @@ def _forward_sent_speed(req, mk: dict) -> None:
         mk.setdefault("speed", req.speed)
 
 
-def _refuse_tool_calls(req) -> None:
-    """Refuse a chat that asks the model to call a tool.
+def _refuse_unserved_chat(req) -> None:
+    """Refuse a chat that asks for more than one choice, stop sequences, or a tool call.
 
-    No adapter here parses a tool call out of a reply, so a client sent plain
+    No chat adapter here returns more than one choice or ends a reply at a stop
+    string, so either one dropped answers a different request with a 200.
+    No adapter parses a tool call out of a reply, so a client sent plain
     text takes it for the model declining every tool. An empty ``tools`` and a
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
     by default. A ``tool_choice`` of ``none`` asks for no call even when
     ``tools`` lists some. Their older names, ``functions`` and
     ``function_call``, follow the same rules.
     """
+    if req.n not in (None, 1):
+        raise ValueError(f"n={req.n}: this model returns one choice")
+    if req.stop:
+        raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
     extra = req.model_extra or {}
     choice = extra.get("tool_choice")
     function_call = extra.get("function_call")
@@ -389,7 +395,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        _refuse_unserved_chat(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -451,7 +457,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        _refuse_unserved_chat(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -505,7 +511,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        _refuse_unserved_chat(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -1054,7 +1060,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        _refuse_unserved_chat(req)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
         # Clients written for the Edge model's serving recipe toggle thinking
@@ -1553,7 +1559,7 @@ class TextChatAdapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        _refuse_unserved_chat(req)
         text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1567,10 +1573,6 @@ class TextChatAdapter(OpenAIAdapter):
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1, got {value}")
         # what the model cannot serve is refused, not dropped: off, a field passes
-        if req.n not in (None, 1):
-            raise ValueError(f"n={req.n}: this model returns one choice")
-        if req.stop:
-            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
         mk = _passthrough(req)
         for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
                      "stop_token_ids"):

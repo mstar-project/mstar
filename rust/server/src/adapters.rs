@@ -373,7 +373,7 @@ impl Adapter {
         upload_dir: &Path,
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
-        refuse_tool_calls(req)?;
+        refuse_unserved_chat(req)?;
         match self {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
@@ -731,9 +731,18 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// Refuse a chat that asks the model to call a tool. The rules are
-/// `_refuse_tool_calls` in `api_server/openai/adapters.py`.
-fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
+/// Refuse a chat that asks for more than one choice, stop sequences, or a
+/// tool call. The rules are `_refuse_unserved_chat` in
+/// `api_server/openai/adapters.py`.
+fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
+    if let Some(n) = req.n.filter(|&n| n != 1) {
+        return Err(format!("n={n}: this model returns one choice"));
+    }
+    if req.stop.as_ref().is_some_and(truthy) {
+        return Err(
+            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
+        );
+    }
     let listed = |field: &str| match req.extra.get(field) {
         None | Some(Value::Null) => false,
         Some(Value::Array(t)) => !t.is_empty(),
@@ -1009,8 +1018,26 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_asking_for_choices_or_stop_strings_is_refused() {
+        for (fields, err) in [
+            (r#""n":2"#, "n=2: this model returns one choice"),
+            (r#""stop":".""#, "stop sequences are not supported"),
+            (r#""stop":["END"]"#, "stop sequences are not supported"),
+        ] {
+            for adapter in CHAT_ADAPTERS {
+                let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
+                assert!(got.starts_with(err), "{fields} on {adapter:?}: {got}");
+            }
+        }
+    }
+
+    #[test]
     fn the_tool_fields_clients_send_by_default_pass() {
         for fields in [
+            r#""n":1"#,
+            r#""n":null"#,
+            r#""stop":null"#,
+            r#""stop":[]"#,
             r#""tools":[]"#,
             r#""tools":null"#,
             r#""tool_choice":"none""#,
