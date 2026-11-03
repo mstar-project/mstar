@@ -236,6 +236,12 @@ class _RaggedManagerBase:
         return self._config.max_segments_per_request
 
     @property
+    def max_segments_per_step(self) -> int | None:
+        """Segments a one-row replay's plan holds for its whole step, as
+        configured; None for a resource sized per request."""
+        return self._config.max_segments_per_step
+
+    @property
     def force_double_buffer(self):
         # plan H2Ds each layout into static buffers that a captured replay reads
         return True
@@ -251,9 +257,10 @@ class _RaggedManagerBase:
 
         Built on the first plan for that key, like the paged backend's. Its
         static buffers are fixed for its lifetime, so they are sized off the
-        config's per-request ceilings and the bucket — NOT off this first
-        plan's ``num_rows``, which is only one of the layouts the bucket will
-        replay.
+        config's segment ceiling at the bucket's batch size
+        (``max_segments_for``) and the bucket's token count — NOT off this
+        first plan's ``num_rows``, which is only one of the layouts the bucket
+        will replay.
         """
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
@@ -355,6 +362,10 @@ class _RaggedManagerBase:
         self._preplanned = ctx.is_preplan
 
     def clear_preplan(self):
+        # The dropped plan's H2Ds went on the plan stream, and the step that runs
+        # instead waits on no event from it, so it must stage its layout itself.
+        for wrapper in self._preplan_states.values():
+            wrapper.forget_plan()
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
@@ -416,7 +427,6 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
-            # TODO: cache the latest plan state
             wrapper.plan(cu_seqlens=self._cu_seqlens(segments), causal=step.causal)
             plan_states[label] = wrapper
 

@@ -73,8 +73,7 @@ class Wan22Config:
     max_video_pixels: int = 256 * 2**20
 
     # torch.compile the inner DiT region (patchify -> blocks -> head). The UniPC
-    # solver stays eager — its CPU-resident sigma trips Inductor (see
-    # Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates
+    # solver stays eager — its CPU-resident sigma trips Inductor. Default ON in serving; the reference-equivalence gates
     # build with this False to hold the eager path against the reference.
     compile_dit: bool = True
     # "WxHxF" request shapes (width x height x num_frames) the compiled DiT
@@ -84,6 +83,15 @@ class Wan22Config:
     # compile on the shared worker. A listed shape compiles at most twice (CFG
     # on and off).
     compile_dit_sizes: tuple[str, ...] | None = None
+    # Requests at one latent grid sharing a dit forward. Each row count traces its
+    # own compiled graph, on top of the shapes above.
+    dit_max_batch_size: int = 1
+
+    # The DiT's self-attention kernel: "flashinfer" runs it through the engine's
+    # ragged resource (FlashInfer's ragged prefill, FA3 on Hopper); "sdpa" runs
+    # torch SDPA, the reference pipeline's kernel. The cross-attention always
+    # runs SDPA.
+    attention_backend: str = "flashinfer"
 
     # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
     # exceeds the estimated untiled peak for the output size and tiles otherwise;
@@ -105,6 +113,10 @@ class Wan22Config:
         # rather than read as on.
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
+        if self.attention_backend not in ("flashinfer", "sdpa"):
+            raise ValueError(
+                f"Wan2.2 attention_backend must be 'flashinfer' or 'sdpa', got {self.attention_backend!r}."
+            )
         self.fast_decode_sizes()
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:

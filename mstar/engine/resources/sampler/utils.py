@@ -20,7 +20,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -28,7 +28,7 @@ import triton
 import triton.language as tl
 
 from mstar.utils.device import DeviceCapability
-from mstar.utils.h2d import PinnedStager, to_device_nonblocking
+from mstar.utils.h2d import H2DMirror, PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import sampler_slots
 
 if TYPE_CHECKING:
@@ -676,6 +676,107 @@ def _fused_filter_kernel(
     tl.store(out_ptr + row * stride_out + offs, out / tl.maximum(total, 1e-30), mask=valid)
 
 
+@triton.jit
+def _kth_largest_key(key, k, HI: tl.constexpr, ITERS: tl.constexpr):
+    """The largest ``t`` in ``[0, HI]`` with at least ``k`` entries of ``key`` >= t."""
+    lo = 0
+    hi = HI
+    for _ in range(ITERS):
+        mid = lo + (hi - lo + 1) // 2
+        ok = tl.sum((key >= mid).to(tl.int32), axis=0) >= k
+        lo = tl.where(ok, mid, lo)
+        hi = tl.where(ok, hi, mid - 1)
+    return lo
+
+
+@triton.jit
+def _fused_sample_kernel(
+    logits_ptr, temperature_ptr, top_k_ptr, top_p_ptr, seed_ptr, offset_ptr,
+    penalty_ptr, seen_ptr, out_ptr,
+    V, stride_l, seen_stride_b, seen_stride_v,
+    APPLY_PENALTY: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """One row's token, from its logits, in registers: the repetition penalty,
+    temperature softmax, top-k then top-p over the renormalised top-k
+    (FlashInfer's order), and an inverse-CDF draw from Philox at the row's
+    own (seed, offset), so a request draws the same token at any batch
+    position. Temperature 0 takes the argmax.
+
+    The cuts rank tokens by their probability's top 16 bits (bf16
+    precision, truncated): a search over 2^14 keys instead of 2^31, so
+    tokens within one bf16 step of the k-th probability are kept with it."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    valid = offs < V
+    x = tl.load(logits_ptr + row * stride_l + offs, mask=valid, other=-float("inf")).to(tl.float32)
+    if APPLY_PENALTY:
+        seen = tl.load(
+            seen_ptr + row * seen_stride_b + offs * seen_stride_v, mask=valid, other=0,
+        ).to(tl.int1)
+        x = _penalize(x, seen, tl.load(penalty_ptr + row))
+    temp = tl.load(temperature_ptr + row)
+    greedy = temp == 0
+    x_max, arg = tl.max(x, axis=0, return_indices=True)
+    inv_temp = tl.where(greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+    # unnormalised: the largest is 1, so every key is at most 1.0's, 0x3F80
+    e = tl.where(valid, tl.exp((x - x_max) * inv_temp), 0.0)
+    key = e.to(tl.int32, bitcast=True) >> 16
+    k = tl.load(top_k_ptr + row)
+    t = 0
+    if k > 0:
+        if k < V:  # a branch, not tl.where: skip the search when nothing is cut
+            t = _kth_largest_key(key, k, 0x3F80, 14)
+    top_p = tl.load(top_p_ptr + row)
+    if top_p < 1.0:
+        # top-p keeps token i iff the mass strictly above it is < p * mass. That
+        # mass falls as i's key rises: search for the smallest key t' with
+        # mass(> t') < p * mass
+        target = top_p * tl.sum(tl.where(key >= t, e, 0.0), axis=0)
+        lo = t
+        hi = 0x3F80
+        for _ in range(14):
+            mid = lo + (hi - lo) // 2
+            ok = tl.sum(tl.where(key > mid, e, 0.0), axis=0) < target
+            hi = tl.where(ok, mid, hi)
+            lo = tl.where(ok, lo, mid + 1)
+        t = lo
+    q = tl.where(key >= t, e, 0.0)
+    # u in (0, mass]: the first token whose running mass reaches u, never one
+    # with no mass
+    u = (1.0 - tl.rand(tl.load(seed_ptr + row), tl.load(offset_ptr + row))) * tl.sum(q, axis=0)
+    drawn = tl.sum((tl.cumsum(q, axis=0) < u).to(tl.int32), axis=0)
+    drawn = tl.minimum(drawn, tl.max(tl.where(q > 0, offs, 0), axis=0))
+    tl.store(out_ptr + row, tl.where(greedy, arg, drawn).to(tl.int64))
+
+
+# Vocabularies up to this size draw in one ``_fused_sample_kernel`` launch, one
+# program per row holding the whole row; larger ones through FlashInfer.
+FUSED_SAMPLE_MAX_VOCAB = 4096
+
+
+def fused_sample(
+    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    seed: torch.Tensor, offset: torch.Tensor,
+    rep_penalty: torch.Tensor | None = None, seen_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``[B]`` int64 tokens drawn from ``logits [B, V]`` (V up to
+    ``FUSED_SAMPLE_MAX_VOCAB``) in one launch: the work of
+    ``fused_temperature_softmax`` plus FlashInfer's top-k/top-p draw, which
+    is a handful of launches of a few microseconds each at a small vocab.
+    Graph-safe."""
+    B, V = logits.shape
+    out = torch.empty(B, dtype=torch.int64, device=logits.device)
+    penalty = rep_penalty is not None and seen_tokens is not None
+    _fused_sample_kernel[(B,)](
+        logits, temperature, top_k, top_p, seed, offset,
+        rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
+        V, logits.stride(0),
+        seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
+        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= 2048 else 8,
+    )
+    return out
+
+
 def filter_top_k_top_p(
     probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     order: FilterOrder | None = None, fused: bool = True,
@@ -753,6 +854,31 @@ def token_logprobs(logits: torch.Tensor, tokens: torch.Tensor, temperature: torc
     scaled = logits / t
     norm = scaled.logsumexp(dim=-1, keepdim=True)
     return (scaled.gather(1, tokens.long().unsqueeze(1)) - norm).squeeze(1)
+
+
+def processed_logprobs(
+    probs: torch.Tensor, tokens: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    history: "HistoryRows | None" = None, order: "FilterOrder | None" = None,
+) -> torch.Tensor:
+    """Log-probs of ``tokens`` under the distribution they were drawn from:
+    ``probs`` (after the penalty, temperature and min-p) filtered and floored
+    as ``_filter_floor_and_draw`` does. 0 for greedy rows; graph-safe."""
+    import flashinfer
+
+    tokens = tokens.long().view(-1, 1)
+    floor = history is not None and history.stop_ids is not None
+    if order is not None or floor:
+        filtered = filter_top_k_top_p(probs, top_k, top_p, order)
+        if floor:
+            filtered = apply_min_tokens_floor(filtered, history)
+        picked = filtered.gather(1, tokens)
+    else:
+        # FlashInfer's own order, as the draw: two renorms and no counting pass
+        first = flashinfer.sampling.top_k_renorm_probs(probs, torch.where(top_k > 0, top_k, probs.shape[1]))
+        then = flashinfer.sampling.top_p_renorm_probs(first, top_p)
+        picked = torch.where(top_p[:, None] < 1.0, then.gather(1, tokens), first.gather(1, tokens))
+    # a renormed near-certain token can land a ulp above 1
+    return picked.squeeze(1).log().clamp_max(0)
 
 
 @triton.jit
@@ -976,6 +1102,7 @@ class SamplingConfig:
     # whether the penalty also counts the prompt's tokens; see ``SamplingReqConfig``
     penalize_prompt: bool = True
     return_logprobs: bool = False
+    logprobs_mode: str = "raw"
     _seed: int = 0 # set by the conductor
 
     def set_seed(self, seed: int):
@@ -1124,7 +1251,8 @@ class Sampler(BaseSampler):
     def sample(
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
-        kept_rids: "frozenset | None" = None, **kwargs
+        kept_rids: "frozenset | None" = None,
+        rand_offset: torch.Tensor | None = None, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1136,6 +1264,9 @@ class Sampler(BaseSampler):
         ``apply_penalty`` False skips the repetition penalty, as the captured
         sampler does for a node or step without it. Only ``kept_rids`` (None:
         all) advance their RNG offset and seen-token mask.
+
+        ``rand_offset`` ([B], on the device) draws at the caller's offsets
+        instead of ``_step_offset``, and leaves advancing them to the caller.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         history, rows = self._gather_history(request_ids, configs)
@@ -1155,10 +1286,12 @@ class Sampler(BaseSampler):
             if any(c.min_p > 0 for c in configs) else None
         )
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.tensor(
-            [self._step_offset.get(rid, 0) for rid in request_ids],
-            device=logits.device, dtype=torch.long,
-        )
+        own_offsets = rand_offset is None
+        if own_offsets:
+            rand_offset = torch.tensor(
+                [self._step_offset.get(rid, 0) for rid in request_ids],
+                device=logits.device, dtype=torch.long,
+            )
 
         any_rep_pen = apply_penalty and any(p != 1.0 for p in penalties)
         any_greedy = any(c.temperature == 0 for c in configs)
@@ -1177,6 +1310,7 @@ class Sampler(BaseSampler):
                 [self._seen_token_mask[rid]._seen_token_mask for rid in request_ids], dim=0,
             )
 
+        processed = [c.return_logprobs and c.logprobs_mode == "processed" for c in configs]
         tokens = sample_tokens(
             logits=logits,
             temperature=temperature,
@@ -1191,7 +1325,9 @@ class Sampler(BaseSampler):
             min_p=min_p,
             history=history,
             order=order,
+            return_probs=any(processed),
         )
+        tokens, probs = tokens if any(processed) else (tokens, None)
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
         # (broadcast-True + index_put) on the default stream, serializing N=bs
@@ -1207,9 +1343,15 @@ class Sampler(BaseSampler):
         tokens = self._broadcast_tokens(tokens)
 
         want = [c.return_logprobs for c in configs]
-        self.logprobs = torch.where(
-            torch.tensor(want, device=logits.device), token_logprobs(logits, tokens, temperature), torch.nan,
-        ) if any(want) else None
+        self.logprobs = None
+        if any(want):
+            chosen = token_logprobs(logits, tokens, temperature)
+            if probs is not None:
+                chosen = torch.where(
+                    torch.tensor(processed, device=logits.device),
+                    processed_logprobs(probs, tokens, top_k, top_p, history, order), chosen,
+                )
+            self.logprobs = torch.where(torch.tensor(want, device=logits.device), chosen, torch.nan)
 
         if history is not None:
             advance_history(history, tokens)
@@ -1227,6 +1369,8 @@ class Sampler(BaseSampler):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
+        if not own_offsets:
+            return tokens
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
         # would make consecutive decode steps reuse overlapping RNG regions.
@@ -1284,6 +1428,11 @@ class Sampler(BaseSampler):
         return FilterOrder(top_p_first=dev[0] != 0, min_keep=dev[1].to(torch.int32))
 
 
+class Draw(NamedTuple):
+    tokens: torch.Tensor
+    probs: torch.Tensor  # the distribution the filters ran on
+
+
 def _sample_cuda(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -1298,8 +1447,10 @@ def _sample_cuda(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
-    """Sample normalized CUDA inputs with FlashInfer."""
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
+    """Sample normalized CUDA inputs with FlashInfer; with ``return_probs``,
+    also the distribution the filters ran on."""
     import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
@@ -1322,8 +1473,8 @@ def _sample_cuda(
         if min_p is not None:
             probs = apply_min_p(probs, min_p)
         if _needs_explicit_filter(history, order):
-            return _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
-        if top_k_zero_count == logits.shape[0]:
+            result = _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
+        elif top_k_zero_count == logits.shape[0]:
             # top-k is off for every row
             result = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p,
@@ -1338,7 +1489,8 @@ def _sample_cuda(
                 deterministic=True,
                 seed=seed, offset=rand_offset,
             )
-        return result[0] if isinstance(result, tuple) else result
+        result = result[0] if isinstance(result, tuple) else result
+        return Draw(result, probs) if return_probs else result
 
 
 def _needs_explicit_filter(history: HistoryRows | None, order: FilterOrder | None) -> bool:
@@ -1464,7 +1616,8 @@ def sample_tokens(
     min_p: float | torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
     Args:
@@ -1492,6 +1645,8 @@ def sample_tokens(
         history: Optional ``HistoryRows`` (CUDA only): the windowed penalty and
             the min-tokens floor.
         order: Optional ``FilterOrder`` (CUDA only): HF's top-p-first order.
+        return_probs: (CUDA only) also return the distribution the filters
+            ran on, for ``processed_logprobs``.
 
     Returns:
         tokens: [batch_size] sampled token IDs.
@@ -1525,6 +1680,7 @@ def sample_tokens(
             min_p=min_p,
             history=history,
             order=order,
+            return_probs=return_probs,
         )
     elif logits.device.type == "xpu":
         if history is not None or order is not None:
@@ -1586,12 +1742,21 @@ def sample_accelerator_graphable_gpu(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
-) -> torch.Tensor:
+    return_probs: bool = False,
+) -> torch.Tensor | Draw:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
-    so the CUDA-graph path can apply the same sign-aware repetition penalty as
-    the regular ``Sampler``, then samples with
+    On CUDA, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
+    ``min_p``, ``history``, ``order`` or ``return_probs`` draws in one
+    ``fused_sample`` launch:
+    per-row seeds, so batch-invariant, but its cuts rank on bf16-truncated
+    keys (see ``_fused_sample_kernel``), and the eager ``Sampler`` path
+    (``_sample_cuda``) keeps FlashInfer, so for those vocabularies an eager
+    and a captured step draw differently for the same seed.
+
+    Otherwise it routes through the fused Triton prep kernel
+    (``fused_temperature_softmax``) so the CUDA-graph path can apply the same
+    sign-aware repetition penalty as the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
     — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy rows keep
     ``temperature == 0`` in the device buffer and the prep kernel turns them into
@@ -1619,6 +1784,8 @@ def sample_accelerator_graphable_gpu(
         history, order: the generation-aware processors (``HistoryRows``,
             ``FilterOrder``); None leaves each out of the captured graph. The
             caller advances ``history`` with the sampled tokens.
+        return_probs: (CUDA only) also return the distribution the filters
+            ran on, for ``processed_logprobs``.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -1643,6 +1810,14 @@ def sample_accelerator_graphable_gpu(
         import flashinfer
 
         with torch.cuda.device(logits.device):
+            if (
+                logits.shape[1] <= FUSED_SAMPLE_MAX_VOCAB and min_p is None
+                and history is None and order is None and not return_probs
+            ):
+                return fused_sample(
+                    logits, temperature, top_k, top_p, seed, offset,
+                    rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
+                )
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=rep_penalty if apply_penalty else None,
@@ -1653,19 +1828,21 @@ def sample_accelerator_graphable_gpu(
             if min_p is not None:
                 probs = apply_min_p(probs, min_p)
             if _needs_explicit_filter(history, order):
-                return _filter_floor_and_draw(probs, top_k, top_p, seed, offset, history, order).to(torch.int64)
-            top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
-            # and offset and folds the row index into philox, so identical (probs,
-            # seed, offset) yield different tokens at different batch positions.
-            # Sampling is thus reproducible only within a fixed batch layout; under
-            # continuous batching (shifting positions) a request's stream is not.
-            # Measured in test/sampling_test/flashinfer_batch_test.py.
-            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p, deterministic=True,
-                seed=seed, offset=offset,
-            )
-        return samples.to(torch.int64)
+                samples = _filter_floor_and_draw(probs, top_k, top_p, seed, offset, history, order)
+            else:
+                # NOTE: this FlashInfer path (not ``fused_sample``'s) is NOT
+                # batch-invariant. FlashInfer reads only row 0's seed
+                # and offset and folds the row index into philox, so identical (probs,
+                # seed, offset) yield different tokens at different batch positions.
+                # Sampling is thus reproducible only within a fixed batch layout; under
+                # continuous batching (shifting positions) a request's stream is not.
+                # Measured in test/sampling_test/flashinfer_batch_test.py (raw FlashInfer).
+                samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, torch.where(top_k > 0, top_k, logits.shape[1]), top_p, deterministic=True,
+                    seed=seed, offset=offset,
+                )
+        samples = samples.to(torch.int64)
+        return Draw(samples, probs) if return_probs else samples
     else:
         raise ValueError(
             f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
@@ -1699,14 +1876,20 @@ class AcceleratorGraphableSampler(BaseSampler):
     # ask); both ``None`` unless the node's spec enables log-probs.
     return_logprobs_buf: torch.Tensor | None = None
     logprob_buf: torch.Tensor | None = None
+    # ``[bs]`` per-request ``logprobs_mode == "processed"``; ``None`` unless
+    # the spec enables processed log-probs.
+    processed_logprobs_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
     # In-graph gather/scatter (``MSTAR_SAMPLER_INGRAPH_SCATTER``): the slot
-    # masters and this slot's padded index row, all static, so the captured
+    # masters and this slot's padded index rows, all static, so the captured
     # sample reads its offsets from the masters and writes the advanced
     # offsets and the sampled tokens back without a launch after the replay.
+    # The scatter row is the gather row with the step's dropped rows
+    # (``SamplerStep.kept_rids``) sent to the trash row, as padding rows are.
     offset_master: torch.Tensor | None = None
     last_token_master: torch.Tensor | None = None
     slot_idx_view: torch.Tensor | None = None
+    scatter_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
 
     # Set during graph capture, and used by the cuda graph runner to determine
@@ -1721,10 +1904,10 @@ class AcceleratorGraphableSampler(BaseSampler):
 
     def scatter_in_graph(self, codes: torch.Tensor) -> None:
         """Advanced offsets and sampled tokens back to the masters, inside the
-        graph: every row, padding rows into the trash row."""
-        self.offset_master.index_copy_(0, self.slot_idx_view, self.offset_buf)
+        graph: every row, padding and dropped rows into the trash row."""
+        self.offset_master.index_copy_(0, self.scatter_idx_view, self.offset_buf)
         self.last_token_master.index_copy_(
-            0, self.slot_idx_view, codes.to(self.last_token_master.dtype),
+            0, self.scatter_idx_view, codes.to(self.last_token_master.dtype),
         )
 
     @torch.compiler.disable
@@ -1739,6 +1922,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
         if self.ingraph_scatter:
             self.gather_in_graph()
+        processed = self.processed_logprobs_buf is not None
         codes = sample_accelerator_graphable_gpu(
             logits, self.temperature_buf,
             top_k, top_p,
@@ -1749,17 +1933,25 @@ class AcceleratorGraphableSampler(BaseSampler):
             min_p=self.min_p_buf,
             history=self.history,
             order=self.order,
+            return_probs=processed,
         )
+        codes, probs = codes if processed else (codes, None)
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
+        if self.logprob_buf is not None:
+            # before the history moves on: the min-tokens floor reads its count
+            chosen = token_logprobs(logits, codes, self.temperature_buf)
+            if processed:
+                chosen = torch.where(
+                    self.processed_logprobs_buf,
+                    processed_logprobs(probs, codes, top_k, top_p, self.history, self.order), chosen,
+                )
+            self.logprob_buf.copy_(torch.where(self.return_logprobs_buf, chosen, torch.nan))
         if self.history is not None:
             # the TP-agreed token, so every rank's history stays the same
             advance_history(self.history, codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
-        if self.logprob_buf is not None:
-            chosen = token_logprobs(logits, codes, self.temperature_buf)
-            self.logprob_buf.copy_(torch.where(self.return_logprobs_buf, chosen, torch.nan))
         if self.ingraph_scatter:
             self.scatter_in_graph(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
@@ -1940,12 +2132,12 @@ class HostBuffer:
 
     The master is on the host because the gather runs in the pre-plan beside a
     live graph, so it must be one H2D copy with no device ops (``mstar.utils.h2d``).
+    A sampler's buffers share that copy: ``ScalarRows`` packs their ``buf`` rows.
     """
     buf: torch.Tensor
     master: np.ndarray
     default: float
     dtype: torch.dtype
-    stager: PinnedStager
 
     @classmethod
     def allocate(
@@ -1958,7 +2150,6 @@ class HostBuffer:
             master=np.full(capacity, default, dtype=np_dtype),
             default=default,
             dtype=dtype,
-            stager=PinnedStager(dtype, numel=max_bs),
         )
 
     def write_master_row(self, slot: int, value) -> None:
@@ -1973,9 +2164,45 @@ class HostBuffer:
         """This slot's per-step row."""
         return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
 
+
+class ScalarRows:
+    """The per-step rows of a sampler's ``HostBuffer``s in one device byte row
+    per cg slot, each buffer's ``buf`` a typed view into it, so a gather stages
+    them all in one H2D copy and skips it when the slot already holds the
+    bytes (a copy per buffer cost more than the gathers themselves)."""
+
+    def __init__(self, buffers: list[HostBuffer], max_bs: int, device: torch.device):
+        self.buffers = buffers
+        cg_slots = buffers[0].buf.shape[0]
+        # 8-byte aligned regions, so every typed view divides its row stride
+        self.regions: list[tuple[int, int]] = []
+        size = 0
+        for buf in buffers:
+            nbytes = max_bs * buf.master.itemsize
+            self.regions.append((size, nbytes))
+            size += -(-nbytes // 8) * 8
+        self.rows = torch.empty(cg_slots, size, dtype=torch.uint8, device=device)
+        for buf, (start, nbytes) in zip(buffers, self.regions, strict=True):
+            view = self.rows[:, start:start + nbytes].view(buf.dtype)
+            view.copy_(buf.buf)
+            buf.buf = view
+        # per slot: a pre-plan may gather one slot while the gpu thread gathers the other
+        self._host = [np.zeros(size, np.uint8) for _ in range(cg_slots)]
+        self._mirrors = [H2DMirror() for _ in range(cg_slots)]
+        # room for several rows a segment, so most gathers leave none (each
+        # segment left costs an event record)
+        self._stager = PinnedStager(torch.uint8, numel=8 * size)
+
     def gather(self, rows: np.ndarray, padded_bs: int, cg_slot: int) -> None:
-        """Rows ``rows`` of the master into ``cg_slot``'s per-step buffer."""
-        self.stager.copy_(self.slot_view(cg_slot, padded_bs), self.master[rows])
+        """Rows ``rows`` of every buffer's master into ``cg_slot``'s row. The
+        bytes past ``padded_bs`` in each region are whatever the slot held: a
+        step reads only its first ``padded_bs``."""
+        slot = cg_slot if self.rows.shape[0] > 1 else 0
+        host = self._host[slot]
+        for buf, (start, _) in zip(self.buffers, self.regions, strict=True):
+            master = buf.master
+            np.take(master, rows, out=host[start:start + padded_bs * master.itemsize].view(master.dtype))
+        self._stager.copy_(self.rows[slot], host, mirror=self._mirrors[slot])
 
 
 @dataclass
@@ -2050,7 +2277,8 @@ class SamplerBuffers:
     # Per-request RNG offset: gathered by slot, advanced in graph, scattered
     # back after replay (all on GPU). Not a config value, so it's kept out of
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
-    # on register instead.
+    # on register instead. Eager steps draw at it and advance it too
+    # (``eager_offsets``): it is the request's only counter.
     offset: Buffer
     # Per-request last sampled token, by slot: the captured sample writes the
     # per-step row (double-buffered, one row per cg slot), ``scatter_last_token``
@@ -2096,11 +2324,16 @@ class SamplerBuffers:
     # log-prob rows the captured sample writes; only when the spec enables them.
     return_logprobs: "HostBuffer | None" = None
     logprob: torch.Tensor | None = None
+    # Per-request ``logprobs_mode == "processed"``; only when the spec enables it.
+    processed_logprobs: "HostBuffer | None" = None
     # Request rows in the masters, trash row excluded; doubles when registrations outgrow it.
     _master_capacity: int = field(default=0, repr=False)
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    # With ``ingraph_scatter``: request rows of the offset and last-token masters, which
+    # the captured graphs index and so never grow; the other masters grow up to it.
+    _ingraph_capacity: int = field(default=0, repr=False)
     # Master row 0, never given to a request, so its config stays SamplingConfig().
     # Padding rows, unregistered rids and capture rows read it; in graph they write it.
     _trash_slot: ClassVar[int] = 0
@@ -2108,7 +2341,10 @@ class SamplerBuffers:
     cg_slots: int = 1
     # Per-step slot-index staging, per cg slot. ``_slot_idx_cpu`` is pinned so
     # the H2D copy can be issued non-blocking; ``_slot_idx_gpu`` is the
-    # device-side index tensor that ``index_select`` reads from.
+    # device-side index tensor that ``index_select`` reads from. A step of
+    # ``padded_bs`` rows uses ``[:padded_bs]`` as its gather index and, with
+    # ``ingraph_scatter``, ``[padded_bs:2 * padded_bs]`` as its scatter index,
+    # so one copy uploads both.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
     # Zero-copy numpy view of ``_slot_idx_cpu``, so staging is one slice write
@@ -2120,6 +2356,8 @@ class SamplerBuffers:
     _last_real_bs: list[int] = field(default_factory=list, repr=False)
     # memoized per (slot, real rows): see ``_scatter_idx``
     _scatter_idx_views: dict = field(default_factory=dict, repr=False)
+    # (cg slot, padded_bs) -> (device dst, pinned src, gather view) of ``_upload_slot_idx``
+    _upload_views: dict = field(default_factory=dict, repr=False)
     # cg slot -> the (rids, padded_bs) its pinned index row currently holds, so
     # gather_dynamic can re-issue the H2D without redoing the O(bs) CPU fill
     _staged_rids: dict[int, tuple[tuple[str, ...], int]] = field(
@@ -2131,9 +2369,10 @@ class SamplerBuffers:
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
-    # Slots whose RNG offset must be zeroed before it is next gathered: a
-    # device write, so the plan thread queues it and ``gather_dynamic`` (GPU
-    # thread, default stream) drains it.
+    # Slots whose RNG offset must be zeroed before it is next read: a device
+    # write, so registration queues it (before any draw, so a drain never zeroes
+    # an offset already drawn at) and the first reader on the GPU thread
+    # (``gather_dynamic`` or ``eager_offsets``) drains it.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Slots whose loop-back state rows go back to their defaults before they
@@ -2155,6 +2394,8 @@ class SamplerBuffers:
     )
     # (padded_bs, cg slot) -> the sampler over that slot's views; see sampler_for
     _samplers: dict = field(default_factory=dict, repr=False)
+    # the scalar buffers' per-step rows, staged together; set by ``allocate``
+    _scalar_rows: ScalarRows | None = field(default=None, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -2164,7 +2405,7 @@ class SamplerBuffers:
         bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
         for opt in (
             self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep, self.return_logprobs,
+            self.top_p_first, self.top_p_min_keep, self.return_logprobs, self.processed_logprobs,
         ):
             if opt is not None:
                 bufs.append(opt)
@@ -2186,13 +2427,17 @@ class SamplerBuffers:
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
         enable_logprobs: bool = False,
+        enable_processed_logprobs: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
         The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
-        request. With ``ingraph_scatter`` that is ``slots`` request rows (the
-        knob's 4096 by default), allocated once: the captured graphs keep their
-        addresses, so they never grow.
+        request, ``max_batch_size`` to start with, doubling as registrations
+        outgrow them. With ``ingraph_scatter`` the offset and last-token masters
+        hold ``slots`` request rows (the knob's 4096 by default), allocated
+        once: the captured graphs keep their addresses, so those two never grow,
+        and the others grow up to them. A registration past them raises, so the
+        caller takes rows only while ``free_rows`` says one is left.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. ``history`` (with ``stop_ids`` and
@@ -2204,10 +2449,14 @@ class SamplerBuffers:
         """
         pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
+        ingraph_cap = 0
         if ingraph_scatter:
-            cap = max(max_batch_size, slots if slots is not None else sampler_slots())
+            ingraph_cap = max(max_batch_size, slots if slots is not None else sampler_slots())
         # row 0 is the trash row; requests take rows 1..cap
         rows = cap + 1
+        graph_rows = max(cap, ingraph_cap) + 1
+        # the in-graph scatter's index follows the gather index (see ``_slot_idx_cpu``)
+        idx_cols = 2 * max_batch_size if ingraph_scatter else max_batch_size
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
             return HostBuffer.allocate(
@@ -2223,15 +2472,15 @@ class SamplerBuffers:
         windowed = history is not None and history.window > 0
         if history is not None:
             history.allocate_step_buffers(max_batch_size)
-        return cls(
+        buffers = cls(
             max_batch_size=max_batch_size,
             temperature=mk(torch.float32, 1.0),
             top_k=mk(torch.int32, 0),
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, 1),
-            last_token=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, cg_slots),
+            offset=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, 1),
+            last_token=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
@@ -2250,15 +2499,19 @@ class SamplerBuffers:
             top_p_min_keep=mk(torch.int32, 1) if enable_top_p_first else None,
             return_logprobs=mk(torch.bool, False) if enable_logprobs else None,
             logprob=torch.zeros(cg_slots, max_batch_size, device=device) if enable_logprobs else None,
+            processed_logprobs=mk(torch.bool, False) if enable_processed_logprobs else None,
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            _ingraph_capacity=ingraph_cap,
             cg_slots=cg_slots,
-            _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
-            _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
+            _slot_idx_cpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, pin_memory=pinned),
+            _slot_idx_gpu=torch.zeros(cg_slots, idx_cols, dtype=torch.long, device=device),
             _last_real_bs=[0] * cg_slots,
             _free_slots=list(range(1, cap + 1)),
         )
+        buffers._scalar_rows = ScalarRows(buffers._scalar_buffers(), max_batch_size, device)
+        return buffers
 
     def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
         """Return bs-sized views into one slot's buffers (zero-copy slices) plus
@@ -2284,10 +2537,14 @@ class SamplerBuffers:
                 self.return_logprobs.slot_view(cg_slot, bs) if self.return_logprobs is not None else None
             ),
             "logprob_buf": self.logprob[cg_slot, :bs] if self.logprob is not None else None,
+            "processed_logprobs_buf": (
+                self.processed_logprobs.slot_view(cg_slot, bs) if self.processed_logprobs is not None else None
+            ),
             "tp_group": self.tp_group,
             "offset_master": self.offset.master,
             "last_token_master": self.last_token.master,
             "slot_idx_view": self._slot_idx_gpu[cg_slot, :bs],
+            "scatter_idx_view": self._slot_idx_gpu[cg_slot, bs:2 * bs] if self.ingraph_scatter else None,
             "ingraph_scatter": self.ingraph_scatter,
         }
 
@@ -2341,6 +2598,8 @@ class SamplerBuffers:
                 self.top_p_min_keep.write_master_row(slot, int(cfg.top_p_min_keep))
             if self.return_logprobs is not None:
                 self.return_logprobs.write_master_row(slot, bool(cfg.return_logprobs))
+            if self.processed_logprobs is not None:
+                self.processed_logprobs.write_master_row(slot, cfg.logprobs_mode == "processed")
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
@@ -2354,11 +2613,13 @@ class SamplerBuffers:
         ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
         if self.ingraph_scatter:
-            raise RuntimeError(
-                f"more than {self._master_capacity} concurrent requests on the "
-                "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
-                "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
-            )
+            # admission (`SamplerResource.reserve`) registers a request only while a row is free
+            if self._master_capacity >= self._ingraph_capacity:
+                raise RuntimeError(
+                    f"a registration past the sampler's {self._ingraph_capacity} in-graph "
+                    "rows (MSTAR_SAMPLER_SLOTS); a request takes one only once free_rows has one"
+                )
+            new_capacity = min(new_capacity, self._ingraph_capacity)
         rows = new_capacity + 1  # plus the trash row
         with self._host_master_lock:
             for buf in self._scalar_buffers():
@@ -2375,13 +2636,21 @@ class SamplerBuffers:
         if self._device_capacity >= cap:
             return
         rows = cap + 1  # plus the trash row
-        self.offset.grow_master(rows)
-        self.last_token.grow_master(rows)
+        if not self.ingraph_scatter:
+            # with it on, these two were allocated at their full size
+            self.offset.grow_master(rows)
+            self.last_token.grow_master(rows)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(rows)
         for buf in self.loopback.values():
             buf.grow_master(rows)
         self._device_capacity = cap
+
+    @property
+    def free_rows(self) -> int:
+        """With ``ingraph_scatter``, the registrations the fixed masters still
+        have rows for: the free list plus the rows the others haven't grown to."""
+        return len(self._free_slots) + self._ingraph_capacity - self._master_capacity
 
     def register_request(
         self, rid: str, sampling_config: SamplingConfig | None = None,
@@ -2401,8 +2670,9 @@ class SamplerBuffers:
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
-        if self.loopback:
-            with self._offset_reset_lock:
+        with self._offset_reset_lock:
+            self._pending_offset_reset.add(slot)
+            if self.loopback:
                 self._pending_loopback_reset.add(slot)
         self._cached_config[rid] = (
             sampling_config if sampling_config is not None else SamplingConfig()
@@ -2482,10 +2752,8 @@ class SamplerBuffers:
 
     def _init_slot(self, slot: int, rid: str) -> None:
         """Init for a newly registered slot, on the gathering thread so rows are
-        written before the gather reads them. No device work (pre-plan): the
-        offset reset is queued for ``gather_dynamic``."""
-        with self._offset_reset_lock:
-            self._pending_offset_reset.add(slot)
+        written before the gather reads them. No device work (pre-plan); the
+        offset reset is queued at registration instead."""
         self._write_master_row(slot, self._cached_config[rid])
         # mask row not cleared: always staged fresh before gather, and clearing
         # here would race the default-stream stage from the plan stream
@@ -2529,10 +2797,32 @@ class SamplerBuffers:
         self._slot_idx_np[cg_slot, :padded_bs] = rows
         self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
 
+    def _stage_scatter_idx(
+        self, request_ids: list[str], padded_bs: int, cg_slot: int, kept: "frozenset | None",
+    ) -> None:
+        """The in-graph scatter's index, behind the staged gather index: the same
+        rows, except that a row ``kept`` leaves out writes the trash row, so its
+        offset and last token stay as they were (``SamplerStep.kept_rids``)."""
+        row = self._slot_idx_np[cg_slot]
+        scatter = row[padded_bs:2 * padded_bs]
+        scatter[:] = row[:padded_bs]
+        if kept is not None:
+            for i, rid in enumerate(request_ids):
+                if rid not in kept:
+                    scatter[i] = self._trash_slot
+
     def _upload_slot_idx(self, padded_bs: int, cg_slot: int) -> torch.Tensor:
-        """H2D the staged row on the CURRENT stream, and hand back its view."""
-        idx_view = self._slot_idx_gpu[cg_slot, :padded_bs]
-        idx_view.copy_(self._slot_idx_cpu[cg_slot, :padded_bs], non_blocking=True)
+        """H2D the staged row on the CURRENT stream, and hand back its gather view."""
+        key = (cg_slot, padded_bs)
+        views = self._upload_views.get(key)
+        if views is None:
+            cols = 2 * padded_bs if self.ingraph_scatter else padded_bs
+            views = self._upload_views[key] = (
+                self._slot_idx_gpu[cg_slot, :cols], self._slot_idx_cpu[cg_slot, :cols],
+                self._slot_idx_gpu[cg_slot, :padded_bs],
+            )
+        dst, src, idx_view = views
+        dst.copy_(src, non_blocking=True)
         return idx_view
 
     def gather_static(
@@ -2556,18 +2846,16 @@ class SamplerBuffers:
                 self._last_real_bs[cg_slot] = len(request_ids)
                 return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        # H2D copies only (pre-plan, see HostBuffer); gather_dynamic uploads
+        # one H2D copy (pre-plan, see ScalarRows); gather_dynamic uploads
         # the device-side index row
-        rows = self._slot_idx_np[cg_slot, :padded_bs]
-        for buf in self._scalar_buffers():
-            buf.gather(rows, padded_bs, cg_slot)
+        self._scalar_rows.gather(self._slot_idx_np[cg_slot, :padded_bs], padded_bs, cg_slot)
         self._last_real_bs[cg_slot] = len(request_ids)
         # read after staging: an init it ran bumped the version
         self._static_key[cg_slot] = (rids, padded_bs, self._config_version)
 
     def gather_dynamic(
         self, request_ids: list[str], padded_bs: int, cg_slot: int,
-        gather_seen_tokens: bool = True,
+        gather_seen_tokens: bool = True, kept: "frozenset | None" = None,
     ) -> None:
         """Gather the per-step state — RNG offset and seen-token mask — into
         ``cg_slot``. Must run inline (default stream) AFTER the previous step's
@@ -2577,23 +2865,51 @@ class SamplerBuffers:
         Only the H2D is re-issued (the pinned row ``gather_static`` staged for
         this slot is stream-agnostic, and this step's batch is the one it was
         staged for) — restaging is the fallback for a caller that reached here
-        without a matching ``gather_static``.
+        without a matching ``gather_static``. With ``ingraph_scatter`` the
+        scatter index for this step's ``kept`` rows is staged here, on the
+        step it is for, and goes up in the same copy.
 
         The seen-token mask is large ([bs, V] bool); only gathered when the
         caller's graph actually applies the penalty in-graph (the Talker)."""
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        with self._offset_reset_lock:
-            resets, self._pending_offset_reset = self._pending_offset_reset, set()
-        for slot in resets:
-            self.offset.master[slot:slot + 1].zero_()
+        if self.ingraph_scatter:
+            self._stage_scatter_idx(request_ids, padded_bs, cg_slot, kept)
+        self._drain_offset_resets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         if not self.ingraph_scatter:
             # with it on, the captured sample gathers off the master itself
             self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
+
+    def _drain_offset_resets(self) -> None:
+        """Zero the offsets of newly registered slots; GPU thread, before a read."""
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
+
+    def eager_offsets(self, request_ids: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(slots, offsets)`` of registered requests, for an eager step to
+        draw at the same counter a captured step does. Hand both back to
+        ``advance_eager_offsets`` after the draw."""
+        self._sync_device_capacity()
+        self._drain_offset_resets()
+        slots = self._slots_of(request_ids)
+        return slots, self.offset.master.index_select(0, slots)
+
+    def advance_eager_offsets(
+        self, slots: torch.Tensor, offsets: torch.Tensor, stride: int,
+        keep: torch.Tensor | None = None,
+    ) -> None:
+        """Advance the masters past an eager draw at ``offsets``; ``keep``
+        (from ``keep_mask``) leaves the False rows where they were."""
+        advanced = offsets + stride
+        if keep is not None:
+            advanced = torch.where(keep, advanced, offsets)
+        self.offset.master.index_copy_(0, slots, advanced)
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).

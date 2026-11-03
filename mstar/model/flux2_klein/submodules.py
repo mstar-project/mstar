@@ -1,6 +1,6 @@
 """FLUX.2 [klein] node submodules (four nodes, one optional engine resource).
 
-    text_encoder -> KleinTextEncoderSubmodule  native Qwen3 taps; batches every request (fixed 512 tokens)
+    text_encoder -> Qwen3TextEncoderSubmodule  native Qwen3 taps over all 512 padded positions (shared node)
     vae_encoder  -> KleinVaeEncoderSubmodule   reference images -> normalized packed latent tokens (edits)
     dit          -> KleinDenoiseSubmodule      DenoiseLoopSubmodule + the klein transformer + Euler step
     vae_decoder  -> KleinVaeDecoderSubmodule   packed tokens -> uint8 image; batches equal shapes
@@ -22,10 +22,15 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    ExactOps,
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+)
 from mstar.model.components.diffusion.decode_utils import (
-    VAE_DECODE_BATCH_SIZES,
+    VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
     decode_in_chunks,
 )
@@ -41,14 +46,15 @@ from mstar.model.components.diffusion.image_io import (
     unpack_latents,
     unpatchify_latents,
 )
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
 # Edge names shared with the model file.
-TEXT_INPUTS, TEXT_MASK, TEXT_EMBEDS = "text_inputs", "text_mask", "text_embeds"
 IMAGE_INPUTS, REF_LATENTS, IMAGE_OUTPUT = "image_inputs", "ref_latents", "image_output"
 
 
@@ -80,53 +86,6 @@ def shape_from_metadata(config: Flux2KleinConfig, step_metadata: dict) -> KleinS
         text_len=config.text_encoder.max_sequence_length,
         ref_grids=tuple(tuple(g) for g in step_metadata.get("ref_grids", ())),
     )
-
-
-# ---------------------------------------------------------------------------
-# text_encoder
-# ---------------------------------------------------------------------------
-
-class KleinTextEncoderSubmodule(BatchedRows, NodeSubmodule):
-    """Qwen3 hidden-state taps over the chat-templated, 512-token right-padded prompt.
-
-    Every request has the same token count, so the node batches unconditionally:
-    ``text_inputs`` / ``text_mask`` rows stack into ``[B, 512]`` and each request gets
-    its ``[1, 512, joint_dim]`` slice of the output. All 512 positions (pad tokens
-    included) are emitted, as the reference feeds them all to the DiT.
-    """
-
-    disable_torch_compile = True
-    output_keys = (TEXT_EMBEDS,)
-    keep_batch_dim = True
-
-    def __init__(self, encoder: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 16):
-        super().__init__()
-        self.encoder = encoder
-        self.config = config
-        self._max_batch_size = max_batch_size
-
-    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={TEXT_INPUTS: inputs[TEXT_INPUTS][0], TEXT_MASK: inputs[TEXT_MASK][0]},
-            input_seq_len=self.config.text_encoder.max_sequence_length,
-        )
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return len(model_inputs) > 1
-
-    def max_batch_size(self, graph_walk: str):
-        return self._max_batch_size
-
-    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
-        return {
-            TEXT_INPUTS: torch.stack([inp.tensor_inputs[TEXT_INPUTS] for inp in inputs]),
-            TEXT_MASK: torch.stack([inp.tensor_inputs[TEXT_MASK] for inp in inputs]),
-        }
-
-    def run_batch(self, text_inputs: torch.Tensor, text_mask: torch.Tensor, **kwargs):
-        device = self.get_device()
-        embeds = self.encoder(text_inputs.to(device=device, dtype=torch.long), text_mask.to(device=device))
-        return {TEXT_EMBEDS: embeds.to(self.encoder.dtype)}
 
 
 # ---------------------------------------------------------------------------
@@ -194,12 +153,16 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
+        bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
+        # A low-precision transformer's bf16 twin, for the steps a schedule runs in bf16.
+        self.bf16_transformer = bf16_transformer
         self.config = config
         self.rope = MultiAxisRoPE(config.transformer.rope_theta, config.transformer.axes_dims_rope)
         self._compiled_shapes: set[tuple] = set()
@@ -207,9 +170,12 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            compile_transformer_forward(
-                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-            )
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                    )
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
@@ -270,7 +236,8 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        velocity = self.transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
         velocity = velocity[:, : latents.shape[1]]
         return euler_step(latents, velocity, sigma, sigma_next)
 
@@ -294,20 +261,23 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
-        warmup_grids: Sequence[tuple[int, int]] = (), decode_batch_sizes: Sequence[int] = VAE_DECODE_BATCH_SIZES,
+        warmup_grids: Sequence[tuple[int, int]] = (),
     ):
         super().__init__()
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
-        # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
-        # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
-        # the compiled decode is not launch-bound (measured), so the node declares no captures.
+        # torch.compile (max-autotune, no cudagraphs) took the 1024^2 decode from 89 to 29 ms on an
+        # H100, moving the image by <= 5.6e-2 in [-1, 1] (~56 dB), before the folded upsample and the
+        # split GroupNorm (compile_vae_decode). Not bit-exact, so it is a deployment knob and stays off
+        # for the bit-exact parity path. CUDA graphs would add nothing: the compiled decode is not
+        # launch-bound (measured), so the node declares no captures.
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         # compiled: only these batch sizes are ever decoded (larger batches are split into them)
-        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        self._decode_batch_sizes = (
+            tuple(geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH))) if compile_decode else ()
+        )
         # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
         # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
         self._warmed: set[tuple[int, int, int]] = set()

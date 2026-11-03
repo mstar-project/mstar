@@ -37,7 +37,7 @@ class _TinyTransformer(nn.Module):
     def dtype(self) -> torch.dtype:
         return torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn=None):
         text = self.text(encoder_hidden_states).mean(1)[:, :, None, None, None]
         t = timestep.float().mean(1)[:, None, None, None, None] * 1e-3
         return self.proj(hidden_states) + text + t
@@ -52,19 +52,25 @@ def _step(node: Wan22DitSubmodule, width: int, height: int, frames: int, guidanc
     t_lat, h_lat, w_lat = (frames - 1) // 4 + 1, height // 16, width // 16
     gen = torch.Generator().manual_seed(width * 7 + height * 3 + frames)
     shape = (1, CHANNELS, t_lat, h_lat, w_lat)
-    meta = {"num_inference_steps": 4, "guidance_scale": guidance}
-    out = node.forward(
-        "video_gen",
-        engine_inputs=SimpleNamespace(single_request_info=SimpleNamespace(
-            step_metadata=meta, dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
-        )),
-        latents=torch.randn(shape, generator=gen),
-        unipc_model_outputs=torch.randn((2, *shape), generator=gen),
-        unipc_last_sample=torch.randn(shape, generator=gen),
-        text_embeds_pos=torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen),
-        text_embeds_neg=torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen),
+    meta = {
+        "num_inference_steps": 4, "guidance_scale": guidance, "height": height, "width": width, "num_frames": frames,
+    }
+    info = SimpleNamespace(
+        request_id="r", rid_handle="r", graph_walk="video_gen", step_metadata=meta,
+        dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
     )
-    return out["latents"][0]
+    node.request_states.pop("r", None)
+    node.get_device = lambda: torch.device("cpu")
+    prepared = node.prepare_inputs("video_gen", info, {
+        "latents": [torch.randn(shape, generator=gen)],
+        "unipc_model_outputs": [torch.randn((2, *shape), generator=gen)],
+        "unipc_last_sample": [torch.randn(shape, generator=gen)],
+        "text_embeds_pos": [torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen)],
+        "text_embeds_neg": [torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen)],
+    })
+    engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": info})
+    stacked = node.preprocess("video_gen", engine_inputs, [prepared])
+    return node.forward("video_gen", engine_inputs=engine_inputs, **stacked)["latents"][0]
 
 
 def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:
@@ -73,12 +79,15 @@ def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:
     compiles, calls = [], []
 
     def compile(fn, **kwargs):
-        def run(*, hidden_states, timestep, encoder_hidden_states):
+        def run(*, hidden_states, timestep, encoder_hidden_states, self_attn_fn=None):
             key = (tuple(hidden_states.shape), tuple(timestep.shape), tuple(encoder_hidden_states.shape))
             calls.append(1)
             if key not in compiles:
                 compiles.append(key)
-            return fn(hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states)
+            return fn(
+                hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states,
+                self_attn_fn=self_attn_fn,
+            )
 
         return run
 
@@ -223,16 +232,17 @@ def test_the_largest_side_the_mp4_encoder_takes_passes() -> None:
 
 
 def test_the_config_examples_uncomment_into_one_model_kwargs_block() -> None:
-    """configs/wan22.yaml documents its knobs as a commented ``model_kwargs``
-    example; with two such blocks, uncommenting both keeps only the second."""
+    """configs/wan22.yaml documents its knobs as commented lines of one
+    ``model_kwargs`` block; with two such blocks, uncommenting both keeps only
+    the second."""
     from pathlib import Path
 
     import yaml
 
     out, inside = [], False
     for line in (Path(__file__).resolve().parents[2] / "configs" / "wan22.yaml").read_text().splitlines():
-        inside = line == "# model_kwargs:" or (inside and line.startswith("#   "))
-        out.append(line[2:] if inside else line)
+        inside = line in ("# model_kwargs:", "model_kwargs:") or (inside and line.startswith(("#   ", "  ")))
+        out.append(line[2:] if inside and line.startswith("#") else line)
     text = "\n".join(out)
     assert text.count("\nmodel_kwargs:") == 1
     kwargs = yaml.safe_load(text)["model_kwargs"]

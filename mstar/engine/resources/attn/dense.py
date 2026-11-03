@@ -7,9 +7,10 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, workspace_bytes
+from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
+from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
@@ -195,8 +196,6 @@ class DenseAttentionManager(AttentionManager):
 
         self._wrapper_class = wrapper_class
         self._wrappers: dict[EagerSlotKey, PrefixedPrefillWrapper] = {}
-        # wrapper -> the (cu_q, cu_k, causal) it was last planned with
-        self._planned: dict[EagerSlotKey, tuple] = {}
         self._wrapper_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
@@ -209,11 +208,13 @@ class DenseAttentionManager(AttentionManager):
         if self._on_flashinfer:
             # One workspace for every wrapper, taken now rather than at the first
             # plan: it is scratch during `run` only (a plan writes the wrapper's
-            # own buffers), and the runs are serialized on the node's stream.
-            workspace = (
-                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda else None
+            # own buffers), and the runs are serialized on the node's stream. Off
+            # CUDA nothing runs, so it is empty.
+            buffer = (
+                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda
+                else torch.empty(0, dtype=torch.uint8)
             )
-            self._wrapper_kwargs.update(workspace_buffer=workspace, backend=flashinfer_backend)
+            self._wrapper_kwargs.update(workspace_buffer=Workspace(buffer, kv_cache), backend=flashinfer_backend)
             if self._on_cuda:
                 self._check_flashinfer_backend()
 
@@ -331,23 +332,17 @@ class DenseAttentionManager(AttentionManager):
             max_q = max(max_q, view.to_compute)
             max_k = max(max_k, view.length)
 
-        # A wrapper holds the schedule of its last plan until it is planned
-        # again (``run`` only reads it), and a denoising request keeps its
-        # layout from step to step, so an unchanged layout is not replanned:
-        # FlashInfer's plan is a device kernel plus a stream sync.
+        # Fresh pinned host layouts per step: the FA3 wrapper H2Ds them non-blocking
+        # (from pageable memory that copy would sync the stream), FlashInfer's plan
+        # reads them on the host, and neither happens when the wrapper already
+        # holds this layout.
         wrapper = self._wrapper(slot_key.label, slot_key.slot)
-        layout = (tuple(cu_q), tuple(cu_k), causal)
-        if self._planned.get(slot_key) != layout:
-            # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
-            # non-blocking (from pageable memory that copy would sync the
-            # stream), FlashInfer's plan reads them on the host.
-            pin = self._on_cuda
-            wrapper.plan(
-                torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),
-                torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
-                causal=causal,
-            )
-            self._planned[slot_key] = layout
+        pin = self._on_cuda
+        wrapper.plan(
+            torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),
+            torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
+            causal=causal,
+        )
         return DensePlan(
             segments=tuple(segments),
             cu_q=tuple(cu_q),

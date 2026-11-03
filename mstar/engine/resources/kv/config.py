@@ -328,7 +328,8 @@ class PrefixSpan:
     ``length`` is how many slots the write fills and ``advance`` is how far it
     moves the position counter. ``digest`` is an item's digest, and None for
     ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end.
+    page up to the item's end. ``opens_step`` is False for a span the step of the
+    span before it writes too, in one row.
     """
     length: int
     advance: int
@@ -336,6 +337,7 @@ class PrefixSpan:
     scratch: int = 0
     digest: bytes | None = None
     end_key: bytes | None = None
+    opens_step: bool = True
 
 
 @dataclass
@@ -361,6 +363,10 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
+    # what the request's chains hang from: empty for the base model, a LoRA adapter's
+    # root otherwise. The prompt's keys already include it; generation keys a first
+    # page with it when the prompt filled none.
+    prefix_root: bytes = b""
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
@@ -370,6 +376,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
+        prefix_root: bytes | None=None,
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
@@ -381,6 +388,8 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
+        if prefix_root is not None:
+            self.prefix_root = prefix_root
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
         if kv_layout is not None:
@@ -742,8 +751,8 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
-    # the rows the forks apply to; None is every row (a chunked prompt
-    # pre-forks on its first chunk and post-forks on its last)
+    # the rows the forks apply to; None is every row. A chunked prompt forks
+    # on some of its chunks only, e.g. a pre-fork on its first
     fork_rids: frozenset | None = None
     # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()

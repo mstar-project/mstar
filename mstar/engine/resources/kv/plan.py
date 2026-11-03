@@ -79,15 +79,6 @@ class PagedIndptrs(NamedTuple):
     # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
-    def to_device(self, device: torch.device):
-        return PagedIndptrs(
-            qo_indptr=self.qo_indptr.to(device, non_blocking=True),
-            paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
-            paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
-            paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
-            kv_lens=self.kv_lens,
-        )
-
     def to_kwargs_dict(self):
         return dict(
             qo_indptr=self.qo_indptr,
@@ -221,8 +212,11 @@ class HostLens(torch.Tensor):
     plan thread every decode step). Iterating the numpy view costs 0.1 us a
     row and the numpy scalar has ``.item()`` too. Everything else FlashInfer
     does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its
-    device buffer) is plain tensor behaviour.
+    device buffer) is plain tensor behaviour, so torch ops skip the subclass
+    dispatch (about 6 us a call) and treat it as a plain tensor.
     """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
 
     def __iter__(self):
         return iter(self.numpy())
@@ -237,12 +231,15 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
+        "rows", "_decode", "columns",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
-        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        decode_pages=None, decode_offsets=None,
+        rows=None, view_builder=None, decode: bool | None = None, columns=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -250,9 +247,6 @@ class KVPlanOutput:
         # made on first use (the FlashInfer path never asks for them)
         self._views = views
         self._view_builder = view_builder
-        # only the packed write addressing needs these on device, and only the
-        # resource that builds them reads them; see KVManager._setup_plan_states
-        self.cuda_indptrs = cuda_indptrs
         # a decode step planned off the previous one (KVManager's plan cache):
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
@@ -260,6 +254,13 @@ class KVPlanOutput:
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
+        # whether every row computes one token, when the plan already knows;
+        # None reads the views
+        self._decode = decode
+        # the plan's host arrays (``PlanColumns``), when it was built from
+        # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
+        # later plan rewrites, they stay valid as long as the output does.
+        self.columns = columns
 
     @property
     def views(self) -> "list[SequenceView]":
@@ -278,6 +279,8 @@ class KVPlanOutput:
     def is_decode(self) -> bool:
         if self.decode_pages is not None:
             return True
+        if self._decode is not None:
+            return self._decode
         return all(view.to_compute == 1 for view in self.views)
 
 
@@ -291,13 +294,14 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks", "later_groups")
+    __slots__ = ("pre_forks", "post_forks", "fork_rids", "later_groups")
 
     def __init__(
         self,
         mapping: dict[str, KVPlanOutput] | None = None,
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
+        fork_rids: frozenset | None = None,
         later_groups: tuple[dict[str, KVPlanOutput], ...] = (),
     ):
         super().__init__(mapping or {})
@@ -305,6 +309,8 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
         self.pre_forks = pre_forks
         # applied by `commit`, after this step's spans land
         self.post_forks = post_forks
+        # the rows both apply to, as `KVStep.fork_rids`; None is every row
+        self.fork_rids = fork_rids
         # the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)
         self.later_groups = later_groups
 
