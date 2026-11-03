@@ -533,7 +533,8 @@ class RopeManager(PositionManager):
 
 
     def position(self, rid: str, label: str) -> int:
-        return self._counters.get(rid, {}).get(label, 0)
+        # by the worker's handle (AGENTS.md invariant 14): the wire id raises
+        return self._counters[rid].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
