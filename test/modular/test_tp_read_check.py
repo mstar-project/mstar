@@ -358,6 +358,38 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     assert manager.pops[-1][1] == ["r0"]
 
 
+def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
+    """r1's read raises as this rank starts it (a CUDA OOM in the H2D copy,
+    say), and again for an input replayed behind it. r1 is reported failed once
+    and recorded for the check, so rank 0's read-checked step naming r1 is built
+    with r1 empty rather than this rank waiting on r1 for good."""
+    sched, manager = _follower_scheduler(ready=["r0"])
+    manager.per_request_info["r1"] = SimpleNamespace(stream_buffers={"audio": None})
+    w = Worker.__new__(Worker)
+    w.worker_id, w.enable_nvtx, w._reads_done_sent = "w1", False, set()
+    w.scheduler, w.request_state = sched, manager
+    w._graph_runtime = SimpleNamespace(get_rid_handle=lambda r: r, get_rid_string=lambda h: h)
+    w.tensor_manager = SimpleNamespace(start_read_tensors=lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("CUDA out of memory"),
+    ))
+    sent = []
+    w.communicator = SimpleNamespace(send=lambda dest, msg: sent.append(msg))
+    edge = _input(18, "audio")
+    edge.is_streaming = True
+    for _ in range(2):
+        w._process_new_inputs(SimpleNamespace(
+            request_id="r1", inputs=[edge], request_info=None, producer_done=set(),
+        ))
+    assert [list(m.body.errors) for m in sent] == [["r1"]]
+    assert sched.read_failed_rids == {"r1"}
+
+    sched.register_tp_follow(_head(read_check=True))
+    batch = sched.get_next_batch(manager)
+
+    assert batch is not None, "the follower waits on r1, which never readies"
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
+
+
 def test_a_removed_requests_read_failure_is_forgotten():
     """The flag is keyed by the handle, which a later request can get."""
     sched, _ = _follower_scheduler(ready=[], read_failed=["r1"])
