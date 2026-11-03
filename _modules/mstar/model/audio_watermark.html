@@ -1011,7 +1011,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">and runs the generator's layers as a function of it: the same ops AudioSeal's</span>
 <span class="sd">streaming layers run, with the state passed in and out. That lets requests</span>
 <span class="sd">at the same point share one batched call, and lets the engine capture that</span>
-<span class="sd">call per (batch, chunk length) bucket.</span>
+<span class="sd">call per (batch, chunk length) bucket. AudioSeal 0.2.1 fixes the propagation,</span>
+<span class="sd">but keeps the state on its modules for one batch of streams that start</span>
+<span class="sd">together, so this module keeps its own.</span>
 
 <span class="sd">The generator works on whole 320-sample frames (its total stride). A chunk</span>
 <span class="sd">that is not a whole number of frames leaves its tail pending until the next</span>
