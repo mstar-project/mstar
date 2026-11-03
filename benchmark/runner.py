@@ -480,7 +480,10 @@ class Benchmark:
         # batch or an online burst back on the client, and that wait would be
         # counted as server latency.
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
+            # Bound a stalled read, not the whole request: every baseline
+            # overrides `total` per request, so M* must not be the only system
+            # cut at 300 s.
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
             connector=aiohttp.TCPConnector(limit=0),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
