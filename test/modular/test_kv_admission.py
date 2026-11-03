@@ -384,7 +384,7 @@ def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds
     assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
 
 
-class _Gate(Resource):
+class _Picky(Resource):
     """A pool every request asks, which refuses the requests in ``refused``."""
 
     def __init__(self):
@@ -414,9 +414,9 @@ class _Gate(Resource):
 
 def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
     kv = _manager(max_num_pages=16)
-    gate = _Gate()
-    # named to sort after "kv", so the runner reserves the KV first and the gate refuses after it
-    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "zgate": gate}, node_resources={NODE: ["kv", "zgate"]}))
+    picky = _Picky()
+    # named to sort after "kv", so the runner reserves the KV first and the other pool refuses after it
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "picky": picky}, node_resources={NODE: ["kv", "picky"]}))
     _prefill(kv, "r", HELD + list(range(1000, 1008)))
     _prefill(kv, "x", list(range(6000, 6064)))
     fill = list(range(2000, 2000 + (kv._room() - 1) * PAGE_SIZE))
@@ -428,18 +428,18 @@ def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
     # "p" passes into the one free page, writes it and finishes, so that page is kept for the head
     _prefill(kv, "p", HELD + list(range(4000, 4008)))
     kv.remove_request("p")
-    # "x" finishes, so the head fits in the KV, but the gate refuses it and the KV's allotment is undone
+    # "x" finishes, so the head fits in the KV, but the other pool refuses it and the KV's allotment is undone
     kv.remove_request("x")
-    gate.refused.add("head")
+    picky.refused.add("head")
     assert not _ready(kv, "head")
-    # "fill" grows into all but the kept page, and the gate lets the head through, which the KV now refuses
+    # "fill" grows into all but the kept page, and the other pool lets the head through, which the KV now refuses
     _grow(kv, "fill", 4 * PAGE_SIZE)
-    gate.refused.clear()
-    gate.moved += 1
+    picky.refused.clear()
+    picky.moved += 1
     assert not _ready(kv, "head")
     _laid_out(kv, "q", HELD + list(range(5000, 5008)), keyed=True)
 
-    assert not _ready(kv, "q"), "a request passed into the page kept for the head, lost when the gate refused the head"
+    assert not _ready(kv, "q"), "a request passed into the page kept for the head, lost when another pool refused it"
 
 
 def test_no_request_passes_a_head_that_fits_now():
