@@ -711,18 +711,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send_each"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send_each()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.get_all_new_messages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.poll_for_messages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.push_sockets"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.push_sockets</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.register_event_for_poll()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.send"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.send()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.try_send_bytes()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.wait_for_work"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.wait_for_work()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.make_communicator"><code class="docutils literal notranslate"><span class="pre">make_communicator()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.requested_transport"><code class="docutils literal notranslate"><span class="pre">requested_transport()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -752,10 +741,7 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.communicator.make_communicator" title="mstar.communication.communicator.make_communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">make_communicator</span></code></a>(*args[, nonblocking_send])</p></td>
-<td><p>Construct the process's communicator, selecting the transport.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.communicator.requested_transport" title="mstar.communication.communicator.requested_transport"><code class="xref py py-obj docutils literal notranslate"><span class="pre">requested_transport</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code> as set, upper-cased: <code class="docutils literal notranslate"><span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">1</span></code> or <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>.</p></td>
+<td><p>Construct the process's communicator: <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code>, on the vendored <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension (see <code class="docutils literal notranslate"><span class="pre">communication/rust_communicator.py</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -771,9 +757,6 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.communicator.OutboxCommunicator" title="mstar.communication.communicator.OutboxCommunicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code></a>(inner)</p></td>
 <td><p>A communicator whose sends never block: a send the peer can't take now (at its high-water mark) is queued, in order behind any earlier one to the same peer, and retried by <code class="docutils literal notranslate"><span class="pre">flush</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.communicator.ZMQCommunicator" title="mstar.communication.communicator.ZMQCommunicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code></a>(my_id, push_ids[, protocol, ...])</p></td>
-<td><p></p></td>
 </tr>
 </tbody>
 </table>
@@ -900,9 +883,9 @@ notably the tensor-file namespace in <code class="docutils literal notranslate">
 <dt class="sig sig-object py" id="mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION">
 <span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">EXPECTED_MSTAR_RUST_VERSION</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0.1.1'</span></span><a class="headerlink" href="#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION" title="Link to this definition">#</a></dt>
 <dd><p>The <code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension version this tree expects (the vendored
-<code class="docutils literal notranslate"><span class="pre">rust/</span></code> crate’s version). Under <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ=AUTO</span></code> a mismatching
-install - e.g. a stale wheel after an upgrade - takes over the mesh
-silently, so the factory warns when the imported version differs.</p>
+<code class="docutils literal notranslate"><span class="pre">rust/</span></code> crate’s version). Every process sends on the extension’s
+transport, so a mismatching install - e.g. a stale wheel after an upgrade -
+is refused at startup rather than left to carry the mesh.</p>
 </dd></dl>
 
 <dl class="py class">
@@ -965,132 +948,21 @@ it would stop every message behind it.</p>
 
 </dd></dl>
 
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">ZMQCommunicator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">push_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">protocol</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">CommProtocol.IPC</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ipc_socket_path_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'/tmp/mstar/'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">codec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference internal" href="#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseCommunicator</span></code></a></p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>my_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>push_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
-<li><p><strong>protocol</strong> (<a class="reference internal" href="#mstar.communication.communicator.CommProtocol" title="mstar.communication.communicator.CommProtocol"><em>CommProtocol</em></a>)</p></li>
-<li><p><strong>ipc_socket_path_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>codec</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><em>type</em></a><em>[</em><a class="reference internal" href="mstar.communication.codec.html#mstar.communication.codec.Codec" title="mstar.communication.codec.Codec"><em>Codec</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.get_all_new_messages">
-<span class="sig-name descname"><span class="pre">get_all_new_messages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">blocking</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout_s</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.get_all_new_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.poll_for_messages">
-<span class="sig-name descname"><span class="pre">poll_for_messages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">20</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.poll_for_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.poll_for_messages" title="Link to this definition">#</a></dt>
-<dd><p>Block until a message is readable, a registered wakeup event
-fires, or <code class="docutils literal notranslate"><span class="pre">timeout_ms</span></code> elapses — whichever comes first. True when
-a message is available (left queued for <code class="docutils literal notranslate"><span class="pre">get_all_new_messages</span></code>);
-a wakeup ends the poll early with False (the event is drained,
-exactly as in <code class="docutils literal notranslate"><span class="pre">wait_for_work</span></code>). Mirrors the Rust communicator’s
-method so call sites work against either transport.</p>
-</dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.push_sockets">
-<span class="sig-name descname"><span class="pre">push_sockets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Socket</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><span class="pre">bytes</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.push_sockets" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.register_event_for_poll">
-<span class="sig-name descname"><span class="pre">register_event_for_poll</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.register_event_for_poll"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll" title="Link to this definition">#</a></dt>
-<dd><p>Have <code class="docutils literal notranslate"><span class="pre">poll_for_messages</span></code> (and <code class="docutils literal notranslate"><span class="pre">wait_for_work</span></code>) also end when
-<code class="docutils literal notranslate"><span class="pre">event</span></code> is signalled.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>event</strong> (<a class="reference internal" href="mstar.communication.event.html#mstar.communication.event.EventWakeup" title="mstar.communication.event.EventWakeup"><em>EventWakeup</em></a>)</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.send">
-<span class="sig-name descname"><span class="pre">send</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">msg</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.send"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.send" title="Link to this definition">#</a></dt>
-<dd><p>entity_id: worker_xyz, conductor, or api_server</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.try_send_bytes">
-<span class="sig-name descname"><span class="pre">try_send_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">data</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.try_send_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.try_send_bytes" title="Link to this definition">#</a></dt>
-<dd><p>Send a message already encoded with <code class="docutils literal notranslate"><span class="pre">self.codec</span></code> without
-blocking: False, with nothing sent, when the peer is at its high-water
-mark. A loop that must keep reading its own input while a peer is slow
-sends with this and retries later (see <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code>).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>data</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.wait_for_work">
-<span class="sig-name descname"><span class="pre">wait_for_work</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">50</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.wait_for_work"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.wait_for_work" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-</dd></dl>
-
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.communication.communicator.make_communicator">
 <span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">make_communicator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nonblocking_send</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#make_communicator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.make_communicator" title="Link to this definition">#</a></dt>
-<dd><p>Construct the process’s communicator, selecting the transport.</p>
-<p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code> selects it (see <code class="docutils literal notranslate"><span class="pre">docs/environment_variables.rst</span></code>):</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code> (default) — the Rust-backed <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code> (vendored
-<code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension; see <code class="docutils literal notranslate"><span class="pre">communication/rust_communicator.py</span></code>) when
-the extension imports successfully, pyzmq otherwise.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">1</span></code> — the Rust communicator; raises if the extension is missing.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">0</span></code> — always the pyzmq <code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code>. A worker refuses this: the
-graph runtime holds a share of the Rust transport.</p></li>
-</ul>
-<p>The two are wire-compatible (same endpoints, same codec).</p>
-<p><code class="docutils literal notranslate"><span class="pre">nonblocking_send</span></code> is for a communicator <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code> wraps,
-which needs <code class="docutils literal notranslate"><span class="pre">try_send_bytes</span></code>: an extension built before
-<code class="docutils literal notranslate"><span class="pre">ZmqCommunicator.try_send</span></code> falls back to pyzmq under <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> and
-raises under <code class="docutils literal notranslate"><span class="pre">1</span></code>. Every other caller keeps such a build.</p>
+<dd><p>Construct the process’s communicator: <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code>, on the
+vendored <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension (see <code class="docutils literal notranslate"><span class="pre">communication/rust_communicator.py</span></code>).</p>
+<p>Raises when the extension is missing or is not the version this tree
+expects. <code class="docutils literal notranslate"><span class="pre">nonblocking_send</span></code> is for a communicator <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code>
+wraps, which needs <code class="docutils literal notranslate"><span class="pre">try_send_bytes</span></code>: an extension built before
+<code class="docutils literal notranslate"><span class="pre">ZmqCommunicator.try_send</span></code> is refused for it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>nonblocking_send</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><em>BaseCommunicator</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.communication.communicator.requested_transport">
-<span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">requested_transport</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#requested_transport"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.requested_transport" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code> as set, upper-cased: <code class="docutils literal notranslate"><span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">1</span></code> or <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1167,18 +1039,7 @@ raises under <code class="docutils literal notranslate"><span class="pre">1</spa
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send_each"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send_each()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.get_all_new_messages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.poll_for_messages()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.push_sockets"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.push_sockets</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.register_event_for_poll()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.send"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.send()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.try_send_bytes()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.ZMQCommunicator.wait_for_work"><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator.wait_for_work()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.make_communicator"><code class="docutils literal notranslate"><span class="pre">make_communicator()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.requested_transport"><code class="docutils literal notranslate"><span class="pre">requested_transport()</span></code></a></li>
 </ul>
   </nav></div>
 

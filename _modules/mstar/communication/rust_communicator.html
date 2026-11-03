@@ -979,10 +979,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.rust_communicator</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""``ZMQCommunicator`` over the Rust transport vendored in</span>
-<span class="sd">``rust/`` (``mstar_rust.ZmqCommunicator``) — drop-in for the pyzmq class:</span>
-<span class="sd">same constructor, methods, endpoints, and wire, so wrapped and unwrapped</span>
-<span class="sd">entities interoperate and migration can proceed one process at a time. The</span>
+<span></span><span class="sd">"""The control-mesh communicator: the Rust ZeroMQ transport vendored in</span>
+<span class="sd">``rust/`` (``mstar_rust.ZmqCommunicator``) behind ``BaseCommunicator``. The</span>
 <span class="sd">codec is a :class:`Codec` (typed msgpack by default, so an edge can</span>
 <span class="sd">terminate in a Rust process); ``register_event_for_poll`` forwards the eventfd to</span>
 <span class="sd">the Rust poller; a readiness poll buffers any consumed message so nothing is</span>
@@ -1025,7 +1023,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RustZMQCommunicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">RustZMQCommunicator</span><span class="p">(</span><span class="n">BaseCommunicator</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The pyzmq ``ZMQCommunicator`` surface over the Rust transport."""</span>
+<span class="w">    </span><span class="sd">"""``BaseCommunicator`` over the Rust transport."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1065,8 +1063,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Protocol </span><span class="si">{</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> not yet supported yet"</span><span class="p">)</span>
 
-    <span class="c1"># endpoint scheme: `_endpoint` / `_tcp_port` come from BaseCommunicator</span>
-    <span class="c1"># (shared with the pyzmq ZMQCommunicator).</span>
+    <span class="c1"># endpoint scheme: `_endpoint` / `_tcp_port` come from BaseCommunicator.</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">entity_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_registered</span><span class="p">:</span>
@@ -1084,8 +1081,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_poll_once</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""One wake-aware poll; returns ``"msg"`` / ``"wake"`` / ``"timeout"``.</span>
-<span class="sd">        A consumed message goes to the buffer; a wakeup drains the event</span>
-<span class="sd">        (same place the pyzmq path drains it)."""</span>
+<span class="sd">        A consumed message goes to the buffer; a wakeup drains the event."""</span>
         <span class="n">kind</span><span class="p">,</span> <span class="n">payload</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">recv_or_wake</span><span class="p">(</span><span class="n">timeout_ms</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"msg"</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_buffered</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
@@ -1139,10 +1135,9 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">blocking</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">blocking</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffered</span><span class="p">:</span>
-            <span class="c1"># Wait until a message is readable before draining — same</span>
-            <span class="c1"># semantics as the pyzmq communicator: a registered wakeup</span>
-            <span class="c1"># event also ends the wait, so a completed compute future can</span>
-            <span class="c1"># interrupt a blocking receive. `timeout_s` bounds the wait</span>
+            <span class="c1"># Wait until a message is readable before draining. A</span>
+            <span class="c1"># registered wakeup event also ends the wait, so a completed</span>
+            <span class="c1"># compute future can interrupt a blocking receive. `timeout_s` bounds the wait</span>
             <span class="c1"># (None = wait indefinitely); on expiry, drain whatever is there.</span>
             <span class="n">deadline</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">timeout_s</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">(</span>
                 <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">timeout_s</span><span class="p">)</span>

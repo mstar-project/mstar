@@ -987,17 +987,14 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">zmq</span>
-
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.codec</span><span class="w"> </span><span class="kn">import</span> <span class="n">Codec</span><span class="p">,</span> <span class="n">decode_each</span><span class="p">,</span> <span class="n">default_codec</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.event</span><span class="w"> </span><span class="kn">import</span> <span class="n">EventWakeup</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="c1">#: The ``mstar_rust`` extension version this tree expects (the vendored</span>
-<span class="c1">#: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching</span>
-<span class="c1">#: install - e.g. a stale wheel after an upgrade - takes over the mesh</span>
-<span class="c1">#: silently, so the factory warns when the imported version differs.</span>
+<span class="c1">#: ``rust/`` crate's version). Every process sends on the extension's</span>
+<span class="c1">#: transport, so a mismatching install - e.g. a stale wheel after an upgrade -</span>
+<span class="c1">#: is refused at startup rather than left to carry the mesh.</span>
 <span class="n">EXPECTED_MSTAR_RUST_VERSION</span> <span class="o">=</span> <span class="s2">"0.1.1"</span>
 
 
@@ -1065,7 +1062,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        waiting for ``get_all_new_messages``; a fired event is drained."""</span></div>
 
 
-    <span class="c1"># -- endpoint scheme (shared by every ZMQ-based communicator) ------------</span>
+    <span class="c1"># -- endpoint scheme ------------------------------------------------------</span>
     <span class="c1"># Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_endpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -1134,221 +1131,48 @@ window.runMermaid = runMermaid;</script>
     <span class="c1">#     pass</span>
 
 
-<div class="viewcode-block" id="ZMQCommunicator">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">ZMQCommunicator</span><span class="p">(</span><span class="n">BaseCommunicator</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">my_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="n">push_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
-        <span class="n">protocol</span><span class="p">:</span> <span class="n">CommProtocol</span><span class="o">=</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">,</span>
-        <span class="n">ipc_socket_path_prefix</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"/tmp/mstar/"</span><span class="p">,</span>
-        <span class="n">codec</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="n">Codec</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="c1"># TODO: for TCP</span>
-    <span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">codec</span> <span class="o">=</span> <span class="n">codec</span> <span class="ow">or</span> <span class="n">default_codec</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Context</span><span class="o">.</span><span class="n">instance</span><span class="p">()</span>
-        <span class="n">transport</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_ZMQ_TRANSPORT"</span><span class="p">,</span> <span class="n">protocol</span><span class="o">.</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">CommProtocol</span><span class="p">(</span><span class="n">transport</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">PULL</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">:</span>
-            <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">ipc_socket_path_prefix</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-
-        <span class="c1"># TODO: maybe only open sockets as we need them, and close sockets</span>
-        <span class="c1"># when we no longer need them</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">SyncSocket</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span> <span class="o">=</span> <span class="n">my_id</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">ipc_socket_path_prefix</span> <span class="o">=</span> <span class="n">ipc_socket_path_prefix</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_lock_deployment</span><span class="p">(</span><span class="n">my_id</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">my_id</span><span class="p">))</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">my_id</span><span class="p">))</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Protocol </span><span class="si">{</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> not yet supported yet"</span><span class="p">)</span>
-
-        <span class="k">for</span> <span class="nb">id</span> <span class="ow">in</span> <span class="n">push_ids</span><span class="p">:</span>
-            <span class="k">if</span> <span class="nb">id</span> <span class="o">==</span> <span class="n">my_id</span><span class="p">:</span>
-                <span class="k">continue</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="nb">id</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">PUSH</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="nb">id</span><span class="p">]</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="nb">id</span><span class="p">))</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="nb">id</span><span class="p">]</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">poller</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Poller</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="kc">None</span>
-
-<div class="viewcode-block" id="ZMQCommunicator.register_event_for_poll">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register_event_for_poll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">:</span> <span class="n">EventWakeup</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span><span class="p">,</span>  <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="n">event</span></div>
-
-
-<div class="viewcode-block" id="ZMQCommunicator.wait_for_work">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.wait_for_work">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_work</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">50</span><span class="p">):</span>
-        <span class="n">events</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">))</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span></div>
-
-
-<div class="viewcode-block" id="ZMQCommunicator.poll_for_messages">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.poll_for_messages">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">poll_for_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">20</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Block until a message is readable, a registered wakeup event</span>
-<span class="sd">        fires, or ``timeout_ms`` elapses — whichever comes first. True when</span>
-<span class="sd">        a message is available (left queued for ``get_all_new_messages``);</span>
-<span class="sd">        a wakeup ends the poll early with False (the event is drained,</span>
-<span class="sd">        exactly as in ``wait_for_work``). Mirrors the Rust communicator's</span>
-<span class="sd">        method so call sites work against either transport."""</span>
-        <span class="n">events</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">))</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span> <span class="ow">in</span> <span class="n">events</span></div>
-
-
-    <span class="c1"># def get_session_id(self) -&gt; str:</span>
-    <span class="c1">#     return self.session_id</span>
-
-<div class="viewcode-block" id="ZMQCommunicator.send">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.send">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">send</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">msg</span><span class="p">):</span>
-        <span class="c1"># TODO: maybe serialize to JSON instead if more efficient</span>
-        <span class="c1"># no str(): the repr is ~10us on an InputSignals and DEBUG is off here</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-            <span class="s2">"</span><span class="si">%s</span><span class="s2"> to send a message </span><span class="si">%s</span><span class="s2"> to entity </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span> <span class="n">entity_id</span>
-        <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_push_socket</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span></div>
-
-
-<div class="viewcode-block" id="ZMQCommunicator.try_send_bytes">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.try_send_bytes">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">try_send_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_push_socket</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">flags</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">NOBLOCK</span><span class="p">)</span>
-        <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Again</span><span class="p">:</span>
-            <span class="k">return</span> <span class="kc">False</span>
-        <span class="k">return</span> <span class="kc">True</span></div>
-
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_push_socket</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">entity_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">:</span>
-            <span class="n">sock</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">PUSH</span><span class="p">)</span>
-            <span class="n">sock</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">entity_id</span><span class="p">))</span>
-            <span class="n">sock</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">sock</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span>
-
-<div class="viewcode-block" id="ZMQCommunicator.get_all_new_messages">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_all_new_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">timeout_s</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
-        <span class="n">messages</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">if</span> <span class="n">blocking</span><span class="p">:</span>
-            <span class="c1"># Wait until the pull socket is readable before draining. A</span>
-            <span class="c1"># registered wakeup event also ends the wait (and is drained</span>
-            <span class="c1"># here, exactly as in wait_for_work), so a completed compute</span>
-            <span class="c1"># future can interrupt a blocking receive. `timeout_s` bounds</span>
-            <span class="c1"># the wait (None = indefinitely); on expiry, drain what's there.</span>
-            <span class="n">timeout_ms</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">timeout_s</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">int</span><span class="p">(</span><span class="n">timeout_s</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
-            <span class="n">events</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">))</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">fd</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">drain</span><span class="p">()</span>
-        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="c1"># zmq.NOBLOCK means zmq doesn't wait for a new message to be</span>
-                <span class="c1"># available, it returns a message if it exists or raises an error</span>
-                <span class="c1"># if no messages are available (error is caught below)</span>
-                <span class="n">frame</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="n">flags</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">NOBLOCK</span><span class="p">)</span>
-                <span class="n">decoded</span> <span class="o">=</span> <span class="n">decode_each</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="p">,</span> <span class="p">[</span><span class="n">frame</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">)</span>
-                <span class="n">messages</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span>
-                <span class="c1"># no str(): the repr is ~10us and DEBUG is off here</span>
-                <span class="k">if</span> <span class="n">decoded</span><span class="p">:</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-                        <span class="s2">"</span><span class="si">%s</span><span class="s2"> to received message </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="n">decoded</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-                    <span class="p">)</span>
-            <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Again</span><span class="p">:</span>
-                <span class="c1"># zmq.Again actually means no messages left to read</span>
-                <span class="k">break</span>
-        <span class="k">return</span> <span class="n">messages</span></div>
-</div>
-
-
-
-<div class="viewcode-block" id="requested_transport">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.requested_transport">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">requested_transport</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_RUST_ZMQ`` as set, upper-cased: ``0``, ``1`` or ``AUTO``."""</span>
-    <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_RUST_ZMQ"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">choice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"0"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">):</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got </span><span class="si">{</span><span class="n">choice</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">choice</span></div>
-
-
-
 <div class="viewcode-block" id="make_communicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">nonblocking_send</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Construct the process's communicator, selecting the transport.</span>
+<span class="w">    </span><span class="sd">"""Construct the process's communicator: ``RustZMQCommunicator``, on the</span>
+<span class="sd">    vendored ``rust/`` extension (see ``communication/rust_communicator.py``).</span>
 
-<span class="sd">    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):</span>
-
-<span class="sd">    * ``AUTO`` (default) — the Rust-backed ``RustZMQCommunicator`` (vendored</span>
-<span class="sd">      ``rust/`` extension; see ``communication/rust_communicator.py``) when</span>
-<span class="sd">      the extension imports successfully, pyzmq otherwise.</span>
-<span class="sd">    * ``1`` — the Rust communicator; raises if the extension is missing.</span>
-<span class="sd">    * ``0`` — always the pyzmq ``ZMQCommunicator``. A worker refuses this: the</span>
-<span class="sd">      graph runtime holds a share of the Rust transport.</span>
-
-<span class="sd">    The two are wire-compatible (same endpoints, same codec).</span>
-
-<span class="sd">    ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,</span>
-<span class="sd">    which needs ``try_send_bytes``: an extension built before</span>
-<span class="sd">    ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and</span>
-<span class="sd">    raises under ``1``. Every other caller keeps such a build.</span>
+<span class="sd">    Raises when the extension is missing or is not the version this tree</span>
+<span class="sd">    expects. ``nonblocking_send`` is for a communicator ``OutboxCommunicator``</span>
+<span class="sd">    wraps, which needs ``try_send_bytes``: an extension built before</span>
+<span class="sd">    ``ZmqCommunicator.try_send`` is refused for it.</span>
 <span class="sd">    """</span>
-    <span class="n">choice</span> <span class="o">=</span> <span class="n">requested_transport</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">choice</span> <span class="o">!=</span> <span class="s2">"0"</span><span class="p">:</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">mstar_rust</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">mstar_rust</span>
+    <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ImportError</span><span class="p">(</span>
+            <span class="s2">"The control mesh runs on the mstar_rust extension, which this "</span>
+            <span class="s2">"environment does not have. The Linux wheels of mstar-ai on PyPI "</span>
+            <span class="s2">"carry it; from a checkout, build it with `maturin develop "</span>
+            <span class="s2">"--release -m rust/Cargo.toml` (see docs/installation.rst)."</span>
+        <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.rust_communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">RustZMQCommunicator</span>
 
-            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.rust_communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">RustZMQCommunicator</span>
-        <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">choice</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
-                <span class="k">raise</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq"</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># A support bundle must be able to tell what a mesh was running,</span>
-            <span class="c1"># and an old wheel left in an env must not silently take over</span>
-            <span class="c1"># the whole mesh under AUTO after an upgrade.</span>
-            <span class="c1"># The path says which copy loaded: a maturin-built mstar-rust</span>
-            <span class="c1"># package shadows the module an mstar-ai Linux wheel ships.</span>
-            <span class="n">version</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="p">,</span> <span class="s2">"__version__"</span><span class="p">,</span> <span class="s2">"&lt;pre-versioning&gt;"</span><span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                <span class="s2">"control mesh transport: rust </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2"> (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span>
-                <span class="n">version</span><span class="p">,</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">version</span> <span class="o">!=</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">"mstar_rust version </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2"> does not match the expected "</span>
-                    <span class="s2">"</span><span class="si">%s</span><span class="s2">: in a checkout, rebuild it with `maturin develop "</span>
-                    <span class="s2">"--release -m rust/Cargo.toml`; in a pip install, upgrade "</span>
-                    <span class="s2">"mstar-ai and `pip uninstall mstar-rust` if a leftover "</span>
-                    <span class="s2">"build is shadowing the wheel's copy"</span><span class="p">,</span>
-                    <span class="n">version</span><span class="p">,</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="p">,</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">)</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">nonblocking_send</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">ZmqCommunicator</span><span class="p">,</span> <span class="s2">"try_send"</span><span class="p">):</span>
-                <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
-            <span class="c1"># built before try_send: every send the outbox makes would fail.</span>
-            <span class="c1"># Only this process's outbox falls back; pyzmq shares the wire.</span>
-            <span class="n">stale</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_rust </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> predates ZmqCommunicator.try_send; "</span>
-                     <span class="s2">"rebuild it with `maturin develop --release` in rust/"</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">choice</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">stale</span><span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">. Using pyzmq for this non-blocking sender meanwhile"</span><span class="p">,</span> <span class="n">stale</span><span class="p">)</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"control mesh transport: pyzmq (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">ZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+    <span class="c1"># A support bundle must be able to tell what a mesh was running. The path</span>
+    <span class="c1"># says which copy loaded: a maturin-built mstar-rust package shadows the</span>
+    <span class="c1"># module an mstar-ai Linux wheel ships.</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="p">,</span> <span class="s2">"__version__"</span><span class="p">,</span> <span class="s2">"&lt;pre-versioning&gt;"</span><span class="p">)</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"control mesh transport: rust </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">version</span> <span class="o">!=</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"mstar_rust version </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> at </span><span class="si">{</span><span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="si">}</span><span class="s2"> does not "</span>
+            <span class="sa">f</span><span class="s2">"match the expected </span><span class="si">{</span><span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="si">}</span><span class="s2">: in a checkout, "</span>
+            <span class="s2">"rebuild it with `maturin develop --release -m rust/Cargo.toml`; in "</span>
+            <span class="s2">"a pip install, upgrade mstar-ai and `pip uninstall mstar-rust` if "</span>
+            <span class="s2">"a leftover build is shadowing the wheel's copy"</span>
+        <span class="p">)</span>
+    <span class="k">if</span> <span class="n">nonblocking_send</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">ZmqCommunicator</span><span class="p">,</span> <span class="s2">"try_send"</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"mstar_rust </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> predates ZmqCommunicator.try_send, which the "</span>
+            <span class="s2">"API server's preprocess thread sends with: rebuild it with "</span>
+            <span class="s2">"`maturin develop --release -m rust/Cargo.toml`"</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 
 
 

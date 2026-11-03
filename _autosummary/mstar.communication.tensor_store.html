@@ -850,7 +850,7 @@ request teardown can find what to free.</p>
 <td><p>One node's output batch, marshalled as columns of primitives.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensor_store.PythonTensorBookkeeping" title="mstar.communication.tensor_store.PythonTensorBookkeeping"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PythonTensorBookkeeping</span></code></a>()</p></td>
-<td><p></p></td>
+<td><p>The pure-Python bookkeeping the Rust one is tested against.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensor_store.ReferenceInfo" title="mstar.communication.tensor_store.ReferenceInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReferenceInfo</span></code></a>([ref_cnt, persist, mem_registered])</p></td>
 <td><p></p></td>
@@ -1024,6 +1024,7 @@ its entry in every column, in the layout’s order.</p>
 <dt class="sig sig-object py" id="mstar.communication.tensor_store.PythonTensorBookkeeping">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensor_store.</span></span><span class="sig-name descname"><span class="pre">PythonTensorBookkeeping</span></span><a class="reference internal" href="../_modules/mstar/communication/tensor_store.html#PythonTensorBookkeeping"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensor_store.PythonTensorBookkeeping" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.communication.tensor_store.TensorBookkeeping" title="mstar.communication.tensor_store.TensorBookkeeping"><code class="xref py py-class docutils literal notranslate"><span class="pre">TensorBookkeeping</span></code></a></p>
+<p>The pure-Python bookkeeping the Rust one is tested against.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensor_store.PythonTensorBookkeeping.can_gc">
 <span class="sig-name descname"><span class="pre">can_gc</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">uuid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensor_store.html#PythonTensorBookkeeping.can_gc"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensor_store.PythonTensorBookkeeping.can_gc" title="Link to this definition">#</a></dt>

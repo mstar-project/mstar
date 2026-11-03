@@ -1322,6 +1322,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PythonTensorBookkeeping">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.PythonTensorBookkeeping">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PythonTensorBookkeeping</span><span class="p">(</span><span class="n">TensorBookkeeping</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The pure-Python bookkeeping the Rust one is tested against."""</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_ref_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">ReferenceInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1686,26 +1688,21 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_tensor_bookkeeping</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">TensorBookkeeping</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The Rust bookkeeper wherever the extension imports: the graph runtime</span>
-<span class="sd">    holds a SHARE of this object, so the two have to be the same</span>
-<span class="sd">    implementation. The Python one is for the api server's data worker, which</span>
-<span class="sd">    may run without the extension.</span>
+<span class="w">    </span><span class="sd">"""The Rust bookkeeper: the graph runtime holds a SHARE of this object, so</span>
+<span class="sd">    the two have to be the same implementation. ``PythonTensorBookkeeping`` is</span>
+<span class="sd">    the reference the tests check it against, not a fallback: serving needs the</span>
+<span class="sd">    extension.</span>
 
 <span class="sd">    Deliberately NOT gated on being in a worker, so the data worker takes the</span>
-<span class="sd">    Rust one too where it can, and pays the copy of each descriptor into Rust</span>
-<span class="sd">    with no graph runtime behind it. Small next to its per-request work, and</span>
-<span class="sd">    the api server is a candidate for Rust itself;</span>
-<span class="sd">    ``TensorStore(bookkeeping=...)`` is the override if that stops being true.</span>
+<span class="sd">    Rust one too, and pays the copy of each descriptor into Rust with no graph</span>
+<span class="sd">    runtime behind it. Small next to its per-request work, and the api server</span>
+<span class="sd">    is a candidate for Rust itself; ``TensorStore(bookkeeping=...)`` is the</span>
+<span class="sd">    override if that stops being true.</span>
 <span class="sd">    """</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">RustTensorBookkeeping</span><span class="p">()</span>
-    <span class="k">except</span> <span class="ne">ModuleNotFoundError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-        <span class="c1"># Only a missing extension falls back. One that imports but lacks</span>
-        <span class="c1"># TensorBookkeeping is a stale build, which should fail here rather</span>
-        <span class="c1"># than as the worker's "needs the Rust TensorBookkeeping" guard.</span>
-        <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">name</span> <span class="o">!=</span> <span class="s2">"mstar_rust"</span><span class="p">:</span>
-            <span class="k">raise</span>
-        <span class="k">return</span> <span class="n">PythonTensorBookkeeping</span><span class="p">()</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">require_rust_extension</span>
+
+    <span class="n">require_rust_extension</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">RustTensorBookkeeping</span><span class="p">()</span>
 
 
 <div class="viewcode-block" id="TensorStore">

@@ -769,7 +769,7 @@ uv<span class="w"> </span>venv<span class="w"> </span>--python<span class="w"> <
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span>.
 </pre></div>
 </div>
-<p>This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
+<p>This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
 console scripts, <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>. To serve from a checkout, also build the
 extension (see <a class="reference internal" href="#rust-extension">Rust extension</a>).</p>
 <div class="admonition important">
@@ -1168,15 +1168,17 @@ mstar-serve<span class="w"> </span>--help
 <section id="rust-extension">
 <h2>Rust extension<a class="headerlink" href="#rust-extension" title="Link to this heading">#</a></h2>
 <p>Serving needs the <code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension (vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code>): the graph
-runtime is Rust, and the conductor refuses to start without it. Importing <code class="docutils literal notranslate"><span class="pre">mstar</span></code>
-does not need it. The extension carries (see <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> for
-the flags):</p>
+runtime is Rust and every process sends on its ZeroMQ transport, so the
+conductor refuses to start without it. Importing <code class="docutils literal notranslate"><span class="pre">mstar</span></code> does not need it.
+The extension carries (see <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> for the flags):</p>
 <ul class="simple">
 <li><p><strong>Graph runtime</strong>: graph state, scheduling, routing and speculation, and the
 frames a worker sends. It holds a share of the Rust transport and of the Rust
 tensor bookkeeper, and needs the msgpack codec.</p></li>
-<li><p><strong>ZeroMQ control mesh</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>: same endpoints, same wire
-format as pyzmq.</p></li>
+<li><p><strong>ZeroMQ control mesh</strong>: the transport every process sends its control
+messages on. Each process logs it at startup (<code class="docutils literal notranslate"><span class="pre">control</span> <span class="pre">mesh</span> <span class="pre">transport:</span>
+<span class="pre">rust</span> <span class="pre">&lt;version&gt;</span> <span class="pre">from</span> <span class="pre">&lt;path&gt;</span></code>) and refuses an extension of another version
+than the one its <code class="docutils literal notranslate"><span class="pre">mstar</span></code> expects.</p></li>
 <li><p><strong>SHM tensor arena</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>: replaces the per-tensor file
 transport; requires the extension, interoperates on the same descriptor
 wire (and depends on the transport above only in the sense that both ship

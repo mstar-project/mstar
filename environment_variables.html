@@ -728,22 +728,7 @@ documented here as they are introduced.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></p></td>
-<td><p>Transport selection for the ZeroMQ control mesh (see
-<a class="reference internal" href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator" title="mstar.communication.communicator.make_communicator"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.communication.communicator.make_communicator()</span></code></a>).
-<code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: the Rust-backed <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code> when the vendored
-<code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension imports successfully, pyzmq otherwise.
-<code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust communicator, raising if the extension is missing.
-<code class="docutils literal notranslate"><span class="pre">0</span></code>: pyzmq. A worker cannot run on it any more, because the graph
-runtime holds a share of the Rust transport: the conductor refuses the
-setting before it starts any worker. An extension built before 0.1.1
-has no non-blocking <code class="docutils literal notranslate"><span class="pre">try_send</span></code>, which the API server’s preprocess
-thread sends with: for that thread alone, <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> then uses pyzmq
-with a warning and <code class="docutils literal notranslate"><span class="pre">1</span></code> raises, asking for a rebuild. The conductor,
-the workers and the rest of the API server keep the Rust transport.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">msgpack</span></code></p></td>
 <td><p>How messages are encoded on every communicator edge (see
 <a class="reference internal" href="_autosummary/mstar.communication.codec.html#mstar.communication.codec.default_codec" title="mstar.communication.codec.default_codec"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.communication.codec.default_codec()</span></code></a>). <code class="docutils literal notranslate"><span class="pre">msgpack</span></code>: the
@@ -754,28 +739,28 @@ extensions instead of pickle. Upgrade all processes in a deployment
 together: older processes cannot decode the new extensions, and
 updated processes reject legacy pickle messages and metadata.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TRANSPORT</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TRANSPORT</span></code></p></td>
 <td><p>constructor’s protocol</p></td>
 <td><p>Overrides the communicator protocol (<code class="docutils literal notranslate"><span class="pre">IPC</span></code> or <code class="docutils literal notranslate"><span class="pre">TCP</span></code>) for a
 process, e.g. to run entities on separate hosts.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TCP_HOST</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TCP_HOST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code></p></td>
 <td><p>Host used to build peer endpoints when the protocol is <code class="docutils literal notranslate"><span class="pre">TCP</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TCP_BASE_PORT</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TCP_BASE_PORT</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">19000</span></code></p></td>
 <td><p>Base of the deterministic entity-id → TCP port map (<code class="docutils literal notranslate"><span class="pre">api_server</span></code>
 = base, <code class="docutils literal notranslate"><span class="pre">conductor</span></code> = base+1, <code class="docutils literal notranslate"><span class="pre">worker_&lt;rank&gt;</span></code> = base+100+rank).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUIRE_ACCELERATOR_GRAPHS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUIRE_ACCELERATOR_GRAPHS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes a worker fail at startup when any accelerator graph bucket
 could not be captured, instead of serving that bucket eagerly at
 10-20x the latency. Off by default: a failed capture is logged at
 ERROR with a per-runner summary and the rest keeps running.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>SHM tensor-transport implementation. <code class="docutils literal notranslate"><span class="pre">0</span></code>: per-uuid files.
 <code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust shared-memory arena (requires the <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
@@ -783,7 +768,7 @@ extension; raises if missing). <code class="docutils literal notranslate"><span 
 extension imports, files otherwise. Must match across the
 deployment — arena locations ride in the tensor descriptors.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEPLOYMENT_TOKEN</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEPLOYMENT_TOKEN</span></code></p></td>
 <td><p>random per launch</p></td>
 <td><p>Mixed into the namespace of the SHM tensor files and arena segments,
 so no two launches share names: not a restart on the same socket
@@ -800,7 +785,7 @@ a reused value would let it do to the next launch’s files).
 The API server logs a warning whenever it keeps a value the launcher
 set.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> (or <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> if unavailable)</p></td>
 <td><p>Base directory for host-staged KV snapshots when remote KV transfer
 uses SHM (<code class="docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir</span></code>). Each deployment creates a
@@ -814,7 +799,7 @@ filesystem. The lock is <code class="docutils literal notranslate"><span class="
 different nodes at one shared directory there: each would sweep the
 other’s live directories.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
 <td><p>Size of each arena segment. The arena grows segment by segment;
 existing segments never move (registrations stay valid). A
@@ -824,7 +809,7 @@ segment counts against /dev/shm, as do spill files, which land in
 /dev/shm by default. A segment /dev/shm cannot hold counts as arena
 full (sends spill, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">32</span></code></p></td>
 <td><p>Growth cap PER ENTITY. Every entity (workers + the api-server data
 worker) creates its own arena, so node-wide /dev/shm demand can
@@ -833,12 +818,12 @@ reach <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS<
 fails fast if one entity’s ceiling exceeds /dev/shm. At the cap,
 sends spill (see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_FULL_TIMEOUT_S</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_FULL_TIMEOUT_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
 <td><p>Strict mode only (<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL=0</span></code>): how long a send
 backpressures on a full arena before failing.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Degrade gracefully at the segment cap: stage the tensor through the
 per-uuid file protocol instead — slower, never fails, matching the
@@ -847,19 +832,19 @@ backpressure + timeout — only meaningful where ANOTHER thread
 drains consumer ACKs (the threaded api-server); on a worker the
 ACKs arrive on the very thread that would be waiting.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL_AFTER_S</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL_AFTER_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>Optional grace before spilling, for deployments where another
 thread frees slots concurrently. Default 0: spill immediately
 (a worker cannot receive ACKs while it waits).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">cudaHostRegister</span></code> each mapped segment (both sides) so D2H/H2D
 copies through the side streams run at page-locked bandwidth and
 stay asynchronous. <code class="docutils literal notranslate"><span class="pre">0</span></code> disables (pageable copies).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN_MAX_MB</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PIN_MAX_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">4096</span></code></p></td>
 <td><p>Budget for TOTAL pinned host memory PER PROCESS, distinct from the
 segment cap (pinned pages come out of the OS’s pageable pool
@@ -868,7 +853,7 @@ system-wide). Node-wide pinned demand is approx
 so one process can pin more than its own arena holds. Segments
 past the budget stay unpinned: copies work, without async overlap.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_MAX_BYTES</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_MAX_BYTES</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">16384</span></code></p></td>
 <td><p>Largest item (bytes) a consumer gathers with others of the same
 shape, dtype and segment into one pinned buffer and one H2D copy,
@@ -876,14 +861,14 @@ instead of a copy per item (<code class="docutils literal notranslate"><span cla
 is the crossover measured on an H200 host; <code class="docutils literal notranslate"><span class="pre">0</span></code> disables the
 gather. Read in <code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.__init__</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
 <td><p>Up to this item size (bytes, 8-byte aligned) the gather indexes
 8-byte words in one pass; larger items are copied one slice each.
 Measured on an H200 host. Read in
 <code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.__init__</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SLOT_TTL_S</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SLOT_TTL_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>TTL backstop for abort-orphaned slots (a request aborted after
 staging but before all consumer ACKs defers reclaim forever).
@@ -893,27 +878,27 @@ timeout) cannot race a real consumer. <code class="docutils literal notranslate"
 pending review discussion); reclaims run under capacity pressure
 and with the periodic stats sweep, logging loudly.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_STATS_INTERVAL_S</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_STATS_INTERVAL_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">60</span></code></p></td>
 <td><p>Under <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>: how often the arena logs its occupancy /
 fragmentation snapshot (segments, free bytes, largest contiguous
 free block, pinned bytes).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_IFNAME</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_IFNAME</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
 <td><p>NCCL’s own variable. Every worker runs on the conductor’s host, so
 the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers and NCCL’s bootstrap
 sockets listen on loopback only. A value you set, or a set
 <code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_FAMILY</span></code>, is kept as is.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_GRAPH_REGISTER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_GRAPH_REGISTER</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>NCCL’s own variable. On, NCCL registers the buffers a CUDA graph
 captures, which succeeds on <code class="docutils literal notranslate"><span class="pre">expandable_segments</span></code> memory, and
 Cosmos3 SP4 with batched captures then gave wrong images (#897).
 Workers on CUDA set <code class="docutils literal notranslate"><span class="pre">0</span></code> unless you set it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
 <td><p>PyTorch’s variable for the Gloo groups next to each TP/SP group.
 Same rule: the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers unless you set

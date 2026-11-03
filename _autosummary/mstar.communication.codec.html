@@ -718,9 +718,8 @@
                   
   <section id="module-mstar.communication.codec">
 <span id="mstar-communication-codec"></span><h1>mstar.communication.codec<a class="headerlink" href="#module-mstar.communication.codec" title="Link to this heading">#</a></h1>
-<p>The encode/decode seam shared by both ZMQ transports.</p>
-<p>Kept apart from either communicator so they can both import it, and mirroring
-the Rust <code class="docutils literal notranslate"><span class="pre">Codec</span></code> trait:</p>
+<p>The encode/decode seam of the ZMQ control mesh, mirroring the Rust
+<code class="docutils literal notranslate"><span class="pre">Codec</span></code> trait:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">pub</span> <span class="n">trait</span> <span class="n">Codec</span><span class="o">&lt;</span><span class="n">M</span><span class="o">&gt;</span> <span class="p">{</span>
     <span class="n">fn</span> <span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">:</span> <span class="o">&amp;</span><span class="n">M</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Result</span><span class="o">&lt;</span><span class="n">Vec</span><span class="o">&lt;</span><span class="n">u8</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">CommError</span><span class="o">&gt;</span><span class="p">;</span>
     <span class="n">fn</span> <span class="n">decode</span><span class="p">(</span><span class="nb">bytes</span><span class="p">:</span> <span class="o">&amp;</span><span class="p">[</span><span class="n">u8</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Option</span><span class="o">&lt;</span><span class="n">M</span><span class="o">&gt;</span><span class="p">;</span>

@@ -21,7 +21,6 @@ mstar.communication.communicator
    .. autosummary::
    
       make_communicator
-      requested_transport
    
    
 
@@ -34,7 +33,6 @@ mstar.communication.communicator
       BaseCommunicator
       CommProtocol
       OutboxCommunicator
-      ZMQCommunicator
    
    
 

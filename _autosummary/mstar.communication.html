@@ -695,7 +695,7 @@
 <td><p>Tensor transport over a shared-memory arena.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.codec.html#module-mstar.communication.codec" title="mstar.communication.codec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">codec</span></code></a></p></td>
-<td><p>The encode/decode seam shared by both ZMQ transports.</p></td>
+<td><p>The encode/decode seam of the ZMQ control mesh, mirroring the Rust <code class="docutils literal notranslate"><span class="pre">Codec</span></code> trait.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.communicator.html#module-mstar.communication.communicator" title="mstar.communication.communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">communicator</span></code></a></p></td>
 <td><p></p></td>
@@ -707,7 +707,7 @@
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.rust_communicator.html#module-mstar.communication.rust_communicator" title="mstar.communication.rust_communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rust_communicator</span></code></a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code> over the Rust transport vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar_rust.ZmqCommunicator</span></code>) — drop-in for the pyzmq class: same constructor, methods, endpoints, and wire, so wrapped and unwrapped entities interoperate and migration can proceed one process at a time.</p></td>
+<td><p>The control-mesh communicator: the Rust ZeroMQ transport vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar_rust.ZmqCommunicator</span></code>) behind <code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.tensor_store.html#module-mstar.communication.tensor_store" title="mstar.communication.tensor_store"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensor_store</span></code></a></p></td>
 <td><p>Tensor storage, split so the bookkeeping half can have a Rust backend.</p></td>

@@ -979,10 +979,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.codec</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""The encode/decode seam shared by both ZMQ transports.</span>
-
-<span class="sd">Kept apart from either communicator so they can both import it, and mirroring</span>
-<span class="sd">the Rust ``Codec`` trait::</span>
+<span></span><span class="sd">"""The encode/decode seam of the ZMQ control mesh, mirroring the Rust</span>
+<span class="sd">``Codec`` trait::</span>
 
 <span class="sd">    pub trait Codec&lt;M&gt; {</span>
 <span class="sd">        fn encode(msg: &amp;M) -&gt; Result&lt;Vec&lt;u8&gt;, CommError&gt;;</span>

@@ -712,10 +712,8 @@
                   
   <section id="module-mstar.communication.rust_communicator">
 <span id="mstar-communication-rust-communicator"></span><h1>mstar.communication.rust_communicator<a class="headerlink" href="#module-mstar.communication.rust_communicator" title="Link to this heading">#</a></h1>
-<p><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code> over the Rust transport vendored in
-<code class="docutils literal notranslate"><span class="pre">rust/</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar_rust.ZmqCommunicator</span></code>) — drop-in for the pyzmq class:
-same constructor, methods, endpoints, and wire, so wrapped and unwrapped
-entities interoperate and migration can proceed one process at a time. The
+<p>The control-mesh communicator: the Rust ZeroMQ transport vendored in
+<code class="docutils literal notranslate"><span class="pre">rust/</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar_rust.ZmqCommunicator</span></code>) behind <code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code>. The
 codec is a <code class="xref py py-class docutils literal notranslate"><span class="pre">Codec</span></code> (typed msgpack by default, so an edge can
 terminate in a Rust process); <code class="docutils literal notranslate"><span class="pre">register_event_for_poll</span></code> forwards the eventfd to
 the Rust poller; a readiness poll buffers any consumed message so nothing is
@@ -734,7 +732,7 @@ dropped or reordered. Build: <code class="docutils literal notranslate"><span cl
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.rust_communicator.RustZMQCommunicator" title="mstar.communication.rust_communicator.RustZMQCommunicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code></a>(my_id, push_ids[, ...])</p></td>
-<td><p>The pyzmq <code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code> surface over the Rust transport.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code> over the Rust transport.</p></td>
 </tr>
 </tbody>
 </table>
@@ -752,7 +750,7 @@ FFI poll can hold the thread, keeping Python signal handling and the
 <dt class="sig sig-object py" id="mstar.communication.rust_communicator.RustZMQCommunicator">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.rust_communicator.</span></span><span class="sig-name descname"><span class="pre">RustZMQCommunicator</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">push_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">protocol</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">CommProtocol.IPC</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ipc_socket_path_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'/tmp/mstar/'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">codec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/rust_communicator.html#RustZMQCommunicator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.rust_communicator.RustZMQCommunicator" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseCommunicator</span></code></a></p>
-<p>The pyzmq <code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code> surface over the Rust transport.</p>
+<p><code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code> over the Rust transport.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
