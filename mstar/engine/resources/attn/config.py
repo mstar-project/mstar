@@ -16,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -104,18 +105,42 @@ class AttentionSpec(NodeResourceSpec):
         return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
-        """Its node's sequence shard's ``exchange`` over its pool's storage; over a pool every rank
-        stores whole (``copied``: MLA's one latent), ``kv_gather`` wherever the node splits."""
+        """Its node's sequence shard's ``exchange`` over its pool's storage; over KV every rank
+        stores whole (``stores_whole``), ``kv_gather`` wherever the node splits."""
         from mstar.engine.resources.sequence_shard import shard_exchange
 
         exchange = shard_exchange(self, specs)
-        if exchange != "none" and specs[self.config.kv_cache].storage == "copied":
+        if exchange != "none" and self.stores_whole(specs[self.config.kv_cache]):
             return "kv_gather"
         return exchange
+
+    def stores_whole(self, kv: NodeResourceSpec) -> bool:
+        """Whether every rank holds this attention's KV whole: a pool copied over the SP ranks
+        (MLA's one latent), or this attention's window layers of a pool placed by position, which
+        keeps them whole on every partner so a decode step reads them with no collective
+        (`PagedKVConfig.placed_groups`). From raw fields."""
+        if kv.storage == "copied":
+            return True
+        window = getattr(self.config, "sliding_window", None)
+        return kv.storage == "by_position" and window is not None and window < kv.config.max_seq_len
 
     def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
         # the ring's partner plans and kv_gather's local plans differ by rank, so run eagerly
         return self.resolve_exchange(specs) not in ("ring", "kv_gather")
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        # kv_gather plans each rank's contiguous pieces of a row (`SeqRange.row_pieces`), which a
+        # ring's striped step doesn't give it
+        if shard.stripe_pool is None or self.resolve_exchange(specs) != "kv_gather":
+            return []
+        return [
+            f"attention {self.resource_key!r} gathers a split step's keys into KV {self.config.kv_cache!r}, which "
+            f"every rank stores whole (kv_gather), planning each rank's contiguous pieces of a row, and node "
+            f"{node!r}'s sequence shard stripes its steps by KV {shard.stripe_pool!r}'s stored positions (its "
+            "exchange ring): split it by all_gather"
+        ]
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits

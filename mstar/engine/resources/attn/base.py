@@ -10,6 +10,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend, SpExchange
@@ -20,7 +21,9 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.plan import HostLens, PagedIndptrs
 from mstar.engine.resources.sequence_shard import (
+    SeqRange,
     SeqShardPlan,
     SequenceShard,
     all_gather,
@@ -69,6 +72,9 @@ class AttentionManager(AttentionResource):
     _shard: SequenceShard | None = None
     # how split steps reach it (`AttentionSpec.resolve_exchange`), set by `build`
     _split_exchange: SpExchange = "ulysses"
+    # the group of the pool's layers it reads (`PagedKVConfig.groups`); a placement stripes the
+    # first alone, and a window group is whole on every partner
+    _group_idx: int = 0
 
     @property
     def splits(self) -> bool:
@@ -88,7 +94,7 @@ class AttentionManager(AttentionResource):
 
     def bind_dependencies(self, resources) -> None:
         kv = resources[self._kv_cache_name]
-        placement = kv.placement
+        placement = kv.placement if self._group_idx == 0 else None
         if placement is not None:
             self._placement = placement
             self._bind_placement(placement)
@@ -301,7 +307,12 @@ class AttentionManager(AttentionResource):
             # the backends whose partials' lse base the merge is known to read right
             lse_known = ("auto", "fa2", "fa3")
             unsupported = [name for name, refused in (
-                ("sliding_window", spec.config.sliding_window is not None),
+                # a window kept in its own group is whole on every partner (`PagedKVConfig.placed_groups`)
+                (
+                    "sliding_window",
+                    spec.config.sliding_window is not None
+                    and not spec.stores_whole(info.dependency(spec.config.kv_cache)),
+                ),
                 # before it degrades to FlashInfer on some hosts, so a config loads on none
                 (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
                 (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
@@ -445,6 +456,38 @@ class AttentionManager(AttentionResource):
         if self._placement is not None:
             return self._current_plan_states[label or self._default_label].reads_step_kv
         return not self.requires_kv_write
+
+
+def own_queries(indptrs: PagedIndptrs, r: SeqRange, page_size: int, causal: bool) -> PagedIndptrs:
+    """A split label's plan under ``kv_gather`` over a pool every rank stores whole: this rank's
+    piece of each row it holds any of (``SeqRange.row_pieces``), over the row's stored context and
+    the step's keys up to the piece's end (causal; the row's whole length otherwise),
+    bottom-right aligned, as the logical plan ``indptrs`` lays the row's pages out."""
+    qo = indptrs.qo_indptr.numpy().astype(np.int64)
+    spans = np.diff(qo)
+    stored = indptrs.kv_lens.numpy().astype(np.int64) - spans
+    pieces = r.row_pieces(spans.tolist())
+    mine = pieces[r.group.rank]
+    rows = np.flatnonzero(mine)
+    ends = (stored + (pieces[: r.group.rank + 1].sum(0) if causal else spans))[rows]
+    pages = -(-ends // page_size)
+    kv_start = indptrs.paged_kv_indptr.numpy().astype(np.int64)[rows]
+    indices = indptrs.paged_kv_indices.numpy()
+    return PagedIndptrs(
+        qo_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(mine[rows])]).astype(np.int32)),
+        paged_kv_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(pages)]).astype(np.int32)),
+        paged_kv_indices=torch.from_numpy(np.concatenate(
+            [indices[start:start + n] for start, n in zip(kv_start, pages, strict=True)],
+        ).astype(np.int32)),
+        paged_kv_last_page_len=torch.from_numpy((ends - (pages - 1) * page_size).astype(np.int32)),
+        kv_lens=torch.from_numpy(ends.astype(np.int32)).as_subclass(HostLens),
+    )
+
+
+def partner_queries(pieces: np.ndarray) -> list[np.ndarray]:
+    """Each partner's qo_indptr under ``kv_gather``: its piece of each row it holds any of
+    (``SeqRange.row_pieces``)."""
+    return [np.concatenate([[0], np.cumsum(piece[piece > 0])]) for piece in pieces]
 
 
 class PlanCacheKey(NamedTuple):

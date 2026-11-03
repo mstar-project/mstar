@@ -898,17 +898,46 @@ def test_head_shards_that_dont_divide_the_kv_heads_are_refused():
         config.shard(12)
 
 
-def test_a_pool_that_keeps_a_sliding_window_is_refused_a_placement():
-    """Its pages hold another page size for the windowed layers, which the placed storage doesn't
-    stripe; refused where the storage is placed, before it is allocated."""
-    config = PagedKVConfig(
-        num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=2, max_num_pages=8,
-        context_parallel=True,
-    )
-    config.keep_window(16, (1,))
+def test_a_placed_pool_keeping_a_window_stripes_its_full_layers_and_keeps_the_window_whole():
+    """Under a placement the full layers' slots stripe over the partners and the window layers stay
+    whole on each, in pages of 1/P their tokens (an arena page holds a partner's 1/P of a full
+    page): every rank writes each of a step's window tokens, and each full token goes to its owner
+    alone. A window page that doesn't split P ways is refused where the storage is placed."""
+    def pool(page_size=None, window_layers=(1,)):
+        cfg = PagedKVConfig(
+            num_layers=1 + len(window_layers), num_kv_heads=1, head_dim=8, max_seq_len=256, num_qo_heads=2,
+            max_num_pages=48, page_size=page_size, context_parallel=True, prefix_cache=False,
+        )
+        cfg.keep_window(64, window_layers)
+        return cfg
+
+    cfg = pool()
+    full, window = cfg.groups
+    ranks = []
+    for rank in range(P):
+        # one config for both, as one process emulating TP builds them (`_manager`)
+        cfg.shard(P)
+        joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
+        ranks.append(KVManager(cfg=cfg, name="kv", joint_comm_group=joint, transfer_engine_info=None,
+                               device=CPU, dtype=torch.float32))
+    assert cfg.groups == (full, replace(window, page_size=window.page_size // P))
+    step = KVStep(segments=(Segment("a", "main", 100),))
+    for kv in ranks:
+        assert kv.kv_cache.layer_view(0).shape[2] == full.page_size // P
+        assert kv.kv_cache.layer_view(1).shape[2] == window.page_size // P
+        kv.ingest_request("a", KVReqConfig(needed_labels=["main"]))
+        assert kv.admit(step, _ctx("a")).ok
+        kv.plan(step, _ctx("a"))
+    written = [[(kv._current_plan_states["main", g].token_to_page != SINK_PAGE).tolist() for kv in ranks]
+               for g in (0, 1)]
+    assert all(sum(owners) == 1 for owners in zip(*written[0], strict=True))
+    assert all(all(rank) for rank in written[1])
+
+    # 3-token window pages (a 6-token full page over 1 full and 2 window layers) don't split 2 ways
+    cfg = pool(page_size=6, window_layers=(1, 2))
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    with pytest.raises(ValueError, match="context_parallel is unsupported over a pool that keeps a sliding window"):
-        config.place(joint, "kv")
+    with pytest.raises(ValueError, match="keeps its sliding-window layers whole on each of its 2 partners in 3-token"):
+        cfg.place(joint, "kv")
 
 
 # the MLA case on CPU runs the MLA wrapper's own torch fallback, which these rows check the same way

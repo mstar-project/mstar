@@ -127,6 +127,8 @@ class PagedKVConfig(KVConfig):
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
+    # the groups as `keep_window` derived them, which a placement re-pages (`placed_groups`)
+    _kept_groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.layout == KVLayout.MLA:
@@ -170,7 +172,7 @@ class PagedKVConfig(KVConfig):
             page = tokens * len(full) // len(layers)
             # the window in whole pages: a stream releases its front pages past it at commit
             groups += (KVGroup(tuple(layers), page, RetentionPolicy(context_budget=-(-window // page) * page)),)
-        self.groups = groups
+        self.groups = self._kept_groups = groups
 
     @property
     def tokens_per_page(self) -> int:
@@ -227,12 +229,10 @@ class PagedKVConfig(KVConfig):
 
         if not self.context_parallel:
             return None
-        if len(self.groups) > 1:
-            # a page of a group's layers holds another page size, which the placed storage doesn't stripe
-            raise ValueError(f"KV {pool!r}: context_parallel is unsupported over a pool that keeps a sliding window")
         tp_size, sp_size = (1, 1) if joint is None else (joint.tp_group.world_size, joint.sp_group.world_size)
         # raises on one rank alone, so past here there is a joint group
         size = self.context_parallel_size(pool, tp_size, sp_size)
+        self.groups = self.placed_groups(pool, size)
         if sp_size > 1:
             sp = joint.sp_group
             return ContextParallel(size=size, index=sp.rank, group=sp, over_sp=True, partners=tuple(range(size)))
@@ -241,6 +241,23 @@ class PagedKVConfig(KVConfig):
         return ContextParallel(
             size=size, index=tp.rank % size, group=tp, over_sp=False, partners=tuple(range(first, first + size)),
         )
+
+    def placed_groups(self, pool: str, size: int) -> "tuple[KVGroup, ...]":
+        """The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the
+        first group's slots stripe over them, and each window group stays whole on every partner,
+        so a decode step attends it with no collective. An arena page then holds ``1/size`` of a
+        first-group page's slots a rank, so a window group's page is ``1/size`` of its unplaced
+        tokens; its retention (whole unplaced pages) still keeps the window. From the groups
+        ``keep_window`` derived, so it can run again."""
+        kept = self._kept_groups
+        for group in kept[1:]:
+            if group.page_size % size:
+                raise ValueError(
+                    f"KV {pool!r}: context_parallel keeps its sliding-window layers whole on each of its {size} "
+                    f"partners in {group.page_size}-token pages, which a partner's 1/{size} of an arena page "
+                    f"doesn't hold whole: use a page_size giving them pages of a multiple of {size} tokens"
+                )
+        return (kept[0], *(replace(group, page_size=group.page_size // size) for group in kept[1:]))
 
     def context_parallel_size(self, pool: str, tp: int, sp: int) -> int:
         """How many ranks ``context_parallel`` stripes each page over on a node of ``tp`` x ``sp``

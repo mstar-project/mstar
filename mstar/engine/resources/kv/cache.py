@@ -199,18 +199,20 @@ class KVCache:
         (`PagedKVConfig.groups`). Each group sees it layer-major (``[layers, pages, 2,
         page_size, heads, head_dim]``), so a layer's view is a page-strided tensor the kernels
         take as they take any other, and ``tensor`` is ``[1, pages, page_bytes]``, so a
-        whole-page copy (offload) moves any group."""
+        whole-page copy (offload) moves any group. Under a placement the first group's page holds
+        this rank's slots of it (``page_slots``); a window group's is whole (`placed_groups`)."""
         heads, dim = cfg.num_kv_heads, cfg.head_dim
         own = cfg.groups[0]
-        unit = len(own.layers) * 2 * own.page_size * heads * dim
+        unit = len(own.layers) * 2 * self.page_slots * heads * dim
         # FlashInfer's FA2 kernels take the page stride as a uint32
         if unit >= 2**32:
             raise ValueError(f"a KV page of {unit} elements is past the kernels' 32-bit page stride")
         buf = torch.zeros(cfg.num_units, unit, dtype=dtype, device=device)
         self.tensor = buf.unsqueeze(0)
         self._layers = [None] * cfg.num_layers
-        for group in cfg.groups:
-            view = buf.view(cfg.num_units, len(group.layers), 2, group.page_size, heads, dim).transpose(0, 1)
+        for g, group in enumerate(cfg.groups):
+            slots = self.page_slots if g == 0 else group.page_size
+            view = buf.view(cfg.num_units, len(group.layers), 2, slots, heads, dim).transpose(0, 1)
             for j, layer in enumerate(group.layers):
                 self._layers[layer] = view[j]
 

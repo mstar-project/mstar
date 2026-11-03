@@ -2235,7 +2235,7 @@ class KVManager(AttentionResource):
 
     def _compute_plan_state(
         self, cuda_indptrs: PagedIndptrs,
-        total_tokens: int, page_size: int,
+        total_tokens: int, page_size: int, placement: "ContextParallel | None" = None,
     ) -> KVPlanState:
         qo_indptr = cuda_indptrs.qo_indptr
         paged_kv_indptr = cuda_indptrs.paged_kv_indptr
@@ -2277,8 +2277,8 @@ class KVManager(AttentionResource):
         abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
 
         pages, offsets = paged_kv_indices[abs_page_ptr].to(torch.long), off_in_page.to(torch.long)
-        if self.placement is not None:
-            pages, offsets = self.placement.write_slots(pages, offsets)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         return KVPlanState(token_to_page=pages, token_to_cache=offsets, total_tokens=total_tokens)
 
     def _empty_plan_state(self) -> KVPlanState:
@@ -2287,7 +2287,9 @@ class KVManager(AttentionResource):
             empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
         return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
 
-    def _decode_plan_state(self, views: list[SequenceView], page_size: int) -> KVPlanState:
+    def _decode_plan_state(
+        self, views: list[SequenceView], page_size: int, placement: "ContextParallel | None" = None,
+    ) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
         The packed path needs the indptrs on device and ~a dozen kernels to
@@ -2296,10 +2298,10 @@ class KVManager(AttentionResource):
         it over as one H2D.
         """
         pages, offsets = self._decode_locations(views, page_size)
-        if self.placement is None:
+        if placement is None:
             locations = torch.tensor([pages, offsets], dtype=torch.long)
         else:
-            locations = torch.as_tensor(np.stack(self.placement.write_slots(pages, offsets)), dtype=torch.long)
+            locations = torch.as_tensor(np.stack(placement.write_slots(pages, offsets)), dtype=torch.long)
         locations = locations.to(self._device, non_blocking=True)
         return KVPlanState(
             token_to_page=locations[0],
@@ -2322,6 +2324,7 @@ class KVManager(AttentionResource):
 
     def _stage_packed_plan_state(
         self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int,
+        placement: "ContextParallel | None" = None,
     ) -> KVPlanState:
         """``_compute_plan_state`` + ``KVPlanState.copy_``, computed on the host
         from the indptrs the plan built there, in one H2D per buffer."""
@@ -2344,8 +2347,8 @@ class KVManager(AttentionResource):
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
         page, offset = np.divmod(pos, page_size)
         pages = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
-        if self.placement is not None:
-            pages, offset = self.placement.write_slots(pages, offset)
+        if placement is not None:
+            pages, offset = placement.write_slots(pages, offset)
         n = max(capture_len, total)
         self._plan_stager.copy_(static_state.token_to_page[:n], pages, pad_value=SINK_PAGE)
         self._plan_stager.copy_(static_state.token_to_cache[:n], offset, pad_value=0)
@@ -2354,14 +2357,14 @@ class KVManager(AttentionResource):
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
-        capture_len: int, page_size: int, pages=None, offsets=None,
+        capture_len: int, page_size: int, pages=None, offsets=None, placement: "ContextParallel | None" = None,
     ) -> KVPlanState:
         """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
         tensor; rows past the real tokens get SINK_PAGE / 0."""
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
-        if self.placement is not None:
-            pages, offsets = self.placement.write_slots(pages, offsets)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         self._plan_stager.copy_(
             static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
         )
@@ -2380,6 +2383,8 @@ class KVManager(AttentionResource):
             # written outside the graph (KVStep.eager_write): never staged
             lease = None
         page_size = self._groups[group].page_size
+        # the placement stripes the first group alone; a window group is whole on every partner
+        placement = self.placement if group == 0 else None
         for plan_label, indptrs in plan_output.items():
             label = (plan_label, group)
             if indptrs.is_decode and lease is not None:
@@ -2393,7 +2398,7 @@ class KVManager(AttentionResource):
                     None if cached else indptrs.views,
                     self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens, page_size,
-                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
+                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets, placement=placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2407,7 +2412,7 @@ class KVManager(AttentionResource):
                 # host indptrs, staged as for decode, not unpacked on device
                 plan_state = self._stage_packed_plan_state(
                     indptrs.cpu_indptrs, self._static_plan_state(lease.slot, label),
-                    lease.bucket.num_tokens, page_size,
+                    lease.bucket.num_tokens, page_size, placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2416,7 +2421,7 @@ class KVManager(AttentionResource):
                     self._current_plan_states[label] = plan_state
                 continue
             if indptrs.is_decode:
-                plan_state = self._decode_plan_state(indptrs.views, page_size)
+                plan_state = self._decode_plan_state(indptrs.views, page_size, placement)
             elif total_tokens == 0:
                 # every segment span 0 (a decoder reading the encoder context
                 # it wrote at prefill): nothing is written, so there is no
@@ -2426,7 +2431,7 @@ class KVManager(AttentionResource):
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
-                    total_tokens=total_tokens, page_size=page_size,
+                    total_tokens=total_tokens, page_size=page_size, placement=placement,
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)

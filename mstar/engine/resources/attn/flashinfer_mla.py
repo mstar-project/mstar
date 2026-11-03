@@ -24,6 +24,8 @@ from mstar.engine.resources.attn.base import (
     WorkspacePool,
     captured_page_capacity,
     one_token_rows,
+    own_queries,
+    partner_queries,
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.base import CGSlotKey
@@ -91,12 +93,6 @@ def _sm_count(device: torch.device) -> int | None:
     """The device's SMs; None off CUDA, where the torch fallback plans."""
     device = torch.device(device)
     return torch.cuda.get_device_properties(device).multi_processor_count if device.type == "cuda" else None
-
-
-def _partner_queries(pieces: np.ndarray) -> list[np.ndarray]:
-    """Each partner's qo_indptr under ``kv_gather``: its piece of each row it holds any of
-    (``SeqRange.row_pieces``)."""
-    return [np.concatenate([[0], np.cumsum(piece[piece > 0])]) for piece in pieces]
 
 
 @functools.cache
@@ -553,7 +549,7 @@ class FlashInferMLAManager(AttentionManager):
             elif placement is None and captured_tokens is None:
                 group = self._shard.group
                 r = SeqRange(group, tuple(sp_seq_split(int(qo[-1]), group.world_size)), None)
-                plans += _partner_queries(r.row_pieces(np.diff(qo).tolist()))
+                plans += partner_queries(r.row_pieces(np.diff(qo).tolist()))
             if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
                 return False
         return True
@@ -627,35 +623,19 @@ class FlashInferMLAManager(AttentionManager):
         self._preplanned = ctx.is_preplan
 
     def _plan_own_queries(self, label: str, indptrs, r, slot: int, causal: bool) -> FlashInferMLAWrapper:
-        """A split label's plan under ``kv_gather``: this rank's piece of each row it holds any of,
-        over the row's stored context and the step's latents up to the piece's end (causal; a row's
-        whole length otherwise), bottom-right aligned. Every partner's plan is checked first, as
-        each rank can lay out every partner's."""
-        page = self._kv_config.tokens_per_page
-        qo = indptrs.qo_indptr.numpy().astype(np.int64)
-        spans = np.diff(qo)
-        stored = indptrs.kv_lens.numpy().astype(np.int64) - spans
-        pieces = r.row_pieces(spans.tolist())
+        """A split label's plan under ``kv_gather`` (``own_queries``), every partner's checked
+        first, as each rank can lay out every partner's."""
         if self._plan_check is not None:
-            for j, partner in enumerate(_partner_queries(pieces)):
+            spans = np.diff(indptrs.qo_indptr.numpy()).tolist()
+            for j, partner in enumerate(partner_queries(r.row_pieces(spans))):
                 self._plan_check(f"partner {j}'s queries", partner)
-        mine = pieces[r.group.rank]
-        rows = np.flatnonzero(mine)
-        ends = stored + (pieces[: r.group.rank + 1].sum(0) if causal else spans)
-        pages = -(-ends[rows] // page)
-        kv_start = indptrs.paged_kv_indptr.numpy().astype(np.int64)[rows]
-        indices = indptrs.paged_kv_indices.numpy()
+        own = own_queries(indptrs, r, self._kv_config.tokens_per_page, causal)
         wrapper = self._eager_wrapper(label, slot)
         wrapper.plan(
-            qo_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(mine[rows])]).astype(np.int32)),
-            paged_kv_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(pages)]).astype(np.int32)),
-            paged_kv_indices=torch.from_numpy(np.concatenate(
-                [indices[start:start + n] for start, n in zip(kv_start, pages, strict=True)],
-            ).astype(np.int32)),
-            paged_kv_last_page_len=torch.from_numpy((ends[rows] - (pages - 1) * page).astype(np.int32)),
-            causal=causal, dtype=self._dtype,
+            qo_indptr=own.qo_indptr, paged_kv_indptr=own.paged_kv_indptr, paged_kv_indices=own.paged_kv_indices,
+            paged_kv_last_page_len=own.paged_kv_last_page_len, causal=causal, dtype=self._dtype,
         )
-        self._step_qo[label] = to_device_nonblocking(qo.astype(np.int32), self._device, torch.int32)
+        self._step_qo[label] = to_device_nonblocking(indptrs.qo_indptr, self._device)
         return wrapper
 
     def _refuse_unplannable(self, what: str, qo_indptr: np.ndarray) -> None:

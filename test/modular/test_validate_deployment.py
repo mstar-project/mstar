@@ -456,6 +456,38 @@ def test_an_mla_node_splits_its_steps_by_gathering_its_latents(tmp_path):
     assert _validate(_mla_llm(), cfg).worker_graphs
 
 
+def _windowed_llm(window_layers=(1,)) -> _Model:
+    """A model whose ``llm`` attends a pool of a full layer and ``window_layers`` keeping a window,
+    and splits its steps."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1 + len(window_layers), num_kv_heads=2, head_dim=8, max_seq_len=256, num_qo_heads=4,
+    ))
+    full = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv"))
+    window = AttentionSpec("window", {"llm"}, AttentionConfig(kv_cache="kv", sliding_window=64,
+                                                              layers=tuple(window_layers)))
+    return _Model(specs=[kv, full, window, _shard()], kv_labels={"kv": {"main": KVLabel()}})
+
+
+@pytest.mark.parametrize("resources, window_layers, refused", [
+    # the full layer split by position, the window layers whole on each rank (kv_gather)
+    ({"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}}, (1,), None),
+    # DCP alone: copied steps, no decode collective on the window layers
+    ({"kv": {"context_parallel": True}}, (1,), None),
+    # kv_gather plans contiguous pieces, which a ring's stripe doesn't give
+    ({"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}}, (1,),
+     r"attention 'window' gathers a split step's keys into KV 'kv', which every rank stores whole \(kv_gather\)"),
+    # 3-token window pages (6-token full ones) don't split over the 2 ranks
+    ({"kv": {"context_parallel": True, "page_size": 6}, "shard": {"exchange": "all_gather"}}, (1, 2),
+     r"keeps its sliding-window layers whole on each of its 2 partners in 3-token pages"),
+], ids=["all_gather", "copied", "ring", "window_page"])
+def test_a_node_storing_kv_by_position_keeps_its_window_layers_whole(resources, window_layers, refused, tmp_path):
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    if refused is None:
+        assert _validate(_windowed_llm(window_layers), cfg).worker_graphs
+    else:
+        _refused(_windowed_llm(window_layers), cfg, refused)
+
+
 def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
     specs = _paged_llm(_shard(), _attention()).get_node_resources()
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == [

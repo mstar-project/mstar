@@ -12,6 +12,7 @@ from mstar.engine.resources.attn.base import (
     WorkspacePool,
     captured_page_capacity,
     one_token_rows,
+    own_queries,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.wrappers import (
@@ -29,6 +30,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.platforms import current_platform
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,15 @@ class FlashInferManager(AttentionManager):
         )
 
         self._workspaces = WorkspacePool(device)
+        # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
+        # rank's queries alone)
+        self._step_qo: dict[str, torch.Tensor] = {}
+
+    def bind_dependencies(self, resources) -> None:
+        # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
+        self._group = self._kv_config.groups[self._group_idx]
+        self._wrapper_kv_kwargs["page_size"] = self._group.page_size
+        super().bind_dependencies(resources)
 
     def _bind_placement(self, placement: ContextParallel) -> None:
         if not self._decode_tensor_cores and not placement.over_sp:
@@ -322,10 +333,11 @@ class FlashInferManager(AttentionManager):
         )
         if self._preplanned:
             # the wrappers were planned a step early against this same step's
-            # KV plan; nothing left to do but promote them
+            # KV plan; nothing left to do but promote them (a leased step, so copied)
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._step_qo.clear()
             return
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
@@ -339,10 +351,24 @@ class FlashInferManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        if not ctx.is_preplan:
+            # not on a pre-plan: the step in flight may still read its own
+            self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)
+            if r is not None and self._split_exchange == "kv_gather":
+                # this rank's own queries over the whole step's keys, every rank storing the
+                # group whole (eager only, `captures_split_steps`)
+                assert lease is None, "a leased step split under kv_gather"
+                own = own_queries(indptrs, r, self._group.page_size, step.causal)
+                wrapper = self._eager_wrapper(label, False, ctx.slot)
+                wrapper.plan(causal=step.causal, dtype=self._dtype, window_left=self._window_left,
+                             **own.to_kwargs_dict())
+                self._step_qo[label] = to_device_nonblocking(indptrs.qo_indptr, self._device)
+                plan_states[label] = wrapper
+                continue
             if r is not None and self._split_exchange == "ring":
                 assert lease is None, "a striped sequence shard plans a leased step copied"
                 wrapper = self._ring_wrapper(label, ctx.slot)
@@ -387,6 +413,8 @@ class FlashInferManager(AttentionManager):
     ### Submodule-level functionality
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
+        if label in self._step_qo:
+            return self._step_qo[label]
         if label not in self._current_plan_states:
             return
         # decode wrappers never set one
@@ -432,7 +460,9 @@ class FlashInferManager(AttentionManager):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
         if self._shard is not None:
-            self._shard.check_bypass(label, "attention run", by_head=self._placement is None)
+            # every rank stores a kv_gather pool whole, heads over TP
+            by_head = self._placement is None and self._split_exchange != "kv_gather"
+            self._shard.check_bypass(label, "attention run", by_head=by_head)
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:
