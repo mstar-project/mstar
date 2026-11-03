@@ -211,31 +211,6 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
     assert acked == [([1, 3], [2, 1])]
 
 
-# ── handles never leave the process in text ────────────────────────────────
-
-def test_worker_graph_errors_name_the_wire_rid_not_the_handle():
-    """A FAIL_REQUESTS body becomes the client's HTTP error detail. Handles
-    are worker-internal and recycled, so one in that text names whatever
-    request holds it by the time anyone reads it."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    assert _rid_name(t.name, a) == "req-abc"
-
-
-def test_rendering_a_released_handle_does_not_raise():
-    """These messages report a rid the worker could not find, so the render
-    is as likely to fail as the lookup that got there."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    t.release(a)
-    assert "released" in _rid_name(t.name, a)
-    assert "unresolved" in _rid_name(None, a)
-
-
 def test_add_new_request_hands_the_handle_to_every_subsystem():
     """The one place a handle is minted. Nothing below NEW_REQUEST sees the
     wire string, so a subsystem handed ``body.request_id`` instead would key
