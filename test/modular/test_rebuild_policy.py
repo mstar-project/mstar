@@ -229,3 +229,24 @@ def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declare
         kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
         assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts the device's allocations")
+def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy():
+    device = torch.device("cuda")
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 12, device))
+    prompt = torch.arange(256, device=device)
+    step_done = torch.Event(device=device)
+    step_done.record()
+    step = _ran(PREFILL, {R: {"text_inputs": [prompt]}})
+    step.completion_event = step_done
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+
+    rebuilds.keep_prompts(step)
+    kept = rebuilds._kept[NODE][R]
+    kept.prompt.landed.synchronize()
+
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated, (
+        "a cast on the pool's stream made every later decode step 0.16 ms slower at Qwen3.5-9B TP2"
+    )
+    assert kept.prompt.view.tolist() == list(range(256)), "the rebuild would prefill other ids"
