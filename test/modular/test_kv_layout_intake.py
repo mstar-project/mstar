@@ -307,6 +307,35 @@ def test_the_conductor_marks_a_request_that_streams_audio_guaranteed(tmp_path, m
     assert new_request.request_info.resource_configs["kv"].guaranteed, "a voice stream would be preempted"
 
 
+class _Pausable(_Model):
+    """A model whose streamed audio is buffered before it plays, so a pause is never heard."""
+    UNPAUSABLE_OUTPUTS = frozenset()
+
+
+def test_a_model_that_declares_no_unpausable_output_leaves_its_streamed_audio_preemptible(tmp_path, monkeypatch):
+    model = _Pausable({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=["audio"])
+    assert not new_request.request_info.resource_configs["kv"].guaranteed, (
+        "streamed audio was guaranteed though the model says it can pause"
+    )
+
+
+@pytest.mark.parametrize("unpausable, outputs, guaranteed", [
+    ([], ["text", "audio"], False), (["text"], ["text"], True),
+], ids=["voice deployment that keeps a fast first chunk", "streamed text that can't pause"])
+def test_the_serving_config_overrides_the_outputs_the_model_says_cant_pause(
+    tmp_path, monkeypatch, unpausable, outputs, guaranteed,
+):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(
+        model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=outputs,
+        unpausable_outputs=unpausable,
+    )
+    assert new_request.request_info.resource_configs["kv"].guaranteed == guaranteed, (
+        "the deployment's unpausable_outputs were ignored"
+    )
+
+
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
     model = _Model()
 
