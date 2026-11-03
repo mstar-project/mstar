@@ -793,8 +793,6 @@ def test_full_geometry_names_resolve_through_pipeline():
 def test_swiglu_clamp_engages_on_every_mlp_path():
     """gate.clamp(max=L) and up.clamp(-L, L), then silu, on the dense MLP and on the shared
     and routed experts, at a limit the unclamped math visibly misses."""
-    from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
-
     torch.manual_seed(31)
     cfg = Glm5NextModelConfig.reduced()
     cfg.swiglu_limit = 1.0  # engage hard at test scales
@@ -823,14 +821,13 @@ def test_swiglu_clamp_engages_on_every_mlp_path():
     assert not torch.allclose(want, unclamped, atol=1e-2)  # clamp is live
 
     block = Glm5NextSparseMoeBlock(cfg)
-    assert isinstance(block.gate, Glm5NextMoEGate)
     block.gate.weight.data.normal_(0, 0.3)
     block.experts.gate_up_proj.data.normal_(0, 0.5)
     block.experts.down_proj.data.normal_(0, 0.5)
     block.shared_expert.gate_up_proj.weight.data.normal_(0, 0.5)
     block.shared_expert.down_proj.weight.data.normal_(0, 0.5)
 
-    topk_weights, topk_ids = block.gate(x)
+    topk_weights, topk_ids, _ = block.gate(x)
     topk_weights = topk_weights.to(x.dtype)
     want = torch.zeros_like(x)
     for t in range(x.shape[0]):
