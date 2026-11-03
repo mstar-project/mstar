@@ -527,8 +527,7 @@ def test_an_async_follower_keeps_a_rebuild_row_of_rank_0s_head_out_of_the_pop():
 
 def test_an_async_follower_takes_a_rebuilds_next_chunk_after_n_as_a_rebuild_row():
     """rb's rebuild ran its first chunk in N. Rank 0's speculative head takes rb's next chunk as one of N's rows
-    mid-prefill, and rank 0's log stamps it a rebuild row. A follower that ran it as a prompt chunk would never land
-    rb, and would take rb's decode row for a rebuild row later."""
+    mid-prefill, and rank 0's log stamps it a rebuild row."""
     w, pending = _spec_follower(
         read_failed=(), continuing=["c0", "rb"], fresh=[], head_rids=["c0", "rb"], dropped=["rb"],
     )

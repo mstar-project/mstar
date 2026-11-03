@@ -1560,9 +1560,9 @@ def _follow_next(scheduler) -> None:
 
 
 def test_a_follower_lands_a_rebuild_between_the_steps_rank_0_landed_it_between(monkeypatch):
-    """Rank 0 lands v's rebuild when it post-processes the rebuild's step K, after it has sent the step it built
-    during K (a yield-away, under async scheduling). A follower post-processes K before it takes that step, so a
-    follower that landed v there would check rank 0's trail holding one dropped request fewer, and stop."""
+    """Rank 0 lands v's rebuild when post-processing the rebuild's step K, after sending the step it built during K
+    (a yield-away, under async scheduling). A follower post-processes K before it takes that step, so a follower that
+    landed v at that point would hold one dropped request fewer than rank 0's trail, and stop."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     scheduler = _follower_of(follow)
@@ -1580,8 +1580,8 @@ def test_a_follower_lands_a_rebuild_between_the_steps_rank_0_landed_it_between(m
 
 
 def test_a_follower_whose_rebuild_still_runs_when_rank_0_lands_it_stops(monkeypatch):
-    """The follower's own rebuild of v hasn't finished when rank 0's land arrives, so it ran other rows than rank 0,
-    and would take v's next decode row for a rebuild row."""
+    """Rank 0's land of v arrives while the follower's own rebuild of v still runs, so the follower didn't run v's
+    last chunk as a rebuild row in the step rank 0 did. It stops on the replay."""
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     scheduler = _follower_of(follow)
     _send(scheduler, lead, 0)
