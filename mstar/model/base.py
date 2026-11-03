@@ -175,6 +175,7 @@ class Span(NamedTuple):
 
     Each span is one step's row, unless a span sets ``opens_step`` False: the step of
     the span before it then writes it too, in the same row, as text around an attachment is.
+    That span is of the same walk, since a step runs one.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
@@ -220,9 +221,14 @@ class LabelLayout(NamedTuple):
         ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
         request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
         worker keys the span."""
-        for span in self.spans:
+        for i, span in enumerate(self.spans):
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
+            if not span.opens_step and (i == 0 or self.spans[i - 1].walk != span.walk):
+                raise ValueError(f"span {i} of walk {span.walk!r} opens no step, but " + (
+                    f"span {i - 1} before it is of walk {self.spans[i - 1].walk!r}: a step runs one walk"
+                    if i else "no span comes before it"
+                ))
             if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
                 raise ValueError(
                     f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
