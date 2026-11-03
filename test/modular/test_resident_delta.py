@@ -39,7 +39,7 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import Allotment, KVManager
 from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext
+from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext, SubmoduleStep
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     Move,
@@ -1299,6 +1299,38 @@ def _both_short_then_drop(monkeypatch):
     assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
     lead.drop_request(NODE, "v", len(_kept("v").ids))
     return (leader, lead), (follower, follow)
+
+
+@pytest.mark.parametrize("dropped", [False, True], ids=["voided head", "row dropped by prepare_inputs"])
+def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkeypatch, dropped):
+    """Rank 0 pre-plans the next decode step of r and s, whose tokens each need a fourth page, and throws the stage
+    away: N's verdict voids the head, or `prepare_inputs` drops s from a yield-away step it planned. A follower never
+    planned the step, so rank 0 has to give back both pages, or the two ranks admit later steps from different
+    counts. The pages go back to the end of rank 0's free list, which only the prefix cache reads."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "s", 3, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "s")
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for rid in ("r", "s"):
+        assert _step(leader, rid, 3 * PAGE_SIZE).ok and _step(follower, rid, 3 * PAGE_SIZE).ok
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1), Segment("s", "main", 1)])
+    step.set_ctx(StepContext(["r", "s"], "decode", 0, False, is_preplan=True))
+
+    assert lead._runner.pre_admit(step).ok
+    step.ctx.is_preplan = False
+    if dropped:
+        step.ctx.request_ids = ["r"]
+    lead._runner.clear_preplan()
+
+    def held(kv):
+        return [len(kv._streams[rid]["main"].page_indices) for rid in "rs"]
+
+    assert held(leader) == held(follower), (
+        f"rank 0 holds {held(leader)} pages for r and s after throwing its pre-plan away, and a follower that never "
+        f"planned the step holds {held(follower)}"
+    )
+    assert _counts(leader)[:-1] == _counts(follower)[:-1] and leader._arena.num_free == follower._arena.num_free
 
 
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
