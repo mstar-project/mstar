@@ -397,7 +397,7 @@ class ExecutingBatch:
 
     admit_error: AdmitFailedReason | None = None
     # recorded once inputs copied to the device for this step have landed, which the step waits on
-    input_ready: list[torch.Event] = field(default_factory=list)
+    input_ready: tuple[torch.Event, ...] = ()
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
@@ -724,6 +724,10 @@ class Engine:
                     "capture key, which the scheduler reads from a request's forward-pass info, and that names "
                     "the decode walk while the request is rebuilt"
                 )
+
+    def node_dtype(self, node_name: str) -> torch.dtype | None:
+        """The dtype ``node_name`` was cast to and runs in, or None if it keeps its own (``disable_autocast``)."""
+        return resolve_node_dtype(self._submodules[node_name].submodule, self._autocast_dtype)
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""

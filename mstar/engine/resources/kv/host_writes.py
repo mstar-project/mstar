@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 # What a step may queue for the host. The device has one device-to-host copy engine, which runs copies
 # in the order they were queued whatever their stream or priority, and the writes queue behind the
 # step's own output copy.
-# `_WRITE_BYTES_PER_STEP` bounds how long every copy to the host a step queues, the worker's included, holds the
-# copy engine before the next step's output copy can run (about 1 ms on an H100).
+# `_WRITE_BYTES_PER_STEP` bounds how long a step's copies to the host, the worker's included, hold the copy engine
+# before the next step's output copy can run (about 1 ms on an H100).
 # `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page at most (about 0.1 ms of host
 # time at 16).
 _WRITE_BYTES_PER_STEP = 32 << 20
@@ -106,8 +106,8 @@ class HostWrites:
                 write.cancelled.add(key)
 
     def take(self, done: int) -> HostWrite | None:
-        """Up to what the step's allowance has left of queued pages to copy, among those queued by commit ``done`` or
-        earlier. Each page comes after its ancestors that have no copy on the host and none on the way."""
+        """Queued pages to copy, as many as the step's allowance has room for, among those queued by commit ``done``
+        or earlier. Each page comes after its ancestors that have no copy on the host and none on the way."""
         left = self._allowance.left
         per_step = min(_WRITE_PAGES_PER_STEP, max(1, left // self._page_bytes)) if left else 0
         keys: list[bytes] = []

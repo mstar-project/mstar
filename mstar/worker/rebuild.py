@@ -7,6 +7,7 @@ from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -182,12 +183,15 @@ class Rebuilds:
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
         pool: HostPool | None = None, allowance: StepAllowance | None = None,
+        node_dtypes: Mapping[str, torch.dtype] = MappingProxyType({}),
     ) -> None:
         # node -> walk -> what the node reads there besides the ids, which the worker copies to the host
         self._copied = {node: policy.check(node, graphs) for node, policy in policies.items()}
         # node -> the walks that read the ids, the only ones an ids span is written in
         self._ids_walks = {node: policy.ids_walks(node, graphs) for node, policy in policies.items()}
         self._policies = dict(policies)
+        # node -> the dtype it runs in, which its host copies take. A node missing here copies nothing.
+        self._node_dtypes = node_dtypes
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
         self._pool = pool
@@ -228,11 +232,14 @@ class Rebuilds:
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> HostSlice | None:
         """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span as int32 and the host
-        copies of what each other span's walk read, or None when the pool can't hold it."""
-        per_slot = self._policies[node].copy_bytes_per_slot
+        copies for its other spans, or None when the pool can't hold it."""
+        spans = [span for layout in layouts for span in layout.spans]
+        dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
+        if dtype is None and any(span.kind != SpanKind.IDS for span in spans):
+            return None
         return self._pool.take(sum(
-            aligned(4 * span.length) if span.kind == SpanKind.IDS else span.length * per_slot[span.walk]
-            for layout in layouts for span in layout.spans
+            aligned(4 * span.length) if span.kind == SpanKind.IDS else span.length * width[span.walk] * dtype.itemsize
+            for span in spans
         ))
 
     def ingest_request(
@@ -245,8 +252,8 @@ class Rebuilds:
 
         A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps a
         log of ``rid`` only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
-        is False. It takes the pool's room for the log now, so a request the pool can't hold is known before it is
-        admitted, and no drop can free it there. The log's rows are the layout's prefill steps
+        is False. A node takes the pool's room for the log now, so a request the pool can't hold is known before it is
+        admitted and is never dropped on that node. The log's rows are the layout's prefill steps
         (`StreamLayout.steps`)."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
@@ -286,9 +293,9 @@ class Rebuilds:
         completes, its other inputs queued to follow them (`flush`), and its step metadata. Once the last step is
         recorded the request keeps its samples, and the slice's unused tail goes back to the pool.
 
-        A step other than the one the request's layout says comes next, by walk or by length, one missing an input
-        the node reads, as a row the prefix cache served past its encoder, or one whose copies overrun the slice the
-        policy's ``copy_bytes_per_slot`` sized, leaves the request with no log, so it is never dropped."""
+        A step other than the one the request's layout says comes next, by walk or by length, or one missing an input
+        the node reads, as a row the prefix cache served past its encoder, leaves the request with no log, so it is
+        never dropped."""
         node = node_batch.node_name
         prefilling = self._prefilling.get(node)
         if not prefilling:
@@ -313,10 +320,13 @@ class Rebuilds:
             nbytes = sum(aligned(tensor.numel() * _kept_dtype(tensor).itemsize) for _, tensor in tensors)
             if (
                 walk != row.walk or (chunk is not None and chunk.total != row.length)
-                or not all(name in inputs for name in names) or kept.used + nbytes > piece.nbytes
+                or not all(name in inputs for name in names)
             ):
                 self._forget(node, rid)
                 continue
+            assert kept.used + nbytes <= piece.nbytes, (
+                f"{node} read more in {walk!r} than its rebuild policy's copy_width says"
+            )
             record = RowRecord(
                 {name: [] for name in names}, {name: tensor.dtype for name, tensor in tensors},
                 dict(node_batch.per_request_info[rid].step_metadata),
@@ -360,8 +370,7 @@ class Rebuilds:
             queued.record.queued -= 1
 
     def _trim(self, node: str, rid: int, used: int) -> None:
-        """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
-        keeps."""
+        """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
         piece = self._droppable[node][rid]
         if used < piece.nbytes:
             self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
@@ -484,12 +493,14 @@ class Rebuilds:
     def fill(
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
-    ) -> list[torch.Event]:
-        """Give each rebuild row of ``rids`` its row's walk and its step's metadata, and its record's inputs on the
-        device when it runs its first chunk or runs whole, and return the events the step waits on before it reads
-        them. The last row's ids get every id sampled since but the newest. A later chunk is cut from the input the
-        engine prepared on the first, and every chunk of a prompt's step in progress from the input the engine
-        keeps for the prompt."""
+    ) -> tuple[torch.Event, ...]:
+        """Give each rebuild row of ``rids`` its row's walk and its inputs, and return the events the step waits on
+        before it reads them.
+
+        A prompt's step in progress runs every chunk from the input the engine keeps for the prompt, under the
+        prompt's own step metadata. Any other row runs under its step's recorded metadata and reads its record, on
+        the device when it runs its first chunk or runs whole, the last row's ids with every id sampled since but the
+        newest appended. A later chunk is cut from the input the engine prepared on the first."""
         ready = []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
@@ -501,7 +512,7 @@ class Rebuilds:
             chunk = chunk_ranges.get(rid)
             if chunk is None or chunk.is_first:
                 inputs[rid] = self._row_inputs(node, cursor, record, ready)
-        return ready
+        return tuple(ready)
 
     def _row_inputs(
         self, node: str, cursor: RebuildCursor, record: RowRecord, ready: list[torch.Event],

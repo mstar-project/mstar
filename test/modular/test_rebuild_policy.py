@@ -48,7 +48,9 @@ POLICY = RebuildPolicy(
     walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
 )
 # as Qwen3.5 declares its LLM: a prompt with images prefills in a walk that also reads the encoder's output
-MEDIA = replace(POLICY, walks=frozenset({PREFILL, VISION}), copy_bytes_per_slot={VISION: 8})
+MEDIA = replace(POLICY, walks=frozenset({PREFILL, VISION}), copy_width={VISION: 2})
+# what ``NODE`` runs in, so a slot of MEDIA's copies takes 8 B
+DTYPES = {NODE: torch.float32}
 
 
 def _graphs() -> dict:
@@ -67,7 +69,7 @@ def _graphs() -> dict:
     ("ids_input", "pixels", "carries"),
     ("sample_output", "codes", "doesn't output"),
     ("loop", "talker_loop", "in no walk"),
-    ("copy_bytes_per_slot", {}, "doesn't say"),
+    ("copy_width", {}, "doesn't say"),
 ])
 def test_a_policy_naming_what_the_graph_doesnt_have_is_refused_at_load(field, value, why):
     policy = RebuildPolicy(**{**vars(MEDIA), field: value})
@@ -121,7 +123,7 @@ IMAGE_CHAT = (
     (POLICY, (PrefixSpan(4, 4, PREFILL),), True),
 ], ids=["copied walk", "walk not copied", "two walks", "ids alone"])
 def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and_copies(policy, spans, rebuildable):
-    rebuilds = Rebuilds({NODE: policy}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: policy}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
 
     kept = _ingest(rebuilds, R, spans)
     rebuilds.record(_ran(spans[0].walk, {R: {"text_inputs": [torch.arange(3)], "embeds": [torch.zeros(6, 2)]}}))
@@ -135,7 +137,7 @@ def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and
 def test_a_video_on_a_walk_whose_inputs_are_copied_can_be_rebuilt():
     """A Qwen3.5 video's frame groups are `rows` spans on the vision walk, which reads the encoder's output for them as
     it does for an image. `rows` only says a span has no digest key, so a rebuild from the same copies writes them."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     video = (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], kind="rows"), IMAGE_CHAT[2])
 
     assert _ingest(rebuilds, R, video), "a video on the copied walk stays guaranteed"
@@ -191,7 +193,10 @@ def test_a_higgs_transcription_can_be_dropped_where_its_llm_runs():
     config.apply_conductor_config(
         kv_layout={"main": out.metadata["kv_layout"][KV_CACHE]["main"].row()}, loop_caps={"decode_loop": 8},
     )
-    rebuilds = Rebuilds(model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 22, torch.device("cpu")))
+    rebuilds = Rebuilds(
+        model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 22, torch.device("cpu")),
+        node_dtypes={"LLM": torch.bfloat16},
+    )
     writes = {KV_CACHE: {"LLM": NodeWrites(frozenset({"prefill_audio", "decode"}), frozenset({"decode_loop"}))}}
 
     rebuildable = rebuilds.ingest_request(R, writes, {KV_CACHE: config.kv_layout.values()}, unpausable=False)
@@ -301,7 +306,7 @@ def test_a_request_no_drop_can_free_keeps_no_ids(why):
 
 def _copying(*rids: int) -> Rebuilds:
     """`Rebuilds` whose ``rids`` were taken in with an image chat on ``VISION``, each with a slice."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     for rid in rids:
         assert _ingest(rebuilds, rid, IMAGE_CHAT)
     return rebuilds
@@ -363,9 +368,9 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
     before it is admitted and stays out of the drops."""
     pool = HostPool(160, torch.device("cpu"))
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, node_dtypes=DTYPES)
 
-    # each text span's ids at 4 B, aligned to 16 and 8, and the image's six slots at 8 B
+    # each text span's ids at 4 B, aligned to 16 and 8, and the image's six slots at two float32 values each
     assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 24 + 48)
     assert _ingest(rebuilds, A, IMAGE_CHAT)
     assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
@@ -383,7 +388,8 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
 
 def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     """The image copies queued every input of every prefill row at once, behind which the next step's output copy
-    waited on the device's one copy engine. They share the allowance #876's page writes keep to, and go first."""
+    waited on the device's one copy engine. The image copies share one allowance with the cached pages' writes, and
+    go first."""
     allowance = StepAllowance(24)
     rebuilds = _copying(R)
     rebuilds._allowance = allowance
@@ -405,8 +411,10 @@ def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_media_copy_split_across_two_steps_lands_whole():
     pool = HostPool(1 << 22, torch.device("cuda"))
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance=(allowance := StepAllowance(1 << 20)))
-    # an image of 3 << 16 slots at the policy's 8 B a slot holds the 3 << 17 float32 embeds
+    rebuilds = Rebuilds(
+        {NODE: MEDIA}, _graphs(), pool, allowance=(allowance := StepAllowance(1 << 20)), node_dtypes=DTYPES,
+    )
+    # an image of 3 << 16 slots at the policy's two float32 values a slot holds the 3 << 17 float32 embeds
     assert _ingest(rebuilds, R, (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], length=3 << 16), IMAGE_CHAT[2]))
     embeds = torch.arange(3 << 17, dtype=torch.float32, device="cuda")
     step_done = torch.Event(device="cuda")
@@ -427,8 +435,8 @@ def test_a_media_copy_split_across_two_steps_lands_whole():
 
 def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
     """A row of ids alone ran under the request's decode step's metadata and a row with images under its prefill's,
-    so the model and the sampler saw the two differently. Every kept request records its prefill row's metadata,
-    and a copy of it, since a later step may change the live one."""
+    so the model and the sampler saw the two differently. Every kept request records a copy of its prefill row's
+    metadata, since a later step may change the live one."""
     rebuilds = _rebuilds()
     prefill = _ran(PREFILL, _rows(R))
     rebuilds.record(prefill)
@@ -444,9 +452,9 @@ def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
 
 
 def test_rebuild_tokens_count_the_slots_a_rebuild_runs():
-    """`rebuild_tokens` counted only text ids, so the slots of an image the rebuild recomputes were left out, and it
-    counted a cached prefix the rebuild never ran."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    """`rebuild_tokens` counted only text ids, so it left out the image slots the rebuild recomputes, and it counted
+    a cached prefix the rebuild never ran."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     _ingest(rebuilds, R, IMAGE_CHAT)
     image_chat = {"text_inputs": [torch.arange(3), torch.arange(2)], "embeds": [torch.ones(4, 2)]}
     rebuilds.record(_ran(VISION, {R: image_chat}))
@@ -480,7 +488,7 @@ class _CountingPool(HostPool):
 def test_the_copy_back_waits_for_the_step_that_reads_it():
     """The copy back to the device ran when the rebuild was queued and made the current stream wait then, so a step
     still being enqueued stalled behind it, and the copy held device memory outside the KV pool while the row
-    waited. It runs when the row's step is built, and only that step waits for it."""
+    waited. The copy back runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     texts = [torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([4, 5], dtype=torch.int32)]
@@ -496,8 +504,36 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     assert pool.copied_in == 1 and len(ready) == 1, "the row's step wouldn't wait for its image"
 
 
-def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
+def test_a_request_with_images_is_not_rebuildable_on_a_node_whose_dtype_is_unknown():
+    """A slice sized for bf16 copies overflowed on an fp32 deployment, and the request was left preemptible with no
+    way back. The log sizes copies in the dtype the node runs in, and a node that keeps its own dtype copies nothing."""
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+
+    assert not _ingest(rebuilds, R, IMAGE_CHAT), "a request whose copies can't be sized would be droppable"
+    assert _ingest(rebuilds, A, (PrefixSpan(4, 4, VISION),)), "a prompt of ids alone would lose its rebuild"
+
+
+def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice_alone():
+    allowance, pool = StepAllowance(0), HostPool(128, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance, node_dtypes=DTYPES)
+    assert _ingest(rebuilds, R, IMAGE_CHAT)
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.full((4,), 7.0)]
+    rebuilds.record(step)
+
+    rebuilds.remove_request(R)
+    piece = pool.take(64)
+    pool.view(piece, torch.uint8, torch.Size([64])).fill_(1)
+    allowance.refill()
+    rebuilds.flush()
+
+    assert pool.view(piece, torch.uint8, torch.Size([64])).tolist() == [1] * 64, (
+        "a removed request's queued copy wrote into the slice its next owner holds"
+    )
+
+
+def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
     texts = [torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([4, 5], dtype=torch.int32)]
     dtypes = {"embeds": torch.float32, "text_inputs": torch.long}
@@ -518,8 +554,10 @@ def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_m
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     rows = 1 << 22
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(4 * rows + (1 << 10), torch.device("cuda")))
-    # an image of rows // 2 slots at the policy's 8 B a slot holds the rows float32 embeds
+    rebuilds = Rebuilds(
+        {NODE: MEDIA}, _graphs(), HostPool(4 * rows + (1 << 10), torch.device("cuda")), node_dtypes=DTYPES,
+    )
+    # an image of rows // 2 slots at the policy's two float32 values a slot holds the rows float32 embeds
     image = replace(IMAGE_CHAT[1], length=rows // 2)
     assert _ingest(rebuilds, R, (IMAGE_CHAT[0], image, IMAGE_CHAT[2]))
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
@@ -667,7 +705,7 @@ IMAGE_STEP = {"text_inputs": [torch.tensor([4, 5])], "embeds": [torch.ones(4, 2)
 
 def _two_steps(*sampled: int) -> Rebuilds:
     """`Rebuilds` whose ``R`` ran both steps of ``TWO_STEPS``, each under its own metadata, and sampled ``sampled``."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), _CountingPool())
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), _CountingPool(), node_dtypes=DTYPES)
     assert _ingest(rebuilds, R, TWO_STEPS)
     for walk, inputs, order in ((PREFILL, TEXT_STEP, "text"), (VISION, IMAGE_STEP, "image")):
         step = _ran(walk, {R: inputs})
@@ -730,7 +768,7 @@ def test_a_rebuild_stays_open_until_its_last_row_lands():
 
 def test_only_the_last_prefill_steps_sample_is_kept():
     """A prefill step before the last draws a token the model throws away, so keeping it would refuse every drop."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     assert _ingest(rebuilds, R, TWO_STEPS)
 
     for walk, inputs, token in ((PREFILL, TEXT_STEP, 40), (VISION, IMAGE_STEP, 41)):
@@ -757,7 +795,7 @@ def test_a_step_with_no_request_still_prefilling_reads_no_row():
 @pytest.mark.parametrize("step", ["another walk", "another length"])
 def test_a_step_other_than_its_layouts_next_leaves_the_request_never_dropped(step):
     """A rebuild from a layout its prefill didn't follow would write other slots."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     assert _ingest(rebuilds, R, TWO_STEPS)
     first = _ran(VISION if step == "another walk" else PREFILL, {R: TEXT_STEP})
     first.chunk_ranges = {} if step == "another walk" else {R: ChunkRange(0, 2, 5, 2)}
@@ -770,7 +808,7 @@ def test_a_step_other_than_its_layouts_next_leaves_the_request_never_dropped(ste
 def test_a_chunked_steps_first_chunk_records_it_and_its_later_chunks_record_nothing():
     """A chunk after the first carries no inputs, since it is cut from what the first prepared, and recording it as
     a step of its own raised for a copied walk."""
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     assert _ingest(rebuilds, R, IMAGE_CHAT)
 
     chunks = [(ChunkRange(0, 4, 11, 4), IMAGE_STEP), (ChunkRange(4, 8, 11, 4), {}), (ChunkRange(8, 11, 11, 3), {})]

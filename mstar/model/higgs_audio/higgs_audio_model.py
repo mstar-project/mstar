@@ -197,7 +197,7 @@ class HiggsAudioModel(Model):
         # the encoder's output from host copies, and the samples follow the text after it.
         return {"LLM": RebuildPolicy(
             walks=frozenset({"prefill_audio"}), ids_input="text_post", sample_output="new_token", loop="decode_loop",
-            copy_bytes_per_slot={"prefill_audio": 2 * self.config.hidden_size},
+            copy_width={"prefill_audio": self.config.hidden_size},
         )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

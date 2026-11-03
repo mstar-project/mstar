@@ -510,8 +510,8 @@ class MicroScheduler:
         self._arrivals = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
-        # node -> rids waiting there, which readiness answers without asking the engine until
-        # `Engine.admit_waiting` admits them or their rebuild lands
+        # node -> rids waiting for capacity there, which readiness answers without asking the
+        # engine until `Engine.admit_waiting` admits them
         self.parked: dict[str, set[int]] = {}
         # (node, graph walk) -> most rows a batch may take while its admits are
         # refused with nothing to evict; see `limit_batch`
@@ -1425,7 +1425,8 @@ class MicroScheduler:
         specs = []
         # a chain holding every request here has nothing waiting on the queues
         if len(request_state.per_request_info) > len(continuing) + len(unpopped):
-            exclude = self.failed_rids.union(self.pending_removes, self.held_until)
+            # A rebuild's request also has its decode row on a queue, which the step mustn't pop.
+            exclude = self.failed_rids.union(self.pending_removes, self.held_until, unpopped)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
@@ -2159,10 +2160,6 @@ class MicroScheduler:
             for node_name, rid in engine.admit_waiting(published_of):
                 self.parked[node_name].discard(rid)
 
-    def note_rebuilt(self, node_name: str, rid: int) -> None:
-        """``rid``'s rebuild on ``node_name`` landed: readiness asks the engine about it again."""
-        self.parked.get(node_name, set()).discard(rid)
-
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
         allow_reload: bool=True
@@ -2172,8 +2169,8 @@ class MicroScheduler:
         fit) just comes back False; a ``terminal`` reason never will, so the
         rid goes to the worker to fail instead of being rescanned forever. A
         rid waiting for capacity is parked on its node until `_unpark`, and a
-        dropped rid until its rebuild lands (`note_rebuilt`)."""
-        if rid in self.parked.get(node_name, ()):
+        dropped rid waits until its rebuild lands."""
+        if rid in self.parked.get(node_name, ()) or self.rebuilds.rebuilding(rid, node_name):
             return False
         engine = self.engine_manager.get_engine(node_name)
         outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
@@ -2181,7 +2178,6 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            self.parked.setdefault(node_name, set()).add(rid)
             rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, fwd_info.graph_walk))
             if rebuild is not None:
                 engine.prepare_rebuild(node_name, rid, rebuild)
