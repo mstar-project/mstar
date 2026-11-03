@@ -11,11 +11,12 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import now, release_unread, rid
+from mstar.api_server.openai._util import check_inline_result, now, release_unread, rid
 from mstar.utils.generation_kwargs import offset_seed
 
 
 async def create_images(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+    check_inline_result(getattr(req, "response_format", None))  # n is served below
     args = adapter.image_to_request(req, api.upload_dir)
     # OpenAI ``n``: submit n engine requests up front and let cross-request
     # batching serve them together (the reference pipelines run n sequential

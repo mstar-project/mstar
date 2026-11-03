@@ -623,6 +623,19 @@ def test_images_edit_carries_declared_seed(tmp_path):
     assert len(result["data"]) == 1
 
 
+def test_images_edit_refuses_n_it_would_drop(tmp_path):
+    """An edit is one engine request, so n=2 came back as one image."""
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+    ref = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(bridge._images(
+            {"prompt": "make it night", "model": "bagel", "input_reference": ref, "n": 2}, _Ctx()))
+    assert (refused.value.code, refused.value.message) == (400, "n=2: this route returns one result per request")
+    assert not server.submitted
+    assert not list(tmp_path.iterdir())  # refused before the reference image is saved
+
+
 # ----------------------------------------------------------------------
 # tensor bridge (seam double; no engine)
 # ----------------------------------------------------------------------

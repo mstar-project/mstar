@@ -866,6 +866,10 @@ async fn images_generations(
         Ok(a) => a,
         Err(r) => return r,
     };
+    // n is served below
+    if let Err(e) = check_inline_result(req.response_format.as_deref(), None) {
+        return error(400, &e, "invalid_request_error");
+    }
     let base = match adapter.image_to_request(&req) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
@@ -915,6 +919,19 @@ fn parse_max_images(raw: Option<&str>) -> i64 {
         .map_or(10, |n| n.max(1))
 }
 
+/// Refuse what an image or video route would otherwise drop, as
+/// `_util.check_inline_result` does: results come back inline as `b64_json`,
+/// and a route that runs one request returns one result.
+fn check_inline_result(response_format: Option<&str>, n: Option<i64>) -> Result<(), String> {
+    if let Some(fmt) = response_format.filter(|f| !f.is_empty() && *f != "b64_json") {
+        return Err(format!("response_format {} is not served; results are returned as b64_json", media::py_repr(fmt)));
+    }
+    match n {
+        None | Some(1) => Ok(()),
+        Some(n) => Err(format!("n={n}: this route returns one result per request")),
+    }
+}
+
 fn image_count(n: Option<i64>, limit: i64) -> Result<i64, String> {
     match n {
         None => Ok(1),
@@ -937,6 +954,9 @@ async fn videos_generations(
         Ok(a) => a,
         Err(r) => return r,
     };
+    if let Err(e) = check_inline_result(req.response_format.as_deref(), req.n) {
+        return error(400, &e, "invalid_request_error");
+    }
     let args = match adapter.video_to_request(&req, &st.upload_dir, st.allow_remote) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
@@ -957,10 +977,13 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
-    let known = ["image", "prompt", "model", "n", "response_format"];
+    let known = ["model"];
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
+    let mut images = 0;
     let mut prompt = String::new();
+    let mut n: Option<String> = None;
+    let mut response_format: Option<String> = None;
     let mut extra: Map<String, Value> = Map::new();
 
     loop {
@@ -977,7 +1000,14 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         // A field read failure (body-limit overrun, mid-upload disconnect,
         // non-UTF-8 text) must surface as a 400, not be flattened to an empty
         // value — otherwise a truncated upload becomes a misleading error.
-        if name == "image" {
+        // One image, edited whole: a mask or a second image would be dropped.
+        // `image[]` is how OpenAI clients name the image list.
+        if has_file && name != "image" && name != "image[]" {
+            let msg = format!("images/edits does not take a '{name}' upload; the whole image is edited");
+            return error(400, &msg, "invalid_request_error");
+        }
+        if name == "image" || name == "image[]" {
+            images += 1;
             image_filename = field.file_name().map(str::to_string);
             match field.bytes().await {
                 Ok(b) => image_bytes = Some(b.to_vec()),
@@ -986,15 +1016,20 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
                     return error(status, &msg, "invalid_request_error");
                 }
             }
-        } else if name == "prompt" {
-            prompt = match field.text().await {
+        } else if matches!(name.as_str(), "prompt" | "n" | "response_format") {
+            let v = match field.text().await {
                 Ok(v) => v,
                 Err(e) => {
                     let (status, msg) = multipart_failure(&e, e.to_string());
                     return error(status, &msg, "invalid_request_error");
                 }
             };
-        } else if known.contains(&name.as_str()) || has_file {
+            match name.as_str() {
+                "prompt" => prompt = v,
+                "n" => n = Some(v),
+                _ => response_format = Some(v),
+            }
+        } else if known.contains(&name.as_str()) {
             if let Err(e) = field.bytes().await {
                 let (status, msg) = multipart_failure(&e, e.to_string());
                 return error(status, &msg, "invalid_request_error");
@@ -1012,10 +1047,21 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     }
 
+    if images > 1 {
+        return error(400, &format!("images/edits takes one image, got {images}"), "invalid_request_error");
+    }
     let image_bytes = match image_bytes {
         Some(b) if !b.is_empty() => b,
         _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
     };
+    let n = match n.filter(|v| !v.is_empty()).map(|v| v.trim().parse::<i64>()) {
+        None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => return error(400, "n must be an integer", "invalid_request_error"),
+    };
+    if let Err(e) = check_inline_result(response_format.as_deref(), n) {
+        return error(400, &e, "invalid_request_error");
+    }
     // Persist the uploaded image so the data-worker's loader can read it by path.
     if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
@@ -1743,6 +1789,44 @@ mod tests {
             (StatusCode::BAD_REQUEST, json!({"detail": "Cannot determine modality for file: notes.xyz"}))
         );
         assert_eq!(std::fs::read_dir(&st.upload_dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&st.upload_dir);
+    }
+
+    #[tokio::test]
+    async fn an_edit_refuses_what_it_would_drop() {
+        let mut st = state(None);
+        st.upload_dir = socket_dir();
+        st.python_adapter = "BagelAdapter".into();
+        for (fields, detail) in [
+            (vec![("image", Some("a.png")), ("mask", Some("m.png"))], "images/edits does not take a 'mask' upload; the whole image is edited"),
+            (vec![("image", Some("a.png")), ("image", Some("b.png"))], "images/edits takes one image, got 2"),
+            (vec![("image[]", Some("a.png")), ("n", None)], "n=2: this route returns one result per request"),
+            (vec![("image", Some("a.png")), ("response_format", None)], "response_format 'url' is not served; results are returned as b64_json"),
+        ] {
+            let parts: Vec<(&str, Option<&str>, &[u8])> = fields
+                .iter()
+                .map(|&(name, file)| {
+                    let value: &[u8] = match name {
+                        "n" => b"2",
+                        "response_format" => b"url",
+                        _ => b"\x89PNG",
+                    };
+                    (name, file, value)
+                })
+                .collect();
+            let mp = Multipart::from_request(multipart_request("/v1/images/edits", &parts), &st).await.unwrap();
+
+            let (status, _, data) = body(images_edits(State(st.clone()), mp).await).await;
+
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)));
+            assert_eq!(std::fs::read_dir(&st.upload_dir).unwrap().count(), 0, "{detail}");
+        }
+        assert_eq!(check_inline_result(Some("b64_json"), Some(1)), Ok(()));
+        assert_eq!(
+            check_inline_result(Some("it's"), None),
+            Err("response_format \"it's\" is not served; results are returned as b64_json".into())
+        );
         let _ = std::fs::remove_dir_all(&st.upload_dir);
     }
 

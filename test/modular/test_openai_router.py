@@ -705,6 +705,34 @@ def test_images_n_below_one_is_400(client_and_stub):
     message = resp.json()["error"]["message"]
     assert resp.status_code == 400 and message.startswith("n must be between 1 and") and "got 0" in message
 
+_PNG = ("in.png", b"\x89PNGinput", "image/png")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("mask", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("image", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "n": "2"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "response_format": "url"}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "n": 2}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+], ids=["mask", "two-images", "edit-n", "edit-url", "image-url", "video-n", "video-url"])
+def test_image_and_video_routes_refuse_what_they_would_drop(client_and_stub, model, path, body):
+    """A mask, a second image, n > 1 on a one-result route, or a url response was dropped with a 200."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    resp = client.post(path, **body)
+    assert resp.status_code == 400, resp.text
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def test_images_edits_takes_the_openai_image_list_name(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    resp = client.post("/v1/images/edits", files=[("image[]", _PNG)], data={"prompt": "x"})
+    assert resp.status_code == 200 and "image" in stub.last_submit["file_paths"]
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the

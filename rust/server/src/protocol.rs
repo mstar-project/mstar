@@ -200,7 +200,6 @@ pub struct ImageGenerationRequest {
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -221,12 +220,10 @@ pub struct VideoGenerationRequest {
     #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
     #[serde(default)]
     pub model: Option<String>,
-    #[allow(dead_code)]
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]

@@ -351,7 +351,11 @@ Endpoints and model coverage:
      - Text-to-image.
    * - ``POST /v1/images/edits``
      - ``bagel``
-     - Image editing (image + prompt → image).
+     - Image editing (image + prompt → image). One ``image`` (or ``image[]``), edited
+       whole: a ``mask``, a second image and ``n`` > 1 are refused.
+
+Image and video results come back inline as ``b64_json``; ``response_format: "url"`` is
+refused (there is no media store to serve one from).
 
 Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
 return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,

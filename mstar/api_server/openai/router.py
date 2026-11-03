@@ -22,7 +22,7 @@ from mstar.api_server.openai import (
     serving_transcriptions,
     serving_videos,
 )
-from mstar.api_server.openai._util import error_type, now
+from mstar.api_server.openai._util import check_inline_result, error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -246,15 +246,28 @@ async def images_edits(request: Request):
         return err
     try:
         form = await request.form()
-        image = form.get("image")
-        if image is None or not hasattr(image, "read"):
+        # One image, edited whole: a mask or a second image would be dropped. ``image[]``
+        # is how OpenAI clients name the image list.
+        images = []
+        for key, value in form.multi_items():
+            if not hasattr(value, "filename"):
+                continue
+            if key not in ("image", "image[]"):
+                return _error(400, f"images/edits does not take a {key!r} upload; the whole image is edited")
+            images.append(value)
+        if len(images) > 1:
+            return _error(400, f"images/edits takes one image, got {len(images)}")
+        image = images[0] if images else None
+        if image is None:
             return _error(400, "images/edits requires an 'image' file upload")
+        n = form.get("n")
+        check_inline_result(form.get("response_format"), int(n) if n else None)
         limit = max_body_bytes()
         if (getattr(image, "size", None) or 0) > limit:
             return _error(413, f"images/edits accepts files up to {limit // 2**20} MiB (MSTAR_MAX_BODY_MB)")
         image_bytes = await image.read()
         prompt = form.get("prompt") or ""
-        known = {"image", "prompt", "model", "n", "size", "response_format"}
+        known = {"image", "image[]", "prompt", "model", "n", "size", "response_format"}
         extra: dict = {}
         for key, value in form.multi_items():
             if key in known or hasattr(value, "filename"):

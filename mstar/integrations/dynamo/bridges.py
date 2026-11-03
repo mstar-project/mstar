@@ -42,6 +42,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from mstar.api_server.openai._util import check_inline_result
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -263,13 +264,17 @@ class RequestBridge:
         reference = body.get("input_reference")
         if reference:
             from mstar.api_server import media_io
+            # one engine request, as on the native route, which refuses an n it would drop
+            try:
+                check_inline_result(None, req.n)
+            except ValueError as exc:
+                raise _BadRequestError(str(exc)) from exc
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
             # seed is a declared field, so model_extra never carries it; the
             # edit adapter expects it in extra_kwargs (the native multipart
-            # route feeds it from a form field). Edits are single-submit on
-            # the native path too, so n does not apply here.
+            # route feeds it from a form field).
             if req.seed is not None:
                 extra.setdefault("seed", req.seed)
             submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
