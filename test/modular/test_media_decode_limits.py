@@ -345,6 +345,13 @@ def test_gop_split_decode_returns_the_frames_in_the_order_asked(monkeypatch, key
     assert len(opened) == decoders
 
 
+def test_the_installed_torchcodec_still_has_the_keyframe_index():
+    """The GOP split reads a private torchcodec method and falls back to one decoder
+    without it, so a torchcodec bump that drops it would only show as slower decodes."""
+    VideoDecoder = pytest.importorskip("torchcodec.decoders").VideoDecoder
+    assert callable(getattr(VideoDecoder, "_get_key_frame_indices", None))
+
+
 def _mp4(path, frames, side=64):
     av = pytest.importorskip("av")
     import numpy as np
