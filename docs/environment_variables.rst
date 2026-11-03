@@ -527,14 +527,25 @@ Worker scheduling
        too small for that across the host may do for the GPUs this container
        has a device node for, since only those can share it, and those rank
        instead (NVIDIA only; a 2-GPU slice of an 8-GPU host fits an 8-core mask
-       this way). Short of that, or with a mask too small to leave a CPU
-       unpinned, nothing is pinned and a warning says why.
+       this way). Short of that, the GPUs this process was given
+       (``CUDA_VISIBLE_DEVICES``, which ``--gpus`` sets) rank, and the mask is
+       cut into as many core sets as it holds for them: a one-GPU server under
+       an 8-core job mask on a node of four GPUs gets three cores and an API
+       core, and the mask holds two such sets. The log line names the rule
+       that sized the plan. Short of that too, or with a mask too small to
+       leave a CPU unpinned, nothing is pinned and a warning says why.
        Servers on one GPU (two MIG instances share its address) would take
        the same CPUs, so the first ``always`` or ``siblings`` server holds
        ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
-       pins nothing, with a warning; the lock goes with the process however
-       it exits. The lock only reaches servers that share ``/tmp``, so
-       servers in separate containers on one GPU still take the same CPUs.
+       pins nothing, with a warning. Every server that pins, a CPU number
+       included, also holds ``/tmp/mstar-core-<CPU>.lock`` for each physical
+       core it pins (named by the core's first CPU, with its pid inside): one
+       that finds a core held logs the holder's pid and takes the mask's next
+       core set, or pins nothing with a warning when none is free. The locks
+       go with the process however it exits, and a file naming a pid that has
+       exited is taken over with an info line. They only reach servers that
+       share ``/tmp``, so servers in separate containers on one GPU or under
+       one mask still take the same CPUs.
        A split config's second worker can also take a core that a server on
        a GPU without allowed CPUs takes under the same mask.
        Threads and pools a pinned thread starts keep the process mask
@@ -545,6 +556,13 @@ Worker scheduling
        server log their CPUs and why. See :ref:`host-idle` for measurements.
        Read by ``knobs.step_thread_core``; no effect where
        ``os.sched_setaffinity`` is missing (macOS, Windows).
+   * - ``MSTAR_STEP_CORE_SET``
+     - set by the API server
+     - Which of the mask's core sets the API server locked under
+       ``step_thread_core`` (``cpus.claim_cores``), for the conductor and
+       workers it starts: they build the same plan, but only the API server
+       knows which set was free. Not meant to be set by hand. Read by
+       ``cpus.devices_plan``.
    * - ``MSTAR_IDLE_HOLD``
      - config's ``knobs: idle_hold``, else ``off``
      - ``qos`` has the API server open ``/dev/cpu_dma_latency``, write a
