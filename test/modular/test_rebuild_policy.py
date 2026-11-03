@@ -148,6 +148,18 @@ def test_a_policy_passes_its_check_on_a_walk_that_chunks(model_class, attrs):
         policy.check(node, graphs)
 
 
+def test_higgs_is_rebuilt_from_its_audio_step_with_the_text_before_the_audio_and_the_encoders_output_copied():
+    from test_model_kv_layouts import _higgs
+
+    model = _higgs()
+    policy = model.rebuild_policies().get("LLM")
+
+    assert policy is not None, "every Higgs transcription would stay guaranteed"
+    assert policy.check("LLM", model.get_graph_walk_graphs()) == {
+        "prefill_audio": frozenset({"text_pre", "audio_embeds"}),
+    }, "a rebuild row would run without the text before the audio or the encoder's output"
+
+
 def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
