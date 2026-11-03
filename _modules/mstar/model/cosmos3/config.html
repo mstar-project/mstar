@@ -1436,6 +1436,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.</span>
     <span class="n">session_timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">600.0</span>
     <span class="n">session_timeout_max_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">3600.0</span>
+    <span class="c1"># A generation step whose requests total more vision tokens than this runs</span>
+    <span class="c1"># request by request. Off by default: it is a per-GPU number. On an H100,</span>
+    <span class="c1"># two 832x480 Nano clips of 189 frames batched took 2.4x one's step time,</span>
+    <span class="c1"># and two 121-frame Edge clips were slower than serial too, so an H100</span>
+    <span class="c1"># deployment sets 16384 in its model_kwargs.</span>
+    <span class="n">max_batched_vision_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">video_temporal_causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">freeze_und</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 

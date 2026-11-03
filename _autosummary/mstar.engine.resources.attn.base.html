@@ -692,7 +692,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.build"><code class="docutils literal notranslate"><span class="pre">AttentionManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">AttentionManager.fingerprint()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">AttentionManager.prefix_skip_safe</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">AttentionManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">AttentionManager.select_last_hidden()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -790,6 +792,20 @@ change what a page holds.</p>
 <span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.qo_indptr_buf">
+<span class="sig-name descname"><span class="pre">qo_indptr_buf</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#AttentionManager.qo_indptr_buf"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.qo_indptr_buf" title="Link to this definition">#</a></dt>
+<dd><p>The current plan’s query offsets per request, for backends that plan them.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.requires_kv_write">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">requires_kv_write</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write" title="Link to this definition">#</a></dt>
@@ -805,6 +821,24 @@ kernel (the dense one). A layer therefore reads</p>
 <p>out = self.attn.run(q, label, kv.layer_view(i), k=k, v=v, layer_idx=i)</p>
 </div></blockquote>
 <p>and stays correct whichever backend the spec named.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.select_last_hidden">
+<span class="sig-name descname"><span class="pre">select_last_hidden</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#AttentionManager.select_last_hidden"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.select_last_hidden" title="Link to this definition">#</a></dt>
+<dd><p>Each request’s last row of <code class="docutils literal notranslate"><span class="pre">hidden</span></code>, used for sampling from prefill,
+for a backend whose <code class="docutils literal notranslate"><span class="pre">qo_indptr_buf</span></code> holds the plan’s query offsets.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -974,7 +1008,9 @@ now. A backend named in the spec or YAML is returned as is.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.build"><code class="docutils literal notranslate"><span class="pre">AttentionManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">AttentionManager.fingerprint()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">AttentionManager.prefix_skip_safe</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">AttentionManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">AttentionManager.select_last_hidden()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

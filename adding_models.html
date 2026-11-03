@@ -2406,8 +2406,9 @@ while replaying a graph sized by its few prompt tokens.</p></li>
 rather than through <code class="docutils literal notranslate"><span class="pre">write_kv</span></code>, asks the KV resource where the step’s tokens go:
 <code class="docutils literal notranslate"><span class="pre">kv.write_target(layer_idx,</span> <span class="pre">label)</span></code> returns <code class="docutils literal notranslate"><span class="pre">(layer</span> <span class="pre">cache,</span> <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">slot</span> <span class="pre">in</span>
 <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">to</span> <span class="pre">write)</span></code> for the current plan (NHD layout only).
-Tokens past that number are the plan’s padding and must not be written. Qwen3-ASR’s
-fused q/k norm, RoPE and KV-write kernel (<code class="docutils literal notranslate"><span class="pre">Qwen3Attention</span></code>) is the example.</p>
+Tokens past that number are the plan’s padding and must not be written. The fused q/k
+norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni’s Thinker call through
+<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code> and <code class="docutils literal notranslate"><span class="pre">norm_rope_table_attend</span></code> are the example.</p>
 <p><strong>Testing.</strong> <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. <code class="docutils literal notranslate"><span class="pre">test/modular/vjepa2/fake_resources.py</span></code> shows how to stub
 the resources, and <code class="docutils literal notranslate"><span class="pre">test/modular/test_resource_runner.py</span></code> tests the runner’s lifecycle

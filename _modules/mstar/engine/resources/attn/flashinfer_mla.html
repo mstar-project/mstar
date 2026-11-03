@@ -1366,15 +1366,6 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">_kv_len_buf</span></div>
 
 
-    <span class="c1"># eager as a whole, as FlashInferManager.select_last_hidden explains</span>
-<div class="viewcode-block" id="FlashInferMLAManager.select_last_hidden">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer_mla.html#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.select_last_hidden">[docs]</a>
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">select_last_hidden</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"main"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-        <span class="n">last</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">qo_indptr_buf</span><span class="p">(</span><span class="n">label</span><span class="p">)[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>
-        <span class="k">return</span> <span class="n">hidden</span><span class="o">.</span><span class="n">index_select</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">last</span><span class="p">)</span></div>
-
-
 <div class="viewcode-block" id="FlashInferMLAManager.run">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer_mla.html#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.run">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>

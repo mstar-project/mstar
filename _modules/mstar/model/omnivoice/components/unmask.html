@@ -983,13 +983,13 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">An exact port of OmniVoice's ``_predict_tokens_with_scoring`` and the schedule</span>
 <span class="sd">arithmetic inside ``_generate_iterative`` (``omnivoice/models/omnivoice.py``).</span>
-<span class="sd">Parity against the reference is decided here, so the operation order is kept</span>
-<span class="sd">verbatim even where it could be tidied — the log_softmax is applied twice on the</span>
-<span class="sd">CFG path because the reference applies it twice, and the mask id is driven to</span>
-<span class="sd">-inf after the combine rather than before.</span>
+<span class="sd">Parity against the reference is decided here, so the arithmetic is kept to the</span>
+<span class="sd">bit even where it could be tidied — the log_softmax is applied twice on the CFG</span>
+<span class="sd">path because the reference applies it twice, and the mask id is driven to -inf</span>
+<span class="sd">after the combine rather than before.</span>
 
-<span class="sd">Nothing here touches the network or the engine; it is pure tensor math over one</span>
-<span class="sd">request's logits, so the parity test can drive it directly.</span>
+<span class="sd">Nothing here touches the network or the engine; it is pure tensor math over a</span>
+<span class="sd">step's packed logits, so the parity test can drive it directly.</span>
 <span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
@@ -997,6 +997,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.h2d</span><span class="w"> </span><span class="kn">import</span> <span class="n">to_device_nonblocking</span>
 
 
 <div class="viewcode-block" id="get_time_steps">
@@ -1035,8 +1037,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    the canvas is always fully revealed regardless of rounding drift.</span>
 
 <span class="sd">    Cached, and returning a tuple so it stays immutable: the schedule depends</span>
-<span class="sd">    only on these four numbers, but ``postprocess`` needs it on every step of</span>
-<span class="sd">    every request, and recomputing it there means a linspace and a Python loop</span>
+<span class="sd">    only on these four numbers, but ``forward_batched`` needs it on every step</span>
+<span class="sd">    of every request, and recomputing it there means a linspace and a Python loop</span>
 <span class="sd">    per step for a list that never changes within a request.</span>
 <span class="sd">    """</span>
     <span class="n">timesteps</span> <span class="o">=</span> <span class="n">get_time_steps</span><span class="p">(</span><span class="n">num_step</span><span class="o">=</span><span class="n">num_step</span><span class="p">,</span> <span class="n">t_shift</span><span class="o">=</span><span class="n">t_shift</span><span class="p">)</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
@@ -1070,131 +1072,151 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="gumbel_sample">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.unmask.html#mstar.model.omnivoice.components.unmask.gumbel_sample">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">gumbel_sample</span><span class="p">(</span>
-    <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Add Gumbel noise at ``temperature``; caller takes the argmax.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_cat</span><span class="p">(</span><span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``torch.cat`` without the copy for a single part."""</span>
+    <span class="k">return</span> <span class="n">parts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">parts</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)</span>
 
-<span class="sd">    ``generator`` carries the request's seed. Both draws in a step (token</span>
-<span class="sd">    choice and reveal order) come from it, so a seeded request replays</span>
-<span class="sd">    exactly; passing ``None`` keeps the global RNG and stays unreproducible.</span>
-<span class="sd">    """</span>
-    <span class="n">scaled_logits</span> <span class="o">=</span> <span class="n">logits</span> <span class="o">/</span> <span class="n">temperature</span>
-    <span class="n">u</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span>
-        <span class="n">scaled_logits</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span>
-        <span class="n">dtype</span><span class="o">=</span><span class="n">scaled_logits</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-        <span class="n">device</span><span class="o">=</span><span class="n">scaled_logits</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-        <span class="n">generator</span><span class="o">=</span><span class="n">generator</span><span class="p">,</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_per_position</span><span class="p">(</span><span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span> <span class="o">|</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A per-request knob over the packed positions: the shared value as a</span>
+<span class="sd">    Python float when every request has the same one (the reference's</span>
+<span class="sd">    arithmetic to the bit), else each position's value, ``[P]``."""</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">values</span><span class="p">))</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">values</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">to_device_nonblocking</span><span class="p">(</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">values</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">lens</span><span class="p">)),</span> <span class="n">device</span>
     <span class="p">)</span>
-    <span class="n">gumbel_noise</span> <span class="o">=</span> <span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">u</span> <span class="o">+</span> <span class="mf">1e-10</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1e-10</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">scaled_logits</span> <span class="o">+</span> <span class="n">gumbel_noise</span></div>
 
 
-
-<div class="viewcode-block" id="predict_tokens_with_scoring">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.unmask.html#mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">predict_tokens_with_scoring</span><span class="p">(</span>
-    <span class="n">c_logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">u_logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<div class="viewcode-block" id="unmask_step">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.unmask.html#mstar.model.omnivoice.components.unmask.unmask_step">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">unmask_step</span><span class="p">(</span>
+    <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">canvases</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
+    <span class="n">uncond_rows</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">counts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">generators</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
+    <span class="n">class_temperature</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
+    <span class="n">layer_penalty_factor</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
+    <span class="n">position_temperature</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
     <span class="n">audio_mask_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">class_temperature</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""CFG-combine conditional and unconditional logits, then rank.</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One unmask iteration for every request of a step, batched.</span>
+
+<span class="sd">    The reference's scoring (``_predict_tokens_with_scoring``) and reveal for</span>
+<span class="sd">    each request, over the step's packed target positions at once. Each request</span>
+<span class="sd">    draws from its own generator in the reference's order (token choice, then</span>
+<span class="sd">    reveal order), and its result is the reference's arithmetic to the bit</span>
+<span class="sd">    when the step's requests share their knobs. A temperature that differs</span>
+<span class="sd">    between them is divided by per position instead of as one scalar, which</span>
+<span class="sd">    can round differently (CUDA divides by a scalar as a multiply by its</span>
+<span class="sd">    reciprocal), so a request batched with others can then flip a reveal at a</span>
+<span class="sd">    near-tie.</span>
 
 <span class="sd">    Args:</span>
-<span class="sd">        c_logits: conditional logits, ``[1, C, T, V]``.</span>
-<span class="sd">        u_logits: unconditional logits, same shape.  Ignored when</span>
-<span class="sd">            ``guidance_scale`` is 0.</span>
-<span class="sd">        audio_mask_id: the MASK class, forced to -inf so it is never predicted.</span>
-<span class="sd">        guidance_scale: 0 disables CFG entirely (and the caller may then skip</span>
-<span class="sd">            the unconditional forward).</span>
-<span class="sd">        class_temperature: 0 takes the argmax; above 0 samples from the top</span>
-<span class="sd">            decile with Gumbel noise.</span>
-<span class="sd">        generator: the request's seeded RNG, or ``None`` for the global one.</span>
+<span class="sd">        logits: ``[1, C, R, V]``: every request's conditional target block in</span>
+<span class="sd">            order, then the unconditional blocks (``PackedCanvas``'s gather order).</span>
+<span class="sd">        canvases: each request's live canvas, ``[C, T_i]``; not written.</span>
+<span class="sd">        uncond_rows: where each request's unconditional block starts in</span>
+<span class="sd">            ``logits``, or -1 for a request with CFG off.</span>
+<span class="sd">        counts: the cells each request reveals this iteration.</span>
+<span class="sd">        generators: each request's RNG for this iteration (``None``: global).</span>
 
 <span class="sd">    Returns:</span>
-<span class="sd">        ``(pred_tokens, confidence_scores)``, each ``[1, C, T]``.  The scores</span>
-<span class="sd">        are max log-probabilities and drive which cells get revealed.</span>
+<span class="sd">        ``[C, P]``: the next canvases end to end, ``P = sum(T_i)``.</span>
 <span class="sd">    """</span>
-    <span class="k">if</span> <span class="n">guidance_scale</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="n">c_log_probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">c_logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-        <span class="n">u_log_probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">u_logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-        <span class="n">log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span>
-            <span class="n">c_log_probs</span> <span class="o">+</span> <span class="n">guidance_scale</span> <span class="o">*</span> <span class="p">(</span><span class="n">c_log_probs</span> <span class="o">-</span> <span class="n">u_log_probs</span><span class="p">),</span>
-            <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">log_probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">c_logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">lens</span> <span class="o">=</span> <span class="p">[</span><span class="n">canvas</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">canvas</span> <span class="ow">in</span> <span class="n">canvases</span><span class="p">]</span>
+    <span class="n">num_codebook</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">canvases</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">logits</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span>
 
+    <span class="n">log_probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">total</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">cfg</span> <span class="o">=</span> <span class="p">[</span><span class="n">row</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">uncond_rows</span><span class="p">]</span>
+    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">cfg</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="n">cfg</span><span class="p">):</span>
+            <span class="n">u_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">total</span><span class="p">:</span><span class="mi">2</span> <span class="o">*</span> <span class="n">total</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># a request without CFG reads its conditional rows; its result is discarded below</span>
+            <span class="n">starts</span> <span class="o">=</span> <span class="p">[</span><span class="n">row</span> <span class="k">if</span> <span class="n">row</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="k">else</span> <span class="nb">sum</span><span class="p">(</span><span class="n">lens</span><span class="p">[:</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">uncond_rows</span><span class="p">)]</span>
+            <span class="n">index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">at</span><span class="p">,</span> <span class="n">at</span> <span class="o">+</span> <span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">at</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">starts</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)])</span>
+            <span class="n">u_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">index_select</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">to_device_nonblocking</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">device</span><span class="p">))</span>
+        <span class="n">u_log_probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">u_logits</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">(</span><span class="n">guidance_scale</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+        <span class="n">scale</span> <span class="o">=</span> <span class="n">scale</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="k">else</span> <span class="n">scale</span>
+        <span class="c1"># log_probs + scale * (log_probs - u_log_probs), to the bit, in u_log_probs' buffer: every</span>
+        <span class="c1"># float32 [C, P, V] copy at once is what max_packed_tokens has to leave room for</span>
+        <span class="n">guided</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">u_log_probs</span><span class="o">.</span><span class="n">neg_</span><span class="p">()</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">log_probs</span><span class="p">)</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">log_probs</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">del</span> <span class="n">u_logits</span><span class="p">,</span> <span class="n">u_log_probs</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="n">cfg</span><span class="p">):</span>
+            <span class="n">log_probs</span> <span class="o">=</span> <span class="n">guided</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">on</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+            <span class="n">log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">on</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">guided</span><span class="p">,</span> <span class="n">log_probs</span><span class="p">)</span>
+        <span class="k">del</span> <span class="n">guided</span>
     <span class="n">log_probs</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">audio_mask_id</span><span class="p">]</span> <span class="o">=</span> <span class="o">-</span><span class="nb">float</span><span class="p">(</span><span class="s2">"inf"</span><span class="p">)</span>
 
-    <span class="k">if</span> <span class="n">class_temperature</span> <span class="o">&gt;</span> <span class="mf">0.0</span><span class="p">:</span>
-        <span class="n">filtered_probs</span> <span class="o">=</span> <span class="n">filter_top_k</span><span class="p">(</span><span class="n">log_probs</span><span class="p">,</span> <span class="n">ratio</span><span class="o">=</span><span class="mf">0.1</span><span class="p">)</span>
-        <span class="n">pred_tokens</span> <span class="o">=</span> <span class="n">gumbel_sample</span><span class="p">(</span>
-            <span class="n">filtered_probs</span><span class="p">,</span> <span class="n">class_temperature</span><span class="p">,</span> <span class="n">generator</span>
-        <span class="p">)</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">pred_tokens</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">pred_tokens</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">sampled</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span> <span class="o">&gt;</span> <span class="mf">0.0</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">class_temperature</span><span class="p">]</span>
+    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">sampled</span><span class="p">):</span>
+        <span class="n">shape</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_codebook</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+        <span class="n">noise</span> <span class="o">=</span> <span class="n">_cat</span><span class="p">([</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">shape</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="n">n</span><span class="p">,)</span> <span class="o">+</span> <span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">log_probs</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">hot</span> <span class="k">else</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">new_zeros</span><span class="p">(</span><span class="n">shape</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="n">n</span><span class="p">,)</span> <span class="o">+</span> <span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:])</span>
+            <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">hot</span><span class="p">,</span> <span class="n">gen</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">lens</span><span class="p">,</span> <span class="n">sampled</span><span class="p">,</span> <span class="n">generators</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+        <span class="n">temp</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">([</span><span class="n">t</span> <span class="k">if</span> <span class="n">hot</span> <span class="k">else</span> <span class="mf">1.0</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">hot</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">class_temperature</span><span class="p">,</span> <span class="n">sampled</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)],</span>
+                             <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+        <span class="n">temp</span> <span class="o">=</span> <span class="n">temp</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">temp</span><span class="p">)</span> <span class="k">else</span> <span class="n">temp</span>
+        <span class="c1"># plus Gumbel noise, -log(-log(u)), built in the noise's buffer like the combine above</span>
+        <span class="n">log_log</span> <span class="o">=</span> <span class="n">noise</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mf">1e-10</span><span class="p">)</span><span class="o">.</span><span class="n">log_</span><span class="p">()</span><span class="o">.</span><span class="n">neg_</span><span class="p">()</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mf">1e-10</span><span class="p">)</span><span class="o">.</span><span class="n">log_</span><span class="p">()</span>
+        <span class="n">drawn</span> <span class="o">=</span> <span class="n">filter_top_k</span><span class="p">(</span><span class="n">log_probs</span><span class="p">,</span> <span class="n">ratio</span><span class="o">=</span><span class="mf">0.1</span><span class="p">)</span><span class="o">.</span><span class="n">div_</span><span class="p">(</span><span class="n">temp</span><span class="p">)</span><span class="o">.</span><span class="n">sub_</span><span class="p">(</span><span class="n">log_log</span><span class="p">)</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="n">sampled</span><span class="p">):</span>
+            <span class="n">pred_tokens</span> <span class="o">=</span> <span class="n">drawn</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">on</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">(</span><span class="n">sampled</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+            <span class="n">pred_tokens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">on</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">drawn</span><span class="p">,</span> <span class="n">pred_tokens</span><span class="p">)</span>
+    <span class="n">scores</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
 
-    <span class="n">confidence_scores</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
-    <span class="k">return</span> <span class="n">pred_tokens</span><span class="p">,</span> <span class="n">confidence_scores</span></div>
-
-
-
-<div class="viewcode-block" id="apply_reveal">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.unmask.html#mstar.model.omnivoice.components.unmask.apply_reveal">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">apply_reveal</span><span class="p">(</span>
-    <span class="n">tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">pred_tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">scores</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">reveal_count</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">audio_mask_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">layer_penalty_factor</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">position_temperature</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Reveal ``reveal_count`` cells of ``tokens`` in place and return it.</span>
-
-<span class="sd">    Ranking is over the flattened ``(C, T)`` canvas, so a step may spend its</span>
-<span class="sd">    whole budget on one codebook row.  Two biases shape the choice, both from</span>
-<span class="sd">    the reference:</span>
-
-<span class="sd">    - ``layer_penalty_factor`` subtracts ``layer_index * factor`` from the</span>
-<span class="sd">      score, pushing the earliest codebooks to resolve first (they carry the</span>
-<span class="sd">      coarse content the later residual rows refine).</span>
-<span class="sd">    - ``position_temperature`` adds Gumbel noise to the *position* ranking, so</span>
-<span class="sd">      the reveal order is stochastic even when token choice is greedy.</span>
-
-<span class="sd">    Already-revealed cells are driven to -inf so a cell is only written once.</span>
-
-<span class="sd">    Args:</span>
-<span class="sd">        tokens: ``[1, C, T]``, the request's live canvas, modified in place.</span>
-<span class="sd">        pred_tokens, scores: ``[1, C, T]`` from ``predict_tokens_with_scoring``.</span>
-<span class="sd">        generator: the request's seeded RNG, or ``None`` for the global one.</span>
-<span class="sd">    """</span>
-    <span class="k">if</span> <span class="n">reveal_count</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">tokens</span>
-
-    <span class="n">num_codebook</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
-    <span class="n">layer_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_codebook</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">tokens</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-    <span class="n">scores</span> <span class="o">=</span> <span class="n">scores</span> <span class="o">-</span> <span class="p">(</span><span class="n">layer_ids</span> <span class="o">*</span> <span class="n">layer_penalty_factor</span><span class="p">)</span>
-
-    <span class="k">if</span> <span class="n">position_temperature</span> <span class="o">&gt;</span> <span class="mf">0.0</span><span class="p">:</span>
-        <span class="n">scores</span> <span class="o">=</span> <span class="n">gumbel_sample</span><span class="p">(</span><span class="n">scores</span><span class="p">,</span> <span class="n">position_temperature</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span>
-
+    <span class="n">layer_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_codebook</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="n">penalty</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">(</span><span class="n">layer_penalty_factor</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+    <span class="n">scores</span> <span class="o">=</span> <span class="n">scores</span> <span class="o">-</span> <span class="p">(</span><span class="n">layer_ids</span> <span class="o">*</span> <span class="p">(</span><span class="n">penalty</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">penalty</span><span class="p">)</span> <span class="k">else</span> <span class="n">penalty</span><span class="p">))</span>
+    <span class="n">shuffled</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span> <span class="o">&gt;</span> <span class="mf">0.0</span> <span class="ow">and</span> <span class="n">c</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">position_temperature</span><span class="p">,</span> <span class="n">counts</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)]</span>
+    <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">shuffled</span><span class="p">):</span>
+        <span class="n">noise</span> <span class="o">=</span> <span class="n">_cat</span><span class="p">([</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_codebook</span><span class="p">,</span> <span class="n">n</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">scores</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">hot</span> <span class="k">else</span> <span class="n">scores</span><span class="o">.</span><span class="n">new_zeros</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_codebook</span><span class="p">,</span> <span class="n">n</span><span class="p">))</span>
+            <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">hot</span><span class="p">,</span> <span class="n">gen</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">lens</span><span class="p">,</span> <span class="n">shuffled</span><span class="p">,</span> <span class="n">generators</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+        <span class="n">temp</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">([</span><span class="n">t</span> <span class="k">if</span> <span class="n">hot</span> <span class="k">else</span> <span class="mf">1.0</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">hot</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">position_temperature</span><span class="p">,</span> <span class="n">shuffled</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)],</span>
+                             <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+        <span class="n">temp</span> <span class="o">=</span> <span class="n">temp</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">temp</span><span class="p">)</span> <span class="k">else</span> <span class="n">temp</span>
+        <span class="n">noisy</span> <span class="o">=</span> <span class="n">scores</span> <span class="o">/</span> <span class="n">temp</span> <span class="o">-</span> <span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">noise</span> <span class="o">+</span> <span class="mf">1e-10</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1e-10</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="n">shuffled</span><span class="p">):</span>
+            <span class="n">scores</span> <span class="o">=</span> <span class="n">noisy</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">on</span> <span class="o">=</span> <span class="n">_per_position</span><span class="p">(</span><span class="n">shuffled</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+            <span class="n">scores</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">on</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">noisy</span><span class="p">,</span> <span class="n">scores</span><span class="p">)</span>
+    <span class="n">tokens</span> <span class="o">=</span> <span class="n">_cat</span><span class="p">(</span><span class="n">canvases</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
     <span class="n">scores</span> <span class="o">=</span> <span class="n">scores</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">tokens</span> <span class="o">!=</span> <span class="n">audio_mask_id</span><span class="p">,</span> <span class="o">-</span><span class="nb">float</span><span class="p">(</span><span class="s2">"inf"</span><span class="p">))</span>
 
-    <span class="n">_</span><span class="p">,</span> <span class="n">topk_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">scores</span><span class="o">.</span><span class="n">flatten</span><span class="p">(),</span> <span class="n">reveal_count</span><span class="p">)</span>
-    <span class="n">flat_tokens</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
-    <span class="n">flat_tokens</span><span class="p">[</span><span class="n">topk_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">pred_tokens</span><span class="o">.</span><span class="n">flatten</span><span class="p">()[</span><span class="n">topk_idx</span><span class="p">]</span>
-    <span class="n">tokens</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">flat_tokens</span><span class="o">.</span><span class="n">view_as</span><span class="p">(</span><span class="n">tokens</span><span class="p">))</span>
-    <span class="k">return</span> <span class="n">tokens</span></div>
+    <span class="c1"># Request i reveals its top counts[i] cells of its own (C, T_i) block: sort</span>
+    <span class="c1"># every cell by score, then stably by request, and take the first counts[i]</span>
+    <span class="c1"># of each request's run. Static shapes, nothing read back on the host.</span>
+    <span class="n">order</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">scores</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">descending</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">stable</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">indices</span>
+    <span class="n">rank</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_codebook</span> <span class="o">*</span> <span class="n">total</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">take</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">&lt;</span> <span class="n">counts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">runs</span> <span class="o">=</span> <span class="p">[</span><span class="n">num_codebook</span> <span class="o">*</span> <span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">lens</span><span class="p">]</span>
+        <span class="n">host</span> <span class="o">=</span> <span class="n">to_device_nonblocking</span><span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">lens</span><span class="p">,</span> <span class="n">counts</span><span class="p">,</span> <span class="p">[</span><span class="nb">sum</span><span class="p">(</span><span class="n">runs</span><span class="p">[:</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">runs</span><span class="p">))]]),</span> <span class="n">device</span>
+        <span class="p">)</span>
+        <span class="n">owner</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">lens</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span> <span class="n">host</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">output_size</span><span class="o">=</span><span class="n">total</span><span class="p">)</span>
+        <span class="n">owner</span> <span class="o">=</span> <span class="n">owner</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">num_codebook</span><span class="p">,</span> <span class="n">total</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">order</span> <span class="o">=</span> <span class="n">order</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">owner</span><span class="p">[</span><span class="n">order</span><span class="p">],</span> <span class="n">stable</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">indices</span><span class="p">]</span>
+        <span class="n">by_owner</span> <span class="o">=</span> <span class="n">owner</span><span class="p">[</span><span class="n">order</span><span class="p">]</span>
+        <span class="n">take</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">-</span> <span class="n">host</span><span class="p">[</span><span class="mi">2</span><span class="p">][</span><span class="n">by_owner</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">host</span><span class="p">[</span><span class="mi">1</span><span class="p">][</span><span class="n">by_owner</span><span class="p">]</span>
+    <span class="n">reveal</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">take</span><span class="p">)</span><span class="o">.</span><span class="n">scatter_</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">take</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">reveal</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_codebook</span><span class="p">,</span> <span class="n">total</span><span class="p">),</span> <span class="n">pred_tokens</span><span class="p">,</span> <span class="n">tokens</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span></div>
 
 </pre></div>
 

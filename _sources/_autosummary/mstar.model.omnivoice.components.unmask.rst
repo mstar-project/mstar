@@ -13,12 +13,10 @@ mstar.model.omnivoice.components.unmask
 
    .. autosummary::
    
-      apply_reveal
       build_reveal_schedule
       filter_top_k
       get_time_steps
-      gumbel_sample
-      predict_tokens_with_scoring
+      unmask_step
    
    
 

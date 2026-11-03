@@ -696,7 +696,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.run"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.select_last_hidden()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.supports_preplan</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.uses_kernel"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.uses_kernel</span></code></a></li>
 </ul>
@@ -825,7 +824,8 @@ queries (and the entries the step appends) start.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.qo_indptr_buf">
 <span class="sig-name descname"><span class="pre">qo_indptr_buf</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/flashinfer_mla.html#FlashInferMLAManager.qo_indptr_buf"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.qo_indptr_buf" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>The current plan’s query offsets per request, for backends that plan them.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
@@ -853,22 +853,6 @@ log-sum-exp of the scores <code class="docutils literal notranslate"><span class
 <li><p><strong>q_pe</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>return_lse</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.select_last_hidden">
-<span class="sig-name descname"><span class="pre">select_last_hidden</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/flashinfer_mla.html#FlashInferMLAManager.select_last_hidden"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.select_last_hidden" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1025,7 +1009,6 @@ checkpoints, not production models.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.run"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.select_last_hidden()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.supports_preplan</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.uses_kernel"><code class="docutils literal notranslate"><span class="pre">FlashInferMLAManager.uses_kernel</span></code></a></li>
 </ul>

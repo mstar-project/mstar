@@ -1295,9 +1295,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">],</span> <span class="s2">"_qo_indptr_buf"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 
 
-    <span class="c1"># Eager as a whole: a break inside it leaves a compiled frame that holds the</span>
-    <span class="c1"># bucket's static token count beside its row count, which captured forwards</span>
-    <span class="c1"># recompile per prefill bucket until Dynamo's recompile limit.</span>
+    <span class="c1"># Eager as a whole, as AttentionManager.select_last_hidden explains. FlashInfer's</span>
+    <span class="c1"># own: a label planned as a decode has no query offsets, and a missing one is an error.</span>
 <div class="viewcode-block" id="FlashInferManager.select_last_hidden">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.select_last_hidden">[docs]</a>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>

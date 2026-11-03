@@ -1055,9 +1055,13 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="decode_canvas">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.codec.html#mstar.model.omnivoice.components.codec.decode_canvas">[docs]</a>
-<span class="nd">@torch</span><span class="o">.</span><span class="n">inference_mode</span><span class="p">()</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">decode_canvas</span><span class="p">(</span><span class="n">codec</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``[C, T_tok]`` tokens -&gt; 1-D float32 waveform at ``codec.config.sample_rate``, on the codec's device."""</span>
+<span class="w">    </span><span class="sd">"""``[C, T_tok]`` tokens -&gt; 1-D float32 waveform at ``codec.config.sample_rate``, on the codec's device.</span>
+
+<span class="sd">    Runs under the engine's ``no_grad``, not ``inference_mode``: the compiled</span>
+<span class="sd">    acoustic decoder (code2wav's ``compile_regions``) was warmed on ordinary</span>
+<span class="sd">    tensors, and an inference tensor fails its guards and recompiles it.</span>
+<span class="sd">    """</span>
     <span class="n">tokens</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">codec</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">codec</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">tokens</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span><span class="o">.</span><span class="n">audio_values</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span></div>
 

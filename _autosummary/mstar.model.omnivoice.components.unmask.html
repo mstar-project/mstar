@@ -688,12 +688,10 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.apply_reveal"><code class="docutils literal notranslate"><span class="pre">apply_reveal()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.build_reveal_schedule"><code class="docutils literal notranslate"><span class="pre">build_reveal_schedule()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.filter_top_k"><code class="docutils literal notranslate"><span class="pre">filter_top_k()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.get_time_steps"><code class="docutils literal notranslate"><span class="pre">get_time_steps()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.gumbel_sample"><code class="docutils literal notranslate"><span class="pre">gumbel_sample()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring"><code class="docutils literal notranslate"><span class="pre">predict_tokens_with_scoring()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.unmask_step"><code class="docutils literal notranslate"><span class="pre">unmask_step()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -710,70 +708,30 @@
 <p>The unmask step: CFG scoring, confidence ranking, and the reveal schedule.</p>
 <p>An exact port of OmniVoice’s <code class="docutils literal notranslate"><span class="pre">_predict_tokens_with_scoring</span></code> and the schedule
 arithmetic inside <code class="docutils literal notranslate"><span class="pre">_generate_iterative</span></code> (<code class="docutils literal notranslate"><span class="pre">omnivoice/models/omnivoice.py</span></code>).
-Parity against the reference is decided here, so the operation order is kept
-verbatim even where it could be tidied — the log_softmax is applied twice on the
-CFG path because the reference applies it twice, and the mask id is driven to
--inf after the combine rather than before.</p>
-<p>Nothing here touches the network or the engine; it is pure tensor math over one
-request’s logits, so the parity test can drive it directly.</p>
+Parity against the reference is decided here, so the arithmetic is kept to the
+bit even where it could be tidied — the log_softmax is applied twice on the CFG
+path because the reference applies it twice, and the mask id is driven to -inf
+after the combine rather than before.</p>
+<p>Nothing here touches the network or the engine; it is pure tensor math over a
+step’s packed logits, so the parity test can drive it directly.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.apply_reveal" title="mstar.model.omnivoice.components.unmask.apply_reveal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_reveal</span></code></a>(tokens, pred_tokens, scores, ...)</p></td>
-<td><p>Reveal <code class="docutils literal notranslate"><span class="pre">reveal_count</span></code> cells of <code class="docutils literal notranslate"><span class="pre">tokens</span></code> in place and return it.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.build_reveal_schedule" title="mstar.model.omnivoice.components.unmask.build_reveal_schedule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_reveal_schedule</span></code></a>(target_len, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.build_reveal_schedule" title="mstar.model.omnivoice.components.unmask.build_reveal_schedule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_reveal_schedule</span></code></a>(target_len, ...)</p></td>
 <td><p>How many of the <code class="docutils literal notranslate"><span class="pre">target_len</span> <span class="pre">*</span> <span class="pre">num_codebook</span></code> cells to reveal per step.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.filter_top_k" title="mstar.model.omnivoice.components.unmask.filter_top_k"><code class="xref py py-obj docutils literal notranslate"><span class="pre">filter_top_k</span></code></a>(logits[, ratio])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.filter_top_k" title="mstar.model.omnivoice.components.unmask.filter_top_k"><code class="xref py py-obj docutils literal notranslate"><span class="pre">filter_top_k</span></code></a>(logits[, ratio])</p></td>
 <td><p>Keep the top <code class="docutils literal notranslate"><span class="pre">ratio</span></code> of the vocabulary, -inf elsewhere.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.get_time_steps" title="mstar.model.omnivoice.components.unmask.get_time_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_time_steps</span></code></a>(num_step, t_shift[, t_start, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.get_time_steps" title="mstar.model.omnivoice.components.unmask.get_time_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_time_steps</span></code></a>(num_step, t_shift[, t_start, ...])</p></td>
 <td><p>The shifted timestep ramp, <code class="docutils literal notranslate"><span class="pre">num_step</span> <span class="pre">+</span> <span class="pre">1</span></code> points on [t_start, t_end].</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.gumbel_sample" title="mstar.model.omnivoice.components.unmask.gumbel_sample"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gumbel_sample</span></code></a>(logits, temperature[, generator])</p></td>
-<td><p>Add Gumbel noise at <code class="docutils literal notranslate"><span class="pre">temperature</span></code>; caller takes the argmax.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring" title="mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring"><code class="xref py py-obj docutils literal notranslate"><span class="pre">predict_tokens_with_scoring</span></code></a>(c_logits, ...[, ...])</p></td>
-<td><p>CFG-combine conditional and unconditional logits, then rank.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.omnivoice.components.unmask.unmask_step" title="mstar.model.omnivoice.components.unmask.unmask_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unmask_step</span></code></a>(logits, canvases, uncond_rows, ...)</p></td>
+<td><p>One unmask iteration for every request of a step, batched.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.omnivoice.components.unmask.apply_reveal">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.unmask.</span></span><span class="sig-name descname"><span class="pre">apply_reveal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pred_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scores</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reveal_count</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_mask_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_penalty_factor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_temperature</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generator</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/unmask.html#apply_reveal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.unmask.apply_reveal" title="Link to this definition">#</a></dt>
-<dd><p>Reveal <code class="docutils literal notranslate"><span class="pre">reveal_count</span></code> cells of <code class="docutils literal notranslate"><span class="pre">tokens</span></code> in place and return it.</p>
-<p>Ranking is over the flattened <code class="docutils literal notranslate"><span class="pre">(C,</span> <span class="pre">T)</span></code> canvas, so a step may spend its
-whole budget on one codebook row.  Two biases shape the choice, both from
-the reference:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">layer_penalty_factor</span></code> subtracts <code class="docutils literal notranslate"><span class="pre">layer_index</span> <span class="pre">*</span> <span class="pre">factor</span></code> from the
-score, pushing the earliest codebooks to resolve first (they carry the
-coarse content the later residual rows refine).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">position_temperature</span></code> adds Gumbel noise to the <em>position</em> ranking, so
-the reveal order is stochastic even when token choice is greedy.</p></li>
-</ul>
-<p>Already-revealed cells are driven to -inf so a cell is only written once.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code>, the request’s live canvas, modified in place.</p></li>
-<li><p><strong>pred_tokens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code> from <code class="docutils literal notranslate"><span class="pre">predict_tokens_with_scoring</span></code>.</p></li>
-<li><p><strong>scores</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code> from <code class="docutils literal notranslate"><span class="pre">predict_tokens_with_scoring</span></code>.</p></li>
-<li><p><strong>generator</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Generator.html#torch.Generator" title="(in PyTorch v2.15)"><em>Generator</em></a><em> | </em><em>None</em>) – the request’s seeded RNG, or <code class="docutils literal notranslate"><span class="pre">None</span></code> for the global one.</p></li>
-<li><p><strong>reveal_count</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>audio_mask_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>layer_penalty_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>position_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.unmask.build_reveal_schedule">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.unmask.</span></span><span class="sig-name descname"><span class="pre">build_reveal_schedule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">target_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_codebook</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t_shift</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/unmask.html#build_reveal_schedule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.unmask.build_reveal_schedule" title="Link to this definition">#</a></dt>
@@ -782,8 +740,8 @@ the reveal order is stochastic even when token choice is greedy.</p></li>
 up and clamped by what is left; the final step takes the entire remainder so
 the canvas is always fully revealed regardless of rounding drift.</p>
 <p>Cached, and returning a tuple so it stays immutable: the schedule depends
-only on these four numbers, but <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> needs it on every step of
-every request, and recomputing it there means a linspace and a Python loop
+only on these four numbers, but <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> needs it on every step
+of every request, and recomputing it there means a linspace and a Python loop
 per step for a list that never changes within a request.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -840,50 +798,40 @@ budget at low SNR where the canvas is still mostly masked.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.omnivoice.components.unmask.gumbel_sample">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.unmask.</span></span><span class="sig-name descname"><span class="pre">gumbel_sample</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">logits</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">temperature</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generator</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/unmask.html#gumbel_sample"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.unmask.gumbel_sample" title="Link to this definition">#</a></dt>
-<dd><p>Add Gumbel noise at <code class="docutils literal notranslate"><span class="pre">temperature</span></code>; caller takes the argmax.</p>
-<p><code class="docutils literal notranslate"><span class="pre">generator</span></code> carries the request’s seed. Both draws in a step (token
-choice and reveal order) come from it, so a seeded request replays
-exactly; passing <code class="docutils literal notranslate"><span class="pre">None</span></code> keeps the global RNG and stays unreproducible.</p>
+<dt class="sig sig-object py" id="mstar.model.omnivoice.components.unmask.unmask_step">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.unmask.</span></span><span class="sig-name descname"><span class="pre">unmask_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">logits</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">canvases</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">uncond_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">counts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generators</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">guidance_scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">class_temperature</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_penalty_factor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_temperature</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_mask_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/unmask.html#unmask_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.unmask.unmask_step" title="Link to this definition">#</a></dt>
+<dd><p>One unmask iteration for every request of a step, batched.</p>
+<p>The reference’s scoring (<code class="docutils literal notranslate"><span class="pre">_predict_tokens_with_scoring</span></code>) and reveal for
+each request, over the step’s packed target positions at once. Each request
+draws from its own generator in the reference’s order (token choice, then
+reveal order), and its result is the reference’s arithmetic to the bit
+when the step’s requests share their knobs. A temperature that differs
+between them is divided by per position instead of as one scalar, which
+can round differently (CUDA divides by a scalar as a multiply by its
+reciprocal), so a request batched with others can then flip a reveal at a
+near-tie.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>logits</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>generator</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Generator.html#torch.Generator" title="(in PyTorch v2.15)"><em>Generator</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.unmask.</span></span><span class="sig-name descname"><span class="pre">predict_tokens_with_scoring</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">c_logits</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">u_logits</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_mask_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">guidance_scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">class_temperature</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generator</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/unmask.html#predict_tokens_with_scoring"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring" title="Link to this definition">#</a></dt>
-<dd><p>CFG-combine conditional and unconditional logits, then rank.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>c_logits</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – conditional logits, <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T,</span> <span class="pre">V]</span></code>.</p></li>
-<li><p><strong>u_logits</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – unconditional logits, same shape.  Ignored when
-<code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code> is 0.</p></li>
-<li><p><strong>audio_mask_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – the MASK class, forced to -inf so it is never predicted.</p></li>
-<li><p><strong>guidance_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>) – 0 disables CFG entirely (and the caller may then skip
-the unconditional forward).</p></li>
-<li><p><strong>class_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>) – 0 takes the argmax; above 0 samples from the top
-decile with Gumbel noise.</p></li>
-<li><p><strong>generator</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Generator.html#torch.Generator" title="(in PyTorch v2.15)"><em>Generator</em></a><em> | </em><em>None</em>) – the request’s seeded RNG, or <code class="docutils literal notranslate"><span class="pre">None</span></code> for the global one.</p></li>
+<li><p><strong>logits</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">R,</span> <span class="pre">V]</span></code>: every request’s conditional target block in
+order, then the unconditional blocks (<code class="docutils literal notranslate"><span class="pre">PackedCanvas</span></code>’s gather order).</p></li>
+<li><p><strong>canvases</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>) – each request’s live canvas, <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">T_i]</span></code>; not written.</p></li>
+<li><p><strong>uncond_rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>) – where each request’s unconditional block starts in
+<code class="docutils literal notranslate"><span class="pre">logits</span></code>, or -1 for a request with CFG off.</p></li>
+<li><p><strong>counts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>) – the cells each request reveals this iteration.</p></li>
+<li><p><strong>generators</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.Generator.html#torch.Generator" title="(in PyTorch v2.15)"><em>Generator</em></a><em> | </em><em>None</em><em>]</em>) – each request’s RNG for this iteration (<code class="docutils literal notranslate"><span class="pre">None</span></code>: global).</p></li>
+<li><p><strong>guidance_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
+<li><p><strong>class_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
+<li><p><strong>layer_penalty_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
+<li><p><strong>position_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>]</em>)</p></li>
+<li><p><strong>audio_mask_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">(pred_tokens,</span> <span class="pre">confidence_scores)</span></code>, each <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code>.  The scores
-are max log-probabilities and drive which cells get revealed.</p>
+<dd class="field-even"><p>the next canvases end to end, <code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">sum(T_i)</span></code>.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">P]</span></code></p>
 </dd>
 </dl>
 </dd></dl>
@@ -937,12 +885,10 @@ are max log-probabilities and drive which cells get revealed.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.apply_reveal"><code class="docutils literal notranslate"><span class="pre">apply_reveal()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.build_reveal_schedule"><code class="docutils literal notranslate"><span class="pre">build_reveal_schedule()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.filter_top_k"><code class="docutils literal notranslate"><span class="pre">filter_top_k()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.get_time_steps"><code class="docutils literal notranslate"><span class="pre">get_time_steps()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.gumbel_sample"><code class="docutils literal notranslate"><span class="pre">gumbel_sample()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.predict_tokens_with_scoring"><code class="docutils literal notranslate"><span class="pre">predict_tokens_with_scoring()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.omnivoice.components.unmask.unmask_step"><code class="docutils literal notranslate"><span class="pre">unmask_step()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -695,7 +695,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.plan"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.run"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.select_last_hidden()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.supports_preplan</span></code></a></li>
 </ul>
 </li>
@@ -830,22 +829,6 @@ by every plan and therefore has no address-stability guarantee.</p>
 </dl>
 </dd></dl>
 
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden">
-<span class="sig-name descname"><span class="pre">select_last_hidden</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/xpu.html#XPUPagedAttentionManager.select_last_hidden"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.supports_preplan">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">supports_preplan</span></span><a class="headerlink" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.supports_preplan" title="Link to this definition">#</a></dt>
@@ -957,7 +940,6 @@ by every plan and therefore has no address-stability guarantee.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.plan"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.run"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.select_last_hidden()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">XPUPagedAttentionManager.supports_preplan</span></code></a></li>
 </ul>
 </li>
