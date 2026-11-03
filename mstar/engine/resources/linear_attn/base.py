@@ -67,6 +67,7 @@ class LinearAttnManager(AttentionResource):
                 state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 device=info.device,
                 speculative_tokens=DeltaNetGeometry.speculative_tokens_of(pool_config.blocks),
+                conv_dtype=pool_config.blocks["conv"].resolved_dtype(info.kv_dtype),
             )
 
         if backend is not LinearAttnBackend.FLASHINFER:

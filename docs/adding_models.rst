@@ -562,6 +562,11 @@ The spec types are:
        A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
        parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
        worker's pool admits requests on its own.
+       ``correct_len(rid, label, delta)`` moves a stream's length between steps, never
+       between a step's admit and commit. A speculative verify step commits its whole block,
+       and its rejected tail is taken back (``delta < 0``) before the next step is declared;
+       the position resource's ``correct_len`` moves the position with it. GLM-5.2's MTP
+       is the user.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -663,7 +668,8 @@ The spec types are:
        instead of the label's plan, and ``k=None`` rotates one tensor. ``interleave``
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
        a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
-       kernel that rotates inside a larger fusion. A model with learned position
+       kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
+       kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
@@ -705,10 +711,10 @@ The spec types are:
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
        settles each one's accepted drafts. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
-       output gate is ``full_rank_output_gate``, which the ``LinearAttnConfig`` declares
-       too: the resource then runs the torch reference, as the fused kernels apply only
-       the low-rank gate).
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
+       the resource its gates as it binds: with Kimi K3's full-rank output gate
+       (``full_rank_output_gate``), or a forget-gate bound the fused kernels can't hold,
+       the resource runs the torch reference.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:

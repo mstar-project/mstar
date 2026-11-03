@@ -74,7 +74,7 @@ class Glm52SparseMoeBlock(nn.Module):
         self.fp8_experts = (
             config.quantization_config is not None and config.moe_fp8_resident
         )
-        self.kernels = getattr(config, "kernels", "reference")
+        self.kernels = config.kernels
         if self.kernels not in KERNELS:
             # an unknown value would otherwise resolve to the uncapturable
             # reference loop and serve eager behind a healthy /health
@@ -363,15 +363,12 @@ class Glm52SparseMoeBlock(nn.Module):
     def process_weights_after_loading(self, device) -> None:
         """Resolve the dispatch on the real device: kernels: auto takes the fused path where
         it runs (else the reference loop, eager, with a warning), kernels: reference the loop."""
-        self.gate.finalize_weights()
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        self._use_fused = (self.fp8_experts and self.kernels == "auto"
+                           and fused_fp8_available(dev, self.block_size))
+        self.gate.finalize_weights(topk_kernel=self._use_fused and self._router_kernel)
         if not self.fp8_experts:
             return
-        dev = torch.device(device) if device is not None else torch.device("cpu")
-        self._use_fused = self.kernels == "auto" and fused_fp8_available(dev, self.block_size)
-        if self._use_fused and self._router_kernel:
-            from mstar.utils.fused_moe import decode as moe_decode  # registers the op
-
-            self.gate._topk_op = moe_decode.router_topk
         global _BACKEND_LOGGED
         if not _BACKEND_LOGGED:
             logger.info(

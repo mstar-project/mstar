@@ -430,8 +430,8 @@ class Glm52Model(Model):
             k: model_kwargs.get(k, getattr(self.config, k))
             for k in keys
         }
-        # the sampler's own knobs with no config default; dropped, a request got neither
-        for k, cast in (("top_k", int), ("min_p", float)):
+        # the sampler's own knobs with no config default; dropped, a request got none of them
+        for k, cast in (("top_k", int), ("min_p", float), ("penalize_prompt", bool)):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:

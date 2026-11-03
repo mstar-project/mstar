@@ -62,18 +62,18 @@ class _Recorder:
 
 
 def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculative_tokens=0,
-          sink=True, dim=DIM, full_rank_output_gate=False):
+          sink=True, dim=DIM, conv_dtype=torch.bfloat16):
     geometry = DeltaNetGeometry(
         num_k_heads=heads, num_v_heads=v_heads, head_k_dim=dim, head_v_dim=dim,
         conv_kernel_size=4,
     )
     pool = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
-        num_layers=3, blocks=geometry.to_blocks(speculative_tokens=speculative_tokens),
+        num_layers=3,
+        blocks=geometry.to_blocks(speculative_tokens=speculative_tokens, conv_dtype=conv_dtype),
         max_slots=6, disable_sink_slot=not sink,
     ))
     kda = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=backend,
-        gate_lower_bound=-5.0, full_rank_output_gate=full_rank_output_gate,
     ))
     return pool, kda
 
@@ -114,10 +114,12 @@ def eager(rids, walk="prefill"):
     return StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
 
 
-def leased(real, padded, bs, tokens, walk="prefill", slot=0):
+def leased(real, padded, bs, tokens, walk="prefill", slot=0, capture=False):
     ctx = StepContext(
-        request_ids=tuple(real), graph_walk=walk, slot=slot, capture=False,
+        request_ids=tuple(real), graph_walk=walk, slot=slot, capture=capture,
         slot_lease=SlotLease(slot=slot, bucket=BucketKey(walk, bs, tokens)),
+        # the prefill buckets here are packed, which the engine marks so
+        force_prefill=walk == "prefill",
     )
     ctx.set_padded_rids(tuple(padded))
     return ctx
@@ -134,10 +136,11 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 
 
 def test_default_kernels(monkeypatch):
-    """The resource picks the fused kernels where they run what the spec declares, and the
-    torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline PTX), at
-    a head dim they aren't validated for and for a full-rank output gate. A spec that leaves
-    the config's default backend builds."""
+    """The resource picks the fused kernels where they run the pool and the layers it binds,
+    and the torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline
+    PTX), at a head dim or activation dtype they aren't validated for, and for a layer with a
+    full-rank output gate or a forget-gate bound past what their decay blocks hold. A spec that
+    leaves the config's default backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     assert not kda.prefill_capturable
@@ -151,9 +154,15 @@ def test_default_kernels(monkeypatch):
 
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
     kda = built_on_cuda(dim=128)
+    kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=False)
     assert isinstance(kda.kernels, TritonKDAKernels) and kda.prefill_capturable
     assert isinstance(built_on_cuda(dim=16).kernels, TorchKDAKernels)
-    assert isinstance(built_on_cuda(dim=128, full_rank_output_gate=True).kernels, TorchKDAKernels)
+    assert isinstance(built_on_cuda(dim=128, conv_dtype=torch.float16).kernels, TorchKDAKernels)
+    for gate in (dict(lower_bound=-5.0, full_rank_output_gate=True),
+                 dict(lower_bound=-6.0, full_rank_output_gate=False)):
+        kda = built_on_cuda(dim=128)
+        kda.bind_layer(**gate)
+        assert isinstance(kda.kernels, TorchKDAKernels), gate
     monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
     assert isinstance(built_on_cuda(dim=128).kernels, TorchKDAKernels)
 
@@ -192,8 +201,8 @@ def test_a_captured_prefill_keeps_one_layout_buffer():
 
 
 def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
-    """Under a lease the walk picks the kernels, not the spans: a replay runs what its
-    bucket captured."""
+    """A packed bucket replays uneven spans, so it runs the prefill kernels even when it
+    captures one token per row; a batched decode bucket decodes."""
     pool, kda = build()
     kda.kernels = _Recorder()
     capture = plan(pool, kda, ["a", "b"], [1, 1], leased(["a", "b"], ["a", "b"], bs=2, tokens=2))
@@ -290,12 +299,55 @@ def test_set_prefix_len_leaves_the_slots_outside_the_step():
     spec = SpecBlocks.of(pool, 0)
     a, c = (pool._slots[r]["main"].index for r in "ac")
     spec.prefix_len[c], spec.side[c] = 2, 1
+    capture = ["cap0", "cap1"]
+    plan(pool, kda, capture, [3, 3],
+         leased(capture, capture, bs=2, tokens=6, walk="decode", capture=True), speculative=True)
+    mix.set_prefix_len(torch.tensor([0, 0]))
     plan(pool, kda, ["a", "pad"], [3, 3],
          leased(["a"], ["a", "pad"], bs=2, tokens=6, walk="decode"), speculative=True)
     mix.set_prefix_len(torch.tensor([1, 2]))
     assert (spec.prefix_len[a, 0].item(), spec.side[a, 0].item()) == (2, 1)
     assert (spec.prefix_len[c, 0].item(), spec.side[c, 0].item()) == (2, 1)
     assert spec.prefix_len[SINK_SLOT, 0].item() == 3
+
+
+def test_a_verify_step_settles_its_count_once_and_its_requests_keep_verifying():
+    """The resource refuses a verify step whose forward skips set_prefix_len or calls it
+    twice, a replay of a capture that skipped it, and a step that doesn't verify for a
+    request that verified, whose state is behind its accepted drafts."""
+    pool, kda = build(speculative_tokens=2)
+    kda.kernels = _Recorder()
+    mix = KDACallable(pool, kda)
+    ctx = eager(["a", "b"])
+    plan(pool, kda, ["a", "b"], [2, 2], ctx)
+    with pytest.raises(RuntimeError, match="didn't verify"):
+        mix.set_prefix_len(torch.tensor([0, 0]))
+    commit(pool, ["a", "b"], [2, 2], ctx)
+
+    def verify(rids, ctx):
+        plan(pool, kda, rids, [3] * len(rids), ctx, speculative=True)
+        return LinearAttnStep(
+            segments=tuple(Segment(r, "main", 3) for r in rids), speculative=True,
+        )
+
+    ctx = eager(["a"], walk="decode")
+    step = verify(["a"], ctx)
+    with pytest.raises(RuntimeError, match="without set_prefix_len"):
+        kda.commit(step, ctx)
+    mix.set_prefix_len(torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="twice"):
+        mix.set_prefix_len(torch.tensor([1]))
+    kda.commit(step, ctx)
+    commit(pool, ["a"], [3], ctx)
+    with pytest.raises(ValueError, match="only a verify step replays"):
+        plan(pool, kda, ["a"], [1], eager(["a"], walk="decode"))
+    plan(pool, kda, ["b"], [1], eager(["b"], walk="decode"))  # b never verified
+
+    verify(["c0"], leased(["c0"], ["c0"], bs=1, tokens=3, walk="decode", capture=True))
+    with pytest.raises(RuntimeError, match="ran no set_prefix_len"):
+        verify(["a"], leased(["a"], ["a"], bs=1, tokens=3, walk="decode"))
+    kda.remove_request("a")  # its handle can go to a request that hasn't verified
+    plan(pool, kda, ["a"], [1], eager(["a"], walk="decode"))
 
 
 def test_a_verify_step_fits_the_pools_blocks():
