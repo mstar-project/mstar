@@ -272,8 +272,10 @@ def _submodule_class():
             )
 
         def preprocess(self, graph_walk, engine_inputs, inputs):
+            # a vision row's ids are embedded and its image rows spliced in, as the
+            # real `preprocess` does, one row at a time
             return {"embeds": [
-                inp.input_embeds if inp.input_embeds is not None
+                self._vision_embeds([inp]) if inp.input_ids is None
                 else self.model.model.embed_tokens(inp.input_ids)
                 for inp in inputs
             ]}
