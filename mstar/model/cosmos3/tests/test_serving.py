@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.model.cosmos3.tests.stubs import StubSampler
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
 
@@ -137,12 +138,8 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
         model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
 
-    class _Sched:
-        def __init__(self, n):
-            self.timesteps = list(range(n))
-
     n = 4
-    dit.request_state("r").add_all(scheduler=_Sched(n), raw_action_dim=2)
+    dit.request_state("r").add_all(scheduler=StubSampler(list(range(n))), raw_action_dim=2)
 
     def info(walk, it):
         return types.SimpleNamespace(
@@ -160,14 +157,12 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     # A forward one past the step count returns its inputs unchanged without
     # touching the transformer or cache manager (both None here).
     lat = torch.zeros(1, 4, 1, 2, 2)
-    ti = torch.tensor([n])
-    out = dit._forward_image_gen(None, dit.request_states["r"], latents=lat, time_index=ti)
-    assert torch.equal(out["latents"][0], lat) and torch.equal(out["time_index"][0], ti)
+    solver = {"unipc_last_sample": torch.ones(1)}
+    out = dit._forward_image_gen(None, dit.request_states["r"], n, latents=lat, **solver)
+    assert torch.equal(out["latents"][0], lat) and out["unipc_last_sample"] == [solver["unipc_last_sample"]]
 
     act = torch.zeros(1, 3, 5)
-    out = dit._forward_action_gen(
-        None, dit.request_states["r"], latents=lat, action_latents=act, time_index=ti
-    )
+    out = dit._forward_action_gen(None, dit.request_states["r"], n, latents=lat, action_latents=act)
     assert torch.equal(out["latents"][0], lat)
     # The action latents (the looped self-edge the loop emits on finish) pass
     # through unchanged on the discarded extra step.
@@ -182,7 +177,7 @@ def test_process_prompt_emits_cond_and_uncond() -> None:
     eos = model.tokenizer.eos_token_id
 
     out = model.process_prompt("a red cube on a table", ["text"], ["image"], tensors={}, size="256x256")
-    ti = out["text_inputs"]
+    ti = out.new_input_tensors["text_inputs"]
     assert len(ti) == 2, "t2i must emit a conditional and unconditional prompt"
     cond, uncond = ti[0].tolist(), ti[1].tolist()
     assert cond[-2:] == [eos, sog]
@@ -409,7 +404,8 @@ def test_vae_decode_bf16_warmup(monkeypatch) -> None:
 
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")  # keep _decode the raw stub
     vae = _StubVAE()
-    sub = Cosmos3VAEDecoderSubmodule(vae, Cosmos3Config())
+    # the stock compiled-decode path (vae_decode_fast routes around it)
+    sub = Cosmos3VAEDecoderSubmodule(vae, Cosmos3Config(vae_decode_fast=False))
     sub._decode_compiled = True
     sub._decode_dtype_cached = torch.bfloat16
 
@@ -678,41 +674,33 @@ def test_postprocess_finishes_captured_step() -> None:
 
     import torch
 
-    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.submodules import IMAGE_GEN_LOOP, Cosmos3DiTSubmodule
     from mstar.model.submodule_base import ARNodeInputs
 
     dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
         model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
-
-    class _Sched:
-        step_index = None
-        timesteps = torch.tensor([900.0, 500.0, 100.0])
-
-        @staticmethod
-        def step(velocity, t, latents, return_dict=False):
-            return (latents + velocity,)
+    dit._solver_state = ()
 
     # One all-noisy latent frame of 2x2 patches (the layout the captured
     # graph's velocity mask is derived from).
     dit.request_state("r").add_all(
-        gs=2.0, scheduler=_Sched(),
+        gs=2.0, scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
         cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
     )
-    info = types.SimpleNamespace(graph_walk="image_gen")
-    lat, ti = torch.ones(1, 1, 2, 2), torch.tensor([1])
-    inp = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": ti})
+    info = types.SimpleNamespace(graph_walk="image_gen", dynamic_loop_iter_counts={IMAGE_GEN_LOOP: 1})
+    lat = torch.ones(1, 1, 2, 2)
+    inp = ARNodeInputs(tensor_inputs={"latents": lat})
 
     # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
     out = {"cond_v": [torch.full((1, 1, 2, 2), 2.0)], "uncond_v": [torch.ones(1, 1, 2, 2)]}
     dit.postprocess("r", info, out, inputs=inp)
-    assert set(out) == {"latents", "time_index"}
+    assert set(out) == {"latents"}
     assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 4.0))
-    assert torch.equal(out["time_index"][0], torch.tensor([2]))
 
     # Eager shape (already finished) and non-gen walks stay untouched.
-    eager = {"latents": [lat], "time_index": [ti]}
+    eager = {"latents": [lat]}
     dit.postprocess("r", info, eager, inputs=inp)
-    assert eager == {"latents": [lat], "time_index": [ti]}
+    assert eager == {"latents": [lat]}
     pre = {"cond_v": [lat]}
     dit.postprocess("r", types.SimpleNamespace(graph_walk="prefill"), pre, inputs=inp)
     assert pre == {"cond_v": [lat]}
@@ -728,7 +716,7 @@ def test_video_postprocess_uses_request_fps(tmp_path) -> None:
     import torch
 
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    frames = torch.zeros(1, 3, 8, 32, 32, dtype=torch.uint8)
+    frames = torch.zeros(8, 3, 32, 32, dtype=torch.uint8)
     data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
     (tmp_path / "v.mp4").write_bytes(data)
     with av.open(io.BytesIO(data)) as container:
@@ -749,3 +737,86 @@ if __name__ == "__main__":
     if NANO_DIR.exists():
         test_process_prompt_emits_cond_and_uncond()
     print("PASS")
+
+
+def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypatch) -> None:
+    """With vae_decode_fast the whole-clip node decodes through
+    wan_vae.decode_causal from an empty cache, channels-last."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.components import wan_vae
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
+
+    class _StubVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.decoder = torch.nn.Identity()
+            self.config = SimpleNamespace(latents_mean=[0.0] * 4, latents_std=[1.0] * 4)
+
+        def decode(self, z):  # the stock path, never taken here
+            raise AssertionError("stock vae.decode called")
+
+    calls = []
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: calls.append("channels_last"))
+    monkeypatch.setattr(wan_vae, "is_channels_last", lambda vae: "channels_last" in calls)
+    monkeypatch.setattr(wan_vae, "new_feat_cache", lambda vae: [])
+
+    def fake_decode_causal(vae, z, feat_cache, step, *, clip_start, latents_per_call=1):
+        calls.append(("decode_causal", clip_start, feat_cache == []))
+        t = 1 + (z.shape[2] - 1) * 4
+        return torch.zeros(1, 3, t, 8, 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(wan_vae, "decode_causal", fake_decode_causal)
+    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config(), fast=True)
+    sub._decode_dtype_cached = torch.bfloat16
+    out = sub.forward("video_gen", None, torch.zeros(1, 4, 3, 8, 8, dtype=torch.bfloat16))
+    assert calls == ["channels_last", ("decode_causal", True, True)]
+    assert out["video_output"][0].shape == (9, 3, 8, 8)
+    assert out["video_output"][0].dtype == torch.uint8
+
+
+def test_vae_decode_fast_keeps_images_on_the_stock_decode(monkeypatch) -> None:
+    """One latent (an image) is faster through the compiled stock decode than
+    through the per-latent step, so the fast path only takes clips."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.components import wan_vae
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
+
+    class _StubVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.decoder = torch.nn.Identity()
+            self.config = SimpleNamespace(latents_mean=[0.0] * 4, latents_std=[1.0] * 4)
+
+        def decode(self, z):
+            return SimpleNamespace(sample=torch.zeros(1, 3, z.shape[2], 8, 8, dtype=torch.bfloat16))
+
+    def no_step(*args, **kwargs):
+        raise AssertionError("the fast path took an image")
+
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: None)
+    monkeypatch.setattr(wan_vae, "decode_causal", no_step)
+    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config(), fast=True)
+    sub._decode_dtype_cached = torch.bfloat16
+    out = sub.forward("image_gen", None, torch.zeros(1, 4, 1, 8, 8, dtype=torch.bfloat16))
+    assert out["image_output"][0].shape == (1, 3, 1, 8, 8) and out["image_output"][0].dtype == torch.uint8
+
+
+def test_vae_decode_fast_must_be_a_bool() -> None:
+    import pytest
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+
+    with pytest.raises(ValueError, match="vae_decode_fast must be true or false"):
+        Cosmos3Config(vae_decode_fast="false").check_streaming_decode()

@@ -58,18 +58,21 @@ class _NoEngine(LocalTransferEngine):
 class _FlatCopyReader:
     """The transfer engine's batch read: ``nbytes`` from ``remote_ptr``."""
 
-    def __init__(self, engine, device, enable_prof=False):
-        pass
+    def __init__(self, engine, device, enable_prof=False, device_filter=""):
+        self.device_filter = device_filter
 
     def submit(self, reads):
         for r in reads:
             ctypes.memmove(r.local_ptr, r.remote_ptr, r.nbytes)
 
+    def transfer_status(self, batch_id):
+        raise AssertionError("no read fails here, so no transfer is handed over")
+
 
 @pytest.fixture(autouse=True)
 def _no_transfer_engine(monkeypatch):
     monkeypatch.setattr(tensors, "MooncakeTransferEngine", _NoEngine)
-    monkeypatch.setattr(tensors, "AsyncMooncakeReader", _FlatCopyReader)
+    monkeypatch.setattr(tensors, "TrackedMooncakeReader", _FlatCopyReader)
 
 
 def _mooncake(entity, bookkeeping="python"):
@@ -138,6 +141,16 @@ def test_batch_store_gapped_views_arrive_intact(bookkeeping):
     received = _transfer(prod, cons, 3, infos)
     for got, want in zip(received, sent, strict=True):
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("protocol, device_filter", [(CommProtocol.TCP, "eth1"), (CommProtocol.RDMA, "")])
+def test_the_reader_gets_the_device_filter_the_engine_was_initialized_with(protocol, device_filter):
+    """The engine filters its topology by the TCP device only, so the reader
+    counts retries under the same filter."""
+    mgr = MooncakeCommunicationManager(
+        "e", "host", "cpu", _NullCommunicator(), protocol=protocol, tcp_transfer_device="eth1",
+    )
+    assert mgr._async_reader.device_filter == device_filter
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

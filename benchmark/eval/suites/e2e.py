@@ -27,8 +27,8 @@ from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, error_row, exception_row, parse_extra
 
 KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-         "gen_clone", "pi05", "frames")
-MEDIA_KINDS = {"chat_image", "chat_audio", "chat_video", "video_i2v", "pi05", "frames"}
+         "gen_clone", "pi05", "frames", "world")
+MEDIA_KINDS = {"chat_image", "chat_audio", "chat_video", "video_i2v", "pi05", "frames", "world"}
 PROMPTS = [
     "Describe this in two sentences.",
     "What is the main subject here? Answer briefly.",
@@ -55,8 +55,25 @@ GEN_PROMPTS = [
     "a small robot watering plants in a greenhouse",
 ]
 PI05_TASKS = ["pick up the red block", "open the drawer", "push the cup left", "stack the blocks"]
-EXT = {"image": "png", "video": "mp4", "video_i2v": "mp4", "pi05": "f32", "frames": "u8"}
+WORLD_PROMPT = "a quiet street at dusk, the camera moving slowly forward"
+WORLD_FRAMES = 29                         # two 4-latent-frame chunks at a temporal VAE stride of 4
+WORLD_INTRINSICS = [500.0, 500.0, 416.0, 240.0]   # fx, fy, cx, cy at 832x480
+EXT = {"image": "png", "video": "mp4", "video_i2v": "mp4", "pi05": "f32", "frames": "u8", "world": "u8"}
 DEFAULT_ITEMS = 16
+
+
+def camera_path(n: int, step: float, yaw_deg: float) -> list[list[list[float]]]:
+    """``n`` OpenCV camera-to-world poses: forward along +z by ``step`` per frame while turning ``yaw_deg`` per
+    frame about the y axis. A seeded, fixed trajectory, so two servers get the same request."""
+    import math
+
+    poses = []
+    for k in range(n):
+        a = math.radians(yaw_deg * k)
+        c, s = math.cos(a), math.sin(a)
+        poses.append([[c, 0.0, s, step * k * s], [0.0, 1.0, 0.0, 0.0], [-s, 0.0, c, step * k * c],
+                      [0.0, 0.0, 0.0, 1.0]])
+    return poses
 
 
 class E2ESuite(Suite):
@@ -149,6 +166,14 @@ class E2ESuite(Suite):
             form.add_field("input_modalities", "image,text")
             form.add_field("output_modalities", "action")
             kwargs = {"robot_state": [0.01 * (j + i % 4) for j in range(32)], "seed": 1000 + i}
+        elif kind == "world":
+            form.add_field("files", self._bytes("i2v.png"), filename="seed.png", content_type="image/png")
+            form.add_field("text", WORLD_PROMPT)
+            form.add_field("input_modalities", "image,text")
+            form.add_field("output_modalities", "video_frame")
+            yaw = [0.0, 1.5, -1.5, 0.75][i % 4]
+            kwargs = {"camera_poses": camera_path(WORLD_FRAMES, 0.05, yaw), "intrinsics": WORLD_INTRINSICS,
+                      "num_frames": WORLD_FRAMES, "seed": 7}
         else:
             form.add_field("files", self._bytes("waypoint_seed.png"), filename="seed.png", content_type="image/png")
             form.add_field("text", "")

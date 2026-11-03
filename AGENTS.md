@@ -44,7 +44,7 @@ For example, nothing under `mstar/model/` should:
 - **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
 - **Manage streams or synchronize.** No `torch.Stream`, `torch.Event`, `torch.accelerator.synchronize`, or device-specific equivalents under `mstar/model/`.
-- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_` ([#383](https://github.com/mstar-project/mstar/pull/383), open PR), `attend` over the current plan), so eager and captured paths address rows the same way.
+- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
 
 Things that look model-specific but belong to the system:
 
@@ -102,7 +102,7 @@ See https://github.com/mstar-project/mstar/pull/368 for some sources of overhead
 
 By default the worker speculates step N+1 through the graph while step N is still running (`enable_async_scheduling`, [mstar/graph/base.py](mstar/graph/base.py#L240), default `True`). It pre-plans it on a separate thread and stream. The full stage order, thread by thread, is in [.claude/skills/async-worker/SKILL.md](.claude/skills/async-worker/SKILL.md) — **read it before changing the worker's main loop, the GPU thread, the plan thread, speculation or postprocess.**
 
-(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `0` and is expected to flip on later)
+(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
 
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
@@ -157,7 +157,7 @@ Review any new early return, `continue`, or exception path in worker and engine 
 
 Lockstep is also about **when** something is run, not only whether. The main thread runs ahead of the GPU thread within a single step (invariant 7), so "one step in flight" does not mean "that step has admitted": admit is on the GPU thread while the main thread is already applying teardowns and scanning readiness, both of which move the state admit reads. A rank can then admit a step in a window that exists only between two of its own state changes, and a rank replaying those changes in order admits the same step from a different state. Every mutation of replicated state has to land before the step is broadcast or after that step has admitted, never between.
 
-**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, LRU orders on wall clock, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
+**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, the victim comes from stamps each rank's scheduler keeps for itself, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
 
 Some lessons learned from debugging KV cache symmetry across TP ranks:
 - **Ordered, not summarized.** A set of offloads plus a set of reloads cannot say whether a request ended up resident; the order of actions must be sent, and replayed verbatim.
@@ -168,7 +168,7 @@ Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo
 ### 12. Async partitions coordinate through streaming edges
 
 Distinct from the async worker in invariant 7. An **async partition** keeps its own set of graph walks with independent state transitions; data crosses between partitions on **streaming edges**, buffered in `StreamBuffer`s on the consumer worker and handed to graph nodes according to a chunk policy. Two hazards we have seen so far:
-- **Cross-partition races.** Partitions that must advance together need an explicit mechanism. Qwen3-Omni's thinker and talker have to stay in lockstep, and specifically the talker must transition to its decode walk at the right moment: the conductor sends a dummy edge for every new graph walk to mark that walk's start, after which decode runs as a dynamic loop with no further conductor intervention. [#385](https://github.com/mstar-project/mstar/pull/385) replaces this with producer-triggered walks: a `Connection`'s `consumer_walk` hook runs on the producer and assigns each pass's streamed items the consumer walk they run under, the consumer switches walk only when the partition is idle, and conductor inputs for a later walk wait on the worker. Once it lands, use it rather than adding a second coordination mechanism, or say why it doesn't fit.
+- **Cross-partition races.** Partitions that must advance together need an explicit mechanism. Qwen3-Omni's thinker and talker have to stay in lockstep, and specifically the talker must move through its prefill walks as the thinker's prefill and decode advance. The mechanism is producer-triggered walks ([#385](https://github.com/mstar-project/mstar/pull/385)): a `Connection`'s `consumer_walk` hook runs on the producer and assigns each row's streamed items the consumer walk they run under, the consumer switches walk only when the partition is idle, and the conductor follows the walk each pass reports on `WORKER_GRAPHS_DONE`. Use it rather than adding a second coordination mechanism, or say why it doesn't fit.
 - **Deciding a streaming partition is finished.** This is easy to get subtly wrong. Qwen3-Omni and Orpheus are the references worth reading before writing a new one.
 
 ### 13. Cross-request prefix reuse
@@ -191,7 +191,7 @@ python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
                                       # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
 pytest test/integration/              # needs GPU + weights
-cd rust && cargo test --release --no-default-features && pytest ../test/rust/
+cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
 The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`, `mstar_rust`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).

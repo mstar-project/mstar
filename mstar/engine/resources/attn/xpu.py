@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
@@ -80,6 +80,7 @@ class XPUPagedAttentionManager(AttentionManager):
         )
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
@@ -163,7 +164,7 @@ class XPUPagedAttentionManager(AttentionManager):
                         for name, values in metadata.items()
                     },
                     max_q=max_q if max_q is not None else max((view.to_compute for view in views), default=0),
-                    max_k=self._kv_config.max_num_pages * self._kv_config.page_size,
+                    max_k=self._kv_config.max_num_pages * self._kv_config.tokens_per_page,
                     causal=causal,
                 )
             for name, values in metadata.items():

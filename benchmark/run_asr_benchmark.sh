@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ASR benchmark script: throughput and latency for Whisper-large-v3 and Higgs Audio.
+# ASR benchmark script: throughput and latency for the ASR models below.
 #
 # Usage:
 #   ./benchmark/run_asr_benchmark.sh --url http://localhost:8000 [options]
@@ -11,7 +11,8 @@
 #   --url  <base_url>       mstar server base URL
 #
 # Optional:
-#   --model  <name>         Run only this model (whisper_large|higgs_audio)
+#   --model  <name>         Run only this model (whisper_large|higgs_audio|canary|
+#                           canary_qwen|parakeet|nemotron_asr)
 #   --num-requests  <n>     Total requests per model (default: 100)
 #   --batch-size  <b>       Batch size for offline profiling (default: 4)
 #   --max-concurrency <c>   Concurrency cap for closed-loop profiling (default: 4)
@@ -52,7 +53,7 @@ if [[ -z "$URL" ]]; then
   exit 1
 fi
 
-ASR_MODELS=(whisper_large higgs_audio)
+ASR_MODELS=(whisper_large higgs_audio canary canary_qwen parakeet nemotron_asr)
 
 if [[ -n "$MODEL" ]]; then
   ASR_MODELS=("$MODEL")
@@ -101,14 +102,14 @@ done
 echo ""
 echo "All ASR benchmarks complete.  Results in: ${OUTPUT_DIR}"
 
-# Print a quick comparison table if all three models ran
+# Print a quick comparison table of the models that ran
 if [[ -z "$MODEL" ]] && command -v python &>/dev/null; then
   export _ASR_OUTPUT_DIR="$OUTPUT_DIR"
   python - <<'PYEOF'
 import json, os, sys
 
 output_dir = os.environ.get("_ASR_OUTPUT_DIR", "./asr_benchmark_results")
-models = ["whisper_large", "higgs_audio"]
+models = ["whisper_large", "higgs_audio", "canary", "canary_qwen", "parakeet", "nemotron_asr"]
 
 rows = []
 for m in models:

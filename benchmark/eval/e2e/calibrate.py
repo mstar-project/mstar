@@ -61,8 +61,8 @@ def add_run(run_dir: Path, models: list[Model], path: str | Path = DEFAULT,
     """Fold one A/A run into the calibration; returns the number of entries recorded (0 when already folded in).
     Failed or errored rows stay out of the perf floors; ``excluded`` gets how many per model.
 
-    Perf drifts (``_runs``) and correctness swings (``_runs_correct``) are tracked apart, so a run folded in before
-    correctness swings were recorded can still add those."""
+    Perf drifts (``_runs``), correctness swings (``_runs_correct``) and quality-score swings (``_runs_quality``) are
+    tracked apart, so a run folded in before one kind was recorded can still add it."""
     path = Path(path)
     run = json.loads((run_dir / "run.json").read_text())
     if run["base"]["sha"] != run["head"]["sha"]:
@@ -70,7 +70,8 @@ def add_run(run_dir: Path, models: list[Model], path: str | Path = DEFAULT,
     gpu = run.get("gpu", "unknown")
     cal = load(path)
     seen, seen_c = set(cal.get("_runs", [])), set(cal.get("_runs_correct", []))
-    if run["id"] in seen and run["id"] in seen_c:
+    seen_q = set(cal.get("_runs_quality", []))
+    if run["id"] in seen and run["id"] in seen_c and run["id"] in seen_q:
         return 0
     n = 0
     if run["id"] not in seen:
@@ -89,12 +90,12 @@ def add_run(run_dir: Path, models: list[Model], path: str | Path = DEFAULT,
                     key = report.calibration_key(gpu, r.model, r.case, p.metric, p.conc)
                     cal.setdefault(key, {"deltas": []})["deltas"].append(round(p.delta_pct, 3))
                     n += 1
-    if run["id"] not in seen_c:
-        for m in models:
-            for name in (m.name, m.name + report.RERUN_TAG):
-                f = run_dir / "results" / name / "compare.json"
-                compare = json.loads(f.read_text()) if f.exists() else {}
-                for c in m.cases:
+    for m in models:
+        for name in (m.name, m.name + report.RERUN_TAG):
+            f = run_dir / "results" / name / "compare.json"
+            compare = json.loads(f.read_text()) if f.exists() else {}
+            for c in m.cases:
+                if run["id"] not in seen_c:
                     swings = [s for s in (report.aa_swing(c.check["kind"], x) for x in compare.get(c.id, []))
                               if s is not None and math.isfinite(s)]
                     if swings:
@@ -102,7 +103,15 @@ def add_run(run_dir: Path, models: list[Model], path: str | Path = DEFAULT,
                         entry = cal.setdefault(key, {"kind": c.check["kind"], "swings": []})
                         entry["swings"] += [round(s, 4) for s in swings]
                         n += 1
+                if run["id"] not in seen_q:
+                    for x in compare.get(c.id, []):
+                        for kind, s in report.quality_swings(x).items():
+                            if kind in c.quality and math.isfinite(s):
+                                key = report.quality_key(gpu, m.name, c.id, kind)
+                                cal.setdefault(key, {"kind": kind, "swings": []})["swings"].append(round(s, 4))
+                                n += 1
     cal["_runs"] = sorted(seen | {run["id"]})
     cal["_runs_correct"] = sorted(seen_c | {run["id"]})
+    cal["_runs_quality"] = sorted(seen_q | {run["id"]})
     save(cal, path)
     return n

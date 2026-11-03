@@ -78,3 +78,12 @@ def test_the_api_server_counts_a_long_clip_without_a_sample_count_only_past_its_
         media_io.check_ref_audio(path, "soundfile")
     assert len(counted) == 1 and 60 < counted[0] <= 60 + LAST_FRAME / RATE
     assert not Path(path).exists()
+
+
+@pytest.mark.parametrize("decoder", ["soundfile", "soundfile+torchcodec"])
+def test_the_api_server_refuses_a_clip_with_no_samples(tmp_path, decoder):
+    path = tmp_path / "empty.wav"
+    soundfile.write(str(path), np.zeros(0, dtype=np.float32), RATE)
+    with pytest.raises(ValueError, match="ref_audio must be audio"):
+        media_io.check_ref_audio(str(path), decoder)
+    assert not path.exists()

@@ -37,7 +37,18 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    prompt_spans,
+)
+from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -50,6 +61,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
+from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -62,8 +74,17 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
-from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.qwen3_5.video import (
+    VIDEO,
+    ProcessedVideo,
+    expand_video_pads,
+    expand_video_parts,
+    group_owners,
+    group_timestamps,
+    sample_video,
+)
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -101,20 +122,9 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
 
 
 def _as_hwc_uint8(image: torch.Tensor):
-    """What the HF image processor expects, from what the data worker sends.
-
-    Images arrive ``(C, H, W)`` float32 in [0, 1] on the GPU. The processor
-    defaults to ``do_rescale=True``, so floats would be rescaled twice and the
-    model would silently see a near-black image.
-    """
-    if image.dtype.is_floating_point:
-        image = (image * 255.0).clamp(0, 255).to(torch.uint8)
-    if image.dim() == 3 and image.shape[0] == 4:
-        # the processor refuses a 4-channel (RGBA) tensor, so drop alpha
-        image = image[:3]
-    if image.dim() == 3 and image.shape[0] in (1, 3):
-        image = image.permute(1, 2, 0)
-    return image.cpu().contiguous().numpy()
+    """What the HF image processor expects, from what ``load_image`` sends:
+    uint8 RGB ``(C, H, W)`` to ``(H, W, C)`` on the host."""
+    return image.permute(1, 2, 0).cpu().contiguous().numpy()
 
 
 @dataclass(frozen=True)
@@ -124,8 +134,9 @@ class WalkInput:
 
 
 # `prefill_order` tags, in prompt order. The nth tag of a kind addresses the
-# nth tensor of that kind.
-TEXT_PART, IMAGE_PART = 0, 1
+# nth tensor of that kind, except that a video's tags, one per temporal group,
+# all address its one tensor.
+TEXT_PART, IMAGE_PART, VIDEO_PART = 0, 1, 2
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,15 @@ class PrefillStep:
     # one list per name: a `prefill_vision` step carries every span and image
     input_tensors: dict[str, list[TensorPointerInfo]]
     order: tuple[int, ...] = ()
+    # each picked image's or video's (t, h, w) patch grid, in plan order: the
+    # nodes size their spans from these host ints
+    image_grids: tuple[tuple[int, int, int], ...] = ()
+
+
+# model_kwargs keys: every image's / video's (t, h, w) patch grid, in attachment order
+IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY = "image_grids", "video_grids"
+# the step_metadata key the prefill_vision nodes read the picked grids from
+STEP_GRIDS_KEY = "step_grids"
 
 
 # TODO: implement MoE variants
@@ -144,6 +164,7 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+    INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
 
     def __init__(
         self,
@@ -172,14 +193,15 @@ class Qwen3_5DenseModel(Model):
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._image_processor = None
+        self._video_processor = None
 
     # -----------------------------------------------------------------------
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
     def _gdn_state_dtype(self) -> torch.dtype:
-        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones),
-        as vLLM does; fp32 wherever the pool's decode kernels cannot take it.
+        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones);
+        fp32 wherever the pool's decode kernels cannot take it.
 
         ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
         halves state traffic, but only FlashInfer's fused bf16 decode kernel
@@ -213,6 +235,7 @@ class Qwen3_5DenseModel(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(_MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -230,6 +253,7 @@ class Qwen3_5DenseModel(Model):
                         head_v_dim=self.config.linear_value_head_dim,
                         conv_kernel_size=self.config.linear_conv_kernel_dim
                     ).to_blocks(state_dtype=self._gdn_state_dtype()),
+                    kv_cache=KV_CACHE,
                 )
             ),
             LinearAttnSpec(
@@ -264,8 +288,11 @@ class Qwen3_5DenseModel(Model):
                     num_qo_heads=vision.num_heads,
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
-                    # a segment per image, not per request: the resize floors each image at `shortest_edge` pixels
-                    max_segments_per_request=(
+                    # A segment per image, not per request: the resize floors
+                    # each image at `shortest_edge` pixels. A video frame group
+                    # has no floor; a step with more segments runs the block
+                    # loop eagerly (`VisionEncoderSubmodule._fits_capture`).
+                    max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
                 ),
@@ -277,6 +304,16 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
@@ -320,15 +357,15 @@ class Qwen3_5DenseModel(Model):
         prefill_vision = Sequential([
             GraphNode(
                 name="vision_encoder",
-                # each image's (t, h, w) patch grid: token count and 3D ids
-                input_names=["pixel_values", "image_grid_thw"],
+                # each image's (t, h, w) patch grid rides in the step metadata
+                input_names=["pixel_values"],
                 outputs=[
                     GraphEdge(next_node="LLM", name="vision_embeds"),
                 ],
             ),
             GraphNode(
                 name="LLM",
-                input_names=["vision_embeds", "image_grid_thw", "text_inputs"],
+                input_names=["vision_embeds", "text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -350,9 +387,12 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
     # The chat template writes each image as this triple with one pad; the
-    # interior is dropped and `prefill_vision` re-emits the sentinels.
+    # interior is dropped and `prefill_vision` re-emits the sentinels. A
+    # video's triple is expanded first (`expand_video_pads`) into one inner
+    # triple per temporal group, and those are the spans.
     _PLACEHOLDER_TOKENS: dict[str, tuple[str, str, str]] = {
         "image": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
+        VIDEO: ("<|vision_start|>", "<|video_pad|>", "<|vision_end|>"),
     }
 
     def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
@@ -380,6 +420,88 @@ class Qwen3_5DenseModel(Model):
             )
         return self._image_processor
 
+    @property
+    def video_processor(self):
+        """The checkpoint's ``video_preprocessor_config.json``, lazily. Its
+        patches are normalized by the image processor's settings
+        (`pixel_normalizer`), so it must agree with them; checked here, on the
+        first video, so a deployment that never sees one never loads it."""
+        if self._video_processor is None:
+            from transformers import AutoVideoProcessor
+
+            video = AutoVideoProcessor.from_pretrained(
+                self.local_dir, cache_dir=self.cache_dir,
+            )
+            image = self.image_processor
+            for name in ("rescale_factor", "image_mean", "image_std", "temporal_patch_size", "patch_size"):
+                if getattr(video, name) != getattr(image, name):
+                    raise ValueError(f"image and video processors disagree on {name}")
+            self._video_processor = video
+        return self._video_processor
+
+    def pixel_normalizer(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-column mean and std that turn `process_prompt`'s byte patches
+        into the processors' normalized pixels: their fused rescale-and-
+        normalize, ``(x - mean / rescale) / (std / rescale)``, element for
+        element. One for images and videos, whose processors share it
+        (`video_processor`)."""
+        processor = self.image_processor
+        scale = 1.0 / processor.rescale_factor
+        mean = torch.tensor(processor.image_mean) * scale
+        std = torch.tensor(processor.image_std) * scale
+        # a patch's columns are channel-major (C x T x P x P)
+        per_channel = processor.temporal_patch_size * processor.patch_size ** 2
+        return mean.repeat_interleave(per_channel), std.repeat_interleave(per_channel)
+
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """The decoded RGB image, left uint8 ``(C, H, W)``.
+
+        The base class hands out floats in [0, 1], which would only be turned
+        back into bytes for the processor: two full-image passes that cost
+        more than the processor itself on a large image.
+        """
+        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+
+    def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
+        """Only the frames the video processor samples, on the host whatever
+        ``device`` is (see `sample_video`)."""
+        video = sample_video(filepath, self.video_processor)
+        return TensorAndMetadata(data=video.frames, metadata=video.metadata)
+
+    def _video_timestamps(self, metadata: dict) -> list[float]:
+        """Seconds per temporal group, from the sampling metadata alone."""
+        return group_timestamps(
+            metadata["frames_indices"], metadata.get("fps"),
+            self.video_processor.temporal_patch_size,
+        )
+
+    def _preprocess_video(
+        self, frames: torch.Tensor, metadata: dict, timestamps: list[float],
+    ) -> ProcessedVideo:
+        """Patches and grid for one sampled video.
+
+        The frames are already sampled, so the processor must not sample
+        again; everything else (resize budget, patchify) is its own.
+        """
+        from transformers.video_utils import VideoMetadata
+
+        out = self.video_processor(
+            videos=[frames.cpu()],
+            video_metadata=[VideoMetadata(**metadata)],
+            do_sample_frames=False,
+            # bytes, normalized on the device like images' (`pixel_normalizer`)
+            do_rescale=False,
+            do_normalize=False,
+            return_tensors="pt",
+        )
+        (grid,) = out["video_grid_thw"]
+        if int(grid[0]) != len(timestamps):
+            raise ValueError(
+                f"video grid has {int(grid[0])} temporal groups but "
+                f"{len(timestamps)} timestamps"
+            )
+        return ProcessedVideo(out["pixel_values_videos"], grid, timestamps)
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -388,12 +510,14 @@ class Qwen3_5DenseModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Render the request once, tokenize once, split at the attachments.
 
         ``text_inputs`` comes back as one span per text step of the prefill
-        plan, since images sit inside the user turn. `_prefill_schedule` walks
-        the same plan, so the nth span is the nth text step.
+        plan, since attachments sit inside the user turn. `_prefill_schedule`
+        walks the same plan, so the nth span is the nth text step. Each
+        video's temporal group count goes back as ``video_groups`` metadata:
+        the schedule needs it to lay out the plan, and only tokenizing knows it.
         """
         if prompt is None:
             # An image-only message renders with an empty text span. With no
@@ -402,7 +526,7 @@ class Qwen3_5DenseModel(Model):
             if not any(m != TEXT for m in input_modalities):
                 raise ValueError(
                     "Qwen3.5 got a request with no text and no attachments; "
-                    "send a prompt, an image, or both"
+                    "send a prompt, an image, a video, or a mix"
                 )
             prompt = ""
 
@@ -412,17 +536,27 @@ class Qwen3_5DenseModel(Model):
             if prompt_parts is not None else prompt,
             [p.role for p in prompt_parts or ()],
         )
-        unsupported = {p.modality for p in parts} - {TEXT, "image"}
+        unsupported = {p.modality for p in parts} - {TEXT, "image", VIDEO}
         if unsupported:
-            # Video needs timestamp tokens and a `video_second_per_grid` position
-            # scale; without them positions would be silently wrong. 400s.
             raise ValueError(
                 f"Qwen3.5 here has no {', '.join(sorted(unsupported))} path; "
-                "text and image attachments only"
+                "text, image and video attachments only"
             )
-        raw_images = (tensors or {}).get("image_inputs", [])
-        # always, or a named but unsent image is quietly dropped
-        check_attachments(parts, {"image": len(raw_images)})
+        tensors = tensors or {}
+        raw_images = tensors.get("image_inputs", [])
+        raw_videos = tensors.get("video_inputs", [])
+        # always, or a named but unsent attachment is quietly dropped
+        check_attachments(parts, {"image": len(raw_images), VIDEO: len(raw_videos)})
+        video_metadata = (kwargs.get("input_metadata") or {}).get("video_inputs", [])
+        if len(video_metadata) != len(raw_videos):
+            raise ValueError(
+                f"Qwen3.5 got {len(raw_videos)} videos but sampling metadata "
+                f"for {len(video_metadata)}; videos must come through `load_video`"
+            )
+
+        # From the metadata alone, so a bad layout 400s before the processors
+        # spend seconds resizing a long video
+        timestamps = [self._video_timestamps(metadata) for metadata in video_metadata]
 
         # The released checkpoints are chat models (base ones say `-Base`), so
         # always use the chat template. `enable_thinking=False` emits an empty,
@@ -438,50 +572,116 @@ class Qwen3_5DenseModel(Model):
             # a chat the template refuses (a system message after the first turn,
             # no user turn) is the client's to fix: a 400, not a 500
             raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
+        if timestamps:
+            start, pad, end = self._PLACEHOLDER_TOKENS[VIDEO]
+            text = expand_video_pads(text, pad, start, end, timestamps)
         # a long prompt is encoded as parallel chunks, identical ids
         input_ids = torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
+
+        groups = [len(times) for times in timestamps]
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
-        check_plan(prefill_plan(parts), spans, len(segments))
+        check_plan(prefill_plan(expand_video_parts(parts, groups)), spans, len(segments))
+
+        # Resized and patchified here, still bytes: the vision encoder
+        # rescales and normalizes on the device (`pixel_normalizer`). That is
+        # a quarter of the bytes to ship, and the float work was most of this
+        # call (43 of 52 ms for a 2560 px image).
+        images = [
+            self.image_processor(
+                images=[_as_hwc_uint8(image)], return_tensors="pt",
+                do_rescale=False, do_normalize=False,
+            )
+            for image in raw_images
+        ]
+        videos = [
+            self._preprocess_video(frames, metadata, times)
+            for frames, metadata, times in zip(raw_videos, video_metadata, timestamps, strict=True)
+        ]
 
         result: NameToTensorList = {"text_inputs": segments}
-        if not raw_images:
-            return result
+        # Each image's and video's (t, h, w), turned into host ints once here:
+        # the spans are sized from them, and they reach the nodes unchanged as
+        # step metadata, so no node reads a grid off the device.
+        image_grids = [tuple(g.tolist()) for out in images for g in out["image_grid_thw"]]
+        video_grids = [tuple(video.grid.tolist()) for video in videos]
+        if images:
+            result["pixel_values"] = [out["pixel_values"] for out in images]
+            # the raw images are not a graph input (the encoder reads
+            # `pixel_values`), so do not ship them to the workers
+            result["image_inputs"] = []
+        if videos:
+            result["pixel_values_videos"] = [video.pixel_values for video in videos]
+            # the decoded frames are spent; don't hold them for the request's life
+            result["video_inputs"] = []
+        walk = "prefill_vision" if images or videos else "prefill_text"
+        merge = self.vision_config.spatial_merge_size
+        owners = group_owners(groups)
 
-        result["pixel_values"] = []
-        result["image_grid_thw"] = []
-        for image in raw_images:
-            out = self.image_processor(
-                images=[_as_hwc_uint8(image)], return_tensors="pt",
-            )
-            result["pixel_values"].append(out["pixel_values"])
-            result["image_grid_thw"] += out["image_grid_thw"]
-        return result
+        def media(step: PromptPart) -> tuple[Span]:
+            # A span is the merged tokens and two sentinels, and each temporal group of a video
+            # is placed like a one-frame image.
+            video = step.modality == VIDEO
+            t, h, w = video_grids[owners[step.index]] if video else image_grids[step.index]
+            grid = torch.tensor((1 if video else t, h, w))
+            rows = int(grid.prod()) // merge**2 + 2
+            source = (VIDEO, owners[step.index]) if video else ("image", step.index)
+            return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
+        plan = prefill_plan(expand_video_parts(parts, groups))
+        layout = LabelLayout(
+            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            # The keys name `prefill_text` alone, and the preprocess worker refuses
+            # a keyed span in any other walk.
+            keyed_spans=0 if walk == "prefill_vision" else None,
+        )
+
+        # always set, so a `video_groups` the client sent never reaches the
+        # schedule; the grids ride to the nodes as step metadata
+        return ProcessPromptOutput(result, {
+            "video_groups": groups,
+            "kv_layout": {KV_CACHE: {"main": layout}},
+            IMAGE_GRIDS_KEY: image_grids,
+            VIDEO_GRIDS_KEY: video_grids,
+        })
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
+        )}}
+
+    def checkpoint_path(self) -> str:
+        return self._resolve_weights()
+
+
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
 
     def postprocess(
-            self,
-            output: torch.Tensor,
-            modality: str,
-            request_kwargs: dict | None = None,
-        ) -> bytes:
-            if modality == "text":
-                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                detok = self.tokenizer.decode(ids)
-                return detok.encode("utf-8")
-            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        self,
+        output: torch.Tensor,
+        modality: str,
+        request_kwargs: dict | None = None,
+    ) -> bytes:
+        if modality == "text":
+            return super().postprocess(output, modality, request_kwargs)
+        raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args
     # ------------------------------------------------------------------
 
-    # Which node reads which of a walk's signals. Both `prefill_vision` nodes
-    # need the grid, so it appears twice; the conductor dedupes the unpersist.
+    # Which node reads which of a walk's signals.
     _WALK_INPUTS: dict[str, list[WalkInput]] = {
         "prefill_text": [WalkInput("LLM", ("text_inputs",))],
         "prefill_vision": [
-            WalkInput("vision_encoder", ("pixel_values", "image_grid_thw")),
-            WalkInput("LLM", ("text_inputs", "image_grid_thw")),
+            WalkInput("vision_encoder", ("pixel_values",)),
+            WalkInput("LLM", ("text_inputs",)),
         ]
     }
 
@@ -489,28 +689,53 @@ class Qwen3_5DenseModel(Model):
         self,
         input_modalities: list[str],
         signals: dict[str, list[TensorPointerInfo]],
+        video_groups: list[int] | None = None,
+        host_grids: dict[str, list] | None = None,
     ) -> list[PrefillStep]:
         """The prefill walks a request runs.
 
-        With images, one `prefill_vision` walk carries the whole interleaving
-        as `order`; without, one `prefill_text` walk per span. `process_prompt`
-        split `text_inputs` against the same plan.
+        With images or videos, one `prefill_vision` walk carries the whole
+        interleaving as `order`; without, one `prefill_text` walk per span.
+        `process_prompt` split `text_inputs` against the same plan, laid out
+        from the same ``video_groups``. A video rides the walk as one tensor
+        and grid, but one tag per temporal group, since timestamp text sits
+        between its groups.
         """
+        video_groups = video_groups or []
         pools = {
             TEXT: signals.get("text_inputs", []),
             "image": signals.get("pixel_values", []),
+            VIDEO: signals.get("pixel_values_videos", []),
         }
-        grids = signals.get("image_grid_thw", [])
+        host_grids = host_grids or {}
+        host_pools = {
+            "image": host_grids.get(IMAGE_GRIDS_KEY) or [],
+            VIDEO: host_grids.get(VIDEO_GRIDS_KEY) or [],
+        }
+        picked_grids: list[tuple[int, int, int]] = []
+        owners = group_owners(video_groups)
+        if len(video_groups) != input_modalities.count(VIDEO):
+            logger.warning(
+                "Qwen3.5 has temporal group counts for %d videos but the "
+                "layout names %d; the rest are skipped",
+                len(video_groups), input_modalities.count(VIDEO),
+            )
 
         order: list[int] = []
         picked: dict[str, list[TensorPointerInfo]] = {
-            "text_inputs": [], "pixel_values": [], "image_grid_thw": [],
+            "text_inputs": [], "pixel_values": [],
         }
-        for step in prefill_plan(parts_from_modalities(input_modalities)):
+        plan = prefill_plan(
+            expand_video_parts(parts_from_modalities(input_modalities), video_groups)
+        )
+        for step in plan:
             pool = pools.get(step.modality, [])
-            # an image needs its grid too
-            short = step.index >= len(pool) or (
-                step.modality != TEXT and step.index >= len(grids)
+            # a video's tensors are indexed by video, its steps by group
+            index = owners[step.index] if step.modality == VIDEO else step.index
+            # an image or video needs its grid too
+            short = index >= len(pool) or (
+                step.modality != TEXT
+                and index >= len(host_pools.get(step.modality, []))
             )
             if short:
                 # `check_plan` already 400s a mismatch at intake. This runs in
@@ -519,16 +744,20 @@ class Qwen3_5DenseModel(Model):
                 logger.warning(
                     "Qwen3.5 prefill plan wants a %s span at index %d but the "
                     "prompt produced %d; skipping it",
-                    step.modality, step.index, len(pool),
+                    step.modality, index, len(pool),
                 )
                 continue
             if step.modality == TEXT:
                 order.append(TEXT_PART)
-                picked["text_inputs"].append(pool[step.index])
-            else:
-                order.append(IMAGE_PART)
-                picked["pixel_values"].append(pool[step.index])
-                picked["image_grid_thw"].append(grids[step.index])
+                picked["text_inputs"].append(pool[index])
+                continue
+            order.append(VIDEO_PART if step.modality == VIDEO else IMAGE_PART)
+            first_group = step.modality != VIDEO or (
+                step.index == 0 or owners[step.index - 1] != index
+            )
+            if first_group:
+                picked["pixel_values"].append(pool[index])
+                picked_grids.append(host_pools[step.modality][index])
 
         if not order:
             return []
@@ -538,10 +767,10 @@ class Qwen3_5DenseModel(Model):
                 PrefillStep("prefill_text", {"text_inputs": [t]}, (TEXT_PART,))
                 for t in picked["text_inputs"]
             ]
-        # TODO: one walk holds every image, so a many-image prompt makes one
-        # very wide step. Cap images per walk here and emit several steps,
-        # each with its share of `order`.
-        return [PrefillStep("prefill_vision", picked, tuple(order))]
+        # TODO: one walk holds every image and video, so a many-image prompt
+        # makes one very wide step. Cap images per walk here and emit several
+        # steps, each with its share of `order`.
+        return [PrefillStep("prefill_vision", picked, tuple(order), tuple(picked_grids))]
 
     def get_initial_forward_pass_args(
         self,
@@ -551,7 +780,12 @@ class Qwen3_5DenseModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        schedule = self._prefill_schedule(input_modalities, input_signals)
+        model_kwargs = model_kwargs or {}
+        schedule = self._prefill_schedule(
+            input_modalities, input_signals,
+            model_kwargs.get("video_groups"),
+            {key: model_kwargs.get(key) for key in (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)},
+        )
         if not schedule:
             # every step was skipped for want of a tensor
             raise ValueError(
@@ -571,15 +805,18 @@ class Qwen3_5DenseModel(Model):
         metadata.kwargs["prefill_schedule"] = schedule[1:]
 
         inputs = self._walk_inputs(step)
+        step_metadata = {
+            "is_prefill": True,
+            "last_prefill": len(schedule) == 1,
+            "prefill_order": step.order,
+        }
+        if step.image_grids:
+            step_metadata[STEP_GRIDS_KEY] = step.image_grids
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": True,
-                "last_prefill": len(schedule) == 1,
-                "prefill_order": step.order,
-            },
+            step_metadata=step_metadata,
         )
 
     @classmethod
@@ -612,6 +849,7 @@ class Qwen3_5DenseModel(Model):
         last_prefill = len(remaining) == 1
 
         order: tuple[int, ...] = ()
+        image_grids: tuple[tuple[int, int, int], ...] = ()
         if metadata.is_prefill and remaining:
             # each prefill step carries its own tensors; only decode reads
             # back what the previous step emitted
@@ -619,6 +857,7 @@ class Qwen3_5DenseModel(Model):
             metadata.graph_walk = step.walk
             inputs = self._walk_inputs(step)
             order = step.order
+            image_grids = step.image_grids
         elif metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
@@ -626,8 +865,8 @@ class Qwen3_5DenseModel(Model):
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
         else:
-            # decode stops via `LLMSubmodule.check_stop`; reaching here again
-            # after it fires means the request is finished
+            # decode stops via `LLMSubmodule.check_stop` or the loop cap;
+            # reaching here again after either means the request is finished
             metadata.kwargs["decode_finished"] = True
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -636,15 +875,18 @@ class Qwen3_5DenseModel(Model):
                 request_done=True,
             )
 
+        step_metadata = {
+            "is_prefill": metadata.is_prefill,
+            "last_prefill": last_prefill,
+            "prefill_order": order,
+        }
+        if image_grids:
+            step_metadata[STEP_GRIDS_KEY] = image_grids
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": metadata.is_prefill,
-                "last_prefill": last_prefill,
-                "prefill_order": order,
-            },
+            step_metadata=step_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -657,7 +899,9 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
+        keys = [
+            "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
+        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}
@@ -719,7 +963,7 @@ class Qwen3_5DenseModel(Model):
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
             logger.info("Loaded Qwen3.5 vision tower onto %s", device)
-            return VisionEncoderSubmodule(tower, self.vision_config)
+            return VisionEncoderSubmodule(tower, self.vision_config, self.pixel_normalizer())
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 

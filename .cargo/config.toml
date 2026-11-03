@@ -1,0 +1,11 @@
+# zmq-sys compiles libzmq from zeromq-src, which never defines
+# HAVE_POSIX_MEMALIGN, so libzmq malloc()s its command queues (16-byte aligned)
+# although command_t is declared aligned(64). A compiler that targets AVX2, such
+# as GCC on Ubuntu 26.04's amd64v3 builds, then copies command_t with aligned
+# 32-byte stores, which segfault on the first message. These are the values
+# libzmq's own build detects on Linux. The per-target variables add to any
+# CXXFLAGS in the environment instead of being replaced by it. At the repository
+# root so that cargo runs from here (setup.py, `--manifest-path rust/...`) see it.
+[env]
+CXXFLAGS_x86_64_unknown_linux_gnu = "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"

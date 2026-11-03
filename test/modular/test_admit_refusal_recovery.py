@@ -61,6 +61,9 @@ def _worker(*, follower=False):
     w._in_flight_rids = set()
     w.parallel_nodes = {NODE} if follower else set()
     w.parallel_leader_nodes = set()
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 
@@ -221,8 +224,10 @@ def test_a_full_ring_pool_holds_the_request_that_waits_and_runs_the_rest():
     w = _worker()
     w.scheduler = SimpleNamespace(held=[])
     w.scheduler.hold_requests = w.scheduler.held.extend
+    w.scheduler.limit_batch = lambda *args: None
+    w.scheduler.could_refill = lambda *args: False
     w.engine_manager = SimpleNamespace(
-        get_engine=lambda node: SimpleNamespace(evictable=lambda n: False),
+        get_engine=lambda node: SimpleNamespace(evictable=lambda n, resources=None: False),
     )
     w._hold_logged = {}
     w._apply_removes_whose_step_landed = lambda: None

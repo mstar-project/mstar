@@ -1,12 +1,16 @@
 """Request-path cases (multipart, urlencoded and JSON parsing, h11, media decoding) and served invariants: one
 result per case, compared base against head by status code and identity flags (``checks.rp_facts``).
 
-python -m benchmark.eval.e2e.request_path --url http://127.0.0.1:PORT --suite whisper|omni|chat|speech \\
+python -m benchmark.eval.e2e.request_path --url http://127.0.0.1:PORT --suite SUITE \\
     --inputs DATA_DIR/rp --out rp.json
 
 ``whisper`` and ``omni`` exercise the request path; ``chat`` and ``speech`` are the served invariants (AGENTS.md):
 identical requests give identical output, streamed equals non-streamed, an edge budget is honoured, and a
-malformed request is a 4xx after which the server still serves.
+malformed request is a 4xx after which the server still serves. ``cancel_speech`` and ``cancel_chat`` drop a
+streamed request's connection mid-transfer (after 3 chunks, and after 1.5 s) and check the server still serves the
+same reply: on a multi-worker config the cancelled request's tensors are still moving between workers.
+``timeout_speech`` and ``timeout_chat`` run against a server whose per-request ``--timeout`` is shorter than one of
+their requests, so the server itself cancels it mid-transfer (#572's trigger).
 """
 
 from __future__ import annotations
@@ -363,7 +367,129 @@ def speech_invariants(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: A
     return r
 
 
-SUITES = {"whisper": whisper, "omni": omni, "chat": chat_invariants, "speech": speech_invariants}
+CANCEL_TEXT = ("The quick brown fox jumps over the lazy dog, then runs across the field, past the old barn and the "
+               "river, until the sun goes down behind the hills and the stars come out one by one.")
+SHORT_TEXT = "The train leaves tomorrow morning."
+STORY = [{"role": "user", "content": "Tell a long story about a lighthouse keeper and a storm."}]
+SETTLE_S = 2.0           # after a cancel, before the follow-up request: teardown of the cancelled request is in flight
+TIMEOUT_SETTLE_S = 6.0   # #572: the worker died 1 to 5 s after the timed-out request was cancelled
+VOICE: str | None = None   # --voice: the speech suites' voice (the model's default when unset)
+
+
+def _status(fn) -> tuple[int | str, str]:
+    """(status, reply hash) of one request; a refused or reset connection (a server that died) is a status too."""
+    try:
+        return fn()
+    except requests.RequestException as e:
+        return type(e).__name__, ""
+
+
+def _cut_stream(url: str, path: str, body: dict, chunks: int = 3, after_s: float | None = None) -> dict:
+    """Start a streamed request and close the socket after ``chunks`` body chunks (or ``after_s`` seconds), without
+    a cancel: the server learns from the dropped connection while tensors for the request are still moving."""
+    t0 = time.perf_counter()
+    got, cut = 0, False
+    try:
+        with requests.post(f"{url}{path}", json=body, stream=True, timeout=120) as r:
+            status = r.status_code
+            if status == 200:
+                for chunk in r.iter_content(chunk_size=None):
+                    got += bool(chunk)
+                    if got >= chunks or (after_s is not None and time.perf_counter() - t0 >= after_s):
+                        cut = True
+                        break
+    except requests.RequestException as e:
+        return {"status": type(e).__name__, "cut": False}
+    return {"status": status, "cut": cut}   # cut False: the stream ended before the cut, nothing was cancelled
+
+
+def _cancel_suite(url: str, path: str, body: dict, reference) -> dict:
+    """The same request served whole, cut after 3 chunks, cut after 1.5 s, then whole again: the server must
+    still serve, and give the same reply as before the cuts."""
+    r: dict = {}
+    s1, ref = _status(reference)
+    r["reference"] = {"status": s1}
+    r["disconnect_after_3_chunks"] = _cut_stream(url, path, body, chunks=3)
+    time.sleep(SETTLE_S)
+    r["disconnect_after_1_5_s"] = _cut_stream(url, path, body, chunks=10**9, after_s=1.5)
+    time.sleep(SETTLE_S)
+    s2, again = _status(reference)
+    r["serves_after_cancels"] = {"status": s2, "identical": s1 == s2 == 200 and again == ref}
+    cuts = (r["disconnect_after_3_chunks"], r["disconnect_after_1_5_s"])
+    if not any(c["cut"] for c in cuts):
+        r["_unexercised"] = "both streams ended before their cut"
+        r["_completed"] = all(c["status"] == 200 for c in cuts)
+    return r
+
+
+def _timeout_suite(reference, long_request) -> dict:
+    """On a server started with a per-request ``--timeout`` shorter than ``long_request``: a short request served
+    (once to warm up), the long one timed out by the server (which cancels it mid-transfer), then the short one
+    again after the window in which #572's worker crashed. The short reply must not change."""
+    _status(reference)
+    s1, ref = _status(reference)
+    r: dict = {"reference": {"status": s1}}
+    s, said = _status(long_request)
+    timed_out = s == 500 and "timed out" in said.lower()   # the API server's own reply (entrypoint.collect_results)
+    r["times_out"] = {"status": s, "ok": timed_out}
+    if not timed_out:
+        r["_unexercised"] = f"the long request was not timed out by the server (status {s})"
+        r["_completed"] = s == 200
+    time.sleep(TIMEOUT_SETTLE_S)
+    s2, again = _status(reference)
+    r["serves_after_timeout"] = {"status": s2, "identical": s1 == s2 == 200 and again == ref}
+    return r
+
+
+def _speech_req(url: str, text: str, **kw):
+    """(status, reply hash), or the error text when the status is not 200."""
+    voice = {"voice": VOICE} if VOICE else {}
+
+    def fn() -> tuple[int, str]:
+        resp = requests.post(f"{url}/v1/audio/speech", json={"model": "default", "input": text, "seed": 7,
+                                                             "response_format": "wav", **voice, **kw}, timeout=600)
+        return resp.status_code, h(resp.content) if resp.status_code == 200 else resp.text[:300]
+
+    return fn
+
+
+def cancel_speech(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
+    body = {"model": "default", "input": CANCEL_TEXT, "stream": True, "seed": 7, **({"voice": VOICE} if VOICE else {})}
+    return _cancel_suite(url, "/v1/audio/speech", body, _speech_req(url, CANCEL_TEXT))
+
+
+def cancel_chat(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
+    body = {"model": "default", "messages": STORY, "temperature": 0.0, "max_tokens": 96, "seed": 1234,
+            "stream": True, "modalities": ["text", "audio"]}
+
+    def whole() -> tuple[int, str]:
+        s, text, _ = _chat(url, stream=True, messages=STORY, max_tokens=48)
+        return s, h(text)
+
+    return _cancel_suite(url, "/v1/chat/completions", body, whole)
+
+
+def timeout_speech(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
+    return _timeout_suite(_speech_req(url, SHORT_TEXT), _speech_req(url, " ".join([CANCEL_TEXT] * 4)))
+
+
+def timeout_chat(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
+    def short() -> tuple[int, str]:
+        s, text, _ = _chat(url, max_tokens=16)
+        return s, h(text)
+
+    def long() -> tuple[int, str]:
+        body = {"model": "default", "messages": STORY, "temperature": 0.0, "max_tokens": 512, "seed": 1234,
+                "modalities": ["text", "audio"]}
+        resp = requests.post(f"{url}/v1/chat/completions", json=body, timeout=600)
+        return resp.status_code, "" if resp.status_code == 200 else resp.text[:300]
+
+    return _timeout_suite(short, long)
+
+
+SUITES = {"whisper": whisper, "omni": omni, "chat": chat_invariants, "speech": speech_invariants,
+          "cancel_speech": cancel_speech, "cancel_chat": cancel_chat, "timeout_speech": timeout_speech,
+          "timeout_chat": timeout_chat}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -372,7 +498,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--suite", required=True, choices=SUITES)
     p.add_argument("--inputs", required=True, help="the rp/ directory of `data e2e`")
     p.add_argument("--out", required=True)
+    p.add_argument("--voice", default=None, help="voice of the cancel and timeout speech suites")
     a = p.parse_args(argv)
+    global VOICE
+    VOICE = a.voice
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="mstar-rp-") as scratch:
         res = SUITES[a.suite](a.url.rstrip("/"), Path(a.inputs), Path(scratch))

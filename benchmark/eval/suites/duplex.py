@@ -140,60 +140,26 @@ class DuplexSuite(Suite):
         self, session: aiohttp.ClientSession, url: str, index: int, item: Item, t0: float
     ) -> dict[str, Any]:
         a = self.args
-        form = aiohttp.FormData()
-        form.add_field("files", Path(item.audio_path).read_bytes(), filename=Path(item.audio_path).name,
-                       content_type="application/octet-stream")
-        form.add_field("input_modalities", "audio")
-        form.add_field("output_modalities", "text,audio")
-        form.add_field("streaming", "true")
-        form.add_field("model_kwargs", json.dumps({"temperature": a.temperature}))
-        frames, first_text_frame, first_frame_wall = 0, None, None
-        texts: list[str] = []
-        pcm = bytearray()
-        rate = 24000
         try:
-            timeout = aiohttp.ClientTimeout(total=a.timeout)
-            async with session.post(f"{url}/generate", data=form, timeout=timeout) as resp:
-                if resp.status != 200:
-                    return error_row(item, f"HTTP {resp.status}", await resp.text())
-                async for raw in resp.content:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    msg = json.loads(line)
-                    data = base64.b64decode(msg["data"]) if msg.get("data") else b""
-                    if "error" in msg or msg.get("modality") == "error":
-                        detail = f"{msg.get('error', '')} {data.decode('utf-8', 'replace')}"
-                        return error_row(item, "stream error", detail)
-                    if msg.get("modality") == "text":
-                        token = data.decode("utf-8", "replace")
-                        if first_frame_wall is None:
-                            first_frame_wall = time.perf_counter() - t0
-                        if first_text_frame is None and not _special(token):
-                            first_text_frame = frames
-                        texts.append(token)
-                        frames += 1
-                    elif msg.get("modality") == "audio":
-                        rate = int((msg.get("metadata") or {}).get("sample_rate", rate))
-                        pcm.extend(data)
+            sess = await generate_session(session, url, item.audio_path, {"temperature": a.temperature}, a.timeout, t0)
+        except SessionError as exc:
+            return error_row(item, exc.error, exc.detail, **exc.extra)
         except Exception as exc:  # noqa: BLE001 - every failure is an error row
             return exception_row(item, exc)
-        e2e = time.perf_counter() - t0
-        if frames == 0:
-            return error_row(item, "no frames", e2e_s=e2e)
+        e2e, frames, rate = sess["e2e_s"], sess["frames"], sess["rate"]
         frame_s = a.frame_ms / 1000
-        audio = pcm16_to_float(bytes(pcm))
+        audio = pcm16_to_float(sess["pcm"])
         category = item.extra.get("category", "turn_taking")
         speech_end, interrupt = user_events(item, a.user_vad_db)
         segs = speech_segments(audio, rate, threshold_db=a.agent_vad_db)
-        first_text_s = None if first_text_frame is None else first_text_frame * frame_s
+        first_text_s = None if sess["first_text_frame"] is None else sess["first_text_frame"] * frame_s
         row = {
             "id": item.id, "ok": True, "error": None, "category": category,
             "e2e_s": e2e, "frames": frames, "wall_ms_per_frame": 1000 * e2e / frames,
-            "on_time": e2e <= frames * frame_s, "first_frame_wall_s": first_frame_wall,
+            "on_time": e2e <= frames * frame_s, "first_frame_wall_s": sess["first_frame_wall_s"],
             "speech_end_s": speech_end, "interrupt_s": interrupt,
             "agent_segments": [[round(s, 3), round(e, 3)] for s, e in segs],
-            "text": "".join(t for t in texts if not _special(t)),
+            "text": "".join(t for t in sess["texts"] if not _special(t)),
             "sample_rate": rate, "_audio": audio,
         }
         row |= timing_metrics(category, segs, first_text_s, speech_end, interrupt,
@@ -225,6 +191,61 @@ class DuplexSuite(Suite):
             "on_time_rate": _rate([r["on_time"] for r in ok]),
             "frames_per_s": sum(r["frames"] for r in ok) / wall_s if wall_s > 0 else None,
         }
+
+
+class SessionError(Exception):
+    """A session that returned no usable stream; ``error`` is the category a results file keeps."""
+
+    def __init__(self, error: str, detail: str | None = None, **extra: Any):
+        super().__init__(error)
+        self.error, self.detail, self.extra = error, detail, extra
+
+
+async def generate_session(
+    session: aiohttp.ClientSession, url: str, audio_path: str, model_kwargs: dict[str, Any], timeout_s: float,
+    t0: float,
+) -> dict[str, Any]:
+    """One duplex session over streamed ``/generate``: the user clip in, one text token and
+    one audio chunk out per frame. Returns the per-frame tokens, the output PCM16 bytes and
+    rate, the frame of the first non-special token, and wall times from ``t0``."""
+    form = aiohttp.FormData()
+    form.add_field("files", Path(audio_path).read_bytes(), filename=Path(audio_path).name,
+                   content_type="application/octet-stream")
+    form.add_field("input_modalities", "audio")
+    form.add_field("output_modalities", "text,audio")
+    form.add_field("streaming", "true")
+    form.add_field("model_kwargs", json.dumps(model_kwargs))
+    frames, first_text_frame, first_frame_wall = 0, None, None
+    texts: list[str] = []
+    pcm = bytearray()
+    rate = 24000
+    async with session.post(f"{url}/generate", data=form, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+        if resp.status != 200:
+            raise SessionError(f"HTTP {resp.status}", await resp.text())
+        async for raw in resp.content:
+            line = raw.strip()
+            if not line:
+                continue
+            msg = json.loads(line)
+            data = base64.b64decode(msg["data"]) if msg.get("data") else b""
+            if "error" in msg or msg.get("modality") == "error":
+                raise SessionError("stream error", f"{msg.get('error', '')} {data.decode('utf-8', 'replace')}")
+            if msg.get("modality") == "text":
+                token = data.decode("utf-8", "replace")
+                if first_frame_wall is None:
+                    first_frame_wall = time.perf_counter() - t0
+                if first_text_frame is None and not _special(token):
+                    first_text_frame = frames
+                texts.append(token)
+                frames += 1
+            elif msg.get("modality") == "audio":
+                rate = int((msg.get("metadata") or {}).get("sample_rate", rate))
+                pcm.extend(data)
+    e2e = time.perf_counter() - t0
+    if frames == 0:
+        raise SessionError("no frames", e2e_s=e2e)
+    return {"frames": frames, "texts": texts, "pcm": bytes(pcm), "rate": rate, "first_text_frame": first_text_frame,
+            "first_frame_wall_s": first_frame_wall, "e2e_s": e2e}
 
 
 def _rate(flags: list[Any]) -> float | None:

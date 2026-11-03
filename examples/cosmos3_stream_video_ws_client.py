@@ -9,7 +9,7 @@ a session) without a new handshake.
 
     python examples/cosmos3_stream_video_ws_client.py --port 8000 \\
         --prompt "a drone flies over a coastal town at dawn" \\
-        --frames 241 --mode kv --window-frames 29 --out /tmp/rollout
+        --frames 241 --mode chained --out /tmp/rollout
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ def main() -> None:
     ap.add_argument("--image", default=None, help="optional i2v conditioning frame")
     ap.add_argument("--size", default="832x480")
     ap.add_argument("--frames", type=int, default=241)
-    ap.add_argument("--mode", choices=["kv", "chained"], default="kv")
-    ap.add_argument("--window-frames", type=int, default=29)
+    ap.add_argument("--mode", choices=["chained", "kv"], default="chained", help="kv is experimental")
+    ap.add_argument("--window-frames", type=int, default=None, help="default: the server's")
     ap.add_argument("--context-frames", type=int, default=None,
                     help="kv: committed context to keep (server default 61)")
     ap.add_argument("--steps", type=int, default=None)
@@ -41,11 +41,10 @@ def main() -> None:
     args = ap.parse_args()
 
     model_kwargs = {
-        "size": args.size, "num_frames": args.frames, "window_mode": args.mode,
-        "window_frames": args.window_frames, "stream_video": True,
+        "size": args.size, "num_frames": args.frames, "window_mode": args.mode, "stream_video": True,
     }
-    for key, value in (("context_frames", args.context_frames), ("num_inference_steps", args.steps),
-                       ("guidance_scale", args.guidance), ("seed", args.seed)):
+    for key, value in (("window_frames", args.window_frames), ("context_frames", args.context_frames),
+                       ("num_inference_steps", args.steps), ("guidance_scale", args.guidance), ("seed", args.seed)):
         if value is not None:
             model_kwargs[key] = value
     message = {

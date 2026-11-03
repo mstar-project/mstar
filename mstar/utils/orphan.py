@@ -4,8 +4,9 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-import threading
 import time
+
+from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,7 @@ def exit_when_orphaned(
     parent=None,
     poll_s: float = 0.5,
     grace_s: float = 5.0,
+    before_hard_exit=None,
 ) -> None:
     """Exit this process once ``parent`` dies, so nothing outlives its parent
     holding GPU memory or IPC handles.
@@ -24,7 +26,8 @@ def exit_when_orphaned(
     Each parent terminates its children on every exit path it controls; this
     covers the one it cannot (killed outright). ``stop_signal`` is the graceful
     stop for this process, but a main thread stuck in a C call cannot service
-    it, so exit hard after ``grace_s``.
+    it, so exit hard after ``grace_s``, running ``before_hard_exit`` first
+    (the hard exit skips every ``finally`` and ``atexit``).
     """
     parent = mp.parent_process() if parent is None else parent
     if parent is None:
@@ -34,6 +37,11 @@ def exit_when_orphaned(
     logger.error("%s: the %s process is gone, exiting", who, parent_name)
     os.kill(os.getpid(), stop_signal)
     time.sleep(grace_s)
+    if before_hard_exit is not None:
+        try:
+            before_hard_exit()
+        except BaseException:
+            logger.exception("%s: cleanup before the hard exit failed", who)
     os._exit(1)
 
 
@@ -41,7 +49,7 @@ def watch_parent(
     who: str, parent_name: str, stop_signal: int = signal.SIGTERM
 ) -> None:
     """Start :func:`exit_when_orphaned` on a daemon thread."""
-    threading.Thread(
+    Thread(
         target=exit_when_orphaned,
         args=(who, parent_name, stop_signal),
         daemon=True,

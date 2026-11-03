@@ -26,9 +26,11 @@ AudioSeal 0.2.0's ``model.streaming(batch_size)`` does not deliver that: its
 state propagation walks ``named_children()`` and stops at the
 ``nn.Sequential`` holding the layers, so no conv caches anything and every
 chunk is watermarked as if it began the stream (upstream issue #105). This
-module keeps each request's stream state itself, as plain tensors, and
-installs it in the generator's streaming layers around each call. That also
-lets requests at the same point share one batched call.
+module keeps each request's stream state itself, as one flat row of tensors,
+and runs the generator's layers as a function of it: the same ops AudioSeal's
+streaming layers run, with the state passed in and out. That lets requests
+at the same point share one batched call, and lets the engine capture that
+call per (batch, chunk length) bucket.
 
 The generator works on whole 320-sample frames (its total stride). A chunk
 that is not a whole number of frames leaves its tail pending until the next
@@ -44,9 +46,12 @@ samples per codec frame) never hold anything back and never pad.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -161,27 +166,81 @@ def _watermark_precision():
 
 @dataclass
 class WatermarkStream:
-    """One request's watermark state: the generator's layer caches (batch 1)
-    and the samples of a partial frame not yet watermarked."""
+    """One request's watermark state: the generator's layer caches as one
+    flat row (``AudioSealWatermarker.cache_size`` floats) and the samples of
+    a partial frame not yet watermarked."""
 
-    caches: list[torch.Tensor] | None = None
+    caches: torch.Tensor | None = None
     pending: torch.Tensor | None = None
     finished: bool = False
 
 
-@dataclass
-class _Slots:
-    """The generator's stateful layers, in a fixed order."""
+@dataclass(frozen=True)
+class _Conv:
+    """A causal streaming conv: the input is the cached tail plus the new
+    samples, and the new cache is the last ``keep`` input samples."""
 
-    convs: list = field(default_factory=list)        # (StreamingConv1d, RawStreamingConv1d)
-    convtrs: list = field(default_factory=list)      # RawStreamingConvTranspose1d
-    lstms: list = field(default_factory=list)        # RawStreamingLSTM
-    adds: list = field(default_factory=list)         # StreamingAdd
-    others: list = field(default_factory=list)       # stateless streaming containers
+    conv: torch.nn.Conv1d
+    slot: int
+    keep: int
+
+
+@dataclass(frozen=True)
+class _ConvTranspose:
+    """A streaming transposed conv: the cached partial output (bias
+    included) is added to the next output's head."""
+
+    conv: torch.nn.ConvTranspose1d
+    slot: int
+    keep: int
+
+
+@dataclass(frozen=True)
+class _LSTM:
+    lstm: torch.nn.LSTM
+    h_slot: int
+    c_slot: int
+    skip: bool
+
+
+@dataclass(frozen=True)
+class _Residual:
+    block: tuple
+    shortcut: tuple | None   # None: identity
+
+
+@dataclass(frozen=True)
+class _Layout:
+    """Where each layer's cache sits in a stream's flat row."""
+
+    offsets: tuple[int, ...]
+    shapes: tuple[tuple[int, ...], ...]   # per stream, without the batch dim
+    lstm_slots: frozenset[int]            # [layers, hidden] here, [layers, B, hidden] in the LSTM
+
+    @property
+    def size(self) -> int:
+        return self.offsets[-1]
+
+
+def _walk(ops: tuple):
+    """Every op, residual blocks flattened."""
+    for op in ops:
+        if isinstance(op, _Residual):
+            yield from _walk(op.shortcut or ())
+            yield from _walk(op.block)
+        else:
+            yield op
 
 
 class AudioSealWatermarker:
-    """AudioSeal generator plus per-request streaming, on one device."""
+    """AudioSeal generator plus per-request streaming, on one device.
+
+    The generator runs as a plain function of the audio and every stream's
+    caches (``_mark``): the same convolutions, LSTM and adds AudioSeal's
+    streaming layers would run, with each layer's state passed in and out
+    instead of kept on the module. Its shapes depend on the batch and chunk
+    length only, so the engine can capture it per (batch, length) bucket
+    (``piecewise_configs``) and ``apply_pcm16`` replays those captures."""
 
     def __init__(self, generator: torch.nn.Module, config: AudioWatermarkConfig, no_compile):
         self.generator = generator
@@ -189,9 +248,23 @@ class AudioSealWatermarker:
         self._no_compile = no_compile
         self.device = next(generator.parameters()).device
         self.hop = int(generator.encoder.hop_length)
-        self._slots = self._collect_slots(generator)
+        shapes: list[tuple[int, ...]] = []
+        lstm_slots: set[int] = set()
+        self._encoder = self._program(generator.encoder, shapes, lstm_slots)
+        self._decoder = self._program(generator.decoder, shapes, lstm_slots)
+        offsets = [0]
+        for shape in shapes:
+            offsets.append(offsets[-1] + math.prod(shape))
+        self._layout = _Layout(tuple(offsets), tuple(shapes), frozenset(lstm_slots))
         self._message_embedding = self._embed_message(generator, config)
         self._fresh = self._fresh_caches()
+        self._capture_lengths: list[int] = []
+        self._eager_logged: set[tuple[str, int]] = set()
+
+    @property
+    def cache_size(self) -> int:
+        """Floats of state per stream."""
+        return self._layout.size
 
     @torch.no_grad()
     def _embed_message(self, generator: torch.nn.Module, config: AudioWatermarkConfig) -> torch.Tensor:
@@ -216,156 +289,153 @@ class AudioSealWatermarker:
         )
         return cls(generator, config, no_compile)
 
-    # -- streaming state ----------------------------------------------------
+    # -- the generator as a function of its streaming state ------------------
 
-    @staticmethod
-    def _collect_slots(generator: torch.nn.Module) -> _Slots:
+    @classmethod
+    def _program(cls, container: torch.nn.Module, shapes: list, lstm_slots: set) -> tuple:
+        """The ops of a SEANet encoder or decoder, each stateful one given the
+        next cache slots (``shapes`` grows by the per-stream cache shape)."""
+        from audioseal.libs.moshi.modules.conv import StreamingConv1d, StreamingConvTranspose1d
+        from audioseal.libs.moshi.modules.seanet import SEANetDecoder, SEANetEncoder
+
+        for module in container.modules():
+            if isinstance(module, (StreamingConv1d, StreamingConvTranspose1d)) and not module.causal:
+                raise ValueError(
+                    "audio_watermark needs a causal (streaming) AudioSeal generator such as "
+                    f"{DEFAULT_GENERATOR!r}; this checkpoint's convolutions are not causal"
+                )
+        if type(container) not in (SEANetEncoder, SEANetDecoder):
+            raise ValueError(f"audio_watermark: unsupported AudioSeal {type(container).__name__}")
+        return cls._sequence(container.model, shapes, lstm_slots)
+
+    @classmethod
+    def _sequence(cls, modules, shapes: list, lstm_slots: set) -> tuple:
         from audioseal.libs.moshi.modules.conv import StreamingConv1d, StreamingConvTranspose1d
         from audioseal.libs.moshi.modules.lstm import RawStreamingLSTM
-        from audioseal.libs.moshi.modules.streaming import (
-            RawStreamingConv1d,
-            RawStreamingConvTranspose1d,
-            StreamingAdd,
-            StreamingModule,
-        )
+        from audioseal.libs.moshi.modules.seanet import SEANetResnetBlock
+        from audioseal.libs.moshi.modules.streaming import StreamingModule
 
-        slots = _Slots()
-        raw_owned = set()
-        for module in generator.modules():
+        ops = []
+        for module in modules:
             if isinstance(module, StreamingConv1d):
-                if not module.causal:
-                    raise ValueError(
-                        "audio_watermark needs a causal (streaming) AudioSeal generator such as "
-                        f"{DEFAULT_GENERATOR!r}; this checkpoint's convolutions are not causal"
-                    )
-                raw = module.conv.conv
-                slots.convs.append((module, raw))
-                raw_owned.add(id(raw))
-            elif isinstance(module, StreamingConvTranspose1d) and not module.causal:
-                raise ValueError(f"audio_watermark needs a causal AudioSeal generator such as {DEFAULT_GENERATOR!r}")
-        for module in generator.modules():
-            if isinstance(module, RawStreamingConvTranspose1d):
-                slots.convtrs.append(module)
+                conv = module.conv.conv.inner_conv
+                keep = (conv.kernel_size[0] - 1) * conv.dilation[0] + 1 - conv.stride[0]
+                shapes.append((conv.in_channels, keep))
+                ops.append(_Conv(conv, len(shapes) - 1, keep))
+            elif isinstance(module, StreamingConvTranspose1d):
+                conv = module.convtr.convtr.inner_conv
+                shapes.append((conv.out_channels, conv.kernel_size[0] - conv.stride[0]))
+                ops.append(_ConvTranspose(conv, len(shapes) - 1, shapes[-1][1]))
             elif isinstance(module, RawStreamingLSTM):
-                slots.lstms.append(module)
-            elif isinstance(module, StreamingAdd):
-                slots.adds.append(module)
-            elif isinstance(module, RawStreamingConv1d):
-                if id(module) not in raw_owned:
-                    raise ValueError("unexpected bare streaming conv in the AudioSeal generator")
-            elif isinstance(module, StreamingModule) and not isinstance(module, StreamingConv1d):
-                slots.others.append(module)
-        return slots
+                lstm = module.lstm
+                for _ in range(2):
+                    shapes.append((lstm.num_layers, lstm.hidden_size))
+                    lstm_slots.add(len(shapes) - 1)
+                ops.append(_LSTM(lstm, len(shapes) - 2, len(shapes) - 1, module.skip))
+            elif isinstance(module, SEANetResnetBlock):
+                identity = isinstance(module.shortcut, torch.nn.Identity)
+                shortcut = None if identity else cls._sequence([module.shortcut], shapes, lstm_slots)
+                ops.append(_Residual(cls._sequence(module.block, shapes, lstm_slots), shortcut))
+            elif isinstance(module, StreamingModule) or any(True for _ in module.children()):
+                raise ValueError(f"audio_watermark: unsupported AudioSeal layer {type(module).__name__}")
+            else:
+                ops.append(module)   # a stateless activation
+        return tuple(ops)
 
-    def _fresh_caches(self) -> list[torch.Tensor]:
-        """A new stream's caches, batch 1: what the layers would build from
+    def _fresh_caches(self) -> torch.Tensor:
+        """A new stream's flat cache row: what the layers would build from
         their causal zero padding on the first chunk, made explicit so a new
         stream batches with ones already under way. Never written in place,
-        so every new stream shares them."""
+        so every new stream shares it."""
+        pieces = [torch.zeros(math.prod(shape), device=self.device) for shape in self._layout.shapes]
+        for op in _walk((*self._encoder, *self._decoder)):
+            if isinstance(op, _ConvTranspose) and op.conv.bias is not None:
+                # the layer adds ``partial - bias`` to the next output; bias makes that 0
+                pieces[op.slot] = op.conv.bias.detach().view(-1, 1).expand(-1, op.keep).reshape(-1)
+        return torch.cat(pieces)
+
+    def _unpack(self, flat: torch.Tensor) -> list[torch.Tensor]:
+        """``[B, cache_size]`` -> each layer's cache, batch first (the LSTM's
+        ``[layers, B, hidden]``, contiguous as cuDNN wants it)."""
+        batch, layout = flat.shape[0], self._layout
         caches = []
-        dev = self.device
-        for outer, raw in self._slots.convs:
-            conv = raw.inner_conv
-            caches.append(torch.zeros(1, conv.in_channels, outer._padding_total, device=dev))
-        for raw in self._slots.convtrs:
-            conv = raw.inner_conv
-            width = conv.kernel_size[0] - conv.stride[0]
-            # the layer adds ``partial - bias`` to the next output; bias makes that 0
-            bias = conv.bias if conv.bias is not None else torch.zeros(conv.out_channels, device=dev)
-            caches.append(bias.detach().view(1, -1, 1).expand(1, -1, width).contiguous())
-        for raw in self._slots.lstms:
-            lstm = raw.lstm
-            zeros = torch.zeros(lstm.num_layers, 1, lstm.hidden_size, device=dev)
-            caches.extend([zeros, zeros])
+        for slot, shape in enumerate(layout.shapes):
+            view = flat[:, layout.offsets[slot]:layout.offsets[slot + 1]].view(batch, *shape)
+            caches.append(view.transpose(0, 1).contiguous() if slot in layout.lstm_slots else view)
         return caches
 
-    def _install(self, caches: list[torch.Tensor], batch: int) -> None:
-        it = iter(caches)
-        for outer, raw in self._slots.convs:
-            outer._streaming_state = outer._init_streaming_state(batch)
-            outer._streaming_state.init_stream()
-            outer._streaming_state.padding_to_add = 0
-            raw._streaming_state = raw._init_streaming_state(batch)
-            raw._streaming_state.init_stream()
-            raw._streaming_state.previous = next(it)
-        for raw in self._slots.convtrs:
-            raw._streaming_state = raw._init_streaming_state(batch)
-            raw._streaming_state.init_stream()
-            raw._streaming_state.partial = next(it)
-        for raw in self._slots.lstms:
-            raw._streaming_state = raw._init_streaming_state(batch)
-            raw._streaming_state.init_stream()
-            raw._streaming_state.previous_h = next(it)
-            raw._streaming_state.previous_c = next(it)
-        for module in (*self._slots.adds, *self._slots.others):
-            module._streaming_state = module._init_streaming_state(batch)
-            module._streaming_state.init_stream()
+    def _pack(self, caches: list[torch.Tensor | None], batch: int) -> torch.Tensor:
+        pieces = []
+        offsets = self._layout.offsets
+        for slot, cache in enumerate(caches):
+            if offsets[slot + 1] == offsets[slot]:   # a layer that keeps nothing
+                continue
+            pieces.append((cache.transpose(0, 1) if slot in self._layout.lstm_slots else cache).reshape(batch, -1))
+        return torch.cat(pieces, dim=1)
 
-    def _harvest(self) -> list[torch.Tensor]:
-        # the conv caches are views into whole-chunk activations: copy them out
-        # so a stream between chunks holds a few KB, not the activations
-        caches = [raw._streaming_state.previous.contiguous() for _, raw in self._slots.convs]
-        caches += [raw._streaming_state.partial.contiguous() for raw in self._slots.convtrs]
-        for raw in self._slots.lstms:
-            caches += [raw._streaming_state.previous_h, raw._streaming_state.previous_c]
-        for add in self._slots.adds:
-            # whole frames in means both branches of every residual add stay in step
-            for leftover in (add._streaming_state.previous_x, add._streaming_state.previous_y):
-                if leftover is not None and leftover.shape[-1]:
-                    raise RuntimeError("AudioSeal residual branches fell out of step")
-        return caches
-
-    def _uninstall(self) -> None:
-        for outer, raw in self._slots.convs:
-            outer._streaming_state = outer._empty_state()
-            raw._streaming_state = raw._empty_state()
-        for module in (*self._slots.convtrs, *self._slots.lstms, *self._slots.adds, *self._slots.others):
-            module._streaming_state = module._empty_state()
-
-    @property
-    def _lstm_offset(self) -> int:
-        return len(self._slots.convs) + len(self._slots.convtrs)
-
-    def _stack(self, per_stream: list[list[torch.Tensor]]) -> list[torch.Tensor]:
-        if len(per_stream) == 1:
-            return per_stream[0]
-        lstm_from = self._lstm_offset
-        return [
-            torch.cat(column, dim=1 if i >= lstm_from else 0)
-            for i, column in enumerate(zip(*per_stream, strict=True))
-        ]
-
-    def _unstack(self, caches: list[torch.Tensor], batch: int) -> list[list[torch.Tensor]]:
-        if batch == 1:
-            return [caches]
-        lstm_from = self._lstm_offset
-        out: list[list[torch.Tensor]] = [[] for _ in range(batch)]
-        for i, tensor in enumerate(caches):
-            lstm = i >= lstm_from
-            for b, part in enumerate(tensor.split(1, dim=1 if lstm else 0)):
-                # cuDNN's LSTM refuses a non-contiguous hx, which a batch-dim
-                # slice of [layers, batch, hidden] is, once the stream runs alone
-                out[b].append(part.contiguous() if lstm else part)
-        return out
+    def _run(self, ops: tuple, x: torch.Tensor, caches: list, new: list) -> torch.Tensor:
+        """AudioSeal's streaming layers, op for op (``moshi.modules.streaming``),
+        with the state in ``caches`` and the next state written to ``new``.
+        Every input holds whole frames, so each conv consumes all of it but
+        its last ``keep`` samples. The kept tails are copied out at once: a
+        view would hold the layer's whole activation until the end of the
+        call, which doubles a 32-row, 2 s capture's memory (5 GB, not 2.5)."""
+        for op in ops:
+            if isinstance(op, _Conv):
+                if (x.shape[-1] % op.conv.stride[0]) != 0:
+                    raise RuntimeError("AudioSeal conv input is not a whole number of strides")
+                if op.keep:
+                    x = torch.cat([caches[op.slot], x], dim=-1)
+                    new[op.slot] = x[..., x.shape[-1] - op.keep:].clone()
+                x = op.conv(x)
+            elif isinstance(op, _ConvTranspose):
+                out = op.conv(x)
+                total = out.shape[-1]
+                if op.conv.bias is not None:
+                    out[..., :op.keep] += caches[op.slot] - op.conv.bias[:, None]
+                else:
+                    out[..., :op.keep] += caches[op.slot]
+                new[op.slot] = out[..., total - op.keep:].clone()
+                x = out[..., :total - op.keep]
+            elif isinstance(op, _LSTM):
+                seq = x.permute(2, 0, 1)
+                y, (h, c) = op.lstm(seq, (caches[op.h_slot], caches[op.c_slot]))
+                new[op.h_slot], new[op.c_slot] = h, c
+                if op.skip:
+                    y = y + seq
+                x = y.permute(1, 2, 0)
+            elif isinstance(op, _Residual):
+                shortcut = x if op.shortcut is None else self._run(op.shortcut, x, caches, new)
+                x = shortcut + self._run(op.block, x, caches, new)
+            else:
+                x = op(x)
+        return x
 
     # -- watermarking -------------------------------------------------------
 
     @torch.no_grad()
-    def _watermark_frames(self, audio: torch.Tensor, caches: list[list[torch.Tensor]]) -> torch.Tensor:
-        """``audio`` [B, T] float, T a multiple of the hop, one stream per row;
-        ``caches`` is updated in place. Returns the watermark [B, T]."""
+    def _mark(self, audio: torch.Tensor, caches: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``audio`` [B, T] float, T a multiple of the hop, one stream per row,
+        and the streams' caches [B, cache_size]. Returns the watermark [B, T]
+        and the caches after it. Shapes depend on B and T only."""
         batch = audio.shape[0]
-        self._install(self._stack(caches), batch)
-        try:
-            with self._no_compile(), _watermark_precision():
-                gen = self.generator
-                hidden = gen.encoder(audio.unsqueeze(1)) + self._message_embedding
-                wm = gen.decoder(hidden)
-            new = self._unstack(self._harvest(), batch)
-        finally:
-            self._uninstall()
-        caches[:] = new
-        return wm.squeeze(1)
+        old = self._unpack(caches)
+        new: list[torch.Tensor | None] = [None] * len(old)
+        with _watermark_precision():
+            hidden = self._run(self._encoder, audio.unsqueeze(1), old, new) + self._message_embedding
+            wm = self._run(self._decoder, hidden, old, new)
+        return wm.squeeze(1), self._pack(new, batch)
+
+    @torch.no_grad()
+    def _mark_pcm16(self, pcm: torch.Tensor, caches: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``_mark`` for PCM16 rows [B, T], quantized back the way the codecs do."""
+        audio = pcm.to(torch.float32) / 32767
+        wm, new = self._mark(audio, caches)
+        marked = audio + self.config.alpha * wm
+        return (marked.clamp(-1, 1) * 32767).to(torch.int16), new
+
+    def _stacked_caches(self, streams: Sequence[WatermarkStream]) -> torch.Tensor:
+        return torch.stack([self._fresh if s.caches is None else s.caches for s in streams])
 
     @torch.no_grad()
     def apply(
@@ -403,24 +473,130 @@ class AudioSealWatermarker:
             groups[whole].append((i, x[:whole], keep if final else whole))
         for members in groups.values():
             audio = torch.stack([x for _, x, _ in members])
-            caches = [streams[i].caches or self._fresh for i, _, _ in members]
-            wm = self._watermark_frames(audio, caches)
+            wm, caches = self._mark(audio, self._stacked_caches([streams[i] for i, _, _ in members]))
             marked = audio + self.config.alpha * wm
-            for row, ((i, _, length), cache) in enumerate(zip(members, caches, strict=True)):
-                streams[i].caches = cache
+            for row, (i, _, length) in enumerate(members):
+                streams[i].caches = None if streams[i].finished else caches[row]
                 results[i] = marked[row, :length]
         return results  # type: ignore[return-value]
 
+    @torch.no_grad()
     def apply_pcm16(
         self,
         chunks: list[torch.Tensor],
         streams: list[WatermarkStream],
         finals: list[bool] | None = None,
+        runners: Mapping[str, Any] | None = None,
     ) -> list[torch.Tensor]:
-        """``apply`` for PCM16 chunks, quantized back the way the codecs do."""
-        floats = [chunk.to(self.device, torch.float32) / 32767 for chunk in chunks]
-        marked = self.apply(floats, streams, finals)
-        return [(m.clamp(-1, 1) * 32767).to(torch.int16) for m in marked]
+        """``apply`` for PCM16 chunks, quantized back the way the codecs do.
+
+        Chunks of whole frames with nothing pending (every Qwen3-TTS chunk)
+        run as one call per length, the conversion to float and back
+        included; with ``runners`` (the engine's captures of
+        ``piecewise_configs``) a call whose length was captured replays it,
+        and a final chunk is zero-padded to the next captured length (the
+        generator is causal and the stream's caches are dropped, so its
+        samples change by float rounding only). Anything else goes through
+        ``apply``."""
+        finals = finals or [False] * len(chunks)
+        results: list[torch.Tensor | None] = [None] * len(chunks)
+        groups: dict[int, list[int]] = defaultdict(list)
+        other = []
+        for i, (chunk, stream, final) in enumerate(zip(chunks, streams, finals, strict=True)):
+            if stream.finished:
+                raise RuntimeError("watermark stream got a chunk after its final one")
+            samples = chunk.numel()
+            if samples == 0 or samples % self.hop or (stream.pending is not None and stream.pending.numel()):
+                other.append(i)
+                continue
+            groups[self._captured_length(samples, runners) if final else samples].append(i)
+        for length, members in groups.items():
+            rows = [chunks[i].reshape(-1).to(self.device, torch.int16) for i in members]
+            pcm = torch.stack([
+                row if row.shape[0] == length else torch.nn.functional.pad(row, (0, length - row.shape[0]))
+                for row in rows
+            ])
+            caches = self._stacked_caches([streams[i] for i in members])
+            runner = runners.get(self.capture_label(length)) if runners else None
+            if runner is not None and runner.can_run(len(members)):
+                out = runner.run({"pcm": pcm, "caches": caches}, real_bs=len(members))
+                marked, caches = out["pcm"], out["caches"]
+            else:
+                if runners:
+                    self._log_eager("length" if runner is None else "batch", length, len(members))
+                marked, caches = self._mark_pcm16(pcm, caches)
+            for row, i in enumerate(members):
+                stream = streams[i]
+                stream.finished = finals[i]
+                stream.caches = None if finals[i] else caches[row]
+                results[i] = marked[row, :rows[row].shape[0]]
+        if other:
+            if runners:
+                self._log_eager("partial", 0, len(other))
+            floats = [chunks[i].to(self.device, torch.float32) / 32767 for i in other]
+            marked = self.apply(floats, [streams[i] for i in other], [finals[i] for i in other])
+            for i, m in zip(other, marked, strict=True):
+                results[i] = (m.clamp(-1, 1) * 32767).to(torch.int16)
+        return results  # type: ignore[return-value]
+
+    # -- capture --------------------------------------------------------------
+
+    def _log_eager(self, reason: str, length: int, rows: int) -> None:
+        """Say once per reason and length that captures exist but a call runs
+        eagerly, so a config whose chunks miss every capture is visible."""
+        if (reason, length) in self._eager_logged:
+            return
+        self._eager_logged.add((reason, length))
+        what = {
+            "length": f"a chunk of {length} samples, a length with no capture",
+            "batch": f"{rows} chunks of {length} samples, more than its largest captured batch",
+            "partial": "a chunk that is not whole frames or has a partial frame pending",
+        }[reason]
+        logger.warning("audio watermark: %s runs eagerly (logged once)", what)
+
+    @staticmethod
+    def capture_label(samples: int) -> str:
+        return f"watermark_{samples}"
+
+    def _captured_length(self, samples: int, runners: Mapping[str, Any] | None) -> int:
+        """The shortest captured chunk length that holds ``samples``, else ``samples``."""
+        if runners:
+            for length in self._capture_lengths:
+                if length >= samples and self.capture_label(length) in runners:
+                    return length
+        return samples
+
+    def piecewise_configs(self, lengths: Sequence[int], batch_sizes: Sequence[int]) -> dict[str, Any]:
+        """One ``PiecewiseBatchedConfig`` per chunk length (samples, whole
+        frames), for ``NodeSubmodule.get_piecewise_accelerator_graph_configs``: the
+        engine captures ``_mark_pcm16`` per (batch, length) bucket, with the
+        PCM rows and the streams' caches as static inputs."""
+        from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig
+
+        lengths = sorted(set(lengths))
+        if not lengths or any(length <= 0 or length % self.hop for length in lengths):
+            raise ValueError(f"audio_watermark capture lengths must be whole {self.hop}-sample frames, got {lengths}")
+        self._capture_lengths = lengths
+
+        def static_inputs(length, shape):
+            return {
+                "pcm": torch.zeros(shape.bs, length, dtype=torch.int16, device=self.device),
+                "caches": self._fresh.expand(shape.bs, -1).clone(),
+            }
+
+        def capture(call):
+            pcm, caches = self._mark_pcm16(call.static_inputs["pcm"], call.static_inputs["caches"])
+            return {"pcm": pcm, "caches": caches}
+
+        return {
+            self.capture_label(length): PiecewiseBatchedConfig(
+                capture_fn=capture,
+                make_static_inputs=partial(static_inputs, length),
+                seq_len=length // self.hop,
+                capture_batch_sizes=sorted(set(batch_sizes)),
+            )
+            for length in lengths
+        }
 
     @torch.no_grad()
     def offline(self, audio: torch.Tensor) -> torch.Tensor:

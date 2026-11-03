@@ -27,6 +27,7 @@ pytest.importorskip("mstar_rust")
 from mstar_rust import GraphRuntime, ZmqCommunicator
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication.edge_items import EdgeItemsBuilder, row_infos, rows
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode, encode, encode_field, encode_fields
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -96,6 +97,7 @@ class _Mesh:
             # request's are the same list.
             "r1", "default", WALK, list(wgs), list(wgs), list(workers),
             [1] * len(wgs),
+            [], [],
         )
 
     def run(self, rid, uuids, **send_kwargs):
@@ -144,6 +146,7 @@ def _send(rt, completion_id, **aos):
         stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
+        skip_rids=aos.get("skip_rids", []),
     )
 
 
@@ -196,7 +199,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
-            partition_name="default",
+            partition_name="default", graph_walk=WALK,
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
@@ -231,6 +234,20 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
+
+
+def test_a_skipped_rid_sends_nothing(tmp_path):
+    """A rid that failed after routing: no peer, client or conductor frame."""
+    mesh = _Mesh(
+        tmp_path, outs=[("out", "remote", False), ("txt", "emit_to_client", True)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    got = mesh.run(rid, uuids=[1], skip_rids=[rid])
+
+    assert got == {"conductor": [], "api_server": [], PEER: []}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
@@ -417,7 +434,7 @@ def test_stream_items_sent_ride_the_worker_graphs_done(tmp_path):
     _put(mesh, 1)
     _put(mesh, 2)
     got = mesh.run(rid, uuids=[1, 2])
-    assert got[PEER][0].body.inputs[0].is_streaming
+    assert got[PEER][0].message_type == WorkerMessageType.EDGE_ITEMS
     assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 2}}
     _put(mesh, 3)
     got = mesh.run(rid, uuids=[3])
@@ -433,7 +450,8 @@ def test_a_stream_item_whose_descriptor_is_gone_is_not_counted(tmp_path):
     _put(mesh, 2)
     mesh.book.forget_tensor(1)
     got = mesh.run(rid, uuids=[1, 2])
-    assert got[PEER][0].body.inputs[0].tensor_info == [_info(2)]
+    frame = got[PEER][0].body
+    assert [row_infos(frame, row) for row in rows(frame)] == [[_info(2)]]
     assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
 
 
@@ -468,7 +486,7 @@ def _loop_mesh(tmp_path):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         [ME, PEER], [1, 1])
+                         [ME, PEER], [1, 1], [], [])
     return rt, rid, inboxes
 
 
@@ -517,7 +535,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -562,7 +580,7 @@ def _persist_mesh(tmp_path, tp_rank):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -618,7 +636,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     """
     mesh = _Mesh(tmp_path, outs=[("out", "", False)])
     rid = mesh.admit()
-    mesh.rt.mark_stream_partition_done(rid, "default")
+    mesh.rt.mark_partition_done(rid, "default")
 
     # Not speculative: the flag rides through as the stream reported it.
     assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
@@ -662,7 +680,7 @@ def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         [ME, PEER, P2], [1, 2])
+                         [ME, PEER, P2], [1, 2], [], [])
     # By default 4 rows of 6 bytes.
     book.put_tensor(1, _info(
         1, dims=list(dims), nbytes=nbytes,
@@ -796,7 +814,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     srcs = [ME, PEER][:src_tp]
     dests = [PEER, P2][:dest_tp]
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         srcs + dests, [src_tp, dest_tp])
+                         srcs + dests, [src_tp, dest_tp], [], [])
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
@@ -893,7 +911,7 @@ def _looping_emit_mesh(tmp_path):
                   "tp_enabled_nodes": [], "sp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1], [], [])
     return rt, book, rid, inboxes
 
 
@@ -997,6 +1015,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     keep = mesh.admit()
     doomed = mesh.rt.add_request(
         "doomed", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+        [], [],
     )
     _put(mesh, 1)
     _put(mesh, 2)
@@ -1014,6 +1033,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     mesh.rt.remove_request(doomed)
     reused = mesh.rt.add_request(
         "fresh", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+        [], [],
     )
     assert reused == doomed, "the handle must be recycled for this to bite"
 
@@ -1036,7 +1056,8 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
 
 def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     """A mixed step routes rows of two walks in one call; each request's
-    worker-graphs-done names its own walk's graph, not the call's first."""
+    worker-graphs-done names its own walk and that walk's graph, not the
+    call's first."""
     book = RustTensorBookkeeping()
     comm = ZmqCommunicator(ME, str(tmp_path))
     conductor = ZmqCommunicator("conductor", str(tmp_path))
@@ -1052,7 +1073,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rids = [
-        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1])
+        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1], [], [])
         for name, walk in (("r_prefill", "prefill"), ("r_decode", "decode"))
     ]
     for rid in rids:
@@ -1067,5 +1088,95 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
           new_token_counts=[], stream_tokens_consumed=[], profiling=[])
 
-    done = {m.body.request_id: m.body.worker_graph_ids for m in _collect(conductor)}
-    assert done == {"r_prefill": [0], "r_decode": [1]}
+    done = {
+        m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
+        for m in _collect(conductor)
+    }
+    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
+
+
+def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
+    """A plain streamed edge to a peer rides EDGE_ITEMS, and the frame Rust
+    builds decodes to the one Python's EdgeItemsBuilder makes of the same
+    edge."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    infos = [
+        _put(mesh, 1, shm_segment="seg0", shm_offset=64, _source_node_name="only",
+             _source_graph_walk=WALK),
+        _put(mesh, 2, dims=[4], stride=[1], nbytes=8, dtype=torch.int64, shm_segment="seg0",
+             shm_offset=128, _source_node_name="only", _source_graph_walk=WALK),
+    ]
+    (frame,) = mesh.run(rid, uuids=[1, 2])[PEER]
+    builder = EdgeItemsBuilder("default")
+    assert builder.try_add("r1", GraphEdge(
+        next_node="remote", name="out", tensor_info=infos, is_streaming=True,
+    ))
+    assert frame == _sent(WorkerMessage(
+        message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
+    ))
+
+
+def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):
+    """Descriptors that don't share the frame's fields (here: another source
+    entity) keep the edge on INPUT_SIGNALS."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    _put(mesh, 2, source_entity="elsewhere")
+    (frame,) = mesh.run(rid, uuids=[1, 2])[PEER]
+    assert frame.message_type == WorkerMessageType.INPUT_SIGNALS
+    assert [i.uuid for i in frame.body.inputs[0].tensor_info] == [1, 2]
+
+
+@pytest.mark.parametrize("edge", ["streamed", "walk_driven", "not_streamed"])
+def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, edge):
+    """A loop pass that sends a peer only streamed items needs no forward-pass
+    info: the receiver reads it only alongside a non-streamed edge, or for a
+    walk-driven stream's consumer walk, which also keeps INPUT_SIGNALS."""
+    streaming = edge != "not_streamed"
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    peer = ZmqCommunicator(PEER, str(tmp_path))
+    node = _node("ar_decode", ["token"], [("token", "ar_decode", False)])
+    node["outputs"].append({"name": "out", "dest": "remote", "persist": False,
+                            "new_token": False, "streaming": streaming, "modality": ""})
+    wg = {
+        "wg_id": WG_ID, "graph_walks": [WALK], "nodes": [node],
+        "loops": [{
+            "name": "ar_loop", "max_iters": 8, "parent": None,
+            "member_nodes": ["ar_decode"],
+            "outputs": [{"name": "token", "dest": "", "persist": False,
+                         "new_token": False, "streaming": False, "modality": ""}],
+            "accumulated": [], "loop_back": [("token", "ar_decode")],
+            "external_inputs": [("token", "ar_decode")],
+        }],
+    }
+    rt = GraphRuntime(
+        worker_graphs=[wg],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
+                               "nodes": ["remote"], "dyn_loops": []}],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    if edge == "walk_driven":
+        rt.set_walk_driven_signals(["out"])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+                         [ME, PEER], [1, 1], [], [])
+    rt.ingest_inputs_batch(_one_signal(rid, "token", "ar_decode"))
+    rt.pop_rids("ar_decode", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    signals = rt.get_output_signals("ar_decode", WALK)
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None,
+        "node_name": "ar_decode", "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1 if s == "out" else 0 for s in signals],
+    })
+    assert (rid in out.rids_needing_request_info) is (edge != "streamed")
+    _send(rt, out.completion_id)
+    (frame,) = _collect(peer)
+    assert frame.message_type == (
+        WorkerMessageType.EDGE_ITEMS if edge == "streamed" else WorkerMessageType.INPUT_SIGNALS
+    )

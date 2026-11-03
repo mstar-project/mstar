@@ -68,6 +68,7 @@ class RealtimeConnection:
         self.stream = None
         self._response_open = False
         self._consumed_audio = False           # any user audio fed yet?
+        self._odd_byte = b""                   # first byte of a sample split across appends
 
     def _open_stream(self):
         """(Re)create the duplex stream, priming the current system prompt."""
@@ -100,7 +101,21 @@ class RealtimeConnection:
                         "started is applied on the next input_audio_buffer.clear"}})
             await self.send_json({"type": "session.updated", "session": self.cfg})
         elif et == "input_audio_buffer.append":
-            pcm = base64.b64decode(event["audio"])
+            try:
+                # whitespace is allowed (base64.encodebytes wraps lines), as on the API server
+                # not `or ""`: a null is an error, not an empty append, on every realtime path
+                audio = event.get("audio", "").encode("ascii").translate(None, b" \t\n\r\v\f")
+                pcm = self._odd_byte + base64.b64decode(audio, validate=True)
+            except (ValueError, TypeError, AttributeError):
+                await self.send_json({"type": "error",
+                                      "error": {"message": "audio is not base64", "code": "invalid_audio"}})
+                return
+            # the stream takes whole int16 samples; an odd trailing byte waits
+            # for the rest of its sample in the next append
+            whole = len(pcm) - len(pcm) % 2
+            pcm, self._odd_byte = pcm[:whole], pcm[whole:]
+            if not pcm:
+                return
             self._consumed_audio = True
             await self._consume(self.stream.append_audio(pcm))
         elif et == "input_audio_buffer.commit":
@@ -108,6 +123,7 @@ class RealtimeConnection:
             await self._finish_response()
         elif et == "input_audio_buffer.clear":
             self._open_stream()  # fresh turn — re-prime the current system prompt
+            self._odd_byte = b""  # only clear drops it: a cancel or update does not end the byte stream
         elif et == "response.cancel":
             self._open_stream()
             await self._finish_response()

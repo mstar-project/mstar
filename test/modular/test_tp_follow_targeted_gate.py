@@ -1,4 +1,4 @@
-"""The TP-follow FIFO must never be popped by a targeted get_next_batch call.
+"""The TP-follow FIFO must never be popped by a speculation chain's step.
 
 A ScheduleTPNode is a mandate from the TP group leader: rank 0 has already
 committed to the batch and will sit on the collective inside the forward
@@ -7,13 +7,13 @@ Once the message is popped from the FIFO, nothing on a follower worker will
 ever reschedule that batch — followers cannot initiate scheduling for
 parallel nodes — so whoever pops it must submit it unconditionally.
 
-The only targeted caller in-tree is the speculation fresh-rid merge in
-``worker._try_speculate_next``, which is a discretionary consumer: it may
+The chain's step (``pick_chain_step`` / ``take_chain_step``, which
+``worker._try_speculate_next`` merges) is a discretionary consumer: it may
 reject rids from the batch it is handed (the "in-flight rid wins" branch).
 Handing it a TP-follow batch therefore risks stranding a popped
 ScheduleTPNode with no re-queue path, hanging the whole TP group at the next
-collective. The guard under test: targeted calls leave the FIFO untouched;
-untargeted calls still serve it, in order.
+collective. The guard under test: the chain's step leaves the FIFO
+untouched; ``get_next_batch`` still serves it, in order.
 """
 
 import sys
@@ -48,9 +48,11 @@ class _FakeEngine:
         return FULL_ADMIT_OK
 
     def get_max_batch_size(self, node_name, graph_walk):
-        """None is no cap: a targeted call now resolves the walk's cap through
-        _room_left, and these tests are about the TP-follow FIFO, not caps."""
+        """None is no cap: these tests are about the TP-follow FIFO, not caps."""
         del node_name, graph_walk
+
+    def splits_by_capture_key(self, node_name, graph_walk):
+        return False
 
 
 class _FakeEngineManager:
@@ -173,14 +175,19 @@ def _msg(rids=("r0", "r1")):
     return ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=list(rids))
 
 
-def test_targeted_call_never_pops_tp_follow():
+def _chain_step(sched, manager):
+    """What a speculation chain on (NODE, WALK) asks of the scheduler."""
+    chain = sched.pick_chain_step(manager, (NODE, WALK), ["r9"])
+    return sched.take_chain_step(manager, chain)
+
+
+def test_the_chains_step_never_pops_tp_follow():
     sched, manager = _setup()
     sched.register_tp_follow(_msg())
 
-    # Even an exactly-matching target must be refused: the targeted caller
-    # (the speculation merge) may reject the batch, and a popped message
-    # has no re-queue path.
-    assert sched.get_next_batch(manager, target=(NODE, WALK)) is None
+    # Even at a matching target: the chain may reject the batch, and a popped
+    # message has no re-queue path.
+    assert _chain_step(sched, manager) is None
     assert len(sched.tp_batches_pending_schedule) == 1
 
     # The refusals consumed nothing: an untargeted call still builds the
@@ -215,12 +222,12 @@ def test_exclude_target_skips_head_but_keeps_it_queued():
     assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
-def test_fifo_order_survives_refused_targeted_calls():
+def test_fifo_order_survives_the_chains_steps():
     sched, manager = _setup(rids=("r0", "r1", "r2", "r3"))
     sched.register_tp_follow(_msg(("r0", "r1")))
     sched.register_tp_follow(_msg(("r2", "r3")))
 
-    assert sched.get_next_batch(manager, target=(NODE, WALK)) is None
+    assert _chain_step(sched, manager) is None
 
     first = sched.get_next_batch(manager)
     assert set(first.request_to_worker_graph) == {"r0", "r1"}

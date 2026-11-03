@@ -12,8 +12,9 @@ import queue
 import threading
 from types import SimpleNamespace
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication.event import EventWakeup
 
 
 def _worker_with(received_chunk_counts):
@@ -45,13 +46,16 @@ def test_preprocess_failure_emits_error_chunk():
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.in_queue = queue.Queue()
-    wt.out_queue = queue.Queue()
+    wt._is_pending = lambda key: True
+    wt.out_queue = ResultQueue(EventWakeup())
+    wt.profile_queue = ResultQueue(EventWakeup())
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
     wt.abort_request_queue = queue.Queue()
     wt.reads_done_queue = queue.Queue()
     wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
+    wt.timing_requested = threading.Event()
     wt.communicator = SimpleNamespace(
         get_all_new_messages=lambda: [], send=lambda *args: None,
     )
@@ -60,8 +64,10 @@ def test_preprocess_failure_emits_error_chunk():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
+    wt._client_edges = frozenset()
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}

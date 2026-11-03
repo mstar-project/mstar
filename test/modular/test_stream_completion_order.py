@@ -18,6 +18,8 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication.edge_items import row_infos
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.communication.wire import decode
@@ -39,10 +41,12 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    EdgeItems,
     InputSignals,
     WorkerGraphsDone,
     WorkerMessageType,
 )
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 PRODUCER = "worker_0"
@@ -95,7 +99,7 @@ class _Producer:
     """``LLM`` on worker_0 streams ``new_token`` into ``snac_decoder`` on
     worker_1, each in its own walk and partition, as Orpheus splits them."""
 
-    def __init__(self, kind, tmp_path):
+    def __init__(self, kind, tmp_path, walk_driven_signals=frozenset()):
         llm = WorkerGraph(
             section=GraphNode(
                 name="LLM", input_names={"text_inputs"},
@@ -111,6 +115,7 @@ class _Producer:
             all_wg_ids_to_nodes={0: {"LLM"}, 1: {"snac_decoder"}},
             node_to_partition={"LLM": "LLM", "snac_decoder": "SNAC"},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+            walk_driven_signals=walk_driven_signals,
         )
         self.kind = kind
         if kind == "python":
@@ -141,6 +146,7 @@ class _Producer:
             request_id=RID, partition="LLM", graph_walk="decode",
             partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0, 1], [[PRODUCER], [CONSUMER]]),
+            loop_caps={},
         )
 
     def step(self, uuid):
@@ -156,6 +162,7 @@ class _Producer:
             output_signals=[EDGE], wg_ids=ParallelList([self.rid], [0]),
             tensors=[uuid], num_tensors=[1],
         ))
+        self.route = out
         fwd = CurrentForwardPassInfo(
             request_id=RID, graph_walk="decode", fwd_index=0, random_seed=0,
             max_tokens=8, partition_name="LLM",
@@ -210,6 +217,9 @@ class _EndsLLM:
 def _conductor(passes=1):
     c = object.__new__(Conductor)
     c.model = _EndsLLM(passes)
+    c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = {"SNAC"}
+    c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}, 1: {"snac_chunk"}}
@@ -260,9 +270,12 @@ def _conduct(c, wgds) -> InputSignals:
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
     w = Worker.__new__(Worker)
+    w._reads_done_sent = set()  # takes every input (`_takes_input`)
+    w._walk_drivers = {}
+    w._walk_driven_edges = {}
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
-    w._draining_rids = set()
+    w._reads_done_sent = set()
     w.enable_nvtx = False
     w._rid = lambda rid: 1
     w.request_state = SimpleNamespace(per_request_info={
@@ -271,31 +284,40 @@ def _consumer(policy):
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w.tensor_manager = SimpleNamespace(
         start_read_tensors=lambda *a, **k: [],
+        start_read_tensors_multi=lambda reads: [],
         get_tensor=lambda uuid: torch.tensor([uuid]),
         dereference_batch_uniform=lambda ids: None,
-        store_and_return_tensor_info=lambda rid, d, **k: {
-            name: [object()] for name in d
-        },
+        increment_ref_batch_uniform=lambda ids: None,
     )
-    w._consumer_node_cache = {EDGE: "snac_decoder"}
-    w._stream_partition = {EDGE: "SNAC"}
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.streams.consumer_node = {EDGE: "snac_decoder"}
+    w.streams._partition = {EDGE: "SNAC"}
     return w, buf
 
 
 def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
-    w._process_new_inputs(descriptor)
-    for edge in descriptor.inputs:
-        w._route_streaming_tensor(1, edge)
+    if isinstance(descriptor, EdgeItems):
+        w._process_edge_items(descriptor)
+        edges = [
+            GraphEdge(next_node=row.next_node, name=row.signal,
+                      tensor_info=row_infos(descriptor, row), is_streaming=True)
+            for row in stream_rows(descriptor)
+        ]
+    else:
+        w._process_new_inputs(descriptor)
+        edges = descriptor.inputs
+    for edge in edges:
+        w.streams.route_tensor(1, edge)
 
 
 def _chunks(w, buf):
     """Every chunk the consumer would take now, as (num_items, is_final)."""
     out = []
-    while (se := w._pop_streaming_edge(buf, EDGE, 1)) is not None:
+    while (se := w.streams.pop_edge(buf, EDGE, 1)) is not None:
         out.append((se.chunk.num_items, se.chunk.is_final))
         if se.chunk.is_final:
-            node_done, partition_done = w._settle_final_streams("snac_decoder", {1: {EDGE}})
+            node_done, partition_done = w.streams.settle_final("snac_decoder", {1: {EDGE}})
             assert node_done == partition_done == {1}
     return out
 
@@ -303,6 +325,23 @@ def _chunks(w, buf):
 @pytest.fixture(params=["python", "rust"])
 def kind(request):
     return request.param
+
+
+@pytest.mark.parametrize("walk_driven", [False, True])
+def test_a_walk_driven_stream_keeps_input_signals(kind, tmp_path, walk_driven):
+    """A stream whose consumer walk the producer decides goes to its peer as
+    INPUT_SIGNALS with its request info, which carries that walk; any other
+    plain stream rides EDGE_ITEMS."""
+    producer = _Producer(
+        kind, tmp_path, walk_driven_signals=frozenset({EDGE}) if walk_driven else frozenset(),
+    )
+    to_consumer, _ = producer.step(1)
+    assert isinstance(to_consumer, InputSignals if walk_driven else EdgeItems)
+    if walk_driven:
+        # the row asks for its forward-pass info, which carries the walk
+        needs = producer.route.rids_needing_request_info
+        assert needs is None or producer.rid in needs
+        assert to_consumer.request_info is not None
 
 
 def test_done_before_the_last_item_waits_for_it(kind, tmp_path):
@@ -401,9 +440,9 @@ def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
 
     w, buf = _consumer(FixedChunkPolicy(1, continue_after_done=True))
     w._process_new_inputs(done)
-    assert w._pop_streaming_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
+    assert w.streams.pop_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
     _deliver(w, descriptor)
-    se = w._pop_streaming_edge(buf, EDGE, 1)
+    se = w.streams.pop_edge(buf, EDGE, 1)
     assert se.chunk.num_items == 1 and not se.chunk.is_final
 
 

@@ -20,10 +20,19 @@ class _RecordingServer:
         self.streaming = kwargs["streaming"]
         return "r"
 
-    def async_stream_results(self, request_id, binary=False):
+    async def open_result_stream(self, request_id, raw_request=None):
+        return None
+
+    def async_stream_results(self, request_id, binary=False, chunks=None):
         async def body():
             yield b'{"modality": "text"}\n'
         return body()
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def release_submission(self, key):
+        pass
 
     async def collect_results(self, request_id, request):
         return []
@@ -112,3 +121,49 @@ def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
 
     assert response.status_code == 500
     assert response.json()["detail"].startswith("downstream failure")
+
+
+def test_generate_returns_400_for_a_refused_request(monkeypatch):
+    """submit_request refuses bad input with a ValueError (a bad seed, an
+    unsupported modality); that is the client's fault, not a 500."""
+    class RefusingServer:
+        async def wait_for_request_id(self, request_id):
+            pass
+
+        def submit_request(self, **kwargs):
+            raise ValueError("seed must fit in a signed 64-bit integer, got 18446744073709551616.")
+
+    monkeypatch.setattr(entrypoint, "api_server", RefusingServer())
+
+    response = TestClient(entrypoint.app).post("/generate")
+
+    assert response.status_code == 400
+    assert "64-bit" in response.json()["detail"]
+
+class _UploadServer(_RecordingServer):
+    def __init__(self, upload_dir):
+        super().__init__()
+        self.upload_dir = upload_dir
+
+
+@pytest.mark.parametrize("files,fields,detail", [
+    ([("clip.wav", b"RIFF"), ("notes.xyz", b"?")], {}, "Cannot determine modality for file: notes.xyz"),
+    ([("clip.wav", b"RIFF")], {"input_modalities": "video_frame"}, "'video_frame' is an output-only modality"),
+    ([("clip.wav", b"RIFF")], {"model_kwargs": "{"}, "model_kwargs must be valid JSON"),
+    ([("clip.wav", b"RIFF")], {"model_kwargs": "[1]"}, "model_kwargs must be a JSON object"),
+], ids=["unknown-file", "video-frame-input", "bad-json", "not-an-object"])
+def test_a_refused_generate_leaves_no_upload_behind(monkeypatch, tmp_path, files, fields, detail):
+    """A request refused after its files are saved is never submitted, so the
+    deferred cleanup never sees them; the refusal deletes them."""
+    server = _UploadServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+
+    response = TestClient(entrypoint.app).post(
+        "/generate",
+        data={"text": "hi", **fields},
+        files=[("files", (name, data, "application/octet-stream")) for name, data in files],
+    )
+
+    assert (response.status_code, response.json()) == (400, {"detail": detail})
+    assert server.streaming is None
+    assert list(tmp_path.iterdir()) == []

@@ -23,8 +23,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     KVManager,
@@ -84,15 +85,17 @@ def _manager() -> KVManager:
     return kv
 
 
-def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT) -> None:
+def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT, decode: int = 0, image: int = 0) -> None:
     whole = len(prompt) // PAGE_SIZE
+    spans = (PrefixSpan(len(prompt), len(prompt), WALK),) + ((PrefixSpan(image, 1, WALK),) if image else ())
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain([
             prompt[at:at + PAGE_SIZE] for at in range(0, len(prompt), PAGE_SIZE)
         ])},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR},
-        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
+        kv_layout={"main": StreamLayout(spans=spans, growth=(("decode_loop", 1),), keyed_spans=1)},
+        loop_caps={"decode_loop": decode},
     ))
 
 
@@ -119,7 +122,7 @@ def _indexed(kv: KVManager) -> int:
 
 def test_an_image_after_the_text_leaves_the_chain_at_the_text():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30, image=IMAGE)
     _step(kv, "r0", len(PROMPT))
     # the image is the last thing prefilled, so its step samples the first token
     _step(kv, "r0", IMAGE)
@@ -141,7 +144,7 @@ def test_an_image_after_the_text_leaves_the_chain_at_the_text():
 
 def test_a_read_in_stream_keys_nothing_it_generates():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30)
     published = PublishedKVInfo.build_for_rank(0, 1, {"main": KVSequenceInfo(
         seq_len=len(PROMPT), latest_kv_transfer_info="peer",
         page_indices=list(range(3)),
@@ -194,7 +197,7 @@ def test_a_peers_publish_drops_the_partial_chain_even_when_nothing_is_read():
 
 def test_a_text_stream_keeps_its_chain_through_its_decode():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30)
     _step(kv, "r0", len(PROMPT))
     _sampled(kv, "r0", 9000)
 
@@ -210,7 +213,7 @@ def test_a_text_stream_keeps_its_chain_through_its_decode():
 
 def test_a_stream_reading_its_own_publish_keeps_keying_its_samples():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30)
     _step(kv, "r0", len(PROMPT))
     _sampled(kv, "r0", 9000)
 
@@ -228,7 +231,7 @@ def test_a_stream_reading_its_own_publish_keeps_keying_its_samples():
 
 def test_a_decode_step_that_commits_before_its_token_is_read_back_keeps_the_chain():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30)
     _step(kv, "r0", len(PROMPT))
 
     # every step commits the token its predecessor sampled before that
@@ -251,13 +254,13 @@ def test_a_decode_step_that_commits_before_its_token_is_read_back_keeps_the_chai
 
 def test_a_stream_that_released_its_front_keys_nothing_further():
     kv = _manager()
-    _ingest(kv, "r0")
+    _ingest(kv, "r0", decode=30)
     _step(kv, "r0", len(PROMPT))
     indexed = _indexed(kv)
     _sampled(kv, "r0", 9000)
 
-    # what a sliding window leaves behind: the pages moved, the lengths did not
-    kv._streams["r0"]["main"].released = PAGE_SIZE
+    # what a sliding window leaves behind: the front page goes, the positions after it stay
+    assert kv.release_oldest("r0", PAGE_SIZE) == PAGE_SIZE
     for token in range(9001, 9031):
         _step(kv, "r0", 1)
         _sampled(kv, "r0", token)
@@ -300,11 +303,11 @@ def test_a_stream_with_no_window_indexes_every_page_it_fills():
 
 # ── a walk the keys never described ─────────────────────────────────────
 
-WALKS = {"main": ("prefill_text", "decode")}
+WALKS = {"main": KeyedWalks(("prefill_text",), ("decode",))}
 
 
 def _first_write(walk: str) -> KVManager:
-    """Key 40 tokens, then commit 50 under ``walk`` before anything else."""
+    """Key 40 tokens, then commit them under ``walk`` before anything else."""
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
@@ -318,9 +321,9 @@ def _first_write(walk: str) -> KVManager:
     kv.ingest_request("r0", KVReqConfig(
         prefix_keys={"main": chain([prompt[:16], prompt[16:32], prompt[32:]])},
         prefix_tail={"main": prompt[32:]},
-        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), "prefill_text")]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(prompt), len(prompt), walk),), keyed_spans=1)},
     ))
-    step = KVStep(segments=(Segment("r0", "main", 50),))
+    step = KVStep(segments=(Segment("r0", "main", len(prompt)),))
     ctx = StepContext(request_ids=("r0",), graph_walk=walk, slot=0, capture=False)
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)

@@ -59,9 +59,10 @@ def make_request(prompt: str, idx: int) -> str:
             if msg.get("modality") == "text":
                 data_b64 = msg.get("data", "")
                 decoded = base64.b64decode(data_b64)
-                output_chunks.append(decoded.decode("utf-8", errors="replace"))
+                output_chunks.append(decoded)
 
-    result = "".join(output_chunks)
+    # joined before decoding: a character can span two chunks
+    result = b"".join(output_chunks).decode("utf-8", errors="replace")
 
     # Thread-safe print
     with print_lock:

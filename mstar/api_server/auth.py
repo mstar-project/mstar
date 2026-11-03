@@ -1,7 +1,7 @@
 """Optional API key for the HTTP and WebSocket surface.
 
 Off unless ``--api-key`` or ``MSTAR_API_KEY`` sets a key. When set, every
-request except the probe paths in ``UNAUTHENTICATED_PATHS`` must carry
+request except the probe and scrape paths in ``UNAUTHENTICATED_PATHS`` must carry
 ``Authorization: Bearer <key>`` (what the OpenAI SDKs send for ``api_key``);
 WebSocket routes are checked at the handshake. The check is one ASGI
 middleware over the whole app rather than a per-route dependency, so a route
@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 API_KEY_ENV = "MSTAR_API_KEY"
 
-#: Served without a key: liveness probes from load balancers and orchestrators.
-UNAUTHENTICATED_PATHS = frozenset({"/health"})
+#: Served without a key: liveness probes from load balancers and orchestrators,
+#: and the Prometheus scrape endpoint (request counts, latencies and the model
+#: name; never prompts or outputs).
+UNAUTHENTICATED_PATHS = frozenset({"/health", "/metrics"})
 
 _UNAUTHORIZED_BODY = json.dumps({"error": {
     "message": "missing or invalid API key; send 'Authorization: Bearer <key>'",
