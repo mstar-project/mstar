@@ -103,11 +103,14 @@ except Exception as e:  # pragma: no cover -- exercised only when triton missing
 
 
 def _make_experts_backend(moe_backend: str, num_experts: int, intermediate_size: int,
-                          hidden_size: int, top_k: int):
-    """The block's fused backend, or None where the fused path cannot load."""
+                          hidden_size: int, top_k: int, skips_rows: bool = False):
+    """The block's fused backend, or None where the fused path cannot load.
+    ``skips_rows`` for blocks that dispatch with ``skip_invalid``."""
     if make_moe_backend is None:
         return None
-    return make_moe_backend(moe_backend, MoEProblem(num_experts, intermediate_size, hidden_size, top_k))
+    return make_moe_backend(
+        moe_backend, MoEProblem(num_experts, intermediate_size, hidden_size, top_k), skips_rows=skips_rows,
+    )
 
 
 class TopKRouter(nn.Module):
@@ -682,6 +685,8 @@ class ParallelSparseMoeBlock(nn.Module):
     When ``tp_size > 1``, expert weights are sharded along the
     intermediate dimension and an all-reduce sums the ranks' partial
     outputs.
+
+    ``mask_padding`` says the caller passes ``token_valid`` to forward.
     """
 
     def __init__(
@@ -694,6 +699,7 @@ class ParallelSparseMoeBlock(nn.Module):
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
         moe_backend: str = "auto",
+        mask_padding: bool = False,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -723,7 +729,7 @@ class ParallelSparseMoeBlock(nn.Module):
             torch.empty(num_experts, hidden_size, shard_inter)
         )
         self.experts_backend = _make_experts_backend(
-            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok,
+            moe_backend, num_experts, shard_inter, hidden_size, num_experts_per_tok, skips_rows=mask_padding,
         )
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
@@ -1023,6 +1029,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         )
         self.experts_backend = _make_experts_backend(
             moe_backend, self.num_local_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
+            skips_rows=True,
         )
         self._attach_weight_loaders()
 
