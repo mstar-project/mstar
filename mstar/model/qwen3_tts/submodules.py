@@ -791,10 +791,15 @@ class TalkerSubmodule(ARNodeSubmodule):
         An EOS frame stays out of the codec stream, ``ignore_eos`` or not: EOS
         is loop control and not a codebook index, and only this host copy
         tells it from audio.
+
+        A per-request step hands this ``postprocess``'s ``layer0_codes``; a
+        decode step whose batched check declines or raises hands the host rows
+        under the forward's name, ``new_token``.
         """
-        if "layer0_codes" not in outputs:
+        codes = outputs.get("layer0_codes") or outputs.get("new_token")
+        if not codes:
             return set()
-        token = int(outputs["layer0_codes"][0].item())
+        token = int(codes[0].item())
         stops = self._stops(request_id, request_info, token)
         is_eos = token == self.talker_config.codec_eos_token_id
         return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
