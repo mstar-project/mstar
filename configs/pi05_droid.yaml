@@ -10,11 +10,10 @@ max_seq_len: 2048
 # are joint velocities and the gripper position in robot units (openpi keeps [:, :8]),
 # the rest is padding. action_dim stays 32, the checkpoint's projection width.
 #
-# These are fixed at server start, and action_horizon and num_cameras are baked into
-# the CUDA-graph captures.
+# These are fixed at server start, and num_cameras is baked into the CUDA-graph captures,
+# as is the action horizon, 15, which comes from the checkpoint's chunk_size.
 model_kwargs:
   model_path_hf: "lerobot/pi05_droid"
-  action_horizon: 15
   num_cameras: 2
   # openpi's DROID stats, gs://openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json
   # (its first 8 dims, the rest is zero padding). Neither lerobot checkpoint ships them.
