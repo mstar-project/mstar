@@ -510,8 +510,8 @@ class MicroScheduler:
         self._arrivals = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
-        # node -> rids waiting there, which readiness answers without asking the engine until
-        # `Engine.admit_waiting` admits them or their rebuild lands
+        # node -> rids waiting for capacity there, which readiness answers without asking the
+        # engine until `Engine.admit_waiting` admits them
         self.parked: dict[str, set[int]] = {}
         # (node, graph walk) -> most rows a batch may take while its admits are
         # refused with nothing to evict; see `limit_batch`
