@@ -676,8 +676,9 @@ model_kwargs
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
 baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune, fixes the
-action horizon and camera count, and carries the DROID robot's normalization stats:
+Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune (whose
+``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
+DROID robot's normalization stats:
 
 .. code-block:: yaml
 
@@ -685,7 +686,6 @@ action horizon and camera count, and carries the DROID robot's normalization sta
    max_seq_len: 2048
    model_kwargs:
      model_path_hf: "lerobot/pi05_droid"
-     action_horizon: 15
      num_cameras: 2
      norm_stats:  # openpi's DROID quantiles, 8 dims each
        state: {q01: [...], q99: [...]}
