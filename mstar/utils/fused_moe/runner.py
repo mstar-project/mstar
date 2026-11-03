@@ -15,6 +15,7 @@ import torch
 import triton.language as tl
 
 from mstar.platforms import current_platform
+from mstar.utils.fused_moe import align
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_triton,
@@ -39,7 +40,9 @@ class MoeAlignment(NamedTuple):
 def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
     """``BLOCK_SIZE_M`` that :func:`fused_experts` aligns to for this batch."""
     experts, two_inter, hidden = w1.shape
-    return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
+    config, _ = get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k,
+                           dtype=w1.dtype, device=w1.device)
+    return config["BLOCK_SIZE_M"]
 
 
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -142,19 +145,20 @@ def fused_experts(
         return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
                                      reduce=reduce_results)
 
+    # tuned launch options must reach a compiled launch as constants, and the alignment's torch
+    # fallback breaks the graph before it, so a compiled call without the CUDA op runs the default
+    # tiles. K is the weights' (static under any compile), not the activations'.
+    tuned = alignment is not None or not torch.compiler.is_compiling() or align._cuda_op_available()
+    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
+                                     dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
-    block_m = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
+    block_m = config["BLOCK_SIZE_M"]
     if alignment is None:
         alignment = MoeAlignment(*moe_align_block_size(topk_ids, block_m, E), block_m)
     assert alignment.block_m == block_m, f"alignment uses BLOCK_SIZE_M={alignment.block_m}, config {block_m}"
     sorted_token_ids, expert_ids, num_tokens_post_padded, _ = alignment
-
-    # Read here, not above: the alignment is a graph break to dynamo, and an int that
-    # crosses one and differs between compiles turns symbolic, which a launch's tile
-    # sizes can't be. A tuned table's tiles differ with the batch.
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k

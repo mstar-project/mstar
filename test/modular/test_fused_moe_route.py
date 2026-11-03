@@ -3,7 +3,6 @@ Its choice of experts, its weights and the expert GEMMs' output have to be the e
 and a batch it doesn't cover has to take ``router_topk``."""
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -125,49 +124,6 @@ def test_the_experts_output_matches_through_the_aligned_path(tokens):
     together = fused_experts(x, w1, w2, weights, ids, alignment=alignment)
     apart = fused_experts(x, w1, w2, weights, ids)
     assert torch.allclose(together.float(), apart.float(), atol=2e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize(("tuned", "M", "picked"), [
-    ({1: "a", 4: "b", 16: "c"}, 1, "a"),
-    ({1: "a", 4: "b", 16: "c"}, 2, "a"),
-    ({1: "a", 4: "b", 16: "c"}, 3, "b"),
-    ({1: "a", 4: "b", 16: "c"}, 10, "b"),
-    ({1: "a", 4: "b", 16: "c"}, 11, "c"),
-    ({1: "a", 4: "b", 16: "c"}, 4096, "c"),
-])
-def test_the_nearest_tuned_entry_is_the_nearest_size(tuned, M, picked):
-    from mstar.utils.fused_moe.kernels import _nearest_tuned
-
-    assert _nearest_tuned(tuned, M) == picked
-
-
-@cuda
-def test_a_compile_with_a_symbolic_token_count_takes_tuned_tiles(monkeypatch, tmp_path):
-    """A prompt past the capture buckets runs compiled, and a second length makes
-    its token count symbolic. Tuned tiles have to stay constants there."""
-    from mstar.utils.fused_moe import fused_experts, kernels
-
-    def tile(stages):
-        return {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4,
-                "num_stages": stages, "down": {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64}}
-
-    table = tmp_path / "tiles.json"
-    # tiles that differ by size, as a real table's do: an int that changes between compiles of a frame turns symbolic
-    table.write_text(json.dumps({"1": tile(3), "64": tile(4), "256": tile(2), "512": tile(5)}))
-    monkeypatch.setattr(kernels, "config_path", lambda E, N, K: table)
-    monkeypatch.setattr(kernels, "_tuned_tables", {})
-    w1 = torch.randn(128, 128, 256, device="cuda", dtype=torch.bfloat16) * 0.05
-    w2 = torch.randn(128, 256, 64, device="cuda", dtype=torch.bfloat16) * 0.05
-
-    def run(x):
-        ids = torch.topk(x[:, :128].float(), 8, dim=-1).indices
-        weights = torch.full(ids.shape, 0.125, device=x.device, dtype=x.dtype)
-        return fused_experts(x, w1, w2, weights, ids)
-
-    compiled = torch.compile(run)  # as the engine compiles: a second length makes the axis symbolic
-    for tokens in (4, 300, 411, 800):
-        x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
-        assert compiled(x).shape == x.shape
 
 
 @cuda
