@@ -1144,7 +1144,10 @@ methods are:
    EOS token: its consumer then never receives it, instead of finding and dropping it with
    a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
    The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro's AR keep their EOS frame out of
-   the codec stream this way.
+   the codec stream this way. On a step whose forward set ``check_stop_buffers``,
+   ``check_stop`` gets the request's rows of those buffers under the forward's names, not
+   the outputs ``postprocess`` renamed. That is the path the engine falls back to when
+   ``check_stop_batched`` declines or raises.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
