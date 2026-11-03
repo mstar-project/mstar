@@ -31,8 +31,8 @@ if TYPE_CHECKING:
 # The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
 # at 4 B each.
 DEFAULT_REBUILD_HOST_MB = 64
-# The serving config's ``rebuild_media_host_mb`` unless it sets one, taken only where a node copies what a walk reads
-# besides the ids: a Qwen3.5-9B image of 1024 tokens is 8 MiB of encoder output.
+# The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
+# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.
 DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
@@ -232,7 +232,8 @@ class Rebuilds:
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> HostSlice | None:
         """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span as int32 and the host
-        copies for its other spans, or None when the pool can't hold it."""
+        copies for its other spans. None when the pool can't hold it, or when the request has spans other than ids and
+        the node's dtype is unknown."""
         spans = [span for layout in layouts for span in layout.spans]
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if dtype is None and any(span.kind != SpanKind.IDS for span in spans):

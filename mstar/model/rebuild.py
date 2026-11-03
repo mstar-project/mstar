@@ -39,9 +39,9 @@ class RebuildPolicy:
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> dict[str, frozenset[str]]:
         """What ``node`` reads in each of ``walks`` besides ``ids_input``, which the worker copies. Raise unless
-        every walk runs ``node``, some walk reads ``ids_input``, and some walk runs ``node`` inside ``loop``. Also
-        raise when ``node`` reads ``ids_input`` in a walk without outputting ``sample_output`` there, since such a
-        walk can end a prompt."""
+        every walk runs ``node``, some walk reads ``ids_input``, ``copy_width`` names each walk where ``node`` reads
+        more than ``ids_input``, and some walk runs ``node`` inside ``loop``. Also raise when ``node`` reads
+        ``ids_input`` in a walk without outputting ``sample_output`` there, since such a walk can end a prompt."""
         if not self.ids_walks(node, graphs):
             raise ValueError(
                 f"{node}'s rebuild row carries its ids as {self.ids_input!r}, which {node} reads in none of its walks"
