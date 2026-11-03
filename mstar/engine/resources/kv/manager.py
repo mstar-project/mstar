@@ -1372,9 +1372,7 @@ class KVManager(AttentionResource):
     def _seed_keys(self, rid: str, label: str, stream: CacheStream) -> None:
         """Put this request's chain for ``label`` on its stream."""
         overrides = self._overrides.get(rid)
-        if overrides is None or not overrides.prefix_cache:
-            return
-        keys = (overrides.prefix_keys or {}).get(label)
+        keys = None if overrides is None else overrides.keys_of(label)
         # the chain reads the span cursor, which only a label the request opens has
         layout = self._held_layout(rid, label)
         if not keys or layout is None:
@@ -3461,7 +3459,7 @@ class KVManager(AttentionResource):
         were sampled since ``layout`` was laid out, or nothing when the label isn't keyed. A label of ids
         alone is keyed as a prompt of ``prompt``. A label with digest spans extends its keys by the samples,
         as the decode steps that sampled them did, and keys its last partial page as a prompt's last page."""
-        if not (overrides.prefix_keys or {}).get(label):
+        if not overrides.keys_of(label):
             return {}
         page_size, root = self.config.tokens_per_page, overrides.prefix_root
         if all(span.kind == SpanKind.IDS for span in layout.spans):

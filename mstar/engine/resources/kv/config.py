@@ -431,6 +431,10 @@ class KVReqConfig(ResourceReqConfig):
         if arrival is not None:
             self.arrival = arrival
 
+    def keys_of(self, label: str) -> list[bytes] | None:
+        """``label``'s prefix keys, or None when the request keys nothing there, as with ``prefix_cache`` off."""
+        return (self.prefix_keys or {}).get(label) if self.prefix_cache else None
+
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return {}
@@ -562,7 +566,7 @@ def rebuild_refusal(configs: Iterable[KVReqConfig]) -> str | None:
     for config, label, layout in laid_out:
         if layout.spans[-1].kind != SpanKind.IDS:
             return "its prompt ends on a digest span, where the ids it sampled can't follow"
-        if (config.prefix_keys or {}).get(label) and layout.keyed_spans != len(layout.spans):
+        if config.keys_of(label) and layout.keyed_spans != len(layout.spans):
             return "it keys only part of its prompt, which a rebuild can't key again"
     return None
 
