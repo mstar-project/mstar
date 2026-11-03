@@ -15,6 +15,7 @@ And one autouse fixture that clears the cached platform around every test.
 """
 import sys
 import types
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -50,6 +51,55 @@ if "triton" not in sys.modules:
     triton.heuristics = lambda *a, **k: (lambda f: f)
     sys.modules["triton"] = triton
     sys.modules["triton.language"] = triton.language
+
+
+# --- Dynamo counts ------------------------------------------------------------
+
+class DynamoCounts(NamedTuple):
+    compiles: int  # frames Dynamo compiled, recompiles and empty graphs included
+    graph_calls: int  # compiled graphs one call runs once everything is compiled
+    traced: frozenset[int]  # data_ptrs of the tensors the compiled graphs take
+
+
+@pytest.fixture
+def dynamo_counts():
+    """``count(fn, *args) -> DynamoCounts`` for ``torch.compile(fn,
+    dynamic=False)`` called twice on ``args``, the second time under the capture
+    stance (``fail_on_recompile``), as the graph runner warms a bucket and then
+    captures it: a frame Dynamo calls back into on a warm call fails it. A graph
+    count would miss a frame that only guards on an int before a graph break: it
+    compiles an empty graph per value."""
+    from torch._dynamo.callback import callback_handler
+
+    def count(fn, *args) -> DynamoCounts:
+        compiles, calls, traced = [0], [0], set()
+
+        def on_start(*_args):
+            compiles[0] += 1
+
+        def backend(gm, example_inputs):
+            traced.update(t.data_ptr() for t in example_inputs if isinstance(t, torch.Tensor))
+
+            def run(*inputs):
+                calls[0] += 1
+                return gm.forward(*inputs)
+            return run
+
+        torch._dynamo.reset()
+        callback_handler.register_start_callback(on_start)
+        try:
+            compiled = torch.compile(fn, backend=backend, dynamic=False)
+            with torch.no_grad():
+                compiled(*args)
+                calls[0] = 0
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    compiled(*args)
+        finally:
+            callback_handler.remove_start_callback(on_start)
+            torch._dynamo.reset()
+        return DynamoCounts(compiles[0], calls[0], frozenset(traced))
+
+    return count
 
 
 # --- torch flag proxies ------------------------------------------------------

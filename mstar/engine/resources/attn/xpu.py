@@ -164,7 +164,7 @@ class XPUPagedAttentionManager(AttentionManager):
                         for name, values in metadata.items()
                     },
                     max_q=max_q if max_q is not None else max((view.to_compute for view in views), default=0),
-                    max_k=self._kv_config.max_num_pages * self._kv_config.page_size,
+                    max_k=self._kv_config.max_num_pages * self._kv_config.tokens_per_page,
                     causal=causal,
                 )
             for name, values in metadata.items():
@@ -202,6 +202,8 @@ class XPUPagedAttentionManager(AttentionManager):
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q
 
+    # eager as a whole, as FlashInferManager.select_last_hidden explains
+    @torch.compiler.disable
     def select_last_hidden(
         self, hidden: torch.Tensor, label: str = "main",
     ) -> torch.Tensor:

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install one Mac check's dependencies, following .github/workflows/ci.yml.
-# The caller supplies Python 3.12 and, for Rust, Cargo and libzmq development files.
+# The caller supplies Python 3.12 and, for cpu-smoke and rust, Cargo and libzmq
+# development files.
 set -euo pipefail
 
 if [[ $# != 1 || ! $1 =~ ^(lint|cpu-smoke|dynamo|rust)$ ]]; then
@@ -29,6 +30,12 @@ case "$job" in
             # BAGEL's CPU graph/KV tests need these without the CUDA extras.
             python -m pip install einops regex transformers
             python -m pip check
+            # The CPU suites build a graph runtime, which needs the extension.
+            python -m pip install maturin
+            wheel_dir=$(mktemp -d)
+            (cd rust && maturin build --release --out "$wheel_dir")
+            python -m pip install --no-deps "$wheel_dir"/*.whl
+            rm -rf -- "$wheel_dir"
         else
             python -m pip install -e '.[dynamo]' pytest==9.2.0
         fi
@@ -36,7 +43,7 @@ case "$job" in
     rust)
         python -m pip install maturin
         # pyyaml: runtime tests import mstar.model.base.
-        python -m pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml
+        python -m pip install pytest==9.2.0 msgpack numpy pyyaml
         # The tensor-transport stack imports torch and Triton. Preserve this
         # job's existing unpinned versions and minimal mstar installation.
         python -m pip install torch --index-url https://download.pytorch.org/whl/cpu

@@ -208,6 +208,8 @@ def test_a_freed_slot_reads_as_zeros():
     pool.commit(step, ctx)
     freed = slot_of(pool, "a")
     pool.remove_request("a")
+    # teardown zeroes the slot's storage in every layer, for backends that read it directly
+    assert all(bool((pool.block("h", layer)[freed] == 0).all()) for layer in (0, 1))
 
     step, ctx = eager(["d"])
     rows = plan(pool, step, ctx)

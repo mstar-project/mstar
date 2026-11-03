@@ -66,6 +66,13 @@ def test_cjk_terminators_and_paragraph_breaks_split():
     assert paragraphs == ["First paragraph no period", "second paragraph no period"]
 
 
+def test_cjk_sentences_in_one_chunk_are_joined_without_a_space():
+    text = "今天天气很好。我们去公园散步吧！你觉得怎么样？" * 2
+    chunks = split_sentences(text, max_chars=30, min_chars=1)
+    assert "".join(chunks) == text and all(" " not in c for c in chunks)
+    assert split_sentences("Hi there. 你好。Bye now.", max_chars=12, min_chars=1) == ["Hi there.", "你好。Bye now."]
+
+
 def test_quotes_after_terminators_stay_with_their_sentence():
     text = 'He said "Wait!" Then she left. "Really?" she asked. Yes.'
     chunks = split_sentences(text, max_chars=20, min_chars=1)
