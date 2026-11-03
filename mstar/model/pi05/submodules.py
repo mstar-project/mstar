@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 class Pi05ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP encoder for camera images.
 
-    Receives raw image tensors of shape ``(num_cameras, 3, H, W)`` per request
-    in ``image_inputs``. Resizes/normalizes them to the SigLIP input format,
-    runs SigLIP, and emits ``img_emb`` of shape
-    ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
+    Receives one ``(3, H, W)`` image per camera in ``image_inputs``, up to
+    ``num_cameras`` of them. Resizes/normalizes each to the SigLIP input format,
+    runs SigLIP over ``num_cameras`` slots, and emits ``img_emb`` of shape
+    ``(cameras_sent * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
     disable_autocast = True
@@ -139,10 +139,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
-        """Batch when all requests share the same number of cameras.
-
-        If camera counts differ, fall back to sequential execution.
-        """
+        """Batch when all requests share the same number of cameras (``prepare_inputs``
+        pads every request to ``num_cameras``)."""
         if not model_inputs:
             return False
         first_num_cameras = model_inputs[0].tensor_inputs["pixel_values"].shape[0]
@@ -189,10 +187,33 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        # One [C, H, W] tensor per camera; every camera goes to SigLIP, in order.
-        images = inputs["image_inputs"]
-        pixels = images[0] if len(images) == 1 else torch.stack(list(images))
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(pixels)})
+        # Each camera is letterboxed on its own, since cameras may differ in resolution.
+        # Free camera slots get blank frames whose tokens postprocess drops, the same as
+        # openpi's image mask (masked tokens get no attention and no positions).
+        pixels = torch.cat([self._prepare_one(image) for image in inputs["image_inputs"]])
+        num_images, missing = pixels.shape[0], self.config.num_cameras - pixels.shape[0]
+        if missing < 0:
+            raise ValueError(
+                f"{num_images} camera images, but this deployment takes at most {self.config.num_cameras}"
+            )
+        if missing:
+            pixels = torch.cat([pixels, pixels.new_full((missing, *pixels.shape[1:]), -1.0)])
+        return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs={"num_images": num_images})
+
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
+        **kwargs,
+    ):
+        """Drop the tokens of the blank frames ``prepare_inputs`` padded the request with."""
+        cameras = self.config.num_cameras
+        num_images = cameras if inputs is None else inputs.kwargs.get("num_images", cameras)
+        if num_images < cameras and "img_emb" in outputs:
+            emb = outputs["img_emb"][0]
+            outputs["img_emb"] = [emb[: emb.shape[0] // cameras * num_images]]
 
     def preprocess(
         self,
