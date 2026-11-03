@@ -309,7 +309,8 @@ class SequenceShard(Resource):
         self.walks = walks
         self.min_tokens = min_tokens
         self.group = group
-        # `SeqShardSpec.stripe_pool`, `SeqShardSpec.eager_splits`
+        # `SeqShardSpec.stripe_pool`, `SeqShardSpec.eager_splits`: a ring runs split steps eagerly
+        assert stripe_pool is None or eager_splits, "a shard striping by a ring's pool runs its split steps eagerly"
         self.stripe_pool = stripe_pool
         self.eager_splits = eager_splits
         self._device = device
