@@ -166,6 +166,11 @@ class MLAAttention(nn.Module):
             k_pe.clone(memory_format=torch.contiguous_format), pos_ids=position_ids)
 
     @property
+    def _label(self) -> dict:
+        """``label=kv_label`` for every KV and attention call, nothing for the default stream."""
+        return {} if self._kv_label is None else {"label": self._kv_label}
+
+    @property
     def cache_layer_idx(self) -> int:
         """The KV layer this attention writes and reads: ``cache_layer``, else its own index."""
         if self._cache_layer is not None:
@@ -177,7 +182,7 @@ class MLAAttention(nn.Module):
     @torch.compiler.disable
     def _write_and_attend(self, q, k, v, q_pe=None):
         layer_idx = self.cache_layer_idx
-        label = {} if self._kv_label is None else {"label": self._kv_label}
+        label = self._label
         self._kv.write_kv(k, v, layer_idx=layer_idx, **label)
         layer = self._kv.layer_view(layer_idx)
         if q_pe is None:
@@ -421,12 +426,13 @@ class MLAAttention(nn.Module):
     @torch.compiler.disable
     def _write_fused_and_attend(self, q_nope, q, fused, position_ids, selection=None, **sparse):
         layer = self._kv.layer_view(self.cache_layer_idx)
-        pages, offsets = self._kv.write_slots()
+        label = self._label
+        pages, offsets = self._kv.write_slots(**label)
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
             self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
         if selection is None:
-            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
+            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
         return self._attend_written(selection, q_nope, q_pe, **sparse)
 
     # A selecting subclass that implements ``_attend_written`` takes the fused prep too.
