@@ -41,7 +41,9 @@ from mstar.utils.attention import rms_norm_rope
 # producing tile: ``[_MAX_PARTIALS, _MAX_ROWS]`` fp32, summed in a fixed order by
 # the consumer, so the RMSNorm needs no pass of its own and stays deterministic.
 _MAX_PARTIALS = 64
-_MAX_ROWS = 64
+_MAX_ROWS = 128
+# rows per ``cp_linear`` program: more rows run as more row tiles of one launch
+_ROW_TILE = 64
 # the output tile of a projection that starts or updates a residual stream: one
 # row partial per tile, so a stream of width H leaves H / STREAM_TILE of them
 STREAM_TILE = 16
@@ -256,19 +258,29 @@ def _cp_linear_kernel(
     With one or two rows (BLOCK_M < 16) a tile is a few output columns reduced on CUDA
     cores, many programs of one warp each: there a tensor-core tile would be
     mostly padding, and more programs keep more weight loads in flight. That
-    mode takes the norm from X and records no partials."""
+    mode takes the norm from X and records no partials.
+
+    Past ``_ROW_TILE`` rows the grid's first axis tiles the rows, so one launch
+    takes up to ``_MAX_ROWS`` of them."""
     GEMV: tl.constexpr = BLOCK_M < 16
-    pid = tl.program_id(0)
+    pid = tl.program_id(1)
     rn = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    rm = tl.arange(0, BLOCK_M)
+    rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
     rows = (rm < M)[:, None]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    if NORM == 1 and not GEMV:
+        # its own pass over X: summed in the pipelined loop below, from the
+        # tile that also feeds tl.dot, they came out wrong, nondeterministically,
+        # once a launch had more programs than the GPU has SMs
+        for k0 in range(0, K, BLOCK_K):
+            xs = tl.load(X + rm[:, None] * s_x + (k0 + rk)[None, :], mask=rows, other=0.0).to(tl.float32)
+            ss += tl.sum(xs * xs, 1)
     for k0 in range(0, K, BLOCK_K):
         x = tl.load(X + rm[:, None] * s_x + (k0 + rk)[None, :], mask=rows, other=0.0)
-        if NORM == 1:
+        if NORM == 1 and GEMV:
             xf = x.to(tl.float32)
             ss += tl.sum(xf * xf, 1)
         w = tl.load(W + rn[:, None] * s_w + (k0 + rk)[None, :])
@@ -309,7 +321,7 @@ def cp_linear(
     norm_eps: float | None = None, partials: torch.Tensor | None = None, n_part: int = 0,
     residual: bool = False, up: torch.Tensor | None = None, bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """A code predictor projection of ``x (rows <= 64, K)`` by ``w (N, K)``, its
+    """A code predictor projection of ``x (rows <= 128, K)`` by ``w (N, K)``, its
     norm and what follows folded in (see ``_cp_linear_kernel``):
 
     * ``norm_eps``: RMSNorm the rows first (``w`` holds the norm weight, see
@@ -345,14 +357,14 @@ def cp_linear(
         block_m, block_k, warps, stages = 2, 1024, 2 if epi == 1 else 1, 2
         norm = 0 if norm_eps is None else 1
     else:
-        block_m = max(16, triton.next_power_of_2(rows))
+        block_m = min(_ROW_TILE, max(16, triton.next_power_of_2(rows)))
         block_n = STREAM_TILE if epi in (1, 3) else 32 if epi == 2 or (n >= 4096 and block_m >= 32) else 16
         block_k, warps, stages = (128, 4, 5) if block_m >= 64 else (256, 2, 4)
         norm = 0 if norm_eps is None else (2 if n_part else 1)
     assert rows <= _MAX_ROWS and n % block_n == 0 and k % block_k == 0 and w.stride(1) == 1 and x.stride(1) == 1
     if epi in (1, 3) and block_m >= 16:
         assert n // block_n <= _MAX_PARTIALS and partials is not None
-    _cp_linear_kernel[(n // block_n,)](
+    _cp_linear_kernel[(triton.cdiv(rows, block_m), n // block_n)](
         x, w, up if up is not None else w, out, bias if bias is not None else w,
         partials if partials is not None else out,
         rows, k, norm_eps or 0.0, n_part,

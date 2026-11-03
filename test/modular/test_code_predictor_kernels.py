@@ -30,7 +30,7 @@ def _norm_rope(x: torch.Tensor, w: torch.Tensor, pos: torch.Tensor, eps: float, 
 
 
 @pytest.mark.parametrize(
-    "bs,seq_len,cache_pos", [(1, 1, 0), (5, 1, 7), (32, 1, 15), (64, 1, 3), (3, 2, 0), (5, 2, 4)],
+    "bs,seq_len,cache_pos", [(1, 1, 0), (5, 1, 7), (32, 1, 15), (64, 1, 3), (128, 1, 9), (3, 2, 0), (5, 2, 4)],
 )
 def test_cp_attend_matches_the_unfused_ops(bs, seq_len, cache_pos):
     """q/k RMSNorm + RoPE, the step's k/v written into the dense cache, and
@@ -75,7 +75,8 @@ def test_cp_attend_matches_the_unfused_ops(bs, seq_len, cache_pos):
 
 @pytest.mark.parametrize(
     "bs,projected,sum_dtype",
-    [(1, False, torch.float32), (8, False, torch.bfloat16), (32, True, torch.float32), (5, True, torch.bfloat16)],
+    [(1, False, torch.float32), (8, False, torch.bfloat16), (32, True, torch.float32), (5, True, torch.bfloat16),
+     (128, True, torch.float32)],
 )
 def test_cp_embed_accumulate_matches_the_unfused_ops(bs, projected, sum_dtype):
     """The index_select + add (in fp32, rounded once to the sum's dtype, as
@@ -110,7 +111,7 @@ def test_cp_embed_accumulate_matches_the_unfused_ops(bs, projected, sum_dtype):
     torch.testing.assert_close(partials[:chunks.shape[0], :bs], chunks, rtol=1e-5, atol=1e-3)
 
 
-@pytest.mark.parametrize("rows", [1, 16, 37, 64])
+@pytest.mark.parametrize("rows", [1, 16, 37, 64, 65, 96, 128])
 def test_cp_linear_matches_the_unfused_ops(rows):
     """Each ``cp_linear`` mode against its op sequence in fp32: the folded
     RMSNorm (row sums of squares from x, and from a producer's partials), the
@@ -148,6 +149,24 @@ def test_cp_linear_matches_the_unfused_ops(rows):
     close(out, a.float() @ w_res.float().t() + bias.float())
     on = out.float() * torch.rsqrt(out.float().pow(2).mean(-1, keepdim=True) + 1e-6)
     close(cp_linear(out, folded, norm_eps=1e-6, partials=partials, n_part=h // STREAM_TILE), on @ folded.float().t())
+    if rows > 64:
+        # past 64 rows a launch tiles the rows: the first 64 come out as a 64-row call's
+        assert torch.equal(cp_linear(x, folded, norm_eps=1e-6)[:64], cp_linear(x[:64], folded, norm_eps=1e-6))
+
+
+def test_cp_linear_norm_from_x_holds_with_more_programs_than_sms():
+    """The row norm ``cp_linear`` takes from x stays right when its launch has
+    more programs than the GPU has SMs (two per SM here), run after run."""
+    from mstar.model.components.code_predictor_kernels import cp_linear
+
+    torch.manual_seed(5)
+    n = 64 * torch.cuda.get_device_properties(0).multi_processor_count  # 32-wide tiles: 2 programs an SM
+    x = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, 1024, device="cuda", dtype=torch.bfloat16) * 0.03
+    want = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)) @ w.float().t()
+    for _ in range(5):
+        got = cp_linear(x, w, norm_eps=1e-6).float()
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2 * want.abs().max().item())
 
 
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
