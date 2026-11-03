@@ -43,6 +43,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
+from mstar.engine.resources.resident import ResidentPlanner, build_planner
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -188,6 +189,8 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # the node's request slots and device tables, where it runs on them
+    resident: ResidentPlanner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -693,6 +696,28 @@ class Engine:
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
 
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
+        """Put ``node_name`` on resident tables if it can and the deployment
+        lets it; the startup log says why a node that named walks stays on the
+        host. In `order`, so an owner runs after what it depends on. Built here
+        because the tables are sized by the node's captures, and ahead of them
+        because a capture holds the tables' addresses."""
+        if knobs.resident_planning() == "off":
+            return
+        submodule_mgmt = self._submodules[node_name]
+        walks = submodule_mgmt.submodule.resident_walks()
+        if not walks:
+            return
+        resources = submodule_mgmt.resources
+        submodule_mgmt.resident, refused = build_planner(
+            node_name, walks,
+            {key: resources[key] for key in self._runner.order if key in resources},
+            self._resource_nodes, self._device, runner.max_capture_bs(walks),
+        )
+        if submodule_mgmt.resident is None:
+            logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        runner.bind_resident(submodule_mgmt.resident)
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager
@@ -805,7 +830,7 @@ class Engine:
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            ag_runners[node_name] = AcceleratorGraphRunner(
+            runner = ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -817,6 +842,7 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
             )
+            self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt
             )
@@ -1951,6 +1977,13 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # promoted and inline plans per resource, apart
+            plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
+            if ctx.resident is not None:
+                ctx.plan_phase = plan_phase
+                t0 = phase_start()
+                ctx.resident.plan(step, ctx)
+                phase_end(f"{plan_phase}.resident", t0)
 
             # Admit was already done, can move on straight to plan
             if nvtx:
@@ -1961,10 +1994,7 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                # promoted and inline plans per resource, apart
-                self._runner.plan(
-                    step, "res.plan" if batch.preplan_event is not None else "res.plan_fresh",
-                )
+                self._runner.plan(step, plan_phase)
             finally:
                 phase_end(
                     "engine.plan.promoted" if batch.preplan_event is not None
@@ -2033,6 +2063,8 @@ class Engine:
             try:
                 self._runner.commit(step)
                 batch.committed = step
+                if submodule_mgmt.resident is not None:
+                    submodule_mgmt.resident.commit(step, ctx)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -2057,6 +2089,9 @@ class Engine:
         the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
+            ctx = batch.step_context
+            if ctx.resident is not None:
+                ctx.resident.flush(ctx.resident_plan)
             return cg_runner.run_forward(
                 lease, preprocessed, plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
@@ -2813,9 +2848,13 @@ class Engine:
                 graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
                 slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
             )
+        planner = submodule_mgmt.resident
+        ctx = batch.step_context
+        ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
+        ctx.resident_plan = None
         if lease is not None:
             batch.lease_slot(lease)
-            batch.step_context.force_prefill = cg_runner.is_packed(lease)
+            ctx.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
@@ -2926,7 +2965,16 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
+            ctx = batch.step_context
             with stream if stream is not None else nullcontext():
+                # A raise here takes what a raise from `pre_plan` below takes:
+                # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                # stays with its streams for exec's admit to find.
+                if ctx.resident is not None:
+                    ctx.plan_phase = "res.pre_plan"
+                    t0 = phase_start()
+                    ctx.resident.plan(step, ctx)
+                    phase_end("res.pre_plan.resident", t0)
                 self._runner.pre_plan(step)
             laps.skip()
             batch.preplan_event = torch.Event(device=self._device)
@@ -3011,11 +3059,19 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        if freed > 0:
+            self._release_resident_slot(node_name, request_id)
+            if node_name in self._resident_delta:
+                self._resident_delta[node_name].add_offloaded(
+                    self._graph_runtime.get_rid_string(request_id)
+                )
         return freed
+
+    def _release_resident_slot(self, node_name: str, request_id: int) -> None:
+        """An offloaded request needs no slot: a reload is written whole anyway."""
+        planner = self._submodules[node_name].resident
+        if planner is not None:
+            planner.release(request_id)
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
@@ -3148,6 +3204,7 @@ class Engine:
                             wire_rid, node_name, len(delta),
                         )
                         return False
+                    self._release_resident_slot(node_name, rid)
                     logger.info(
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
@@ -3247,6 +3304,8 @@ class Engine:
         self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+            if submodule_mgmt.resident is not None:
+                submodule_mgmt.resident.release(request_id)
         return freed
 
     def shutdown(self):

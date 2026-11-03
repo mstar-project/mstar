@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
@@ -32,6 +33,7 @@ from mstar.model.qwen3_tts.config import (
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_MIXED,
+    TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
@@ -1543,6 +1545,58 @@ def test_code_predictor_depth_loop_compiles_no_frame_per_position(monkeypatch, d
     assert dynamo_counts(fn4, *args4).compiles == dynamo_counts(fn2, *args2).compiles
 
 
+class _IdentityNorm(torch.nn.Module):
+    """A CPU stand-in for the FlashInfer RMSNorm, fused residual add included:
+    like FlashInfer's, the add updates the residual stream in place."""
+
+    def forward(self, hidden_states):
+        return hidden_states.clone()
+
+    def forward_residual(self, hidden_states, residual, comm_group=None):
+        if residual is None:
+            return hidden_states.clone(), hidden_states
+        residual.add_(hidden_states)
+        return residual.clone(), residual
+
+
+class _HalveAttention(torch.nn.Module):
+    """Stands in for the paged attention: the residual stream is what's under test."""
+
+    def __init__(self):
+        super().__init__()
+        self.attend = SimpleNamespace(bind_step=lambda label: None, set_layer_idx=lambda idx: None)
+
+    def forward(self, hidden_states):
+        return 0.5 * hidden_states
+
+
+def test_qwen3_tts_talker_leaves_its_input_alone():
+    """The fused add + norm writes the residual stream in place, and a replay's
+    input is a static buffer: a packed replay never restages the rows past its
+    real ones, so a stream started at that input would accumulate into them."""
+    config = _tiny_model_config()
+    model = Qwen3TTSTalkerModel(config).model
+    for layer in model.layers:
+        layer.self_attn = _HalveAttention()
+        layer.mlp = torch.nn.Identity()
+        layer.input_layernorm = _IdentityNorm()
+        layer.post_attention_layernorm = _IdentityNorm()
+    model.norm = _IdentityNorm()
+    embeds = torch.randn(3, config.talker.hidden_size)
+    before = embeds.clone()
+    with torch.no_grad():
+        model(embeds, label="main")
+    assert torch.equal(embeds, before)
+
+
+def test_qwen3_tts_talker_declares_the_rope_theta_its_kernel_reads():
+    """``Qwen3Attention``'s kernel reads the theta off the position resource,
+    whose default is not the checkpoint's."""
+    model = _make_model()
+    position = next(spec for spec in model.get_node_resources() if spec.resource_key == TALKER_POS)
+    assert position.config.rope_theta == model.config.talker.rope_theta != PositionConfig(kv_cache="kv").rope_theta
+
+
 def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     """Residual groups are configured through the code predictor's own sampler
     resource, which the engine opens per-request buffers for."""
@@ -2044,6 +2098,38 @@ def test_qwen3_tts_fused_snake_matches_the_reference_activation():
     beta = torch.exp(snake.beta).cuda()[None, :, None]
     expected = x + (1.0 / (beta + snake.no_div_by_zero)) * torch.pow(torch.sin(x * alpha), 2)
     torch.testing.assert_close(fused(x), expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel runs on CUDA")
+def test_qwen3_tts_fused_snake_channels_last_matches_the_contiguous_form():
+    from mstar.model.qwen3_tts.components.snake import FusedSnakeBeta
+
+    snake = SimpleNamespace(
+        alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
+    )
+    fused = FusedSnakeBeta(snake).cuda()
+    # large activations too, where an approximate hardware sine drifts from torch.sin
+    scale = torch.tensor([1.0, 1.0, 1.0, 50.0, 50.0, 300.0], device="cuda")[:, None]
+    x = torch.randn(3, 6, 1000, device="cuda") * scale
+    channels_last = fused(x.unsqueeze(2).contiguous(memory_format=torch.channels_last))
+    assert channels_last.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(channels_last.squeeze(2), fused(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel runs on CUDA")
+def test_qwen3_tts_fused_snake_reads_a_4d_input_in_any_layout():
+    from mstar.model.qwen3_tts.components.snake import FusedSnakeBeta
+
+    snake = SimpleNamespace(
+        alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
+    )
+    fused = FusedSnakeBeta(snake).cuda()
+    x = torch.randn(3, 6, 1000, device="cuda")
+    want = fused(x).unsqueeze(2)
+    assert torch.equal(fused(x.unsqueeze(2)), want)
+    strided = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)[..., ::2]
+    assert not strided.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(fused(strided), want[..., ::2])
 
 
 def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():

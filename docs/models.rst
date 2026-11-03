@@ -797,6 +797,9 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
+- The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
+  KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
+  the position resource, which declares the checkpoint's.
 - The codec decoder runs in float32 by default: a stream's audio is the
   reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs:
   {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay
