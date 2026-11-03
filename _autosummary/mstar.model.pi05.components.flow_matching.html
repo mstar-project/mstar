@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.pi05.components.tokenization" href="mstar.model.pi05.components.tokenization.html" />
+    <link rel="next" title="mstar.model.pi05.components.normalization" href="mstar.model.pi05.components.normalization.html" />
     <link rel="prev" title="mstar.model.pi05.components" href="mstar.model.pi05.components.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -708,8 +708,8 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.pi05.components.flow_matching.discretize_state" title="mstar.model.pi05.components.flow_matching.discretize_state"><code class="xref py py-obj docutils literal notranslate"><span class="pre">discretize_state</span></code></a>(state[, num_bins, ...])</p></td>
-<td><p>Map continuous robot state values in [value_min, value_max] to bin indices.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.pi05.components.flow_matching.discretize_state" title="mstar.model.pi05.components.flow_matching.discretize_state"><code class="xref py py-obj docutils literal notranslate"><span class="pre">discretize_state</span></code></a>(state[, num_bins])</p></td>
+<td><p>Bin a normalized robot state the way openpi's PaligemmaTokenizer does.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.pi05.components.flow_matching.euler_step" title="mstar.model.pi05.components.flow_matching.euler_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">euler_step</span></code></a>(x, velocity, dt)</p></td>
 <td><p>One Euler integration step: x_{t+dt} = x_t + dt * v(x_t, t).</p></td>
@@ -722,25 +722,20 @@
 </div>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.pi05.components.flow_matching.discretize_state">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.pi05.components.flow_matching.</span></span><span class="sig-name descname"><span class="pre">discretize_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_bins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">256</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value_min</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value_max</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/pi05/components/flow_matching.html#discretize_state"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.pi05.components.flow_matching.discretize_state" title="Link to this definition">#</a></dt>
-<dd><p>Map continuous robot state values in [value_min, value_max] to bin indices.</p>
-<p>Used by Pi0.5 to tokenize proprioceptive state into language tokens that
-PaliGemma can embed alongside image and language tokens.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.pi05.components.flow_matching.</span></span><span class="sig-name descname"><span class="pre">discretize_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_bins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">256</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/pi05/components/flow_matching.html#discretize_state"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.pi05.components.flow_matching.discretize_state" title="Link to this definition">#</a></dt>
+<dd><p>Bin a normalized robot state the way openpi’s PaligemmaTokenizer does.</p>
+<p>That is <code class="docutils literal notranslate"><span class="pre">np.digitize(state,</span> <span class="pre">np.linspace(-1,</span> <span class="pre">1,</span> <span class="pre">num_bins</span> <span class="pre">+</span> <span class="pre">1)[:-1])</span> <span class="pre">-</span> <span class="pre">1</span></code>:
+equal bins over [-1, 1], with values below -1 giving -1 and values at or
+above 1 giving <code class="docutils literal notranslate"><span class="pre">num_bins</span> <span class="pre">-</span> <span class="pre">1</span></code>. lerobot’s pi0.5 processor bins the same way.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>state</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – 1D tensor of state values.</p></li>
-<li><p><strong>num_bins</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of discrete bins.</p></li>
-<li><p><strong>value_max</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>) – assumed range of normalized state values.</p></li>
-<li><p><strong>value_min</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>value_max</strong></p></li>
+<li><p><strong>state</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_bins</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>1D <code class="docutils literal notranslate"><span class="pre">torch.long</span></code> tensor of bin indices in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">num_bins)</span></code>.</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -814,11 +809,11 @@ returned; preallocated so the action-gen step stays capturable.</p></li>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.pi05.components.tokenization.html"
+       href="mstar.model.pi05.components.normalization.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.pi05.components.tokenization</p>
+        <p class="prev-next-title">mstar.model.pi05.components.normalization</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

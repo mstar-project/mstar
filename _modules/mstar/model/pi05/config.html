@@ -1048,6 +1048,14 @@ window.runMermaid = runMermaid;</script>
     <span class="n">state_token_bins</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span>  <span class="c1"># number of discretization bins for robot state</span>
     <span class="n">state_token_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># vocab offset where state-bin tokens start</span>
 
+    <span class="c1"># ----- Deployment normalization -----</span>
+    <span class="c1"># Quantile stats of the robot a deployment serves, as in openpi's</span>
+    <span class="c1"># norm_stats.json: a mapping with "state" and/or "actions" entries holding</span>
+    <span class="c1"># q01/q99 lists, or the path of such a file. With "state" set, clients send</span>
+    <span class="c1"># the raw robot state; with "actions", the first dims of the reply are in</span>
+    <span class="c1"># robot units. Unset, both are the model's normalized values.</span>
+    <span class="n">norm_stats</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="c1"># ----- Tokenization / sequence limits -----</span>
     <span class="n">max_lang_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">200</span>
     <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
@@ -1073,6 +1081,8 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"num_attention_heads"</span><span class="p">:</span> <span class="s2">"num_qo_heads"</span><span class="p">,</span>
     <span class="s2">"num_key_value_heads"</span><span class="p">:</span> <span class="s2">"num_kv_heads"</span><span class="p">,</span>
     <span class="s2">"intermediate_size"</span><span class="p">:</span> <span class="s2">"pali_intermediate_size"</span><span class="p">,</span>
+    <span class="c1"># lerobot's name for openpi's action_horizon (50 for pi05_base, 15 for pi05_droid)</span>
+    <span class="s2">"chunk_size"</span><span class="p">:</span> <span class="s2">"action_horizon"</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="c1"># Pi05Config field names — computed once from the dataclass.</span>

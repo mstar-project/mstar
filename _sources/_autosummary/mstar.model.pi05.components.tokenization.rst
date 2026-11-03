@@ -13,7 +13,7 @@ mstar.model.pi05.components.tokenization
 
    .. autosummary::
    
-      normalize_prompt
+      pi05_prompt
    
    
 

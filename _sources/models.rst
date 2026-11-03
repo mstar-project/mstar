@@ -83,6 +83,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        A request sends one image per camera, up to the config's ``num_cameras`` (3 in
        ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
        images than that are a 400.
+       ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
+       openpi's DROID normalization: raw joint state in, joint velocities out.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear

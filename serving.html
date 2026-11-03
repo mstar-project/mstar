@@ -1470,16 +1470,26 @@ per-walk groups giving one node different <code class="docutils literal notransl
 <h2>model_kwargs<a class="headerlink" href="#model-kwargs" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> are model parameters fixed at server start (not per request) — they are
 baked into the model’s config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID variant fixes the action horizon:</p>
+Pi0.5 DROID deployment (<code class="docutils literal notranslate"><span class="pre">configs/pi05_droid.yaml</span></code>) loads the DROID fine-tune (whose
+<code class="docutils literal notranslate"><span class="pre">config.json</span></code> sets the 15-step action horizon), fixes the camera count, and carries the
+DROID robot’s normalization stats:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"pi05"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">model_kwargs</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">action_horizon</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">15</span>
+<span class="w">  </span><span class="nt">model_path_hf</span><span class="p">:</span><span class="w"> </span><span class="s">"lerobot/pi05_droid"</span>
+<span class="w">  </span><span class="nt">num_cameras</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">  </span><span class="nt">norm_stats</span><span class="p">:</span><span class="w">  </span><span class="c1"># openpi's DROID quantiles, 8 dims each</span>
+<span class="w">    </span><span class="nt">state</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">q01</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">...</span><span class="p p-Indicator">],</span><span class="nt"> q99</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">...</span><span class="p p-Indicator">]}</span>
+<span class="w">    </span><span class="nt">actions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">q01</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">...</span><span class="p p-Indicator">],</span><span class="nt"> q99</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">...</span><span class="p p-Indicator">]}</span>
 <span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">vit_encoder</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
 </pre></div>
 </div>
+<p>With <code class="docutils literal notranslate"><span class="pre">norm_stats</span></code> set, Pi0.5 takes the raw robot state in <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> and returns
+actions in robot units, as openpi’s policy server does. <code class="docutils literal notranslate"><span class="pre">norm_stats</span></code> can also be the path
+of an openpi <code class="docutils literal notranslate"><span class="pre">norm_stats.json</span></code>. Without it, <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> must already be normalized to
+[-1, 1].</p>
 <p>Per-request knobs (<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, …) are sent by the
 client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. A <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes a request’s random stream whatever
 it is batched with, so requests sent with the same seed and settings sample the same

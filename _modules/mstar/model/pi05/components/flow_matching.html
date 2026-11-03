@@ -1044,29 +1044,15 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="discretize_state">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.pi05.components.flow_matching.html#mstar.model.pi05.components.flow_matching.discretize_state">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">discretize_state</span><span class="p">(</span>
-    <span class="n">state</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">num_bins</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
-    <span class="n">value_min</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="o">-</span><span class="mf">1.0</span><span class="p">,</span>
-    <span class="n">value_max</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Map continuous robot state values in [value_min, value_max] to bin indices.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">discretize_state</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">num_bins</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Bin a normalized robot state the way openpi's PaligemmaTokenizer does.</span>
 
-<span class="sd">    Used by Pi0.5 to tokenize proprioceptive state into language tokens that</span>
-<span class="sd">    PaliGemma can embed alongside image and language tokens.</span>
-
-<span class="sd">    Args:</span>
-<span class="sd">        state: 1D tensor of state values.</span>
-<span class="sd">        num_bins: number of discrete bins.</span>
-<span class="sd">        value_min / value_max: assumed range of normalized state values.</span>
-
-<span class="sd">    Returns:</span>
-<span class="sd">        1D ``torch.long`` tensor of bin indices in ``[0, num_bins)``.</span>
+<span class="sd">    That is ``np.digitize(state, np.linspace(-1, 1, num_bins + 1)[:-1]) - 1``:</span>
+<span class="sd">    equal bins over [-1, 1], with values below -1 giving -1 and values at or</span>
+<span class="sd">    above 1 giving ``num_bins - 1``. lerobot's pi0.5 processor bins the same way.</span>
 <span class="sd">    """</span>
-    <span class="n">clamped</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">value_min</span><span class="p">,</span> <span class="n">value_max</span><span class="p">)</span>
-    <span class="n">normalized</span> <span class="o">=</span> <span class="p">(</span><span class="n">clamped</span> <span class="o">-</span> <span class="n">value_min</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">value_max</span> <span class="o">-</span> <span class="n">value_min</span><span class="p">)</span>
-    <span class="n">indices</span> <span class="o">=</span> <span class="p">(</span><span class="n">normalized</span> <span class="o">*</span> <span class="p">(</span><span class="n">num_bins</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">round</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">indices</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_bins</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span></div>
+    <span class="n">edges</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="o">-</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="n">num_bins</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">state</span><span class="o">.</span><span class="n">device</span><span class="p">)[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">bucketize</span><span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">),</span> <span class="n">edges</span><span class="p">,</span> <span class="n">right</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span></div>
 
 </pre></div>
 

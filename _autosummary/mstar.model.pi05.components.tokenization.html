@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.model.pi05.config" href="mstar.model.pi05.config.html" />
-    <link rel="prev" title="mstar.model.pi05.components.flow_matching" href="mstar.model.pi05.components.flow_matching.html" />
+    <link rel="prev" title="mstar.model.pi05.components.normalization" href="mstar.model.pi05.components.normalization.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -692,7 +692,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.Pi05Tokenizer.encode_prompt"><code class="docutils literal notranslate"><span class="pre">Pi05Tokenizer.encode_prompt()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.normalize_prompt"><code class="docutils literal notranslate"><span class="pre">normalize_prompt()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.pi05_prompt"><code class="docutils literal notranslate"><span class="pre">pi05_prompt()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -706,12 +706,12 @@
                   
   <section id="module-mstar.model.pi05.components.tokenization">
 <span id="mstar-model-pi05-components-tokenization"></span><h1>mstar.model.pi05.components.tokenization<a class="headerlink" href="#module-mstar.model.pi05.components.tokenization" title="Link to this heading">#</a></h1>
-<p>Tokenization wrapper for Pi0.5: PaliGemma tokenizer + state discretization.</p>
+<p>Tokenization wrapper for Pi0.5: PaliGemma tokenizer and openpi’s prompt text.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.pi05.components.tokenization.normalize_prompt" title="mstar.model.pi05.components.tokenization.normalize_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">normalize_prompt</span></code></a>(prompt)</p></td>
-<td><p>Lowercase + strip whitespace, matching openpi's PaligemmaTokenizer.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.pi05.components.tokenization.pi05_prompt" title="mstar.model.pi05.components.tokenization.pi05_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pi05_prompt</span></code></a>(task[, state_bins])</p></td>
+<td><p>The text openpi's PaligemmaTokenizer tokenizes for pi0.5.</p></td>
 </tr>
 </tbody>
 </table>
@@ -720,7 +720,7 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.pi05.components.tokenization.Pi05Tokenizer" title="mstar.model.pi05.components.tokenization.Pi05Tokenizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Pi05Tokenizer</span></code></a>(hf_tokenizer, config)</p></td>
-<td><p>Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.</p></td>
+<td><p>Wrapper around the HF PaliGemma tokenizer.</p></td>
 </tr>
 </tbody>
 </table>
@@ -729,11 +729,8 @@
 <dt class="sig sig-object py" id="mstar.model.pi05.components.tokenization.Pi05Tokenizer">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.pi05.components.tokenization.</span></span><span class="sig-name descname"><span class="pre">Pi05Tokenizer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hf_tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/pi05/components/tokenization.html#Pi05Tokenizer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.pi05.components.tokenization.Pi05Tokenizer" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.</p>
-<p>Robot state values are discretized into <code class="docutils literal notranslate"><span class="pre">state_token_bins</span></code> bins and mapped
-to language token IDs starting at <code class="docutils literal notranslate"><span class="pre">state_token_offset</span></code>. Pi0.5 reuses
-bottom-of-vocab tokens for state bins so that PaliGemma’s embedding table
-can embed them directly.</p>
+<p>Wrapper around the HF PaliGemma tokenizer. The robot state reaches it as
+text inside the prompt (see <a class="reference internal" href="#mstar.model.pi05.components.tokenization.pi05_prompt" title="mstar.model.pi05.components.tokenization.pi05_prompt"><code class="xref py py-func docutils literal notranslate"><span class="pre">pi05_prompt()</span></code></a>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config" title="mstar.model.pi05.config.Pi05Config"><em>Pi05Config</em></a>)</p>
@@ -755,12 +752,17 @@ can embed them directly.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.pi05.components.tokenization.normalize_prompt">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.pi05.components.tokenization.</span></span><span class="sig-name descname"><span class="pre">normalize_prompt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">prompt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/pi05/components/tokenization.html#normalize_prompt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.pi05.components.tokenization.normalize_prompt" title="Link to this definition">#</a></dt>
-<dd><p>Lowercase + strip whitespace, matching openpi’s PaligemmaTokenizer.</p>
+<dt class="sig sig-object py" id="mstar.model.pi05.components.tokenization.pi05_prompt">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.pi05.components.tokenization.</span></span><span class="sig-name descname"><span class="pre">pi05_prompt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">task</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">state_bins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/pi05/components/tokenization.html#pi05_prompt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.pi05.components.tokenization.pi05_prompt" title="Link to this definition">#</a></dt>
+<dd><p>The text openpi’s PaligemmaTokenizer tokenizes for pi0.5.</p>
+<p>Underscores and newlines in the task become spaces. The case is kept, and
+so is the space after “Action:”, since openpi tokenizes the string as built.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>prompt</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>task</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>state_bins</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
@@ -782,12 +784,12 @@ can embed them directly.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.pi05.components.flow_matching.html"
+       href="mstar.model.pi05.components.normalization.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.pi05.components.flow_matching</p>
+        <p class="prev-next-title">mstar.model.pi05.components.normalization</p>
       </div>
     </a>
     <a class="right-next"
@@ -821,7 +823,7 @@ can embed them directly.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.Pi05Tokenizer.encode_prompt"><code class="docutils literal notranslate"><span class="pre">Pi05Tokenizer.encode_prompt()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.normalize_prompt"><code class="docutils literal notranslate"><span class="pre">normalize_prompt()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.pi05.components.tokenization.pi05_prompt"><code class="docutils literal notranslate"><span class="pre">pi05_prompt()</span></code></a></li>
 </ul>
   </nav></div>
 

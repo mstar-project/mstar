@@ -29,6 +29,7 @@ mstar.model.pi05.components
 
    action_expert
    flow_matching
+   normalization
    paligemma
    siglip
    tokenization
