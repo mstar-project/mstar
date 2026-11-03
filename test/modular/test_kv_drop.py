@@ -65,11 +65,12 @@ def _step(rid: str, span: int) -> tuple[KVStep, StepContext]:
     return step, StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
 
 
-def _config(tokens: list[int], cap: int = 50, kind: str = "ids") -> KVReqConfig:
-    """A prompt keyed as the data worker does it, on a label whose samples are keyed too."""
+def _config(tokens: list[int], cap: int = 50, kind: str = "ids", root: bytes = b"") -> KVReqConfig:
+    """A prompt keyed as the data worker does it, on a label whose samples are keyed too, under ``root``."""
     pages = [tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)]
     return KVReqConfig(
-        prefix_keys={"main": chain(pages)}, prefix_tail={"main": pages[-1] if len(tokens) % PAGE_SIZE else []},
+        prefix_keys={"main": chain(pages, root=root)}, prefix_root=root,
+        prefix_tail={"main": pages[-1] if len(tokens) % PAGE_SIZE else []},
         prefix_decode={"main": "text_inputs"}, loop_caps={"decode_loop": cap},
         kv_layout={"main": StreamLayout(
             spans=(PrefixSpan(len(tokens), len(tokens), WALK, kind=kind),), growth=(("decode_loop", 1),), keyed_spans=1,
@@ -243,16 +244,18 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     assert rope._counters["r"] == {"main": PAGE_SIZE}, "the positions were reset for a request that keeps its KV"
 
 
-def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
+# A LoRA adapter's requests hang their keys from its root, which keys the first page when the prompt fills none.
+@pytest.mark.parametrize("root, length", [(b"", 20), (b"an adapter", 10)])
+def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt(root, length):
     kv, fresh = _manager(), _manager()
-    prompt, sampled = list(range(20)), list(range(100, 130))
-    kv.ingest_request("r", _config(prompt, cap=50))
+    prompt, sampled = list(range(length)), list(range(100, 130))
+    kv.ingest_request("r", _config(prompt, cap=50, root=root))
     footprint = kv._streams["r"]["main"].footprint
     _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
     kv.drop("r")
 
     kv.prepare_rebuild("r", Rebuild(array("i", sampled)))
-    fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29))
+    fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29, root=root))
     fresh._streams["f"]["main"].chain.extend(sampled[-1:], PAGE_SIZE)
     rebuilt, want = kv._streams["r"]["main"], fresh._streams["f"]["main"]
     assert rebuilt.footprint == footprint, "the rebuild would hold more pages than the request declared"
