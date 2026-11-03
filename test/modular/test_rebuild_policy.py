@@ -110,8 +110,7 @@ IMAGE_CHAT = (
     (POLICY, IMAGE_CHAT, False),
     (MEDIA, (replace(IMAGE_CHAT[0], walk="vit"), *IMAGE_CHAT[1:]), False),
     (POLICY, (PrefixSpan(4, 4, PREFILL),), True),
-    (MEDIA, (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], kind="rows"), IMAGE_CHAT[2]), False),
-], ids=["copied walk", "walk not copied", "two walks", "ids alone", "video"])
+], ids=["copied walk", "walk not copied", "two walks", "ids alone"])
 def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and_copies(policy, spans, rebuildable):
     rebuilds = Rebuilds({NODE: policy}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
 

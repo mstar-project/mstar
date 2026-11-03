@@ -46,8 +46,8 @@ Each pool decides the class once, at the request's first `ask`, from two facts. 
 | # | A request with | Class | Why |
 |---|---|---|---|
 | 1 | An output it streams that can't pause, audio unless the model or the deployment says otherwise | guaranteed | a pause is a gap in playback |
-| 2 | A `rows` span | moves only to the host there, or guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
-| 3 | A `digest` span | preemptible at one rank where the node's rebuild policy copies the walk's inputs, and elsewhere moves only to the host there, or guaranteed | its KV comes from an encoder's output, freed after prefill, so a rebuild needs a host copy of it |
+| 2 | A `rows` span from another node's outputs | moves only to the host there, or guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads, and no policy on its node rebuilds it |
+| 3 | A `digest` or `rows` span on a walk of its node's rebuild policy | preemptible at one rank, and elsewhere moves only to the host there, or guaranteed | its KV comes from an encoder's output, freed after prefill, such as a Qwen3.5 image's or video's, so a rebuild needs a host copy of it |
 | 4 | No rebuild policy on the node that writes its KV | moves only to the host there, or guaranteed | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
