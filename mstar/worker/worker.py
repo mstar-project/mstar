@@ -1407,17 +1407,28 @@ class Worker:
 
     def _route_streaming_tensor(self, request_id: int, edge: GraphEdge) -> None:
         """Route a streaming tensor to its request's StreamBuffer for this edge."""
-        req_info = self.request_state.per_request_info.get(request_id)
-        stream_buf = req_info.stream_buffers[edge.name]
+        self._route_streaming_tensors([(request_id, edge)])
 
-        for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(info.uuid)
-
-            stream_buf.put(info.uuid, tensor.clone())
-        # After the loop: one crossing for the edge rather than one per tensor.
-        self.tensor_manager.dereference_batch_uniform(
-            [info.uuid for info in edge.tensor_info]
-        )
+    def _route_streaming_tensors(self, routes: list[tuple[int, GraphEdge]]) -> None:
+        """Route each (request, edge)'s streaming tensors to the request's
+        StreamBuffer for the edge. The buffers keep copies, since the reads go
+        back to the transport; one ``clone_received`` for all of them lets a
+        transport that copies on its own stream hand them over once."""
+        buffers: list[StreamBuffer] = []
+        uuids: list[int] = []
+        tensors: list[torch.Tensor] = []
+        for request_id, edge in routes:
+            stream_buf = self.request_state.per_request_info.get(request_id).stream_buffers[edge.name]
+            for info in edge.tensor_info:
+                buffers.append(stream_buf)
+                uuids.append(info.uuid)
+                tensors.append(self.tensor_manager.get_tensor(info.uuid))
+        for stream_buf, uuid, copy in zip(
+            buffers, uuids, self.tensor_manager.clone_received(tensors), strict=True,
+        ):
+            stream_buf.put(uuid, copy)
+        # After the loop: one crossing for the batch rather than one per tensor.
+        self.tensor_manager.dereference_batch_uniform(uuids)
 
     def _partition_walk(self, request_id: int, partition: str) -> str | None:
         req_info = self.request_state.per_request_info.get(request_id)
@@ -1770,18 +1781,19 @@ class Worker:
                 self._fail_requests(failed)
         if ready and self._lockstep_led:
             self._note_lockstep_reads(ready)
-        for request_id, edges in ready.items():
-            # Separate streaming edges from normal edges
-            streaming = [e for e in edges if e.is_streaming]
-            normal = [e for e in edges if not e.is_streaming]
-
+        streaming = [
+            (request_id, edge) for request_id, edges in ready.items()
+            for edge in edges if edge.is_streaming
+        ]
+        if streaming:
             if self.enable_nvtx:
                 range_push("check_ready-tensors.route_streaming")
-            for edge in streaming:
-                self._route_streaming_tensor(request_id, edge)
-
+            self._route_streaming_tensors(streaming)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+        for request_id, edges in ready.items():
+            normal = [e for e in edges if not e.is_streaming]
+            if self.enable_nvtx:
                 range_push("process_new_inputs.process_inputs")
 
             if normal:
