@@ -489,6 +489,11 @@ class Resource(ABC):
         """Bring it back. False when it doesn't fit on device yet."""
         return True
 
+    def can_offload(self, rid: str) -> bool:
+        """Whether the request may be moved off the device to free room. If this is False, the request is no
+        eviction candidate however much it holds."""
+        return True
+
     def can_reload(self, rid: str) -> bool:
         """Whether the request can be reloaded. If this is False, the Engine
         will not attempt to reload. If True, it will attempt to reload but still

@@ -3267,6 +3267,12 @@ class Engine:
             delta.pop_left()
         return True
 
+    def can_offload(self, node_name: str, request_id: str) -> bool:
+        return all(
+            resource.can_offload(request_id)
+            for resource in self._submodules[node_name].resources.values() if resource.supports_eviction
+        )
+
     def reclaimable(self, node_name: str, request_id: str, affected_resources: set[str] | None=None) -> int:
         """What this node's resources could reclaim from the request. 0 means
         offloading it would free nothing, so it is not a candidate."""

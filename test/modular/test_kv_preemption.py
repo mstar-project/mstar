@@ -21,7 +21,6 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
-from mstar.engine.resources import Residency
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
@@ -421,7 +420,7 @@ def test_a_guaranteed_request_whose_lease_is_cut_writes_the_cut_pages_within_its
         assert _step(kv, "g", PAGE_SIZE).ok, "g ran short of the pages its reservation held for the cut ones"
 
 
-def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_the_offload_leaves_it():
+def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_is_no_eviction_candidate():
     """`reclaimable` answered 0 for a guaranteed request only on the rank that decides, so a follower's replay read
     the request's pages instead, and a teardown needed a second hook to count them."""
     kv = _pool()
@@ -429,9 +428,7 @@ def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_the_offload_le
     _running(kv, "g", 2, arrival=0, guaranteed=True)
 
     assert kv.reclaimable("g") == len(kv._streams["g"]["main"].pages()), "reclaimable answered by class"
-    assert kv.offload("g") == 0 and kv.residency("g") is Residency.RESIDENT, (
-        "a guaranteed request was moved to the host"
-    )
+    assert not kv.can_offload("g"), "the offload of the least recently active request could move g to the host"
 
 
 def test_a_guaranteed_request_that_wrote_nothing_keeps_its_allotment_when_an_older_one_runs_short():

@@ -3476,10 +3476,10 @@ class KVManager(AttentionResource):
         copied: a step admitted before the claim can still run its fork copy,
         and that copy reads one of these streams.
 
-        A guaranteed request never moves. A victim `preempt` chose that doesn't
-        move comes off its earmark with nothing freed.
+        A victim `preempt` chose that doesn't move comes off its earmark with
+        nothing freed.
         """
-        if self._cpu_pool is None or rid not in self._streams or rid in self._guaranteed:
+        if self._cpu_pool is None or rid not in self._streams:
             return 0
         claimed, read_futures = self._claim_for_offload(rid)
         if not claimed:
@@ -3651,6 +3651,10 @@ class KVManager(AttentionResource):
             label=label,
             request_id=rid,
         )
+
+    def can_offload(self, rid: str) -> bool:
+        """False for a guaranteed request, which reserves what it grows into so that nothing preempts it."""
+        return rid not in self._guaranteed
 
     def can_reload(self, rid: str) -> bool:
         """Whether `_reload_room` covers the pages ``rid``'s reload takes. A request that asks again after
