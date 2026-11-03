@@ -106,7 +106,8 @@ class NodeResourceSpec(ABC):
     nodes: set[str]
     # how a split step reaches this resource where it has more than one way (``sp_exchanges``): a
     # deployment's choice, its ``resources:`` block's ``sp_exchange`` (`apply_yaml_overrides`); None
-    # takes the first wherever its node splits (`own_exchange`)
+    # takes the first (`split_exchange`). A ragged attention's is its model's declaration instead
+    # (``RaggedAttentionSpec.sp_exchange``), which no deployment sets
     sp_exchange: str | None = field(default=None, init=False, repr=False)
 
     # the ways a split step may reach this resource that a deployment picks among, the default first;
@@ -168,15 +169,21 @@ class NodeResourceSpec(ABC):
         field may still hold its default when the shard derives."""
         return "none"
 
+    @property
+    def split_exchange(self) -> str:
+        """For a resource with ``sp_exchanges``: the one its split steps take, ``sp_exchange`` or
+        the first of them."""
+        return self.sp_exchange or self.sp_exchanges[0]
+
     def own_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> str:
         """For a resource with ``sp_exchanges``: ``none`` where its node's sequence shard never
         splits (``shard_exchange``), which ``sp_exchange`` doesn't change, and otherwise
-        ``sp_exchange`` or the first of them. From raw fields, as ``resolve_exchange``."""
+        ``split_exchange``. From raw fields, as ``resolve_exchange``."""
         from mstar.engine.resources.sequence_shard import shard_exchange
 
         if shard_exchange(self, specs) == "none":
             return "none"
-        return self.sp_exchange or self.sp_exchanges[0]
+        return self.split_exchange
 
     def captures_split_steps(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
         """Whether this resource runs a split step inside an accelerator graph. False for one whose

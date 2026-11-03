@@ -95,7 +95,7 @@ class LinearAttnSpec(NodeResourceSpec):
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
     ) -> list[str]:
         # only a node whose shard splits gets here, so the choice is what its split steps take
-        exchange = self.sp_exchange or self.sp_exchanges[0]
+        exchange = self.split_exchange
         pool = specs[self.config.recurrent_state].config
         name = f"linear attention {self.resource_key!r}"
         if shard.axis == 1 or shard.stripe_pool is not None:

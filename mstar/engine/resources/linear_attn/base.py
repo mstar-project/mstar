@@ -137,7 +137,7 @@ class LinearAttnManager(AttentionResource):
     def build(cls, spec: LinearAttnSpec, info: EngineResourceInfo):
         manager = cls._build_variant(spec, info)
         manager._shard_key = spec.shard_key
-        manager._split_exchange = spec.sp_exchange or spec.sp_exchanges[0]
+        manager._split_exchange = spec.split_exchange
         return manager
 
     @classmethod
