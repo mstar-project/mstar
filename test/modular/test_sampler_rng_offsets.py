@@ -125,20 +125,13 @@ def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
 @pytest.mark.parametrize("first_step", ["eager", "captured"])
-def test_consecutive_draws_are_independent(ingraph, monkeypatch, first_step):
+def test_consecutive_draws_are_independent(ingraph, first_step):
     """Real draws and a real graph replay: with the same near-flat logits on a
     request's step and the captured step after it, two independent draws agree
-    about 1/V of the time. Two draws at one offset always agree.
-
-    ``eager``: an eager FlashInfer step, then the captured one, with the
-    captured step on FlashInfer too (fused_sample's RNG never agrees with
-    FlashInfer's, so a shared offset would go unseen). ``captured``: two
-    captured steps on fused_sample, which this vocabulary takes."""
+    about 1/V of the time. Two draws at one offset always agree, since an eager
+    and a captured step draw this vocabulary alike (``fused_sample``)."""
     pytest.importorskip("flashinfer")
-    if first_step == "eager":
-        monkeypatch.setattr(sampler_utils, "FUSED_SAMPLE_MAX_VOCAB", 0)
-    else:
-        assert V <= sampler_utils.FUSED_SAMPLE_MAX_VOCAB
+    assert V <= sampler_utils.FUSED_SAMPLE_MAX_VOCAB
     device = torch.device("cuda")
     res = _resource(device, ingraph)
     pad = -1

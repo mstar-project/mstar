@@ -622,8 +622,8 @@ def test_fused_sample_draws_from_the_filtered_distribution(vocab):
     FlashInfer's order: no token outside the kept set is ever drawn, the
     empirical distribution over 4096 draws per setting is within sampling
     noise of it, temperature 0 is the argmax, and a (seed, offset) draws the
-    same token at any batch position."""
-    from mstar.engine.resources.sampler.utils import fused_sample
+    same token at any batch position and on the eager sampler."""
+    from mstar.engine.resources.sampler.utils import fused_sample, sample_tokens
 
     torch.manual_seed(0)
     dev, draws = torch.device("cuda"), 4096
@@ -662,6 +662,10 @@ def test_fused_sample_draws_from_the_filtered_distribution(vocab):
         pen[rows][flip], seen[rows][flip],
     )
     assert torch.equal(again[flip].view(n, draws), tokens)
+    eager = sample_tokens(
+        logits[rows], temp[rows], top_k[rows], top_p[rows], pen[rows], seen[rows], seed=seed, rand_offset=offset,
+    )
+    assert torch.equal(eager.view(n, draws), tokens)
 
 
 def test_fused_sample_cuts_a_near_tie_with_the_kth_token():

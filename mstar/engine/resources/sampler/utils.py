@@ -764,6 +764,27 @@ def fused_sample(
     return out
 
 
+def _fused_draw(
+    logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
+    seed: torch.Tensor | None, offset: torch.Tensor | None,
+    rep_penalty: torch.Tensor | None, seen_tokens: torch.Tensor | None,
+    min_p: torch.Tensor | None, history: HistoryRows | None, order: FilterOrder | None,
+    return_probs: bool,
+) -> torch.Tensor | None:
+    """``fused_sample``'s draw when it covers the step, else None (FlashInfer
+    draws). The eager and the captured sampler both pick here, so on a node
+    whose ``SamplerSpec`` enables none of min-p, the generation history, the
+    filter order or processed log-probs, a request's eager and captured steps
+    draw the same token at a (seed, offset). (A node's captured sampler with
+    one of them always draws through FlashInfer, which is batch-variant.)"""
+    if (
+        logits.shape[1] > FUSED_SAMPLE_MAX_VOCAB or seed is None or offset is None
+        or min_p is not None or history is not None or order is not None or return_probs
+    ):
+        return None
+    return fused_sample(logits, temperature, top_k, top_p, seed, offset, rep_penalty, seen_tokens)
+
+
 def filter_top_k_top_p(
     probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     order: FilterOrder | None = None, fused: bool = True,
@@ -1493,8 +1514,9 @@ def _sample_cuda(
     order: FilterOrder | None = None,
     return_probs: bool = False,
 ) -> torch.Tensor | Draw:
-    """Sample normalized CUDA inputs with FlashInfer; with ``return_probs``,
-    also the distribution the filters ran on."""
+    """Sample normalized CUDA inputs with ``fused_sample`` where it covers the
+    step, else FlashInfer; with ``return_probs``, also the distribution the
+    filters ran on."""
     import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
@@ -1503,13 +1525,20 @@ def _sample_cuda(
     # worker's current-device stream while probs lives off-device (e.g. BAGEL
     # LLM on rank 1) — a cross-stream race that yields garbage.
     with torch.cuda.device(logits.device):
+        penalty = repetition_penalty if seen_token_mask is not None else None
+        drawn = _fused_draw(
+            logits, temperature, top_k, top_p, seed, rand_offset, penalty, seen_token_mask,
+            min_p, history, order, return_probs,
+        )
+        if drawn is not None:
+            return drawn
         # One Triton kernel fuses (optional rep-penalty, and the history's
         # windowed penalty) + (temperature-scaled softmax) + (argmax → one-hot
         # for greedy rows). FlashInfer's sample-from-probs then deterministically
         # picks argmax on one-hot rows, matching greedy semantics.
         probs = fused_temperature_softmax(
             logits, temperature,
-            penalty=repetition_penalty if seen_token_mask is not None else None,
+            penalty=penalty,
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
             history=history,
@@ -1792,10 +1821,8 @@ def sample_accelerator_graphable_gpu(
 
     On CUDA, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
     ``min_p``, ``history``, ``order`` or ``return_probs`` draws in one
-    ``fused_sample`` launch:
-    per-row seeds, so batch-invariant, but the eager ``Sampler`` path
-    (``_sample_cuda``) keeps FlashInfer, so for those vocabularies an eager
-    and a captured step draw differently for the same seed.
+    ``fused_sample`` launch (``_fused_draw``, which the eager ``Sampler``
+    path shares): per-row seeds, so batch-invariant.
 
     Otherwise it routes through the fused Triton prep kernel
     (``fused_temperature_softmax``) so the CUDA-graph path can apply the same
@@ -1853,14 +1880,13 @@ def sample_accelerator_graphable_gpu(
         import flashinfer
 
         with torch.cuda.device(logits.device):
-            if (
-                logits.shape[1] <= FUSED_SAMPLE_MAX_VOCAB and min_p is None
-                and history is None and order is None and not return_probs
-            ):
-                return fused_sample(
-                    logits, temperature, top_k, top_p, seed, offset,
-                    rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
-                )
+            drawn = _fused_draw(
+                logits, temperature, top_k, top_p, seed, offset,
+                rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
+                min_p, history, order, return_probs,
+            )
+            if drawn is not None:
+                return drawn
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=rep_penalty if apply_penalty else None,
