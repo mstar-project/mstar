@@ -129,8 +129,10 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
             return False
         if self.config.predictor_kind != "ac":
             # A 64-frame clip is 8192 tokens, enough to fill the GPU alone, so
-            # batching buys no throughput, while each new batch size cost a
-            # recompile that stalled the step 10-60 s.
+            # batching buys no throughput. It also cost a recompile per new
+            # batch size that stalled the step 10-60 s.
+            # TODO: if B>1 is ever measured to pay, warm the encoder's batch
+            # sizes at startup and drop this opt-out.
             return False
         shapes: set[tuple] = {
             tuple(inp.tensor_inputs["video_frames"].shape) for inp in model_inputs

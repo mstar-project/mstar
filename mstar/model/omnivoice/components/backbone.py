@@ -250,6 +250,15 @@ class OmniVoiceBackbone(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
+        # `encode` runs a layer's projections as F.linear over the fused weights
+        # apply_flashinfer leaves, all but the two it calls
+        self.lora_unservable = {
+            f"model.llm.layers.{i}.{part}.{name}": "fused at load by apply_flashinfer, run as F.linear over that"
+            for i, layer in enumerate(model.llm.layers)
+            for part, called in (("self_attn", "o_proj"), ("mlp", "down_proj"))
+            for name, child in getattr(layer, part).named_children()
+            if name != called and isinstance(child, nn.Linear)
+        }
 
     def encode(
         self,

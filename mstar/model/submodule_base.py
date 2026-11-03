@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.resources.lora.config import LoraStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -844,6 +845,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
+    # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
+    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
+    # and to each piecewise region's (``lora_rows``), from its segments: in order, the
+    # rows the adapted linears see, each a request's span of tokens (a request may have
+    # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
+    # declares its own ``LoraStep`` under the pool's key.
+    lora_keys: tuple[str, ...] = ()
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -873,6 +882,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
+        from mstar.model.components.lora.modules import bind_module_lora
+
+        self.lora_keys = bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1267,7 +1279,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         precision; the node's resources are bound but nothing is admitted or
         planned, so it must not read or change resource state. On a lockstep
         node every rank calls it in the same order, so it may run the
-        collectives its forward runs. Default: nothing."""
+        collectives its forward runs. A node serving LoRA adapters runs its
+        adapted linears here as in a step whose rows name no adapter. Default:
+        nothing."""
 
     def can_use_accelerator_graphs(
         self,
@@ -1439,6 +1453,27 @@ class NodeSubmodule(torch.nn.Module, ABC):
         this on request removal; overrides with extra internal state should
         call super()."""
         self.request_states.pop(request_id, None)
+
+
+def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
+    """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
+    itself, its rows the step's segments, as a new step (a declaration reused across
+    calls keeps its own). A step without segments gets none: an adapted module it runs
+    refuses for want of a plan (``LoraLayerDelta``)."""
+    if lora_keys and step is not None and step.segments is not None:
+        segments = tuple(step.segments)
+        added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
+        if added:
+            step = replace(step, steps={**step.steps, **added})
+    return step
+
+
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+    """What the engine calls for a node's step: its ``declare_step``, with the LoRA
+    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
+    no LoRA step."""
+    # the engine drives duck-typed submodules too
+    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
 
 
 class ARNodeSubmodule(NodeSubmodule):
