@@ -80,6 +80,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+       A request sends one image per camera, up to the config's ``num_cameras`` (3 in
+       ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
+       images than that are a 400.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
