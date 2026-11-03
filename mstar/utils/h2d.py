@@ -114,6 +114,16 @@ class PinnedStager:
         ]
         streams.clear()
 
+    def _claim(self, total: int) -> int:
+        """Where ``total`` values go in the arena, contiguous; under the lock."""
+        if total > self._seg_numel:
+            self._grow(total)
+        elif self._off + total > self._seg_numel:
+            self._next_segment()
+        at = self._seg * self._seg_numel + self._off
+        self._off += total
+        return at
+
     def _next_segment(self) -> None:
         self._leave_segment()
         self._seg = (self._seg + 1) % self._depth
@@ -167,12 +177,7 @@ class PinnedStager:
         with self._lock:
             if mirror is not None and mirror.matches(key, values):
                 return
-            if total > self._seg_numel:
-                self._grow(total)
-            elif self._off + total > self._seg_numel:
-                self._next_segment()
-            at = self._seg * self._seg_numel + self._off
-            self._off += total
+            at = self._claim(total)
             view = self._view
             view[at:at + n] = values
             if pad_value is not None:
@@ -195,9 +200,8 @@ class PinnedStager:
 
     def copy_runs_(self, dsts: Sequence[torch.Tensor], values: np.ndarray) -> None:
         """Fill each of ``dsts`` from consecutive ``values``, in order: one
-        non-blocking copy per destination, all out of one pinned buffer. On a
-        stream behind a running graph the copies queue there, and a buffer per
-        copy would have ``copy_`` wait out that graph once the ring wraps."""
+        non-blocking copy per destination, all out of one claim on the arena,
+        so a flush of many runs takes the lock and checks the ring once."""
         if not dsts:
             return
         capability = DeviceCapability.of(dsts[0].device)
@@ -207,23 +211,36 @@ class PinnedStager:
                 dst.view(-1).copy_(torch.as_tensor(values[at: at + dst.numel()], dtype=self.dtype))
                 at += dst.numel()
             return
+        total = len(values)
+        if total == 0:
+            return
+        device = dsts[0].device
+        direct = (
+            self._memcpy is not None and dsts[0].is_cuda
+            and all(dst.dtype == self.dtype and dst.is_contiguous() for dst in dsts)
+        )
+        if direct:
+            stream = torch._C._cuda_getCurrentRawStream(dsts[0].get_device())
+        else:
+            stream = torch.accelerator.current_stream(device)
         with self._lock:
-            if len(values) > self._numel:
-                self._grow(len(values))
-            i = self._next
-            self._next = (i + 1) % self._depth
-            ev = self._events[i]
-            if ev is not None:
-                ev.synchronize()
-            self._views[i][: len(values)] = values
-            at = 0
+            at = self._claim(total)
+            self._view[at:at + total] = values
             for dst in dsts:
                 n = dst.numel()
-                dst.view(-1).copy_(self._bufs[i][at: at + n], non_blocking=True)
+                if direct:
+                    err = self._memcpy(
+                        dst.data_ptr(), self._ptr + at * self._itemsize, n * self._itemsize, _H2D, stream,
+                    )
+                    if err:
+                        raise RuntimeError(f"cudaMemcpyAsync failed with error {err}")
+                else:
+                    dst.view(-1).copy_(self._arena[at:at + n], non_blocking=True)
                 at += n
-            if ev is None:
-                ev = self._events[i] = torch.Event(device=dsts[0].device)
-            ev.record(torch.accelerator.current_stream(dsts[0].device))
+            streams = self._streams[self._seg]
+            if stream not in streams:
+                streams.append(stream)
+            self.copies += len(dsts)
 
 
 _H2D = 1  # cudaMemcpyHostToDevice
