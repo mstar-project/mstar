@@ -786,8 +786,10 @@ class _Unread(dict):
         raise AssertionError("a decode step's rows were read")
 
 
-def test_a_step_with_no_request_still_prefilling_reads_no_row():
-    rebuilds = _two_steps(6)
+def test_a_decode_step_reads_no_row_while_a_request_is_still_prefilling():
+    """Under steady arrivals some request is always prefilling, and every decode step walked its rows."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    assert _ingest(rebuilds, R, TWO_STEPS)
 
     rebuilds.record(_ran(DECODE, _Unread({R: {}})))
 

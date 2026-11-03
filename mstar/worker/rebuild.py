@@ -298,18 +298,19 @@ class Rebuilds:
         the node reads, as a row the prefix cache served past its encoder, leaves the request with no log, so it is
         never dropped."""
         node = node_batch.node_name
-        prefilling = self._prefilling.get(node)
-        if not prefilling:
+        prefilling, ctx = self._prefilling.get(node), node_batch.step_context
+        # a step of no walk that prefills, such as every decode step, has no row to record
+        walks = self._copied.get(node, {})
+        if not prefilling or (ctx.graph_walk not in walks and walks.keys().isdisjoint(ctx.request_walks.values())):
             return
-        ctx, ids_input = node_batch.step_context, self._policies[node].ids_input
+        ids_input = self._policies[node].ids_input
         for rid, inputs in node_batch.per_request_input_tensors.items():
+            if rid not in prefilling or rid in ctx.rebuild_rids:
+                continue
             chunk, walk = node_batch.chunk_ranges.get(rid), ctx.walk_of(rid)
             # A later chunk is cut from the input its first prepared, and a TP follower's unread row has no inputs,
-            # which the step fails. A step of a walk that prefills nothing, such as decode, isn't a prefill step.
-            if (
-                rid not in prefilling or rid in ctx.rebuild_rids or not inputs or walk not in self._copied[node]
-                or not (chunk is None or chunk.is_first)
-            ):
+            # which the step fails.
+            if not inputs or walk not in walks or not (chunk is None or chunk.is_first):
                 continue
             kept, piece = self._kept[node][rid], self._droppable[node][rid]
             row = kept.rows[len(kept.records)]
