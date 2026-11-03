@@ -185,7 +185,8 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
     all-to-all from split tokens to split heads, and back). On a node whose shard splits
     (``SeqShardSpec.splits``) it shards heads over every TP and SP rank, slicing them on a copied
-    step, and every label goes through an exchange, so ``run(..., return_lse=True)`` raises there.
+    step. On SP ranks of such a node every label goes through an exchange, so
+    ``run(..., return_lse=True)`` raises there.
     ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
     node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
 

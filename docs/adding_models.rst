@@ -722,15 +722,17 @@ The spec types are:
        for a ``one_row_per_step`` region) and
        ``max_tokens_per_request``, ``compile_op`` and ``workspace_mb``. ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
-       missing. The heads are split across the node's TP ranks.
+       missing. The heads are split across the node's TP ranks (TP × SP for
+       ``sp_exchange="ulysses"`` on a node whose shard splits, below).
        ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less,
        since a ragged prefill only uses it for split-KV partials. The spec's
        ``sp_exchange="ulysses"`` attends a label the node's sequence shard splits by
-       Ulysses, splitting the heads over TP × SP (see **Sequence and context
-       parallelism**). ``compile_op``, ``workspace_mb`` and ``sp_exchange`` are the
-       model's declaration; the serving config's ``resources:`` overrides take only the
-       backends and the ceilings.
+       Ulysses, splitting the heads over TP × SP on a node whose shard splits
+       (``SeqShardSpec.splits``; see **Sequence and context parallelism**).
+       ``compile_op``, ``workspace_mb`` and ``sp_exchange`` are the model's declaration;
+       the serving config's ``resources:`` overrides take only the backends and the
+       ceilings.
        See `Cacheless attention (encoder towers)`_ for ``compile_op``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
@@ -1031,9 +1033,10 @@ Called with ``return_lse=True``, a ragged or ragged cross-attention resource's `
 FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
 needs; a compiled caller breaks there even with ``compile_op``. A label exchanged over SP ranks
-on its step can't return one, and on SP ranks every label of a ``"ulysses"`` resource is, copied
-steps included: on a split step the resource merges the partials itself (LTX-2.5's audio queries
-over each rank's share of the video tokens, merged by ``gather_merge``).
+on its step can't return one: on SP ranks of a node whose shard splits, that is every label of a
+``"ulysses"`` resource (copied steps included), and a cross-attention pair whose keys split on
+the step. Where keys split, the resource merges the partials itself (LTX-2.5's audio queries over
+each rank's share of the video tokens, merged by ``gather_merge``).
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
