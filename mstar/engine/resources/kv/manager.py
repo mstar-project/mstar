@@ -3460,7 +3460,8 @@ class KVManager(AttentionResource):
         have a torn host copy, and that fork's source is one of these streams,
         so the whole request stays on device rather than half of it.
         """
-        self._touch_plan_cache(rid)
+        # its resident slot goes with the offload (`Engine.offload_request`)
+        self._touch_plan_cache(rid, row=False)
         with self._lock:
             streams = self._streams.get(rid, {})
             for claim in moved:
@@ -3539,7 +3540,8 @@ class KVManager(AttentionResource):
         from the host. False when the device can't fit them right now; nothing
         moves in that case, so the caller can evict further and try again.
         """
-        self._touch_plan_cache(rid)
+        # an offload gave its resident slot up, so its next step writes the row whole
+        self._touch_plan_cache(rid, row=False)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
@@ -4514,7 +4516,10 @@ class KVManager(AttentionResource):
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
-        self._resident = KVResidentTables(planner, page_size, -(-self.config.max_seq_len // page_size))
+        # the pool's own context or override (not the serving config's top-level
+        # `max_seq_len`), and a stream's pages are distinct pages of the pool
+        width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
+        self._resident = KVResidentTables(planner, page_size, width)
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         stream = self._streams[rid][writes.label]

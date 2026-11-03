@@ -693,12 +693,11 @@ class AcceleratorGraphRunner:
         num_slots: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
-        resident: ResidentPlanner | None = None,
     ):
         self._submodule_name = submodule_name
         self._submodule = submodule
         self._comm_group = joint_comm_group
-        self._resident = resident
+        self._resident: ResidentPlanner | None = None
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -778,6 +777,17 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def max_capture_bs(self, walks: Collection[str]) -> int:
+        """The widest capture of any of ``walks``, 0 when none of them has one."""
+        return max(
+            (max(self._batch_sizes(config)) for config in self._capture_configs if config.capture_graph_walk in walks),
+            default=0,
+        )
+
+    def bind_resident(self, planner: ResidentPlanner | None) -> None:
+        """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
+        self._resident = planner
 
     # ── Capture ─────────────────────────────────────────────────────────
 

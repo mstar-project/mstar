@@ -695,12 +695,13 @@ class Engine:
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
-            self._build_resident_planner(node_name)
 
-    def _build_resident_planner(self, node_name: str) -> None:
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
         """Put ``node_name`` on resident tables if it can and the deployment
         lets it; the startup log says why a node that named walks stays on the
-        host. In `order`, so an owner runs after what it depends on."""
+        host. In `order`, so an owner runs after what it depends on. Built here
+        because the tables are sized by the node's captures, and ahead of them
+        because a capture holds the tables' addresses."""
         if knobs.resident_planning() == "off":
             return
         submodule_mgmt = self._submodules[node_name]
@@ -711,10 +712,11 @@ class Engine:
         submodule_mgmt.resident, refused = build_planner(
             node_name, walks,
             {key: resources[key] for key in self._runner.order if key in resources},
-            self._resource_nodes, self._device, knobs.resident_slots(),
+            self._resource_nodes, self._device, runner.max_capture_bs(walks),
         )
         if submodule_mgmt.resident is None:
             logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        runner.bind_resident(submodule_mgmt.resident)
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -828,7 +830,7 @@ class Engine:
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            ag_runners[node_name] = AcceleratorGraphRunner(
+            runner = ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -839,8 +841,8 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
-                resident=submodule_mgmt.resident,
             )
+            self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt
             )
@@ -2960,6 +2962,9 @@ class Engine:
             stream = cg_runner.plan_stream()
             ctx = batch.step_context
             with stream if stream is not None else nullcontext():
+                # A raise here takes what a raise from `pre_plan` below takes:
+                # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                # stays with its streams for exec's admit to find.
                 if ctx.resident is not None:
                     ctx.plan_phase = "res.pre_plan"
                     t0 = phase_start()
@@ -3049,11 +3054,19 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        if freed > 0:
+            self._release_resident_slot(node_name, request_id)
+            if node_name in self._resident_delta:
+                self._resident_delta[node_name].add_offloaded(
+                    self._graph_runtime.get_rid_string(request_id)
+                )
         return freed
+
+    def _release_resident_slot(self, node_name: str, request_id: int) -> None:
+        """An offloaded request needs no slot: a reload is written whole anyway."""
+        planner = self._submodules[node_name].resident
+        if planner is not None:
+            planner.release(request_id)
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
@@ -3186,6 +3199,7 @@ class Engine:
                             wire_rid, node_name, len(delta),
                         )
                         return False
+                    self._release_resident_slot(node_name, rid)
                     logger.info(
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,

@@ -22,7 +22,6 @@ KNOBS: dict[str, str] = {
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "resident_planning": "MSTAR_RESIDENT_PLANNING",
-    "resident_slots": "MSTAR_RESIDENT_SLOTS",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -227,10 +226,3 @@ def resident_planning() -> str:
     resident-capable, and says why at startup when one is not; ``off`` keeps
     the host plan everywhere."""
     return _resident_planning_value(_setting("resident_planning", "auto"))
-
-
-def resident_slots() -> int:
-    """``resident_slots`` / ``MSTAR_RESIDENT_SLOTS`` (default 4096): request
-    rows of the resident tables, allocated once at startup since a captured
-    graph holds their addresses."""
-    return int(_setting("resident_slots", "4096"))

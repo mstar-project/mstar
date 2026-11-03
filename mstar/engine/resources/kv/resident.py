@@ -49,6 +49,8 @@ class KVResidentTables:
     def row(self, stored_len: int, pages: list[int], slot: int, row: list[int]) -> None:
         """The cells of a stream about to append one token. Its host mirrors
         move here, not at the flush: a plan that never runs leaves the row stale."""
+        if len(pages) > self.block_table.width:
+            raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         cols = stored_len // self.page_size + 1
         row[self.kv_len.col] = stored_len
         row.extend(pages[:cols])
@@ -74,6 +76,8 @@ class KVResidentTables:
             return
         for i in rows.tolist():
             rid, slot, last = plan.rids[i], int(slots[i]), int(need[i]) - 1
+            if last >= self.block_table.width:
+                raise ValueError(f"page {last} of a stream doesn't fit a block table row of {self.block_table.width}")
             if last > cols[i]:
                 plan.taken.add(rid)
                 rewrite(rid, slot, plan.writes)

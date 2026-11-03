@@ -8,6 +8,7 @@ set of resources plans the same requests on the host as the reference.
 """
 from __future__ import annotations
 
+import random
 import sys
 from types import SimpleNamespace
 
@@ -33,8 +34,17 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep  # noqa: E402
+from mstar.engine.resources.step import (  # noqa: E402
+    AllocationFailed,
+    BucketKey,
+    Segment,
+    SlotLease,
+    StepContext,
+    SubmoduleStep,
+)
 from mstar.utils import knobs  # noqa: E402
+from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
@@ -60,7 +70,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64):
+def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
@@ -70,7 +80,7 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64):
     )
     kv._cg_max_seq_len = 64
     pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
-        num_layers=1, max_slots=9, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
+        num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
     ))
     rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
@@ -171,10 +181,11 @@ def _replay(res, planner, s, promote=True):
     return s
 
 
-def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64):
+def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
     """The same requests prefilled on resident resources and on a host-planned reference."""
-    live, ref = _resources(cpu_offload_pages, max_num_pages), _resources(cpu_offload_pages, max_num_pages)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_slots=8)
+    live = _resources(cpu_offload_pages, max_num_pages, pool_slots)
+    ref = _resources(cpu_offload_pages, max_num_pages, pool_slots)
+    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     for res in (live, ref):
         for rid, n in prompts.items():
             _ingest(res, rid)
@@ -408,8 +419,7 @@ def test_a_fork_marks_the_row_stale():
 
 
 def test_a_row_whose_pages_moved_is_rewritten():
-    """What a reload leaves: the stream on other pages. Its hook is `_touch_plan_cache(rid)`;
-    `test_real_offload_and_reload_mark_the_row` runs the real one on a GPU."""
+    """A stream on other pages, as a fork or reset can leave it. Its hook is `_touch_plan_cache(rid)`."""
     live, ref, planner = _setup({1: 9})
     del ref
     _captured_step(live, planner, [1], slot=0, bs=1)
@@ -426,16 +436,18 @@ def test_a_row_whose_pages_moved_is_rewritten():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the host page pool is page-locked")
-def test_real_offload_and_reload_mark_the_row():
+def test_a_real_offload_gives_the_slot_up_and_its_reload_is_written_whole():
+    device = torch.device("cuda")
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=16, page_size=PAGE,
             cpu_offload_pages=16,
         ),
-        name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cuda"), dtype=torch.float32,
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, torch.device("cuda"), max_slots=2)
+    kv._cg_max_seq_len = 64
+    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=2)
+    engine = _offload_engine({"kv": kv}, planner)
     kv.ingest_request(1, KVReqConfig())
     segments = (Segment(1, "main", 9),)
     ctx = StepContext(request_ids=(1,), graph_walk="prefill", slot=0, capture=False)
@@ -443,13 +455,15 @@ def test_real_offload_and_reload_mark_the_row():
     assert kv.admit(step, ctx).ok
     ctx.plan_results["kv"] = kv.plan(step, ctx)
     kv.commit(step, ctx)
-    planner._slot_of[1] = 1
-    assert kv.offload(1) > 0
-    assert 1 in planner._stale
-    planner._stale.clear()
+    with planner._lock:
+        planner._slot_of[1] = planner._free.pop()
+    assert engine.offload_request("n", 1) > 0
+    assert planner.slot_of(1) is None
+    assert not planner._stale
     torch.cuda.synchronize()
-    assert kv.reload(1)
-    assert 1 in planner._stale
+    assert engine.reload_request("n", 1)
+    assert not planner._stale
+    assert planner.slot_of(1) is None
 
 
 def test_an_abandoned_preplan_writes_nothing_and_gives_its_rows_back():
@@ -566,17 +580,16 @@ def test_a_freed_slot_waits_for_the_last_step_that_read_it():
     # step N reads the slot and is still running: planned, not committed
     s = _captured_step(live, planner, [1], slot=0, bs=1, preplan=True, run=False)
     _promote(live, planner, s)
-    slot = s.ctx.resident_plan.slots[0]
+    slot = int(s.ctx.resident_plan.slots[0])
+    seq = s.ctx.resident_plan.seq
     planner.release(1)
-    planner._free.clear()
-    assert (int(slot), s.ctx.resident_plan.seq) in planner._cooling
-    with pytest.raises(RuntimeError, match="slots are held"):
-        with planner._lock:
-            planner._take_slot()
+    assert (slot, seq) in planner._cooling
+    with planner._lock:
+        assert slot not in planner._take_slots(7, seq + 1)
     # commit lets the slot go; its late advance landed on the old owner's row
     _replay(live, planner, s, promote=False)
     with planner._lock:
-        assert planner._take_slot() == slot
+        assert planner._take_slots(1, seq + 2) == [slot]
 
 
 def test_a_late_commit_cannot_touch_the_next_owner():
@@ -631,14 +644,586 @@ def test_a_recycled_handle_gets_a_fresh_row():
     _assert_row(planner, live, 1)
 
 
-def test_running_out_of_slots_says_how_to_fix_it():
-    live, ref, planner = _setup({})
+def _slot_ledger(planner: ResidentPlanner) -> None:
+    """Every request slot is exactly one of free, cooling or held."""
+    held = list(planner._slot_of.values())
+    cooling = [slot for slot, _ in planner._cooling]
+    assert sorted(held + cooling + planner._free) == list(range(1, planner.max_slots))
+
+
+def _assert_step_read_its_streams(live, s, rids) -> None:
+    """What the replay addressed against the host, which has committed the step since."""
+    for i, rid in enumerate(rids):
+        stream = live["kv"]._streams[rid]["main"]
+        wrote = stream.stored_len - 1
+        assert s.pages[i] == stream.page_indices[wrote // PAGE]
+        assert s.offsets[i] == wrote % PAGE
+        assert s.positions[i] == live["rope"].position(rid, "main") - 1
+        assert s.pool_slots[i] == live["pool"]._slots[rid]["main"].index
+
+
+def _assert_held_rows(planner, live) -> None:
+    """A row marked neither stale nor moved holds what its stream says."""
+    for rid in planner._slot_of:
+        if rid not in planner._stale and rid not in planner._moved:
+            _assert_row(planner, live, rid)
+
+
+def _recycle(live, planner, rid: int, tokens: int) -> None:
+    """The request ends, and its handle comes back as another's."""
+    for key in ("kv", "pool", "rope"):
+        live[key].remove_request(rid)
+    planner.release(rid)
+    _ingest(live, rid)
+    step, ctx = _host_step(live, [rid], [tokens])
+    planner.commit(step, ctx)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_more_live_requests_than_slots_run_off_the_cache(seed):
+    """B=4, so 8 slots and the trash row, under 20 live requests taking turns, with
+    pre-plans, abandoned ones, host steps and teardowns mixed in. Nothing raises,
+    a displaced row is written whole when it next runs, the victims are the least
+    recently run, and every row a step reads is its stream."""
+    rng = random.Random(seed)
+    prompts = {rid: 1 + rid % 7 for rid in range(1, 21)}
+    live, ref, planner = _setup(prompts, max_num_pages=1024, pool_slots=32)
     del ref
-    planner._free.clear()
-    _ingest(live, 1)
-    _host_step(live, [1], [2])
-    with pytest.raises(RuntimeError, match="resident_slots"):
-        _captured_step(live, planner, [1], slot=0, bs=1)
+    assert planner.max_slots == 9
+    order, at, displaced, returned = list(prompts), 0, set(), 0
+    for t in range(300):
+        rows = [order[(at + i) % len(order)] for i in range(rng.randint(1, 4))]
+        at += len(rows)
+        roll = rng.random()
+        if roll < 0.1:
+            recycled = rng.choice(order)
+            _recycle(live, planner, recycled, rng.randint(1, 9))
+            displaced.discard(recycled)
+        elif roll < 0.2:
+            step, ctx = _host_step(live, rows, [1] * len(rows), walk="mixed")
+            planner.commit(step, ctx)
+        elif roll < 0.3:
+            _captured_step(live, planner, rows, slot=t % 2, bs=4, preplan=True, run=False)
+            for key in ("kv", "pool", "rope"):
+                live[key].clear_preplan()
+        before = {rid: int(planner._last_read[slot]) for rid, slot in planner._slot_of.items()}
+        s = _captured_step(live, planner, rows, slot=t % 2, bs=4, preplan=rng.random() < 0.5)
+        _assert_step_read_its_streams(live, s, rows)
+        for rid in rows:
+            _assert_row(planner, live, rid)
+            assert planner.slot_of(rid) != TRASH_SLOT
+            if rid in displaced:
+                assert rid in s.ctx.resident_plan.taken
+                returned += 1
+                displaced.discard(rid)
+        gone = before.keys() - planner._slot_of.keys()
+        displaced |= gone
+        kept = before.keys() - gone - set(rows)
+        if gone and kept:
+            assert max(before[rid] for rid in gone) <= min(before[rid] for rid in kept)
+        _slot_ledger(planner)
+        _assert_held_rows(planner, live)
+        live["kv"].assert_pages_conserved()
+    assert returned > 100
+
+
+def test_a_displaced_row_is_written_whole_with_its_lengths():
+    live, ref, planner = _setup({rid: 5 + rid for rid in range(1, 12)}, max_num_pages=256, pool_slots=16)
+    del ref
+    # eight rows fill the slots, the oldest step's first
+    _captured_step(live, planner, [1, 2, 3, 4], slot=0, bs=4)
+    _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4)
+    assert not planner._free
+    victim_slot = planner.slot_of(1)
+    s = _captured_step(live, planner, [9], slot=0, bs=4)
+    assert planner.slot_of(1) is None
+    assert planner.slot_of(9) == victim_slot
+    assert s.ctx.resident_plan.taken == {9}
+    tables = live["kv"]._resident
+    assert tables.host_len[victim_slot] == live["kv"]._streams[9]["main"].stored_len
+    _assert_row(planner, live, 9)
+    # the next victims are the rest of the oldest step, in the order they took slots
+    _captured_step(live, planner, [10], slot=1, bs=4)
+    assert planner.slot_of(2) is None and planner.slot_of(3) is not None
+    # and the first comes back through the new-request path
+    s = _captured_step(live, planner, [1], slot=0, bs=4)
+    assert s.ctx.resident_plan.taken == {1}
+    _assert_step_read_its_streams(live, s, [1])
+    _assert_row(planner, live, 1)
+    assert tables.host_len[planner.slot_of(1)] == live["kv"]._streams[1]["main"].stored_len
+
+
+def test_a_step_does_not_displace_its_own_rows_or_the_step_behind_it():
+    live, ref, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)
+    del ref
+    _captured_step(live, planner, [1, 2, 3, 4], slot=0, bs=4)
+    _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4)
+    # planned behind a step that hasn't committed: its rows are out of reach
+    behind = _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4, preplan=True, run=False)
+    _promote(live, planner, behind)
+    s = _captured_step(live, planner, [9, 10, 11, 12], slot=0, bs=4, run=False)
+    planner.plan(s.step, s.ctx)
+    assert set(planner._slot_of) == {5, 6, 7, 8, 9, 10, 11, 12}
+    # the late commit advances the rows it read, none of them taken
+    _replay(live, planner, behind, promote=False)
+    _assert_row(planner, live, 5)
+
+
+def test_a_step_keeps_its_own_oldest_row_and_a_victim_leaves_no_marks():
+    live, ref, planner = _setup({rid: 3 for rid in range(1, 12)}, max_num_pages=256, pool_slots=16)
+    del ref
+    _captured_step(live, planner, [1, 2, 3, 4], slot=0, bs=4)
+    _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4)
+    planner.mark_stale(2)
+    planner._moved.add(3)
+    # 1 is the oldest and in the step, so the victims come after it
+    s = _captured_step(live, planner, [1, 9, 10], slot=0, bs=4)
+    assert planner.slot_of(1) is not None
+    assert planner.slot_of(2) is None and planner.slot_of(3) is None and planner.slot_of(4) is not None
+    assert not planner._stale and not planner._moved
+    _slot_ledger(planner)
+    _assert_step_read_its_streams(live, s, [1, 9, 10])
+
+
+def test_plans_that_never_ran_hold_no_slots():
+    """Refused retries and abandoned pre-plans, one after another with no commit
+    between: however many there are, only the newest can look uncommitted."""
+    live, ref, planner = _setup({rid: 3 for rid in range(1, 26)}, max_num_pages=256, pool_slots=32)
+    del ref
+    rid = 1
+    for t in range(6):
+        rows = list(range(rid, rid + 4))
+        rid += 4
+        s = _captured_step(live, planner, rows, slot=t % 2, bs=4, preplan=True, run=False)
+        assert set(s.ctx.resident_plan.rids) == set(rows)
+        for key in ("kv", "pool", "rope"):
+            live[key].clear_preplan()
+        _slot_ledger(planner)
+
+
+def test_no_slot_is_an_invariant_violation_not_a_knob():
+    live, ref, planner = _setup({1: 3})
+    del ref
+    # every slot read by the step planned just now, which no step can do
+    with planner._lock:
+        planner._slot_of.update({100 + i: planner._free.pop() for i in range(8)})
+        planner._last_read[1:] = 5
+        planner._plan_seq = 5
+        with pytest.raises(RuntimeError, match="accounting is wrong"):
+            planner._take_slots(1, 6)
+
+
+def test_a_rank_whose_release_lands_on_the_other_side_of_a_commit_still_runs():
+    """Ranks replay teardowns between the same steps, but a release can land
+    before or after a commit on the GPU thread, so the same slot is cooling on one
+    rank and free on the other. Neither may raise, and each rank's rows are its own."""
+    ranks = []
+    for release_before_commit in (False, True):
+        live, ref, planner = _setup({rid: 2 + rid for rid in range(1, 21)}, max_num_pages=1024, pool_slots=32)
+        del ref
+        ranks.append((live, planner, release_before_commit))
+    next_rid = 21
+    for t in range(60):
+        rows = [1 + (4 * t + i) % 20 for i in range(4)]
+        gone = rows[0]
+        for live, planner, early in ranks:
+            s = _captured_step(live, planner, rows, slot=t % 2, bs=4, preplan=True, run=False)
+            _promote(live, planner, s)
+            if early:
+                planner.release(gone)
+            _replay(live, planner, s, promote=False)
+            _assert_step_read_its_streams(live, s, rows)
+            if not early:
+                planner.release(gone)
+            for key in ("kv", "pool", "rope"):
+                live[key].remove_request(gone)
+            _ingest(live, gone)
+            step, ctx = _host_step(live, [gone], [next_rid % 5 + 1])
+            planner.commit(step, ctx)
+            _slot_ledger(planner)
+        next_rid += 1
+
+
+def test_ranks_with_the_same_history_displace_the_same_requests():
+    runs = []
+    for shuffle in (0, 1):
+        live, ref, planner = _setup({rid: 3 for rid in range(1, 21)}, max_num_pages=1024, pool_slots=32)
+        del ref
+        # handles and slot numbers are per rank, so a tie must not depend on either
+        if shuffle:
+            planner._free.reverse()
+        seen = []
+        for t in range(40):
+            rows = [1 + (3 * t + i) % 20 for i in range(4)]
+            _captured_step(live, planner, rows, slot=t % 2, bs=4)
+            seen.append(frozenset(planner._slot_of))
+        runs.append(seen)
+    assert runs[0] == runs[1]
+
+
+def test_the_store_is_sized_by_the_widest_capture():
+    res = _resources()
+    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=8)
+    assert planner.max_slots == 17
+    assert len(planner._free) == 16
+    assert TRASH_SLOT not in planner._free
+
+
+def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
+    res = _resources(max_num_pages=64)
+    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    stride = planner._tables[0].stride
+    assert planner._stager._numel >= 4 * stride + 4 * 4
+    monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
+    rows = [(slot, list(range(stride))) for slot in range(1, 5)]
+    plan = SimpleNamespace(writes=SimpleNamespace(rows=rows))
+    planner.flush(plan)
+    assert planner.store.view(9, stride)[1:5].tolist() == [list(range(stride))] * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the stager pins and copies on a GPU")
+def test_a_flush_of_the_largest_step_stages_on_the_device_without_growing(monkeypatch):
+    device = torch.device("cuda")
+    kv = KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=64, page_size=PAGE,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
+    )
+    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=4)
+    stride = planner._tables[0].stride
+    monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
+    rows = [(slot, list(range(100, 100 + stride))) for slot in range(1, 5)]
+    planner.flush(SimpleNamespace(writes=SimpleNamespace(rows=rows)))
+    planner._stager.copy_(planner.buffers(BucketKey(WALK, 4, 4), 0).cells, [0] * 16)
+    torch.cuda.synchronize()
+    assert planner.store.view(9, stride)[1:5].tolist() == [list(range(100, 100 + stride))] * 4
+
+
+# ---- the block table's width ----
+
+def _kv(max_seq_len: int, max_num_pages: int) -> KVManager:
+    return KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
+            max_num_pages=max_num_pages, page_size=PAGE,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
+    )
+
+
+def test_a_row_is_as_wide_as_the_pool_when_the_context_is_wider():
+    kv = _kv(max_seq_len=1 << 20, max_num_pages=64)
+    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    assert kv._resident.block_table.width == kv.config.request_pages == 63
+
+
+def test_a_row_is_as_wide_as_the_context_when_the_pool_is_wider():
+    kv = _kv(max_seq_len=4 * 10 + 1, max_num_pages=64)
+    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    assert kv._resident.block_table.width == 11
+
+
+def test_a_stream_wider_than_a_row_raises():
+    kv = _kv(max_seq_len=8, max_num_pages=64)
+    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    tables = kv._resident
+    assert tables.block_table.width == 2
+    with pytest.raises(ValueError, match="fit a block table row"):
+        tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols)
+    plan = SimpleNamespace(
+        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=resident_mod.ResidentWrites("main"),
+        crossed=None,
+    )
+    tables.host_len[1], tables.host_cols[1] = 8, 2
+    with pytest.raises(ValueError, match="fit a block table row"):
+        tables.stage_step(plan, lambda rid: [1, 2, 3], planner.rewrite)
+    assert not plan.writes.cells
+
+
+# ---- what a raise in the plan leaves ----
+
+def _preplan_worker(engine):
+    worker = Worker.__new__(Worker)
+    worker.worker_id = "w"
+    worker.enable_nvtx = False
+    worker._phase_period = 0
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    return worker
+
+
+def _preplan_engine(res, planner):
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.runner import StepRunner
+
+    resources = {k: res[k] for k in ("kv", "pool", "rope")}
+    engine = Engine.__new__(Engine)
+    engine._enable_nvtx = False
+    engine._device = CPU
+    engine._runner = StepRunner(resources)
+    runner = SimpleNamespace(
+        plan_stream=lambda: None, pad_inputs=lambda lease, inputs: inputs,
+        step_ids=lambda lease, rids: list(rids), release=lambda lease, rows: None,
+    )
+
+    def declare(graph_walk, request_ids, inputs, **kwargs):
+        del graph_walk, inputs, kwargs
+        segments = [Segment(rid, "main", 1) for rid in request_ids]
+        keys = {"kv": KVStep(), "pool": RecurrentStep(), "rope": PositionStep()}
+        return SubmoduleStep(segments=segments, steps=keys)
+
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
+        accelerator_graph_runner=runner, piecewise_runners={}, resident=planner,
+    )}
+    engine.can_pre_plan = lambda node: True
+    engine.reserve_replay_slot = lambda batch: batch.step_context.slot_lease
+    return engine
+
+
+def _preplan_batch(planner, rids, bs):
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
+    lease = SlotLease(slot=0, bucket=bucket)
+    ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
+    ctx.resident = planner
+    return SimpleNamespace(
+        node_name="n", inputs=[SimpleNamespace() for _ in rids], request_ids=list(rids), per_request_info={},
+        step_context=ctx, preplan_event=None, preplanned_rids=None, step=None,
+    )
+
+
+@pytest.mark.parametrize("raiser", ["resident", "runner"])
+def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, raiser):
+    """`pre_admit` reserved a crossing page and something raises before the stage
+    is done. The plan thread's wrapper resets the pre-plan: the page stays with the
+    stream, the in-flight mark goes, and exec's admit finds the page and takes no
+    other. The same for a raise from the planner and from the runner's own pre-plan."""
+    res = _resources()
+    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    _ingest(res, 1)
+    step, ctx = _host_step(res, [1], [3])
+    planner.commit(step, ctx)
+    s = _captured_step(res, planner, [1], slot=0, bs=1)
+    _assert_step_read_its_streams(res, s, [1])
+    kv, stream = res["kv"], res["kv"]._streams[1]["main"]
+    assert stream.stored_len == 4 and len(stream.page_indices) == 1
+
+    engine = _preplan_engine(res, planner)
+    batch = _preplan_batch(planner, [1], 1)
+    target = planner if raiser == "resident" else engine._runner
+    name = "plan" if raiser == "resident" else "pre_plan"
+    real = getattr(target, name)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("raised mid pre-plan")
+
+    monkeypatch.setattr(target, name, boom)
+    assert _preplan_worker(engine)._preplan_spec(None, SimpleNamespace(node_batch=batch)) is False
+    monkeypatch.setattr(target, name, real)
+
+    assert batch.preplan_event is None and batch.preplanned_rids is None and batch.step is None
+    assert engine._runner._pre_admitted is None and not engine._runner.staged
+    assert not stream.step_in_flight
+    assert len(stream.page_indices) == 2
+    pages, free = list(stream.page_indices), kv._arena.num_free
+    kv.assert_pages_conserved()
+
+    # exec re-drives it: the page it finds is the one pre_admit took
+    s = _captured_step(res, planner, [1], slot=1, bs=1)
+    assert stream.page_indices == pages and kv._arena.num_free == free
+    assert s.pages[0] == pages[1]
+    _assert_step_read_its_streams(res, s, [1])
+    _assert_row(planner, res, 1)
+    kv.assert_pages_conserved()
+
+
+def test_a_plan_that_raises_leaves_its_rows_to_the_next_step(monkeypatch):
+    live, ref, planner = _setup({1: 3, 2: 5})
+    del ref
+    kv = live["kv"]
+    real = kv.resident_row
+
+    def boom(rid, slot, row, writes):
+        if rid == 2:
+            raise ValueError("a row that can't be written")
+        real(rid, slot, row, writes)
+
+    monkeypatch.setattr(kv, "resident_row", boom)
+    s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False)
+    with pytest.raises(ValueError, match="can't be written"):
+        planner.plan(s.step, s.ctx)
+    assert planner._stale == {1, 2}
+    monkeypatch.setattr(kv, "resident_row", real)
+    _replay(live, planner, s)
+    _assert_row(planner, live, 1)
+    _assert_row(planner, live, 2)
+
+
+# ---- what an offload does to a slot ----
+
+class _HostPagesKV:
+    """The offload hooks of a KV manager over a real one's streams and arena, for a
+    host with no page-locked memory: a stream's pages go back to the pool and the
+    reload takes others, which is all a row can see of the real move."""
+
+    def __init__(self, kv: KVManager):
+        self.kv = kv
+        self.away: dict[int, int] = {}
+        kv.__class__ = type("_Offloading", (KVManager,), {
+            "offload": lambda _, rid: self.offload(rid),
+            "reload": lambda _, rid: self.reload(rid),
+            "is_offloaded": lambda _, rid: rid in self.away,
+            "can_reload": lambda _, rid: True,
+            "supports_eviction": property(lambda _: True),
+            "reclaimable": lambda _, rid: len(kv._streams[rid]["main"].page_indices) if rid not in self.away else 0,
+        })
+
+    def offload(self, rid: int) -> int:
+        stream = self.kv._streams[rid]["main"]
+        if stream.step_in_flight:
+            return 0
+        pages = stream.page_indices
+        self.kv._touch_plan_cache(rid, row=False)
+        stream.page_indices = []
+        self.kv._arena.release(pages)
+        self.away[rid] = len(pages)
+        return len(pages)
+
+    def reload(self, rid: int) -> bool:
+        self.kv._touch_plan_cache(rid, row=False)
+        stream = self.kv._streams[rid]["main"]
+        stream.page_indices = self.kv._arena.acquire(self.away.pop(rid))
+        return True
+
+
+def _offload_engine(resources, planner):
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    engine._tp_follower_nodes = set()
+    engine._resident_delta = {}
+    engine._resources = resources
+    engine._submodules = {"n": SimpleNamespace(resources=resources, resident=planner)}
+    engine._graph_runtime = SimpleNamespace(get_rid_string=str, get_rid_handle=int)
+    return engine
+
+
+def _refused_worker(engine, line):
+    """The real handler and the real victim search over a real engine."""
+    worker = Worker.__new__(Worker)
+    worker.parallel_nodes = set()
+    worker.parallel_leader_nodes = set()
+    worker._hold_logged = {}
+    worker.pushed = []
+    worker.held = []
+    worker._apply_removes_whose_step_landed = lambda: None
+    worker._apply_pending_removes_safe_to_drop = lambda rids: None
+    worker._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, graphs: worker.pushed.append(rids))
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker.eviction_policy = SimpleNamespace(value="last_in_line")
+    worker.scheduler = SimpleNamespace(
+        arrival=list(line), hold_requests=worker.held.extend, could_refill=lambda *a: False,
+        last_in_line=lambda node, walk, rids: max(rids, key=line.index),
+    )
+    return worker
+
+
+def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
+    """Through the worker's refusal path: the KV pool refuses, `_handle_allocation_failure`
+    offloads the row furthest from a step, its slot goes with it, the retry runs, and the
+    victim's reload is written whole at its own lengths."""
+    from mstar.engine.resources.runner import StepRunner
+
+    # seven pages to hand out, all held: each of 1 and 2 has room for one more token
+    live = _resources(max_num_pages=8)
+    owned = {k: live[k] for k in ("kv", "pool", "rope")}
+    planner = ResidentPlanner("n", {WALK}, owned, CPU, max_bs=4)
+    for rid, tokens in ((1, 7), (2, 7), (3, 11)):
+        _ingest(live, rid)
+        step, ctx = _host_step(live, [rid], [tokens])
+        planner.commit(step, ctx)
+    kv = live["kv"]
+    _HostPagesKV(kv)
+    _captured_step(live, planner, [1, 2, 3], slot=0, bs=3)
+    assert planner.slot_of(3) is not None and kv._arena.num_free == 0
+    engine = _offload_engine(owned, planner)
+
+    # both cross a page now
+    segments = tuple(Segment(rid, "main", 1) for rid in (1, 2))
+    step = SubmoduleStep(
+        segments=list(segments), steps={"kv": KVStep(), "pool": RecurrentStep(), "rope": PositionStep()},
+    )
+    step.set_ctx(StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False))
+    outcome = StepRunner(owned).admit(step)
+    assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and outcome.failed_resource == "kv"
+
+    worker = _refused_worker(engine, line=[1, 2, 3])
+    batch = SimpleNamespace(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
+    worker._handle_allocation_failure(batch, SimpleNamespace(
+        node_name="n", admit_error=outcome.reason, failed_resource=outcome.failed_resource,
+    ))
+    assert worker.pushed == [[1, 2]] and worker.held == [3]
+    assert engine.is_offloaded("n", 3)
+    assert planner.slot_of(3) is None and 3 not in planner._stale
+
+    # the retry runs on the victim's pages
+    s = _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    _assert_step_read_its_streams(live, s, [1, 2])
+    _assert_row(planner, live, 1)
+
+    for key in ("kv", "pool", "rope"):
+        live[key].remove_request(2)
+    planner.release(2)
+    assert engine.reload_request("n", 3)
+    assert planner.slot_of(3) is None
+    s = _captured_step(live, planner, [3], slot=0, bs=1)
+    assert s.ctx.resident_plan.taken == {3}
+    stream = kv._streams[3]["main"]
+    assert stream.stored_len == 13
+    assert kv._resident.host_len[planner.slot_of(3)] == stream.stored_len
+    _assert_step_read_its_streams(live, s, [3])
+    _assert_row(planner, live, 3)
+
+
+def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict():
+    """The pool refuses with `AllocationFailed`, which is backpressure: it has no
+    eviction, so nothing is offloaded and the row it named is held for a smaller retry."""
+    live = _resources(pool_slots=2)
+    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    for rid in (1, 2):
+        _ingest(live, rid)
+    step, ctx = _host_step(live, [1], [3])
+    planner.commit(step, ctx)
+    _HostPagesKV(live["kv"])
+    pool_step = RecurrentStep(segments=(Segment(2, "main", 1),))
+    pool_ctx = StepContext(request_ids=(2,), graph_walk="prefill", slot=0, capture=False)
+    live["kv"].admit(KVStep(segments=(Segment(2, "main", 1),)), pool_ctx)
+    outcome = live["pool"].admit(pool_step, pool_ctx)
+    assert not outcome.ok and isinstance(outcome.reason, AllocationFailed)
+    assert outcome.reason.request_id == 2
+
+    engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
+    worker = _refused_worker(engine, line=[1, 2])
+    batch = SimpleNamespace(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
+    worker._handle_allocation_failure(batch, SimpleNamespace(
+        node_name="n", admit_error=outcome.reason, failed_resource="pool",
+    ))
+    assert worker.pushed == [[2]]
+    assert worker.held == [2]
+    assert not engine.is_offloaded("n", 1)
+
+
+def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
+    live, ref, planner = _setup({1: 9})
+    del ref
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    _HostPagesKV(live["kv"])
+    engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
+    engine._tp_follower_nodes = {"n"}
+    delta = OffloadDelta.new()
+    delta.add_offloaded("1")
+    assert engine.apply_resident_delta("n", delta)
+    assert planner.slot_of(1) is None
 
 
 # ---- refusals ----
@@ -649,8 +1234,8 @@ class _Spare(Resource):
         return cls()
 
 
-def _build(resources, nodes=None, walks=(WALK,)):
-    return build_planner("n", walks, resources, nodes or {}, CPU, 8)
+def _build(resources, nodes=None, walks=(WALK,), max_bs=4):
+    return build_planner("n", walks, resources, nodes or {}, CPU, max_bs)
 
 
 def test_every_resident_resource_passes():
@@ -663,6 +1248,13 @@ def test_no_walks_no_planner():
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, walks=())
     assert planner is None and "no resident walk" in why
+
+
+def test_no_capture_of_the_walks_no_planner():
+    res = _resources()
+    planner, why = _build({"kv": res["kv"]}, max_bs=0)
+    assert planner is None and "nothing captures" in why
+    assert res["kv"]._resident is None
 
 
 def test_a_resource_without_a_table_refuses():
@@ -772,6 +1364,13 @@ def test_a_resident_walk_is_one_token_a_row_in_one_stream():
 
 # ---- the engine ----
 
+def _capture_runner(max_bs=4):
+    bound = {}
+    return SimpleNamespace(
+        max_capture_bs=lambda walks: max_bs, bind_resident=lambda planner: bound.update(p=planner), bound=bound,
+    )
+
+
 def _engine(walks, resources, device=CPU):
     from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
@@ -785,12 +1384,14 @@ def _engine(walks, resources, device=CPU):
     return engine, engine._submodules["n"]
 
 
-def test_the_engine_builds_a_planner_for_a_capable_node(monkeypatch):
-    monkeypatch.setattr(knobs, "resident_slots", lambda: 8)
+def test_the_engine_builds_a_planner_for_a_capable_node():
     res = _resources()
     engine, mgmt = _engine({WALK}, {k: res[k] for k in ("kv", "pool", "rope")})
-    engine._build_resident_planner("n")
+    runner = _capture_runner()
+    engine._build_resident_planner("n", runner)
     assert isinstance(mgmt.resident, ResidentPlanner)
+    assert runner.bound["p"] is mgmt.resident
+    assert mgmt.resident.max_slots == 9
     assert mgmt.resident.covers(BucketKey(WALK, 2, 2))
     assert not mgmt.resident.covers(BucketKey("prefill_text", 2, 64))
 
@@ -799,17 +1400,16 @@ def test_the_knob_turns_it_off(monkeypatch):
     monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
     res = _resources()
     engine, mgmt = _engine({WALK}, {"kv": res["kv"]})
-    engine._build_resident_planner("n")
+    engine._build_resident_planner("n", _capture_runner())
     assert mgmt.resident is None
     assert res["kv"]._resident is None
 
 
-def test_a_refused_node_stays_on_the_host_and_says_why(monkeypatch, caplog):
-    monkeypatch.setattr(knobs, "resident_slots", lambda: 8)
+def test_a_refused_node_stays_on_the_host_and_says_why(caplog):
     res = _resources()
     engine, mgmt = _engine({WALK}, {"kv": res["kv"], "other": _Spare()})
     with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n")
+        engine._build_resident_planner("n", _capture_runner())
     assert mgmt.resident is None
     assert "_Spare keeps no resident table" in caplog.text
     assert res["kv"]._resident is None
@@ -819,7 +1419,7 @@ def test_a_node_with_no_resident_walk_is_left_alone(caplog):
     res = _resources()
     engine, mgmt = _engine((), {"kv": res["kv"]})
     with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n")
+        engine._build_resident_planner("n", _capture_runner())
     assert mgmt.resident is None
     assert not caplog.text
 
@@ -872,6 +1472,20 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     assert set(out) == {"input_ids"}
 
 
+def test_a_capture_runner_answers_for_the_walks_it_captures():
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner as Runner
+
+    runner = Runner.__new__(Runner)
+    runner._capture_configs = [
+        SimpleNamespace(capture_graph_walk="decode", capture_batch_sizes=[1, 8, 128]),
+        SimpleNamespace(capture_graph_walk="prefill", capture_batch_sizes=[1, 512]),
+        SimpleNamespace(capture_graph_walk="other", capture_batch_sizes=None),
+    ]
+    assert runner.max_capture_bs({"decode"}) == 128
+    assert runner.max_capture_bs({"other"}) == max(Runner.CAPTURE_BATCH_SIZES)
+    assert runner.max_capture_bs({"absent"}) == 0
+
+
 # ---- the knob ----
 
 def test_the_knob_takes_auto_and_off():
@@ -889,3 +1503,8 @@ def test_the_knob_defaults_to_auto(monkeypatch):
     assert knobs.resident_planning() == "auto"
     monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
     assert knobs.resident_planning() == "off"
+
+
+def test_the_slot_count_is_no_knob():
+    with pytest.raises(ValueError):
+        knobs.check({"resident_slots": 8})

@@ -18,7 +18,8 @@ side by side in one row of one store, so rewriting it is one H2D.
 
 The host stays the source of truth. A row is written whole the first time a
 step reads it and whenever something other than a resident commit changed it
-(a host-planned step, an offload, a reload, a fork); see `mark_stale`.
+(a host-planned step, a fork); see `mark_stale`. An offload gives the slot up,
+so a reload starts over as a new request does.
 """
 from __future__ import annotations
 
@@ -190,23 +191,33 @@ class CapturedResidentStep:
 
 
 class ResidentPlanner:
-    """One node's request slots, tables and per-step rows."""
+    """One node's request slots, tables and per-step rows.
+
+    Slots are a cache, not something a request can run out of. Every cell of a
+    row mirrors host state, so a request can lose its slot whenever no step needs
+    it, and it takes another with a whole-row rewrite when it next runs, as a new
+    request does. ``2 * max_bs`` slots, ``max_bs`` being the widest capture of a
+    resident walk, always hold a step, on every rank and whatever the commit
+    timing: a slot is free, cooling or held, and a step can take any of them but
+    its own rows, at most ``max_bs``, and those of the one earlier step that may
+    still commit, at most ``max_bs``. Slot numbers are private to a rank's
+    planner, and no collective reads one.
+    """
 
     def __init__(
         self, node: str, walks: Collection[str], resources: Mapping[str, Resource],
-        device: torch.device, max_slots: int,
+        device: torch.device, max_bs: int,
     ):
         self.node = node
         self.walks = frozenset(walks)
         self.device = device
         # request rows plus the trash row
-        self.max_slots = max_slots + 1
+        self.max_slots = 2 * max_bs + 1
         self._owners = tuple(resources.values())
         self._tables: list[ResidentTable] = []
         self._store: torch.Tensor | None = None
         # columns of the one-cell tables, which a rewritten row always covers
         self.narrow_cols = 0
-        self._stager = PinnedStager(torch.long, numel=1 << 16)
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
@@ -214,7 +225,7 @@ class ResidentPlanner:
         self._lock = threading.Lock()
         # rid -> slot. Handle-keyed: `release` purges it.
         self._slot_of: dict[int, int] = {}
-        self._free: list[int] = list(range(max_slots, TRASH_SLOT, -1))
+        self._free: list[int] = list(range(self.max_slots - 1, TRASH_SLOT, -1))
         # (slot, seq of the last step that read it), freed under a step not yet committed
         self._cooling: list[tuple[int, int]] = []
         self._last_read = np.zeros(self.max_slots, dtype=np.int64)
@@ -233,6 +244,9 @@ class ResidentPlanner:
         for resource in self._owners:
             resource.bind_resident(self)
         self._seal()
+        # the largest flush up front, plus a cells row: growing the stager waits
+        # out its copies, which on the GPU thread would be a sync in the step path
+        self._stager = PinnedStager(torch.long, numel=max_bs * self._tables[0].stride + 4 * max_bs)
 
     # Tables
 
@@ -277,27 +291,54 @@ class ResidentPlanner:
     def slot_of(self, rid: int) -> int | None:
         return self._slot_of.get(rid)
 
-    def _take_slot(self) -> int:
-        """Caller holds the lock. A freed slot comes back once the last step
-        that read it has committed: until then that step's commit still
-        advances the slot's host lengths."""
+    def _take_slots(self, n: int, seq: int) -> list[int]:
+        """``n`` slots for the new rows of plan ``seq``, whose held rows carry
+        its stamp already. Caller holds the lock. A slot is taken only once the
+        last step that read it has committed, or can't: until then that step's
+        commit still advances the slot's host lengths. A step is planned behind
+        the commit of the one before it, so only the newest earlier plan can
+        still be waiting on one, however many before it never ran."""
+        settled = max(self._committed_seq, seq - 2)
         if self._cooling:
-            done = self._committed_seq
-            ready = [slot for slot, seq in self._cooling if seq <= done]
+            ready = [slot for slot, read in self._cooling if read <= settled]
             if ready:
-                self._cooling = [(slot, seq) for slot, seq in self._cooling if seq > done]
+                self._cooling = [(slot, read) for slot, read in self._cooling if read > settled]
                 self._free.extend(ready)
-        if not self._free:
+        free = self._free
+        taken = [free.pop() for _ in range(min(n, len(free)))]
+        if len(taken) < n:
+            taken += self._displace(n - len(taken), settled)
+        return taken
+
+    def _displace(self, n: int, settled: int) -> list[int]:
+        """The slots of the ``n`` least recently run requests. Each loses its
+        slot and takes another when it next runs; the slot's host mirrors go to
+        the new tenant. Ordered by plan, not by clock or slot number, and a
+        step's rows in the order they took their slots, so a rank with the same
+        history picks the same requests. Nothing depends on that: a displaced
+        row is host state and one H2D, and no collective sees it."""
+        held = self._slot_of
+        reads = self._last_read[np.fromiter(held.values(), dtype=np.int64, count=len(held))]
+        open_rows = np.flatnonzero(reads <= settled)
+        if open_rows.size < n:
             raise RuntimeError(
-                f"resident planning on {self.node}: all {self.max_slots - 1} slots are held; "
-                "raise `knobs: resident_slots`"
+                f"resident planning on {self.node}: {n} rows found no slot among {self.max_slots - 1}, "
+                f"{open_rows.size} of the {len(held)} held open. A step's rows and those of the one step "
+                "behind it can't hold them all, so the slot accounting is wrong"
             )
-        return self._free.pop()
+        rids = list(held)
+        slots = []
+        for i in open_rows[np.argsort(reads[open_rows], kind="stable")][:n].tolist():
+            rid = rids[i]
+            slots.append(held.pop(rid))
+            self._stale.discard(rid)
+            self._moved.discard(rid)
+        return slots
 
     def release(self, rid: int) -> None:
-        """The request is gone. Its slot cools until the last step that read it
-        has committed; on the device the row is only read again behind that
-        step, by stream order."""
+        """The request is gone, or offloaded: a reload is written whole anyway.
+        Its slot cools until the last step that read it has committed; on the
+        device the row is only read again behind that step, by stream order."""
         with self._lock:
             self._stale.discard(rid)
             self._moved.discard(rid)
@@ -371,16 +412,20 @@ class ResidentPlanner:
         lease = ctx.slot_lease
         laps = PhaseLaps(f"{ctx.plan_phase}.resident.")
         with self._lock:
+            self._plan_seq += 1
+            seq = self._plan_seq
             if rids == self._last_rids:
                 slots = self._last_slots
             else:
                 get = self._slot_of.get
                 row = [get(rid) for rid in rids]
                 if None in row:
-                    for i, slot in enumerate(row):
-                        if slot is None:
-                            row[i] = self._slot_of[rids[i]] = self._take_slot()
-                            self._stale.add(rids[i])
+                    # stamped first: a row of this step is no one's victim
+                    self._last_read[[slot for slot in row if slot is not None]] = seq
+                    new = [i for i, slot in enumerate(row) if slot is None]
+                    for i, slot in zip(new, self._take_slots(len(new), seq), strict=True):
+                        row[i] = self._slot_of[rids[i]] = slot
+                        self._stale.add(rids[i])
                 slots = np.array(row, dtype=np.int64)
                 self._last_rids, self._last_slots = rids, slots
             stale = self._stale
@@ -390,25 +435,28 @@ class ResidentPlanner:
             refreshed = moved.intersection(rids) if moved else set()
             moved -= refreshed
             refreshed -= taken
-            self._plan_seq += 1
-            seq = self._plan_seq
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
         plan = ResidentPlan(key, rids, slots, seq, self._commits, ResidentWrites(label), taken, refreshed)
         laps.lap("rows")
-        for rid, slot in rows:
-            self.rewrite(rid, slot, plan.writes)
-        laps.lap("rewrites")
-        buffers = self.buffers(lease.bucket, lease.slot)
-        if buffers.staged is not slots:
-            self._stager.copy_(buffers.slots, slots, pad_value=TRASH_SLOT)
-            buffers.staged = slots
-        laps.lap("slot_row")
-        for resource in self._owners:
-            resource.resident_stage(plan)
-        laps.lap("stage")
-        self._stage_cells(plan, buffers)
-        laps.lap("cells")
+        try:
+            for rid, slot in rows:
+                self.rewrite(rid, slot, plan.writes)
+            laps.lap("rewrites")
+            buffers = self.buffers(lease.bucket, lease.slot)
+            if buffers.staged is not slots:
+                self._stager.copy_(buffers.slots, slots, pad_value=TRASH_SLOT)
+                buffers.staged = slots
+            laps.lap("slot_row")
+            for resource in self._owners:
+                resource.resident_stage(plan)
+            laps.lap("stage")
+            self._stage_cells(plan, buffers)
+            laps.lap("cells")
+        except BaseException:
+            # nothing wrote these rows, so the next step that reads them must
+            self._restore(plan)
+            raise
         return plan
 
     def rewrite(self, rid: int, slot: int, writes: ResidentWrites) -> None:
@@ -512,7 +560,7 @@ class ResidentPlanner:
 
 def build_planner(
     node: str, walks: Iterable[str], resources: Mapping[str, Resource],
-    resource_nodes: Mapping[str, Collection[str]], device: torch.device, max_slots: int,
+    resource_nodes: Mapping[str, Collection[str]], device: torch.device, max_bs: int,
 ) -> tuple[ResidentPlanner | None, str]:
     """A planner for ``node``, or None and why not. Every resource of the node
     must be able to, since a capture is one graph: one host-planned resource
@@ -520,10 +568,12 @@ def build_planner(
     walks = frozenset(walks)
     if not walks:
         return None, "its submodule names no resident walk"
+    if max_bs < 1:
+        return None, f"nothing captures its resident walks {sorted(walks)}"
     for key, resource in resources.items():
         if len(resource_nodes.get(key, ())) > 1:
             return None, f"resource {key!r} is shared by nodes {sorted(resource_nodes[key])}"
         refusal = resource.resident_refusal()
         if refusal is not None:
             return None, f"resource {key!r}: {refusal}"
-    return ResidentPlanner(node, walks, resources, device, max_slots), ""
+    return ResidentPlanner(node, walks, resources, device, max_bs), ""
