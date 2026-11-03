@@ -61,16 +61,13 @@ class HostPool:
             start = self._free.pop(i).offset
         self._free.insert(i, HostSlice(start, end - start))
 
-    def copy_out(
-        self, src: torch.Tensor, after: torch.Event | None, dtype: torch.dtype | None = None,
-    ) -> HostCopy | None:
-        """Copy ``src``, in ``dtype`` when given, into a slice once ``after`` (the step that wrote it) completes.
-        None when no free slice holds it."""
-        dtype = src.dtype if dtype is None else dtype
-        piece = self.take(src.numel() * dtype.itemsize)
+    def copy_out(self, src: torch.Tensor, after: torch.Event | None) -> HostCopy | None:
+        """Copy ``src`` as it is into a slice once ``after`` (the step that wrote it) completes, running nothing on
+        the device but the copy. None when no free slice holds it."""
+        piece = self.take(src.nbytes)
         if piece is None:
             return None
-        view = self._memory[piece.offset:piece.offset + src.numel() * dtype.itemsize].view(dtype).view(src.shape)
+        view = self._memory[piece.offset:piece.offset + src.nbytes].view(src.dtype).view(src.shape)
         if after is None:
             view.copy_(src)
             return HostCopy(piece, view, None)
@@ -78,7 +75,7 @@ class HostPool:
             self._stream = torch.Stream(device=self.device)
         self._stream.wait_event(after)
         with self._stream:
-            view.copy_(src.to(dtype), non_blocking=True)
+            view.copy_(src, non_blocking=True)
         # the step's inputs may be freed before the copy reads them
         src.record_stream(self._stream)
         landed = torch.Event(device=self.device)
