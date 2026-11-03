@@ -146,8 +146,6 @@ class Rebuilds:
             return f"it keeps no ids on {node}"
         if not kept.prompt.has_landed():
             return "its ids haven't reached the host"
-        if (node, rid) in self._cursors:
-            return "its rebuild is in progress"
         if walk not in self._loop_walks[node]:
             return f"it is in walk {walk!r}, where loop {policy.loop!r} doesn't run {node}"
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:
