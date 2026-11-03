@@ -49,11 +49,11 @@ from mstar.model.gr00t_n17.config import (
     Gr00tN17Config,
 )
 
-from .helpers import BACKBONE, GR00T
+from .helpers import BACKBONE, GR00T, REFERENCE_SRC
 
 # NVIDIA's `AlternateVLDiT` from a checkout of Isaac-GR00T, loaded by file path: the `gr00t`
 # package's `__init__` imports nothing, and the reference's venv is not this one.
-_REFERENCE = Path.home() / "ref/Isaac-GR00T/gr00t/model/modules/dit.py"
+_REFERENCE = REFERENCE_SRC / "gr00t/model/modules/dit.py"
 # the DT's weights, which `test_dit.py` counts off the safetensors header
 _CKPT_PREFIX = "action_head.model."
 _CKPT_TENSORS = 456

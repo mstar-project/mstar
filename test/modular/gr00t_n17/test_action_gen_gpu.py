@@ -33,17 +33,16 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 from mstar.model.gr00t_n17.submodules import Gr00tN17DenoiseStepSubmodule
 from mstar.model.gr00t_n17.weight_loader import load_gr00t_n17_weights
 
-from .helpers import BACKBONE, GR00T
+from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS
 
-_RUNS = Path.home() / "gr00t-runs"
-_ORACLE_FP32, _ORACLE_BF16, _DUMP = _RUNS / "oracle_fp32", _RUNS / "oracle_bf16", _RUNS / "dump"
+_ORACLE_FP32, _ORACLE_BF16, _DUMP = RUNS / "oracle_fp32", RUNS / "oracle_bf16", RUNS / "dump"
 _REQUESTS = 20
 # Each recording set's (fp32, bf16) pair. `recorded` starts from the dump's own noise and is what
 # the parity tests read.
 _SETS = {
     "recorded": (_ORACLE_FP32, _ORACLE_BF16),
     **{
-        f"seed{s}": (_RUNS / f"oracle_fp32_seed{s}", _RUNS / f"oracle_bf16_seed{s}")
+        f"seed{s}": (RUNS / f"oracle_fp32_seed{s}", RUNS / f"oracle_bf16_seed{s}")
         for s in (7, 8, 9, 10, 11)
     },
 }
@@ -61,7 +60,7 @@ pytestmark = pytest.mark.skipif(
          and _complete(_ORACLE_FP32, _ORACLE_BF16, _DUMP)),
     reason=(
         f"the full action_gen loop needs CUDA, the cached checkpoint and the {_REQUESTS} recorded "
-        f"requests in {_RUNS}/{{oracle_fp32,oracle_bf16,dump}}"
+        f"requests in {RUNS}/{{oracle_fp32,oracle_bf16,dump}} ({RECORDINGS})"
     ),
 )
 
