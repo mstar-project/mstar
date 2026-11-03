@@ -678,19 +678,6 @@ def _fused_filter_kernel(
 
 
 @triton.jit
-def _kth_largest_key(key, k, HI: tl.constexpr, ITERS: tl.constexpr):
-    """The largest ``t`` in ``[0, HI]`` with at least ``k`` entries of ``key`` >= t."""
-    lo = 0
-    hi = HI
-    for _ in range(ITERS):
-        mid = lo + (hi - lo + 1) // 2
-        ok = tl.sum((key >= mid).to(tl.int32), axis=0) >= k
-        lo = tl.where(ok, mid, lo)
-        hi = tl.where(ok, hi, mid - 1)
-    return lo
-
-
-@triton.jit
 def _fused_sample_kernel(
     logits_ptr, temperature_ptr, top_k_ptr, top_p_ptr, seed_ptr, offset_ptr,
     penalty_ptr, seen_ptr, out_ptr,
@@ -703,9 +690,8 @@ def _fused_sample_kernel(
     own (seed, offset), so a request draws the same token at any batch
     position. Temperature 0 takes the argmax.
 
-    The cuts rank tokens by their probability's top 16 bits (bf16
-    precision, truncated): a search over 2^14 keys instead of 2^31, so
-    tokens within one bf16 step of the k-th probability are kept with it."""
+    The cuts compare the probabilities' full float32 bits, so a token just
+    below the k-th one is cut however close it is."""
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     valid = offs < V
@@ -719,14 +705,14 @@ def _fused_sample_kernel(
     greedy = temp == 0
     x_max, arg = tl.max(x, axis=0, return_indices=True)
     inv_temp = tl.where(greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    # unnormalised: the largest is 1, so every key is at most 1.0's, 0x3F80
+    # unnormalised: the largest is 1, so every key is at most 1.0's bits
     e = tl.where(valid, tl.exp((x - x_max) * inv_temp), 0.0)
-    key = e.to(tl.int32, bitcast=True) >> 16
+    key = e.to(tl.int32, bitcast=True)
     k = tl.load(top_k_ptr + row)
     t = 0
     if k > 0:
         if k < V:  # a branch, not tl.where: skip the search when nothing is cut
-            t = _kth_largest_key(key, k, 0x3F80, 14)
+            t = _kth_largest_bits(key, k)
     top_p = tl.load(top_p_ptr + row)
     if top_p < 1.0:
         # top-p keeps token i iff the mass strictly above it is < p * mass. That
@@ -734,8 +720,8 @@ def _fused_sample_kernel(
         # mass(> t') < p * mass
         target = top_p * tl.sum(tl.where(key >= t, e, 0.0), axis=0)
         lo = t
-        hi = 0x3F80
-        for _ in range(14):
+        hi = 0x3F800000
+        for _ in range(30):
             mid = lo + (hi - lo) // 2
             ok = tl.sum(tl.where(key > mid, e, 0.0), axis=0) < target
             hi = tl.where(ok, mid, hi)
@@ -1807,8 +1793,7 @@ def sample_accelerator_graphable_gpu(
     On CUDA, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
     ``min_p``, ``history``, ``order`` or ``return_probs`` draws in one
     ``fused_sample`` launch:
-    per-row seeds, so batch-invariant, but its cuts rank on bf16-truncated
-    keys (see ``_fused_sample_kernel``), and the eager ``Sampler`` path
+    per-row seeds, so batch-invariant, but the eager ``Sampler`` path
     (``_sample_cuda``) keeps FlashInfer, so for those vocabularies an eager
     and a captured step draw differently for the same seed.
 
