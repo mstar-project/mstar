@@ -75,7 +75,7 @@ class CPUPagePool:
         # be async
         self.cpu_kv_cache = torch.empty(
             kv_cache.tensor.shape[0],
-            arena.allocator.max_num_pages,
+            arena.max_num_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
@@ -182,7 +182,7 @@ class CPUPagePool:
             "(%d of %d pages free; %d more offloads refused since the last "
             "warning)",
             n_pages, rid, label, self.arena.num_free,
-            self.arena.allocator.max_num_pages, self._refused_unlogged,
+            self.arena.max_num_pages, self._refused_unlogged,
         )
         self._refused_logged_at = now
         self._refused_unlogged = 0
@@ -309,5 +309,4 @@ class CPUPagePool:
     def takes(self, pages: int, keys: list[bytes]) -> int:
         """How many pages `place` takes out of `room` for a stream ``pages`` long, filed under ``keys``. A page
         another request holds under the same key costs nothing."""
-        owners = self.arena.num_owners
-        return pages - sum(owners[page] > 1 for page in self.index.pages_for(keys))
+        return pages - sum(owners > 1 for owners in self.arena.owners_of(self.index.pages_for(keys)))

@@ -122,6 +122,13 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
     }[representation]
     model, kwargs, expected_tensors = _case(case, convert)
     original_kwargs = dict(kwargs)
+    file_paths = None
+    if case == "pi05":
+        # a pi0.5 request needs a camera image
+        from PIL import Image
+
+        Image.new("RGB", (8, 8)).save(tmp_path / "camera.png")
+        file_paths = {"image": [str(tmp_path / "camera.png")]}
     communicator = _Communicator()
     sender = _manager(tmp_path, "api_server", device, communicator)
     receiver = _manager(tmp_path, "worker_0", device, communicator)
@@ -133,7 +140,7 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
     )
     try:
         outputs = _OUTPUTS.get(case, ["video"])
-        worker._process_input(PreprocessInput("r", "Pick up the cup", None, [], outputs, kwargs))
+        worker._process_input(PreprocessInput("r", "Pick up the cup", file_paths, [], outputs, kwargs))
         request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
         for name, value in original_kwargs.items():
             assert kwargs[name] is value

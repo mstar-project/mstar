@@ -1,0 +1,73 @@
+---
+title: "Installation"
+description: "Install M* from PyPI or source and prepare a GPU environment."
+---
+
+## Requirements
+
+- **Python 3.12 or newer.**
+- **Linux with an NVIDIA GPU** and a recent CUDA toolkit for GPU model families.
+  BAGEL also supports Intel GPUs with XPU PyTorch; see the
+  [Intel GPU Docker instructions](https://mstar.stanford.edu/mstar/installation.html#using-docker-image-on-intel-gpu).
+- Enough GPU memory for your model. Several families, including BAGEL-7B and
+  Qwen3-Omni-30B, require substantial GPU memory and may need multiple GPUs.
+
+A CPU-only machine can run graph and worker plumbing in dummy mode for development
+and modular tests, but cannot run real model inference.
+
+## Install from PyPI
+
+The published package is `mstar-ai`. The Python import and command-line tools are
+named `mstar`. Use [uv](https://docs.astral.sh/uv/) to create a Python environment:
+
+```bash
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+
+uv pip install --torch-backend=auto "mstar-ai[all]"
+```
+
+For a smaller install, choose the extras your model needs, such as
+`"mstar-ai[bagel]"` or `"mstar-ai[qwen3_omni,audio]"`. See the
+[optional dependencies reference](https://mstar.stanford.edu/mstar/installation.html#optional-dependencies)
+for the full list and model-specific setup.
+
+<Warning>
+  For CUDA installs, keep `--torch-backend=auto` on each `uv pip install` command.
+  It selects a PyTorch build for your driver. Source-compiled extensions also
+  require a matching CUDA toolkit major version. Follow the
+  [CUDA toolkit guidance](https://mstar.stanford.edu/mstar/installation.html#matching-your-cuda-toolkit)
+  if your driver, toolkit, and PyTorch build differ.
+</Warning>
+
+## Install from source
+
+Use an editable install to work on M* itself:
+
+```bash
+git clone https://github.com/mstar-project/mstar.git
+cd mstar
+
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+
+uv pip install --torch-backend=auto -e .
+```
+
+This installs the core runtime and the `mstar` and `mstar-serve` commands. Install
+the [extras for your model](https://mstar.stanford.edu/mstar/installation.html#optional-dependencies)
+before serving it.
+
+## Start a server
+
+```bash
+mstar serve bagel
+```
+
+Continue to the [quickstart](/quickstart) to send a request.
+
+<Info>
+  The [complete installation guide](https://mstar.stanford.edu/mstar/installation.html)
+  covers additional model dependencies, Docker, CUDA troubleshooting, and transport
+  setup while those sections are being migrated to this site.
+</Info>

@@ -1,4 +1,5 @@
-"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized.
+"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized; the scale
+layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4).
 
 A block-scale checkpoint (DeepSeek-V3's format, GLM-5.x's) stores each linear weight as e4m3 with one fp32
 ``weight_scale_inv`` per ``weight_block_size`` block. Triton-free, so a model's config can import it on a
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -15,6 +17,53 @@ _WEIGHT = ".weight"
 _SCALE_INV = ".weight_scale_inv"
 
 FP8_DTYPE = torch.float8_e4m3fn
+E8M0_DTYPE = torch.float8_e8m0fnu
+FP4_DTYPE = torch.float4_e2m1fn_x2
+
+
+# The swizzled scale layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4) tiles blocks by this many along K and
+# rows by 128; ``model.components.block_scaled`` holds the formats.
+BLOCKS_PER_TILE = 4
+_ROWS_PER_TILE = 128
+
+
+class BlockQuant(NamedTuple):
+    """One block-scaled matrix ``[rows, K // packing]``. ``scale`` is flat in the GEMM's swizzled layout;
+    ``tensor_scale`` is NVFP4's second level, a ``[1]`` fp32 (None under MXFP8)."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+    tensor_scale: torch.Tensor | None = None
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def swizzled_scale_elements(rows: int, k_blocks: int) -> int:
+    """Length of the flat scales of ``[rows, k_blocks]``: both padded to whole tiles."""
+    return (_ceil_div(rows, _ROWS_PER_TILE) * _ROWS_PER_TILE) * (_ceil_div(k_blocks, BLOCKS_PER_TILE) * BLOCKS_PER_TILE)
+
+
+def swizzle_block_scales(scales: torch.Tensor) -> torch.Tensor:
+    """``[rows, k_blocks]`` -> the flat 32x4x4 layout of the cuBLAS block scaling factors: 128x4 tiles of 512
+    elements, row ``r``, block ``j`` of a tile at ``(r % 32) * 16 + (r // 32) * 4 + j``."""
+    rows, blocks = scales.shape
+    row_tiles, col_tiles = _ceil_div(rows, _ROWS_PER_TILE), _ceil_div(blocks, BLOCKS_PER_TILE)
+    padded = torch.zeros(
+        row_tiles * _ROWS_PER_TILE, col_tiles * BLOCKS_PER_TILE, dtype=scales.dtype, device=scales.device,
+    )
+    padded[:rows, :blocks] = scales
+    tiles = padded.view(row_tiles, _ROWS_PER_TILE, col_tiles, BLOCKS_PER_TILE).permute(0, 2, 1, 3)
+    return tiles.reshape(-1, BLOCKS_PER_TILE, 32, BLOCKS_PER_TILE).transpose(1, 2).reshape(-1, 32, 16).flatten()
+
+
+def unswizzle_block_scales(flat: torch.Tensor, rows: int, k_blocks: int) -> torch.Tensor:
+    """The inverse of :func:`swizzle_block_scales`, padding dropped."""
+    row_tiles, col_tiles = _ceil_div(rows, _ROWS_PER_TILE), _ceil_div(k_blocks, BLOCKS_PER_TILE)
+    tiles = flat.view(-1, 32, 16).reshape(-1, 32, BLOCKS_PER_TILE, BLOCKS_PER_TILE).transpose(1, 2)
+    padded = tiles.reshape(row_tiles, col_tiles, _ROWS_PER_TILE, BLOCKS_PER_TILE).permute(0, 2, 1, 3)
+    return padded.reshape(row_tiles * _ROWS_PER_TILE, col_tiles * BLOCKS_PER_TILE)[:rows, :k_blocks]
 
 
 @dataclass(frozen=True)
