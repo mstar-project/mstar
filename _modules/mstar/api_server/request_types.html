@@ -998,7 +998,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">modality</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># "text" | "image" | "audio" | "video" | "video_frame"</span>
     <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span>  <span class="c1"># raw payload (text encoded as utf-8)</span>
-    <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+    <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># --log-stats only: when the output tensor was read (None for a value</span>
+    <span class="c1"># sent inline), and the seconds spent postprocessing it</span>
+    <span class="c1"># (``Model.postprocess``, or its share of the step's</span>
+    <span class="c1"># ``postprocess_inline`` call for a value sent inline)</span>
+    <span class="n">read_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">postprocess_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span></div>
 
 
 

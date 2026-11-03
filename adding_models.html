@@ -2192,7 +2192,12 @@ EOS token: its consumer then never receives it, instead of finding and dropping 
 a device read. <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code> returns a <code class="docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code> for the same.
 The Qwen3-Omni Talker and Fish S2 Pro’s AR keep their EOS frame out of the codec
 stream this way; a <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> names such outputs in <code class="docutils literal notranslate"><span class="pre">withhold</span></code>, left unrouted on a
-row whose token is a stop id (the Qwen3-TTS Talker).</p>
+row whose token is a stop id (the Qwen3-TTS Talker).
+Only an output that leaves by a streaming edge can be withheld (any other consumer
+would wait for an item that never comes), and not one that a node this worker
+speculates into reads, nor the loop-back signal. Startup refuses a
+<code class="docutils literal notranslate"><span class="pre">TokenStop.withhold</span></code> that breaks this; a <code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> from <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> is not
+checked.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">on_request_added(self,</span> <span class="pre">request_id,</span> <span class="pre">request_info)</span></code> (optional)</dt><dd><p>Called on the worker’s main thread when the request reaches the worker, before any of
 its steps, with the request’s first <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code>. For host work worth

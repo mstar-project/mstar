@@ -1203,8 +1203,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">plan</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">plan</span><span class="o">.</span><span class="n">cu_q</span></div>
 
 
+    <span class="c1"># eager as a whole, as FlashInferManager.select_last_hidden explains</span>
 <div class="viewcode-block" id="XPUPagedAttentionManager.select_last_hidden">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">select_last_hidden</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">hidden</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"main"</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>

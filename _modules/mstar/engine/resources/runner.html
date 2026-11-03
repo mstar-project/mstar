@@ -1266,7 +1266,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">continue</span>
             <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
                 <span class="n">per_rid</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
-                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">per_rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">per_rid</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">):</span>
                     <span class="n">resource</span><span class="o">.</span><span class="n">extend_prefix_chain</span><span class="p">(</span>
                         <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
                         <span class="n">walk_of</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">walk_of</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">walk_of</span><span class="p">(</span><span class="n">rid</span><span class="p">),</span> <span class="n">per_rid</span><span class="p">,</span>
