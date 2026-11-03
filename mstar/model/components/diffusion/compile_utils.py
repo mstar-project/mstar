@@ -99,17 +99,24 @@ def compile_transformer_forward(
     every kept module but a 1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion
     (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst).
 
-    ``recompile_limit`` replaces the process-wide limit for this forward only. Past the limit a frame silently
-    runs uncompiled, inside the captured graphs too."""
+    ``recompile_limit`` replaces Dynamo's limit while this forward runs. Past the limit a frame silently runs
+    uncompiled, inside the captured graphs too. Dynamo reads the limit when a call compiles, so it is set around
+    each call (``torch.compile`` takes none before torch 2.12); before torch 2.12 Dynamo's config is not per
+    thread, so another compile running at the same time sees it too."""
     types = exact_op_types(exact_ops)
     if types:
         kept = exclude_from_compile(transformer, types)
         logger.info("compiled transformer keeps %d modules (%s) on the eager result", kept,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
-    transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False, recompile_limit=recompile_limit),
-        eager_rounding=bool(eager_rounding),
-    )
+    compiled = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
+    if recompile_limit is not None:
+        unlimited = compiled
+
+        def compiled(*args, **kwargs):
+            with torch._dynamo.config.patch(recompile_limit=recompile_limit):
+                return unlimited(*args, **kwargs)
+
+    transformer.forward = with_inductor_rounding(compiled, eager_rounding=bool(eager_rounding))
 
 
 def step_schedule_recompile_limit(step_dtypes) -> int | None:
