@@ -407,7 +407,9 @@ class RequestBridge:
                 from mstar.api_server import media_io
                 audio = audios[i]
                 try:
-                    video = media_io.mux_mp4_with_pcm16(
+                    # ffprobe + ffmpeg, up to minutes: off the event loop every request shares
+                    video = await asyncio.to_thread(
+                        media_io.mux_mp4_with_pcm16,
                         video,
                         audio.data,
                         sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),

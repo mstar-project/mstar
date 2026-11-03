@@ -636,6 +636,27 @@ def test_images_edit_refuses_n_it_would_drop(tmp_path):
     assert not list(tmp_path.iterdir())  # refused before the reference image is saved
 
 
+def test_videos_mux_the_audio_off_the_event_loop(tmp_path, monkeypatch):
+    from mstar.api_server import media_io
+
+    server = _FakeRealtimeServer([_chunk("video", b"mp4"), _chunk("audio", b"\x01\x00")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["ltx2_5"], "ltx2_5")
+
+    def fake_mux(video, audio, **kwargs):
+        # ffmpeg can run for minutes: off the worker's event loop, which serves every other request
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        return b"muxed"
+
+    monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
+
+    async def run():
+        return [out async for out in bridge.videos({"prompt": "a dog barking", "model": "ltx2_5"}, _Ctx())]
+
+    (out,) = asyncio.run(run())
+    assert base64.b64decode(out["data"][0]["b64_json"]) == b"muxed"
+
+
 # ----------------------------------------------------------------------
 # tensor bridge (seam double; no engine)
 # ----------------------------------------------------------------------

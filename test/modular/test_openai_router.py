@@ -417,6 +417,9 @@ def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, mon
 
     def fake_mux(video, audio, sample_rate, num_channels, video_fps=None):
         muxed.update(video=video, audio=audio, sample_rate=sample_rate, num_channels=num_channels)
+        # ffmpeg can run for minutes: off the event loop, which keeps serving meanwhile
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
         return b"muxed"
 
     monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)

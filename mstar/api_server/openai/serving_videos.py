@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -58,7 +59,9 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         if i < len(audios):
             audio = audios[i]
             try:
-                video = media_io.mux_mp4_with_pcm16(
+                # ffprobe + ffmpeg, up to minutes: off the event loop
+                video = await asyncio.to_thread(
+                    media_io.mux_mp4_with_pcm16,
                     video,
                     audio.data,
                     sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),
