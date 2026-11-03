@@ -152,6 +152,17 @@ anchor = Path(a.socket_path_prefix) / "conductor.ipc"
 anchor.parent.mkdir(parents=True, exist_ok=True)
 anchor.touch()
 NS = hashlib.sha1(f"ipc://{{os.path.realpath(anchor)}}".encode()).hexdigest()[:12]
+ARENA = None
+if MODE.startswith("tokened"):
+    # as an API server under #552: it mints the launch token after exec, only the workers it spawns carry it, and
+    # the files (arena segments too) are named by the SHA-1 of the token and the endpoint
+    import secrets, subprocess, sys
+    token = secrets.token_hex(8)
+    subprocess.Popen([sys.executable, "-c", "import os, time\nwhile os.getppid() != 1: time.sleep(0.5)"],
+                     env={{**os.environ, "MSTAR_DEPLOYMENT_TOKEN": token}})
+    NS = hashlib.sha1(f"{{token}}\0ipc://{{os.path.realpath(anchor)}}".encode()).hexdigest()[:12]
+    ARENA = f"mstar_{{NS}}_arena_worker_0_ab12cd34"
+LEAK = MODE in ("leak", "tokened_leak")
 live, aborted, last = {{}}, set(), {{}}
 
 
@@ -177,6 +188,8 @@ async def generate(request):
     last[rid] = text
     seg = SHM / f"mstar_{{NS}}_worker_0_{{len(last)}}{{id(request)}}"
     seg.touch()
+    if ARENA:   # an arena keeps every segment it grows into until shutdown
+        (SHM / f"{{ARENA}}.seg{{len(last)}}").touch()
     if MODE == "neighbour":   # another server on the host: its token and pid, never given back here
         (SHM / f"mstar_{{'0' * 12}}_worker_0_{{len(last)}}{{id(request)}}").touch()
         (SHM / f"mstar_kv_{{os.getuid()}}_1_{{len(last)}}{{id(request)}}").touch()
@@ -201,7 +214,7 @@ async def generate(request):
         if live.get(rid) is me:
             del live[rid]
         (aborted.discard if finished else aborted.add)(rid)
-        if finished or MODE != "leak":
+        if finished or not LEAK:
             seg.unlink(missing_ok=True)
     return resp
 
@@ -216,7 +229,8 @@ web.run_app(app, host="127.0.0.1", port=a.port, print=None, handle_signals=True)
 def fake_tree(d: Path, mode: str) -> Path:
     """A checkout whose `mstar serve` is a /generate server holding pinned ids; ``mode`` sets how it misbehaves
     once a client has gone away under an id: good, hang, mix, leak, crash; neighbour behaves but leaves files
-    of another deployment in the shared shm dir."""
+    of another deployment in the shared shm dir; tokened and tokened_leak (good, leak) name their files under a
+    launch token their spawned worker carries, and grow arena segments they never give back."""
     (d / "mstar" / "cli").mkdir(parents=True)
     (d / "mstar" / "__init__.py").write_text("")
     (d / "mstar" / "cli" / "__init__.py").write_text("")
@@ -276,6 +290,22 @@ def test_another_servers_files_in_the_shm_dir_are_not_a_leak(tmp_path, monkeypat
     shm = tmp_path / "shm"
     assert any(n.name.startswith("mstar_000000000000_") for n in shm.iterdir())
     assert any(n.name.startswith("mstar_kv_") for n in shm.iterdir())
+
+
+@pytest.mark.parametrize("mode, leak", [("tokened", False), ("tokened_leak", True)])
+def test_the_leak_count_follows_a_launch_token_and_leaves_arena_segments_out(tmp_path, monkeypatch, mode, leak):
+    """Under #552 a server's files carry its launch token, read from the workers it spawned, and its arena grows
+    ``mstar_<ns>_arena_*`` segments under load that it keeps until shutdown: those are no leak, tensor files the
+    server never gives back are."""
+    v, md, code = run_pair(tmp_path, monkeypatch, mode, runs=2 if not leak else 4)
+    arena = [n.name for n in (tmp_path / "shm").iterdir() if "_arena_" in n.name]
+    assert arena, "the fake arena grew no segment"
+    if leak:
+        assert code == 1 and v.flagged and v.head.with_class("leak") == 4, v.head.runs
+        assert all(r["shm_after"] > r["shm_idle"] for r in v.head.runs)
+    else:
+        assert code == 0 and not v.flagged and v.head.with_class("leak") == 0, v.head.runs
+        assert all(r["shm_idle"] >= 0 for r in v.head.runs)
 
 
 def test_identical_servers_are_not_flagged_and_every_pattern_ran(tmp_path, monkeypatch):

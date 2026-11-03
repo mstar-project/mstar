@@ -7,7 +7,8 @@ slots — registering a partial one would hand both to the same buffers, and
 under a lower index than the one it captured under.
 
 Capture failure is also a per-rank event, so the barrier count must not depend
-on whether a capture succeeded.
+on whether a capture succeeded. The batch sizes a bucket list is built from
+(``geometric_batch_sizes``) are checked here too.
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from torch.distributed import ReduceOp
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType, geometric_batch_sizes
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
@@ -47,11 +50,11 @@ class _Group:
     def barrier(self):
         self.count += 1
 
-    def all_gather(self, tensor, dim=0):
-        del dim
-        peer = torch.tensor(self._peer, dtype=tensor.dtype, device=tensor.device)
-        # rank-major, matching CommGroup.all_gather
-        return torch.cat([tensor, peer])
+    def agree(self, values, op):
+        if self._peer is None:
+            return list(values)
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _FakeRunner:
@@ -83,9 +86,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = SimpleNamespace(
-            tp_group=self.barrier, sp_group=self.barrier
-        )
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
@@ -393,7 +394,7 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
 
 @requires_cuda
 @pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
-def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fails):
+def test_benchmark_is_off_inside_the_capture_and_restored_after(torch_flag, fails):
     """Qwen3-Omni turns cuDNN's benchmark mode on for Code2Wav's warm-up.
     Inside a capture its search fails the capture, which cost Code2Wav its
     bs=32 graph and kept that graph's pool."""
@@ -407,7 +408,7 @@ def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fai
         return x + torch.tensor([1.0], device=device) if fails else x * 2
 
     for benchmark in (True, False):
-        monkeypatch.setattr(torch.backends.cudnn, "benchmark", benchmark)
+        torch_flag(torch.backends.cudnn, "benchmark", benchmark)
         with pytest.raises(RuntimeError) if fails else nullcontext():
             capture_into_graph(run, AcceleratorGraphPool(torch.cuda.graph_pool_handle()), device, None)
         assert torch.backends.cudnn.benchmark is benchmark, "the caller's setting must come back"
@@ -455,3 +456,27 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+@pytest.mark.parametrize(
+    "max_batch_size, expected",
+    [
+        (1, [1]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (6, [1, 2, 4, 6]),
+        (8, [1, 2, 4, 8]),
+        (16, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_geometric_batch_sizes(max_batch_size, expected):
+    """Powers of two below B, then B itself -- so startup grows with log B, not
+    B. B that is itself a power of two ends on it once (no duplicate); a B that
+    is not appends the odd top bucket the padding path rounds up to."""
+    assert geometric_batch_sizes(max_batch_size) == expected
+
+
+def test_geometric_batch_sizes_refuses_a_max_under_one():
+    with pytest.raises(ValueError, match="at least 1"):
+        geometric_batch_sizes(0)

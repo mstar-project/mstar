@@ -497,8 +497,15 @@ def build_static_inputs(
     pos_dtype = torch.float32 if any(p.is_floating_point() for p in parts) else torch.long
     position_ids = torch.cat([p.to(pos_dtype) for p in parts], dim=1)
     static["position_ids"] = position_ids
+    static["gen_position_ids"] = _gen_band(position_ids, text["und_len"])
     static["sequence_length"] = sequence_length
     return static
+
+
+def _gen_band(position_ids: torch.Tensor, und_len: int) -> torch.Tensor:
+    """The generation band's position ids as their own tensor; the DiT
+    submodule builds the band's rotary table from them."""
+    return position_ids[:, und_len:].contiguous()
 
 
 def build_t2i_static_inputs(
@@ -585,5 +592,6 @@ def build_action_static_inputs(
         "num_noisy_action_tokens": len(action_noisy),
         "action_mode": mode,
         "position_ids": position_ids,
+        "gen_position_ids": _gen_band(position_ids, text["und_len"]),
         "sequence_length": curr + action_chunk_size,
     }

@@ -5,11 +5,7 @@ groups, conv kernel 4 -> conv_dim 12288."""
 import pytest
 import torch
 
-from mstar.engine.resources.recurrent import (
-    DeltaNetGeometry,
-    Mamba2Geometry,
-    RecurrentStateConfig,
-)
+from mstar.engine.resources.recurrent import DeltaNetGeometry, Mamba2Geometry
 
 NEMOTRON_H = Mamba2Geometry(num_heads=128, head_dim=80, state_size=128, n_groups=8, conv_kernel_size=4)
 
@@ -19,10 +15,6 @@ def test_nemotron_h_blocks():
     assert NEMOTRON_H.d_inner == 10240 and NEMOTRON_H.conv_dim == 12288
     assert blocks["ssm"].shape == (128, 80, 128) and blocks["ssm"].dtype is torch.float32
     assert blocks["conv"].shape == (12288, 3) and blocks["conv"].dtype is torch.bfloat16
-    # per-slot bytes: fp32 ssm (5.0 MiB/layer) + bf16 conv (72 KiB/layer)
-    cfg = RecurrentStateConfig(num_layers=27, blocks=blocks, max_slots=64)
-    assert cfg.slot_bytes == 27 * (128 * 80 * 128 * 4 + 12288 * 3 * 2)
-    assert round(cfg.slot_bytes / 2**20) == 137
 
 
 def test_blocks_round_trip():

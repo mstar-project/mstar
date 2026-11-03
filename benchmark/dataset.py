@@ -660,6 +660,11 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
     return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
 
 
+def _task_strings(tasks_df) -> dict[int, str]:
+    """task_index -> instruction from a lerobot v3.0 meta/tasks.parquet, which keeps the strings in the index."""
+    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=True))
+
+
 def _decode_frames_to_png_and_video(
     video_path: str,
     frame_indices: list[int],
@@ -774,9 +779,7 @@ class DROIDDataset(BaseDataset):
         tasks: dict[int, str] = {}
         try:
             import pandas as _pd
-            tasks_df = _pd.read_parquet(_dl("meta/tasks.parquet"))
-            tasks = dict(zip(tasks_df["task_index"].astype(int),
-                             tasks_df["task"].astype(str), strict=False))
+            tasks = _task_strings(_pd.read_parquet(_dl("meta/tasks.parquet")))
             print(f"  tasks loaded: {len(tasks)}")
         except Exception as e:
             print(f"  [warn] could not load tasks.parquet: {e}")

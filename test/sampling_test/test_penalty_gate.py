@@ -39,7 +39,7 @@ class _RecordingSampler:
     def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
-    def sample(self, request_ids, logits, apply_penalty=False):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
         self.sampled_with.append(apply_penalty)
         return torch.zeros(len(request_ids), dtype=torch.long)
 
@@ -63,7 +63,7 @@ class _RecordingBuffers:
     def stage_seen_token_masks(self, request_ids, seen_masks):
         self.staged += 1
 
-    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True):
+    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True, kept=None):
         self.gathered_seen.append(gather_seen_tokens)
 
     def sampler_for(self, padded_bs, cg_slot):

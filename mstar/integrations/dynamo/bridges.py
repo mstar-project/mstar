@@ -50,6 +50,8 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.generation_kwargs import offset_seed
+from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -221,19 +223,21 @@ class RequestBridge:
 
         cancelled = False
         dropped: set[str] = set()
+        text = Utf8Stream()
         try:
             async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "text":
-                    yield envelope({
-                        "role": "assistant",
-                        "content": chunk.data.decode("utf-8", "replace"),
-                    })
+                    # a token that completes no character (or an end token) sends no delta
+                    if content := text.feed(chunk.data):
+                        yield envelope({"role": "assistant", "content": content})
                 elif chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
                 else:
                     dropped.add(chunk.modality)
             cancelled = _client_gone(context)
             if not cancelled:
+                if tail := text.flush():
+                    yield envelope({"role": "assistant", "content": tail})
                 yield envelope({"role": "assistant", "content": ""}, finish="stop")
         finally:
             self.server.abort_request(rid)
@@ -279,7 +283,7 @@ class RequestBridge:
             for i in range(1, n):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
-                    kwargs["seed"] = int(seed) + i
+                    kwargs["seed"] = offset_seed(int(seed), i)
                 submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
         rids = [self._submit(args, prefix="img") for args in submits]
@@ -693,19 +697,21 @@ class RealtimeBridge:
             sent_audio = False
             stopped = False
             text_parts: list[str] = []
+            text = Utf8Stream()
+            etype = ("response.output_audio_transcript.delta" if want_audio
+                     else "response.output_text.delta")
             try:
                 # _stream_chunks races the context's killed-or-stopped future,
                 # so a dropped socket aborts the turn instead of generating
                 # into a queue nobody reads until the model finishes.
                 async for chunk in _stream_chunks(self.server, rid, context):
                     if chunk.modality == "text":
-                        delta = chunk.data.decode("utf-8", "replace")
-                        # the reply's end token decodes to nothing: no delta for it
+                        delta = text.feed(chunk.data)
+                        # the reply's end token decodes to nothing, and a
+                        # character split across tokens waits for its last byte
                         if not delta:
                             continue
                         text_parts.append(delta)
-                        etype = ("response.output_audio_transcript.delta" if want_audio
-                                 else "response.output_text.delta")
                         await events.put(self._content_event(etype, turn, delta=delta))
                     elif chunk.modality == "audio":
                         sent_audio = True
@@ -720,6 +726,9 @@ class RealtimeBridge:
             if stopped:
                 # Connection torn down mid-turn; claim no completed response.
                 return
+            if tail := text.flush():
+                text_parts.append(tail)
+                await events.put(self._content_event(etype, turn, delta=tail))
             if sent_audio:
                 await events.put(self._content_event("response.output_audio.done", turn))
             if not want_audio:

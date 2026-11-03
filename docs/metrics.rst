@@ -232,6 +232,14 @@ From the conductor's status message, sent every second while metrics are on.
    conductor dispatched and has not heard back from. The conductor sees whole passes,
    so a node running a request's decode loop counts it once for the loop.
 
+``mstar_routing_predicted_saving_total{model_name, term}``
+   Counter, up to a second old. Per term of the data-parallel replica cost (see
+   "Data-parallel routing" in :doc:`serving`), the saving predicted on the replica each
+   request was sent to, in request-equivalents, unweighted. For ``prefix``, each request
+   adds the share of its prompt predicted cached there, so its rate over the request rate
+   is a mean of per-request shares, not the token ratio the workers' prefix-cache counters
+   give.
+
 ``mstar_conductor_status_age_seconds{model_name}``
    Gauge, seconds, computed at scrape time. Time since the API server received the
    conductor's last status message, or since metrics were enabled if none arrived yet.
@@ -271,13 +279,15 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 
 ``mstar_prefix_cache_query_tokens_total{model_name, component}``
    Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
-   keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
-   Orpheus); the cache is off under tensor parallelism.
+   keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL,
+   Orpheus and Qwen3.5). Under tensor parallelism only rank 0 counts a lookup.
 
 ``mstar_prefix_cache_hit_tokens_total{model_name, component}``
    Counter. Tokens the prefix cache already held at that lookup. The hit rate is
    ``rate(mstar_prefix_cache_hit_tokens_total[5m])`` divided by
-   ``rate(mstar_prefix_cache_query_tokens_total[5m])``.
+   ``rate(mstar_prefix_cache_query_tokens_total[5m])``. For Qwen3.5 these are the KV
+   cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
+   cuts to 0 still counts.
 
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not

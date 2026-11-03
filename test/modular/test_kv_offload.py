@@ -13,9 +13,11 @@ what both a leak and a double-free break.
 
 from __future__ import annotations
 
+import ctypes
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -30,7 +32,9 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVLayout, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.platforms import current_platform
@@ -149,21 +153,21 @@ def _assert_pages_conserved(mgr: KVManager) -> None:
     assert not missing, f"pages orphaned (leaked): {sorted(missing)}"
 
 
-def _hook_offload_stream(mgr: KVManager, hook, when: str | None = None):
+def _hook_host_copy(mgr: KVManager, hook):
     """Run ``hook`` on another thread from inside a host copy.
 
     The manager lock is not held there, so this reproduces exactly what the
     plan thread can do mid-offload. Joining with a timeout means a regression
     that takes the lock across the copy fails the test instead of hanging it.
     """
-    real = mgr._cpu_pool.offload_stream
+    real = mgr._cpu_pool.copy_out
     fired = False
 
-    def wrapper(**kwargs):
+    def wrapper(gpu_kv_cache, copies):
         nonlocal fired
-        moved = real(**kwargs)
+        real(gpu_kv_cache, copies)
         # once only, so a test can retry the offload without racing it again
-        if not fired and (when is None or kwargs["label"] == when):
+        if not fired:
             fired = True
             thread = threading.Thread(target=hook)
             thread.start()
@@ -172,9 +176,8 @@ def _hook_offload_stream(mgr: KVManager, hook, when: str | None = None):
                 "the racing thread blocked: offload is holding the manager "
                 "lock across the host copy"
             )
-        return moved
 
-    mgr._cpu_pool.offload_stream = wrapper
+    mgr._cpu_pool.copy_out = wrapper
 
 
 # --- round trip ------------------------------------------------------------
@@ -386,7 +389,7 @@ def test_alloc_during_offload_is_refused():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     raced: list = []
 
-    _hook_offload_stream(mgr, lambda: raced.append(_grow(mgr, "r0", "main", PAGE_SIZE)))
+    _hook_host_copy(mgr, lambda: raced.append(_grow(mgr, "r0", "main", PAGE_SIZE)))
 
     assert mgr.offload("r0") == 2
     outcome = raced[0]
@@ -416,7 +419,7 @@ def test_admit_refused_for_every_label_of_an_offloading_request():
         # can still be reported
         seen.append(_grow(mgr, "r0", "main", PAGE_SIZE, pre_forks=(("main", "cfg"),)))
 
-    _hook_offload_stream(mgr, race, when="main")
+    _hook_host_copy(mgr, race)
 
     mgr.offload("r0")
     assert all(isinstance(o.reason, RequestOffloading) for o in seen), seen
@@ -440,9 +443,7 @@ def test_fork_during_offload_declines_the_offload():
     host_free = mgr._cpu_pool.num_free_pages
 
     # the fork bumps `cfg`'s generation while its pages are mid-copy
-    _hook_offload_stream(
-        mgr, lambda: mgr._apply_fork("r0", "main", "cfg"), when="main"
-    )
+    _hook_host_copy(mgr, lambda: mgr._apply_fork("r0", "main", "cfg"))
 
     assert mgr.offload("r0") == 0
     assert mgr.is_offloaded("r0") is False
@@ -464,7 +465,7 @@ def test_remove_during_offload_leaks_nothing():
     mgr.ingest_request("r0")
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
 
-    _hook_offload_stream(mgr, lambda: mgr.remove_request("r0"))
+    _hook_host_copy(mgr, lambda: mgr.remove_request("r0"))
 
     assert mgr.offload("r0") == 0
     assert mgr._streams.get("r0") is None
@@ -484,14 +485,16 @@ def test_raise_mid_copy_leaves_no_half_offloaded_request():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     _grow(mgr, "r0", "cfg", 2 * PAGE_SIZE)
     held = mgr.reclaimable("r0")
-    real = mgr._cpu_pool.offload_stream
+    real = mgr._cpu_pool.copy_out
+    copied = []
 
-    def blow_up_on_the_second(**kwargs):
-        if kwargs["label"] == "cfg":
+    def blow_up_on_the_second(gpu_kv_cache, copies):
+        copied.append(copies)
+        if len(copied) == 2:
             raise RuntimeError("copy died")
-        return real(**kwargs)
+        real(gpu_kv_cache, copies)
 
-    mgr._cpu_pool.offload_stream = blow_up_on_the_second
+    mgr._cpu_pool.copy_out = blow_up_on_the_second
 
     with pytest.raises(RuntimeError, match="copy died"):
         mgr.offload("r0")
@@ -502,7 +505,7 @@ def test_raise_mid_copy_leaves_no_half_offloaded_request():
     _assert_pages_conserved(mgr)
 
     # and the request is still usable afterwards
-    mgr._cpu_pool.offload_stream = real
+    mgr._cpu_pool.copy_out = real
     assert mgr.offload("r0") == held
     assert mgr.reload("r0") is True
     _assert_pages_conserved(mgr)
@@ -516,7 +519,7 @@ def test_is_offloaded_true_while_the_copy_is_in_flight():
     _grow(mgr, "r0", "main", PAGE_SIZE)
     seen: list[bool] = []
 
-    _hook_offload_stream(mgr, lambda: seen.append(mgr.is_offloaded("r0")))
+    _hook_host_copy(mgr, lambda: seen.append(mgr.is_offloaded("r0")))
 
     mgr.offload("r0")
     assert seen == [True]
@@ -532,7 +535,7 @@ def test_alloc_for_other_requests_still_works_during_offload():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     raced: list = []
 
-    _hook_offload_stream(mgr, lambda: raced.append(_grow(mgr, "r1", "main", PAGE_SIZE)))
+    _hook_host_copy(mgr, lambda: raced.append(_grow(mgr, "r1", "main", PAGE_SIZE)))
 
     assert mgr.offload("r0") == 2
     assert raced[0].ok
@@ -801,12 +804,12 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
     device = mgr.kv_cache.tensor
     device.copy_(torch.randn_like(device))
     expected = device.clone()
-    src, dst = [5, 2, 9], [3, 11, 7]
+    src, dst, host = [5, 6, 9], [3, 4, 7], [0, 1, 2]
 
-    assert pool.offload_stream("r0", "main", device, src, stored_len=0, position=0)
+    pool.copy_out(device, PageCopies(gpu=src, cpu=host))
     pool.sync()
     device.fill_(-99.0)
-    pool.reload_stream("r0", "main", device, dst)
+    pool.copy_in(device, PageCopies(gpu=dst, cpu=host))
     pool.sync()
     torch.cuda.synchronize()
 
@@ -814,6 +817,67 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
         assert torch.equal(device[:, d], expected[:, s])
     others = [p for p in range(device.shape[1]) if p not in dst]
     assert (device[:, others] == -99.0).all()
+
+
+def test_a_copier_checks_each_pair_of_caches_once():
+    """Checking a pair costs the host more than the copies the copier then queues, so the copier keeps
+    each pair's pitches and strides."""
+
+    class _Counting(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            return 0
+
+    copier = _Counting()
+    checked = []
+    check = copier._check
+    copier._check = lambda dst, src: checked.append((dst, src)) or check(dst, src)
+    host, device, other = (torch.zeros(2, 4, 3) for _ in range(3))
+    stream = SimpleNamespace(cuda_stream=0)
+
+    copier.copy(host, [0], device, [1], stream)
+    copier.copy(host, [2], device, [3], stream)
+    assert len(checked) == 1, "a second copy between the same two caches checked them again"
+    copier.copy(other, [0], device, [1], stream)
+    assert len(checked) == 2, "a copy into another cache used the first pair's pitches and strides"
+    # as if `later` had taken the id of a freed cache
+    later = torch.zeros(2, 4, 3)
+    copier._layouts[id(later), id(device)] = copier._layouts.pop((id(other), id(device)))
+    copier.copy(later, [0], device, [1], stream)
+    assert len(checked) == 3, "a cache at a reused id got the freed cache's pitches and strides"
+
+
+def test_pages_adjacent_in_both_caches_go_as_one_copy():
+    """A call per page costs a 60-page reload about 160 µs of host time, and adjacent pages are one block
+    per layer."""
+    calls = []
+
+    class _Recording(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            calls.append((dst, dpitch, src, spitch, width, height))
+            return 0
+
+    # float32, [layers, pages, 3]: a page is 12 bytes, a layer 96 bytes on the host and 72 on the device
+    host, device = torch.zeros(2, 8, 3), torch.zeros(2, 6, 3)
+    # pages as (host, device): (5, 2) to (6, 4) is adjacent on the host only, and (6, 4) to (0, 5) on the device only
+    _Recording().copy(host, [4, 5, 6, 0], device, [1, 2, 4, 5], SimpleNamespace(cuda_stream=0))
+
+    h, d = host.data_ptr(), device.data_ptr()
+    want = [(h + 48, 96, d + 12, 72, 24, 2), (h + 72, 96, d + 48, 72, 12, 2), (h, 96, d + 60, 72, 12, 2)]
+    assert calls == want, "a copy didn't cover exactly a run of pages adjacent in both caches"
+
+
+@requires_cuda
+@requires_nvidia
+def test_copies_on_cuda_keep_the_gil():
+    """Beside a thread running Python, queueing four page copies took 15 ms dropping the GIL and 28 µs keeping it."""
+    _loadable(page_copier.CudartCopier)
+    copier = page_copier.make_page_copier.__wrapped__()
+    fn = getattr(copier, "_fn", None)
+    assert fn is not None and fn._flags_ & ctypes._FUNCFLAG_PYTHONAPI, f"{copier.name} drops the GIL on every copy"
 
 
 @requires_cuda
@@ -826,14 +890,13 @@ def test_pool_copies_do_not_block_the_host():
         "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"
     )
     device = mgr.kv_cache.tensor
-    pool.offload_stream("warm", "main", device, [1], stored_len=0, position=0)
-    pool.remove_request("warm")
+    pool.copy_out(device, PageCopies(gpu=[1], cpu=[0]))
     torch.cuda.synchronize()
 
     torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the copies
     start = time.perf_counter()
-    pool.offload_stream("r0", "main", device, [1, 2, 3], stored_len=0, position=0)
-    pool.reload_stream("r0", "main", device, [4, 5, 6])
+    pool.copy_out(device, PageCopies(gpu=[1, 2, 3], cpu=[0, 1, 2]))
+    pool.copy_in(device, PageCopies(gpu=[4, 5, 6], cpu=[0, 1, 2]))
     pool.sync()
     elapsed = time.perf_counter() - start
     torch.cuda.synchronize()
@@ -846,16 +909,15 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
     counting the refusals it stood for, keeps the log readable."""
     mgr = _make_manager(cpu_offload_pages=1)
     pool = mgr._cpu_pool
-    device = mgr.kv_cache.tensor
-    assert pool.offload_stream("held", "main", device, [1], stored_len=0, position=0)
+    assert pool.place("held", "main", (GroupPages([1]),), [], position=0)
     clock = [100.0]
     monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
 
     with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
         for _ in range(50):
-            assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+            assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
         clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
-        assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+        assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
 
     warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
     assert len(warnings) == 2
@@ -875,6 +937,7 @@ def test_copier_falls_through_to_the_next_that_works(monkeypatch, caplog):
 
     class _Wrong(page_copier._Memcpy2DCopier):
         name = "wrong"
+        _max_pitch = 1 << 62
 
         def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
             return 0  # claims success, copies nothing

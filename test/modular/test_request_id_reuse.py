@@ -28,15 +28,18 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
+from mstar.communication.event import EventWakeup
+from mstar.model.base import Model
+from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     NewRequestConductor,
@@ -50,8 +53,15 @@ TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
 
 class _Model:
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def process_prompt(self, *args, **kwargs):
         return None
+
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -78,6 +88,13 @@ class _Socket:
     def send(self, entity, msg):
         self.sent.append((entity, msg))
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
     def deliver(self, message_type, body):
         self.inbox.put(WorkerMessage(message_type=message_type, body=body))
 
@@ -95,6 +112,11 @@ class _TensorManager:
     def register_for_send(self, request_id, tensor_infos):
         pass
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         return {}
 
@@ -104,7 +126,7 @@ class _TensorManager:
     def force_cleanup_request(self, request_id):
         self.forced.append(request_id)
 
-    def ack_unread_tensors(self, request_id, graph_edges):
+    def ack_unread_tensors(self, graph_edges):
         pass
 
 
@@ -120,8 +142,8 @@ class _Rig:
         self.worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=queue.Queue(),
-            profile_queue=queue.Queue(),
+            out_queue=ResultQueue(EventWakeup()),
+            profile_queue=ResultQueue(EventWakeup()),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),
@@ -139,6 +161,7 @@ class _Rig:
         facade.cleanup_request_queue = self.worker.cleanup_request_queue
         facade.discard_tensor_queue = self.worker.discard_tensor_queue
         facade.output_queue = self.worker.out_queue
+        facade.results_wakeup = EventWakeup()
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.data_worker = facade
@@ -162,7 +185,7 @@ class _Rig:
     def output(self, request_id, value=7):
         """A worker's output for ``request_id``, as the message thread hands it
         over; returns the chunk the data worker emits, or None."""
-        self.data_worker.new_result_token(request_id, value, None, "text_inputs", "text")
+        self.data_worker.new_result_tokens([request_id], [value], "text_inputs", "text")
         try:
             return self.worker.out_queue.get(timeout=2)
         except queue.Empty:
@@ -258,7 +281,7 @@ def test_the_older_request_s_remove_does_not_unlink_the_reuse_s_inputs(rig):
 def _received(rig, key):
     """A worker's chunk for ``key`` as the message thread hands it over; returns
     the chunks the API server reads back from the data worker."""
-    rig.data_worker.new_result_token(key, 7, None, "text_inputs", "text")
+    rig.data_worker.new_result_tokens([key], [7], "text_inputs", "text")
     rig.settle()
     return rig.data_worker.get_result_chunks()
 
@@ -372,9 +395,7 @@ def _run_message_thread(s, pw, chunks=(), messages=(), until=lambda: True):
     pw.get_result_chunks = lambda: [chunks.pop(0)] if chunks else []
     pw.get_profile_updates = lambda: []
     pw.finished_reading = lambda rid, drained: None
-    s.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: [messages.pop(0)] if messages else [],
-    )
+    s.communicator = StandInSocket(lambda: [messages.pop(0)] if messages else [])
     s.conductor_proc = None
     s._liveness_interval_s = 0.5
     s.running = True
@@ -435,6 +456,7 @@ def test_an_error_that_names_the_key_reaches_the_client_under_its_own_id(source)
 
 class _PreprocessWorker:
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.inputs = []
         self.aborted = []
 
@@ -715,14 +737,14 @@ def test_a_stream_is_bound_to_its_submission_before_it_is_iterated():
 def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
     """The chat stream is bound when it is made: Starlette first iterates it
     after the id is reused, and it still reads its own request's result."""
-    from mstar.api_server.openai.serving_chat import _stream
+    from mstar.api_server.openai.serving_chat import _stream_events
 
     pw = _PreprocessWorker()
     s = _api_server(pw)
     s.submit_request(text="first", request_id="X", **TEXT)
 
     async def run():
-        body = _stream(s, "m", "X", 24000)
+        body = _stream_events(s.iter_result_chunk_batches("X"), "m", "X", 24000)
         _complete(s, pw.inputs[0].request_id, b"first")
         s.submit_request(text="second", request_id="X", **TEXT)
         _complete(s, pw.inputs[1].request_id, b"second")

@@ -1,0 +1,18 @@
+# The encoder and the decoder in separate worker processes on one GPU, so a decode step never queues
+# behind an encoder batch on the same stream. `mps: true` runs both as clients of one MPS daemon so
+# their kernels overlap rather than time-slice.
+model: "qwen3_asr_realtime"
+max_seq_len: 65536
+# Realtime steps are short (one chunk of audio so far), 1024 pages hold them.
+max_concurrent_requests: 64
+resources:
+  kv_cache:
+    max_num_pages: 1024
+    cpu_offload_pages: 256
+rank_devices: {0: 0, 1: 0}
+mps: true
+node_groups:
+  - node_names: [audio_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [1]

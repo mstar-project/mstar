@@ -1,4 +1,4 @@
-"""RMSNorm and AdaRMSNorm.
+"""RMSNorm, AdaRMSNorm and a bias-free LayerNorm.
 
 ``RMSNorm`` supports both the standard Llama-style normalization
 (``normed * weight``) and Gemma's variant (``normed * (1 + weight)``)
@@ -10,6 +10,9 @@ that matches Hugging Face Gemma exactly.
 condition vector). Used by pi05's action expert flow-matching path; the
 output is consumed by ``GatedDecoderLayer`` rather than a plain residual
 add.
+
+``BiasFreeLayerNorm`` is Cohere's LayerNorm (Command A+), with a fused
+residual add + norm kernel for CUDA.
 """
 from __future__ import annotations
 
@@ -17,7 +20,40 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.rms_norm import run_rms_norm
+from mstar.engine.resources.rms_norm import gemma_rms_norm, run_rms_norm
+
+
+def rms_norm(
+    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool = False,
+) -> torch.Tensor:
+    """``RMSNorm``'s forward, for a norm whose weight lives elsewhere (e.g. a wrapped
+    Hugging Face module's): ``mstar::rms_norm``, or Gemma's fp32 ``(1 + weight)``."""
+    if gemma_mode:
+        return gemma_rms_norm(hidden_states, weight, eps)
+    # Fused kernels expect 2D input. Reshape/restore so callers can pass
+    # arbitrary leading dims, such as [batch, sequence, hidden_size].
+    orig_shape = hidden_states.shape
+    flat = hidden_states.reshape(-1, orig_shape[-1])
+    return run_rms_norm(flat, weight, eps=eps).reshape(orig_shape)
+
+
+def add_rms_norm(
+    hidden_states: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+    gemma_mode: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``r = hidden_states + residual``; returns ``(rms_norm(r), r)``.
+
+    In place (``mstar::fused_add_rms_norm``): ``residual += hidden_states``, then
+    ``hidden_states = norm(residual)``, so both inputs are consumed. On CUDA in
+    half precision that is one FlashInfer kernel: Inductor's own fusion of the
+    pair is a reduction over a few rows that takes ~3x as long at decode batch
+    sizes.
+    """
+    orig_shape = hidden_states.shape
+    h = hidden_states.reshape(-1, orig_shape[-1])
+    r = residual.reshape(-1, orig_shape[-1])
+    torch.ops.mstar.fused_add_rms_norm(h, r, weight, eps, gemma_mode)
+    return h.reshape(orig_shape), r.reshape(orig_shape)
 
 
 class RMSNorm(nn.Module):
@@ -44,31 +80,29 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(init)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.gemma_mode:
-            orig_dtype = hidden_states.dtype
-            x = hidden_states.to(torch.float32)
-            var = x.square().mean(dim=-1, keepdim=True)
-            normed = x * torch.rsqrt(var + self.variance_epsilon)
-            normed = normed * (1.0 + self.weight.to(torch.float32))
-            return normed.to(orig_dtype)
-        # Fused kernels expect 2D input. Reshape/restore so callers can pass
-        # arbitrary leading dims, such as [batch, sequence, hidden_size].
-        orig_shape = hidden_states.shape
-        flat = hidden_states.reshape(-1, orig_shape[-1])
-        out = run_rms_norm(flat, self.weight, eps=self.variance_epsilon)
-        return out.reshape(orig_shape)
+        return rms_norm(hidden_states, self.weight, self.variance_epsilon, self.gemma_mode)
 
     def forward_residual(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor,
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None,
         comm_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``r = hidden_states + residual``; returns ``(norm(r), r)``.
+
+        ``residual`` None starts a residual stream at ``hidden_states``
+        (``(norm(hidden_states), hidden_states)``), so a layer loop that defers
+        each add into the next norm needs no first-layer branch. It must be a
+        full tensor (e.g. the embeddings), not a TP partial sum, so the start
+        reduces nothing. Later calls update the stream in place, so start it
+        from a tensor the caller may overwrite (``run_layers`` starts it from
+        a copy).
 
         Keeps add and norm together so inductor fuses them, rather than folding
         the add into the producing GEMM as an ``addmm`` (an extra copy of
         ``residual``). Under TP ``hidden_states`` is a row-parallel partial sum
         that ``comm_group`` reduces in the same fused kernel.
         """
+        if residual is None:
+            return self(hidden_states), hidden_states
         if comm_group is not None and comm_group.world_size > 1:
             orig_shape = hidden_states.shape
             normed, r = comm_group.allreduce_add_rmsnorm(
@@ -78,21 +112,7 @@ class RMSNorm(nn.Module):
                 weight_bias=1.0 if self.gemma_mode else 0.0,
             )
             return normed.reshape(orig_shape), r.reshape(orig_shape)
-        if hidden_states.is_cuda and hidden_states.dtype in (torch.bfloat16, torch.float16):
-            # One FlashInfer kernel, in place: `residual += hidden_states`, then
-            # `hidden_states = norm(residual)`. Inductor's own fusion of the
-            # pair is a reduction over a few rows that takes ~3x as long at
-            # decode batch sizes. Both inputs are consumed by the caller.
-            from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
-
-            orig_shape = hidden_states.shape
-            h = hidden_states.reshape(-1, orig_shape[-1])
-            r = residual.reshape(-1, orig_shape[-1])
-            fused = gemma_fused_add_rmsnorm if self.gemma_mode else fused_add_rmsnorm
-            fused(h, r, self.weight, self.variance_epsilon)
-            return h.reshape(orig_shape), r.reshape(orig_shape)
-        r = hidden_states + residual
-        return self(r), r
+        return add_rms_norm(hidden_states, residual, self.weight, self.variance_epsilon, self.gemma_mode)
 
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.variance_epsilon}, gemma_mode={self.gemma_mode}"
@@ -167,3 +187,32 @@ class AdaRMSNorm(nn.Module):
         gate = modulation[:, 2 * H:]
 
         return adarms_norm_fused(x_flat, scale, shift, gate, self.variance_epsilon)
+
+
+class BiasFreeLayerNorm(nn.Module):
+    """LayerNorm with FP32 statistics, a learned scale and no bias."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        centered = x - x.mean(dim=-1, keepdim=True)
+        variance = centered.square().mean(dim=-1, keepdim=True)
+        normalized = centered * torch.rsqrt(variance + self.eps)
+        return (self.weight.float() * normalized).to(input_dtype)
+
+    def add_forward(
+        self, residual: torch.Tensor, delta: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(h, self(h))`` for ``h = residual + delta`` in the input dtype, or
+        ``h = residual`` when ``delta`` is None; one Triton kernel on CUDA."""
+        if not residual.is_cuda:
+            h = residual if delta is None else residual + delta
+            return h, self(h)
+        from mstar.utils.add_layernorm import add_layernorm
+
+        return add_layernorm(residual, delta, self.weight, self.eps)

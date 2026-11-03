@@ -10,10 +10,13 @@ published HF defaults for easy reference / fallback.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
+
+from mstar.model.components.aut_encoder import AuTEncoderConfig
 
 # ---------------------------------------------------------------------------
 # Resource label constants
@@ -23,6 +26,9 @@ TALKER_KV = "talker_kv"
 
 THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"
+# the encoders' cacheless attention (ragged: within each window / frame)
+AUDIO_ATTN = "audio_attn"
+VISION_ATTN = "vision_attn"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
@@ -125,14 +131,35 @@ class ThinkerConfig:
 class VisionEncoderConfig:
     depth: int = 27
     hidden_size: int = 1152
+    intermediate_size: int = 4304
     num_heads: int = 16
+    in_channels: int = 3
+    patch_size: int = 16
+    temporal_patch_size: int = 2
     spatial_merge_size: int = 2
+    num_position_embeddings: int = 2304
     out_hidden_size: int = 3584
+    hidden_act: str = "gelu_pytorch_tanh"
+    rope_theta: float = 10_000.0
     deepstack_visual_indexes: tuple[int, ...] = (8, 16, 24)
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    @property
+    def num_grid_per_side(self) -> int:
+        """The learned position table is a square grid."""
+        return int(self.num_position_embeddings**0.5)
+
+    @property
+    def merge_unit(self) -> int:
+        return self.spatial_merge_size**2
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> VisionEncoderConfig:
         fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        d = {**d, **d.get("rope_parameters", {})}
         filtered = {k: v for k, v in d.items() if k in fnames}
         # HF may store tuple fields as lists
         if "deepstack_visual_indexes" in filtered and isinstance(
@@ -142,24 +169,6 @@ class VisionEncoderConfig:
                 filtered["deepstack_visual_indexes"]
             )
         return cls(**filtered)
-
-
-# ---------------------------------------------------------------------------
-# Audio encoder
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AudioEncoderConfig:
-    d_model: int = 1280
-    encoder_layers: int = 32
-    encoder_attention_heads: int = 20
-    output_dim: int = 3584
-    max_source_positions: int = 1500
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> AudioEncoderConfig:
-        fnames = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in fnames})
 
 
 # ---------------------------------------------------------------------------
@@ -295,16 +304,25 @@ class Code2WavConfig:
     num_hidden_layers: int = 8
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
-    # Streaming chunk size (in codec frames) for the Talker→Code2Wav edge.
-    # 25 frames keeps TTFT low (~1s). ``codec_left_context_frames`` is the
-    # number of overlap frames prepended to non-first chunks by
-    # ``LeftContextChunkPolicy`` (warms up the causal ConvNet vocoder) and
-    # trimmed from the emitted waveform in ``Code2WavSubmodule``.
+    # Streaming chunk sizes (in codec frames, 12.5 Hz) for the Talker→Code2Wav
+    # edge, a ``ScheduledLeftContextChunkPolicy``. Chunk k carries
+    # ``codec_chunk_schedule[k]`` new frames, then ``codec_chunk_frames`` once
+    # the schedule runs out, each behind up to ``codec_left_context_frames``
+    # already-delivered frames (warm-up for the vocoder, trimmed from the
+    # emitted waveform in ``Code2WavSubmodule``). The first audio waits for
+    # the first chunk, so the ramp starts it after 12 frames (0.96 s of audio)
+    # instead of 25 (2 s); an empty schedule restores 25-frame first chunks.
+    # The ramp sums to the left context: its windows hold the whole stream so
+    # far, and every later window is the one 25-frame first chunks would pop,
+    # so the audio is theirs. Playback stalls unless the Talker runs at least
+    # 1.5x real time over its first 50 frames; (4, 8, 13) starts audio sooner
+    # but needs 2x, and on a B200 it stalled from concurrency 16.
     #
     # Named with a ``codec_`` prefix to avoid collision with HF's
     # ``Qwen3OmniMoeCode2WavConfig`` (which has no such field today but could
     # add one; the HF method ``chunked_decode(chunk_size=...)`` also uses the
     # same bare name with different semantics).
+    codec_chunk_schedule: Tuple[int, ...] = (12, 13)
     codec_chunk_frames: int = 25
     codec_left_context_frames: int = 25
     attention_bias: bool = False
@@ -328,10 +346,55 @@ class Code2WavConfig:
     def from_dict(cls, d: dict[str, Any]) -> Code2WavConfig:
         fnames = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in d.items() if k in fnames}
-        for tup_field in ("upsample_rates", "upsampling_ratios"):
+        for tup_field in ("upsample_rates", "upsampling_ratios", "codec_chunk_schedule"):
             if tup_field in filtered and isinstance(filtered[tup_field], list):
                 filtered[tup_field] = tuple(filtered[tup_field])
         return cls(**filtered)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.codec_chunk_schedule, list):
+            self.codec_chunk_schedule = tuple(self.codec_chunk_schedule)
+        self.check_streaming_knobs()
+
+    @property
+    def codec_lookahead_samples(self) -> int:
+        """Samples a window decodes short of ``frames * total_upsample`` (555
+        for Qwen3-Omni): each decoder block's ``ConvTranspose1d(2r, stride r,
+        padding r)`` drops ``r`` samples, scaled by the blocks after it."""
+        rates = self.upsample_rates
+        return sum(rate * math.prod(rates[i + 1:]) for i, rate in enumerate(rates))
+
+    @property
+    def codec_min_left_context_frames(self) -> int:
+        """Fewest context frames whose audio covers the lookahead samples the
+        window before could not decode (1 for Qwen3-Omni: 555 < 1920). With
+        fewer, ``Code2WavSubmodule.postprocess`` drops them at every boundary."""
+        total_upsample = math.prod(self.upsample_rates) * math.prod(self.upsampling_ratios)
+        return -(-self.codec_lookahead_samples // total_upsample)
+
+    def check_streaming_knobs(self) -> None:
+        """Reject chunking that would drop or repeat streamed audio."""
+        def is_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        schedule = self.codec_chunk_schedule
+        if not isinstance(schedule, tuple) or not all(is_int(size) and size >= 1 for size in schedule):
+            raise ValueError(f"codec_chunk_schedule must be a list of positive integers, got {schedule!r}")
+        if not is_int(self.codec_chunk_frames) or self.codec_chunk_frames < 1:
+            raise ValueError(f"codec_chunk_frames must be a positive integer, got {self.codec_chunk_frames!r}")
+        minimum = self.codec_min_left_context_frames
+        if not is_int(self.codec_left_context_frames) or self.codec_left_context_frames < minimum:
+            raise ValueError(
+                f"codec_left_context_frames must be an integer >= {minimum}, got "
+                f"{self.codec_left_context_frames!r}: a window decodes {self.codec_lookahead_samples} samples short "
+                f"and the next window's context must re-decode them, or they are lost at every chunk boundary"
+            )
+
+    @property
+    def codec_max_window(self) -> int:
+        """Frames in the widest window the chunk schedule pops. Every window
+        is padded to it, so the vocoder runs (and captures) one shape."""
+        return self.codec_left_context_frames + max((self.codec_chunk_frames, *self.codec_chunk_schedule))
 
     def get_hf_config(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -382,7 +445,7 @@ class Qwen3OmniModelConfig:
     thinker_text: ThinkerTextConfig = field(default_factory=ThinkerTextConfig)
     thinker: ThinkerConfig = field(default_factory=ThinkerConfig)
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
-    audio_encoder: AudioEncoderConfig = field(default_factory=AudioEncoderConfig)
+    audio_encoder: AuTEncoderConfig = field(default_factory=AuTEncoderConfig)
     talker_text: TalkerTextConfig = field(default_factory=TalkerTextConfig)
     talker: TalkerConfig = field(default_factory=TalkerConfig)
     code_predictor: CodePredictorConfig = field(default_factory=CodePredictorConfig)
@@ -514,7 +577,7 @@ class Qwen3OmniModelConfig:
         thinker_text = ThinkerTextConfig.from_dict(thinker_text_raw)
         thinker = ThinkerConfig.from_dict(thinker_raw)
         vision = VisionEncoderConfig.from_dict(vision_raw)
-        audio_encoder = AudioEncoderConfig.from_dict(audio_enc_raw)
+        audio_encoder = AuTEncoderConfig.from_hf(audio_enc_raw)
 
         # --- Talker ---------------------------------------------------
         talker_raw = raw.get("talker_config", {})

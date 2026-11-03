@@ -121,6 +121,7 @@ def _admit(runtime, request_id="r1", walk=WALK):
         request_id=request_id, partition="default", graph_walk=walk,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     )
 
 
@@ -185,11 +186,11 @@ def test_removing_twice_is_idempotent(runtime):
 
 # --- per-request state -------------------------------------------------------
 
-def test_set_walk_and_stream_done_reach_the_request(runtime):
+def test_set_walk_and_partition_done_reach_the_request(runtime):
     rid = _admit(runtime)
     runtime.set_walk(rid, "default", "other_walk")
-    runtime.mark_stream_partition_done(rid, "default")
-    # No getter for stream-done on the ABC; not raising is the assertion, and
+    runtime.mark_partition_done(rid, "default")
+    # No getter for partition_done on the ABC; not raising is the assertion, and
     # the walk change is observable.
     assert runtime is not None
 
@@ -867,10 +868,9 @@ def test_a_peer_stop_applies_only_when_newer(runtime):
     kept = runtime._loop_stop_times(rid)["ar_loop"]
     assert kept.wg_fwd_pass_idx == 3
 
-    # An older observation is recorded but must not re-stop a loop that has
-    # since restarted.
+    # An older observation is dropped, not recorded over the newer one.
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
-    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 1
+    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 3
 
 
 def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):

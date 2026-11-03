@@ -3,14 +3,16 @@ name = "mstar-server"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+publish = false
 
 [[bin]]
 name = "mstar-server"
 path = "src/main.rs"
 
 [dependencies]
-# The vendored transport/arena library crate (rust/) — rlib target.
-# Executables must link libpython; extension-module suppresses that linkage.
+# The vendored transport/arena library crate (rust/) — rlib target. No default
+# features: the server uses only the transport, so it builds without `python`
+# and links no libpython.
 mstar-rust = { path = "..", package = "mstar-rust", default-features = false }
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }

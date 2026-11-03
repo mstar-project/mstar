@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=78.1.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -31,6 +31,7 @@ wan22 = ["mstar-ai[wan22]"]
 waypoint = ["mstar-ai[waypoint]"]
 vjepa2_ac = ["mstar-ai[vjepa2_ac]"]
 asr = ["mstar-ai[asr]"]
+glm = ["mstar-ai[glm]"]
 all = ["mstar-ai[all]"]
 
 [project.urls]

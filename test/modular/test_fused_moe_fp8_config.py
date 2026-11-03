@@ -292,5 +292,6 @@ def test_bf16_fused_experts_signature_unchanged():
     params = list(inspect.signature(runner.fused_experts).parameters)
     assert params == [
         "hidden_states", "w1", "w2", "topk_weights", "topk_ids", "activation", "reduce_results", "skip_invalid",
+        "alignment",
     ]
     assert list(inspect.signature(get_default_config).parameters) == ["M", "E", "N", "K", "top_k"]
