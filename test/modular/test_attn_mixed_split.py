@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
@@ -88,7 +89,7 @@ def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout, ten
     n = len(ROWS)
     kvp = plan["paged_kv_indptr"]
     ref = FlashInferPrefillWrapper(
-        workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
+        workspace_buffer=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"), **_kw(device),
     )
     ref.plan(
         causal=True, dtype=torch.bfloat16, window_left=window_left,
@@ -100,8 +101,8 @@ def test_mixed_split_attends_as_the_packed_prefill_does(window_left, layout, ten
     ref_out = ref.run(q[:real], cache)
 
     mixed = FlashInferMixedWrapper(
-        decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
-        prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+        decode_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
+        prefill_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
         batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
         max_prefill_rows=MAX_PROMPTS, use_tensor_cores=tensor_cores, **_kw(device),
     )
@@ -140,8 +141,8 @@ def test_a_replay_of_another_layout_attends_as_the_packed_prefill_does():
     cache = torch.randn(num_pages, 2, PAGE, KV_HEADS, DIM, device=device, dtype=torch.bfloat16)
     q = torch.randn(BUCKET_TOKENS, QO_HEADS, DIM, device=device, dtype=torch.bfloat16)
     mixed = FlashInferMixedWrapper(
-        decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
-        prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+        decode_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
+        prefill_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
         batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
         max_prefill_rows=MAX_PROMPTS, **_kw(device),
     )
@@ -164,7 +165,7 @@ def test_a_replay_of_another_layout_attends_as_the_packed_prefill_does():
     real = int(plan["qo_indptr"][n])
     kvp = plan["paged_kv_indptr"]
     ref = FlashInferPrefillWrapper(
-        workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
+        workspace_buffer=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"), **_kw(device),
     )
     ref.plan(
         causal=True, dtype=torch.bfloat16,
@@ -199,8 +200,8 @@ def test_later_plans_match_a_first_plan(tensor_cores):
 
     def mixed():
         return FlashInferMixedWrapper(
-            decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
-            prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+            decode_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
+            prefill_workspace=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"),
             batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
             max_prefill_rows=MAX_PROMPTS, use_tensor_cores=tensor_cores, **_kw(device),
         )
@@ -227,7 +228,7 @@ def test_later_plans_match_a_first_plan(tensor_cores):
 
         kvp = plan["paged_kv_indptr"]
         ref = FlashInferPrefillWrapper(
-            workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
+            workspace_buffer=Workspace(torch.empty(WS, dtype=torch.uint8, device=device), "test"), **_kw(device),
         )
         ref.plan(
             causal=True, dtype=torch.bfloat16,

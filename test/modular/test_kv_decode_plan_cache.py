@@ -61,7 +61,8 @@ def _manager(mode: int, sliding: tuple[int, ...] = ()) -> KVManager:
 
 
 def _prefill(kv: KVManager, rid: str, n: int) -> None:
-    kv.ingest_request(rid, KVReqConfig())
+    if rid not in kv._streams:  # opened once per request, as the worker does
+        kv.ingest_request(rid, KVReqConfig())
     step = KVStep(segments=(Segment(rid, "main", n),))
     ctx = StepContext(request_ids=(rid,), graph_walk="prefill", slot=0, capture=False)
     assert kv.admit(step, ctx).ok

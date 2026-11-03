@@ -19,6 +19,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -109,9 +110,8 @@ def _wrap_node_in_loop(
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
-        # where the two runtimes order the completion cascade differently
-        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
-        # rather than ship a shape only one runtime gets right.
+        # whose completion cascades into the parent's (rust/src/graph/state.rs).
+        # Chunking does not handle that, so refuse it.
         if node_name in section.section.get_nodes():
             raise ValueError(
                 f"node {node_name!r} is chunkable and already inside Loop "
@@ -132,6 +132,9 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.lora.config import LoraSpec
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -170,6 +173,9 @@ class ClientChunk(NamedTuple):
 class Span(NamedTuple):
     """One write to a KV stream. A layout lists them in the order the walks write.
 
+    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
+    the span before it then writes it too, in the same row, as text around an attachment is.
+
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
     the tensor whose next entry an ids span keys, or the file of a digest span
@@ -186,6 +192,7 @@ class Span(NamedTuple):
     source: str | tuple[str, int]
     params: tuple = ()
     scratch: int = 0
+    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -210,8 +217,9 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
+        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
+        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
+        worker keys the span."""
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
@@ -222,7 +230,7 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
@@ -473,7 +481,7 @@ def _divide_into_worker_graphs(
         # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
         # matching over a streamed latent) inexpressible. Honouring it instead
         # means changing this, Loop._is_streamed_input, and the Rust held_mask
-        # together, or the two runtimes disagree.
+        # together.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams
@@ -537,6 +545,52 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment's YAML turns on, before its ``resources:``
+    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
+    (``mstar.engine.resources.lora.serving``)."""
+    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+
+    specs = list(model.get_node_resources() or [])
+    lora = declared_lora_specs(model, model_config)
+    size_lora_specs(lora, model_config)
+    return specs + lora
+
+
+def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
+    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
+    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
+    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
+
+    return drop_lora_specs_without_targets(specs)
+
+
+def parse_autocast_dtype(value) -> torch.dtype | None:
+    """The serving YAML's ``autocast_dtype``, spelled as a string (``float16``). ``null``
+    stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
+
+
+def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
+    ``resources:`` overrides applied, as ``built_resources``.
+
+    Every process that reads specs resolves them here, so the conductor validates
+    requests against what the workers built. ``validate_deployment`` takes the same
+    steps, reporting every problem rather than the first.
+    """
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return built_resources(specs)
+
+
 class Model(ABC):
     def __init_subclass__(cls, **kwargs):
         # A chunkable node runs inside its chunk Loop wherever the walk graphs
@@ -561,7 +615,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids")
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -707,6 +761,20 @@ class Model(ABC):
         hands each node the subset naming it.
         """
         pass
+
+    def get_lora_specs(self) -> list["LoraSpec"]:
+        """The per-request LoRA adapters this model can serve: a spec per node they
+        reach (none for a model that serves none), the first keyed
+        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
+        and the conductor opens a request with the same adapter on each.
+
+        Built only when the deployment's YAML has a ``resources: lora:`` block (see
+        ``serving_resources``): a deployment without one builds exactly what it did
+        before. Usually by ``module_lora_spec`` from each node's weights root, whose
+        LoRA-capable modules the node then binds itself. The conductor opens each
+        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
+        """
+        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -893,8 +961,8 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
-        raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
+        ``image_grid_thw`` and ``audio_features`` from the raw
+        ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
             prompt: Raw text input from the user, or None if no text.
@@ -947,11 +1015,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        try:
-            img = read_image(filepath, rgb=True)
-        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
-        img = img.to(device).float().div_(255.0)  # CxHxW
+        img = read_image(filepath, rgb=True).to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 

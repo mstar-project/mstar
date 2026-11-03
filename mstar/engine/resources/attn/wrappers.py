@@ -20,6 +20,7 @@ import logging
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,7 @@ class FlashInferPrefillWrapper:
     CUDA graph mode using static buffers. KV writes are the KVManager's job.
 
     Args:
-        workspace_buffer: FlashInfer workspace (256MB+ recommended)
+        workspace_buffer: the `Workspace` it plans through, which grows to what a plan asks for
         num_qo_heads: number of query/output heads
         num_kv_heads: number of key/value heads
         head_dim: dimension per head
@@ -147,7 +148,7 @@ class FlashInferPrefillWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -171,6 +172,7 @@ class FlashInferPrefillWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -195,7 +197,7 @@ class FlashInferPrefillWrapper:
             )
 
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer,
+                self._workspace.tensor,
                 "NHD",
                 use_cuda_graph=True,
                 qo_indptr_buf=self._qo_indptr_buf,
@@ -214,7 +216,7 @@ class FlashInferPrefillWrapper:
             )
         else:
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD", backend=backend
+                self._workspace.tensor, "NHD", backend=backend
             )
             self.token_to_page = None
             self.token_to_cache = None
@@ -308,7 +310,8 @@ class FlashInferPrefillWrapper:
                 self._pinned_done.record()
             return
         self.dtype = dtype
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
@@ -347,7 +350,8 @@ class FlashInferPrefillWrapper:
             )
             return
         self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=self._paged_kv_indices_buf[:n],
@@ -453,7 +457,7 @@ class FlashInferDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -480,6 +484,7 @@ class FlashInferDecodeWrapper:
         # with where in them the per-step indptr and lengths go
         self._planner_args: list | None = None
         self._planner_slots: tuple[int, int | None] = (4, 5)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -500,7 +505,7 @@ class FlashInferDecodeWrapper:
             )
 
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer,
+                self._workspace.tensor,
                 "NHD",
                 use_cuda_graph=True,
                 use_tensor_cores=use_tensor_cores,
@@ -511,7 +516,7 @@ class FlashInferDecodeWrapper:
             )
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD",
+                self._workspace.tensor, "NHD",
                 use_tensor_cores=use_tensor_cores,
                 backend=backend,
             )
@@ -563,7 +568,8 @@ class FlashInferDecodeWrapper:
 
             range_push("flashinfer.decode.plan_inner", synchronize=False)
         try:
-            self.attn_wrapper.plan(
+            self._workspace.plan(
+                self.attn_wrapper.plan,
                 indptr=paged_kv_indptr,
                 indices=paged_kv_indices,
                 last_page_len=paged_kv_last_page_len,
@@ -670,7 +676,7 @@ class FmhaDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -687,7 +693,7 @@ class FmhaDecodeWrapper:
         check_flashinfer_head_dim(head_dim, device)
         self.batch_size = batch_size
         self.dtype = torch.bfloat16
-        self._workspace = workspace_buffer
+        self._workspace = workspace_buffer.tensor
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._scale = head_dim ** -0.5
@@ -822,8 +828,8 @@ class FlashInferMixedWrapper:
 
     def __init__(
         self,
-        decode_workspace: torch.Tensor,
-        prefill_workspace: torch.Tensor,
+        decode_workspace: Workspace,
+        prefill_workspace: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,

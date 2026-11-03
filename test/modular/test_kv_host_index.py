@@ -106,7 +106,8 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
 
 
 def _probe(kv: KVManager, rid: str, tokens: list[int]) -> int:
-    _ingest(kv, rid, tokens)
+    if rid not in kv._streams:  # opened once per request, as the worker does
+        _ingest(kv, rid, tokens)
     inputs = ARNodeInputs(input_seq_len=len(tokens))
     prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
     kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)

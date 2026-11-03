@@ -66,11 +66,15 @@ def encode_reference(codec: nn.Module, waveform: torch.Tensor) -> torch.Tensor:
     return codec.encode(waveform.unsqueeze(0)).audio_codes.squeeze(0)
 
 
-@torch.inference_mode()
-def decode_canvas(codec: nn.Module, tokens: torch.Tensor) -> np.ndarray:
-    """``[C, T_tok]`` tokens -> 1-D waveform at ``codec.config.sample_rate``."""
+def decode_canvas(codec: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    """``[C, T_tok]`` tokens -> 1-D float32 waveform at ``codec.config.sample_rate``, on the codec's device.
+
+    Runs under the engine's ``no_grad``, not ``inference_mode``: the compiled
+    acoustic decoder (code2wav's ``compile_regions``) was warmed on ordinary
+    tensors, and an inference tensor fails its guards and recompiles it.
+    """
     tokens = tokens.to(codec.device)
-    return codec.decode(tokens.unsqueeze(0)).audio_values[0].float().cpu().numpy()
+    return codec.decode(tokens.unsqueeze(0)).audio_values[0].float().reshape(-1)
 
 
 def post_process(
@@ -88,11 +92,12 @@ def post_process(
     designed or automatic voice has no reference to match and is peak-normalised
     to 0.5 instead.
 
-    Imported from the ``omnivoice`` package rather than re-ported: the silence
-    trim is pydub-based and re-implementing it would drift from the reference
-    for no gain.
+    The fade and pad are the ``omnivoice`` package's own; the silence trim is
+    a sample-exact vectorized port of its pydub-based one (``silence.py``),
+    which cost ~14 ms of Python per second of audio.
     """
-    from omnivoice.utils.audio import fade_and_pad_audio, remove_silence
+    from mstar.model.omnivoice.components.silence import remove_silence
+    from omnivoice.utils.audio import fade_and_pad_audio
 
     audio = waveform
     if audio.ndim == 1:

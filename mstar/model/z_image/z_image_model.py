@@ -29,15 +29,14 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
-from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
     IMAGE_OUTPUT,
     LATENTS,
     TEXT_EMBEDS,
-    TEXT_INPUTS,
     ZImageDenoiseSubmodule,
     ZImageTextEncoderSubmodule,
     ZImageVaeDecoderSubmodule,
@@ -206,6 +205,7 @@ class ZImageModel(Model):
             raise ValueError("Z-Image-Turbo is text-to-image only; reference images are not supported")
         self._resolve_size(kwargs)
         self._resolve_steps(kwargs)
+        image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
         if float(kwargs.get("guidance_scale", 0.0)) > 0.0:
             logger.info("guidance_scale is ignored: Z-Image-Turbo is distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
@@ -299,14 +299,16 @@ class ZImageModel(Model):
         from mstar.model.z_image.weight_loader import build_text_encoder, build_transformer, build_vae
 
         if node_name == "text_encoder":
-            return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
-                                              max_batch_size=self.max_batch_size)
+            return ZImageTextEncoderSubmodule(
+                build_text_encoder(self.config, self.snapshot, device), self.config,
+                max_batch_size=self.max_batch_size,
+                capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
+            )
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
                 build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
-                decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],  # see klein
             )
         if node_name == "dit":
             return ZImageDenoiseSubmodule(
