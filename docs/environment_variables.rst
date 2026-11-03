@@ -498,56 +498,53 @@ Worker scheduling
        ``knobs.pre_plan_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``off``
-     - Pin each worker's main, GPU and plan threads together, and the API
-       server's message thread and Rust frontend bridge on a CPU of their own.
-       A step hands work between the three worker threads several times and
-       every step's tokens pass from the message thread to the bridge; a
-       thread woken on an idle core waits for that core to leave its idle
-       state, and a core that sleeps between handoffs runs them at a low
-       clock. Pinning keeps the same core or L2 cluster awake. ``off`` pins
-       nothing. ``auto`` pins where
-       ``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency`` shows an enabled
-       idle state of 100 µs or more on a CPU of the process mask
-       (``cpus.deepest_idle``, ``cpus.DEEP_IDLE_US``), and otherwise pins
-       nothing and says so in one log line: without deep idle states a handoff
-       is cheap and pinning only makes the threads queue. It also pins nothing
-       when a worker would get a single CPU, where the three threads queue
-       behind each other (Qwen3-TTS c=1 TTFA 23 → 32 ms), and the log line names
-       the mask that would do. And it pins only on the CPU vendors its
-       placement has been measured on (``cpus.AUTO_VENDORS``, by
-       ``/proc/cpuinfo``'s ``vendor_id``): so far Intel alone. On an AMD or
-       Arm host ``auto`` pins nothing and logs one line saying so; on a
-       2-socket EPYC with C2 at 800 µs the Intel placement cost Qwen3.5-0.8B
-       14-20% at c=1 and c=8. ``always`` skips all three checks. A number names the
-       first worker's core (its hardware threads in
-       the mask); the next workers take the next cores up and the API server
-       the last core of the mask. A number outside the mask, or too near its
-       top for every worker, stops the server at startup.
-       ``auto`` and ``always`` place by the GPU's rank among the host's GPUs on
-       its NUMA node (sysfs ``/sys/bus/pci/devices``: the PCI functions of the
-       GPU's vendor and class in address order, ``numa_node`` and
-       ``local_cpulist``), so servers on different GPUs take different CPUs
-       without knowing about each other: a worker the core at that rank from
-       the bottom of the node's cores in the process mask, the API server the
-       core at its first worker's GPU's rank from the top; further workers of
-       one deployment on one GPU step by the node's GPU count. A GPU whose node
-       has no CPU in the mask picks, by its rank among the host's GPUs in the
-       same case, from the cores the node-local GPUs leave. The cores a GPU
-       picks from must hold two per GPU that picks from them. A mask too small
-       for that across the host may do for the GPUs this container has a device
-       node for, since only those can share it, and those rank instead (NVIDIA
-       only; a 2-GPU slice of an 8-GPU host fits an 8-core mask this way). Short
-       of that, or with a mask too small to leave a CPU unpinned, nothing is
-       pinned and a warning says why.
-       A core with one CPU in the mask (no SMT, or its sibling left out) would
-       leave the three step threads queueing on one CPU, so two such cores of
-       one L2 cluster (``topology/cluster_cpus_list``) count as one core. A core
-       with no such partner keeps its one CPU under ``always`` and makes
-       ``auto`` pin nothing, so give an SMT host's mask the siblings too
-       (``32-39,160-167``, not ``32-39``). Two cores across clusters measured
-       close to no pin at all on Qwen3-TTS, so the pair stays inside a cluster.
+     - Pin each worker's main, GPU and plan threads, and the API server's
+       message thread and Rust frontend bridge on a CPU of their own. A step
+       hands work between the three worker threads several times and every
+       step's tokens pass from the message thread to the bridge; on a host
+       whose idle cores drop into deep C-states, each handoff to a sleeping
+       core waits for it to wake. ``off`` pins nothing.
+       ``always`` gives each worker ``cpus.STEP_CORES`` (3) cores, one
+       hardware thread of each, and the API server one core; no two pinned
+       threads share a core and the siblings of the CPUs taken stay unpinned.
+       ``siblings`` puts each worker's three threads on all hardware threads
+       of one core instead (two cores of one L2 cluster,
+       ``topology/cluster_cpus_list``, where a core has one CPU in the mask);
+       ``cpus._siblings`` has its numbers. On a deep-idle Xeon 6767P it beat
+       no pin and three separate cores; on two H200 hosts with SMT it lost to
+       no pin.
+       ``auto`` pins nothing and logs one line saying why for this host, since
+       no host it can tell apart has a measurement in which a layout beats no
+       pin: ``idle_hold`` is set (with the cores held awake pinning measured
+       no faster), the CPU vendor isn't Intel (``cpus.AUTO_VENDORS``, by
+       ``/proc/cpuinfo``'s ``vendor_id``), no enabled idle state of 100 µs or
+       more shows on a CPU of the process mask
+       (``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency``,
+       ``cpus.deepest_idle``, ``cpus.DEEP_IDLE_US``), or, on a deep-idle Intel
+       host, three separate cores measured no faster than no pin.
+       A number names the first worker's core (its hardware threads in the
+       mask); the next workers take the next cores up and the API server the
+       last core of the mask. A number outside the mask, or too near its top
+       for every worker, stops the server at startup.
+       ``always`` and ``siblings`` place by the GPU's rank among the host's
+       GPUs on its NUMA node (sysfs ``/sys/bus/pci/devices``: the PCI
+       functions of the GPU's vendor and class in address order,
+       ``numa_node`` and ``local_cpulist``), so servers on different GPUs take
+       different CPUs without knowing about each other: the API server the
+       core at its first worker's GPU's rank from the top of the node's cores
+       in the process mask, a worker its cores at that rank from the bottom of
+       the rest; further workers of one deployment on one GPU step by the
+       node's GPU count. A GPU whose node has no CPU in the mask picks, by its
+       rank among the host's GPUs in the same case, from the cores the
+       node-local GPUs leave. Under ``always`` the cores a GPU picks from must
+       hold four per GPU that picks from them (two under ``siblings``). A mask
+       too small for that across the host may do for the GPUs this container
+       has a device node for, since only those can share it, and those rank
+       instead (NVIDIA only; a 2-GPU slice of an 8-GPU host fits an 8-core mask
+       this way). Short of that, or with a mask too small to leave a CPU
+       unpinned, nothing is pinned and a warning says why.
        Servers on one GPU (two MIG instances share its address) would take
-       the same CPUs, so the first ``auto`` or ``always`` server holds
+       the same CPUs, so the first ``always`` or ``siblings`` server holds
        ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
        pins nothing, with a warning; the lock goes with the process however
        it exits. The lock only reaches servers that share ``/tmp``, so
@@ -571,8 +568,11 @@ Worker scheduling
        not writable only costs the hold: startup carries on. Containers
        usually hide the device. The request is host-wide and holds cores awake
        whether or not the server is busy, so it spends power on idle hosts; it
-       is off by default. Read by ``knobs.idle_hold``, applied by
-       ``cpus.hold_idle``.
+       is off by default. ``auto`` placement stands down while it is set:
+       with every server core held awake by a ``SCHED_IDLE`` spinner (the
+       stand-in where the device is hidden), one core's hardware threads lost
+       to no pin and three separate cores were level with it. Read by
+       ``knobs.idle_hold``, applied by ``cpus.hold_idle``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
