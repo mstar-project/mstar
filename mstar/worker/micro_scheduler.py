@@ -470,7 +470,8 @@ class MicroScheduler:
         # these cannot be scheduled (unless this is a TP follower node)
         self.failed_rids: set[int] = set()
         # rid -> message, for requests a resource declared unservable during a
-        # readiness check. Drained by the worker, which reports them onward.
+        # readiness check, or that a raising scheduling pass left in no step.
+        # Drained by the worker, which reports them onward.
         self.admit_errors: dict[int, str] = {}
         # Rids an input read of which failed on this rank. A TP follower never
         # gets those inputs, so it builds the leader's step without the row and
@@ -1246,28 +1247,47 @@ class MicroScheduler:
         Under a combined walk, backlogged rows of ``skip_walk`` (a yield-away
         from that walk) stay parked."""
         backlogged = self.backlog.pop(node_walk, None)
-        live = [] if backlogged is None else self._backlog_candidates(
-            backlogged, skip_walk=skip_walk,
-        )
-        found = {entry.request_id for entry in entries}
-        walk_of = None
-        if node_walk in self._walks_of_key:
-            walks = {entry.request_id: entry.graph_walk for entry in entries}
-            walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
-        check = self._readiness(request_state, node_walk[0])
-        pick = self.batch_builder.pick(self._step_candidates(
-            request_state, node_walk, backlog=live,
-            queued=[entry.request_id for entry in entries],
-            walk_of=walk_of,
-            ready=lambda rid: rid in found or check(rid),
-        ))
+        try:
+            live = [] if backlogged is None else self._backlog_candidates(
+                backlogged, skip_walk=skip_walk,
+            )
+            found = {entry.request_id for entry in entries}
+            walk_of = None
+            if node_walk in self._walks_of_key:
+                walks = {entry.request_id: entry.graph_walk for entry in entries}
+                walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
+            check = self._readiness(request_state, node_walk[0])
+            pick = self.batch_builder.pick(self._step_candidates(
+                request_state, node_walk, backlog=live,
+                queued=[entry.request_id for entry in entries],
+                walk_of=walk_of,
+                ready=lambda rid: rid in found or check(rid),
+            ))
+            if backlogged is not None:
+                self._drop_failed_rows(backlogged)
+                if not backlogged:
+                    backlogged = None  # every row failed
+            fresh = self._assemble_batch(request_state, *node_walk, entries) \
+                if entries else None
+            return self._build_step(request_state, node_walk, backlogged, fresh or None, pick)
+        except Exception:
+            self._fail_unscheduled(backlogged, entries)
+            raise
+
+    def _fail_unscheduled(
+        self, backlogged: ScheduledBatch | None, entries: list[ReadyNodeEntry],
+    ) -> None:
+        """A scheduling pass raised with ``backlogged`` popped and ``entries``
+        popped too, or still queued. The popped rows are in no queue and no
+        step, so nothing else would ever schedule or fail them; the queued ones
+        would raise the next pass again. They fail rather than go back, where a
+        persistent raise would loop. A rejection already recorded stands."""
+        lost = {entry.request_id for entry in entries}
         if backlogged is not None:
-            self._drop_failed_rows(backlogged)
-            if not backlogged:
-                backlogged = None  # every row failed
-        fresh = self._assemble_batch(request_state, *node_walk, entries) \
-            if entries else None
-        return self._build_step(request_state, node_walk, backlogged, fresh or None, pick)
+            lost.update(backlogged.request_to_worker_graph)
+        for rid in lost:
+            self.admit_errors.setdefault(rid, "Error in worker: scheduling failed (see the worker log)")
+        self.fail_rids(lost)
 
     def _build_step(
         self, request_state: RequestStateManager, node_walk: tuple[str, str],
@@ -1451,11 +1471,15 @@ class MicroScheduler:
             self.backlog.pop(key)
         else:
             backlogged = None
-        fresh = self._assemble_batch(request_state, *key, entries) if entries else None
-        return self._build_step(
-            request_state, key, backlogged, fresh or None, chain.pick,
-            chain.mid_prefill, pre_existing_batch_size, pre_existing_seq_lens,
-        )
+        try:
+            fresh = self._assemble_batch(request_state, *key, entries) if entries else None
+            return self._build_step(
+                request_state, key, backlogged, fresh or None, chain.pick,
+                chain.mid_prefill, pre_existing_batch_size, pre_existing_seq_lens,
+            )
+        except Exception:
+            self._fail_unscheduled(backlogged, entries)
+            raise
 
     def _step_candidates(
         self, request_state: RequestStateManager, key: tuple[str, str], *,
