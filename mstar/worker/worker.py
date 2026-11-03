@@ -1200,14 +1200,18 @@ class Worker:
         READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
-        if self.is_tp_follower and body.source not in (
+        handle = self._rid(body.request_id)
+        # Honor only the leader's forwarded drain, like REMOVE_REQUEST, but for a
+        # request never admitted here: the conductor sends a NEW_REQUEST ahead of
+        # its drain on one FIFO socket, so the leader has no handle either and
+        # forwards nothing.
+        if self.is_tp_follower and handle is not None and body.source not in (
             MessageSource.TP_RANK_0, MessageSource.SELF
         ):
-            return  # honor only the leader's forwarded drain, like REMOVE_REQUEST
+            return
 
         # Defer behind an in-flight GPU step, same as REMOVE_REQUEST: clearing
         # the scheduler while a step references the rid would race the GPU thread.
-        handle = self._rid(body.request_id)
         if handle is not None and handle in self._in_flight_rids:
             self._pending_drains.add(body.request_id)
             return
