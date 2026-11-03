@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cached_property, partial
 from time import sleep
@@ -1217,7 +1217,14 @@ class Worker:
 
     def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
-        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        # a rebuild keys a label again only where the request's own keys cover it
+        layouts = {
+            key: [
+                layout if config.keys_of(label) else replace(layout, keyed_spans=0)
+                for label, layout in (config.kv_layout or {}).items()
+            ]
+            for key, config in kv_configs.items()
+        }
         unpausable = any(config.unpausable for config in kv_configs.values())
         for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:
@@ -3746,7 +3753,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        self._rebuilds.record(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
@@ -3756,7 +3763,6 @@ class Worker:
         self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
-        self._rebuilds.keep_copies(batch_N.node_batch)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -3843,8 +3849,8 @@ class Worker:
         _pp_stage("after_output_copy")
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
-        lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
+        the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:
@@ -3858,20 +3864,26 @@ class Worker:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = {
-            rid: cursor for rid in rebuild
-            if rid in ran and (cursor := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        ended = {
+            rid: run for rid in rebuild
+            if rid in ran and (run := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
         }
-        if landed:
+        if ended:
             # the step's kernels read the prepared input released here
             self._wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid, cursor in landed.items():
-                if not cursor.resumes_prefill:
+            for rid, run in ended.items():
+                self._preemption.rebuilt(rid, node, run.ran)
+                # A row from a record prepared its own input. A prompt's step in progress goes on from the
+                # input the engine keeps for the prompt, which waited aside while the rows before it ran.
+                if run.row.record is not None:
                     engine.release_chunk_inputs(rid, node)
+                if self._rebuilds.rebuilding(rid, node):
+                    if self._rebuilds.cursor(rid, node).resumes_prefill:
+                        engine.restore_chunk_inputs(rid, node)
+                    continue
                 engine.land_rebuild(node, rid)
                 self.scheduler.note_rebuilt(node, rid)
-                self._preemption.rebuilt(rid, node, cursor.ran)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)

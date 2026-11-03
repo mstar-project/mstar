@@ -557,24 +557,21 @@ def refuse_undeclared_labels(
 
 
 def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
-    """Why one rebuild row can't write a request's laid-out labels again, or None.
+    """Why rebuild rows can't write a request's laid-out labels again, or None. ``keyed_spans`` is what the
+    request's own keys cover, none with the prefix cache off.
 
-    The row writes one label, grown by one loop, in the one step of one walk that wrote its spans. It writes the
-    ids spans from the request's kept ids, every other span from host copies of what that walk read, whatever the
-    span's kind, and the ids sampled since at the end of the last span, which must be ids.
+    The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write
+    every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.
+    A keyed label is keyed again by extending its keys, which needs them to cover every span.
     """
     laid_out = [layout for layout in layouts if layout.spans]
     if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
-        return "it writes more than one label or growth loop, which one rebuild row can't lay out again"
+        return "it writes more than one label or growth loop, which its rebuild rows can't lay out again"
     for layout in laid_out:
-        if len({span.walk for span in layout.spans}) > 1:
-            return "its prompt was written in more than one walk, which one rebuild row can't run"
-        if any(span.opens_step for span in layout.spans[1:]):
-            return "its prompt was written in more than one step, which one rebuild row can't run"
         if layout.spans[-1].kind != SpanKind.IDS:
             return "its prompt ends on a span of no ids, where the ids it sampled can't follow"
-        if len(layout.spans) > 1 and layout.keyed_spans:
-            return "it keys a prompt of more than one span, which a rebuild can't key again"
+        if 0 < layout.keyed_spans < len(layout.spans):
+            return "it keys only part of its prompt, which a rebuild can't key again"
     return None
 
 

@@ -40,10 +40,10 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
-from mstar.worker.host_pool import HostCopy, HostPool
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, LayoutRow, Prefilling, Rebuilds, RowRecord, policies_run_here
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -64,9 +64,10 @@ class _Engine(SimpleNamespace):
 
 
 def _kept(tokens: int) -> KeptIds:
-    """A request's prompt of ``tokens`` ids on the host, and one sample."""
-    view = torch.arange(tokens, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), "prefill", torch.long, array("i", [0]), {})
+    """A request's prompt of ``tokens`` ids, recorded in its one prefill step, and one sample."""
+    ids = torch.arange(tokens, dtype=torch.int32)
+    record = RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {})
+    return KeptIds((LayoutRow("prefill", tokens),), [record], array("i", [0]))
 
 
 def _worker(kv):
@@ -232,7 +233,7 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     _running(kv, "v", 5, arrival=2)
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
-    del w._rebuilds._kept[NODE]["v"]
+    w._rebuilds._kept[NODE]["v"].sampled = array("i")
     w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
         rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
@@ -362,11 +363,10 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
     assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
-    """A drop lays the pool's one label out again as one span of the policy's walk. In the two labels case, the
-    second label is written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses
-    the request."""
+@pytest.mark.parametrize("layout", ["two labels", "two loops"])
+def test_a_pool_whose_layout_its_rebuild_rows_cant_write_again_isnt_rebuildable(layout):
+    """A drop lays the pool's one label out again, grown by one loop. In the two labels case, the second label is
+    written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses the request."""
     kv = _pool()
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
@@ -375,8 +375,6 @@ def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(l
     layouts = {"main": StreamLayout(spans=(span,), growth=growth)}
     if layout == "two labels":
         layouts["uncond"] = StreamLayout(spans=(PrefixSpan(4, 4, "cfg_text"),), growth=(("cfg_loop", 1),))
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        layouts["main"] = StreamLayout(spans=(span, PrefixSpan(4, 4, "prefill")), growth=growth)
     else:
         layouts["main"] = StreamLayout(spans=(span,), growth=(*growth, ("other_loop", 1)))
     configs = {"kv": KVReqConfig(kv_layout=layouts, loop_caps={"decode": 64, "cfg_loop": 4, "other_loop": 4})}

@@ -28,10 +28,19 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
-from mstar.worker.host_pool import HostCopy, HostPool
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import (
+    KeptIds,
+    LayoutRow,
+    NodeWrites,
+    PlannedRow,
+    Prefilling,
+    RebuildCursor,
+    Rebuilds,
+    RowRecord,
+)
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
@@ -50,9 +59,15 @@ def _graphs() -> dict:
     }
 
 
+def _record(prompt=(1, 2, 3)) -> RowRecord:
+    """A prefill step that read ``prompt`` as int64 ids."""
+    ids = torch.tensor(prompt, dtype=torch.int32)
+    return RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {"is_prefill": True})
+
+
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
+    """A log of one prefill step that read ``prompt``, and ``sampled``."""
+    return KeptIds((LayoutRow(PREFILL, len(prompt)),), [_record(prompt)], array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -154,7 +169,8 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     eng.land_rebuild = lambda node, rid: landed.append(rid)
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies, w._rebuilds._kept = {node: POLICY}, {node: {1: _kept()}}
-    w._rebuilds._cursors[(node, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long)
+    w._rebuilds._prefilling = {node: set()}
+    w._rebuilds._cursors[(node, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, _record()),), array("i"))
     w.scheduler.note_rebuilt = lambda node, rid: None
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
@@ -176,12 +192,13 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
     w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
-    w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
+    w._rebuilds._kept = {node: {1: KeptIds((LayoutRow(walk, 4),))}}
+    w._rebuilds._prefilling = {node: {1}}
     w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
-    w._rebuilds._droppable = {node: {1: LogRoom(pool.take(64), 0)}}
+    w._rebuilds._droppable = {node: {1: pool.take(64)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
-        rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
+        rid: {"embeds": [] if build == "speculative" else [t], "text_inputs": [t]} for rid, t in embeds.items()
     })
     if build == "speculative":
         # a speculated step gets its embeds only once the encoder has run
@@ -198,7 +215,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     # what the worker does once the step's outputs are sent
     w._rebuilds.flush()
 
-    assert w._rebuilds._kept[node][1].copies.inputs["embeds"][0].tolist() == embeds[1].tolist(), (
+    assert w._rebuilds._kept[node][1].records[0].inputs["embeds"][0].tolist() == embeds[1].tolist(), (
         "a rebuild would need the encoder to run again"
     )
 
@@ -206,7 +223,8 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
 def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
     w, _ = _worker()
     w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
-    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, step_metadata={})
+    record = replace(_record(), step_metadata={})
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor((PlannedRow(PREFILL, 2, 2, record),), array("i"))
 
     node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})))
 
@@ -255,6 +273,8 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
 def test_a_prompts_rebuild_lands_and_leaves_the_prompts_input_to_its_last_chunk():
     w, eng = _worker()
     w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    # its one prefill step was recorded on its first chunk
+    w._rebuilds._kept[NODE][R] = _kept()
     eng.dropped.append(R)
     w._rebuilds.start(R, NODE, Prefilling(PREFILL, 4, 10))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))

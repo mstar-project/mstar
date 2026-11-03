@@ -6,7 +6,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -20,7 +20,7 @@ from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 from mstar.utils.h2d import to_device_nonblocking
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice, aligned
+from mstar.worker.host_pool import HostPool, HostSlice, aligned
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
@@ -35,48 +35,44 @@ DEFAULT_REBUILD_HOST_MB = 64
 DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
+class LayoutRow(NamedTuple):
+    """One prefill step of a request on a node, as its layout says: the walk it runs and the slots it writes."""
+    walk: str
+    length: int
+
+
 @dataclass(slots=True)
-class HostCopies:
-    """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
-    ``slots`` of its KV. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
-    started, and ``landed`` is recorded after the last copy that has, None where the copies run in place."""
-    slots: int = 0
-    inputs: NameToTensorList | None = None
+class RowRecord:
+    """One prefill step of a request as it ran, kept so its rebuild can run the step again: host copies of every
+    input the node read in it, in the request's slice, the dtype each was read in, and the step's metadata. Ids,
+    read as int64, are kept as int32. ``queued`` counts the copies that haven't started, and ``landed`` is recorded
+    after the last that has, None where the copies run in place."""
+    inputs: NameToTensorList
+    dtypes: dict[str, torch.dtype]
+    step_metadata: dict
     queued: int = 0
     landed: torch.Event | None = None
 
     def ready(self) -> bool:
-        return self.inputs is not None and not self.queued and (self.landed is None or self.landed.query())
+        return not self.queued and (self.landed is None or self.landed.query())
 
 
 @dataclass(slots=True)
 class KeptIds:
-    """A request's ids on one node: its prompt copied to the host as int32, the ``walk`` it prefilled in and the
-    dtype that walk read it in, each id sampled since, and the prefill row's step metadata, which its rebuild row
-    runs under. ``lengths`` splits the prompt into the tensors the walk read, and is None for one tensor. A walk
-    that read more than the ids has its other inputs in ``copies``."""
-    prompt: HostCopy
-    walk: str
-    dtype: torch.dtype
-    sampled: array
-    step_metadata: dict
-    lengths: tuple[int, ...] | None = None
-    copies: HostCopies | None = None
-
-
-class LogRoom(NamedTuple):
-    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and the slots of
-    its spans other than ids, which its rebuild writes from the host copies."""
-    piece: HostSlice
-    copied_slots: int
+    """A request's log on one node: the rows of its layout's prefill steps, a record of each step that has run, in
+    order, and each id sampled once the last has. ``used`` counts the bytes of its slice the records take."""
+    rows: tuple[LayoutRow, ...]
+    records: list[RowRecord] = field(default_factory=list)
+    sampled: array = field(default_factory=lambda: array("i"))
+    used: int = 0
 
 
 class QueuedCopy(NamedTuple):
-    """A device tensor's bytes still to be copied into ``into`` once ``after`` completes, for ``copies``."""
+    """A device tensor's bytes still to be copied into ``into`` once ``after`` completes, for ``record``."""
     src: torch.Tensor
     into: HostSlice
     after: torch.Event | None
-    copies: HostCopies
+    record: RowRecord
 
 
 class Prefilling(NamedTuple):
@@ -86,30 +82,48 @@ class Prefilling(NamedTuple):
     total: int
 
 
-@dataclass(slots=True)
-class RebuildCursor:
-    """A rebuild under way: the walk its rows run, the slots it writes (``total``) of an input ``length`` long,
-    the end of its chunks that have landed, 0 before the first, and the slots those chunks ran (``ran``), which
-    leave out a cached prefix.
-
-    A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and any host ``copies``,
-    runs under its prefill's ``step_metadata``, and writes every id but the last, which the next decode step
-    reads. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut
-    from the input the engine keeps for the prompt, up to where the prompt stood."""
+class PlannedRow(NamedTuple):
+    """One row of a rebuild: the walk it runs, the slots it writes (``total``) of an input ``length`` long, and the
+    record it reads. A prompt's step in progress has no record: it reads the input the engine keeps for the prompt,
+    up to where the prompt stood."""
     walk: str
     total: int
     length: int
-    ids: array | None = None
-    dtype: torch.dtype | None = None
-    lengths: tuple[int, ...] | None = None
-    copies: HostCopies | None = None
-    step_metadata: dict | None = None
+    record: RowRecord | None
+
+
+class RowRun(NamedTuple):
+    """A rebuild row that has run, and the slots its chunks ran, which leave out a cached prefix."""
+    row: PlannedRow
+    ran: int
+
+
+@dataclass(slots=True)
+class RebuildCursor:
+    """A rebuild under way: its rows, the one running (``row``), the end of that row's chunks that have landed, 0
+    before the first, and the slots they ran (``ran``). The last row read from a record also writes every id
+    ``sampled`` since but the newest, which the next decode step reads."""
+    rows: tuple[PlannedRow, ...]
+    sampled: array
+    row: int = 0
     done: int = 0
     ran: int = 0
 
     @property
+    def walk(self) -> str:
+        return self.rows[self.row].walk
+
+    @property
+    def total(self) -> int:
+        return self.rows[self.row].total
+
+    @property
+    def length(self) -> int:
+        return self.rows[self.row].length
+
+    @property
     def resumes_prefill(self) -> bool:
-        """Whether its request's prompt goes on past it, from the input the engine keeps for the prompt."""
+        """Whether the row running is its prompt's step in progress, which goes on past the rebuild."""
         return self.total < self.length
 
 
@@ -161,9 +175,9 @@ def node_writes(
 
 
 class Rebuilds:
-    """The kept ids of each request on the nodes that declare a `RebuildPolicy`, checked against the
-    graph when the worker starts, and the rebuilds under way. Host copies of what a walk read besides the ids
-    spend the step's ``allowance`` (`flush`)."""
+    """The log of each request on the nodes that declare a `RebuildPolicy`, checked against the graph when the
+    worker starts, and the rebuilds under way. Host copies of what a step read besides ids spend the step's
+    ``allowance`` (`flush`)."""
 
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
@@ -175,11 +189,13 @@ class Rebuilds:
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
         self._pool = pool
-        # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
-        # ids of its own.
+        # node -> handle -> its log. Per node, since a colocated node of another partition samples ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free, each with its `LogRoom`. Only these keep ids.
-        self._droppable: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
+        # node -> the handles whose log hasn't recorded every prefill step yet
+        self._prefilling: dict[str, set[int]] = {node: set() for node in policies}
+        # node -> the handles whose pages a drop there can free, each with the slice of the pool its log takes. Only
+        # these keep a log.
+        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         self._allowance = StepAllowance() if allowance is None else allowance
@@ -196,7 +212,7 @@ class Rebuilds:
 
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
-        and its loop grows labels one rebuild row can lay out again, written in one of the policy's walks."""
+        and its loop grows labels its rebuild rows can lay out again, written in the policy's walks."""
         policy, layouts = self._policies.get(node), list(layouts)
         return (
             policy is not None and rebuild_refusal(layouts) is None
@@ -207,28 +223,28 @@ class Rebuilds:
             )
         )
 
-    def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
-        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
-        and the host copies of what each other span's walk read, or None when the pool can't hold it."""
-        spans = [span for layout in layouts for span in layout.spans]
-        ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
+    def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> HostSlice | None:
+        """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span as int32 and the host
+        copies of what each other span's walk read, or None when the pool can't hold it."""
         per_slot = self._policies[node].copy_bytes_per_slot
-        others = [span for span in spans if span.kind != SpanKind.IDS]
-        piece = self._pool.take(aligned(4 * ids) + sum(span.length * per_slot[span.walk] for span in others))
-        return None if piece is None else LogRoom(piece, sum(span.length for span in others))
+        return self._pool.take(sum(
+            aligned(4 * span.length) if span.kind == SpanKind.IDS else span.length * per_slot[span.walk]
+            for layout in layouts for span in layout.spans
+        ))
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
         layouts: Mapping[str, Collection[StreamLayout]], unpausable: bool,
     ) -> dict[str, bool]:
-        """For each paged KV cache in ``writes``, whether a drop here can free ``rid``'s pages there: one
-        rebuild row can lay out the request's ``layouts`` in that cache again, and every node that writes those
-        layouts can redo all of its writes. A node that writes nothing for the request isn't asked.
+        """For each paged KV cache in ``writes``, whether a drop here can free ``rid``'s pages there: rebuild rows
+        can lay out the request's ``layouts`` in that cache again, and every node that writes those layouts can redo
+        all of its writes. A node that writes nothing for the request isn't asked.
 
-        A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps
-        ``rid``'s ids only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
-        is False. It takes the pool's room for them now, so a request the pool can't hold is known before it is
-        admitted, and no drop can free it there."""
+        A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps a
+        log of ``rid`` only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
+        is False. It takes the pool's room for the log now, so a request the pool can't hold is known before it is
+        admitted, and no drop can free it there. The log's rows are the layout's prefill steps
+        (`StreamLayout.steps`)."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
         for key, nodes in writes.items():
@@ -241,87 +257,85 @@ class Rebuilds:
         taken = {}
         if not unpausable:
             for node in written.keys() - refused:
-                room = None if self._pool is None else self._log_room(node, written[node])
-                if room is None:
+                piece = None if self._pool is None else self._log_room(node, written[node])
+                if piece is None:
                     refused.add(node)
                 else:
-                    taken[node] = room
+                    taken[node] = piece
         rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
-        for node, room in taken.items():
+        for node, piece in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = room
+                self._droppable[node][rid] = piece
+                self._kept[node][rid] = KeptIds(tuple(
+                    LayoutRow(step[0].walk, sum(span.length for span in step))
+                    for layout in written[node] for step in layout.steps()
+                ))
+                self._prefilling[node].add(rid)
             else:
-                self._pool.give(room.piece)
+                self._pool.give(piece)
         return rebuildable
 
-    def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy a row's prompt into its request's slice once the step that read the prompt completes, when the row
-        is in one of the policy's walks, a drop here can free its request's pages, and the request keeps no ids
-        yet. A row of a walk that reads more than the ids gets its host copies after them (`keep_copies`)."""
-        policy = self._policies.get(node_batch.node_name)
-        if self._pool is None or policy is None:
-            return
-        walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
-        if walk not in policy.walks and policy.walks.isdisjoint(walks.values()):
-            return
-        kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
-        for rid, row in node_batch.per_request_input_tensors.items():
-            row_walk = walks.get(rid, walk)
-            # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
-                continue
-            tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
-            prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event, torch.int32)
-            copies = bool(self._copied[node_batch.node_name][row_walk])
-            kept[rid] = KeptIds(
-                copy, row_walk, prompt.dtype, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
-                tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies(droppable[rid].copied_slots) if copies else None,
-            )
-            if not copies:
-                self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
+    def record(self, node_batch: ExecutingBatch) -> None:
+        """Record each row of the step that runs the next prefill step of a request still prefilling here, on the
+        row's first chunk, which carries the step's whole input: its ids into the request's slice once the step
+        completes, its other inputs queued to follow them (`flush`), and its step metadata. Once the last step is
+        recorded the request keeps its samples, and the slice's unused tail goes back to the pool.
 
-    def keep_copies(self, node_batch: ExecutingBatch) -> None:
-        """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
-        request's slice after the ids. A request whose copies don't fit its slice,
-        which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
+        A step other than the one the request's layout says comes next, by walk or by length, one missing an input
+        the node reads, as a row the prefix cache served past its encoder, or one whose copies overrun the slice the
+        policy's ``copy_bytes_per_slot`` sized, leaves the request with no log, so it is never dropped."""
         node = node_batch.node_name
-        copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
-        walks = {walk for walk, names in copied.items() if names}
-        if not walks or not kept_ids:
+        prefilling = self._prefilling.get(node)
+        if not prefilling:
             return
-        # a step of no copied walk, such as every decode step, has no row to copy
-        ctx = node_batch.step_context
-        if ctx.graph_walk not in walks and walks.isdisjoint(ctx.request_walks.values()):
-            return
-        rows = []
-        for rid in node_batch.request_ids:
-            kept = kept_ids.get(rid)
-            # the prefill row of a request whose copies aren't taken yet
+        ctx, ids_input = node_batch.step_context, self._policies[node].ids_input
+        for rid, inputs in node_batch.per_request_input_tensors.items():
+            chunk, walk = node_batch.chunk_ranges.get(rid), ctx.walk_of(rid)
+            # A later chunk is cut from the input its first prepared, and a TP follower's unread row has no inputs,
+            # which the step fails. A step of a walk that prefills nothing, such as decode, isn't a prefill step.
             if (
-                kept is not None and kept.copies is not None and kept.copies.inputs is None
-                and node_batch.per_request_info[rid].graph_walk == kept.walk
+                rid not in prefilling or rid in ctx.rebuild_rids or not inputs or walk not in self._copied[node]
+                or not (chunk is None or chunk.is_first)
             ):
-                rows.append((rid, kept))
-        for rid, kept in rows:
-            piece, inputs = self._droppable[node][rid].piece, node_batch.per_request_input_tensors[rid]
-            tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
-            used = aligned(kept.prompt.view.nbytes)
-            if used + sum(aligned(tensor.nbytes) for _, tensor in tensors) > piece.nbytes:
+                continue
+            kept, piece = self._kept[node][rid], self._droppable[node][rid]
+            row = kept.rows[len(kept.records)]
+            names = sorted({ids_input, *self._copied[node][walk]})
+            tensors = [
+                (name, tensor.reshape(-1) if name == ids_input else tensor)
+                for name in names for tensor in inputs.get(name, ())
+            ]
+            nbytes = sum(aligned(tensor.numel() * _kept_dtype(tensor).itemsize) for _, tensor in tensors)
+            if (
+                walk != row.walk or (chunk is not None and chunk.total != row.length)
+                or not all(name in inputs for name in names) or kept.used + nbytes > piece.nbytes
+            ):
                 self._forget(node, rid)
                 continue
-            kept.copies.inputs = {name: [] for name in copied[kept.walk]}
+            record = RowRecord(
+                {name: [] for name in names}, {name: tensor.dtype for name, tensor in tensors},
+                dict(node_batch.per_request_info[rid].step_metadata),
+            )
             for name, tensor in tensors:
-                into = HostSlice(piece.offset + used, tensor.nbytes)
-                kept.copies.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
-                src = tensor.reshape(-1).view(torch.uint8)
-                self._queued.append(QueuedCopy(src, into, node_batch.completion_event, kept.copies))
-                kept.copies.queued += 1
-                used += aligned(tensor.nbytes)
-            self._trim(node, rid, used)
+                dtype = _kept_dtype(tensor)
+                into = HostSlice(piece.offset + kept.used, tensor.numel() * dtype.itemsize)
+                if dtype != tensor.dtype:
+                    copy = self._pool.copy_out(tensor, into, node_batch.completion_event, dtype)
+                    record.inputs[name].append(copy.view)
+                    record.landed = copy.landed
+                else:
+                    record.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
+                    self._queued.append(QueuedCopy(
+                        tensor.reshape(-1).view(torch.uint8), into, node_batch.completion_event, record,
+                    ))
+                    record.queued += 1
+                kept.used += aligned(into.nbytes)
+            kept.records.append(record)
+            if len(kept.records) == len(kept.rows):
+                prefilling.discard(rid)
+                self._trim(node, rid, kept.used)
 
     def flush(self) -> None:
         """Start the queued copies to the host, oldest first, up to what the step's allowance has left, once the
@@ -333,38 +347,40 @@ class Rebuilds:
             if not nbytes:
                 return
             copy = self._pool.copy_out(queued.src[:nbytes], HostSlice(queued.into.offset, nbytes), queued.after)
-            queued.copies.landed = copy.landed
+            queued.record.landed = copy.landed
             if nbytes < queued.src.numel():
                 self._queued[0] = queued._replace(
                     src=queued.src[nbytes:], into=HostSlice(queued.into.offset + nbytes, queued.into.nbytes - nbytes),
                 )
                 return
             self._queued.popleft()
-            queued.copies.queued -= 1
+            queued.record.queued -= 1
 
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
         keeps."""
-        room = self._droppable[node][rid]
-        if used < room.piece.nbytes:
-            self._pool.give(HostSlice(room.piece.offset + used, room.piece.nbytes - used))
-            self._droppable[node][rid] = room._replace(piece=HostSlice(room.piece.offset, used))
+        piece = self._droppable[node][rid]
+        if used < piece.nbytes:
+            self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
+            self._droppable[node][rid] = HostSlice(piece.offset, used)
 
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
-        if kept is not None and kept.copies is not None and kept.copies.queued:
+        self._prefilling[node].discard(rid)
+        if kept is not None and any(record.queued for record in kept.records):
             # its slice goes back to the pool, so no copy may start into it
-            self._queued = deque(queued for queued in self._queued if queued.copies is not kept.copies)
-        room = self._droppable[node].pop(rid, None)
-        if room is not None:
-            self._pool.give(room.piece)
+            records = {id(record) for record in kept.records}
+            self._queued = deque(queued for queued in self._queued if id(queued.record) not in records)
+        piece = self._droppable[node].pop(rid, None)
+        if piece is not None:
+            self._pool.give(piece)
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None, skip_rids: Collection[int] = (),
     ) -> None:
-        """Append each kept row's sample, from the stop check's host copy, to its kept ids. ``skip_rids``
-        are rows whose sample is not real, as for `Engine.step_finished`."""
+        """Append each kept row's sample, from the stop check's host copy, to its log, once its log holds every
+        prefill step. ``skip_rids`` are rows whose sample is not real, as for `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
@@ -390,10 +406,15 @@ class Rebuilds:
                 if sample.numel() != 1:
                     raise ValueError(self._not_one_id(node, name, sample.numel()))
                 pairs.append((rid, int(sample)))
+        prefilling = self._prefilling[node]
         for rid, token in pairs:
             kept = kept_ids.get(rid)
-            # the host rows are the forward's, which can hold a row the worker has since taken out of the step
-            if kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids:
+            # The host rows are the forward's, which can hold a row the worker has since taken out of the step. A
+            # prefill step before the last draws a token the model throws away.
+            if (
+                kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids
+                and rid not in prefilling
+            ):
                 kept.sampled.append(token)
 
     @staticmethod
@@ -406,22 +427,23 @@ class Rebuilds:
     def refusal(
         self, rid: int, node: str, walk: str, loop_iters: Mapping[str, int], prefilling: Prefilling | None,
     ) -> str | None:
-        """Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None. A request ``prefilling`` its
-        prompt is rebuilt from the input the engine keeps for the prompt, which covers what its KV holds. Any
-        other is rebuilt from its kept ids, which cover its KV when the prefill and each iteration of the
+        """Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None. Its rebuild reruns each prefill step
+        recorded before the one in progress from its record, which has to be on the host. A request ``prefilling``
+        its prompt reruns the step in progress from the input the engine keeps for the prompt. Any other reruns
+        every step its layout lays out, and its samples cover its KV when the prefill and each iteration of the
         policy's loop sampled one id, since the KV holds all but the last."""
         policy = self._policies.get(node)
         if policy is None:
             return f"{node} declares no rebuild policy"
-        if prefilling is not None:
-            return None
         kept = self._kept[node].get(rid)
         if kept is None:
-            return f"it keeps no ids on {node}"
-        if not kept.prompt.has_landed():
-            return "its ids haven't reached the host"
-        if kept.copies is not None and not kept.copies.ready():
-            return "its host copies haven't landed"
+            return f"it keeps no log on {node}"
+        if prefilling is None and len(kept.records) < len(kept.rows):
+            return "its prefill hasn't run every step its layout lays out"
+        if not all(record.ready() for record in (kept.records[:-1] if prefilling is not None else kept.records)):
+            return "its prefill steps' inputs haven't reached the host"
+        if prefilling is not None:
+            return None
         if walk not in self._loop_walks[node]:
             return f"it is in walk {walk!r}, where loop {policy.loop!r} doesn't run {node}"
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:
@@ -429,22 +451,23 @@ class Rebuilds:
         return None
 
     def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
-        """Open ``rid``'s rebuild on ``node``, and return what it writes from its kept ids, or None when it runs
-        the chunks its prompt was ``prefilling`` again, which the request's layout already describes."""
+        """Open ``rid``'s rebuild on ``node``, one row per prefill step from its records, and return what it writes
+        past its layout. A prompt ``prefilling`` its step in progress reruns that step's chunks last, and changes
+        nothing the layout says, so this returns None for it."""
         assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
-        if prefilling is not None:
-            self._cursors[(node, rid)] = RebuildCursor(prefilling.walk, prefilling.done, prefilling.total)
-            return None
         kept = self._kept[node][rid]
-        ids = array("i", kept.prompt.view.numpy().tobytes())
-        ids.extend(kept.sampled)
-        # the row writes every id but the last, and the slots its host copies fill
-        slots = len(ids) - 1 + (0 if kept.copies is None else kept.copies.slots)
-        cursor = RebuildCursor(
-            kept.walk, slots, slots, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
-        )
-        self._cursors[(node, rid)] = cursor
-        return Rebuild(kept.sampled)
+        records = kept.records if prefilling is None else kept.records[:-1]
+        rows = [
+            PlannedRow(row.walk, row.length, row.length, record)
+            for row, record in zip(kept.rows[:len(records)], records, strict=True)
+        ]
+        if prefilling is not None:
+            rows.append(PlannedRow(prefilling.walk, prefilling.done, prefilling.total, None))
+        else:
+            grown = len(kept.sampled) - 1
+            rows[-1] = rows[-1]._replace(total=rows[-1].total + grown, length=rows[-1].length + grown)
+        self._cursors[(node, rid)] = RebuildCursor(tuple(rows), kept.sampled)
+        return None if prefilling is not None else Rebuild(kept.sampled)
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors
@@ -459,41 +482,55 @@ class Rebuilds:
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
     ) -> list[torch.Event]:
-        """Give each rebuild row of ``rids`` its walk, a row from kept ids its prefill's step metadata, and its kept
-        ids and host copies on the device when it runs its first chunk or runs whole, and return the events the step
-        waits on before it reads the copies. The ids
-        are split as its prefill row read them, with the ids sampled since appended to the last tensor. A later
-        chunk is cut from the input the engine prepared on the first, and every chunk of a prompt's rebuild from
-        the input the engine keeps for the prompt."""
-        ids_input, ready = self._policies[node].ids_input, []
+        """Give each rebuild row of ``rids`` its row's walk and its step's metadata, and its record's inputs on the
+        device when it runs its first chunk or runs whole, and return the events the step waits on before it reads
+        them. The last row's ids get every id sampled since but the newest. A later chunk is cut from the input the
+        engine prepared on the first, and every chunk of a prompt's step in progress from the input the engine
+        keeps for the prompt."""
+        ready = []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
-            copies = cursor.copies
-            infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
-            if cursor.ids is not None:
-                infos[rid] = replace(infos[rid], step_metadata=cursor.step_metadata)
+            record = cursor.rows[cursor.row].record
+            if record is None:
+                infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
+                continue
+            infos[rid] = replace(infos[rid], graph_walk=cursor.walk, step_metadata=record.step_metadata)
             chunk = chunk_ranges.get(rid)
-            if cursor.ids is not None and (chunk is None or chunk.is_first):
-                ids = to_device_nonblocking(_row_ids(cursor).to(cursor.dtype), self._pool.device)
-                head = cursor.lengths[:-1] if cursor.lengths else ()
-                inputs[rid] = {ids_input: list(ids.split([*head, len(ids) - sum(head)]))}
-                for name, views in (copies.inputs if copies is not None else {}).items():
-                    inputs[rid][name] = []
-                    for view in views:
-                        tensor, landed = self._pool.copy_in(view)
-                        inputs[rid][name].append(tensor)
-                        ready += [landed] if landed is not None else []
+            if chunk is None or chunk.is_first:
+                inputs[rid] = self._row_inputs(node, cursor, record, ready)
         return ready
 
-    def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RebuildCursor | None:
-        """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its
-        cursor once the rebuild has finished."""
+    def _row_inputs(
+        self, node: str, cursor: RebuildCursor, record: RowRecord, ready: list[torch.Event],
+    ) -> NameToTensorList:
+        ids_input, inputs = self._policies[node].ids_input, {}
+        for name, views in record.inputs.items():
+            host, dtype = list(views), record.dtypes[name]
+            if name == ids_input and cursor.row == len(cursor.rows) - 1 and len(cursor.sampled) > 1:
+                host[-1] = torch.cat([host[-1], torch.frombuffer(cursor.sampled, dtype=torch.int32)[:-1]])
+            inputs[name] = []
+            for tensor in host:
+                if tensor.dtype != dtype:
+                    inputs[name].append(to_device_nonblocking(tensor.to(dtype), self._pool.device))
+                    continue
+                tensor, landed = self._pool.copy_in(tensor)
+                inputs[name].append(tensor)
+                ready += [landed] if landed is not None else []
+        return inputs
+
+    def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RowRun | None:
+        """Record that ``rid``'s rebuild ran ``chunk`` of its row, or the rest of the row with no chunk, and return
+        the row once it has run. The rebuild then moves to its next row, and ends after its last."""
         cursor = self._cursors[(node, rid)]
         cursor.ran += cursor.total - cursor.done if chunk is None else chunk.end - chunk.start
         cursor.done = cursor.total if chunk is None else chunk.end
         if cursor.done < cursor.total:
             return None
-        return self._cursors.pop((node, rid))
+        run = RowRun(cursor.rows[cursor.row], cursor.ran)
+        cursor.row, cursor.done, cursor.ran = cursor.row + 1, 0, 0
+        if cursor.row == len(cursor.rows):
+            del self._cursors[(node, rid)]
+        return run
 
     def remove_request(self, rid: int) -> None:
         for node in self._kept:
@@ -501,5 +538,7 @@ class Rebuilds:
             self._cursors.pop((node, rid), None)
 
 
-def _row_ids(cursor: RebuildCursor) -> torch.Tensor:
-    return torch.frombuffer(cursor.ids, dtype=torch.int32)[:-1]
+
+def _kept_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """The dtype a log keeps ``tensor`` in: ids, read as int64, as int32."""
+    return torch.int32 if tensor.dtype == torch.int64 else tensor.dtype

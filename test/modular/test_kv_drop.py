@@ -142,25 +142,21 @@ IMAGE = PrefixSpan(6, 4, WALK, kind="digest", opens_step=False)
 @pytest.mark.parametrize("layout, why", [
     ("two labels", "more than one label"),
     ("two loops", "more than one label or growth loop"),
-    ("two walks", "more than one walk"),
-    ("two steps", "more than one step"),
     ("image last", "ends on a span of no ids"),
-    ("keyed text around an image", "can't key again"),
+    ("keys short of the image", "keys only part of its prompt"),
 ])
-def test_a_layout_one_row_couldnt_write_again_is_refused(layout, why):
+def test_a_layout_its_rebuild_rows_couldnt_write_again_is_refused(layout, why):
     main = _config(list(range(PAGE_SIZE))).kv_layout["main"]
     (text,) = main.spans
     tail = replace(text, opens_step=False)
     layouts = {
         "two labels": [main, main],
         "two loops": [replace(main, growth=(*main.growth, ("other_loop", 1)))],
-        "two walks": [replace(main, spans=(text, replace(IMAGE, walk="vit"), tail))],  # as a Bagel image chat
-        "two steps": [replace(main, spans=(text, text))],  # as a prompt prefilled over two rows
         "image last": [replace(main, spans=(text, IMAGE))],
-        "keyed text around an image": [replace(main, spans=(text, IMAGE, tail), keyed_spans=3)],
+        "keys short of the image": [replace(main, spans=(text, IMAGE, tail), keyed_spans=1)],
     }[layout]
 
-    assert why in (rebuild_refusal(layouts) or ""), f"one rebuild row would write {layout} again"
+    assert why in (rebuild_refusal(layouts) or ""), f"rebuild rows would write {layout} again"
 
 
 def test_a_second_drop_before_the_rebuild_lands_is_refused():
