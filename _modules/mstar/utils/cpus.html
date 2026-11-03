@@ -993,20 +993,36 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">with ``deployment_plan`` from the same inputs (the knob, the mask, the</span>
 <span class="sd">deployment's devices), so they agree on it without talking.</span>
 
-<span class="sd">Placement under ``auto`` is by the device's rank among the host's GPUs on its</span>
-<span class="sd">NUMA node, as sysfs lists them (every GPU of the host, not only the ones this</span>
-<span class="sd">process was given), so servers on different GPUs pick different CPUs without</span>
-<span class="sd">knowing about each other. A worker takes the core at its device's rank from the</span>
-<span class="sd">bottom of the node's allowed CPUs, the API server the core at its first</span>
-<span class="sd">device's rank from the top, so the cores a GPU picks from must hold two per GPU</span>
-<span class="sd">or ``auto`` pins nothing. Servers on one GPU can't be told apart that way, so</span>
-<span class="sd">the first holds a lock on it (``claim_gpus``) and the next pins nothing.</span>
+<span class="sd">Placement under ``always`` and ``siblings`` is by the device's rank among the</span>
+<span class="sd">host's GPUs on its NUMA node, as sysfs lists them (every GPU of the host, not</span>
+<span class="sd">only the ones this process was given), so servers on different GPUs pick</span>
+<span class="sd">different CPUs without knowing about each other. The API server takes the core</span>
+<span class="sd">at its first device's rank from the top of the node's allowed CPUs, and a worker</span>
+<span class="sd">the step unit at its device's rank from the bottom of the cores below the API</span>
+<span class="sd">servers'. Under ``always`` a unit is ``STEP_CORES`` cores, one hardware thread</span>
+<span class="sd">of each, so the cores a GPU picks from must hold four per GPU, and no two pinned</span>
+<span class="sd">threads share a core; ``siblings`` (``_siblings``) puts a worker on one core's</span>
+<span class="sd">hardware threads instead. A mask too small across the host may still do for the</span>
+<span class="sd">GPUs this container can open, which are the only ones that can share it, so those</span>
+<span class="sd">rank instead; failing that, nothing is pinned. Servers on one GPU can't be told</span>
+<span class="sd">apart by rank, so the first holds a lock on it (``claim_gpus``) and the next</span>
+<span class="sd">pins nothing.</span>
+
+<span class="sd">Pinning can pay where a thread woken on an idle core waits for that core to</span>
+<span class="sd">leave a deep idle state, and costs throughput where it doesn't, since the</span>
+<span class="sd">threads only queue on their CPUs. Which layout pays depends on the host: on a</span>
+<span class="sd">deep-idle Xeon one core's hardware threads beat no pin and separate cores lost</span>
+<span class="sd">to it, while one core's hardware threads lost on two H200 hosts. So ``auto``</span>
+<span class="sd">pins nothing and logs why (``_auto_declines``): the reason names the idle hold,</span>
+<span class="sd">a CPU vendor other than Intel, idle states under ``DEEP_IDLE_US``</span>
+<span class="sd">(``deepest_idle``), or what the separate cores measured.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
@@ -1015,10 +1031,30 @@ window.runMermaid = runMermaid;</script>
 <span class="n">_CGROUP_ROOT</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/sys/fs/cgroup"</span><span class="p">)</span>
 <span class="n">_PCI_DEVICES</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/sys/bus/pci/devices"</span><span class="p">)</span>
 <span class="n">_CPU_TOPOLOGY</span> <span class="o">=</span> <span class="s2">"/sys/devices/system/cpu/cpu</span><span class="si">{}</span><span class="s2">/topology/thread_siblings_list"</span>
+<span class="n">_CPU_CLUSTER</span> <span class="o">=</span> <span class="s2">"/sys/devices/system/cpu/cpu</span><span class="si">{}</span><span class="s2">/topology/cluster_cpus_list"</span>
+<span class="n">_CPU_ROOT</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/sys/devices/system/cpu"</span><span class="p">)</span>
+<span class="n">_CPUINFO</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/proc/cpuinfo"</span><span class="p">)</span>
+<span class="n">_PM_QOS_DEVICE</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/dev/cpu_dma_latency"</span><span class="p">)</span>
 <span class="c1"># not TMPDIR: every server on the host has to find the same file</span>
 <span class="n">_GPU_LOCK_DIR</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="s2">"/tmp"</span><span class="p">)</span>
 
 <span class="n">PINNABLE</span> <span class="o">=</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">os</span><span class="p">,</span> <span class="s2">"sched_setaffinity"</span><span class="p">)</span>
+
+<span class="c1"># Exit latency, in µs, from which a handoff to a sleeping core costs more than</span>
+<span class="c1"># queueing on a pinned one. VM-exposed and C1-class states sit well below it,</span>
+<span class="c1"># the C6 class well above.</span>
+<span class="n">DEEP_IDLE_US</span> <span class="o">=</span> <span class="mi">100</span>
+<span class="c1"># settings that place by the GPU's rank</span>
+<span class="n">PLACED</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"always"</span><span class="p">,</span> <span class="s2">"siblings"</span><span class="p">)</span>
+<span class="c1"># Physical cores one worker's main, GPU and plan threads share under ``always``,</span>
+<span class="c1"># one hardware thread of each: a woken step thread finds a CPU of its own, and</span>
+<span class="c1"># none of them shares a core's execution units with another.</span>
+<span class="n">STEP_CORES</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="c1"># CPU latency the idle hold asks for: admits C1 and C1E, refuses the C6 class</span>
+<span class="n">IDLE_HOLD_US</span> <span class="o">=</span> <span class="mi">10</span>
+<span class="c1"># ``/proc/cpuinfo`` vendors ``auto``'s measurements come from (Xeon 6767P and</span>
+<span class="c1"># 6740E hosts); elsewhere its reason says so rather than quote them</span>
+<span class="n">AUTO_VENDORS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"GenuineIntel"</span><span class="p">,)</span>
 
 
 <span class="c1"># ── CPU lists ───────────────────────────────────────────────────────────────</span>
@@ -1112,8 +1148,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="StepCpus">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.StepCpus">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">StepCpus</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The CPUs one worker's main, GPU and plan threads share (one core's</span>
-<span class="sd">    hardware threads in the mask), and how they were chosen, for the log."""</span>
+<span class="w">    </span><span class="sd">"""The CPUs one worker's main, GPU and plan threads share, and how they</span>
+<span class="sd">    were chosen, for the log."""</span>
     <span class="n">cpus</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">why</span><span class="p">:</span> <span class="nb">str</span></div>
 
@@ -1131,6 +1167,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">workers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">StepCpus</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="n">result</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">why</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"step_thread_core off"</span>
+    <span class="c1"># auto chose not to pin here, which is no fault of the deployment's</span>
+    <span class="n">declined</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">pinned</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
@@ -1277,6 +1315,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="l2_cluster">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.l2_cluster">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">l2_cluster</span><span class="p">(</span><span class="n">cpu</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The CPUs sharing ``cpu``'s L2 cluster, ``cpu`` included."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">_CPU_CLUSTER</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">cpu</span><span class="p">))</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">parse_cpu_list</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">())</span> <span class="o">|</span> <span class="p">{</span><span class="n">cpu</span><span class="p">}</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">OSError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">({</span><span class="n">cpu</span><span class="p">})</span></div>
+
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_cores</span><span class="p">(</span><span class="n">cpus</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">siblings</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
 <span class="w">    </span><span class="sd">"""``cpus`` grouped by physical core (each core's CPUs within ``cpus``, in</span>
 <span class="sd">    order), cores ordered by their first CPU."""</span>
@@ -1284,13 +1334,145 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">cores</span><span class="p">)</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_Unit</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The CPUs one worker's step threads share, and the physical cores they</span>
+<span class="sd">    come from."""</span>
+    <span class="n">cpus</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">cores</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_Layout</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""How a placing setting cuts a pool's cores into workers' step units, and</span>
+<span class="sd">    what each GPU needs, for the log."""</span>
+    <span class="n">units</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]],</span> <span class="nb">list</span><span class="p">[</span><span class="n">_Unit</span><span class="p">]]</span>
+    <span class="n">need</span><span class="p">:</span> <span class="nb">str</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_spread</span><span class="p">(</span><span class="n">cores</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">_Unit</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``cores`` taken ``STEP_CORES`` at a time, in order, one hardware thread</span>
+<span class="sd">    of each: a worker's step threads under ``always``."""</span>
+    <span class="n">groups</span> <span class="o">=</span> <span class="p">(</span><span class="n">cores</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span> <span class="o">+</span> <span class="n">STEP_CORES</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">cores</span><span class="p">)</span> <span class="o">-</span> <span class="n">STEP_CORES</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">STEP_CORES</span><span class="p">))</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">_Unit</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">core</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">group</span><span class="p">),</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">group</span><span class="p">))</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_paired</span><span class="p">(</span><span class="n">cores</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="n">cluster</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""``cores`` with each run of one-CPU cores of an L2 cluster taken two at a</span>
+<span class="sd">    time, in the same order."""</span>
+    <span class="n">alone</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">cores</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">core</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">alone</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">cluster</span><span class="p">(</span><span class="n">core</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">core</span><span class="p">)</span>
+    <span class="c1"># a core -&gt; the pair it leads, or None if it follows one</span>
+    <span class="n">merged</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">members</span> <span class="ow">in</span> <span class="n">alone</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">first</span><span class="p">,</span> <span class="n">second</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">members</span><span class="p">[::</span><span class="mi">2</span><span class="p">],</span> <span class="n">members</span><span class="p">[</span><span class="mi">1</span><span class="p">::</span><span class="mi">2</span><span class="p">],</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+            <span class="n">merged</span><span class="p">[</span><span class="n">first</span><span class="p">],</span> <span class="n">merged</span><span class="p">[</span><span class="n">second</span><span class="p">]</span> <span class="o">=</span> <span class="n">first</span> <span class="o">+</span> <span class="n">second</span><span class="p">,</span> <span class="kc">None</span>
+    <span class="n">placed</span> <span class="o">=</span> <span class="p">(</span><span class="n">merged</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">core</span><span class="p">,</span> <span class="n">core</span><span class="p">)</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">cores</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">core</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">placed</span> <span class="k">if</span> <span class="n">core</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_siblings</span><span class="p">(</span><span class="n">cores</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="n">cluster</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">_Unit</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``step_thread_core: siblings``: a worker's step threads on all hardware</span>
+<span class="sd">    threads of one core, or on two cores of an L2 cluster where a core has one</span>
+<span class="sd">    CPU in the mask. The core (or cluster) stays awake while any of the three</span>
+<span class="sd">    runs, so a handoff rarely waits for it to leave a deep idle state, but the</span>
+<span class="sd">    three share its execution units.</span>
+
+<span class="sd">    Qwen3.5-0.8B tok/s at c=1 / c=8 on 8 cores of the server's mask: Xeon</span>
+<span class="sd">    6767P (SMT, an L2 per core, C6 at 170 µs) 808 / 5670 against 548 / 3939</span>
+<span class="sd">    with no pin and 526 / 3851 on three cores of their own; Xeon 6740E (no SMT,</span>
+<span class="sd">    four cores to an L2 cluster) 527 / 3635 against 371 / 2688. With a</span>
+<span class="sd">    ``SCHED_IDLE`` spinner holding the 6767P's cores awake it lost at c=1, 753</span>
+<span class="sd">    against 906 with no pin. On two H200 hosts with SMT it lost to no pin: c=1</span>
+<span class="sd">    506 against 634 on a 2-socket AMD EPYC (C2 at 800 µs), 13-26% at c=1-32 on</span>
+<span class="sd">    the other. So ``auto`` never takes it."""</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">_Unit</span><span class="p">(</span><span class="n">unit</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">core</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">cores</span> <span class="k">if</span> <span class="n">core</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">in</span> <span class="n">unit</span><span class="p">))</span> <span class="k">for</span> <span class="n">unit</span> <span class="ow">in</span> <span class="n">_paired</span><span class="p">(</span><span class="n">cores</span><span class="p">,</span> <span class="n">cluster</span><span class="p">)]</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_step_cpus</span><span class="p">(</span><span class="n">core</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">why</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StepCpus</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""A worker's step threads on all of ``core``'s hardware threads in the</span>
-<span class="sd">    mask. On one CPU the three queue behind each other (a Qwen3-TTS worker's</span>
-<span class="sd">    main thread alone keeps about 0.6 of a CPU busy at c=1); on the core's two</span>
-<span class="sd">    hardware threads there is room, and a woken thread still finds the core</span>
-<span class="sd">    awake."""</span>
+<span class="w">    </span><span class="sd">"""A worker's step threads on all of ``core``'s CPUs: what a</span>
+<span class="sd">    ``step_thread_core`` number gives each worker."""</span>
     <span class="k">return</span> <span class="n">StepCpus</span><span class="p">(</span><span class="nb">frozenset</span><span class="p">(</span><span class="n">core</span><span class="p">),</span> <span class="n">why</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="cpu_vendor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.cpu_vendor">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">cpu_vendor</span><span class="p">(</span><span class="n">cpuinfo</span><span class="p">:</span> <span class="n">Path</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The first ``vendor_id`` ``/proc/cpuinfo`` lists (``GenuineIntel``,</span>
+<span class="sd">    ``AuthenticAMD``); None where it lists none, as on Arm, or can't be read."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">cpuinfo</span> <span class="ow">or</span> <span class="n">_CPUINFO</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">key</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">line</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="s2">":"</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="o">==</span> <span class="s2">"vendor_id"</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="ow">or</span> <span class="kc">None</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+        <span class="k">pass</span>
+    <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<span class="c1"># ── how deep the host sleeps ────────────────────────────────────────────────</span>
+
+<div class="viewcode-block" id="IdleState">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.IdleState">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">IdleState</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""An idle state a CPU may enter, as sysfs names it, with its exit latency."""</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">latency_us</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="deepest_idle">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.deepest_idle">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">deepest_idle</span><span class="p">(</span><span class="n">cpus</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">root</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">_CPU_ROOT</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IdleState</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The idle state of ``cpus`` with the longest exit latency, leaving out</span>
+<span class="sd">    states disabled in sysfs; None where sysfs lists none (a VM that exposes</span>
+<span class="sd">    no cpuidle)."""</span>
+    <span class="n">deepest</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="k">for</span> <span class="n">cpu</span> <span class="ow">in</span> <span class="n">cpus</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">states</span> <span class="o">=</span> <span class="nb">list</span><span class="p">((</span><span class="n">root</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"cpu</span><span class="si">{</span><span class="n">cpu</span><span class="si">}</span><span class="s2">"</span> <span class="o">/</span> <span class="s2">"cpuidle"</span><span class="p">)</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="s2">"state*"</span><span class="p">))</span>
+        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="k">for</span> <span class="n">state</span> <span class="ow">in</span> <span class="n">states</span><span class="p">:</span>
+            <span class="n">latency</span><span class="p">,</span> <span class="n">name</span> <span class="o">=</span> <span class="n">_read</span><span class="p">(</span><span class="n">state</span> <span class="o">/</span> <span class="s2">"latency"</span><span class="p">),</span> <span class="n">_read</span><span class="p">(</span><span class="n">state</span> <span class="o">/</span> <span class="s2">"name"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">latency</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">latency</span><span class="o">.</span><span class="n">isdigit</span><span class="p">()</span> <span class="ow">or</span> <span class="n">_read</span><span class="p">(</span><span class="n">state</span> <span class="o">/</span> <span class="s2">"disable"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">deepest</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">int</span><span class="p">(</span><span class="n">latency</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">deepest</span><span class="o">.</span><span class="n">latency_us</span><span class="p">:</span>
+                <span class="n">deepest</span> <span class="o">=</span> <span class="n">IdleState</span><span class="p">(</span><span class="n">name</span> <span class="ow">or</span> <span class="n">state</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">latency</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">deepest</span></div>
+
+
+
+<span class="n">_idle_hold_fd</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+
+<div class="viewcode-block" id="hold_idle">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.hold_idle">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">hold_idle</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">_PM_QOS_DEVICE</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Hold a PM QoS CPU latency request of ``IDLE_HOLD_US`` for the life of</span>
+<span class="sd">    this process, and say what happened, for the log. The kernel keeps every</span>
+<span class="sd">    CPU of the host out of idle states slower than that while the fd stays</span>
+<span class="sd">    open, and drops the request however the process exits. Failing to get it</span>
+<span class="sd">    costs only the hold, so this never raises."""</span>
+    <span class="k">global</span> <span class="n">_idle_hold_fd</span>
+    <span class="k">if</span> <span class="n">_idle_hold_fd</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"idle_hold qos: already holding </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">fd</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">O_WRONLY</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"idle_hold qos: nothing held, </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="s2"> is absent (a container often hides it)"</span>
+    <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"idle_hold qos: nothing held, can't open </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">strerror</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">IDLE_HOLD_US</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="n">sys</span><span class="o">.</span><span class="n">byteorder</span><span class="p">))</span>
+    <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">)</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"idle_hold qos: nothing held, can't write </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">strerror</span><span class="si">}</span><span class="s2">"</span>
+    <span class="n">_idle_hold_fd</span> <span class="o">=</span> <span class="n">fd</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"idle_hold qos: holding </span><span class="si">{</span><span class="n">device</span><span class="si">}</span><span class="s2"> at </span><span class="si">{</span><span class="n">IDLE_HOLD_US</span><span class="si">}</span><span class="s2"> µs for this server's life"</span></div>
+
 
 
 <span class="c1"># ── building it ─────────────────────────────────────────────────────────────</span>
@@ -1305,17 +1487,24 @@ window.runMermaid = runMermaid;</script>
     <span class="n">usable</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">pci_root</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">_PCI_DEVICES</span><span class="p">,</span>
     <span class="n">siblings</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">smt_siblings</span><span class="p">,</span>
+    <span class="n">cluster</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">l2_cluster</span><span class="p">,</span>
+    <span class="n">cpu_root</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">_CPU_ROOT</span><span class="p">,</span>
+    <span class="n">reachable</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="n">cpuinfo</span><span class="p">:</span> <span class="n">Path</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">idle_hold</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"off"</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CpuPlan</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The plan for a deployment whose workers' devices sit at PCI</span>
 <span class="sd">    ``addresses``, in the conductor's worker order (None for a device sysfs</span>
-<span class="sd">    doesn't place, such as a CPU worker; only ``auto`` reads them).</span>
+<span class="sd">    doesn't place, such as a CPU worker; only ``always`` and ``siblings``</span>
+<span class="sd">    read them), and ``reachable`` the GPUs this container can open.</span>
 
-<span class="sd">    ``off`` pins nothing. A CPU number is the first worker's CPU; the next</span>
-<span class="sd">    workers take the next cores above it, and the API server the last core of</span>
-<span class="sd">    the mask; a number outside the mask, or too near its top for every worker,</span>
-<span class="sd">    raises ``CpuPlanError``. ``auto`` places by device rank (module docstring),</span>
-<span class="sd">    and pins nothing, saying why in ``CpuPlan.why``, when the mask is too small.</span>
-<span class="sd">    Either way at least one CPU of the mask stays unpinned.</span>
+<span class="sd">    ``off`` pins nothing, and ``auto`` pins nothing and says why. A CPU number</span>
+<span class="sd">    is the first worker's core; the next workers take the next cores above it,</span>
+<span class="sd">    and the API server the last core of the mask; a number outside the mask,</span>
+<span class="sd">    or too near its top for every worker, raises ``CpuPlanError``. ``always``</span>
+<span class="sd">    and ``siblings`` place by device rank (module docstring), and pin nothing,</span>
+<span class="sd">    saying why in ``CpuPlan.why``, when the mask is too small. At least one CPU</span>
+<span class="sd">    of the mask stays unpinned.</span>
 <span class="sd">    """</span>
     <span class="n">mask</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">process_mask</span><span class="p">()</span> <span class="k">if</span> <span class="n">mask</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">mask</span><span class="p">)</span>
     <span class="n">usable</span> <span class="o">=</span> <span class="n">usable_cpus</span><span class="p">()</span> <span class="k">if</span> <span class="n">usable</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">usable</span>
@@ -1323,9 +1512,22 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">CpuPlan</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">usable</span><span class="p">,</span> <span class="n">why</span><span class="o">=</span><span class="s2">"step_thread_core off"</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">PINNABLE</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">CpuPlan</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">usable</span><span class="p">,</span> <span class="n">why</span><span class="o">=</span><span class="s2">"not pinned: no sched_setaffinity here"</span><span class="p">)</span>
-    <span class="n">cores</span> <span class="o">=</span> <span class="n">_cores</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">setting</span> <span class="o">==</span> <span class="s2">"auto"</span><span class="p">:</span>
-        <span class="n">placed</span> <span class="o">=</span> <span class="n">_auto</span><span class="p">(</span><span class="n">addresses</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores</span><span class="p">,</span> <span class="n">pci_root</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span>
+        <span class="n">declined</span> <span class="o">=</span> <span class="n">_auto_declines</span><span class="p">(</span><span class="n">idle_hold</span><span class="p">,</span> <span class="n">cpu_vendor</span><span class="p">(</span><span class="n">cpuinfo</span><span class="p">),</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cpu_root</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">CpuPlan</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">usable</span><span class="p">,</span> <span class="n">why</span><span class="o">=</span><span class="sa">f</span><span class="s2">"not pinned: </span><span class="si">{</span><span class="n">declined</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">declined</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">cores</span> <span class="o">=</span> <span class="n">_cores</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">setting</span> <span class="ow">in</span> <span class="n">PLACED</span><span class="p">:</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">cores_of</span><span class="p">(</span><span class="n">cpus</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
+            <span class="k">return</span> <span class="n">_cores</span><span class="p">(</span><span class="n">cpus</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">setting</span> <span class="o">==</span> <span class="s2">"siblings"</span><span class="p">:</span>
+            <span class="n">layout</span> <span class="o">=</span> <span class="n">_Layout</span><span class="p">(</span><span class="k">lambda</span> <span class="n">cores</span><span class="p">:</span> <span class="n">_siblings</span><span class="p">(</span><span class="n">cores</span><span class="p">,</span> <span class="n">cluster</span><span class="p">),</span>
+                             <span class="s2">"2, one for its worker's step threads and one for its API server (3 where a core has "</span>
+                             <span class="s2">"one CPU in the mask)"</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">layout</span> <span class="o">=</span> <span class="n">_Layout</span><span class="p">(</span><span class="n">_spread</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">STEP_CORES</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">STEP_CORES</span><span class="si">}</span><span class="s2"> for its worker's step threads, 1 for its API "</span>
+                                      <span class="s2">"server)"</span><span class="p">)</span>
+        <span class="n">placed</span> <span class="o">=</span> <span class="n">_by_rank</span><span class="p">(</span><span class="n">setting</span><span class="p">,</span> <span class="n">addresses</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores_of</span><span class="p">,</span> <span class="n">layout</span><span class="p">,</span> <span class="n">pci_root</span><span class="p">,</span> <span class="n">reachable</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">placed</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">CpuPlan</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">usable</span><span class="p">,</span> <span class="n">why</span><span class="o">=</span><span class="sa">f</span><span class="s2">"not pinned: </span><span class="si">{</span><span class="n">placed</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="n">workers</span><span class="p">,</span> <span class="n">result</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">placed</span>
@@ -1335,11 +1537,43 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">pinned</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">mask</span><span class="p">):</span>
         <span class="n">reason</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">addresses</span><span class="p">)</span><span class="si">}</span><span class="s2"> worker(s) and the API server would pin all </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span><span class="si">}</span><span class="s2"> CPU(s) "</span>
                   <span class="sa">f</span><span class="s2">"of the process mask </span><span class="si">{</span><span class="n">format_cpu_list</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span><span class="si">}</span><span class="s2">, leaving none for the rest"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">setting</span> <span class="o">==</span> <span class="s2">"auto"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">setting</span> <span class="ow">in</span> <span class="n">PLACED</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">CpuPlan</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">usable</span><span class="p">,</span> <span class="n">why</span><span class="o">=</span><span class="sa">f</span><span class="s2">"not pinned: </span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">raise</span> <span class="n">CpuPlanError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"step_thread_core </span><span class="si">{</span><span class="n">setting</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">out</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_auto_declines</span><span class="p">(</span><span class="n">idle_hold</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">vendor</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">mask</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">cpu_root</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why ``auto`` leaves this host's threads alone. No host it can tell</span>
+<span class="sd">    apart has a measurement in which its layout beats no pin yet, so the</span>
+<span class="sd">    answer is never None; the reason names what the host has."""</span>
+    <span class="n">anyway</span> <span class="o">=</span> <span class="s2">"step_thread_core always pins anyway"</span>
+    <span class="k">if</span> <span class="n">idle_hold</span> <span class="o">!=</span> <span class="s2">"off"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"idle_hold </span><span class="si">{</span><span class="n">idle_hold</span><span class="si">}</span><span class="s2"> keeps the cores out of deep idle, where pinning measured no faster than none "</span>
+                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="n">anyway</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">vendor</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">AUTO_VENDORS</span><span class="p">:</span>
+        <span class="n">this</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"this host's is </span><span class="si">{</span><span class="n">vendor</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">vendor</span> <span class="k">else</span> <span class="s2">"/proc/cpuinfo names no vendor here"</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"auto is measured on Intel hosts only and </span><span class="si">{</span><span class="n">this</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">anyway</span><span class="si">}</span><span class="s2">)"</span>
+    <span class="n">shallow</span> <span class="o">=</span> <span class="n">_no_deep_idle</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">cpu_root</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">shallow</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">shallow</span>
+    <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"on an Intel host whose cores sleep deep, the step threads on </span><span class="si">{</span><span class="n">STEP_CORES</span><span class="si">}</span><span class="s2"> cores of their own measured "</span>
+            <span class="sa">f</span><span class="s2">"no faster than no pin; step_thread_core siblings, one core's hardware threads, measured faster there "</span>
+            <span class="sa">f</span><span class="s2">"but lost on other hosts (</span><span class="si">{</span><span class="n">anyway</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_no_deep_idle</span><span class="p">(</span><span class="n">mask</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">cpu_root</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why the mask's CPUs don't pay for pinning; None when they do."""</span>
+    <span class="n">deepest</span> <span class="o">=</span> <span class="n">deepest_idle</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">cpu_root</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">deepest</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">where</span> <span class="o">=</span> <span class="s2">"sysfs lists no idle state"</span>
+    <span class="k">elif</span> <span class="n">deepest</span><span class="o">.</span><span class="n">latency_us</span> <span class="o">&lt;</span> <span class="n">DEEP_IDLE_US</span><span class="p">:</span>
+        <span class="n">where</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"the deepest idle state is </span><span class="si">{</span><span class="n">deepest</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> at </span><span class="si">{</span><span class="n">deepest</span><span class="o">.</span><span class="n">latency_us</span><span class="si">}</span><span class="s2"> µs"</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2"> on CPUs </span><span class="si">{</span><span class="n">format_cpu_list</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span><span class="si">}</span><span class="s2">, under the </span><span class="si">{</span><span class="n">DEEP_IDLE_US</span><span class="si">}</span><span class="s2"> µs from which pinning could pay "</span>
+            <span class="s2">"(step_thread_core always pins anyway)"</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_explicit</span><span class="p">(</span><span class="n">first</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">mask</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">cores</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]):</span>
@@ -1359,16 +1593,19 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_Pool</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The cores some GPUs pick from. A GPU's worker takes the core at ``rank``</span>
-<span class="sd">    from the bottom and its API server the one at ``rank`` from the top, so</span>
-<span class="sd">    they need two cores per GPU to stay apart."""</span>
+<span class="w">    </span><span class="sd">"""The physical cores some GPUs pick from. The top ``gpus`` cores are their</span>
+<span class="sd">    API servers', by ``rank`` from the top; a GPU's worker takes the step</span>
+<span class="sd">    units of the cores below at ``rank`` from the bottom."""</span>
     <span class="n">cores</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span>
     <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">gpus</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">why</span><span class="p">:</span> <span class="nb">str</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">units</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layout</span><span class="p">:</span> <span class="n">_Layout</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">_Unit</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="n">layout</span><span class="o">.</span><span class="n">units</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cores</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">gpus</span><span class="p">])</span>
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_gpu_pools</span><span class="p">(</span><span class="n">gpus</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_Pool</span><span class="p">]:</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_gpu_pools</span><span class="p">(</span><span class="n">gpus</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores_of</span><span class="p">,</span> <span class="n">layout</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_Pool</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Each host GPU's pool. A GPU with allowed CPUs on its node picks among</span>
 <span class="sd">    those by its rank on the node; the GPUs with none pick, by their rank among</span>
 <span class="sd">    themselves, from the cores those ranks leave."""</span>
@@ -1377,7 +1614,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">nodes</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">gpu</span><span class="o">.</span><span class="n">node</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gpu</span><span class="p">)</span>
     <span class="n">pools</span><span class="p">,</span> <span class="n">claimed</span> <span class="o">=</span> <span class="p">{},</span> <span class="nb">set</span><span class="p">()</span>
     <span class="k">for</span> <span class="n">members</span> <span class="ow">in</span> <span class="n">nodes</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-        <span class="n">local</span> <span class="o">=</span> <span class="n">_cores</span><span class="p">(</span><span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">local</span> <span class="o">&amp;</span> <span class="n">mask</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span> <span class="k">if</span> <span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">local</span> <span class="k">else</span> <span class="p">[]</span>
+        <span class="n">local</span> <span class="o">=</span> <span class="n">cores_of</span><span class="p">(</span><span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">local</span> <span class="o">&amp;</span> <span class="n">mask</span><span class="p">)</span> <span class="k">if</span> <span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">local</span> <span class="k">else</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">local</span><span class="p">:</span>
             <span class="k">continue</span>
         <span class="n">count</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">members</span><span class="p">)</span>
@@ -1385,9 +1622,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">rank</span><span class="p">,</span> <span class="n">gpu</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">members</span><span class="p">):</span>
             <span class="n">pools</span><span class="p">[</span><span class="n">gpu</span><span class="o">.</span><span class="n">address</span><span class="p">]</span> <span class="o">=</span> <span class="n">_Pool</span><span class="p">(</span>
                 <span class="n">local</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">count</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"GPU </span><span class="si">{</span><span class="n">rank</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="si">}</span><span class="s2"> of </span><span class="si">{</span><span class="n">count</span><span class="si">}</span><span class="s2"> on its NUMA node, over its allowed CPUs </span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">local</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">count</span><span class="p">:</span>
-            <span class="n">claimed</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">local</span><span class="p">[:</span><span class="n">count</span><span class="p">]</span> <span class="o">+</span> <span class="n">local</span><span class="p">[</span><span class="o">-</span><span class="n">count</span><span class="p">:])</span>
-    <span class="n">spare</span> <span class="o">=</span> <span class="p">[</span><span class="n">core</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">cores</span> <span class="k">if</span> <span class="n">core</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">claimed</span><span class="p">]</span>
+        <span class="n">units</span> <span class="o">=</span> <span class="n">pools</span><span class="p">[</span><span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">address</span><span class="p">]</span><span class="o">.</span><span class="n">units</span><span class="p">(</span><span class="n">layout</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">units</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">count</span><span class="p">:</span>
+            <span class="n">claimed</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">core</span> <span class="k">for</span> <span class="n">unit</span> <span class="ow">in</span> <span class="n">units</span><span class="p">[:</span><span class="n">count</span><span class="p">]</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">unit</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span>
+            <span class="n">claimed</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">local</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">local</span><span class="p">)</span> <span class="o">-</span> <span class="n">count</span><span class="p">:])</span>
+    <span class="n">spare</span> <span class="o">=</span> <span class="p">[</span><span class="n">core</span> <span class="k">for</span> <span class="n">core</span> <span class="ow">in</span> <span class="n">cores_of</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span> <span class="k">if</span> <span class="n">core</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">claimed</span><span class="p">]</span>
     <span class="n">elsewhere</span> <span class="o">=</span> <span class="p">[</span><span class="n">gpu</span> <span class="k">for</span> <span class="n">gpu</span> <span class="ow">in</span> <span class="n">gpus</span> <span class="k">if</span> <span class="n">gpu</span><span class="o">.</span><span class="n">address</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">pools</span><span class="p">]</span>
     <span class="k">for</span> <span class="n">rank</span><span class="p">,</span> <span class="n">gpu</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">elsewhere</span><span class="p">):</span>
         <span class="n">pools</span><span class="p">[</span><span class="n">gpu</span><span class="o">.</span><span class="n">address</span><span class="p">]</span> <span class="o">=</span> <span class="n">_Pool</span><span class="p">(</span>
@@ -1397,34 +1636,41 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">pools</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_auto</span><span class="p">(</span><span class="n">addresses</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores</span><span class="p">,</span> <span class="n">pci_root</span><span class="p">,</span> <span class="n">siblings</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_by_rank</span><span class="p">(</span><span class="n">setting</span><span class="p">,</span> <span class="n">addresses</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores_of</span><span class="p">,</span> <span class="n">layout</span><span class="p">,</span> <span class="n">pci_root</span><span class="p">,</span> <span class="n">reachable</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""``(workers, result, why)``, or why nothing can be pinned."""</span>
+    <span class="n">cores</span> <span class="o">=</span> <span class="n">cores_of</span><span class="p">(</span><span class="n">mask</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">cores</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">addresses</span><span class="p">:</span>
         <span class="k">return</span> <span class="s2">"no CPU or no worker to place"</span>
     <span class="n">gpus</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">found</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">addresses</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">and</span> <span class="p">(</span><span class="n">found</span> <span class="o">:=</span> <span class="n">host_gpus</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">pci_root</span><span class="p">))),</span> <span class="p">[])</span>
-    <span class="n">pools</span> <span class="o">=</span> <span class="n">_gpu_pools</span><span class="p">(</span><span class="n">gpus</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores</span><span class="p">,</span> <span class="n">siblings</span><span class="p">)</span>
     <span class="n">unplaced</span> <span class="o">=</span> <span class="n">_Pool</span><span class="p">(</span><span class="n">cores</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"no sysfs entry for its device, so over the process mask"</span><span class="p">)</span>
-    <span class="n">homes</span> <span class="o">=</span> <span class="p">[</span><span class="n">pools</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">unplaced</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">addresses</span><span class="p">]</span>
-    <span class="k">for</span> <span class="n">home</span> <span class="ow">in</span> <span class="n">homes</span><span class="p">:</span>
-        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">home</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="p">:</span>
-            <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">home</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">home</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span><span class="si">}</span><span class="s2"> core(s) there for </span><span class="si">{</span><span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="si">}</span><span class="s2"> GPU(s), and each needs two; "</span>
-                    <span class="s2">"widen the mask or name a CPU"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">short_of_cores</span><span class="p">(</span><span class="n">group</span><span class="p">):</span>
+        <span class="n">pools</span> <span class="o">=</span> <span class="n">_gpu_pools</span><span class="p">(</span><span class="n">group</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">cores_of</span><span class="p">,</span> <span class="n">layout</span><span class="p">)</span>
+        <span class="n">homes</span> <span class="o">=</span> <span class="p">[</span><span class="n">pools</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">unplaced</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">addresses</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">homes</span><span class="p">,</span> <span class="nb">next</span><span class="p">((</span><span class="n">home</span> <span class="k">for</span> <span class="n">home</span> <span class="ow">in</span> <span class="n">homes</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">home</span><span class="o">.</span><span class="n">units</span><span class="p">(</span><span class="n">layout</span><span class="p">))</span> <span class="o">&lt;</span> <span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
+
+    <span class="n">homes</span><span class="p">,</span> <span class="n">short</span> <span class="o">=</span> <span class="n">short_of_cores</span><span class="p">(</span><span class="n">gpus</span><span class="p">)</span>
+    <span class="n">within</span> <span class="o">=</span> <span class="p">[</span><span class="n">gpu</span> <span class="k">for</span> <span class="n">gpu</span> <span class="ow">in</span> <span class="n">gpus</span> <span class="k">if</span> <span class="n">gpu</span><span class="o">.</span><span class="n">address</span> <span class="ow">in</span> <span class="n">reachable</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">short</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">within</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">within</span><span class="p">)</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">gpus</span><span class="p">):</span>
+        <span class="n">homes</span><span class="p">,</span> <span class="n">short</span> <span class="o">=</span> <span class="n">short_of_cores</span><span class="p">(</span><span class="n">within</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">short</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">short</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">short</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span><span class="si">}</span><span class="s2"> core(s) there for </span><span class="si">{</span><span class="n">short</span><span class="o">.</span><span class="n">gpus</span><span class="si">}</span><span class="s2"> GPU(s), and each needs "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">layout</span><span class="o">.</span><span class="n">need</span><span class="si">}</span><span class="s2">; widen the mask or name a CPU"</span><span class="p">)</span>
     <span class="n">first</span> <span class="o">=</span> <span class="n">homes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">result_core</span> <span class="o">=</span> <span class="n">first</span><span class="o">.</span><span class="n">cores</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">first</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">first</span><span class="o">.</span><span class="n">rank</span><span class="p">]</span>
     <span class="n">taken</span> <span class="o">=</span> <span class="p">{</span><span class="n">result_core</span><span class="p">}</span>
     <span class="n">workers</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">home</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">homes</span><span class="p">):</span>
         <span class="c1"># workers of this deployment on one device (a split config) step by the</span>
-        <span class="c1"># pool's GPU count, so each GPU's first worker keeps its core; the top</span>
-        <span class="c1"># ``gpus`` cores are those GPUs' API servers'</span>
+        <span class="c1"># pool's GPU count, so each GPU's first worker keeps its cores</span>
         <span class="n">nth</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">a</span> <span class="o">==</span> <span class="n">addresses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">addresses</span><span class="p">[:</span><span class="n">i</span><span class="p">])</span>
-        <span class="n">steps</span> <span class="o">=</span> <span class="n">home</span><span class="o">.</span><span class="n">cores</span><span class="p">[</span><span class="n">home</span><span class="o">.</span><span class="n">rank</span> <span class="o">+</span> <span class="n">nth</span> <span class="o">*</span> <span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">home</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span> <span class="o">-</span> <span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="p">]</span>
-        <span class="n">core</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">steps</span> <span class="k">if</span> <span class="n">c</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">taken</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">core</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">units</span> <span class="o">=</span> <span class="n">home</span><span class="o">.</span><span class="n">units</span><span class="p">(</span><span class="n">layout</span><span class="p">)[</span><span class="n">home</span><span class="o">.</span><span class="n">rank</span> <span class="o">+</span> <span class="n">nth</span> <span class="o">*</span> <span class="n">home</span><span class="o">.</span><span class="n">gpus</span><span class="p">:]</span>
+        <span class="n">unit</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">u</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">units</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">taken</span><span class="o">.</span><span class="n">intersection</span><span class="p">(</span><span class="n">u</span><span class="o">.</span><span class="n">cores</span><span class="p">)),</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">unit</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">addresses</span><span class="p">)</span><span class="si">}</span><span class="s2"> worker(s) and the API server need more cores than the mask has"</span>
-        <span class="n">taken</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">core</span><span class="p">)</span>
-        <span class="n">workers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">_step_cpus</span><span class="p">(</span><span class="n">core</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"auto: </span><span class="si">{</span><span class="n">home</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span>
-    <span class="k">return</span> <span class="n">workers</span><span class="p">,</span> <span class="n">result_core</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="sa">f</span><span class="s2">"auto: </span><span class="si">{</span><span class="n">first</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2"> (the first worker's device), from the top"</span>
+        <span class="n">taken</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">unit</span><span class="o">.</span><span class="n">cores</span><span class="p">)</span>
+        <span class="n">workers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">StepCpus</span><span class="p">(</span><span class="nb">frozenset</span><span class="p">(</span><span class="n">unit</span><span class="o">.</span><span class="n">cpus</span><span class="p">),</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">setting</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">home</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">workers</span><span class="p">,</span> <span class="n">result_core</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">setting</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">first</span><span class="o">.</span><span class="n">why</span><span class="si">}</span><span class="s2"> (the first worker's device), from the top"</span>
 
 
 <div class="viewcode-block" id="device_addresses">
@@ -1444,11 +1690,16 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="devices_plan">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.devices_plan">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">devices_plan</span><span class="p">(</span><span class="n">setting</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span><span class="p">,</span> <span class="n">devices</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">CpuPlan</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">devices_plan</span><span class="p">(</span><span class="n">setting</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span><span class="p">,</span> <span class="n">devices</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">idle_hold</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"off"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CpuPlan</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``deployment_plan`` for the workers' device strings, in the conductor's</span>
 <span class="sd">    worker order: the same call in the API server and in every worker."""</span>
-    <span class="n">addresses</span> <span class="o">=</span> <span class="n">device_addresses</span><span class="p">(</span><span class="n">devices</span><span class="p">)</span> <span class="k">if</span> <span class="n">setting</span> <span class="o">==</span> <span class="s2">"auto"</span> <span class="k">else</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">devices</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">deployment_plan</span><span class="p">(</span><span class="n">setting</span><span class="p">,</span> <span class="n">addresses</span><span class="p">)</span></div>
+    <span class="c1"># auto, which pins nothing, never asks torch about the devices</span>
+    <span class="k">if</span> <span class="n">setting</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">PLACED</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">deployment_plan</span><span class="p">(</span><span class="n">setting</span><span class="p">,</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">devices</span><span class="p">),</span> <span class="n">idle_hold</span><span class="o">=</span><span class="n">idle_hold</span><span class="p">)</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
+
+    <span class="k">return</span> <span class="n">deployment_plan</span><span class="p">(</span><span class="n">setting</span><span class="p">,</span> <span class="n">device_addresses</span><span class="p">(</span><span class="n">devices</span><span class="p">),</span> <span class="n">idle_hold</span><span class="o">=</span><span class="n">idle_hold</span><span class="p">,</span>
+                           <span class="n">reachable</span><span class="o">=</span><span class="n">current_platform</span><span class="o">.</span><span class="n">reachable_pci_addresses</span><span class="p">())</span></div>
 
 
 
@@ -1475,7 +1726,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Hold a lock on each GPU for the life of this process; if one can't be</span>
 <span class="sd">    had, hold none of them and say why.</span>
 
-<span class="sd">    ``auto`` depends only on the PCI address and the mask, so two servers on</span>
+<span class="sd">    Placement depends only on the PCI address and the mask, so two servers on</span>
 <span class="sd">    one GPU (two MIG instances report one address) would take the same CPUs.</span>
 <span class="sd">    The kernel drops an ``flock`` however the process exits, so a dead server</span>
 <span class="sd">    leaves nothing to clean up. The file is never unlinked: another process may</span>

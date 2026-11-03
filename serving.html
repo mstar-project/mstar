@@ -694,6 +694,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#restarts-and-the-compile-cache">Restarts and the compile cache</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#host-idle-states">Host idle states</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>
@@ -1173,9 +1174,10 @@ model: the server refuses to start on another value. See <a class="reference int
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
-<code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code>, <code class="docutils literal notranslate"><span class="pre">pre_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> and
+<code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code>, <code class="docutils literal notranslate"><span class="pre">pre_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code>, <code class="docutils literal notranslate"><span class="pre">idle_hold</span></code> and
 <code class="docutils literal notranslate"><span class="pre">compile_deterministic</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> or an integer; <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> takes
-<code class="docutils literal notranslate"><span class="pre">off</span></code>, the default, <code class="docutils literal notranslate"><span class="pre">auto</span></code> or a CPU number). <code class="docutils literal notranslate"><span class="pre">compile_deterministic</span></code> reaches
+<code class="docutils literal notranslate"><span class="pre">auto</span></code>, the default, <code class="docutils literal notranslate"><span class="pre">off</span></code>, <code class="docutils literal notranslate"><span class="pre">always</span></code>, <code class="docutils literal notranslate"><span class="pre">siblings</span></code> or a CPU number, and <code class="docutils literal notranslate"><span class="pre">idle_hold</span></code>
+<code class="docutils literal notranslate"><span class="pre">off</span></code>, the default, or <code class="docutils literal notranslate"><span class="pre">qos</span></code>; see <a class="reference internal" href="#host-idle"><span class="std std-ref">Host idle states</span></a>). <code class="docutils literal notranslate"><span class="pre">compile_deterministic</span></code> reaches
 Qwen3.5’s text walks and no other model (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>). Each one’s environment variable
 (<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> and so on; see
 <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>) overrides it when set, and an unknown name
@@ -1495,6 +1497,75 @@ upgrade, <code class="docutils literal notranslate"><span class="pre">-O</span><
 next start’s compile. On a quota-limited or network-mounted home (NFS), or a volume that
 concurrent jobs on several hosts share, export <code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code> to a node-local
 path and copy a warm cache in at job start.</p>
+</section>
+<section id="host-idle-states">
+<span id="host-idle"></span><h2>Host idle states<a class="headerlink" href="#host-idle-states" title="Link to this heading">#</a></h2>
+<p>A decode step hands work between a worker’s main, GPU and plan threads several
+times, and every step’s tokens go from the API server’s message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the <code class="docutils literal notranslate"><span class="pre">powersave</span></code> governor, so a small model’s step is mostly
+host time spent waking CPUs. Two knobs deal with it:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> pins those threads. <code class="docutils literal notranslate"><span class="pre">always</span></code> gives each worker three cores,
+one hardware thread of each, and the API server a core of its own. <code class="docutils literal notranslate"><span class="pre">siblings</span></code>
+puts a worker’s three threads on one core’s hardware threads (two cores of an L2
+cluster where there is no SMT), which keeps that core awake. <code class="docutils literal notranslate"><span class="pre">auto</span></code> pins nothing
+and logs one line saying why for this host, since neither layout has beaten no pin
+on every host it was measured on (table below). <code class="docutils literal notranslate"><span class="pre">off</span></code> never pins, a number names
+the first worker’s core.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">idle_hold:</span> <span class="pre">qos</span></code> asks the kernel to keep every CPU out of deep idle states
+through <code class="docutils literal notranslate"><span class="pre">/dev/cpu_dma_latency</span></code> for the server’s life. It needs a device most
+containers hide, and it logs what it got.</p></li>
+</ul>
+<p>Qwen3.5-0.8B tok/s at c=1 / 8, <code class="docutils literal notranslate"><span class="pre">benchmark.runner</span></code> at <code class="docutils literal notranslate"><span class="pre">-O2</span></code>, the server <code class="docutils literal notranslate"><span class="pre">taskset</span></code>
+to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Host</p></th>
+<th class="head"><p>no pin</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">always</span></code> (three cores)</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">siblings</span></code></p></th>
+<th class="head"><p>every core held out of idle</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs)</p></td>
+<td><p>548 / 3939</p></td>
+<td><p>526 / 3851</p></td>
+<td><p>808 / 5670</p></td>
+<td><p>c=1: no pin 906, three cores 935, <code class="docutils literal notranslate"><span class="pre">siblings</span></code> 753</p></td>
+</tr>
+<tr class="row-odd"><td><p>2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs)</p></td>
+<td><p>371 / 2688</p></td>
+<td><p>not measured</p></td>
+<td><p>527 / 3635 (two cores of a cluster)</p></td>
+<td><p>636 / 4251, no pin</p></td>
+</tr>
+<tr class="row-even"><td><p>H100 VM without deep idle states (a handoff 22 µs)</p></td>
+<td><p>529 (c=1) / 6520 (c=16)</p></td>
+<td><p>not measured</p></td>
+<td><p>419 / 5526 (an earlier <code class="docutils literal notranslate"><span class="pre">auto</span></code>, the same layout)</p></td>
+<td><p>not measured</p></td>
+</tr>
+<tr class="row-odd"><td><p>H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask</p></td>
+<td><p>634 / 3617</p></td>
+<td><p>not measured</p></td>
+<td><p>506 / 3103 (an earlier <code class="docutils literal notranslate"><span class="pre">auto</span></code>, the same layout)</p></td>
+<td><p>not measured</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The last column is a <code class="docutils literal notranslate"><span class="pre">SCHED_IDLE</span></code> spinner on each server CPU, a stand-in for
+<code class="docutils literal notranslate"><span class="pre">idle_hold:</span> <span class="pre">qos</span></code> where the device is hidden: the hold itself has not been measured.
+With the cores held awake, <code class="docutils literal notranslate"><span class="pre">siblings</span></code> loses to no pin and three separate cores are
+level with it, so <code class="docutils literal notranslate"><span class="pre">auto</span></code> names the hold first when it is set.</p>
+<p>Pinning has other costs. <code class="docutils literal notranslate"><span class="pre">siblings</span></code> on the 6740E raised 0.8B’s time to first token
+at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
+at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
+leave it <code class="docutils literal notranslate"><span class="pre">off</span></code>.</p>
+<p>Details are in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> under <code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code>.</p>
 </section>
 <section id="tensor-transport">
 <span id="id3"></span><h2>Tensor transport<a class="headerlink" href="#tensor-transport" title="Link to this heading">#</a></h2>
@@ -1853,6 +1924,7 @@ curl<span class="w"> </span>-s<span class="w"> </span>localhost:8000/metrics<spa
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#config-files">Config files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-kwargs">model_kwargs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#restarts-and-the-compile-cache">Restarts and the compile cache</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#host-idle-states">Host idle states</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-transport">Tensor transport</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-profiling">Request profiling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#metrics">Metrics</a></li>
