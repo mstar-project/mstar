@@ -197,9 +197,10 @@ class VJepa2Model(Model):
         self.skip_weight_loading = skip_weight_loading
 
         self.config = self._load_config(predictor_kind, ac_predictor_config)
+        # here and not on the first video, so a bad checkpoint is refused at startup
+        self.video_processor = self._load_video_processor()
         self._repo_dir: Path | None = None
         self._ac_pt_path: Path | None = None
-        self._video_processor = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
         # Lazily materialized components (populated in get_submodule).
@@ -271,6 +272,23 @@ class VJepa2Model(Model):
             config.ac_predictor = VJepa2ACPredictorConfig(**defaults)
         return config
 
+    def _load_video_processor(self):
+        """The checkpoint's own ``VJEPA2VideoProcessor``: resize, crop size, mean
+        and std as its ``video_preprocessor_config.json`` sets them. Its crop has
+        to be the one the encoder was built for. None for the AC model, whose
+        checkpoint has no processor, and without weights, like ``_load_config``."""
+        if self.skip_weight_loading or self.config.predictor_kind == "ac":
+            return None
+        from transformers import AutoVideoProcessor
+
+        processor = AutoVideoProcessor.from_pretrained(self.model_path_hf, cache_dir=self.cache_dir)
+        crop = (processor.crop_size["height"], processor.crop_size["width"])
+        if crop != (self.config.crop_size, self.config.crop_size):
+            raise ValueError(
+                f"{self.model_path_hf}: the video processor crops {crop}, config.json says {self.config.crop_size}"
+            )
+        return processor
+
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
             return self._repo_dir
@@ -293,28 +311,6 @@ class VJepa2Model(Model):
             cache_dir=self.cache_dir,
         )
         return self._ac_pt_path
-
-    @property
-    def video_processor(self):
-        """The checkpoint's own ``VJEPA2VideoProcessor``, loaded once: resize,
-        crop size, mean and std as its ``video_preprocessor_config.json`` sets
-        them. Its crop has to be the one the encoder was built for."""
-        if self._video_processor is None:
-            from transformers import AutoVideoProcessor
-
-            processor = AutoVideoProcessor.from_pretrained(self.model_path_hf, cache_dir=self.cache_dir)
-            crop = (processor.crop_size["height"], processor.crop_size["width"])
-            if crop != (self.config.crop_size, self.config.crop_size):
-                raise ValueError(
-                    f"{self.model_path_hf}: the video processor crops {crop}, config.json says {self.config.crop_size}"
-                )
-            self._video_processor = processor
-        return self._video_processor
-
-    def warmup_preprocess(self) -> None:
-        # so the first video does not load the processor
-        if self.config.predictor_kind != "ac":
-            _ = self.video_processor
 
     def _preprocess_video(self, frames: torch.Tensor, target_frames: int) -> torch.Tensor:
         """``target_frames`` of ``load_video``'s uint8 ``[T, 3, H, W]`` frames,
