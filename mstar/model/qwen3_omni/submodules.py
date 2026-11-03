@@ -337,6 +337,7 @@ class _PromptPart(NamedTuple):
     pos_ids: torch.Tensor | None  # (3, rows), or None when a text row leaves them to the plan
     masks: torch.Tensor  # (2, rows): multimodal, then text inclusion
     advance: int  # how far the part moves the MRoPE position
+    keep: torch.Tensor  # (rows,) bool on the host: the rows the Talker keeps
     ids: torch.Tensor | None = None  # a text span's token ids
     deepstack: list[torch.Tensor] | None = None  # a vision part's, per layer over its rows
 
@@ -493,7 +494,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     @staticmethod
     def _media_masks(rows: int, device: torch.device) -> torch.Tensor:
         """An attachment's talker masks: its encoder rows are multimodal, and
-        its two sentinels are text the Talker keeps."""
+        its two sentinels are text the Talker keeps, so it keeps every row."""
         multimodal = torch.ones(rows + 2, dtype=torch.bool, device=device)
         multimodal[0] = False
         multimodal[-1] = False
@@ -501,15 +502,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     def _text_part(self, ids: torch.Tensor, pos: int | None) -> _PromptPart:
         device = self.get_device()
+        # The Talker's text mask, built on the host so postprocess knows the kept
+        # rows without reading the device: one copy of the ids back here, where
+        # the mask built from device ids read the device once per turn.
+        keep = talker_text_mask(ids.cpu(), self.config)
         ids = ids.to(device)
         n = ids.shape[0]
-        masks = torch.stack([
-            torch.zeros(ids.shape, dtype=torch.bool, device=device),  # multimodal
-            talker_text_mask(ids, self.config),  # text inclusion
-        ])
+        masks = torch.stack([torch.zeros_like(keep), keep]).to(device)  # multimodal, text inclusion
         return _PromptPart(
             self.model.model.embed_tokens(ids), None if pos is None else get_rope_index_text(n, pos, device),
-            masks, n, ids=ids,
+            masks, n, keep, ids=ids,
         )
 
     def _audio_part(self, audio_embeds: torch.Tensor, pos: int) -> _PromptPart:
@@ -526,7 +528,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
             get_rope_index_audio(n, pos + 1, device, self.config.thinker.position_id_per_seconds),
             get_rope_index_text(1, pos + 1 + n, device),
         ], dim=1)
-        return _PromptPart(self._wrap_audio_input(audio_embeds), pos_ids, self._media_masks(n, device), n + 2)
+        return _PromptPart(
+            self._wrap_audio_input(audio_embeds), pos_ids, self._media_masks(n, device), n + 2,
+            torch.ones(n + 2, dtype=torch.bool),
+        )
 
     def _vision_part(
         self, vision_embeds: torch.Tensor, deepstack: list[torch.Tensor], grid_thw: torch.Tensor,
@@ -569,7 +574,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # The next position is one past the EOS token, which follows the
         # grid's largest position: more than the row count for a 2D grid.
         advance = int(end_pos_base + 1 - pos)
-        return _PromptPart(wrapped, pos_ids, self._media_masks(n, device), advance, deepstack=full_deepstack)
+        return _PromptPart(
+            wrapped, pos_ids, self._media_masks(n, device), advance, torch.ones(n + 2, dtype=torch.bool),
+            deepstack=full_deepstack,
+        )
 
     def _prefill_inputs(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList) -> ARNodeInputs:
         """A whole prompt as one row, spliced in prompt order.
@@ -600,7 +608,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 input_seq_len=part.advance,
                 input_embeds=part.embeds,
                 input_ids=part.ids,
-                tensor_inputs={"masks_for_talker": part.masks},
+                tensor_inputs={"masks_for_talker": part.masks, "talker_keep": part.keep},
             )
 
         parts: list[_PromptPart] = []
@@ -629,6 +637,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ids = [part.ids for part in parts if part.ids is not None]
         tensor_inputs: dict[str, Any] = {
             "masks_for_talker": torch.cat([part.masks for part in parts], dim=1),
+            "talker_keep": torch.cat([part.keep for part in parts]),
             # the prompt's text, for the repetition penalty
             "text_token_ids": torch.cat(ids) if ids else torch.zeros(0, dtype=torch.long, device=device),
             "mrope_pos_advance": pos,
@@ -658,7 +667,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
-        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        cut.tensor_inputs = {
+            "masks_for_talker": tensors["masks_for_talker"][:, start:end],
+            "talker_keep": tensors["talker_keep"][start:end],
+        }
         if "deepstack" in tensors:
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
         if "mrope_pos_advance" in tensors:
@@ -1161,34 +1173,59 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # previous-assistant), and emit a 1D multimodal mask aligned to
             # the kept tokens. Doing this here (not in the Talker) avoids
             # shipping both hidden states for every token.
+            #
+            # This runs on the GPU thread before the next step launches, so it
+            # never reads the device: a boolean index would wait for the whole
+            # forward. The kept rows are known on the host instead.
             ts_list = outputs.get("thinker_states")
             mask_list = outputs.get("thinker_mask")
             if ts_list and mask_list:
                 ts = ts_list[0]                # (seq_len, 2*hidden)
-                mask = mask_list[0]            # (2, seq_len)
                 thinker_hidden = self.config.thinker_hidden_size
-                layer_0 = ts[..., :thinker_hidden]
-                layer_n = ts[..., thinker_hidden:]
-                multimodal_mask = mask[0].bool()
-                text_inclusion_mask = mask[1].bool()
-                text_mask = text_inclusion_mask & ~multimodal_mask
-                inclusion_mask = text_mask | multimodal_mask
-
-                selected = torch.where(
-                    multimodal_mask.unsqueeze(-1), layer_n, layer_0,
-                )                              # (seq_len, hidden)
-                states = selected[inclusion_mask]
-                multimodal_mask = multimodal_mask[inclusion_mask]
-                if not decode and first_embed:
-                    # the sampled token's layer-0 row, as its decode step would send it
-                    states = torch.cat([states, first_embed[0].to(states.dtype)])
-                    multimodal_mask = torch.cat([multimodal_mask, multimodal_mask.new_zeros(1)])
+                if decode:
+                    # one text token, mask [[0], [1]]: its layer-0 half, kept
+                    states = ts[..., :thinker_hidden]
+                    multimodal_mask = self._get_decode_thinker_mask(self.get_device())[0]
+                else:
+                    states, multimodal_mask = self._talker_rows(
+                        ts, mask_list[0], kwargs["inputs"].tensor_inputs["talker_keep"],
+                    )
+                    if first_embed:
+                        # the sampled token's layer-0 row, as its decode step would send it
+                        states = torch.cat([states, first_embed[0].to(states.dtype)])
+                        multimodal_mask = torch.cat([multimodal_mask, multimodal_mask.new_zeros(1)])
                 outputs["thinker_states"] = [states]
                 outputs["thinker_mask"] = [multimodal_mask]
 
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def _talker_rows(
+        self, ts: torch.Tensor, masks: torch.Tensor, keep: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A prefill row's states for the Talker and their multimodal mask:
+        ``ts`` (rows, 2*hidden) on the device, ``masks`` its (2, rows)
+        ``masks_for_talker``, ``keep`` the host's (rows,) bool of what the
+        Talker keeps. The kept rows come in a few runs (the turns the Talker
+        reads), so they are slices of the device tensors, joined."""
+        assert keep.shape[0] == ts.shape[0], (keep.shape, ts.shape)
+        hidden = self.config.thinker_hidden_size
+        multimodal = masks[0].bool()
+        selected = torch.where(multimodal.unsqueeze(-1), ts[..., hidden:], ts[..., :hidden])
+        flags = keep.to(torch.int8)
+        edges = torch.diff(flags, prepend=flags.new_zeros(1), append=flags.new_zeros(1))
+        runs = list(zip(
+            (edges == 1).nonzero().flatten().tolist(), (edges == -1).nonzero().flatten().tolist(), strict=True,
+        ))
+        if runs == [(0, keep.shape[0])]:
+            return selected, multimodal
+        if not runs:
+            return selected[:0], multimodal[:0]
+        return (
+            torch.cat([selected[a:b] for a, b in runs]),
+            torch.cat([multimodal[a:b] for a, b in runs]),
+        )
 
     def check_stop(
         self, request_id: str,
