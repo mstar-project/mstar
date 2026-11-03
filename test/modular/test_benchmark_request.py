@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import random
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("aiohttp")
 
+from benchmark import runner  # noqa: E402
 from benchmark.base import Model, Orpheus, RequestType  # noqa: E402
 from benchmark.request import (  # noqa: E402
     OursOpenAI,
@@ -118,3 +121,29 @@ def test_the_stamped_output_length_reaches_the_payload(system, model, req_type):
     req = RequestInput(req_type=req_type, prompt="hi", model_kwargs={"max_tokens": 33, "ignore_eos": True})
     asyncio.run(system().send_request(session, req, "http://x", 0, model()))
     assert (session.payload["max_tokens"], session.payload["ignore_eos"]) == (33, True)
+
+
+def test_an_offline_run_stamps_each_request_its_own_length_and_fills_its_last_wave(monkeypatch):
+    """A dataset resized past its length repeats the same RequestInput objects:
+    stamping them in place gave repeats one shared length. The offline round-up
+    to a whole wave must happen before the dataset is sized."""
+    cfg = runner.BenchmarkConfig(
+        url="http://x", model=_TextModel(), dataset=runner.DatasetType.TEXT, num_requests=5,
+        request_type=RequestType.T2T, local_cache_dir=".", num_warmup=0, batch_size=4,
+        profiling_type=runner.ProfilingType.OFFLINE, output_len_min=1, output_len_max=1000,
+    )
+    bench = runner.Benchmark.__new__(runner.Benchmark)
+    bench.config = cfg
+    base = [RequestInput(req_type=RequestType.T2T, prompt=str(i)) for i in range(2)]
+    bench._get_dataset = lambda: SimpleNamespace(get_requests=lambda: (base * 8)[: cfg.num_requests])
+    sent = []
+
+    async def offline(session, requests):
+        sent.extend(requests)
+        return []
+
+    bench._run_concurrent_offline = offline
+    monkeypatch.setattr(runner, "aggregate_metrics", lambda *a, **k: None)
+    asyncio.run(bench.run())
+    rng = random.Random(cfg.output_len_seed)
+    assert [r.model_kwargs["max_tokens"] for r in sent] == [rng.randint(1, 1000) for _ in range(8)]

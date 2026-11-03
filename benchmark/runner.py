@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import os
 import random
 import time
@@ -451,9 +452,13 @@ class Benchmark:
         if (lo is None) != (hi is None):
             raise ValueError("output_len_min and output_len_max must be set together")
         rng = random.Random(cfg.output_len_seed)
-        for req in requests:
+        for i, req in enumerate(requests):
             if req.req_type.get_output_modalities() not in ("text", "audio"):
                 continue
+            # A dataset resized past its length repeats the same RequestInput
+            # objects; stamp a copy so each request keeps its own length.
+            requests[i] = req = copy.copy(req)
+            req.model_kwargs = dict(req.model_kwargs)
             if lo is not None:
                 length = rng.randint(lo, hi)
                 req.model_kwargs["max_tokens"] = length
@@ -462,11 +467,11 @@ class Benchmark:
                 req.model_kwargs["ignore_eos"] = True
 
     async def run(self) -> tuple[list[RequestMetrics], AggregateMetrics]:
-        dataset = self._get_dataset()
         if self.config.profiling_type == ProfilingType.OFFLINE:
             bs = self.config.batch_size
-            # make even multiple of batch size
+            # make even multiple of batch size, before the dataset is sized
             self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
+        dataset = self._get_dataset()
         requests = dataset.get_requests()[: self.config.num_requests]
         self._assign_output_lengths(requests)
 
