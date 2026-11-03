@@ -35,6 +35,7 @@ mstar.engine.resources.attn
    flashinfer_mla
    flex
    ragged
+   workspace
    wrappers
    xpu
 

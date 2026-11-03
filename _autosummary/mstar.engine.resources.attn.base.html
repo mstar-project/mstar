@@ -707,13 +707,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey.q_seq_lens"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey.q_seq_lens</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.WorkspacePool"><code class="docutils literal notranslate"><span class="pre">WorkspacePool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.WorkspacePool.get"><code class="docutils literal notranslate"><span class="pre">WorkspacePool.get()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.captured_page_capacity"><code class="docutils literal notranslate"><span class="pre">captured_page_capacity()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.resolve_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_attn_backend()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.workspace_bytes"><code class="docutils literal notranslate"><span class="pre">workspace_bytes()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -727,8 +722,8 @@
                   
   <section id="module-mstar.engine.resources.attn.base">
 <span id="mstar-engine-resources-attn-base"></span><h1>mstar.engine.resources.attn.base<a class="headerlink" href="#module-mstar.engine.resources.attn.base" title="Link to this heading">#</a></h1>
-<p>The attention resource’s shared machinery: the spec-time factory, the
-custom op every backend attends through, and the workspace pool.</p>
+<p>The attention resource’s shared machinery: the spec-time factory and the
+custom op every backend attends through.</p>
 <p>The backends themselves live beside this — <cite>flashinfer</cite>, <cite>cross</cite>, <cite>dense</cite>,
 <cite>flex</cite> — and <cite>AttentionManager.build</cite> reaches them by deferred import, so
 naming a backend in a spec does not load the others.</p>
@@ -740,9 +735,6 @@ naming a backend in a spec does not load the others.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.resolve_attn_backend" title="mstar.engine.resources.attn.base.resolve_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_attn_backend</span></code></a>(backend, device)</p></td>
 <td><p>The concrete backend for <code class="docutils literal notranslate"><span class="pre">backend</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code>.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.workspace_bytes" title="mstar.engine.resources.attn.base.workspace_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">workspace_bytes</span></code></a>()</p></td>
-<td><p>Size of one FlashInfer workspace buffer (<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -758,9 +750,6 @@ naming a backend in a spec does not load the others.</p>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.PlanCacheKey" title="mstar.engine.resources.attn.base.PlanCacheKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PlanCacheKey</span></code></a>(q_seq_lens, page_indices, ...)</p></td>
 <td><p>Fingerprint of a wrapper <code class="docutils literal notranslate"><span class="pre">plan</span></code> call's inputs.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.WorkspacePool" title="mstar.engine.resources.attn.base.WorkspacePool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkspacePool</span></code></a>(device[, size_mb])</p></td>
-<td><p>FlashInfer workspace buffers, one per (plan label, cg slot).</p></td>
 </tr>
 </tbody>
 </table>
@@ -798,7 +787,7 @@ change what a page holds.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe">
-<span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -890,39 +879,6 @@ between steps the re-plan is skippable.</p>
 
 </dd></dl>
 
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.WorkspacePool">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">WorkspacePool</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size_mb</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#WorkspacePool"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.WorkspacePool" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>FlashInfer workspace buffers, one per (plan label, cg slot).</p>
-<p>Persistent: a wrapper is planned against the buffer it was built with, so
-these outlive any single step.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
-<li><p><strong>size_mb</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.WorkspacePool.get">
-<span class="sig-name descname"><span class="pre">get</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cg_slot</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#WorkspacePool.get"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.WorkspacePool.get" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>cg_slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-</dd></dl>
-
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.base.captured_page_capacity">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">captured_page_capacity</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#captured_page_capacity"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.captured_page_capacity" title="Link to this definition">#</a></dt>
@@ -961,17 +917,6 @@ now. A backend named in the spec or YAML is returned as is.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttnBackend" title="mstar.engine.resources.attn.config.AttnBackend"><em>AttnBackend</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.workspace_bytes">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">workspace_bytes</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#workspace_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.workspace_bytes" title="Link to this definition">#</a></dt>
-<dd><p>Size of one FlashInfer workspace buffer (<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1044,13 +989,8 @@ now. A backend named in the spec or YAML is returned as is.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey.q_seq_lens"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey.q_seq_lens</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.WorkspacePool"><code class="docutils literal notranslate"><span class="pre">WorkspacePool</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.WorkspacePool.get"><code class="docutils literal notranslate"><span class="pre">WorkspacePool.get()</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.captured_page_capacity"><code class="docutils literal notranslate"><span class="pre">captured_page_capacity()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.resolve_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_attn_backend()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.workspace_bytes"><code class="docutils literal notranslate"><span class="pre">workspace_bytes()</span></code></a></li>
 </ul>
   </nav></div>
 

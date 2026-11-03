@@ -15,7 +15,6 @@ mstar.engine.resources.attn.base
    
       captured_page_capacity
       resolve_attn_backend
-      workspace_bytes
    
    
 
@@ -28,7 +27,6 @@ mstar.engine.resources.attn.base
       AttentionManager
       EagerSlotKey
       PlanCacheKey
-      WorkspacePool
    
    
 

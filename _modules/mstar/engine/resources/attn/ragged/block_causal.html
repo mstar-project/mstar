@@ -997,6 +997,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">padded_head_dim</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.workspace</span><span class="w"> </span><span class="kn">import</span> <span class="n">Workspace</span>
 
 
 <div class="viewcode-block" id="block_causal_layout">
@@ -1065,7 +1066,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">Workspace</span><span class="p">,</span>
         <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1093,11 +1094,12 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span> <span class="o">=</span> <span class="n">max_total_tokens</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_total_tokens</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">workspace_buffer</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">accelerator_graph</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchPrefillWithPagedKVCacheWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="p">,</span> <span class="s2">"NHD"</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">tensor</span><span class="p">,</span> <span class="s2">"NHD"</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">return</span>
 
@@ -1112,7 +1114,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_indices_buf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_indices</span><span class="p">,</span> <span class="o">**</span><span class="n">i32</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_page_len_buf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_blocks</span><span class="p">,</span> <span class="o">**</span><span class="n">i32</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchPrefillWithPagedKVCacheWrapper</span><span class="p">(</span>
-            <span class="n">workspace_buffer</span><span class="p">,</span> <span class="s2">"NHD"</span><span class="p">,</span> <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">tensor</span><span class="p">,</span> <span class="s2">"NHD"</span><span class="p">,</span> <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">qo_indptr_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span><span class="p">,</span>
             <span class="n">paged_kv_indptr_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_indptr_buf</span><span class="p">,</span>
             <span class="n">paged_kv_indices_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_indices_buf</span><span class="p">,</span>
@@ -1174,7 +1176,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">n_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_blocks</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="n">n_seg</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_total_tokens</span> <span class="o">=</span> <span class="n">total</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">(</span><span class="n">qo</span><span class="p">),</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">(</span><span class="n">kv</span><span class="p">),</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">(</span><span class="n">indices</span><span class="p">),</span>

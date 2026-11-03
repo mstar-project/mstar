@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.engine.resources.attn.xpu" href="mstar.engine.resources.attn.xpu.html" />
-    <link rel="prev" title="mstar.engine.resources.attn.ragged.wrappers" href="mstar.engine.resources.attn.ragged.wrappers.html" />
+    <link rel="prev" title="mstar.engine.resources.attn.workspace" href="mstar.engine.resources.attn.workspace.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -777,7 +777,7 @@ exactly 1 new token. Uses BatchDecodeWithPagedKVCacheWrapper.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – FlashInfer workspace</p></li>
+<li><p><strong>workspace_buffer</strong> (<a class="reference internal" href="mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace" title="mstar.engine.resources.attn.workspace.Workspace"><em>Workspace</em></a>) – FlashInfer workspace</p></li>
 <li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
 <li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
 <li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
@@ -859,8 +859,8 @@ tensor-core half’s in theirs (<code class="docutils literal notranslate"><span
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>decode_workspace</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>prefill_workspace</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>decode_workspace</strong> (<a class="reference internal" href="mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace" title="mstar.engine.resources.attn.workspace.Workspace"><em>Workspace</em></a>)</p></li>
+<li><p><strong>prefill_workspace</strong> (<a class="reference internal" href="mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace" title="mstar.engine.resources.attn.workspace.Workspace"><em>Workspace</em></a>)</p></li>
 <li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
@@ -923,7 +923,7 @@ CUDA graph mode using static buffers. KV writes are the KVManager’s job.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>) – FlashInfer workspace (256MB+ recommended)</p></li>
+<li><p><strong>workspace_buffer</strong> (<a class="reference internal" href="mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace" title="mstar.engine.resources.attn.workspace.Workspace"><em>Workspace</em></a>) – the <cite>Workspace</cite> it plans through, which grows to what a plan asks for</p></li>
 <li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
 <li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
 <li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
@@ -1004,7 +1004,7 @@ and <code class="docutils literal notranslate"><span class="pre">max_seq_len</sp
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>workspace_buffer</strong> (<a class="reference internal" href="mstar.engine.resources.attn.workspace.html#mstar.engine.resources.attn.workspace.Workspace" title="mstar.engine.resources.attn.workspace.Workspace"><em>Workspace</em></a>)</p></li>
 <li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
@@ -1119,12 +1119,12 @@ wrappers with a stand-in module and toy head dims) is not checked.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.engine.resources.attn.ragged.wrappers.html"
+       href="mstar.engine.resources.attn.workspace.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.engine.resources.attn.ragged.wrappers</p>
+        <p class="prev-next-title">mstar.engine.resources.attn.workspace</p>
       </div>
     </a>
     <a class="right-next"

@@ -989,6 +989,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.workspace</span><span class="w"> </span><span class="kn">import</span> <span class="n">Workspace</span>
+
 <span class="c1"># Head dims the FlashInfer prefill kernels are instantiated for. An unsupported</span>
 <span class="c1"># one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).</span>
 <span class="n">SUPPORTED_HEAD_DIMS</span> <span class="o">=</span> <span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
@@ -1243,7 +1245,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">Workspace</span><span class="p">,</span>
         <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1254,17 +1256,18 @@ window.runMermaid = runMermaid;</script>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">padded_head_dim</span> <span class="o">=</span> <span class="n">padded_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">workspace_buffer</span>
 
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchPrefillWithRaggedKVCacheWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="p">,</span> <span class="n">kv_layout</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">tensor</span><span class="p">,</span> <span class="n">kv_layout</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
             <span class="p">)</span>
             <span class="k">return</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchPrefillWithRaggedKVCacheWrapper</span><span class="p">(</span>
-            <span class="n">workspace_buffer</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">tensor</span><span class="p">,</span>
             <span class="n">kv_layout</span><span class="p">,</span>
             <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">qo_indptr_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span><span class="p">,</span>
@@ -1292,7 +1295,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan_kernel</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">cu</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cu</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">,</span>
             <span class="n">cu</span><span class="p">,</span>
             <span class="n">kv_cu</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>

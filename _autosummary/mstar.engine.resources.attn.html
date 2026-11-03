@@ -692,7 +692,7 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.base.html#module-mstar.engine.resources.attn.base" title="mstar.engine.resources.attn.base"><code class="xref py py-obj docutils literal notranslate"><span class="pre">base</span></code></a></p></td>
-<td><p>The attention resource's shared machinery: the spec-time factory, the custom op every backend attends through, and the workspace pool.</p></td>
+<td><p>The attention resource's shared machinery: the spec-time factory and the custom op every backend attends through.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.config.html#module-mstar.engine.resources.attn.config" title="mstar.engine.resources.attn.config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">config</span></code></a></p></td>
 <td><p>What a model declares about attention: its backend, its spec, its step.</p></td>
@@ -715,10 +715,13 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.html#module-mstar.engine.resources.attn.ragged" title="mstar.engine.resources.attn.ragged"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ragged</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.wrappers.html#module-mstar.engine.resources.attn.wrappers" title="mstar.engine.resources.attn.wrappers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wrappers</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.workspace.html#module-mstar.engine.resources.attn.workspace" title="mstar.engine.resources.attn.workspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">workspace</span></code></a></p></td>
+<td><p>FlashInfer's workspaces: the scratch a plan reserves its split-KV partials in.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.wrappers.html#module-mstar.engine.resources.attn.wrappers" title="mstar.engine.resources.attn.wrappers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wrappers</span></code></a></p></td>
 <td><p>FlashInfer utility wrappers for batched paged attention.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu" title="mstar.engine.resources.attn.xpu"><code class="xref py py-obj docutils literal notranslate"><span class="pre">xpu</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu" title="mstar.engine.resources.attn.xpu"><code class="xref py py-obj docutils literal notranslate"><span class="pre">xpu</span></code></a></p></td>
 <td><p>Paged attention through vllm-xpu-kernels.</p></td>
 </tr>
 </tbody>

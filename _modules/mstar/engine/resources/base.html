@@ -999,6 +999,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
         <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
     <span class="p">)</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.workspace</span><span class="w"> </span><span class="kn">import</span> <span class="n">WorkspacePool</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.transfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TransferEngineInfo</span>
 
 
@@ -1630,6 +1631,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span></div>
 
 
+<div class="viewcode-block" id="Resource.seal_capture_buffers">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.seal_capture_buffers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seal_capture_buffers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Every bucket on the device has been sized and none captured yet: from here on,</span>
+<span class="sd">        what a captured graph reads keeps its address. Called once, by the engine."""</span>
+        <span class="c1"># A no-op is safe for a resource that never reallocates what a graph reads once it</span>
+        <span class="c1"># is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first</span>
+        <span class="c1"># plan during sizing). The one kind a plan grows is a FlashInfer workspace:</span>
+        <span class="c1"># `AttentionResource` seals the pools they come from, and the dense backend's own,</span>
+        <span class="c1"># outside a pool, is never captured.</span>
+        <span class="k">return</span></div>
+
+
 <div class="viewcode-block" id="Resource.post_warmup_validate">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.post_warmup_validate">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">post_warmup_validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1667,6 +1681,10 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">_default_label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"main"</span>
     <span class="n">_default_layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># FlashInfer's float workspaces, on a resource that plans FlashInfer. Kept here so the</span>
+    <span class="c1"># seal is too: a workspace grows at a plan that overflows it, which past capture would</span>
+    <span class="c1"># free memory a graph reads.</span>
+    <span class="n">_workspaces</span><span class="p">:</span> <span class="n">WorkspacePool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">default_label</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -1691,6 +1709,13 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">reset_default_cursors</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span> <span class="o">=</span> <span class="s2">"main"</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_default_layer_idx</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="AttentionResource.seal_capture_buffers">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.AttentionResource.seal_capture_buffers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seal_capture_buffers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">seal</span><span class="p">()</span></div>
 </div>
 
 

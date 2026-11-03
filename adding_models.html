@@ -1446,9 +1446,10 @@ missing. By default the heads are split across all TP × SP ranks of the node;
 <code class="docutils literal notranslate"><span class="pre">shard_over_sp=False</span></code> splits them across the TP ranks only, for an attention
 each sequence-parallel rank runs whole over its own tokens (one over a
 replicated stream, or a cross-attention from the rank’s query shard).
-<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> sizes each label’s FlashInfer workspace per slot (default
-<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512); a node with many labels can declare less,
-since a ragged prefill only uses it for split-KV partials. <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>,
+<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> is the floor of each label’s FlashInfer workspace per slot (default
+<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512, which doesn’t apply once it is declared): a plan that
+asks for more at startup grows it. A node with many labels can declare less, since a
+ragged prefill only uses it for split-KV partials. <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>,
 <code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> are the model’s declaration; the serving
 config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the backends and the ceilings. See
 <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a> for <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>.</p></td>
