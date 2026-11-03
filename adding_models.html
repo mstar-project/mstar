@@ -3100,8 +3100,10 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
 <span class="nt">preprocess_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
 </pre></div>
 </div>
-<p>The pool only helps work that releases the GIL, so measure each stage first. A model with
-client streams always prepares inline, since an append has to follow its request.</p>
+<p>The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni and
+V-JEPA2 declare it (<code class="docutils literal notranslate"><span class="pre">configs/vjepa2.yaml</span></code> and <code class="docutils literal notranslate"><span class="pre">configs/vjepa2_ac.yaml</span></code> set 8 and 4, the
+sizes measured for their video decode). A model with client streams always prepares inline,
+since an append has to follow its request.</p>
 <p>A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> hands the tensor it reads straight to the

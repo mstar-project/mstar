@@ -27,5 +27,6 @@ mstar.model.z\_image.components
    :toctree:
    :recursive:
 
+   qk_norm_rope
    transformer
 

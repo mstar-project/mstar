@@ -1062,12 +1062,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RopeTables">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.RopeTables">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">RopeTables</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""One cached step's ``(sin, cos)`` per axis (``rope_tables_BNHD``): built once</span>
-<span class="sd">    from the step's positions and shared by every block, q and k."""</span>
+<span class="w">    </span><span class="sd">"""One cached step's ``(sin, cos)`` (``ACRoPEAttention.rope_tables``): built</span>
+<span class="sd">    once from the step's positions and shared by every block, q and k."""</span>
 
-    <span class="n">d</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
-    <span class="n">h</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
-    <span class="n">w</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">spatial</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>  <span class="c1"># d/h/w side by side over the head dim</span>
     <span class="n">time</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span>  <span class="c1"># action tokens, over the d dims</span></div>
 
 </pre></div>
