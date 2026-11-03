@@ -248,6 +248,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``unpausable_outputs``
+     - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
+       that streams one of them reserves its whole KV footprint and is never preempted (see
+       below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]`` unless the
+       model declares otherwise. ``[]`` gives a voice deployment a fast first chunk under KV
+       pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
@@ -448,24 +454,31 @@ its pages, and is otherwise dropped if it can be rebuilt from its token ids. The
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
 request on the host waits at its place in the queue until its pages and one more page fit, and
 its pages are then copied back. A dropped request waits until its history and one more page
-fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
-made from media or another node's outputs, reserves its whole footprint in every pool, with
-every cache hit counted, and is never dropped or moved to the host. So does a request in the
-pools of a node that keeps no token ids to rebuild it. Voice requests then queue when the pool
-is short and are never preempted mid-stream.
+fit, then recomputes its KV in one prefill row. A request that streams an output in
+``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
+and is never dropped or moved to the host. Voice requests then queue when the pool is short and
+are never preempted mid-stream. A request no drop can free, because it holds KV made from media
+or another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
+when it is admitted the host pool sets room for its whole footprint aside, and it reserves only
+its prompt. When the host pool can't, it reserves its whole footprint in that pool, as a voice
+request does. So ``cpu_offload_pages`` also sets how many such requests run at once with only
+their prompt reserved.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
-step that follows, so every rank admits each step from the same reservations. A request that
-runs short and can neither move to the host nor be dropped waits for room when moving or
-dropping the newer requests wouldn't cover its shortage. Several such requests can wait on each
-other. ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a safe
-value. ``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping
-it. An offload frees only the device pages no other running request reads, though, so a request
-that shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is copied to
-the host once no request holds it, and a later request whose prefix the device evicted copies it
-back from there. So the host pool should hold more pages than the device's prefix cache.
+step that follows, so every rank admits each step from the same reservations. On a node with a
+second paged KV cache, such as Whisper's decoder, a decode step that finds no page and nothing to
+offload holds its requests until they time out. Elsewhere, a request that runs short and can
+neither move to the host nor be dropped waits in its pool's queue, at its arrival, until its
+shortage fits, when moving or dropping the newer requests wouldn't cover it. Several such
+requests can wait on each other. ``max_concurrent_requests`` prevents both. It caps how many
+requests run at once, and the pool's pages divided by the pages one request needs, prompt and
+output together, is a safe value. ``cpu_offload_pages`` lets a full pool move a request to the
+host instead of dropping it. An offload frees only the device pages no other running request
+reads, though, so a request that shares most of its prompt frees little. Offload helps a pool
+that runs short now and then. It doesn't replace the cap. With a host pool and the prefix cache
+on, a cached page is copied to the host once no request holds it, and a later request whose
+prefix the device evicted copies it back from there. So the host pool should hold more pages
+than the device's prefix cache.
 
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own

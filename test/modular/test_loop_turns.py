@@ -355,7 +355,6 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
-    w._victims = {}
     w._metrics = None
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub)

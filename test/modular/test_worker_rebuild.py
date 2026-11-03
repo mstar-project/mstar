@@ -28,7 +28,7 @@ from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.rebuild import KeptIds, RebuildRow, Rebuilds
+from mstar.worker.rebuild import KeptIds, NodeWrites, RebuildRow, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -88,8 +88,11 @@ def _worker():
     w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    w._kv_keys, w._rebuilding = {NODE: ["kv"]}, frozenset()
-    w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
+    w._rebuilding, w._dropped = frozenset(), {}
+    w._kv_writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
+    w._preemption = SimpleNamespace(
+        counts=defaultdict(PreemptionCounts), returned=lambda rid, node: None, remove_request=lambda rid: None,
+    )
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     w.parallel_nodes = w.parallel_leader_nodes = set()
     # holds no row, so any routing, stop or loop-count call fails the test
@@ -129,12 +132,15 @@ def test_a_rebuild_tells_the_node_what_its_row_writes_and_queues_the_row():
     assert w.scheduler.rebuild_queued(R), "the row would never reach a step"
 
 
-@pytest.mark.parametrize("shared", [False, True], ids=["own pool", "pool shared with a node with no rebuild policy"])
-def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeypatch, shared):
+@pytest.mark.parametrize("talker_walk", [None, "talk", PREFILL], ids=[
+    "own pool", "pool shared with a node that writes nothing for it",
+    "pool shared with a node with no rebuild policy that writes for it",
+])
+def test_a_request_no_rebuild_can_write_again_isnt_rebuildable_in_its_pools(monkeypatch, talker_walk):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     w, _ = _worker()
-    if shared:
-        w._kv_keys["talker"] = ["kv"]
+    if talker_walk is not None:
+        w._kv_writes["kv"]["talker"] = NodeWrites(frozenset({talker_walk}), frozenset())
     kv, w._unprocessed_messages = _pool(), {}
     # neither the publish skip nor the streams bear on the class
     w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
@@ -147,16 +153,16 @@ def test_a_request_no_rebuild_can_write_again_is_guaranteed_in_its_pools(monkeyp
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     # 12's KV grows in a loop the node's policy doesn't name, so no rebuild can write it again.
     # 13's prompt was written in a walk the node's policy doesn't prefill, so it keeps no ids.
-    # 10 lays out nothing, so it isn't guaranteed.
+    # 10 lays out nothing, so nothing refuses it.
     configs = {R: _config(), 12: _config(growth=(("embeds_loop", 1),)), 13: _config(walk="audio"),
                10: {"kv": KVReqConfig(kv_layout={})}}
     for rid, config in configs.items():
         info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=config, stream_lead_items={})
         w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
                                            worker_graph_to_workers={}, initial_inputs=[], request_info=info))
-    guaranteed = {rid for rid in configs if kv._overrides[rid].guaranteed}
-    assert guaranteed == ({R, 12, 13} if shared else {12, 13}), (
-        "a request nothing can drop would reserve only its prompt"
+    refused = {rid for rid in configs if not kv._overrides[rid].rebuildable}
+    assert refused == ({R, 12, 13} if talker_walk == PREFILL else {12, 13}), (
+        "a request nothing can drop would count as one a drop frees"
     )
 
 
@@ -177,11 +183,10 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     assert landed == [R], "the rebuilt request would never be ready to decode again"
 
 
-@pytest.mark.parametrize("why", ["no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short"])
+@pytest.mark.parametrize("why", ["no ids", "backlog", "rebuild queued", "prefill walk", "samples short"])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
     w._rebuilds._kept[NODE].update({} if why == "no ids" else {R: _kept(5)})
-    w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w.scheduler.rows.update({R: RebuildRow(NODE, PREFILL, {})} if why == "rebuild queued" else {})
     w.infos[R].graph_walk = PREFILL if why == "prefill walk" else DECODE

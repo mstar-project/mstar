@@ -471,8 +471,6 @@ class MicroScheduler:
         # (node, handle) -> what the worker's kept ids would rebuild of the request on that node, or None. The
         # worker installs it.
         self.rebuild_of: Callable[[str, int], Rebuild | None] = lambda node, rid: None
-        # handles the worker moves off the device once their node's next step goes out, so their rebuild rows wait
-        self.moving: Collection[int] = frozenset()
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -1199,7 +1197,7 @@ class MicroScheduler:
         return {
             rid: row for rid, row in self.rebuilds.get(node_walk, {}).items()
             if self.held_until.get(rid, 0.0) <= now and rid not in self.failed_rids
-            and rid not in self.pending_removes and rid not in self.moving
+            and rid not in self.pending_removes
         }
 
     def _schedule_rebuilds(self, request_state: RequestStateManager) -> ScheduledBatch | None:

@@ -219,7 +219,7 @@ class _FakePool(CPUPagePool):
     def __init__(self, max_cpu_pages: int = 64):
         self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
         self.index = PrefixIndex(self.arena)
-        self.offloaded = {}
+        self.offloaded, self.reserved = {}, {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
         self.dropped = self.written = self.cancelled = 0

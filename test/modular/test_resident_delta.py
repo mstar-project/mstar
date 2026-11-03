@@ -645,7 +645,6 @@ class _Leader:
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
         self._tp_followers = {}
-        self._victims = {}
         group = SimpleNamespace(_workers=["rank0", *followers])
         # The runtime owns both the sharding config and the handle table now.
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
@@ -720,17 +719,6 @@ def test_the_broadcast_sends_the_rebuild_rows_apart_from_the_rows_the_follower_p
     assert (body.request_ids, body.rebuild_ids) == (["wire-r0"], ["wire-rb"]), "the follower can't pop a rebuild row"
 
 
-def test_rank_0_drops_its_victim_before_it_drains_the_journal_for_the_step():
-    """A follower drops the victim before it builds the step, so rank 0's drop has to travel with that step."""
-    leader = _Leader()
-    leader._victims = {"v": None}
-    leader._move_victims = lambda node: leader.engine._resident_delta[node].add(MoveKind.DROP, "wire-v", count=8)
-
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
-
-    assert leader.sent[0][1].body.resident_delta.kinds == [MoveKind.DROP], "rank 0 admits a step its followers don't"
-
-
 def test_the_journal_is_drained_by_the_broadcast():
     leader = _Leader(followers=("rank1",))
     leader.engine.offload_request("node", "victim")
@@ -764,10 +752,9 @@ class _Rank:
     _handle_allocation_failure = Worker._handle_allocation_failure
     _is_tp_follower_node = Worker._is_tp_follower_node
     _push_back_batch = Worker._push_back_batch
-    _preempt = Worker._preempt
 
     def __init__(self, *, leader: bool):
-        self._kv_caches = {}
+        self._preemption = SimpleNamespace(preempt=lambda node_batch: False)
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
@@ -996,7 +983,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._rebuilds = Rebuilds({}, {})
-        self._kv_keys, self._kv_caches, self._dropped, self._victims, self._preempted = {}, {}, {}, {}, {}
+        self._dropped, self._preemption = {}, SimpleNamespace(remove_request=lambda rid: None)
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
@@ -1265,18 +1252,23 @@ def _ingest(kvs, rid: str, pages: int, arrival: int) -> None:
     layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
     for kv in kvs:
         _ENGINES[id(kv)]._runner.ingest_request(rid, {"kv": KVReqConfig(
-            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
-        )})
+            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE},
+        )}, arrival)
 
 
 def _counts(kv) -> tuple:
     """What the next admit reads, and the order the next grant takes free pages in."""
     return (
         kv._unused, {rid: (a.pages, a.remaining, a.prompt) for rid, a in kv._allotments.items()},
-        {rid: (e.pages, sorted(e.victims), e.freed) for rid, e in kv._earmarks.items()},
+        {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
         sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
         list(kv._arena.allocator.free_pages.queue),
     )
+
+
+def _preempt(kv, rid: str, droppable: bool):
+    """Rank 0's choice of victims for ``rid``'s shortage of one page, newest first."""
+    return kv.preempt(rid, 1, _ENGINES[id(kv)]._runner.newer_than(rid), lambda other: droppable)
 
 
 def _kept(rid):
@@ -1296,7 +1288,7 @@ def _both_short_then_drop(monkeypatch):
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
         assert _counts(leader) == _counts(follower)
-    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+    assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
     lead.drop_request(NODE, "v", len(_kept("v").ids))
     return (leader, lead), (follower, follow)
 
@@ -1389,7 +1381,8 @@ def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(m
 
 
 def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatch):
-    """A dropped request reserved again for its return holds pages a grant can take, so rank 0 may choose it."""
+    """A dropped request reserved again for its return holds an allotment a grant can take, so rank 0 may choose it.
+    With nothing written yet it gives the allotment back on both ranks and asks again."""
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     for engine in (lead, follow):
@@ -1398,9 +1391,9 @@ def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatc
     lead.prepare_rebuild(NODE, "v", _kept("v"))
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     _ingest((leader, follower), "x", 1, arrival=0)
-    leader._allotments["x"] = follower._allotments["x"] = Allotment(pages=1)
+    leader._allotments["x"], follower._allotments["x"] = Allotment(pages=1), Allotment(pages=1)
 
-    assert leader.preempt("x", 1, droppable=lambda rid: True) == ["v"]
+    assert _preempt(leader, "x", droppable=True).to_ask == ["v"]
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     assert _counts(leader) == _counts(follower)
 
@@ -1439,7 +1432,7 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
-    assert leader.preempt("r", 1, droppable=lambda rid: False) == ["v"] and leader.moves_to_host("v")
+    assert _preempt(leader, "r", droppable=False).to_host == ["v"]
     lead.offload_request(NODE, "v")
     delta = lead.take_resident_delta(NODE)
     assert delta.kinds == [MoveKind.EARMARK, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "a choice or a move went unjournaled"
@@ -1510,19 +1503,3 @@ def test_a_follower_builds_rank_0s_rebuild_rows_and_runs_nothing_for_moves_alone
     assert scheduler._try_schedule_tp_follow(None) is None and scheduler.peek_tp_follow() is rebuild
     batch = scheduler._try_schedule_tp_follow(None)
     assert batch.rebuild_rids == (7,) and not batch.request_to_worker_graph, "the follower's step isn't rank 0's"
-
-
-def test_rank_0_holds_a_victim_and_the_request_it_was_chosen_for_until_the_drop(monkeypatch):
-    (leader, lead), (follower, _) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
-    _ingest((leader, follower), "r", 3, arrival=1)
-    _ingest((leader, follower), "v", 5, arrival=2)
-    assert _admits(leader, "r")
-    assert _admits(leader, "v")
-    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
-        _step(leader, rid, tokens)
-    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
-
-    for rid in ("r", "v"):
-        assert not _admits(leader, rid, "decode"), f"a step before the drop could take {rid}"
-    lead.drop_request(NODE, "v", len(_kept("v").ids))
-    assert _admits(leader, "r", "decode"), "r still waits after the drop went out"

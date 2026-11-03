@@ -400,7 +400,7 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
     _cache(ranks, "a", shared)
     for kv in ranks:
-        kv.ingest_request("b", replace(_config([prompt]), guaranteed=guaranteed))
+        kv.ingest_request("b", replace(_config([prompt]), unpausable=guaranteed))
     assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
 

@@ -51,7 +51,6 @@ import queue
 import sys
 import time
 import traceback
-from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -631,7 +630,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.stream_buffers import StreamBufferManager
     from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
-    from mstar.worker.worker_metrics import PreemptionCounts
 
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
@@ -693,9 +691,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
-    w._kv_keys, w._kv_caches = defaultdict(list), {}
-    w._rebuilding, w._dropped, w._victims = frozenset(), {}, {}
-    w._preempted, w._preemptions, w._drop_logged = {}, defaultdict(PreemptionCounts), {}
+    w._kv_writes = {}
+    w._rebuilding, w._dropped = frozenset(), {}
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
             getattr(w, setup)()

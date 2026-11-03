@@ -34,7 +34,7 @@ class Admission:
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
         self._resources = resources
         # `_arrival` orders the requests: by the conductor's arrival number, then, for a request without
-        # one, in the order it first asked.
+        # one, in the order it first asked. `_numbered` lists the requests with a number, in that order.
         # `_waiting` holds what each waiting request asked.
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
         # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
@@ -45,6 +45,7 @@ class Admission:
         # it, which `admit_waiting` reports so their parked checks resume.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
+        self._numbered: list[str] = []
         self._waiting: dict[str, _Waiting] = {}
         self._queues: dict[str, list[str]] = {key: [] for key in ask_order}
         self._short: dict[str, object] = {}
@@ -53,8 +54,18 @@ class Admission:
         self._started: dict[str, set[str]] = {}
 
     def set_arrival(self, rid: str, arrival: int) -> None:
-        """Order ``rid`` by the conductor's arrival number."""
-        self._arrival[rid] = (False, arrival)
+        """Order ``rid`` by the conductor's arrival number. A worker serving two of the request's partitions
+        ingests it once for each, with the same number."""
+        if rid not in self._arrival:
+            self._arrival[rid] = (False, arrival)
+            bisect.insort(self._numbered, rid, key=self._arrival.__getitem__)
+
+    def newer_than(self, rid: str) -> list[str] | None:
+        """The requests numbered after ``rid``, newest first, or None when the conductor gave ``rid`` no number."""
+        arrival = self._arrival.get(rid)
+        if arrival is None or arrival[0]:
+            return None
+        return self._numbered[bisect.bisect_right(self._numbered, arrival, key=self._arrival.__getitem__):][::-1]
 
     def admitted(self, rid: str, node_name: str) -> bool:
         return node_name in self._admitted.get(rid, ())
@@ -149,7 +160,9 @@ class Admission:
             self._leave(rid, entry.asked)
         self._admitted.pop(rid, None)
         self._started.pop(rid, None)
-        self._arrival.pop(rid, None)
+        arrival = self._arrival.pop(rid, None)
+        if arrival is not None and not arrival[0]:
+            self._numbered.remove(rid)
 
     def _park_request(self, rid: str, key: str, node_name: str, graph_walk: str) -> _Waiting:
         """Put ``rid`` in ``key``'s queue at its arrival, and return what it waits for."""

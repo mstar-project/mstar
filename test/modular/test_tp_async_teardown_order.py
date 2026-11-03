@@ -149,7 +149,7 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers = {}
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -270,13 +270,15 @@ def test_rank_0_sends_an_owed_drop_before_the_loop_top_removes_its_victim(monkey
     removal applies, so the removal is stamped with the step that carries the drop."""
     w, log = _rank(monkeypatch, tp_rank=0, inbox=[])
     w.parallel_nodes = w.parallel_leader_nodes = {NODE}
-    w._kv_caches = {"kv": SimpleNamespace(nodes={NODE}, cache=SimpleNamespace(head_on_host=lambda: None))}
-    w._victims = {HANDLES["gone"]: worker_mod.Victim("kv", 1)}
+    w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
+    owed = {NODE}
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=owed.__contains__)
     w._pending_removes = {HANDLES["gone"]: None}
     w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])
     broadcast = w.maybe_send_zmq_to_tp_followers
 
     def _logged(node_batch, **kwargs):
+        owed.clear()
         log.append(("broadcast", broadcast(node_batch, **kwargs)))
         return log[-1][1]
 

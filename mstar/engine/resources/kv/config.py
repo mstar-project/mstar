@@ -382,10 +382,11 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
-    arrival: int | None = None
-    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
-    guaranteed: bool = False
+    # `unpausable`: the request streams an output that can't pause, set by the conductor.
+    # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
+    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    unpausable: bool = False
+    rebuildable: bool = True
 
     def apply_conductor_config(
         self,
@@ -396,7 +397,6 @@ class KVReqConfig(ResourceReqConfig):
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
-        arrival: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -428,8 +428,6 @@ class KVReqConfig(ResourceReqConfig):
                 loop: loop_caps[loop]
                 for layout in self.kv_layout.values() for loop, _ in layout.growth
             }
-        if arrival is not None:
-            self.arrival = arrival
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
@@ -553,18 +551,11 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     return None
 
 
-def mark_guaranteed(
-    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
-) -> None:
-    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
-    playback, or when any of them lays out KV that a rebuild from token ids can't recompute."""
-    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
-    guaranteed = (streaming and "audio" in output_modalities) or any(
-        span.kind != "ids"
-        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
-    )
-    for config in kv_configs:
-        config.guaranteed = guaranteed
+def mark_unpausable(configs: Mapping[str, ResourceReqConfig], unpausable: bool) -> None:
+    """Mark every KV config in ``configs``, since a pause in any pool is heard."""
+    for config in configs.values():
+        if isinstance(config, KVReqConfig):
+            config.unpausable = unpausable
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:

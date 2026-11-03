@@ -3035,6 +3035,15 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
+    def newer_than(self, request_id: int) -> list[str] | None:
+        """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
+        return self._runner.newer_than(request_id)
+
+    def readmit_request(self, node_name: str, request_id: int) -> None:
+        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        `Admission.readmit`."""
+        self._runner.readmit(request_id, node_name)
+
     def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
         """Discard the request's state on this node that can be recomputed from
         its token ids, and return the pages freed. ``kept`` is how many of those ids
@@ -3181,6 +3190,9 @@ class Engine:
             return OffloadDelta.new()
         return self._resident_delta[node_name].take()
 
+    def owes_moves(self, node_name: str) -> bool:
+        return bool(self._resident_delta.get(node_name))
+
     def apply_resident_delta(
         self, node_name: str, delta: OffloadDelta, rebuild_of: Callable[[int], Rebuild | None],
     ) -> bool:
@@ -3211,11 +3223,13 @@ class Engine:
                 if kind == MoveKind.EARMARK:
                     logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
                                 node_name, move.count, move.victims)
+            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and any(
+                kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes
+            ):
+                logger.debug("Replay: %s's %s on %s waits for its step; %d moves still owed",
+                             wire_rid, kind.name, node_name, len(delta))
+                return False
             elif kind == MoveKind.DROP:
-                if any(kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes):
-                    logger.debug("Replay: %s's drop on %s waits for its step; %d moves still owed",
-                                 wire_rid, node_name, len(delta))
-                    return False
                 rebuild = rebuild_of(rid)
                 if rebuild is None or len(rebuild.ids) != move.count:
                     raise RuntimeError(
@@ -3321,7 +3335,7 @@ class Engine:
     ) -> None:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
-        self._runner.ingest_request(request_id, overrides)
+        self._runner.ingest_request(request_id, overrides, None if request_info is None else request_info.arrival)
         if request_info is None:
             return
         try:

@@ -622,6 +622,10 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
+    # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
+    # overrides it.
+    UNPAUSABLE_OUTPUTS: frozenset[str] = frozenset({"audio"})
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default

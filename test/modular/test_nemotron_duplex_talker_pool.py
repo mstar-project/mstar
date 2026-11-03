@@ -281,8 +281,8 @@ def test_every_session_of_the_longest_length_fits_the_talker_pool_at_once(monkey
     for session in range(model.DEFAULT_SESSIONS):
         runner.ingest_request(f"s{session}", {TALKER_KV: KVReqConfig(
             kv_layout={"main": stream, "uncond": stream}, needed_labels=["main", "uncond"],
-            loop_caps={"talker_decode_loop": model.get_max_output_tokens()}, arrival=session, guaranteed=True,
-        )})
+            loop_caps={"talker_decode_loop": model.get_max_output_tokens()}, unpausable=True,
+        )}, session)
 
     admitted = [runner.admit_retrieve(f"s{session}", "talker", "talker_decode").ready
                 for session in range(model.DEFAULT_SESSIONS)]

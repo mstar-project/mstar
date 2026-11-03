@@ -29,7 +29,6 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     SpanKind,
     StreamLayout,
-    mark_guaranteed,
 )
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -281,23 +280,60 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 29
 
 
-@pytest.mark.parametrize("streaming, outputs, kinds, guaranteed", [
-    (True, ["text", "audio"], ("ids", "ids"), True), (False, ["text", "audio"], ("ids", "ids"), False),
-    (True, ["text"], ("ids", "ids"), False), (False, ["text"], ("digest", "ids"), True),
-    (False, ["text"], ("ids", "rows"), True),
-])
-def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, kinds, guaranteed):
-    configs = {key: KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(PS, PS, "prefill", kind=kind),))})
-               for key, kind in zip(("kv", "talk"), kinds, strict=True)}
-    mark_guaranteed(configs, streaming, outputs)
-    assert [config.guaranteed for config in configs.values()] == [guaranteed] * 2, "a pool got another class"
+@pytest.mark.parametrize("streaming, outputs", [
+    (False, ["text", "audio"]), (True, ["text"]),
+], ids=["unstreamed audio", "streamed text"])
+def test_the_conductor_leaves_a_request_that_can_pause_preemptible(tmp_path, monkeypatch, streaming, outputs):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=streaming, outputs=outputs)
+    assert not new_request.request_info.resource_configs["kv"].unpausable, "a request that can pause was guaranteed"
 
 
-def test_the_conductor_marks_a_request_that_streams_audio_guaranteed(tmp_path, monkeypatch):
+def test_the_conductor_leaves_a_rows_span_to_the_pools_that_hold_it(tmp_path, monkeypatch):
+    """An unstreamed Qwen3-Omni chat with audio out lays out rows only in the Talker's pool, since the Talker reads
+    the Thinker's hidden states. Guaranteed in every pool, it would reserve the Thinker's whole decode cap, though
+    a rebuild writes the Thinker's ids again."""
+    model = _Model()
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, outputs=["text", "audio"])
+    assert not new_request.request_info.resource_configs["kv"].unpausable, (
+        "a rows span made the request guaranteed in every pool"
+    )
+
+
+def test_the_conductor_marks_a_request_that_streams_audio_unpausable(tmp_path, monkeypatch):
     model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
     kwargs = _preprocess(model, {})
     new_request = _ingest(model, kwargs, tmp_path, monkeypatch, streaming=True, outputs=["text", "audio"])
-    assert new_request.request_info.resource_configs["kv"].guaranteed, "a voice stream would be preempted"
+    assert new_request.request_info.resource_configs["kv"].unpausable, "a voice stream would be preempted"
+
+
+class _Pausable(_Model):
+    """A model whose streamed audio is buffered before it plays, so a pause is never heard."""
+    UNPAUSABLE_OUTPUTS = frozenset()
+
+
+def test_a_model_that_declares_no_unpausable_output_leaves_its_streamed_audio_preemptible(tmp_path, monkeypatch):
+    model = _Pausable({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=["audio"])
+    assert not new_request.request_info.resource_configs["kv"].unpausable, (
+        "streamed audio was guaranteed though the model says it can pause"
+    )
+
+
+@pytest.mark.parametrize("unpausable, outputs, guaranteed", [
+    ([], ["text", "audio"], False), (["text"], ["text"], True),
+], ids=["voice deployment that keeps a fast first chunk", "streamed text that can't pause"])
+def test_the_serving_config_overrides_the_outputs_the_model_says_cant_pause(
+    tmp_path, monkeypatch, unpausable, outputs, guaranteed,
+):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(
+        model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=True, outputs=outputs,
+        unpausable_outputs=unpausable,
+    )
+    assert new_request.request_info.resource_configs["kv"].unpausable == guaranteed, (
+        "the deployment's unpausable_outputs were ignored"
+    )
 
 
 def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
@@ -319,7 +355,7 @@ def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):
     assert cfg.kv_layout["main"].spans[0].length == PROMPT, "a client's layout would size another request's pages"
 
 
-def test_requests_carry_their_arrival_on_every_kv_config(tmp_path, monkeypatch):
+def test_requests_carry_their_arrival_on_the_request_info(tmp_path, monkeypatch):
     model = _Model()
     groups = [{"node_names": ["llm"], "ranks": [0]}, {"node_names": ["talker"], "ranks": [1]}]
     kwargs = _preprocess(model, {"max_output_tokens": 30})
@@ -329,7 +365,7 @@ def test_requests_carry_their_arrival_on_every_kv_config(tmp_path, monkeypatch):
     frames = [msg.body for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"]
     arrivals = {rid: set() for rid in ("r", "s")}
     for frame in frames:
-        arrivals[frame.request_id].update(cfg.arrival for cfg in frame.request_info.resource_configs.values())
+        arrivals[frame.request_id].add(frame.request_info.arrival)
     assert len(frames) == 4, "each worker hears of each request"
     ((first,), (second,)) = arrivals["r"], arrivals["s"]
     assert first < second, "a frame carried another number, or the later request didn't get the later one"

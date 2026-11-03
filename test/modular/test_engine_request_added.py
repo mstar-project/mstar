@@ -15,7 +15,7 @@ class _Runner:
     def __init__(self, log):
         self.log = log
 
-    def ingest_request(self, rid, overrides=None):
+    def ingest_request(self, rid, overrides=None, arrival=None):
         self.log.append(("ingest", rid))
 
     def remove_request(self, rid):
