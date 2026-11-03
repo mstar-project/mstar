@@ -166,15 +166,15 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     _running(kv, "v", 4, arrival=3)
     assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
 
-    none = Victims([], [])
-    assert kv.preempt("r2", _short(kv, "r2"), droppable=lambda rid: True) == none, "r2 took r1's victim or moved itself"
-    assert kv.waits("r2"), "r2 doesn't wait for the room v's move makes"
-    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True) == none, "r1 chose again before v moved"
+    waits = kv.preempt("r2", _short(kv, "r2"), droppable=lambda rid: True)
+    assert waits == Victims([], [], waits=True), "r2 took r1's victim or moved itself"
+    _runner(kv).readmit("r2", NODE)
+    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], []), "r1 chose again"
     _drop(kv, "v")
 
-    assert not kv.waits("r2") and not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
+    assert not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
     assert _step(kv, "r1", 1).ok, "r1 didn't get the page its victim freed"
-    assert _step(kv, "r2", 1).ok, "r2 didn't get a page from the room v's move made"
+    assert _admitted(kv, "r2") and _step(kv, "r2", 1).ok, "r2 didn't get a page from the room v's move made"
 
 
 def test_a_request_waiting_on_its_own_victims_isnt_chosen_as_a_victim():
@@ -223,17 +223,21 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
 
     victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
-    dropped = ["r"] if then == "drops itself" else []
-    assert victims == Victims([], dropped) and not kv._earmarks, "nothing newer frees a page"
-    assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
+    drops = then == "drops itself"
+    assert victims == Victims([], ["r"] if drops else [], waits=not drops), "r waits only when it can't drop itself"
+    assert not kv._earmarks, "nothing newer frees a page"
+    if not drops:
+        _runner(kv).readmit("r", NODE)
+        assert _queue(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait in the queue for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
-        assert not kv.waits("r") and _queue(kv) == ["r"], "r's wait for room outlived its drop"
+        returns = kv._dropped["r"].returns
+        assert kv._need("r", NODE, WALK, None) == returns, "r's wait for its shortage outlived its drop"
         _remove(kv, "older")
         assert _admitted(kv, "r"), "r didn't return once its history and a page fit"
     elif then == "waits":
         _remove(kv, "older")
-        assert not kv.waits("r"), "r kept waiting after the room grew"
+        assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
 
 
 @pytest.mark.parametrize("state", ["pending victim", "dropped", "rebuilding", "earmark's request"])
@@ -256,7 +260,7 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     admission = _runner(kv)._admission
     left = [
         state for state in (
-            kv._earmarks, kv._victims, kv._short, kv._ran_short, kv._asks, kv._dropped, kv._allotments,
+            kv._earmarks, kv._victims, kv._ran_short, kv._asks, kv._dropped, kv._allotments,
             admission._waiting, admission._admitted, admission._arrival, admission._queues["kv"],
         ) if gone in state
     ]

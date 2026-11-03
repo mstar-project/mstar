@@ -24,6 +24,7 @@ from test_kv_preemption import (  # noqa: F401
     _drop,
     _offload,
     _pool,
+    _queue,
     _ready,
     _request,
     _running,
@@ -63,6 +64,7 @@ def _worker(kv):
     engine = _Engine(
         drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: _drop(kv, rid),
         offload_request=lambda node, rid: _offload(kv, rid),
+        readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
         admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),
     )
@@ -136,7 +138,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert w._preemptions[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
     elif case == "a node where no request keeps ids":
         # the node's policy decides how it preempts, whichever requests keep ids now
-        assert not w.tried and not w.held and kv.waits("r") and kv.is_resident("v"), (
+        assert not w.tried and not w.held and _queue(kv) == ["r"] and kv.is_resident("v"), (
             "a node that rebuilds requests switched to the offload and the hold while none kept ids"
         )
     else:
@@ -168,12 +170,12 @@ def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_t
     assert _step(kv, "r", 1).ok
 
 
-def test_a_request_that_can_only_wait_holds_nothing_and_is_logged(caplog):
+def test_a_request_that_can_only_wait_waits_in_the_queue_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         kv, w = _preempting("nothing to drop")
 
-    assert kv.waits("r") and not w.held and not w._dropped
-    assert "r waits for room" in caplog.text, "a request that can only wait left no line"
+    assert _queue(kv) == ["r"] and "r" in kv._allotments and not w.held and not w._dropped
+    assert "r waits in the queue" in caplog.text, "a request that can only wait left no line"
 
 
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():

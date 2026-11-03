@@ -3028,6 +3028,11 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
+    def readmit_request(self, node_name: str, request_id: int) -> None:
+        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        `Admission.readmit`."""
+        self._runner.readmit(request_id, node_name)
+
     def drop_request(self, node_name: str, request_id: int) -> int:
         """Discard the request's state on this node that can be recomputed from
         its token ids, and return the pages freed."""

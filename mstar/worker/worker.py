@@ -1174,9 +1174,10 @@ class Worker:
 
     def _preempt(self, node_batch: ExecutingBatch) -> bool:
         """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
-        drop it, and return True. Return False, so the offload and the hold run, when the failed resource isn't a
-        paged KV cache, when the node rebuilds no request here and the cache has no host pool or isn't the node's
-        only one, or when `KVManager.preempt` returns None."""
+        drop it, or queue the request for its shortage when no move covers it, and return True. Return False, so
+        the offload and the hold run, when the failed resource isn't a paged KV cache, when the node rebuilds no
+        request here and the cache has no host pool or isn't the node's only one, or when `KVManager.preempt`
+        returns None."""
         kv = self._kv_caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
         if kv is None or not (
@@ -1196,11 +1197,13 @@ class Worker:
         victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
         if victims is None:
             return False
-        if not (victims.to_host or victims.to_drop) and kv.cache.waits(reason.request_id):
+        if victims.waits:
+            for node in kv.nodes:
+                self.engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self._log_throttled(
                 self._hold_logged, (node_batch.node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits for room, since moving what the pool can move wouldn't "
-                "cover its shortage of %d pages (%d earlier waits not logged)",
+                "KV short on node=%s walk=%s: %s waits in the queue for its shortage of %d pages, since moving what "
+                "the pool can move wouldn't cover it (%d earlier waits not logged)",
                 node_batch.node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id),
                 reason.pages_short,
             )
