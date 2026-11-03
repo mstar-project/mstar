@@ -455,6 +455,34 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     assert pool.copied_in == 1 and len(ready) == 1, "the row's step wouldn't wait for its image"
 
 
+def test_a_request_with_images_is_not_rebuildable_on_a_node_whose_dtype_is_unknown():
+    """A slice sized for bf16 copies overflowed on an fp32 deployment, and the request was left preemptible with no
+    way back. The log sizes copies in the dtype the node runs in, and a node that keeps its own dtype copies nothing."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+
+    assert not _ingest(rebuilds, R, IMAGE_CHAT), "a request whose copies can't be sized would be droppable"
+    assert _ingest(rebuilds, A, (PrefixSpan(4, 4, VISION),)), "a prompt of ids alone would lose its rebuild"
+
+
+def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice_alone():
+    allowance, pool = StepAllowance(0), HostPool(64, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance)
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media(), LogRoom(pool.take(64), 0)
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.full((4,), 7.0)]
+    rebuilds.keep_copies(step)
+
+    rebuilds.remove_request(R)
+    piece = pool.take(64)
+    pool.view(piece, torch.uint8, torch.Size([64])).fill_(1)
+    allowance.refill()
+    rebuilds.flush()
+
+    assert pool.view(piece, torch.uint8, torch.Size([64])).tolist() == [1] * 64, (
+        "a removed request's queued copy wrote into the slice its next owner holds"
+    )
+
+
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
