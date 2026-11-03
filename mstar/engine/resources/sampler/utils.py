@@ -613,10 +613,11 @@ def _count_ge(x_bits, t):
 @triton.jit
 def _kth_largest_bits(x_bits, k):
     """The largest threshold ``t`` (float bits) with at least ``k`` entries >= t:
-    the k-th largest value's bits. Non-negative floats order like their bits."""
+    the k-th largest value's bits, for values in [0, 1]: those order like their
+    bits, which are at most 1.0's, so 30 halvings cover them."""
     lo = 0
-    hi = 0x7F800000
-    for _ in range(31):
+    hi = 0x3F800000
+    for _ in range(30):
         mid = lo + (hi - lo + 1) // 2
         ok = _count_ge(x_bits, mid) >= k
         lo = tl.where(ok, mid, lo)
@@ -638,7 +639,7 @@ def _fused_filter_kernel(
     offs = tl.arange(0, BLOCK)
     valid = offs < V
     p = tl.load(probs_ptr + row * stride_in + offs, mask=valid, other=0.0)
-    p = tl.maximum(p, 0.0)
+    p = tl.minimum(tl.maximum(p, 0.0), 1.0)
     bits = p.to(tl.int32, bitcast=True)
     k = tl.load(top_k_ptr + row)
     first_k = tl.load(first_k_ptr + row)
@@ -705,8 +706,9 @@ def _fused_sample_kernel(
     greedy = temp == 0
     x_max, arg = tl.max(x, axis=0, return_indices=True)
     inv_temp = tl.where(greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    # unnormalised: the largest is 1, so every key is at most 1.0's bits
-    e = tl.where(valid, tl.exp((x - x_max) * inv_temp), 0.0)
+    # unnormalised: the largest is 1, so every key is at most 1.0's bits (the
+    # minimum holds that against an approximate exp just below 0)
+    e = tl.where(valid, tl.minimum(tl.exp((x - x_max) * inv_temp), 1.0), 0.0)
     key = e.to(tl.int32, bitcast=True)
     k = tl.load(top_k_ptr + row)
     t = 0
