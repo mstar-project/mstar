@@ -1533,7 +1533,10 @@ puts a worker’s three threads on one core’s hardware threads (two cores of a
 cluster where there is no SMT), which keeps that core awake. <code class="docutils literal notranslate"><span class="pre">auto</span></code> pins nothing
 and logs one line saying why for this host, since neither layout has beaten no pin
 on every host it was measured on (table below). <code class="docutils literal notranslate"><span class="pre">off</span></code> never pins, a number names
-the first worker’s core.</p></li>
+the first worker’s core. Under a job’s mask too small for every GPU the container
+can open (8 cores on a node of four GPUs), <code class="docutils literal notranslate"><span class="pre">always</span></code> and <code class="docutils literal notranslate"><span class="pre">siblings</span></code> size by the
+GPUs the server was given, and a lock per core keeps servers that share <code class="docutils literal notranslate"><span class="pre">/tmp</span></code>
+on different cores.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">idle_hold:</span> <span class="pre">qos</span></code> asks the kernel to keep every CPU out of deep idle states
 through <code class="docutils literal notranslate"><span class="pre">/dev/cpu_dma_latency</span></code> for the server’s life. It needs a device most
 containers hide, and it logs what it got.</p></li>

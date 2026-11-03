@@ -14,6 +14,7 @@ mstar.utils.cpus
    .. autosummary::
    
       cgroup_cpu_quota
+      claim_cores
       claim_gpus
       cpu_vendor
       deepest_idle

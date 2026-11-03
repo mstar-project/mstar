@@ -772,7 +772,10 @@ host time spent waking CPUs. Two knobs deal with it:
   cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
   and logs one line saying why for this host, since neither layout has beaten no pin
   on every host it was measured on (table below). ``off`` never pins, a number names
-  the first worker's core.
+  the first worker's core. Under a job's mask too small for every GPU the container
+  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
+  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+  on different cores.
 - ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
   through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
   containers hide, and it logs what it got.
