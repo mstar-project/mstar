@@ -93,6 +93,7 @@ def _worker(scheduler, runtime):
             get_fwd_info=lambda rid, partition: fwd[rid],
         ),
         _in_flight_rids=set(),
+        _rows_by_lane={},
         chunk_loops=ChunkLoops(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
@@ -104,7 +105,7 @@ def _worker(scheduler, runtime):
     streams.poll_for = lambda rid, node: []
     streams.chunks_for = lambda rid, node, inputs: None
     worker.streams = streams
-    for name in ("_try_speculate_next", "_try_follow_speculation"):
+    for name in ("_try_speculate_next", "_try_follow_speculation", "_hold_rows"):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
     ctx = SpeculationContext(
         graph_runtime=runtime, tensor_manager=worker.tensor_manager,

@@ -790,6 +790,10 @@ Qwen3-TTS notes
   keeps the sum it had before the two shared the component: Qwen3-TTS
   accumulates in the model dtype, rounding after every add (the reference sums
   in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once.
+- The Codec does not run beside the Talker on a side stream (``side_stream``,
+  see :doc:`serving`): its windows read and write their streams' ``codec_state``
+  rows, and the side lane only takes a node that holds no resources, since it
+  neither admits nor plans a step ahead. No Qwen3-TTS config sets the field.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
