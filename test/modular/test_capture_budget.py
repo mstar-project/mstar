@@ -43,8 +43,8 @@ _MIB = 2**20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
-# a node with no float32 setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None)
+# a node with no float32 or cuDNN-search setting of its own
+_NO_PRECISION = SimpleNamespace(fp32_precision=None, submodule=SimpleNamespace(capture_cudnn_benchmark=False))
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -344,10 +344,14 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
             ))},
         )
 
+    opened = set()
+
     def ensure(key, bs):
         rids = list(range(-bs, 0))
         for rid in rids:
-            kv.ingest_capture_row(rid)
+            if rid not in opened:  # each padding row once, as DummyRowPool keeps its rows
+                opened.add(rid)
+                kv.ingest_capture_row(rid)
         return rids
 
     runner = _StubMeasuredRunner(torch.device("cuda", 0), {wide: _cost(100), fits: _cost(10)})

@@ -19,6 +19,7 @@ Entries marked *open PR* are not on `main` yet. Check the checkout; if your port
 | | `RaggedBlockCausalAttentionSpec` (#381, *open PR*) | each block attends its span's prefix of blocks |
 | a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #383, *open PR*) | rows at any position in one batch; per-row source; a per-distance score term |
 | fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`) |
+| per-request adapter weights (LoRA) | `LoraSpec` / `LoraAdapterPool` | a slot per resident adapter, held for a request's lifetime; the step's tokens grouped by slot for the kernels |
 | frame rings (Waypoint) | `RingKVManager` | to be merged into bounded KV |
 
 A resource that holds per-request state gives models operations driven by the step (`gather` / `scatter_`, `attend` over the current plan). It never asks a model to index its storage or to hold and select rows of its plans.
@@ -48,6 +49,7 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 ## Attention backends
 
 - **Attention over several short key ranges tiles them as one sequence** (key to range by index math) and selects the pointer before loading: per-range tile loops and a masked load per source each cost about a quarter of the kernel on the token2wav DiT.
+- **A wrapper over FlashInfer plans through its `Workspace`** (`attn/workspace.py`), not on the FlashInfer wrapper directly. A plan's float workspace need scales with the bucket's rows and heads and the GPU's SM count, and it can only grow before capture: a graph records the address. A `Workspace` grows at the first plan that overflows it, up to `Resource.seal_capture_buffers`, which the engine calls once every bucket is sized.
 - **Verify a kernel swap numerically, not just that it runs.** FlashInfer at head_dim 72 runs and returns wrong values (see `check_flashinfer_head_dim` in `attn/wrappers.py`).
 - **FlashInfer accepts `(k_cache, v_cache)` as a tuple of 4-D tensors**, not only the paired 5-D layout. With the paired layout it calls `.unbind(dim=1)` on every attention call (`flashinfer/utils.py::_unpack_paged_kv_cache`) and hands the kernel strided views. A split K/V layout avoids that.
 - **FlashAttention's causal mask is bottom-right aligned** (the new queries are the last positions); `F.scaled_dot_product_attention(is_causal=True)` is top-left aligned. They disagree whenever `q_len != kv_len`, so build the mask explicitly in a reference or you will "find" an FA bug that isn't there.

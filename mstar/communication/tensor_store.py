@@ -270,6 +270,8 @@ class TensorBookkeeping(ABC):
 
 
 class PythonTensorBookkeeping(TensorBookkeeping):
+    """The pure-Python bookkeeping the Rust one is tested against."""
+
     def __init__(self):
         self._ref_info: dict[int, ReferenceInfo] = {}
         self._tensor_info: dict[int, TensorPointerInfo] = {}
@@ -546,21 +548,21 @@ class RustTensorBookkeeping(TensorBookkeeping):
 
 
 def _build_tensor_bookkeeping() -> TensorBookkeeping:
-    """The Rust bookkeeper wherever the extension imports: the graph runtime
-    holds a SHARE of this object, so the two have to be the same
-    implementation. The Python one is for the api server's data worker, which
-    may run without the extension.
+    """The Rust bookkeeper: the graph runtime holds a SHARE of this object, so
+    the two have to be the same implementation. ``PythonTensorBookkeeping`` is
+    the reference the tests check it against, not a fallback: serving needs the
+    extension.
 
     Deliberately NOT gated on being in a worker, so the data worker takes the
-    Rust one too where it can, and pays the copy of each descriptor into Rust
-    with no graph runtime behind it. Small next to its per-request work, and
-    the api server is a candidate for Rust itself;
-    ``TensorStore(bookkeeping=...)`` is the override if that stops being true.
+    Rust one too, and pays the copy of each descriptor into Rust with no graph
+    runtime behind it. Small next to its per-request work, and the api server
+    is a candidate for Rust itself; ``TensorStore(bookkeeping=...)`` is the
+    override if that stops being true.
     """
-    try:
-        return RustTensorBookkeeping()
-    except ImportError:
-        return PythonTensorBookkeeping()
+    from mstar.graph.runtime.utils import require_rust_extension
+
+    require_rust_extension()
+    return RustTensorBookkeeping()
 
 
 class TensorStore:

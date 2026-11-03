@@ -16,6 +16,8 @@ import torch
 
 sys.path.insert(0, ".")
 
+from test_flux2_klein_reference_equivalence import _encode_rows  # noqa: E402
+
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, ZImageConfig, resolve_snapshot_dir  # noqa: E402
@@ -84,8 +86,7 @@ def test_trajectory_and_image_match_oracle(model, meta):
     text_len = int(ids.shape[0])
     with torch.no_grad():
         node_inputs = text.prepare_inputs(IMAGE_GEN_WALK, None, {"text_inputs": [ids]})
-        kwargs = text.preprocess(IMAGE_GEN_WALK, engine_inputs, [node_inputs])
-        embeds = text.forward(IMAGE_GEN_WALK, engine_inputs, **kwargs)[TEXT_EMBEDS][0]
+        embeds = _encode_rows(text, IMAGE_GEN_WALK, [node_inputs])[0]
         expected_embeds = torch.load(ORACLE_DIR / "t2i" / "prompt_embeds.pt")
         diff = (embeds[0, :text_len].cpu().float() - expected_embeds.float()).abs().max().item()
         print(f"caption embeds max_abs={diff:.3e}")

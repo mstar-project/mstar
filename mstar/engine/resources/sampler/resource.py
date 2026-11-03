@@ -203,10 +203,6 @@ class SamplerResource(Resource):
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
-        if rid in self._sampler._sampling_config:
-            # a worker serving two partitions ingests the rid twice; adding it
-            # again would reset its seen-token mask and RNG offset mid-request
-            return
         extra_kwargs = asdict(overrides) if overrides is not None else {}
         self._sampler.add_request(request_id=rid)
         self._sampler.set_config(
@@ -622,7 +618,7 @@ class SamplerResource(Resource):
 
     def enable_device_loopback_reader(self) -> None:
         """A node of this sampler declares it reads its last sampled tokens
-        back on the device (``NodeSubmodule.reads_device_loopback``). Only then
+        back on the device (``ARNodeSubmodule.device_loopback``). Only then
         are the slot masters kept: the eager-step write behind them is a small
         synchronous host-to-device copy per step, and a node that takes its
         tokens on the host would pay it for nothing. Honours the knob."""

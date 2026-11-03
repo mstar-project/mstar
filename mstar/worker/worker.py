@@ -22,6 +22,8 @@ from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import (
     LocalTransferEngine,
@@ -76,6 +78,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
+    EdgeItems,
     FailRequests,
     InputSignals,
     MessageSource,
@@ -321,7 +324,7 @@ def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
     return buf.reshape(buf.shape[0], -1)[:, 0]
 
 
-class _LazyPerRid:
+class _LazyPerRid(Mapping):
     """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
     the first time a consumer reads them. The batched stop check, the row store
     and the inline emit read the rows directly, so in the common decode step
@@ -339,14 +342,8 @@ class _LazyPerRid:
             self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
         return self._built
 
-    def get(self, key, default=None):
-        return self._dict().get(key, default)
-
     def __getitem__(self, key):
         return self._dict()[key]
-
-    def __contains__(self, key) -> bool:
-        return key in self._dict()
 
     def __iter__(self):
         return iter(self._dict())
@@ -354,9 +351,7 @@ class _LazyPerRid:
     def __len__(self) -> int:
         return len(self._request_ids)
 
-    def __bool__(self) -> bool:
-        return bool(self._request_ids)
-
+    # the built dict's own views, rather than Mapping's per-key lookups
     def items(self):
         return self._dict().items()
 
@@ -367,6 +362,81 @@ class _LazyPerRid:
         return self._dict().values()
 
 
+class _LazyHostOutputs(Mapping):
+    """Per-rid host copies of a step's outputs, copied by output name on first
+    read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
+
+    The stop check reads at most the sampled token, and a loop that stops on
+    its iteration count reads nothing, so copying every output down each step
+    paid for transfers nobody read. Outputs that leave by a host transport are
+    copied by the send instead; ``landed`` hands it what was copied here.
+    """
+
+    __slots__ = ("_source", "_copy_names", "_landed")
+
+    def __init__(self, source: dict, copy_names: Callable[[list[str]], dict]):
+        self._source = source
+        self._copy_names = copy_names
+        self._landed: dict[str, dict] = {}
+
+    def _copy(self, names) -> None:
+        missing = [n for n in dict.fromkeys(names) if n not in self._landed]
+        if missing:
+            self._landed.update(self._copy_names(missing))
+
+    def _host(self, name: str) -> dict:
+        self._copy((name,))
+        return self._landed[name]
+
+    def landed(self, names=()) -> dict[int, NameToTensorList]:
+        """What was copied, ``names`` first copied too, in one batched copy
+        and one sync for a host transport, which would otherwise copy each
+        tensor on its own."""
+        self._copy(names)
+        out: dict[int, NameToTensorList] = {}
+        for name, by_rid in self._landed.items():
+            for rid, value in by_rid.items():
+                out.setdefault(rid, {})[name] = value
+        return out
+
+    def get(self, rid, default=None):
+        row = self._source.get(rid)
+        if row is None:
+            return default
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __getitem__(self, rid):
+        row = self._source[rid]
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __iter__(self):
+        return iter(self._source)
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+
+class _LazyHostRow(Mapping):
+    """One request's view of ``_LazyHostOutputs``: reading a name copies it."""
+
+    __slots__ = ("_parent", "_rid", "_row")
+
+    def __init__(self, parent: _LazyHostOutputs, rid, row: dict):
+        self._parent, self._rid, self._row = parent, rid, row
+
+    def __getitem__(self, name):
+        value = self._row[name]
+        # only a list of tensors has anything to copy
+        return self._parent._host(name)[self._rid] if isinstance(value, list) else value
+
+    def __contains__(self, name) -> bool:
+        return name in self._row
+
+    def __iter__(self):
+        return iter(self._row)
+
+    def __len__(self) -> int:
+        return len(self._row)
 
 
 class Worker:
@@ -539,6 +609,7 @@ class Worker:
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
+        topology = model.get_partition_topology() if model else None
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -551,6 +622,10 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            walk_driven_signals=frozenset(
+                conn.edge_name for conn in topology.connections
+                if conn.consumer_walk is not None
+            ) if topology is not None else frozenset(),
         )
 
         self.engine_manager = EngineManager.build(
@@ -704,7 +779,7 @@ class Worker:
         self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
-        self.partition_topology = model.get_partition_topology() if model else None
+        self.partition_topology = topology
 
         # Determine which partition this worker serves (by checking which node names
         # appear in my_worker_graphs vs the topology connections)
@@ -907,29 +982,36 @@ class Worker:
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
 
+        # One NewRequest comes per partition this worker serves, and a later one
+        # can land after a step already ran. The tensor manager and the engine
+        # hold request-wide state, so only the first opens it. Opening it again
+        # would reset that state under the partition that is running.
+        first = request_id not in self.request_state.per_request_info
         self.request_state.add_request(request_id, body.request_info)
         self.scheduler.note_arrival(request_id)
         self._graph_runtime.register_stop_limits(request_id, body.request_info)
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
+        if first:
+            self.tensor_manager.register_request(
+                request_id, self._graph_runtime.get_sharding_config(request_id),
+            )
         laps.lap("worker_state")
-        try:
-            self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs, body.request_info,
-            )
-            laps.lap("engine_add")
-            self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
-            laps.lap("skip_publish")
-        except Exception as err:
-            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            text, _ = client_error_text(
-                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
-                log=logger,
-            )
-            self._fail_requests({request_id: f"Error in worker: {text}"})
-            self._process_unprocessed(body.request_id)
-            return
+        if first:
+            try:
+                self.engine_manager.add_request(
+                    request_id, body.request_info.resource_configs, body.request_info,
+                )
+                laps.lap("engine_add")
+                self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
+                laps.lap("skip_publish")
+            except Exception as err:
+                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+                text, _ = client_error_text(
+                    err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                    log=logger,
+                )
+                self._fail_requests({request_id: f"Error in worker: {text}"})
+                self._process_unprocessed(body.request_id)
+                return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
@@ -982,9 +1064,7 @@ class Worker:
             self.worker_id, message.message_type.value, message.body.request_id,
         )
         if message.message_type == WorkerMessageType.INPUT_SIGNALS:
-            self.tensor_manager.ack_unread_tensors(
-                message.body.request_id, message.body.inputs,
-            )
+            self.tensor_manager.ack_unread_tensors(message.body.inputs)
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -1251,14 +1331,7 @@ class Worker:
             if edge.is_streaming and edge.tensor_info:
                 (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
         if unbuffered:
-            # Nothing here will consume it: ack it unread so the producer frees
-            # it. Expected when the request's ingest failed on this worker.
-            if request_id not in self.scheduler.failed_rids:
-                logger.warning(
-                    "Worker %s: no stream buffer for %s of request %s; dropping it",
-                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
-                )
-            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
+            self._ack_unbuffered(request_id, body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -1285,7 +1358,9 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
-        # Start RDMA reads for non-streaming edges with tensor_info
+        # Start RDMA reads for non-streaming edges with tensor_info; a
+        # streamed row of an EDGE_ITEMS replayed from the park has none, and
+        # no forward-pass info either
         if non_streaming:
             futures = self.tensor_manager.start_read_tensors(
                 request_id, non_streaming,
@@ -1298,7 +1373,9 @@ class Worker:
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
-            # a client stream's chunks come with no forward-pass info, and drive no walk
+            # no forward-pass info comes with a client stream's chunks, nor with
+            # a stream whose walk the producer does not decide (see
+            # `walk_driven_signals`)
             walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
@@ -1321,6 +1398,49 @@ class Worker:
             )
         if self.enable_nvtx:
             range_pop()
+
+    def _process_edge_items(self, frame: EdgeItems) -> None:
+        """A step's streamed tensors from one producer (EDGE_ITEMS): each
+        row is what one INPUT_SIGNALS of a single streamed edge did, and the
+        frame's reads start in one call."""
+        reads: list[tuple[int, list[GraphEdge]]] = []
+        dtypes = frame_dtypes(frame)
+        for row in stream_rows(frame):
+            rid = self._rid(row.request_id)
+            if rid is None or rid not in self.request_state.per_request_info:
+                # not here yet, or removed: parked or dropped as the
+                # INPUT_SIGNALS it replaces
+                self._process_message_list([WorkerMessage(
+                    message_type=WorkerMessageType.INPUT_SIGNALS,
+                    body=row_input_signals(frame, row),
+                )])
+                continue
+            if not self._takes_input(row.request_id):
+                continue  # as _process_new_inputs: nothing read after READS_DONE
+            edge = GraphEdge(
+                next_node=row.next_node, name=row.signal,
+                tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
+            )
+            stream_buf = self.request_state.per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is None:
+                self._ack_unbuffered(rid, row.request_id, [edge])
+                continue
+            # a row is one edge's items: a chunked producer's pieces join
+            stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
+            reads.append((rid, [edge]))
+        if reads:
+            self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
+
+    def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
+        """Streamed edges of a known request with no stream buffer here:
+        nothing will consume them, so ack them unread for the producer to
+        free. Expected when the request's ingest failed on this worker."""
+        if rid not in self.scheduler.failed_rids:
+            logger.warning(
+                "Worker %s: no stream buffer for %s of request %s; dropping it",
+                self.worker_id, [edge.name for edge in edges], request_id,
+            )
+        self.tensor_manager.ack_unread_tensors(edges)
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
@@ -1376,6 +1496,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.EDGE_ITEMS:
+                self._process_edge_items(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
@@ -1664,7 +1786,9 @@ class Worker:
         reclaimed.
         """
         engine = self.engine_manager.get_engine(node_name)
-        if not engine.evictable(node_name):
+        # quietly: a resource that never evicts (a LoRA pool) ran out, which is
+        # backpressure for the scheduler, not a working set that does not fit
+        if not engine.evictable(node_name, affected_resources):
             return None
 
         active = [
@@ -3863,7 +3987,10 @@ class Worker:
                     node_name=batch_N.node_name,
                     graph_walk=graph_walk,
                     skip_cuda_sync=True,
-                    cpu_tensors=cpu_outputs,
+                    cpu_tensors=(
+                        cpu_outputs.landed(signals if self.tensor_manager.needs_cpu_tensor else ())
+                        if isinstance(cpu_outputs, _LazyHostOutputs) else cpu_outputs
+                    ),
                     ready_event=batch_N.node_batch.completion_event,
                 )
             return stored
@@ -4330,22 +4457,20 @@ class Worker:
         outputs: "BatchedModelOutput",
         completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
-    ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+    ) -> tuple[Mapping[int, Mapping[str, list[torch.Tensor]]], HostRows | None]:
+        """Side-stream D→H of the CUDA tensors in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
-        copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
-
-        AR engines emit small per-rid output dicts (sampled token + maybe
-        a code) so the cost is negligible. If a future engine emits large
-        tensors here (e.g. activations), revisit.
+        Returns per-rid host outputs, plus ``HostRows`` when the submodule
+        handed over row-addressed buffers, for a batched stop check. Without
+        those, the outputs are a ``_LazyHostOutputs``, which copies an output
+        name for every rid the first time it is read. Skipped (returns
+        ``outputs`` unchanged) when there's no completion event (CPU execution)
+        or when CUDA is unavailable.
 
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
@@ -4390,36 +4515,41 @@ class Worker:
                 HostRows(tuple(row_rids), host),
             )
 
-        cpu_per_rid: dict = {}
+        # Shared by every name copied this step, so two names never land in
+        # one pinned buffer.
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with side:
-            for rid, name_to_list in source.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
-                    continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.device.type == self.device.type:
-                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
-                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
-        side.synchronize()
 
-        return cpu_per_rid, None
+        def copy_names(names: list[str]) -> dict[str, dict]:
+            host: dict[str, dict] = {name: {} for name in names}
+            with side:
+                for name in names:
+                    for rid, name_to_list in source.items():
+                        if not isinstance(name_to_list, dict) or name not in name_to_list:
+                            continue
+                        tensors = name_to_list[name]
+                        if not isinstance(tensors, list):
+                            host[name][rid] = tensors
+                            continue
+                        new_list = []
+                        for t in tensors:
+                            if torch.is_tensor(t) and t.device.type == self.device.type:
+                                # by size class, not shape: a per-shape count gives
+                                # two shapes in one class the same buffer
+                                key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
+                                idx = buffer_indices[key]
+                                buffer_indices[key] += 1
+                                cpu_t = self._get_pinned_d2h_buffer(
+                                    "check_stop", t.shape, t.dtype, idx,
+                                )
+                                cpu_t.copy_(t, non_blocking=True)
+                                new_list.append(cpu_t)
+                            else:
+                                new_list.append(t)
+                        host[name][rid] = new_list
+            side.synchronize()
+            return host
+
+        return _LazyHostOutputs(source, copy_names), None
 
     def _removal_step_reached(self, body: RemoveRequest) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages

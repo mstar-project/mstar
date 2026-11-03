@@ -79,6 +79,7 @@ def tiny_config() -> KokoroModelConfig:
 def tiny_model(seed: int = 0) -> KokoroTTS:
     torch.manual_seed(seed)
     model = KokoroTTS(tiny_config()).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     return model
 
@@ -103,9 +104,14 @@ def test_masked_bilstm_matches_packed_bidirectional():
     lengths = torch.tensor([7, 4, 1])
     packed = torch.nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
     expected, _ = torch.nn.utils.rnn.pad_packed_sequence(ref(packed)[0], batch_first=True, total_length=7)
+    # both directions run as one block-diagonal LSTM
+    ours.fuse()
     out = ours(x, lengths)
     assert torch.allclose(out, expected, atol=1e-6)
     assert out[1, 4:].abs().sum() == 0 and out[2, 1:].abs().sum() == 0
+    # the fused LSTM is in the module tree, so a later dtype or device move reaches it
+    ours.double()
+    assert torch.allclose(ours(x.double(), lengths), expected.double(), atol=1e-6)
 
 
 def test_real_stft_inverse_matches_torch_istft_per_row():
@@ -212,7 +218,8 @@ def test_remap_name(checkpoint_key, expected):
 def test_remapped_checkpoint_names_cover_every_parameter():
     """Every parameter of the M* module is reachable from a checkpoint key
     written in the upstream naming, and vice versa (modulo the pooler)."""
-    model = tiny_model()
+    # the checkpoint loads before the LSTM directions fuse
+    model = KokoroTTS(tiny_config())
     params = set(dict(model.named_parameters()))
     # Invert the mapping for the names that differ, then check round trip.
     inverse = {
@@ -666,6 +673,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
     config.decoder_dtype = "bfloat16"
     torch.manual_seed(0)
     model = KokoroTTS(config).eval()
+    model.fuse_lstm_directions()
     model.decoder.generator.m_source.deterministic = True
     ids = torch.tensor([[0, 1, 5, 3, 9, 2, 0]])
     lengths = torch.tensor([7])
@@ -674,6 +682,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
         audio, frame_lengths, _ = model(ids, lengths, style, torch.tensor([1.0]))
         config32 = tiny_config()
         ref = KokoroTTS(config32).eval()
+        ref.fuse_lstm_directions()
         ref.load_state_dict(model.state_dict())
         ref.decoder.generator.m_source.deterministic = True
         audio32, _, _ = ref(ids, lengths, style, torch.tensor([1.0]))

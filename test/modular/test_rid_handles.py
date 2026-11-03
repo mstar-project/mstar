@@ -206,7 +206,7 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
         dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
     )
     w._handle_tensor_received(TensorReceived(
-        request_id="gone", successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
+        successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
     assert acked == [([1, 3], [2, 1])]
 
@@ -218,9 +218,12 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w, t = _worker()
     got: dict[str, object] = {}
     cfg = SimpleNamespace(sharding_config="cfg", stream_buffers={})
-    w.request_state.add_request = (
-        lambda request_id, request_info: got.__setitem__("state", request_id)
-    )
+
+    def _state_add(request_id, request_info):
+        got["state"] = request_id
+        w.request_state.per_request_info[request_id] = cfg
+
+    w.request_state.add_request = _state_add
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
@@ -242,8 +245,6 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         partition_worker_graph_ids={}, worker_graph_to_workers={},
         initial_inputs=[], loop_caps={},
     )
-    w.request_state.per_request_info = {0: cfg}
-
     Worker._add_new_request(w, body)
 
     handle = t.handle("wire-1")
