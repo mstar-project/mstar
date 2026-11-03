@@ -36,11 +36,10 @@ node_groups:
     ranks: [0]
 # The first policy request of a fresh server compiles the action denoise step
 # (about 9 s); this warms it at startup with the model card's example frame as
-# the observation, in the layout NVIDIA's RoboLab server sends (the robot
-# state, 32 predicted rows, 736x544, 15 fps).
+# the observation, in the layout NVIDIA's RoboLab server sends (the robot state
+# and the 736x544 bucket; the chunk, fps and domain come from checkpoint.json).
 warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
-    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, action_chunk_size: 32, fps: 15,
-                   size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
