@@ -705,10 +705,10 @@ The spec types are:
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
        settles each one's accepted drafts. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
-       output gate is ``full_rank_output_gate``, which the ``LinearAttnConfig`` declares
-       too: the resource then runs the torch reference, as the fused kernels apply only
-       the low-rank gate).
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
+       the resource its gates as it binds: with Kimi K3's full-rank output gate
+       (``full_rank_output_gate``), or a forget-gate bound the fused kernels can't hold,
+       the resource runs the torch reference.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:

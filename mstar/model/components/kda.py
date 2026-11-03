@@ -314,7 +314,8 @@ class KimiDeltaAttention(nn.Module):
 
     def bind_resources(self, resources: dict) -> None:
         """Resolve the resources this layer calls. See ``NodeSubmodule.bind_node_resources``."""
-        self.mix = KDACallable(resources[self._state_key], resources[self._kda_key])
+        kda = resources[self._kda_key]
+        self.mix = KDACallable(resources[self._state_key], kda)
         # The conv tail is read alongside the projected activations, so the
         # pool must hold them in the dtype the layer was loaded in.
         pool_dtype = self.mix.conv_dtype
@@ -324,6 +325,11 @@ class KimiDeltaAttention(nn.Module):
                 f"KDA conv state is {pool_dtype} but the KDA projections are "
                 f"{proj_dtype}; declare the pool's conv block in the projections' dtype "
                 "(DeltaNetGeometry.to_blocks(conv_dtype=...))"
+            )
+        if kda is not None:
+            kda.bind_layer(
+                lower_bound=self.forget_gate.gate_lower_bound,
+                full_rank_output_gate=self.full_rank_output_gate,
             )
 
     def params(self) -> KDAParams:

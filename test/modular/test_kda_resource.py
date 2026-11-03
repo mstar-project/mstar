@@ -62,18 +62,18 @@ class _Recorder:
 
 
 def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculative_tokens=0,
-          sink=True, dim=DIM, full_rank_output_gate=False):
+          sink=True, dim=DIM, conv_dtype=torch.bfloat16):
     geometry = DeltaNetGeometry(
         num_k_heads=heads, num_v_heads=v_heads, head_k_dim=dim, head_v_dim=dim,
         conv_kernel_size=4,
     )
     pool = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
-        num_layers=3, blocks=geometry.to_blocks(speculative_tokens=speculative_tokens),
+        num_layers=3,
+        blocks=geometry.to_blocks(speculative_tokens=speculative_tokens, conv_dtype=conv_dtype),
         max_slots=6, disable_sink_slot=not sink,
     ))
     kda = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=backend,
-        gate_lower_bound=-5.0, full_rank_output_gate=full_rank_output_gate,
     ))
     return pool, kda
 
@@ -136,10 +136,11 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 
 
 def test_default_kernels(monkeypatch):
-    """The resource picks the fused kernels where they run what the spec declares, and the
-    torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline PTX), at
-    a head dim they aren't validated for and for a full-rank output gate. A spec that leaves
-    the config's default backend builds."""
+    """The resource picks the fused kernels where they run the pool and the layers it binds,
+    and the torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline
+    PTX), at a head dim or activation dtype they aren't validated for, and for a layer with a
+    full-rank output gate or a forget-gate bound past what their decay blocks hold. A spec that
+    leaves the config's default backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     assert not kda.prefill_capturable
@@ -153,9 +154,15 @@ def test_default_kernels(monkeypatch):
 
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
     kda = built_on_cuda(dim=128)
+    kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=False)
     assert isinstance(kda.kernels, TritonKDAKernels) and kda.prefill_capturable
     assert isinstance(built_on_cuda(dim=16).kernels, TorchKDAKernels)
-    assert isinstance(built_on_cuda(dim=128, full_rank_output_gate=True).kernels, TorchKDAKernels)
+    assert isinstance(built_on_cuda(dim=128, conv_dtype=torch.float16).kernels, TorchKDAKernels)
+    for gate in (dict(lower_bound=-5.0, full_rank_output_gate=True),
+                 dict(lower_bound=-6.0, full_rank_output_gate=False)):
+        kda = built_on_cuda(dim=128)
+        kda.bind_layer(**gate)
+        assert isinstance(kda.kernels, TorchKDAKernels), gate
     monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
     assert isinstance(built_on_cuda(dim=128).kernels, TorchKDAKernels)
 

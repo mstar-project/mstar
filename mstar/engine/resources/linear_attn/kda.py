@@ -2,7 +2,7 @@
 
 As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
 layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
-The math is a kernel bundle's, which the resource picks from the spec and the pool:
+The math is a kernel bundle's, which the resource picks from the pool and its layers' gates:
 ``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
 elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
 None), ``run_paged`` and, for a speculative step, ``run_verify``. The plan stages the
@@ -97,14 +97,22 @@ class KDAPlan:
         return self._cache[key]
 
 
-def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, config: LinearAttnConfig):
-    fused = (
-        # the Triton kernels inline NVIDIA PTX
-        device.type == "cuda" and not current_platform.is_rocm() and kda_triton._HAS_TRITON
-        and kda_triton.supported(geometry.head_k_dim) and geometry.conv_kernel_size == 4
-        and not config.full_rank_output_gate
-    )
-    return kda_triton.TritonKDAKernels() if fused else kda_torch.TorchKDAKernels()
+def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, conv_dtype: torch.dtype):
+    """The fused kernels where they run the pool's shape, else the torch reference. The layers'
+    gates can still move it to the reference (`KDAManager.bind_layer`)."""
+    # the Triton kernels inline NVIDIA PTX
+    if device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON:
+        return kda_torch.TorchKDAKernels()
+    if not kda_triton.supported(geometry.head_k_dim):
+        reason = f"head dim {geometry.head_k_dim}"
+    elif geometry.conv_kernel_size != 4:
+        reason = f"conv width {geometry.conv_kernel_size}"
+    elif conv_dtype is not torch.bfloat16:
+        reason = f"{conv_dtype} activations"
+    else:
+        return kda_triton.TritonKDAKernels()
+    logger.warning("kda: the fused kernels don't run %s; the torch reference runs", reason)
+    return kda_torch.TorchKDAKernels()
 
 
 class KDAManager(LinearAttnManager):
@@ -116,6 +124,7 @@ class KDAManager(LinearAttnManager):
         state_dtype: torch.dtype,
         device: torch.device,
         speculative_tokens: int = 0,
+        conv_dtype: torch.dtype = torch.bfloat16,
     ):
         if (geometry.num_k_heads != geometry.num_v_heads
                 or geometry.head_k_dim != geometry.head_v_dim):
@@ -133,7 +142,7 @@ class KDAManager(LinearAttnManager):
         self.num_layers = num_layers
         self._device = device
         self._pool_key = config.recurrent_state
-        self.kernels = _default_kernels(device, geometry, config)
+        self.kernels = _default_kernels(device, geometry, conv_dtype)
         # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
         self.speculative_tokens = speculative_tokens
 
@@ -145,6 +154,24 @@ class KDAManager(LinearAttnManager):
         # it. Follows the pool, which it depends on.
         self._preplanned = False
         self._cached_plan_output: dict[str, KDAPlan] | None = None
+
+    def bind_layer(self, *, lower_bound: float, full_rank_output_gate: bool) -> None:
+        """A layer's gates, as it binds. The fused kernels apply only the low-rank output gate
+        and a forget-gate bound their decay blocks hold, so a layer they can't run moves every
+        layer to the torch reference."""
+        if not isinstance(self.kernels, kda_triton.TritonKDAKernels):
+            return
+        cfg = self.kernels.config
+        if full_rank_output_gate:
+            reason = "a full-rank output gate"
+        elif not kda_triton.bound_fits(lower_bound, min(cfg.row_block, cfg.chunk)):
+            reason = f"forget-gate bound {lower_bound}"
+        else:
+            return
+        if self._current or self._preplanned:
+            raise RuntimeError("kda: a layer bound after the resource planned with its kernels")
+        logger.warning("kda: the fused kernels don't run %s; the torch reference runs", reason)
+        self.kernels = kda_torch.TorchKDAKernels()
 
     @property
     def prefill_capturable(self) -> bool:
