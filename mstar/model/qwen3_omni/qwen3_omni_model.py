@@ -441,8 +441,10 @@ class Qwen3OmniModel(Model):
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # the Talker's KV is built from the Thinker's states, which no ids recompute
-        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                         loop="thinker_decode_loop")}
+        return {"Thinker": RebuildPolicy(
+            walks=frozenset({"prefill_text"}), ids_input="text_inputs", sample_output="new_token",
+            loop="thinker_decode_loop",
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.

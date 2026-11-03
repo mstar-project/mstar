@@ -29,7 +29,7 @@ from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, MidPrefillRow
 from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
 
-PREFILL, DECODE, MIXED = POLICY.walk, "decode", "mixed"
+(PREFILL,), DECODE, MIXED = POLICY.walks, "decode", "mixed"
 R = "r"
 
 
@@ -96,7 +96,9 @@ def _rebuilding(sched, rid=R, total=20, done=0):
 def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
     sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
     prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
-    sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 12), prompt, None), torch.int64, array("i", [4]))
+    sched.rebuilds._kept[NODE]["d0"] = KeptIds(
+        HostCopy(HostSlice(0, 12), prompt, None), PREFILL, torch.int64, array("i", [4]),
+    )
 
     sched.get_next_batch(state)
     sched.get_next_batch(state)

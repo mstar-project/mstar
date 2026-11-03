@@ -48,7 +48,7 @@ from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE = "LLM"
-POLICY = RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token", loop="decode")
+POLICY = RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token", loop="decode")
 
 
 def _graphs(node_name: str = NODE) -> dict:
@@ -66,7 +66,7 @@ class _Engine(SimpleNamespace):
 def _kept(tokens: int) -> KeptIds:
     """A request's prompt of ``tokens`` ids on the host, and one sample."""
     view = torch.arange(tokens, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", [0]))
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), "prefill", torch.long, array("i", [0]))
 
 
 def _worker(kv):
@@ -233,7 +233,7 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
     del w._rebuilds._kept[NODE]["v"]
-    w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
+    w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
         rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")

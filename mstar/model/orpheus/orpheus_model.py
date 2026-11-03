@@ -121,7 +121,7 @@ class OrpheusModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+        return {"LLM": RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token",
                                      loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

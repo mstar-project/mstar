@@ -37,7 +37,7 @@ from mstar.worker.worker import PendingBatch, Speculation, Worker
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
-POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="loop")
+POLICY = RebuildPolicy(walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="loop")
 
 
 def _graphs() -> dict:
@@ -52,7 +52,7 @@ def _graphs() -> dict:
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), PREFILL, torch.long, array("i", sampled))
 
 
 def _cleanup(node, rids, wgs):
@@ -174,8 +174,9 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     eng = _engine(_Sub())
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
-    w._rebuilds._policies = {node: replace(POLICY, copied_inputs={walk: ("embeds",)})}
-    w._rebuilds._kept = {node: {1: replace(_kept(), copies=HostCopies(walk))}}
+    w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
+    w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
+    w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
