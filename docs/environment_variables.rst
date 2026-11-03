@@ -662,6 +662,16 @@ Worker scheduling
        ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
        not the config's top-level key), at most the pool's pages, plus a few, 8
        bytes each. Read by ``knobs.resident_planning``.
+   * - ``MSTAR_FUSED_DECODE``
+     - config's ``knobs: fused_decode``, else ``auto``
+     - ``auto`` replays a fused forward in place of the compiled graph for the
+       captured buckets a submodule declares (``NodeSubmodule.get_fused_decode_configs``;
+       Qwen3.5's decode at 1 and 2 rows, one persistent kernel per 4-layer block),
+       where the submodule's guard passes, the fused capture succeeds and its
+       boot parity step agrees with the modules; the worker log says why a bucket
+       or node keeps its graph. Lockstep (TP/SP) nodes always keep theirs.
+       ``off`` keeps every compiled graph. Read by ``Engine._bind_fused_decode``
+       through ``knobs.fused_decode``.
    * - ``MSTAR_KV_PLAN_CACHE``
      - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's

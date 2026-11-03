@@ -1659,6 +1659,29 @@ own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become
 of the row, so a resident step stages none of them, while the RNG offset, the last token
 and the repetition-penalty mask stay by the sampler's own row of each request.
 
+A submodule can also run some captured decode buckets on its own fused kernels instead of
+the compiled graph (``mstar/engine/fused_decode.py``). It declares them in
+``get_fused_decode_configs()`` (a ``FusedDecodeConfig`` of a walk and batch sizes, each a
+batched capture of that walk) and implements three things: ``prepare_fused_decode(resources)``,
+which runs before the engine sizes its captures and either gets ready (stacks the weights
+its kernels read) or returns why it can't; the config's forward method (``forward_fused``),
+which takes the walk's static inputs and returns what the capture forward does; and
+``decode_hidden(graph_walk, engine_inputs, fused, **static_inputs)``, the step's final hidden
+state through the fused kernels or through the modules. The kernels read only what the
+resources hand over for the planned step: ``RecurrentStatePool.block(name)`` and the step's
+``addressing().slot_indices``, ``KVManager.layer_views()``, and the attention resource's
+``decode_tables()`` (the decode wrapper's block table and lengths, filled by the host plan or
+inside the graph on a resident step), so admit, plan, commit, eviction and pre-plan are
+unchanged. Counters and accumulators come from ``engine_inputs.fused_scratch``, one set per
+captured slot, and the kernels must leave them as they found them (zero). The engine captures
+the fused forward right after each declared bucket's graph and keeps the graph where the
+capture fails or the parity step disagrees: one step of the capture rows, planned as ordinary
+rows with their own slots and pages, through both paths from one snapshot of their state
+(``Resource.row_state``), compared by relative L2 on the final hidden state and every state the
+rows hold after the step (``PARITY_REL_L2``, 2%). Lockstep (TP/SP) nodes and ``knobs:
+{fused_decode: off}`` keep their graphs. Qwen3.5's decode is the one user
+(``mstar/model/qwen3_5/fused_decode.py``).
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 

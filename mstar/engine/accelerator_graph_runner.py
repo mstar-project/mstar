@@ -1382,15 +1382,17 @@ class AcceleratorGraphRunner:
             inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
             slot_lease=lease, per_request_info=warmed.dummy_metadata,
         )
-        step = replace(step, _ctx=StepContext(
-            request_ids=tuple(rids), graph_walk=walk, slot=spec.slot, capture=False, slot_lease=lease,
-        ))
-        self._dummy_rows.reset(rids)
-        outcome = self._step_runner.admit(step)
-        if not outcome.ok:
-            raise RuntimeError(f"parity admit failed for {spec.bucket}: {outcome.reason}")
+        if step is not None:
+            step = replace(step, _ctx=StepContext(
+                request_ids=tuple(rids), graph_walk=walk, slot=spec.slot, capture=False, slot_lease=lease,
+            ))
+            self._dummy_rows.reset(rids)
+            outcome = self._step_runner.admit(step)
+            if not outcome.ok:
+                raise RuntimeError(f"parity admit failed for {spec.bucket}: {outcome.reason}")
         try:
-            self._step_runner.plan(step)
+            if step is not None:
+                self._step_runner.plan(step)
             engine_inputs = replace(warmed.engine_inputs, step=step)
             with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
                 errors = fused_parity(
@@ -1398,8 +1400,9 @@ class AcceleratorGraphRunner:
                 )
             self._graph_backend.synchronize()
         finally:
-            self._step_runner.rollback_admit(step)
-            self._dummy_rows.reset(rids, free=True)
+            if step is not None:
+                self._step_runner.rollback_admit(step)
+                self._dummy_rows.reset(rids, free=True)
         return errors
 
     def _dummy_engine_inputs(
