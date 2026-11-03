@@ -236,11 +236,11 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
             layer_n_hidden: [tokens, hidden_size] or None -- hidden states
                 after ``accept_hidden_layer`` (for Talker conditioning)
         """
-        hidden_states = input_embeds
-
-        # Capture input embeddings BEFORE any transformer layers (the first
-        # fused norm adds into the residual stream in place)
-        layer_0_embed = hidden_states.clone()
+        # The fused norms update the residual stream in place, so it starts from
+        # a copy: ``input_embeds`` (a captured graph's static input) stays as
+        # staged, and is the layer-0 input the Talker takes.
+        hidden_states = input_embeds.clone()
+        layer_0_embed = input_embeds
         layer_n_hidden = None
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
 
