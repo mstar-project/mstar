@@ -2650,7 +2650,7 @@
     {
       "type": "timeseries",
       "title": "KV rebuilds: tokens prefilled and cached pages found",
-      "description": "Tokens of kept history the rebuild rows prefilled per second, cache hits included; dashed: pages a rebuild row found in the prefix cache per second.",
+      "description": "Tokens the rebuild rows prefilled per second, cache hits included; dashed: pages a rebuild row found in the prefix cache per second.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"

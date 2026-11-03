@@ -3820,18 +3820,20 @@ class Worker:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
+        landed = {
+            rid: cursor for rid in rebuild
+            if rid in ran and (cursor := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
         if landed:
             # the step's kernels read the prepared input released here
             self._wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, cursor in landed.items():
+                if not cursor.resumes_prefill:
+                    engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
                 self.scheduler.note_rebuilt(node, rid)
-                self._preemption.rebuilt(rid, node)
+                self._preemption.rebuilt(rid, node, cursor.total)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)

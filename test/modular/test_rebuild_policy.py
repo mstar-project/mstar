@@ -191,9 +191,9 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
     if sampled is not None:
         rebuilds._kept[NODE][R] = _kept([1, 2], *[5] * sampled)
 
-    assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters})
+    assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters}, None)
     rebuilds._kept[NODE][R] = _kept([1, 2], 5, 6)
-    assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}) is None, "a request its ids cover was refused"
+    assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}, None) is None, "a request its ids cover was refused"
 
 
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
@@ -202,7 +202,7 @@ def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
     rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
 
-    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}), (
+    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"
     )
 
@@ -211,7 +211,7 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     rebuilds = _rebuilds()
     rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
 
-    rebuild = rebuilds.start(R, NODE)
+    rebuild = rebuilds.start(R, NODE, None)
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
     rebuilds.fill(NODE, {R}, {}, inputs, infos)
 

@@ -18,8 +18,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 from test_rebuild_policy import POLICY, _graphs
-from test_scheduler_room import NODE, _rids, _Runtime, _State
+from test_scheduler_room import NODE, _rids, _Runtime
 from test_scheduler_room import _Engine as _RoomEngine
+from test_scheduler_room import _State as _RoomState
 
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
@@ -32,8 +33,16 @@ PREFILL, DECODE, MIXED = POLICY.walk, "decode", "mixed"
 R = "r"
 
 
+class _State(_RoomState):
+    """Forward-pass infos that name each request's walk, which a rebuild starts from."""
+
+    def get_fwd_info(self, rid, partition):
+        return SimpleNamespace(graph_walk=self.runtime.walks.get(rid))
+
+
 class _Engine(_RoomEngine):
-    """Readiness that answers ``dropped`` with a rebuild, a token budget, and lengths read off the row's ids."""
+    """Readiness that answers ``dropped`` with a rebuild, a token budget, and ``cached`` tokens of every rebuild
+    in the prefix cache."""
 
     def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=()):
         super().__init__(max_bs)
@@ -52,9 +61,8 @@ class _Engine(_RoomEngine):
     def walk_token_caps(self, node_name, graph_walk):
         return None
 
-    def input_sequence_len(self, node_name, graph_walk, info, inputs, rid=None):
-        tokens = inputs[POLICY.ids_input][0].shape[0]
-        return InputSeqLenInfo(tokens - self.cached, cached_prefix=self.cached)
+    def unserved_len(self, node_name, graph_walk, info, rid, length, end):
+        return InputSeqLenInfo(end - self.cached, cached_prefix=self.cached)
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         self.asked.append(rid)
@@ -80,7 +88,9 @@ def _scheduler(walks, combined=False, **engine):
 
 def _rebuilding(sched, rid=R, total=20, done=0):
     """``rid``'s rebuild on ``NODE``, ``done`` of its ``total`` tokens in."""
-    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(PREFILL, array("i", range(total + 1)), torch.int64, done)
+    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(
+        PREFILL, total, total, array("i", range(total + 1)), torch.int64, done,
+    )
 
 
 def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():

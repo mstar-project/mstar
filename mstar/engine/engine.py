@@ -1297,6 +1297,7 @@ class Engine:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
         (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any.
+        A rebuild of a prompt mid-prefill is cut from the prompt's input, which its first chunk finds prepared.
 
         Raises when the prepared input is not the length the scheduler cut it
         by (``get_input_sequence_len`` disagreeing with ``prepare_inputs``):
@@ -1305,7 +1306,7 @@ class Engine:
         key = (rid, batch.node_name)
         full = self._chunking.prepared.get(key)
         start, end, total = chunk.start, chunk.end, chunk.total
-        if full is None:
+        if chunk.is_first and full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
                 fwd_info=batch.per_request_info_wrapped[rid],
@@ -1321,6 +1322,9 @@ class Engine:
                     f"{batch.node_name}/{walk}: the row was measured at {total} tokens "
                     f"and chunked by that, but its prepared inputs hold {full.input_seq_len}"
                 )
+            self._chunking.prepared[key] = full
+            batch.first_chunk_rids.add(rid)
+        if chunk.is_first:
             if walk in self._keyed_walks.get(batch.node_name, ()):
                 # a first chunk starts past what `input_sequence_len` matched;
                 # the probe answers the same again, now checked against the prepared inputs
@@ -1345,8 +1349,6 @@ class Engine:
                     prefix = prefix._replace(tokens=0, position=prefix.position - prefix.tokens)
                 # a declined or uncuttable walk writes over the lease (prefix None)
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
-            self._chunking.prepared[key] = full
-            batch.first_chunk_rids.add(rid)
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -2740,24 +2742,31 @@ class Engine:
         write over the lease the walks before it were served from."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        if info is None or rid is None:
+            return info
+        return self.unserved_len(node_name, graph_walk, request_info, rid, info.seq_len, info.seq_len)
+
+    def unserved_len(
+        self, node_name: str, graph_walk: str, request_info: CurrentForwardPassInfo, rid: int,
+        length: int, end: int,
+    ) -> InputSeqLenInfo:
+        """The tokens up to ``end`` of ``rid``'s ``length``-token row, as `input_sequence_len` measures them. A
+        rebuild of a prompt mid-prefill writes only the tokens before ``end``."""
         policy = self._chunking.policy(node_name, graph_walk)
         if (
-            info is None or rid is None
-            or graph_walk not in self._keyed_walks.get(node_name, ())
+            graph_walk not in self._keyed_walks.get(node_name, ())
             # the manager's, not the policy's: a walk the deployment does not
             # chunk is never cut, so it starts at its first token
             or not self._chunking.chunkable(node_name, graph_walk)
             or (policy.reuses_cached_prefix is not None
                 and not policy.reuses_cached_prefix(request_info))
         ):
-            return info
+            return InputSeqLenInfo(end)
         prefix = self._runner.resolve_cached_prefix(
-            rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
+            rid, node_name, graph_walk, _MeasuredRow(length),
         )
-        matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
-        if matched <= 0:
-            return info
-        return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
+        matched = min(prefix.tokens if prefix is not None else 0, end)
+        return InputSeqLenInfo(end - matched, cached_prefix=matched)
 
     def check_ready(
         self, node_name: str, request_id: str,
