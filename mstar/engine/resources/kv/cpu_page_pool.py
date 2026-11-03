@@ -120,6 +120,9 @@ class CPUPagePool:
         self.reserved[rid] = pages
         return True
 
+    def unreserve(self, rid: str) -> None:
+        self.reserved.pop(rid, None)
+
     def _set_aside(self, rid: str | None) -> int:
         """The reserved pages no request has moved into yet, other than ``rid``'s."""
         return sum(
@@ -293,7 +296,7 @@ class CPUPagePool:
     def remove_request(self, rid: str) -> None:
         for state in self.offloaded.pop(rid, {}).values():
             self.arena.release(state.host_pages)
-        self.reserved.pop(rid, None)
+        self.unreserve(rid)
 
     @property
     def num_free_pages(self) -> int:

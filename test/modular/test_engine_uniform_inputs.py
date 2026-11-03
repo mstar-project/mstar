@@ -17,14 +17,13 @@ class _Batch:
         self.node_name = "llm"
         self.request_ids = list(rids)
         self.step_context = SimpleNamespace(
-            graph_walk=walk, request_walks={}, walk_of=lambda _r: walk,
+            graph_walk=walk, request_walks={}, walk_of=lambda _r: walk, rebuild_rids=frozenset(),
         )
         self.per_request_info_wrapped = {r: SimpleNamespace() for r in rids}
         self.per_request_input_tensors = {}
         self.per_request_input_metadata = {}
         self.final_stream_rids = set()
         self.skipped_rids = set()
-        self.rebuild_rids = frozenset()
         self.failed_requests = {}
         self.inputs = None
         self.running_batched = None

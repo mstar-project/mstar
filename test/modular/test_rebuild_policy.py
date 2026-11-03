@@ -14,9 +14,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.sampler.config import discard_samples
-from mstar.engine.resources.step import SubmoduleStep
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
@@ -24,6 +24,7 @@ from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.rebuild import KeptIds, Rebuilds
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
@@ -83,37 +84,70 @@ def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
 
-def test_a_prompt_rows_ids_are_kept_once_and_its_steps_share_one_copy():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+def _rebuilds() -> Rebuilds:
+    return Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
 
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R, A))
-    rebuilds.keep_prompts(NODE, PREFILL, {}, {R: {"text_inputs": [torch.tensor([0])]}})  # its rebuild row
-    rebuilds.keep_prompts(NODE, MIXED, {A: PREFILL, B: DECODE}, _rows(A, B))
-    rebuilds.keep_prompts(NODE, DECODE, {}, _rows(B))
-    rebuilds.keep_prompts(NODE, PREFILL, {}, {B: {}})  # a TP follower's unread row
+
+def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNamespace:
+    """A step of ``walk`` that read ``inputs``, run on the host."""
+    ctx = SimpleNamespace(graph_walk=walk, request_walks=request_walks or {})
+    return SimpleNamespace(node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, completion_event=None)
+
+
+def _kept(prompt, *sampled: int) -> KeptIds:
+    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
+    view = torch.tensor(prompt, dtype=torch.int32)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+
+
+def test_a_prompt_rows_ids_are_kept_once_on_the_host():
+    rebuilds = _rebuilds()
+
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A)))
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.tensor([0])]}}))  # its rebuild row
+    rebuilds.keep_prompts(_ran(MIXED, _rows(A, B), {A: PREFILL, B: DECODE}))
+    rebuilds.keep_prompts(_ran(DECODE, _rows(B)))
+    rebuilds.keep_prompts(_ran(PREFILL, {B: {}}))  # a TP follower's unread row
 
     kept = rebuilds._kept[NODE]
-    assert kept[R].prompt.tolist() == [7, 8, 9] and kept[A].prompt.tolist() == [8, 9, 10], "it kept another row's ids"
-    assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
-    assert kept[R].prompt.untyped_storage().data_ptr() == kept[A].prompt.untyped_storage().data_ptr(), (
-        "each row would pay a copy of its own"
+    assert kept[R].prompt.view.tolist() == [7, 8, 9] and kept[A].prompt.view.tolist() == [8, 9, 10], (
+        "it kept another row's ids"
     )
+    assert kept[R].dtype == torch.long, "the rebuild row would read its ids in another dtype than the walk's"
+    assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
-def _batch(rids, rebuild=frozenset(), kept_rids=None) -> SimpleNamespace:
-    step = SimpleNamespace(steps={"sampler": SamplerStep(kept_rids=kept_rids)})
-    return SimpleNamespace(node_name=NODE, request_ids=list(rids), rebuild_rids=rebuild, step=step,
-                           step_context=StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False))
+def test_a_full_pool_keeps_no_ids():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+
+    rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
+
+    assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE], "two requests' ids would share host memory"
+
+
+def test_removing_a_request_gives_its_slice_back():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
+
+    rebuilds.remove_request(R)
+    rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
+
+    assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
+
+
+def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
+    ctx = StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False, rebuild_rids=rebuild)
+    return SimpleNamespace(node_name=NODE, request_ids=list(rids), step_context=ctx)
 
 
 @pytest.mark.parametrize("sampled", [[4, 5, 6], [[4], [5], [6]]])  # the sampler's [B] output, and a [B, 1] one
 def test_only_a_rows_kept_sample_is_appended(sampled):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R, A, B))
-    # A's sampler throws its sample away, and B is a rebuild row
-    batch = _batch((R, A, B), rebuild=frozenset({B}), kept_rids=frozenset({R, B}))
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R, A, B)))
+    # A runs a chunk short of its prompt's end, and B is a rebuild row
+    batch = _batch((R, A, B), rebuild=frozenset({B}))
 
-    rebuilds.keep_samples(batch, {}, HostRows((R, A, B), {"new_token": torch.tensor(sampled)}))
+    rebuilds.keep_samples(batch, {}, HostRows((R, A, B), {"new_token": torch.tensor(sampled)}), skip_rids={A})
     rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [torch.tensor([9])]}}, None)
 
     kept = rebuilds._kept[NODE]
@@ -123,8 +157,8 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
 
 @pytest.mark.parametrize("host", [True, False])
 def test_a_sample_of_more_than_one_id_is_refused(host):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds.keep_prompts(NODE, PREFILL, {}, _rows(R))
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
     codes = torch.tensor([[4, 5, 6]])  # as a talker samples several codebooks
 
     with pytest.raises(ValueError, match="hold 3 ids"):
@@ -141,46 +175,43 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
     ("don't cover its KV", NODE, DECODE, 1, 1),
 ])
 def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sampled, iters):
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    rebuilds = _rebuilds()
     if sampled is not None:
-        rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2]), array("i", [5] * sampled))
+        rebuilds._kept[NODE][R] = _kept([1, 2], *[5] * sampled)
 
     assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters})
-    rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2]), array("i", [5, 6]))
+    rebuilds._kept[NODE][R] = _kept([1, 2], 5, 6)
     assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}) is None, "a request its ids cover was refused"
 
 
-def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_last():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    rebuilds._kept[NODE][R] = KeptIds(torch.tensor([1, 2, 3]), array("i", [4, 5]))
+def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
+    rebuilds = _rebuilds()
+    prompt = torch.tensor([1, 2], dtype=torch.int32)
+    copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
+    rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
 
-    rebuild, row = rebuilds.rebuild(R, NODE, torch.device("cpu"))
-
-    assert rebuild == Rebuild(PREFILL, array("i", [1, 2, 3, 4, 5])), "the KV would lay out other ids"
-    assert (row.node, row.walk) == (NODE, PREFILL) and list(row.inputs) == ["text_inputs"]
-    [tokens] = row.inputs["text_inputs"]
-    assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
-
-
-def test_a_requests_prompt_goes_to_the_host_once_however_often_its_rebuild_is_asked_for():
-    rebuilds, copies = Rebuilds({NODE: POLICY}, _graphs()), []
-    prompt = SimpleNamespace(tolist=lambda: copies.append(None) or [1, 2, 3])
-    rebuilds._kept[NODE][R] = KeptIds(prompt, array("i", [4]))
-
-    # a follower replays rank 0's drop and its rebuild, then builds the row
-    asked = [rebuilds.writes(R, NODE).ids for _ in range(3)]
-    rebuilds._kept[NODE][R].sampled.append(5)
-
-    assert len(copies) == 1, "each ask would wait on the device to copy the prompt again"
-    assert asked == [array("i", [1, 2, 3, 4])] * 3 and rebuilds.writes(R, NODE).ids == array("i", [1, 2, 3, 4, 5]), (
-        "a rebuild would write other ids than the request kept"
+    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}), (
+        "a rebuild would read ids the copy hasn't written yet"
     )
 
 
-def test_the_engine_keeps_no_sample_of_a_rebuild_row_whatever_the_model_declared():
+def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_last():
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
+
+    rebuild = rebuilds.start(R, NODE)
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
+    rebuilds.fill(NODE, {R}, {}, inputs, infos)
+
+    assert rebuild == Rebuild(PREFILL, array("i", [1, 2, 3, 4, 5])), "the KV would lay out other ids"
+    assert infos[R].graph_walk == PREFILL and list(inputs[R]) == ["text_inputs"]
+    [tokens] = inputs[R]["text_inputs"]
+    assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
+
+
+def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():
+    ctx = StepContext(request_ids=(R, A), graph_walk=PREFILL, slot=0, capture=False, rebuild_rids=frozenset({R}))
     for kept_rids in (None, frozenset({R, A})):
-        step = SubmoduleStep(segments=[], steps={"sampler": SamplerStep(kept_rids=kept_rids)})
+        kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
-        discard_samples(step, [R, A], frozenset({R}))
-
-        assert step.steps["sampler"].kept_rids == {A}, "the rebuild row's sample would overwrite decode's next input"
+        assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"

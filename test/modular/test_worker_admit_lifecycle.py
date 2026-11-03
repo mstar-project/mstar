@@ -101,7 +101,7 @@ def _worker():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._kv_writes = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}

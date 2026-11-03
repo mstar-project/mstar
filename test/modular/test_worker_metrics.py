@@ -332,7 +332,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
     w.parallel_nodes, w.parallel_leader_nodes = set(), set()
-    w._in_flight_rids, w._dropped = set(), {}
+    w._in_flight_rids = set()
     w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)

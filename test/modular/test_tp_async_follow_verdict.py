@@ -62,7 +62,7 @@ class _FakeEngineManager:
             prefix_cache_open=lambda node: self.cache_open, apply_resident_delta=self._apply,
         )
 
-    def _apply(self, delta, rebuild_of):
+    def _apply(self, delta, kept_count):
         while (move := delta.pop_left()) is not None:
             self.applied.append((move.rid, move.kind))
         return True
@@ -331,15 +331,13 @@ def test_a_step_with_no_rows_or_moves_is_queued_and_consumed():
     assert Worker._removal_step_reached(s, removal), "the removal waits until this rank admits the next step"
 
 
-def test_a_message_of_moves_or_rebuild_rows_alone_is_queued():
+def test_a_message_of_moves_alone_is_queued():
     s = _stub()
     moves = ScheduleTPNode(NODE, WALK, [], spec_seq=3)
-    moves.resident_delta.add(MoveKind.DROP, "r0", count=2)
-    rebuild = ScheduleTPNode(NODE, WALK, [], spec_seq=4, rebuild_ids=["r0"])
+    moves.resident_delta.add(MoveKind.DROP, "r0", count=2, node=NODE)
     s._register_tp_follow(moves)
-    s._register_tp_follow(rebuild)
 
-    assert list(s.scheduler.tp_batches_pending_schedule) == [moves, rebuild], "rank 0 ran a step this rank skips"
+    assert list(s.scheduler.tp_batches_pending_schedule) == [moves], "rank 0 ran a step this rank skips"
 
 
 def test_nospec_store_is_bounded():

@@ -155,7 +155,9 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w.enable_prof = False
     w.device = torch.device("cpu")
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(
+        preempt=lambda node_batch: False, rebuilt=lambda rid, node: None, remove_request=lambda rid: None,
+    )
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
