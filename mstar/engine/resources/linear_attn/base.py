@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
     LinearSpExchange,
 )
+from mstar.engine.resources.linear_attn.wrappers import ConvMetadata, conv_metadata
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
 from mstar.engine.resources.sequence_shard import (
@@ -43,21 +44,62 @@ from mstar.utils.h2d import to_device_nonblocking
 logger = logging.getLogger(__name__)
 
 
+class Chunk(NamedTuple):
+    """One call of the chunked kernel over some prompt rows' pieces on this rank, a sequence each:
+    their tokens (``index`` into this rank's) and ``cu_seqlens``, on the device."""
+
+    rows: tuple[int, ...]
+    index: torch.Tensor
+    cu: torch.Tensor
+
+
+class HandOff(NamedTuple):
+    """A ``state_passing`` split's prompt rows on this rank, the same in every layer, so planned
+    once a step: the ``rows`` with a piece here, in order, those that ``start`` or ``end`` here,
+    and each row's piece (``offsets`` into this rank's tokens, ``spans``); the chunked calls,
+    ``fresh`` (the rows starting here, from their slots ``fresh_slots``), ``first`` (a row
+    continuing into this rank, from the state it enters with) and ``middle`` (the last row twice
+    over where it neither starts nor ends here: its offset and transition); and every prompt
+    row's slot in the order the finals gather lays them out, ``counts`` a rank."""
+
+    rows: tuple[int, ...]
+    starts: frozenset[int]
+    ends: frozenset[int]
+    offsets: np.ndarray
+    spans: np.ndarray
+    fresh: Chunk | None
+    fresh_slots: torch.Tensor | None
+    fresh_has_state: torch.Tensor | None
+    first: Chunk | None
+    middle: Chunk | None
+    ended_slots: torch.Tensor
+    counts: list[int]
+
+    @property
+    def passes(self) -> int | None:
+        """The row this rank hands on (its last, not ending here), or None: it hands on nothing."""
+        return self.rows[-1] if self.rows and self.rows[-1] not in self.ends else None
+
+
 class SplitRows(NamedTuple):
     """A split step's label on this rank: its ranges, each rank's piece of each row
     (``SeqRange.row_pieces``), the conv halo on the device, the local conv's layout, and the
     rows' slots and whether each carries state. ``run`` leading rows are one-token decode rows,
-    which run copied."""
+    which run copied. ``hand_off`` is the prompt rows' plan under ``state_passing``."""
 
     range: SeqRange
     pieces: np.ndarray
     halo: ConvHalo
-    # the rows with a piece here, as the conv kernel lays them out
+    # the rows with a piece here, as the conv kernel lays them out, each from its scratch window
     conv_cu: torch.Tensor
     conv_spans: torch.Tensor
+    conv_metadata: ConvMetadata
+    conv_windows: torch.Tensor
+    conv_has_state: torch.Tensor
     slots: torch.Tensor
     has_state: torch.Tensor
     run: int
+    hand_off: HandOff | None
 
     @property
     def decode_tokens(self) -> tuple[int, ...]:
@@ -178,17 +220,24 @@ class LinearAttnManager(AttentionResource):
         taps = self.conv_taps
         host = conv_halo_plan(pieces, r.group.rank, taps)
         device = self._device
-        halo = host.to(device)
-        rows = len(spans)
+        rows, local = len(spans), len(host.rows)
+        slots = addressing.slot_indices[:rows]
         return SplitRows(
             range=r,
             pieces=pieces,
-            halo=halo,
+            halo=host.to(device),
             conv_cu=to_device_nonblocking(np.concatenate([[0], np.cumsum(host.spans)]), device, torch.int32),
             conv_spans=torch.from_numpy(host.spans.astype(np.int32)),
-            slots=addressing.slot_indices[:rows],
+            conv_metadata=conv_metadata(host.spans.tolist(), device),
+            conv_windows=torch.arange(local, dtype=torch.int32, device=device),
+            conv_has_state=torch.ones(local, dtype=torch.bool, device=device),
+            slots=slots,
             has_state=addressing.has_state[:rows],
             run=run,
+            hand_off=(
+                _hand_off(pieces, r.group.rank, run, slots, addressing.has_state[:rows], device)
+                if self._split_exchange == "state_passing" else None
+            ),
         )
 
     @property
@@ -207,16 +256,14 @@ class LinearAttnManager(AttentionResource):
         split = self._split_rows[label]
         # before the collective, alike on every rank
         self._shard.check_scattered(label)
-        rows = len(split.halo.rows)
 
         def conv(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
             # the rows with a piece here, each from its scratch window
             return causal_conv1d_fn(
                 x=x.transpose(0, 1), weight=weight, bias=bias, conv_states=initial,
-                query_start_loc=split.conv_cu,
-                cache_indices=torch.arange(rows, dtype=torch.int32, device=x.device),
-                has_initial_state=torch.ones(rows, dtype=torch.bool, device=x.device),
-                activation=activation, pad_slot_id=-1, null_block_id=-1, seqlens_cpu=split.conv_spans,
+                query_start_loc=split.conv_cu, cache_indices=split.conv_windows,
+                has_initial_state=split.conv_has_state, activation=activation, pad_slot_id=-1,
+                null_block_id=-1, seqlens_cpu=split.conv_spans, metadata=split.conv_metadata,
             ).transpose(0, 1)
 
         stored = gather_rows(conv_layer, split.slots, split.has_state)
@@ -226,25 +273,52 @@ class LinearAttnManager(AttentionResource):
 
     def _decode_slab(self, split: SplitRows, *xs: torch.Tensor) -> list[torch.Tensor]:
         """The step's decode run, every rank's tokens of it gathered: the first tokens of each of
-        ``xs``, this rank's, and the whole run back, one collective per dtype sized by the step
-        (a ``cat`` of two would promote one)."""
+        ``xs``, this rank's, and the whole run back, one collective per dtype sized by the step."""
         counts = split.decode_tokens
         mine = counts[split.range.group.rank]
         out: list[torch.Tensor | None] = [None] * len(xs)
         for dtype in dict.fromkeys(x.dtype for x in xs):
             chosen = [i for i, x in enumerate(xs) if x.dtype == dtype]
-            whole = gather_sequence(split.range.group, torch.cat([xs[i][:mine].flatten(1) for i in chosen], 1), counts)
-            for i, part in zip(chosen, whole.split([xs[i][0].numel() for i in chosen], dim=1), strict=True):
+            flat = torch.cat([xs[i][:mine].flatten(1) for i in chosen], dim=1)
+            whole = gather_sequence(split.range.group, flat, counts)
+            parts = whole.split([xs[i][0].numel() for i in chosen], dim=1)
+            for i, part in zip(chosen, parts, strict=True):
                 out[i] = part.unflatten(1, xs[i].shape[1:]).contiguous()
         return out
 
 
-def finals_by_rank(pieces: np.ndarray, first: int) -> tuple[np.ndarray, list[int]]:
-    """The rows from ``first`` holding tokens, whose final states every replica gathers from the
-    rank each ends on, and how many end on each rank: in row order, as the ranks hold them."""
-    rows = first + np.flatnonzero(pieces[:, first:].any(0))
-    ends_on = pieces.shape[0] - 1 - np.argmax(pieces[::-1, rows] > 0, axis=0)
-    return rows, np.bincount(ends_on, minlength=pieces.shape[0]).tolist()
+def _hand_off(
+    pieces: np.ndarray, rank: int, run: int, slots: torch.Tensor, has_state: torch.Tensor, device: torch.device,
+) -> HandOff:
+    """``rank``'s ``HandOff`` for prompt rows (from ``run``) split ``pieces``."""
+    mine = pieces[rank].astype(np.int64)
+    offsets = np.cumsum(mine) - mine
+    rows = tuple(i for i in range(run, len(mine)) if mine[i])
+    starts = frozenset(i for i in rows if not pieces[:rank, i].any())
+    ends = frozenset(i for i in rows if not pieces[rank + 1:, i].any())
+
+    def chunk(chosen: list[int]) -> Chunk:
+        index = np.concatenate([np.arange(offsets[i], offsets[i] + mine[i]) for i in chosen])
+        cu = np.concatenate([[0], np.cumsum([mine[i] for i in chosen])])
+        return Chunk(tuple(chosen), to_device_nonblocking(index, device, torch.int64),
+                     to_device_nonblocking(cu, device, torch.int64))
+
+    fresh = [i for i in rows if i in starts]
+    fresh_index = to_device_nonblocking(fresh, device, torch.int64) if fresh else None
+    last = rows[-1] if rows else None
+    # every prompt row's final, from the rank it ends on: in row order, as the ranks hold them
+    ended = run + np.flatnonzero(pieces[:, run:].any(0))
+    ends_on = pieces.shape[0] - 1 - np.argmax(pieces[::-1, ended] > 0, axis=0)
+    return HandOff(
+        rows=rows, starts=starts, ends=ends, offsets=offsets, spans=mine,
+        fresh=chunk(fresh) if fresh else None,
+        fresh_slots=None if fresh_index is None else slots.index_select(0, fresh_index),
+        fresh_has_state=None if fresh_index is None else has_state.index_select(0, fresh_index),
+        first=chunk([rows[0]]) if rows and rows[0] not in starts else None,
+        middle=chunk([last, last]) if last is not None and last not in starts | ends else None,
+        ended_slots=slots.index_select(0, to_device_nonblocking(ended, device, torch.int64)),
+        counts=np.bincount(ends_on, minlength=pieces.shape[0]).tolist(),
+    )
 
 
 def gather_rows(layer: torch.Tensor, slots: torch.Tensor, has_state: torch.Tensor) -> torch.Tensor:

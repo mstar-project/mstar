@@ -12,15 +12,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 
-import numpy as np
 import torch
 
 from mstar.distributed.communication import gather_sequence
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import (
+    Chunk,
     LinearAttnManager,
     SplitRows,
-    finals_by_rank,
     gather_rows,
     scatter_rows,
 )
@@ -44,7 +43,6 @@ from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
-from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -424,71 +422,56 @@ class GDNManager(LinearAttnManager):
         return ulysses(run, q, k, v, a, b, r=split.range)
 
     def _state_passing(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
-        """A split step's prompt rows by token (``sequence_shard.state_passing``): each rank runs
-        the rows starting on it from their slots, hands off the row it passes on (its final, or for
-        a middle piece the piece's transition from the identity with no values and its offset from
-        zeros, which needs equal key and value dims), runs a row continuing into it from the state
-        it gets, and every row's final state is gathered into every replica."""
-        group, rank = split.range.group, split.range.group.rank
-        pieces, run = split.pieces, split.run
-        mine = pieces[rank]
-        offsets = np.cumsum(mine) - mine
-        rows = [i for i in range(run, len(mine)) if mine[i]]
-        starts = {i: not pieces[:rank, i].any() for i in rows}
-        ends = {i: not pieces[rank + 1:, i].any() for i in rows}
+        """A split step's prompt rows by token (``sequence_shard.state_passing``), as planned
+        (``HandOff``): each rank runs the rows starting on it from their slots, hands off the row it
+        passes on (its final, or for a middle piece the piece's transition from the identity with
+        no values and its offset from zeros, which needs equal key and value dims), runs a row
+        continuing into it from the state it gets, and every row's final state is gathered into
+        every replica."""
+        group, plan = split.range.group, split.hand_off
         alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
         beta = torch.sigmoid(b.float())
         heads, dim_v, dim_k = state_layer.shape[1:]
         out = v.new_zeros(v.shape[0], heads, dim_v)
         finals: dict[int, torch.Tensor] = {}
 
-        def chunked(chosen: list[int], initial: torch.Tensor, zero_values: bool = False) -> torch.Tensor:
-            # the chunked kernel over `chosen` rows' pieces here, a sequence each (twice over with
-            # `zero_values`: the second time with no values); never on an empty set, on which the
-            # kernel deadlocks while the other ranks wait in the hand-off
-            index = np.concatenate([np.arange(offsets[i], offsets[i] + mine[i]) for i in chosen])
-            spans = [mine[i] for i in chosen]
+        def chunked(chunk: Chunk, initial: torch.Tensor, zero_values: bool = False) -> torch.Tensor:
+            # the chunked kernel over the chunk's rows here, a sequence each (with `zero_values`, its
+            # second half has no values); never on an empty set, on which the kernel deadlocks
+            # while the other ranks wait in the hand-off
+            values = v.index_select(0, chunk.index)
             if zero_values:
-                index, spans = np.concatenate([index, index]), spans * 2
-            index_t = to_device_nonblocking(index, q.device, torch.int64)
-            values = v.index_select(0, index_t)
-            if zero_values:
-                values[len(index) // 2:] = 0
-            cu = to_device_nonblocking(np.concatenate([[0], np.cumsum(spans)]), q.device, torch.int64)
+                values[values.shape[0] // 2:] = 0
             got, final = _chunked_kernel(q.device)(
-                q=q.index_select(0, index_t), k=k.index_select(0, index_t), v=values,
-                g=alpha.index_select(0, index_t), beta=beta.index_select(0, index_t), scale=self.config.sm_scale,
-                initial_state=initial.to(self._prefill_dtype), output_final_state=True, cu_seqlens=cu,
-                use_qk_l2norm_in_kernel=False,
+                q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
+                g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
+                scale=self.config.sm_scale, initial_state=initial.to(self._prefill_dtype), output_final_state=True,
+                cu_seqlens=chunk.cu, use_qk_l2norm_in_kernel=False,
             )
             if not zero_values:
-                for i, start in zip(chosen, np.cumsum([0, *spans[:-1]]), strict=True):
-                    out[offsets[i]:offsets[i] + mine[i]] = got[start:start + mine[i]].to(out.dtype)
-                    finals[i] = final[chosen.index(i)].float()
+                start = 0
+                for j, i in enumerate(chunk.rows):
+                    span, at = int(plan.spans[i]), int(plan.offsets[i])
+                    out[at:at + span] = got[start:start + span].to(out.dtype)
+                    finals[i] = final[j].float()
+                    start += span
             return final.float()
 
-        fresh = [i for i in rows if starts[i]]
-        if fresh:
-            index = to_device_nonblocking(fresh, q.device, torch.int64)
-            chunked(fresh, gather_rows(state_layer, split.slots[index], split.has_state[index]))
+        if plan.fresh is not None:
+            chunked(plan.fresh, gather_rows(state_layer, plan.fresh_slots, plan.fresh_has_state))
         identity = torch.eye(dim_k, device=q.device).expand(heads, dim_k, dim_k)
         transition, offset = identity, state_layer.new_zeros(heads, dim_v, dim_k, dtype=torch.float32)
-        if rows and not ends[rows[-1]]:
-            last = rows[-1]
-            if starts[last]:
-                transition, offset = torch.zeros_like(identity), finals[last]
-            else:
-                # a middle piece: its offset from zeros, its transition from the identity with no values
-                offset, transition = chunked([last], torch.stack([torch.zeros_like(identity), identity]), True)
+        if plan.middle is not None:
+            # its offset from zeros, its transition from the identity with no values
+            offset, transition = chunked(plan.middle, torch.stack([torch.zeros_like(identity), identity]), True)
+        elif plan.passes is not None:
+            transition, offset = torch.zeros_like(identity), finals[plan.passes]
         entering = state_passing(group, transition, offset, torch.matmul)
-        if rows and not starts[rows[0]]:
-            chunked([rows[0]], entering[None])
-        # every prompt row's final state, gathered from the rank it ends on
-        ended, counts = finals_by_rank(pieces, run)
-        local = [finals[i] for i in rows if ends[i]]
-        mine_finals = torch.stack(local) if local else offset.new_zeros(0, heads, dim_v, dim_k)
-        slots = split.slots.index_select(0, to_device_nonblocking(ended, q.device, torch.int64))
-        scatter_rows(state_layer, slots, gather_sequence(group, mine_finals, counts))
+        if plan.first is not None:
+            chunked(plan.first, entering[None])
+        local = [finals[i] for i in plan.rows if i in plan.ends]
+        mine = torch.stack(local) if local else offset.new_zeros(0, heads, dim_v, dim_k)
+        scatter_rows(state_layer, plan.ended_slots, gather_sequence(group, mine, plan.counts))
         return out
 
     @torch.compiler.disable

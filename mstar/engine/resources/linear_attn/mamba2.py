@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from mstar.distributed.communication import gather_sequence
@@ -26,7 +25,6 @@ from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
 from mstar.engine.resources.linear_attn.base import (
     LinearAttnManager,
     SplitRows,
-    finals_by_rank,
     gather_rows,
     scatter_rows,
 )
@@ -42,7 +40,6 @@ from mstar.engine.resources.recurrent.config import Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
 from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
-from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -287,54 +284,48 @@ class Mamba2Manager(LinearAttnManager):
         return ulysses(run, x, dt, b, c, r=split.range)
 
     def _state_passing(self, plan: Mamba2Plan, split: SplitRows, x, dt, b, c, ssm_layer, a, d, dt_bias):
-        """A split step by token (``sequence_shard.state_passing``): each rank scans every row it
-        holds, from its slot where it starts here and from zeros otherwise, and hands off the row it
-        passes on (its final, or for a middle piece its decay ``exp(sum dt A)`` and its final from
-        zeros). A row continuing into the rank is then corrected in closed form for the state it
-        enters with, ``y_t += C_t . (exp(sum_{s<=t} dt_s A) h0)`` and ``final += exp(sum dt A) h0``,
-        and every row's final state is gathered into every replica."""
-        group, rank = split.range.group, split.range.group.rank
-        pieces = split.pieces
-        mine = pieces[rank]
-        offsets = np.cumsum(mine) - mine
-        rows = [i for i in range(len(mine)) if mine[i]]
-        starts = {i: not pieces[:rank, i].any() for i in rows}
-        ends = {i: not pieces[rank + 1:, i].any() for i in rows}
+        """A split step by token (``sequence_shard.state_passing``), as planned (``HandOff``): each
+        rank scans every row it holds, from its slot where it starts here and from zeros otherwise,
+        and hands off the row it passes on (its final, or for a middle piece its decay
+        ``exp(sum dt A)`` and its final from zeros). A row continuing into the rank is then
+        corrected in closed form for the state it enters with, ``y_t += C_t . (exp(sum_{s<=t} dt_s
+        A) h0)`` and ``final += exp(sum dt A) h0``, and every row's final state is gathered into
+        every replica."""
+        group, hand = split.range.group, split.hand_off
         decay = _effective_dt(dt, dt_bias, True, self._time_step_limit) * a
         out = torch.zeros_like(x)
         finals: dict[int, torch.Tensor] = {}
-        for i in rows:
-            span = slice(offsets[i], offsets[i] + mine[i])
+
+        def span(i: int) -> slice:
+            return slice(int(hand.offsets[i]), int(hand.offsets[i] + hand.spans[i]))
+
+        for i in hand.rows:
             h0 = None
-            if starts[i]:
+            if i in hand.starts:
                 h0 = gather_rows(ssm_layer, split.slots[i:i + 1], split.has_state[i:i + 1])[0]
-            out[span], finals[i] = mamba2_scan(
-                x[span], dt[span], a, b[span], c[span], h0, d=d, dt_bias=dt_bias, dt_softplus=True,
+            rows = span(i)
+            out[rows], finals[i] = mamba2_scan(
+                x[rows], dt[rows], a, b[rows], c[rows], h0, d=d, dt_bias=dt_bias, dt_softplus=True,
                 time_step_limit=self._time_step_limit,
             )
         heads, head_dim, state_size = ssm_layer.shape[1:]
         transition = torch.ones(heads, device=x.device)
         offset = torch.zeros(heads, head_dim, state_size, device=x.device)
-        if rows and not ends[rows[-1]]:
-            last = rows[-1]
-            if starts[last]:
-                transition = torch.zeros_like(transition)
-            else:
-                transition = decay[offsets[last]:offsets[last] + mine[last]].sum(0).exp()
+        if hand.passes is not None:
+            last = hand.passes
+            transition = decay[span(last)].sum(0).exp() if last not in hand.starts else torch.zeros_like(transition)
             offset = finals[last]
         entering = state_passing(group, transition, offset, lambda state, y: state * y[:, None, None])
-        if rows and not starts[rows[0]]:
-            first = rows[0]
-            span = slice(offsets[first], offsets[first] + mine[first])
-            carried = decay[span].cumsum(0).exp()
-            cx = _expand_groups(c[span].float(), heads)
-            out[span] = (out[span].float() + torch.einsum("lh,hpn,lhn->lhp", carried, entering, cx)).to(out.dtype)
+        if hand.first is not None:
+            first = hand.rows[0]
+            rows = span(first)
+            carried = decay[rows].cumsum(0).exp()
+            cx = _expand_groups(c[rows].float(), heads)
+            out[rows] = (out[rows].float() + torch.einsum("lh,hpn,lhn->lhp", carried, entering, cx)).to(out.dtype)
             finals[first] = finals[first] + carried[-1][:, None, None] * entering
-        ended, counts = finals_by_rank(pieces, 0)
-        local = [finals[i] for i in rows if ends[i]]
-        mine_finals = torch.stack(local) if local else offset.new_zeros(0, heads, head_dim, state_size)
-        slots = split.slots.index_select(0, to_device_nonblocking(ended, x.device, torch.int64))
-        scatter_rows(ssm_layer, slots, gather_sequence(group, mine_finals, counts))
+        local = [finals[i] for i in hand.rows if i in hand.ends]
+        mine = torch.stack(local) if local else offset.new_zeros(0, heads, head_dim, state_size)
+        scatter_rows(ssm_layer, hand.ended_slots, gather_sequence(group, mine, hand.counts))
         return out
 
     # Engine lifecycle
