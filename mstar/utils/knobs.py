@@ -114,9 +114,9 @@ def sampler_slots() -> int:
 
 def ingraph_decode_rope() -> bool:
     """``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a
-    captured step of a text walk (decode, text prefill, mixed) builds its
-    rotary tables inside the graph from the position resource's planned
-    positions instead of building them before the replay."""
+    captured text prefill or mixed step builds its rotary tables inside the
+    graph from the position resource's planned positions instead of building
+    them before the replay. A captured decode step always does."""
     return _setting("ingraph_decode_rope", "0") == "1"
 
 

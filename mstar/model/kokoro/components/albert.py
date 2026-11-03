@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components import MLP, FusedColumnLinear
-from mstar.model.kokoro.components.masking import length_mask
+from mstar.model.components.masking import length_mask
 from mstar.model.kokoro.config import KokoroBertConfig
 
 
