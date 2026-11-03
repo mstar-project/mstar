@@ -14,27 +14,43 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
+    """The response dict, or for ``req.stream`` the SSE response itself."""
     args = adapter.chat_to_request(req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
+        # resolved once, before it is submitted: the response names the adapter that
+        # served it, as vLLM's does, whether the model field or the lora_adapter kwarg
+        # picked it
+        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+        served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
+        if served is not None:
+            model_name = served
         api.submit_request(
             text=args.text,
             file_paths=args.file_paths,
             input_modalities=args.input_modalities,
             output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
+            model_kwargs=model_kwargs,
             prompt_parts=args.prompt_parts,
             streaming=bool(req.stream),
             request_id=request_id,
         )
         if req.stream:
-            return _stream(api, model_name, request_id, sample_rate)
+            # a request the engine refuses gets its status, not a 200
+            batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            return ReleasingStreamingResponse(
+                _stream_events(batches, model_name, request_id, sample_rate),
+                release=lambda: api.release_request(request_id),
+                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+            )
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
@@ -81,12 +97,6 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
-
-
-def _stream(api, model_name, request_id, sample_rate):
-    # Bound to the submission now: the body is iterated later, by Starlette.
-    batches = api.iter_result_chunk_batches(request_id)
-    return _stream_events(batches, model_name, request_id, sample_rate)
 
 
 async def _stream_events(batches, model_name, request_id, sample_rate):

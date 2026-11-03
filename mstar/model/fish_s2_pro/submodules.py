@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 import logging
 import math
@@ -33,7 +32,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -57,26 +60,12 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopCheck,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def full_fp32():
-    """Disable TF32 for convolutions and matmuls while the codec runs.
-
-    The reference encodes references in full fp32 (TF32 convolutions flip
-    about 3% of the codes), and the codec decodes in fp32 too.
-    """
-    matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-    try:
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = matmul, cudnn
 
 
 # ===========================================================================
@@ -94,8 +83,15 @@ class ARSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    MAX_BATCH_SIZE = 32
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The top decode bucket is also the cap on rows per AR step; a step
+    # costs about the same at 64 rows as at 32, so 64 streams do not run as
+    # two alternating batches, and padding a batch up to 32 or 64 is cheap.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    MAX_BATCH_SIZE = DECODE_CAPTURE_BATCH_SIZES[-1]
+    # Plain prompts are short (the chat frame around one text). Eager, a
+    # prefill step took ~60 ms of mostly launch-bound stream time on an H200.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def __init__(self, slow_ar: FishSlowAR, fast_ar: FishFastAR, config: FishS2ProConfig) -> None:
         super().__init__()
@@ -257,8 +253,8 @@ class ARSubmodule(ARNodeSubmodule):
         semantic = torch.where(is_eos, torch.zeros_like(head_index), head_index)
         codes = self.fast_ar(last_hidden, semantic, self._get_fast_kv(semantic.shape[0]))
         next_embeds = self.next_input_embeds(head_index, codes)
-        # The codec stream carries the head index in codebook 0, so the frame
-        # that ends the stream (<|im_end|>) is recognizable and dropped.
+        # The codec stream carries the head index in codebook 0; the frame
+        # that ends the stream (<|im_end|>) is withheld by ``check_stop``.
         stream = codes.clone()
         stream[:, 0] = head_index
         return {"ar_input_embeds": next_embeds, "codec_tokens": stream, "new_token": head_index}
@@ -319,12 +315,14 @@ class ARSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
+    ) -> set[str] | StopCheck:
         """Stop on ``<|im_end|>`` or the request's frame limit.
 
         Frames are counted here, not in ``postprocess``: a speculative step's
         ``postprocess`` can run before the previous step's stop check, and a
-        discarded speculative step never reaches this.
+        discarded speculative step never reaches this. The ``<|im_end|>``
+        frame (head index ``eos_code`` in codebook 0) stays out of the codec
+        stream, which then carries only frames to decode.
         """
         if "head_index" not in outputs:
             return set()
@@ -334,11 +332,13 @@ class ARSubmodule(ARNodeSubmodule):
         state.add("generated_frames", generated)
         max_tokens = request_info.max_tokens
         sampling = request_info.resource_configs.get(AR_SAMPLER)
-        reached_eos = head_index == self.eos_code and not bool(getattr(sampling, "ignore_eos", False))
+        is_eos = head_index == self.eos_code
+        reached_eos = is_eos and not bool(getattr(sampling, "ignore_eos", False))
+        stops = set()
         if reached_eos or generated >= max_tokens:
             logger.debug("fish ar %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
-            return {"ar_decode_loop"}
-        return set()
+            stops = {"ar_decode_loop"}
+        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return (
@@ -354,10 +354,29 @@ class ARSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Capture the whole one-token decode step (both ARs and sampling) per batch bucket."""
+        """Capture the whole one-token decode step (both ARs and sampling) per
+        batch bucket, and prefills packed into token buckets. A voice clone's
+        prefill is the same forward over a prompt that embeds the reference
+        frames, so it replays the same captures when it fits the buckets."""
         del tp_world_size
         dtype = self.slow_ar.semantic_head.dtype
+
+        def prefill_input(num_tokens: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(num_tokens, self.config.slow_ar.dim, dtype=dtype, device=device),
+                input_seq_len=num_tokens,
+                kwargs={"suppress_eos": True},
+            )
+
         return [
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk="ar_prefill",
+                replay_graph_walks=["ar_prefill", "ar_prefill_clone"],
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=prefill_input,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="ar_decode",
                 single_request_inputs=ARNodeInputs(
@@ -371,7 +390,9 @@ class ARSubmodule(ARNodeSubmodule):
         ]
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        if batch.graph_walk != "ar_decode" or not self.can_batch(batch, model_inputs):
+        if batch.graph_walk not in ("ar_decode", "ar_prefill", "ar_prefill_clone") or not self.can_batch(
+            batch, model_inputs,
+        ):
             return False
         return super().can_use_accelerator_graphs(batch, model_inputs)
 
@@ -397,13 +418,15 @@ class CodecSubmodule(ARNodeSubmodule):
     disable_autocast = True
     MAX_BATCH_SIZE = 32
 
-    def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = True):
+    def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = False):
         super().__init__()
         self.decoder = decoder
         self.config = config
         self.codec = config.codec
         self.hop = config.codec.hop_length
-        self.exact_fp32 = exact_fp32
+        if exact_fp32:
+            # full fp32 for the decode, as the reference: the engine applies it
+            self.float32_matmul_precision, self.cudnn_allow_tf32 = "highest", False
         receptive_field = decoder.conv_receptive_field()
         if self.codec.conv_context_frames < receptive_field:
             raise ValueError(
@@ -437,15 +460,19 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Drop the end-of-stream frame and lay the window out as ``[10, frames]``."""
+        """Lay the window out as ``[10, frames]``. Every item is a frame: the
+        AR withholds its ``<|im_end|>`` frame (``ARSubmodule.check_stop``)."""
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
-        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # a stream whose first frame was <|im_end|> ends with an empty chunk
+            codes = torch.zeros(0, self.config.num_codebooks, dtype=torch.long, device=self.get_device())
         codes = codes.view(-1, self.config.num_codebooks)
-        # A sync: which window holds the end-of-stream frame is not known on the host.
-        codes = codes[codes[:, 0] < self.config.eos_code]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         start_offset = chunk.start_offset if chunk is not None else 0
         conv_start = context - min(context, self.conv_context)
         logger.debug(
@@ -496,9 +523,7 @@ class CodecSubmodule(ARNodeSubmodule):
         width = codec_tokens.shape[-1]
         if width == 0:
             return codec_tokens.new_zeros((codec_tokens.shape[0], 0), dtype=torch.int16)
-        guard = full_fp32() if self.exact_fp32 else contextlib.nullcontext()
-        with guard:
-            wav = self.decoder.decode_window(codec_tokens, start_offset, conv_start, self.conv_frames(width))
+        wav = self.decoder.decode_window(codec_tokens, start_offset, conv_start, self.conv_frames(width))
         return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
     def forward(
@@ -582,14 +607,16 @@ class CodecSubmodule(ARNodeSubmodule):
 class RefEncoderSubmodule(NodeSubmodule):
     """DAC-encode one 44.1 kHz reference clip into ``[frames, 10]`` codes.
 
-    Runs on the GPU under ``full_fp32``: TF32 convolutions would flip some
-    of the codes. Codes
+    Runs on the GPU in full fp32, as the reference encodes (the engine applies
+    the declaration below): TF32 convolutions flip about 3% of the codes. Codes
     are memoised by clip content: a voice is reused across requests and
     across the sentence chunks of one long request.
     """
 
     disable_torch_compile = True
     disable_autocast = True
+    float32_matmul_precision = "highest"
+    cudnn_allow_tf32 = False
     CACHE_SIZE = 64
 
     def __init__(self, encoder: FishDACEncoder, config: FishS2ProConfig) -> None:
@@ -611,7 +638,7 @@ class RefEncoderSubmodule(NodeSubmodule):
         return NodeInputs(tensor_inputs={"waveform": waveform}, kwargs={"clip_key": clip_key})
 
     def encode(self, waveform: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad(), full_fp32():
+        with torch.no_grad():
             codes = self.encoder(waveform.view(1, 1, -1).float())
         return codes[0].t().contiguous().long()
 

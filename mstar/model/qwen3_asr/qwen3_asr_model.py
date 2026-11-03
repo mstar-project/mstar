@@ -70,7 +70,7 @@ from mstar.model.qwen3_asr.config import (
     Qwen3ASRModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteLevelDetokenizer
+from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +428,8 @@ class Qwen3ASRModel(Model):
         )
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
@@ -437,9 +438,12 @@ class Qwen3ASRModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
+
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for Qwen3-ASR: {modality!r}")
 
     # -------------------------------------------------------------------

@@ -26,7 +26,7 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
@@ -70,7 +70,7 @@ def _pi05_cpu_threads():
 )
 def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
     from mstar.engine.accelerator_graph_runner import autocast_scope
-    from mstar.engine.engine import Engine
+    from mstar.engine.node_dtype import resolve_node_dtype
 
     class Encoder(torch.nn.Module):
         def __init__(self):
@@ -89,12 +89,11 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(range(batch_size)), per_request_info={},
         )
-        engine = Engine(graph_runtime=None, autocast_dtype=torch.bfloat16)
 
         with autocast_scope(None, "cpu"):
             reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
         with autocast_scope(torch.bfloat16, "cpu"):
-            with autocast_scope(engine._autocast_dtype_for(submodule), "cpu"):
+            with autocast_scope(resolve_node_dtype(submodule, torch.bfloat16), "cpu"):
                 if batched:
                     outputs = submodule.forward_batched("prefill", engine_inputs, images)
                     actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
@@ -103,6 +102,105 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
 
         assert actual.dtype == torch.float32
         assert torch.equal(actual, reference)
+
+
+def test_pi05_vision_gets_every_camera():
+    """The server hands one [C, H, W] tensor per camera; all of them reach SigLIP, in order."""
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.0, 0.5, 1.0)]
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels, torch.stack(cameras) * 2 - 1)
+
+
+class _TwoTokensPerImage(torch.nn.Module):
+    """Stands in for SigLIP + connector: two tokens per image, from its mean and its first pixel."""
+
+    def forward(self, pixels):
+        return torch.stack([pixels.mean(dim=(1, 2, 3)), pixels[:, 0, 0, 0]], dim=1).unsqueeze(-1)
+
+
+def _encode(submodule, cameras):
+    """prepare_inputs, the eager forward and postprocess for one request, as the engine runs them."""
+    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras})
+    pixels = submodule.preprocess("prefill", None, [inputs])["pixel_values"]
+    outputs = submodule.forward("prefill", None, pixels)
+    submodule.postprocess("r", None, outputs, inputs=inputs)
+    return inputs, outputs["img_emb"][0]
+
+
+@pytest.mark.parametrize("num_images", [1, 2, 3])
+def test_pi05_vision_pads_missing_cameras_and_drops_their_tokens(num_images):
+    """A request with fewer cameras than the deployment's num_cameras fills the
+    captured ViT's slots with blank frames, and only its own cameras' tokens reach
+    the LLM, as openpi's image mask leaves masked cameras out of the prefix."""
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.25, 0.5, 1.0)[:num_images]]
+    inputs, img_emb = _encode(submodule, cameras)
+
+    pixels = inputs.tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels[:num_images], torch.stack(cameras) * 2 - 1)
+    assert pixels[num_images:].eq(-1).all()
+    expected = torch.tensor([[v * 2 - 1] * 2 for v in (0.25, 0.5, 1.0)[:num_images]]).reshape(-1, 1)
+    assert torch.equal(img_emb, expected)
+
+
+def test_pi05_vision_batches_requests_with_different_camera_counts():
+    """Every request is padded to num_cameras, so a batch can mix camera counts and
+    each request still gets only its own cameras' tokens."""
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    requests = {"one": [torch.full((3, 4, 4), 0.25)], "two": [torch.full((3, 4, 4), 0.5), torch.zeros(3, 4, 4)]}
+    inputs = [submodule.prepare_inputs("prefill", None, {"image_inputs": cams}) for cams in requests.values()]
+    assert submodule.can_batch(None, inputs)
+    engine_inputs = ModelInputsFromEngine(request_ids=list(requests), per_request_info={})
+    pixels = submodule.preprocess("prefill", engine_inputs, inputs)["pixel_values"]
+    outputs = submodule.forward_batched("prefill", engine_inputs, pixels)
+    for rid, request_inputs in zip(requests, inputs, strict=True):
+        submodule.postprocess(rid, None, outputs[rid], inputs=request_inputs)
+    assert torch.equal(outputs["one"]["img_emb"][0], torch.tensor([[-0.5], [-0.5]]))
+    assert torch.equal(outputs["two"]["img_emb"][0], torch.tensor([[0.0], [0.0], [-1.0], [-1.0]]))
+
+
+def test_pi05_vision_letterboxes_each_camera_at_its_own_resolution():
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
+    wide, tall = torch.full((3, 2, 4), 1.0), torch.full((3, 8, 4), 1.0)
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": [wide, tall]}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (2, 3, 4, 4)
+    assert torch.equal(pixels[0], submodule._prepare_one(wide)[0])
+    assert torch.equal(pixels[1], submodule._prepare_one(tall)[0])
+
+
+def test_pi05_vision_refuses_more_cameras_than_its_slots():
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
+    with pytest.raises(ValueError, match="takes at most 2"):
+        submodule.prepare_inputs("prefill", None, {"image_inputs": [torch.zeros(3, 4, 4)] * 3})
+
+
+def test_pi05_refuses_more_images_than_cameras_before_decoding():
+    """The data worker checks file counts against max_input_files before it decodes
+    any file, so a fourth image is a 400 rather than a failed SigLIP step."""
+    from mstar.model.media_limits import check_file_counts
+
+    model = _make_model()
+    assert model.max_input_files() == {"image": model.config.num_cameras} == {"image": 3}
+    check_file_counts({"image": 3}, model.max_input_files())
+    with pytest.raises(ValueError, match="attaches 4 image files; this model takes at most 3"):
+        check_file_counts({"image": 4}, model.max_input_files())
+
+
+def test_pi05_prefix_scaling_follows_openpi():
+    """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
+    config = Pi05Config(hidden_size=16)
+    embed = torch.nn.Embedding(10, 16)
+    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
+                           torch.nn.Identity(), torch.nn.Identity(), config)
+    img = torch.randn(6, 16)
+    ids = torch.tensor([1, 4, 7])
+    with torch.no_grad():
+        prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
+        assert torch.equal(prefix[:6], img)
+        assert torch.allclose(prefix[6:], embed(ids) * 4.0)
 
 
 # ----------------------------------------------------------------------
@@ -306,6 +404,10 @@ def test_discretize_state_round_trip_within_bin():
 # ----------------------------------------------------------------------
 
 
+# what the data worker hands process_prompt for a one-camera request
+_ONE_IMAGE = {"image_inputs": [torch.zeros(3, 4, 4)]}
+
+
 class _StubTokenizer:
     """Captures the prompt string passed to encode_prompt for assertion."""
 
@@ -334,6 +436,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         prompt="pick up the\nblock",
         input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
         robot_state=state,
     ).new_input_tensors
 
@@ -356,8 +459,9 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     model.tokenizer = stub
     result = model.process_prompt(
         prompt="hello world",
-        input_modalities=["text"],
+        input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
     ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
@@ -394,7 +498,7 @@ def test_pi05_process_prompt_tokenizes_openpi_text():
     model = _make_model()
     model.tokenizer = Pi05Tokenizer(hf_tokenizer, model.config)
     result = model.process_prompt(
-        "Put_the Cup\naway", ["image", "text"], ["action"], robot_state=[0.5, -1.2, 1.0],
+        "Put_the Cup\naway", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.5, -1.2, 1.0],
     )
     assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
     assert result.new_input_tensors["text_inputs"][0].tolist() == [2, 7, 9]
@@ -469,7 +573,7 @@ def test_pi05_process_prompt_normalizes_raw_state_like_openpi():
     stats = _TINY_STATS["norm_stats"]["state"]
     rng = np.random.default_rng(0)
     for raw in ([0.1, -1.0, 0.5], [0.95, -2.9, 0.0], *rng.uniform(-3, 3, size=(32, 3)).tolist(), [0.3, -1.2]):
-        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=raw)
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=raw)
         bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
         assert [int(b) for b in bins] == _openpi_state_bins(raw, stats["q01"], stats["q99"])
 
@@ -477,7 +581,9 @@ def test_pi05_process_prompt_normalizes_raw_state_like_openpi():
 def test_pi05_process_prompt_rejects_state_wider_than_norm_stats():
     model = _model_with_stats(_TINY_STATS)
     with pytest.raises(ValueError, match="robot_state has 4 values"):
-        model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.0] * 4)
+        model.process_prompt(
+            "pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.0] * 4,
+        )
 
 
 def test_pi05_postprocess_unnormalizes_the_dims_the_action_stats_cover():
@@ -496,7 +602,7 @@ def test_pi05_postprocess_unnormalizes_the_dims_the_action_stats_cover():
 def test_pi05_without_norm_stats_bins_state_and_returns_actions_as_given():
     model = _make_model()
     model.tokenizer = _StubTokenizer()
-    model.process_prompt("pick up the cup", ["image", "text"], ["action"], robot_state=[0.5, -0.25])
+    model.process_prompt("pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.5, -0.25])
     assert model.tokenizer.last_prompt == "Task: pick up the cup, State: 192 96;\nAction: "
     actions = torch.rand(model.config.action_horizon, model.config.action_dim)
     assert model.postprocess(actions, modality="action") == actions.numpy().tobytes()
@@ -512,6 +618,30 @@ def test_pi05_norm_stats_come_from_model_kwargs(tmp_path):
     assert model.norm_stats.state.q01.tolist() == [-0.8, -2.7, 0.0]
     with pytest.raises(FileNotFoundError):
         Pi05Model("unused", skip_weight_loading=True, norm_stats=str(tmp_path / "missing.json"))
+
+
+@pytest.mark.parametrize("num_images", [1, 2, 3])
+def test_pi05_kv_layout_counts_the_cameras_the_request_sent(num_images):
+    """The ViT drops the tokens of empty camera slots, so the prefix the KV layout
+    declares holds 256 image tokens per camera the request sent."""
+    from mstar.model.pi05.config import LLM_KV
+
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    out = model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)] * num_images},
+    )
+    image_span, text_span = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    assert (image_span.length, image_span.advance) == (num_images * 256, num_images * 256)
+    assert text_span.length == 1
+
+
+def test_pi05_refuses_a_request_without_images():
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="at least one camera image"):
+        model.process_prompt(prompt="pick", input_modalities=["text"], output_modalities=["action"], tensors={})
 
 
 # ----------------------------------------------------------------------

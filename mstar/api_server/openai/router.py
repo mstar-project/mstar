@@ -11,7 +11,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
@@ -104,8 +104,15 @@ def _resolve(require: str):
 @router.get("/v1/models")
 async def list_models():
     api = _api()
-    name = api.model_name if api is not None else "unknown"
-    return JSONResponse(ModelList(data=[ModelCard(id=name, created=now())]).model_dump())
+    if api is None:
+        return JSONResponse(ModelList(data=[ModelCard(id="unknown", created=now())]).model_dump())
+    created = now()
+    # served LoRA adapters beside the base model, each naming it as its parent (vLLM's shape)
+    cards = [ModelCard(id=api.model_name, created=created)] + [
+        ModelCard(id=name, created=created, parent=api.model_name)
+        for name in api.served_models.adapters
+    ]
+    return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
 
 
 @router.post("/v1/chat/completions")
@@ -118,9 +125,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
         return _exception_error(e, "/v1/chat/completions")
     if request.stream:
-        return StreamingResponse(
-            result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_chat builds the streaming response
     return JSONResponse(result)
 
 
@@ -228,11 +233,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/videos/generations")
     if (request.model_extra or {}).get("stream_video"):
-        # A windowed request delivering each window as it lands: NDJSON lines
-        # (see serving_videos._stream_ndjson) instead of one JSON body.
-        return StreamingResponse(
-            result, media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"}
-        )
+        return result  # serving_videos builds the streaming response
     return JSONResponse(result)
 
 
@@ -272,6 +273,7 @@ async def images_edits(request: Request):
             image_bytes=image_bytes,
             image_filename=getattr(image, "filename", None),
             model_kwargs=extra,
+            requested_model=form.get("model"),
             raw_request=request,
         )
     except Exception as e:  # noqa: BLE001

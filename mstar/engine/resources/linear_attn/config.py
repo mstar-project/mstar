@@ -64,6 +64,19 @@ class LinearAttnSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.recurrent_state}
 
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
+    @property
+    def writes_prefix_snapshots(self) -> bool:
+        # only the GDN wrapper writes state checkpoints into the pool's snapshot slots
+        return self.config.variant is LinearAttnVariant.GDN
+
+    @property
+    def restores_prefix(self) -> bool:
+        # its state is the pool's
+        return True
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.linear_attn.base import LinearAttnManager

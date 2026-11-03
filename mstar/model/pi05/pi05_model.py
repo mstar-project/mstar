@@ -550,11 +550,14 @@ class Pi05Model(Model):
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
         text_ids = self.tokenizer.encode_prompt(pi05_prompt(prompt, state_bins))
         cfg = self.config
-        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
-        images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        # the ViT drops the tokens of the camera slots a request leaves empty
+        images = len(kwargs.get("tensors", {}).get("image_inputs", ()))
+        if not images:
+            raise ValueError("a pi0.5 request needs at least one camera image")
+        image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
-                Span("rows", self.PREFILL_WALK, images, images, "img_emb"),
+                Span("rows", self.PREFILL_WALK, image_rows, image_rows, "img_emb"),
                 Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
@@ -563,6 +566,10 @@ class Pi05Model(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
+
+    def max_input_files(self) -> dict[str, int]:
+        # one image per camera slot the SigLIP capture holds
+        return {"image": self.config.num_cameras}
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":

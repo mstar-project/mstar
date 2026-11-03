@@ -25,17 +25,18 @@ case "$job" in
             # on CPU; 3.6.0 is the version torch 2.10.0 pins.
             python -m pip install triton==3.6.0
             python -m pip install -e '.[dev,waypoint]'
+            python -m pip install pytest==9.2.0
             # BAGEL's CPU graph/KV tests need these without the CUDA extras.
             python -m pip install einops regex transformers
             python -m pip check
         else
-            python -m pip install -e '.[dynamo]' pytest
+            python -m pip install -e '.[dynamo]' pytest==9.2.0
         fi
         ;;
     rust)
         python -m pip install maturin
         # pyyaml: runtime tests import mstar.model.base.
-        python -m pip install pytest pyzmq msgpack numpy pyyaml
+        python -m pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml
         # The tensor-transport stack imports torch and Triton. Preserve this
         # job's existing unpinned versions and minimal mstar installation.
         python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
