@@ -344,10 +344,14 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
             ))},
         )
 
+    opened = set()
+
     def ensure(key, bs):
         rids = list(range(-bs, 0))
         for rid in rids:
-            kv.ingest_capture_row(rid)
+            if rid not in opened:  # each padding row once, as DummyRowPool keeps its rows
+                opened.add(rid)
+                kv.ingest_capture_row(rid)
         return rids
 
     runner = _StubMeasuredRunner(torch.device("cuda", 0), {wide: _cost(100), fits: _cost(10)})

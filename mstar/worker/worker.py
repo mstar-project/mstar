@@ -982,29 +982,36 @@ class Worker:
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
 
+        # One NewRequest comes per partition this worker serves, and a later one
+        # can land after a step already ran. The tensor manager and the engine
+        # hold request-wide state, so only the first opens it. Opening it again
+        # would reset that state under the partition that is running.
+        first = request_id not in self.request_state.per_request_info
         self.request_state.add_request(request_id, body.request_info)
         self.scheduler.note_arrival(request_id)
         self._graph_runtime.register_stop_limits(request_id, body.request_info)
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
+        if first:
+            self.tensor_manager.register_request(
+                request_id, self._graph_runtime.get_sharding_config(request_id),
+            )
         laps.lap("worker_state")
-        try:
-            self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs, body.request_info,
-            )
-            laps.lap("engine_add")
-            self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
-            laps.lap("skip_publish")
-        except Exception as err:
-            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            text, _ = client_error_text(
-                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
-                log=logger,
-            )
-            self._fail_requests({request_id: f"Error in worker: {text}"})
-            self._process_unprocessed(body.request_id)
-            return
+        if first:
+            try:
+                self.engine_manager.add_request(
+                    request_id, body.request_info.resource_configs, body.request_info,
+                )
+                laps.lap("engine_add")
+                self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
+                laps.lap("skip_publish")
+            except Exception as err:
+                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+                text, _ = client_error_text(
+                    err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                    log=logger,
+                )
+                self._fail_requests({request_id: f"Error in worker: {text}"})
+                self._process_unprocessed(body.request_id)
+                return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
