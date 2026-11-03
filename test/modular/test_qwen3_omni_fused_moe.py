@@ -112,6 +112,37 @@ def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, 
     torch.testing.assert_close(fused_out, naive_out, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 64])
+def test_thinker_experts_through_aiter_numerical_parity(num_tokens):
+    """The Thinker's experts on AITER, which ``auto`` picks on MI325X, in the
+    band the Triton kernels meet above."""
+    from mstar.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        pytest.skip("AITER runs on AMD GPUs")
+    pytest.importorskip("aiter")
+    from mstar.utils.fused_moe.backend import MoEProblem, make_moe_backend
+
+    hidden, inter, num_experts, top_k = 2048, 768, 128, 8
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    hidden_states = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
+    w1 = torch.randn(num_experts, 2 * inter, hidden, device=device, dtype=dtype) * 0.02
+    w2 = torch.randn(num_experts, hidden, inter, device=device, dtype=dtype) * 0.02
+    topk_weights, topk_ids = _random_router_output(hidden_states, num_experts, top_k, norm_topk_prob=True)
+
+    backend = make_moe_backend("aiter", MoEProblem(num_experts, inter, hidden, top_k))
+    p1 = torch.nn.Parameter(w1.clone(), requires_grad=False)
+    p2 = torch.nn.Parameter(w2.clone(), requires_grad=False)
+    backend.prepare_weights(p1, p2)
+    fused_out = backend(hidden_states, p1, p2, topk_weights, topk_ids)
+    naive_out = _dispatch_experts_fused(hidden_states, w1, w2, num_experts, topk_ids, topk_weights)
+
+    assert fused_out.shape == hidden_states.shape
+    assert fused_out.dtype == dtype
+    torch.testing.assert_close(fused_out, naive_out, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4])
 @pytest.mark.parametrize("hidden,inter", [(2048, 768), (1024, 384)])  # Thinker, Talker
 @pytest.mark.parametrize("reduce_results", [True, False])
