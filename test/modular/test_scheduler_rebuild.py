@@ -230,3 +230,18 @@ def test_pending_rows_and_a_refill_count_waiting_rebuilds():
 
     assert sched.pending_rows()[NODE] == 2, "the worker would report its node idle with a rebuild waiting"
     assert sched.could_refill(NODE, PREFILL, {"p0"}), "a refused step would hold its row though the rebuild refills it"
+
+
+def test_a_chain_takes_a_rebuild_and_leaves_the_requests_parked_decode_row_queued():
+    sched, runtime, state, _ = _scheduler({"c0": DECODE, "d0": DECODE, "d1": DECODE}, combined=True, budget=64)
+    queues = runtime.get_ready_nodes
+    runtime.get_ready_nodes = lambda exclude, target=None, exclude_target=None: queues(exclude)  # all one mixed key
+    runtime.ready.discard("c0")  # the chain's own row, in flight
+    sched.parked[NODE] = {"d0"}
+    _rebuilding(sched, "d0")
+
+    chain = sched.pick_chain_step(state, (NODE, DECODE), ["c0"])
+    batch = sched.take_chain_step(state, chain, pre_existing_batch_size=1)
+
+    assert _rids(batch) == ["d0", "d1"] and batch.rebuild_rids == {"d0"}
+    assert "d0" in runtime.ready, "the parked decode row would be popped into its own rebuild's step"
