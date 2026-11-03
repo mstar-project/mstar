@@ -12,7 +12,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.accelerator_graph_config import (
@@ -68,11 +67,9 @@ class AuTEncoderSubmodule(NodeSubmodule):
     def feature_inputs(self, features: torch.Tensor) -> NodeInputs:
         """This node's inputs for one request's ``(num_mel_bins, frames)``
         features, already on the encoder's device and in its dtype."""
-        num_frames = int(features.shape[-1])
         return NodeInputs(
             tensor_inputs={"audio_features": features},
-            kwargs={"num_frames": num_frames},
-            input_seq_len=self.encoder.config.tokens_for_frames(num_frames),
+            input_seq_len=self.encoder.config.tokens_for_frames(features.shape[-1]),
         )
 
     def declare_step(
@@ -102,13 +99,8 @@ class AuTEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        lens = [inp.kwargs["num_frames"] for inp in inputs]
-        longest = max(lens)
-        padded = torch.stack([
-            F.pad(inp.tensor_inputs["audio_features"], (0, longest - n))
-            for inp, n in zip(inputs, lens, strict=True)
-        ])
-        return {"audio_features": padded, "feature_lens": lens}
+        # the clips as they are; the frontend packs their frames
+        return {"audio_features": [inp.tensor_inputs["audio_features"] for inp in inputs]}
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
@@ -167,31 +159,27 @@ class AuTEncoderSubmodule(NodeSubmodule):
         ).get("embeds")
 
     def _encode(
-        self, audio_features: torch.Tensor, feature_lens: list[int],
+        self, audio_features: list[torch.Tensor],
         engine_inputs: ModelInputsFromEngine | None = None,
     ) -> list[torch.Tensor]:
         enc = self.encoder
-        layout = enc.layout(feature_lens)
-        hidden = enc.frontend(audio_features, feature_lens)
+        layout = enc.layout([clip.shape[-1] for clip in audio_features])
+        hidden = enc.frontend(audio_features)
         embeds = None
         if engine_inputs is not None:
             embeds = self._replay_encode(engine_inputs, hidden, layout.window_lengths)
         if embeds is None:
-            cu = torch.tensor(layout.cu_seqlens, dtype=torch.int32, device=hidden.device)
-            embeds = enc.encode(hidden, cu)
+            embeds = enc.encode(hidden, layout.cu_seqlens)
         return list(embeds.split(layout.tokens_per_request, dim=0))
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        feature_lens: list[int],
+        audio_features: list[torch.Tensor],
         **kwargs,
     ) -> NameToTensorList:
-        if audio_features.dim() == 2:
-            audio_features = audio_features.unsqueeze(0)
-        return {"audio_embeds": [self._encode(audio_features, feature_lens, engine_inputs)[0]]}
+        return {"audio_embeds": [self._encode(audio_features, engine_inputs)[0]]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # A packed step holds at most the largest capture's tokens. Past it the
@@ -208,11 +196,10 @@ class AuTEncoderSubmodule(NodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        feature_lens: list[int],
+        audio_features: list[torch.Tensor],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        per_request = self._encode(audio_features, feature_lens, engine_inputs)
+        per_request = self._encode(audio_features, engine_inputs)
         return {
             rid: {"audio_embeds": [emb]}
             for rid, emb in zip(engine_inputs.request_ids, per_request, strict=True)

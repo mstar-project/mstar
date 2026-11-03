@@ -19,6 +19,7 @@ import pytest
 import test_kv_host_index as host
 from test_kv_admission import _remove, _runner
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
+from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
@@ -320,6 +321,7 @@ def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_foo
     )
 
 
+@pytest.mark.usefixtures("backend")
 def test_victims_that_share_pages_are_preempted_together():
     kv = _pool()
     shared, tokens = list(range(3 * PAGE_SIZE)), {"a": range(100, 116), "b": range(200, 216)}
