@@ -156,7 +156,7 @@ def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
     first, second = _Recording(), _Recording()
     engine, rebuild = Engine.__new__(Engine), Rebuild(WALK, array("i", [1, 2, 3]))
     engine._submodules = {NODE: SimpleNamespace(resources={"first": first, "second": second})}
-    engine._tp_leader_nodes = set()
+    engine._tp_leader_nodes = engine._tp_follower_nodes = set()
 
     engine.prepare_rebuild(NODE, "r", rebuild)
     engine.land_rebuild(NODE, "r")
