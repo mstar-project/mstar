@@ -205,9 +205,11 @@ class Pi05Model(Model):
         if self.skip_weight_loading:
             cfg = Pi05Config()
         else:
-            try:
-                from huggingface_hub import hf_hub_download
+            # The checkpoint's config.json sets the action horizon (chunk_size), so a
+            # deployment that cannot read it must not fall back to the default 50 steps.
+            from huggingface_hub import hf_hub_download
 
+            try:
                 config_path = hf_hub_download(
                     repo_id=self.model_path_hf,
                     filename="config.json",
@@ -216,10 +218,7 @@ class Pi05Model(Model):
                 with open(config_path) as f:
                     cfg = load_pi05_config(json.load(f))
             except Exception as exc:
-                logger.warning(
-                    "Could not load Pi0.5 config from HF (%s); using defaults.", exc
-                )
-                cfg = Pi05Config()
+                raise RuntimeError(f"could not read the config.json of {self.model_path_hf}: {exc}") from exc
 
         # Overlay yaml-driven overrides (e.g. action_horizon for DROID).
         # Applied last so they win over both HF config.json and Pi05Config
