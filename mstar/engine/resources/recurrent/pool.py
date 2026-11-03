@@ -325,8 +325,7 @@ class RecurrentStatePool(Resource):
         index = rows.scatter_index.get(capturing)
         if index is None:
             index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
-        block = self.block(name, layer_idx)
-        block.index_copy_(0, index, value.to(block.dtype))
+        self.block(name, layer_idx).index_copy_(0, index, value)
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select
