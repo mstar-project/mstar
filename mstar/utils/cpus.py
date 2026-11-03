@@ -29,7 +29,8 @@ a deep idle state. Without one it costs throughput, since the threads only queue
 on their CPUs, so ``auto`` reads the idle states sysfs lists for the mask's CPUs
 and pins nothing unless one reaches ``DEEP_IDLE_US`` (``deepest_idle``). It also
 refuses to give a worker a single CPU, where the step threads queue behind each
-other. ``always`` skips both checks.
+other, and pins only on the CPU vendors in ``AUTO_VENDORS``, the ones its
+placement was measured on. ``always`` skips all three checks.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ _PCI_DEVICES = Path("/sys/bus/pci/devices")
 _CPU_TOPOLOGY = "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list"
 _CPU_CLUSTER = "/sys/devices/system/cpu/cpu{}/topology/cluster_cpus_list"
 _CPU_ROOT = Path("/sys/devices/system/cpu")
+_CPUINFO = Path("/proc/cpuinfo")
 _PM_QOS_DEVICE = Path("/dev/cpu_dma_latency")
 # not TMPDIR: every server on the host has to find the same file
 _GPU_LOCK_DIR = Path("/tmp")
@@ -61,6 +63,9 @@ DEEP_IDLE_US = 100
 PLACED = ("auto", "always")
 # CPU latency the idle hold asks for: admits C1 and C1E, refuses the C6 class
 IDLE_HOLD_US = 10
+# ``/proc/cpuinfo`` vendors ``auto`` pins on: its placement is measured on Xeon
+# 6767P and 6740E hosts, and the same placement lost on an AMD EPYC
+AUTO_VENDORS = ("GenuineIntel",)
 
 
 # ── CPU lists ───────────────────────────────────────────────────────────────
@@ -153,9 +158,8 @@ class CpuPlan:
     workers: tuple[StepCpus | None, ...] = ()
     result: int | None = None
     why: str = "step_thread_core off"
-    # nothing pinned because the host doesn't call for it, which is no fault of
-    # the deployment's
-    shallow: bool = False
+    # auto chose not to pin here, which is no fault of the deployment's
+    declined: bool = False
 
     @property
     def pinned(self) -> frozenset[int]:
@@ -324,6 +328,20 @@ def _step_cpus(core: tuple[int, ...], why: str) -> StepCpus:
     return StepCpus(frozenset(core), why)
 
 
+def cpu_vendor(cpuinfo: Path | None = None) -> str | None:
+    """The first ``vendor_id`` ``/proc/cpuinfo`` lists (``GenuineIntel``,
+    ``AuthenticAMD``); None where it lists none, as on Arm, or can't be read."""
+    try:
+        with open(cpuinfo or _CPUINFO) as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                if key.strip() == "vendor_id":
+                    return value.strip() or None
+    except OSError:
+        pass
+    return None
+
+
 # ── how deep the host sleeps ────────────────────────────────────────────────
 
 class IdleState(NamedTuple):
@@ -391,6 +409,7 @@ def deployment_plan(
     cluster: Callable[[int], frozenset[int]] = l2_cluster,
     cpu_root: Path = _CPU_ROOT,
     reachable: Collection[str] = (),
+    cpuinfo: Path | None = None,
 ) -> CpuPlan:
     """The plan for a deployment whose workers' devices sit at PCI
     ``addresses``, in the conductor's worker order (None for a device sysfs
@@ -402,8 +421,9 @@ def deployment_plan(
     the mask; a number outside the mask, or too near its top for every worker,
     raises ``CpuPlanError``. ``always`` places by device rank (module
     docstring), and pins nothing, saying why in ``CpuPlan.why``, when the mask
-    is too small. ``auto`` does the same where the mask's CPUs have a deep idle
-    state and every worker gets two CPUs, and otherwise pins nothing, saying so.
+    is too small. ``auto`` does the same on a CPU vendor in ``AUTO_VENDORS``
+    where the mask's CPUs have a deep idle state and every worker gets two
+    CPUs, and otherwise pins nothing, saying so.
     Either way at least one CPU of the mask stays unpinned.
     """
     mask = frozenset(process_mask() if mask is None else mask)
@@ -413,9 +433,9 @@ def deployment_plan(
     if not PINNABLE:
         return CpuPlan(mask, usable, why="not pinned: no sched_setaffinity here")
     if setting == "auto":
-        shallow = _no_deep_idle(mask, cpu_root)
-        if shallow is not None:
-            return CpuPlan(mask, usable, why=f"not pinned: {shallow}", shallow=True)
+        declined = _auto_declines(cpu_vendor(cpuinfo), mask, cpu_root)
+        if declined is not None:
+            return CpuPlan(mask, usable, why=f"not pinned: {declined}", declined=True)
     cores = _cores(mask, siblings)
     if setting in PLACED:
         def cores_of(cpus: Collection[int]) -> list[tuple[int, ...]]:
@@ -437,6 +457,15 @@ def deployment_plan(
             return CpuPlan(mask, usable, why=f"not pinned: {reason}")
         raise CpuPlanError(f"step_thread_core {setting}: {reason}")
     return out
+
+
+def _auto_declines(vendor: str | None, mask: frozenset[int], cpu_root: Path) -> str | None:
+    """Why ``auto`` leaves this host's threads alone; None when it pins."""
+    if vendor not in AUTO_VENDORS:
+        this = f"this host's is {vendor}" if vendor else "/proc/cpuinfo names no vendor here"
+        return (f"auto is measured on Intel hosts only and {this} "
+                "(step_thread_core always pins anyway)")
+    return _no_deep_idle(mask, cpu_root)
 
 
 def _no_deep_idle(mask: frozenset[int], cpu_root: Path) -> str | None:
@@ -570,7 +599,7 @@ def devices_plan(setting: str | int, devices: Sequence[str]) -> CpuPlan:
     """``deployment_plan`` for the workers' device strings, in the conductor's
     worker order: the same call in the API server and in every worker."""
     # a host auto leaves alone never asks torch about its devices
-    if setting not in PLACED or (setting == "auto" and _no_deep_idle(process_mask(), _CPU_ROOT)):
+    if setting not in PLACED or (setting == "auto" and _auto_declines(cpu_vendor(), process_mask(), _CPU_ROOT)):
         return deployment_plan(setting, [None] * len(devices))
     from mstar.platforms import current_platform
 

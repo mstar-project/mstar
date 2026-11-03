@@ -2259,7 +2259,7 @@ class Worker:
         step = self._step_cpus
         if step is None:
             # a host that doesn't call for pinning is the API server's one line
-            if not plan.shallow:
+            if not plan.declined:
                 logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
         else:
             logger.info(

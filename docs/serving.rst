@@ -750,6 +750,8 @@ host time spent waking CPUs. Two knobs deal with it:
   two cores of an L2 cluster where there is no SMT. ``auto`` pins only where sysfs
   shows an enabled idle state of 100 µs or more on the server's CPUs, and logs one
   line when it doesn't, so a VM without deep idle states keeps its threads free.
+  It also pins only on Intel CPUs, the only ones its placement has been measured
+  on: on an AMD or Arm host ``auto`` pins nothing and logs one line saying so.
   ``always`` pins on any host, ``off`` never does, a number names the CPU.
 - ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
   through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
@@ -790,6 +792,11 @@ Measured with ``benchmark.runner`` and the speech and ASR benches at ``-O2``, a 
      - Qwen3.5-0.8B c=1 / 16, tok/s
      - 529 / 6520
      - not pinned; ``always`` 419 / 5526
+     - not measured
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+     - Qwen3.5-0.8B c=1 / 8 / 64, tok/s
+     - 634 / 3617 / 12227
+     - not pinned; ``always`` 506 / 3103 / 11712
      - not measured
 
 The last column is a ``SCHED_IDLE`` spinner on each server core, a stand-in for

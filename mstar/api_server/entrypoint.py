@@ -566,7 +566,7 @@ class APIServer:
         if plan.result is not None:
             logger.info("API server: message thread and frontend bridge on CPU %d (%s; mask %s)",
                         plan.result, plan.why, cpus.format_cpu_list(plan.mask))
-        elif plan.shallow:
+        elif plan.declined:
             logger.info("API server: result threads not pinned (%s)", plan.why)
         elif knobs.step_thread_core() != "off":
             logger.warning("API server: result threads not pinned (%s)", plan.why)

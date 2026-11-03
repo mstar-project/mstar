@@ -513,7 +513,12 @@ Worker scheduling
        is cheap and pinning only makes the threads queue. It also pins nothing
        when a worker would get a single CPU, where the three threads queue
        behind each other (Qwen3-TTS c=1 TTFA 23 → 32 ms), and the log line names
-       the mask that would do. ``always`` skips both checks. A number names the
+       the mask that would do. And it pins only on the CPU vendors its
+       placement has been measured on (``cpus.AUTO_VENDORS``, by
+       ``/proc/cpuinfo``'s ``vendor_id``): so far Intel alone. On an AMD or
+       Arm host ``auto`` pins nothing and logs one line saying so; on a
+       2-socket EPYC with C2 at 800 µs the Intel placement cost Qwen3.5-0.8B
+       14-20% at c=1 and c=8. ``always`` skips all three checks. A number names the
        first worker's core (its hardware threads in
        the mask); the next workers take the next cores up and the API server
        the last core of the mask. A number outside the mask, or too near its
