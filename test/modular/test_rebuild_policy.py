@@ -35,9 +35,11 @@ from mstar.worker.worker import _LazyHostOutputs
 
 NODE, PREFILL, VISION, DECODE, MIXED = "LLM", "prefill", "vision", "decode", "mixed"
 R, A, B = 7, 8, 9
-POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="decode_loop")
+POLICY = RebuildPolicy(
+    walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+)
 # as Qwen3.5 declares its LLM: a prompt with images prefills in a walk that also reads the encoder's output
-MEDIA = replace(POLICY, copied_inputs={VISION: ("embeds",)})
+MEDIA = replace(POLICY, walks=frozenset({PREFILL, VISION}), copy_bytes_per_slot={VISION: 8})
 
 
 def _graphs() -> dict:
@@ -52,24 +54,24 @@ def _graphs() -> dict:
 
 
 @pytest.mark.parametrize("field, value, why", [
-    ("walk", "audio", "doesn't run"),
+    ("walks", frozenset({"audio"}), "doesn't run"),
     ("ids_input", "embeds", "carries"),
-    ("copied_inputs", {VISION: ("pixels",)}, "carries"),
     ("sample_output", "codes", "doesn't output"),
     ("loop", "talker_loop", "in no walk"),
+    ("copy_bytes_per_slot", {}, "doesn't say"),
 ])
 def test_a_policy_naming_what_the_graph_doesnt_have_is_refused_at_load(field, value, why):
-    policy = RebuildPolicy(**{**vars(POLICY), field: value})
+    policy = RebuildPolicy(**{**vars(MEDIA), field: value})
 
     with pytest.raises(ValueError, match=why):
         Rebuilds({NODE: policy}, _graphs())
 
 
-def test_a_walk_whose_node_reads_more_than_the_ids_is_refused_at_load():
+def test_a_walk_whose_node_reads_more_than_the_ids_must_say_what_its_copies_take():
     graphs = _graphs()
     graphs[PREFILL].input_names = {"text_inputs", "pixel_values"}
 
-    with pytest.raises(ValueError, match="carries"):
+    with pytest.raises(ValueError, match="doesn't say"):
         Rebuilds({NODE: POLICY}, graphs)
 
 
@@ -78,10 +80,10 @@ def test_a_copied_walk_this_worker_doesnt_run_and_every_copied_walk_above_one_ra
     walks = {(NODE, walk) for walk in (PREFILL, VISION, DECODE)}
 
     assert policies_run_here(policies, _graphs(), walks, ()) == policies
-    assert policies_run_here(policies, _graphs(), walks - {(NODE, VISION)}, ())[NODE].copied_inputs == {}, (
+    assert policies_run_here(policies, _graphs(), walks - {(NODE, VISION)}, ())[NODE].walks == {PREFILL}, (
         "a worker that never runs the walk would keep its requests droppable with no copies to rebuild them"
     )
-    assert policies_run_here(policies, _graphs(), walks, {NODE})[NODE].copied_inputs == {}, (
+    assert policies_run_here(policies, _graphs(), walks, {NODE})[NODE].walks == {PREFILL}, (
         "rank 0 could drop a request whose copies haven't landed on a follower"
     )
 
@@ -113,7 +115,9 @@ def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and
 
 
 @pytest.mark.parametrize("model_class, attrs", [
-    (Qwen3_5DenseModel, {"config": SimpleNamespace(max_position_embeddings=4096), "vision_config": None}),
+    (Qwen3_5DenseModel, {
+        "config": SimpleNamespace(max_position_embeddings=4096, hidden_size=64), "vision_config": None,
+    }),
     (OrpheusModel, {"config": SimpleNamespace(max_position_embeddings=4096)}),
     (BagelModel, {
         "config": SimpleNamespace(max_position_embeddings=4096, num_timesteps=50),
@@ -128,7 +132,9 @@ def test_a_policy_passes_its_check_on_a_walk_that_chunks(model_class, attrs):
     graphs = model.get_graph_walk_graphs()
 
     for node, policy in model.rebuild_policies().items():
-        assert chunk_loop_name(node, policy.walk) in graphs[policy.walk].get_loops(), "the walk runs no chunk Loop"
+        assert any(chunk_loop_name(node, walk) in graphs[walk].get_loops() for walk in policy.walks), (
+            "no walk runs a chunk Loop"
+        )
         policy.check(node, graphs)
 
 
@@ -161,7 +167,7 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
 def _kept(prompt, *sampled: int) -> KeptIds:
     """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
     view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), PREFILL, torch.long, array("i", sampled))
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -217,7 +223,7 @@ def test_a_request_no_drop_can_free_keeps_no_ids(why):
 
 
 def _media(prompt=(1,), *sampled: int, copies: HostCopies | None = None) -> KeptIds:
-    return replace(_kept(prompt, *sampled), copies=HostCopies(VISION) if copies is None else copies)
+    return replace(_kept(prompt, *sampled), walk=VISION, copies=HostCopies() if copies is None else copies)
 
 
 def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_its_copies():
@@ -231,7 +237,7 @@ def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_
     assert kept.prompt.view.tolist() == [1, 2, 3, 4, 5] and kept.lengths == (3, 2), (
         "the rebuild row would read other text"
     )
-    assert kept.copies == HostCopies(VISION), "a rebuild row would leave out the image"
+    assert kept.walk == VISION and kept.copies == HostCopies(), "a rebuild row would leave out the image"
     kept.sampled.append(6)
     assert "haven't landed" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
         "a drop would leave nothing to rebuild the image"
@@ -280,7 +286,7 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
-    copies = HostCopies(VISION, {"embeds": [embeds]}, metadata)
+    copies = HostCopies({"embeds": [embeds]}, metadata)
     rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, 7, copies=copies), lengths=(3, 2))
 
     rebuild = rebuilds.start(R, NODE, None)
@@ -392,7 +398,7 @@ def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
     prompt = torch.tensor([1, 2], dtype=torch.int32)
     copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
-    rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
+    rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, torch.long, array("i", [5]))
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"

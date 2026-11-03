@@ -711,7 +711,7 @@ class Engine:
                     f"{type(model).__name__}: {node!r} declares a rebuild policy, but {refusing} can't drop a "
                     "request's state"
                 )
-            walks = {policy.walk, combined.get((node, policy.walk), policy.walk)}
+            walks = {*policy.walks, *(combined.get((node, walk), walk) for walk in policy.walks)}
             split = sorted(walk for walk in walks if mgmt.submodule.split_batches_by_capture_key(walk))
             if split:
                 raise ValueError(

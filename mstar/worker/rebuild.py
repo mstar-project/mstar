@@ -33,10 +33,9 @@ DEFAULT_REBUILD_HOST_MB = 64
 
 @dataclass(slots=True)
 class HostCopies:
-    """Host copies of what ``walk`` read besides a request's ids when it prefilled the request, and of that
-    row's step metadata, for the request's rebuild row. Empty until the row's step has run. ``landed`` is
-    recorded after the copies, and stays None on a CPU device, where the inputs are kept as they are."""
-    walk: str
+    """Host copies of what a request's prefill walk read besides its ids, and of that row's step metadata, for
+    the request's rebuild row. Empty until the row's step has run. ``landed`` is recorded after the copies, and
+    stays None on a CPU device, where the inputs are kept as they are."""
     inputs: NameToTensorList | None = None
     step_metadata: dict | None = None
     landed: torch.Event | None = None
@@ -61,10 +60,11 @@ class HostCopies:
 
 @dataclass(slots=True)
 class KeptIds:
-    """A request's ids on one node: its prompt copied to the host as int32, the dtype the walk it prefilled in
-    read it in, and each id sampled since. ``lengths`` splits the prompt into the tensors that walk read, and is
-    None for one tensor. A walk of the policy's ``copied_inputs`` read more inputs, which ``copies`` holds."""
+    """A request's ids on one node: its prompt copied to the host as int32, the ``walk`` it prefilled in and the
+    dtype that walk read it in, and each id sampled since. ``lengths`` splits the prompt into the tensors the walk
+    read, and is None for one tensor. A walk that read more than the ids has its other inputs in ``copies``."""
     prompt: HostCopy
+    walk: str
     dtype: torch.dtype
     sampled: array
     lengths: tuple[int, ...] | None = None
@@ -107,18 +107,22 @@ def policies_run_here(
     policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection], my_walks: Collection[tuple[str, str]],
     parallel_nodes: Collection[str],
 ) -> dict[str, RebuildPolicy]:
-    """The policies whose rebuild this worker runs: it runs the node in the policy's walk and in every walk its
-    loop grows the KV in. A disaggregated decode node can't run the prefill walk its rebuild needs.
+    """The policies whose rebuild this worker runs, each with the walks this worker runs its node in: it runs the
+    node in every walk its loop grows the KV in, and in one of the policy's walks. A disaggregated decode node can't
+    run the prefill walk its rebuild needs.
 
-    Each keeps the copied walks this worker runs the node in. Above one rank it keeps none, since rank 0 decides
-    a drop from its own host copies, and a follower's may not have landed.
+    Above one rank a policy keeps only the walks with nothing to copy, since rank 0 decides a drop from its own host
+    copies, and a follower's may not have landed.
     """
     here = {}
     for node, policy in policies.items():
-        if all((node, walk) in my_walks for walk in {policy.walk, *policy.loop_walks(node, graphs)}):
-            here[node] = replace(policy, copied_inputs={} if node in parallel_nodes else {
-                walk: names for walk, names in policy.copied_inputs.items() if (node, walk) in my_walks
-            })
+        copied = policy.check(node, graphs)
+        walks = frozenset(
+            walk for walk in policy.walks
+            if (node, walk) in my_walks and not (copied[walk] and node in parallel_nodes)
+        )
+        if walks and all((node, walk) in my_walks for walk in policy.loop_walks(node, graphs)):
+            here[node] = replace(policy, walks=walks)
     return here
 
 
@@ -155,8 +159,8 @@ class Rebuilds:
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
         pool: HostPool | None = None, side_stream: Callable[[], torch.Stream | None] = lambda: None,
     ) -> None:
-        for node, policy in policies.items():
-            policy.check(node, graphs)
+        # node -> walk -> what the node reads there besides the ids, which the worker copies to the host
+        self._copied = {node: policy.check(node, graphs) for node, policy in policies.items()}
         self._policies = dict(policies)
         self._side_stream = side_stream
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
@@ -180,12 +184,12 @@ class Rebuilds:
 
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
-        and its loop grows labels one rebuild row can lay out again, written in a walk the policy prefills."""
+        and its loop grows labels one rebuild row can lay out again, written in one of the policy's walks."""
         policy, layouts = self._policies.get(node), list(layouts)
         return (
             policy is not None and rebuild_refusal(layouts) is None
             and all(loop == policy.loop for layout in layouts for loop, _ in layout.growth)
-            and all(span.walk in policy.prefill_walks for layout in layouts for span in layout.spans)
+            and all(span.walk in policy.walks for layout in layouts for span in layout.spans)
         )
 
     def ingest_request(
@@ -218,65 +222,64 @@ class Rebuilds:
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in a walk
-        the policy prefills, a drop here can free its request's pages, and the request keeps no ids yet. A row the
-        pool can't hold keeps none. A row of a copied walk gets its host copies once its step has run
-        (`keep_copies`)."""
+        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in one of
+        the policy's walks, a drop here can free its request's pages, and the request keeps no ids yet. A row the
+        pool can't hold keeps none. A row of a walk that reads more than the ids gets its host copies once its step
+        has run (`keep_copies`)."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
             return
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
-        if walk not in policy.prefill_walks and policy.prefill_walks.isdisjoint(walks.values()):
+        if walk not in policy.walks and policy.walks.isdisjoint(walks.values()):
             return
         kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
         for rid, row in node_batch.per_request_input_tensors.items():
             row_walk = walks.get(rid, walk)
             # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or rid not in droppable or row_walk not in policy.prefill_walks:
+            if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
             prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
             copy = self._pool.copy_out(prompt, node_batch.completion_event, torch.int32)
             if copy is not None:
                 kept[rid] = KeptIds(
-                    copy, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                    HostCopies(row_walk) if row_walk in policy.copied_inputs else None,
+                    copy, row_walk, prompt.dtype, array("i"), tuple(map(len, tensors)) if len(tensors) > 1 else None,
+                    HostCopies() if self._copied[node_batch.node_name][row_walk] else None,
                 )
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
         """Copy to the host what each row of a copied walk read besides its ids, as the step received it, and
         its step metadata. The host has waited on the step, so the copies need no wait."""
         node = node_batch.node_name
-        policy, kept_ids = self._policies.get(node), self._kept.get(node)
-        if policy is None or not policy.copied_inputs or not kept_ids:
+        copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
+        walks = {walk for walk, names in copied.items() if names}
+        if not walks or not kept_ids:
             return
         # a step of no copied walk, such as every decode step, has no row to copy
-        ctx, walks = node_batch.step_context, policy.copied_inputs.keys()
+        ctx = node_batch.step_context
         if ctx.graph_walk not in walks and walks.isdisjoint(ctx.request_walks.values()):
             return
         rows = []
         for rid in node_batch.request_ids:
             kept = kept_ids.get(rid)
-            copies = None if kept is None else kept.copies
             # the prefill row of a request whose copies aren't taken yet
             if (
-                copies is not None and copies.inputs is None
-                and node_batch.per_request_info[rid].graph_walk == copies.walk
+                kept is not None and kept.copies is not None and kept.copies.inputs is None
+                and node_batch.per_request_info[rid].graph_walk == kept.walk
             ):
-                rows.append((rid, copies))
+                rows.append((rid, kept))
         if not rows:
             return
         stream = self._side_stream()
-        for rid, copies in rows:
+        for rid, kept in rows:
             inputs = node_batch.per_request_input_tensors[rid]
-            names = policy.copied_inputs[copies.walk]
-            copies.inputs = {name: [_to_host(tensor, stream) for tensor in inputs[name]] for name in names}
-            copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
+            kept.copies.inputs = {name: [_to_host(t, stream) for t in inputs[name]] for name in copied[kept.walk]}
+            kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
         if stream is not None:
             landed = torch.Event(device=stream.device)
             landed.record(stream)
-            for _, copies in rows:
-                copies.landed = landed
+            for _, kept in rows:
+                kept.copies.landed = landed
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -357,9 +360,9 @@ class Rebuilds:
         kept = self._kept[node][rid]
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        cursor = RebuildCursor(self._policies[node].walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths)
+        cursor = RebuildCursor(kept.walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths)
         if kept.copies is not None:
-            cursor.walk, cursor.step_metadata = kept.copies.walk, kept.copies.step_metadata
+            cursor.step_metadata = kept.copies.step_metadata
             cursor.copied = kept.copies.to_device(self._pool.device, self._side_stream())
         self._cursors[(node, rid)] = cursor
         return Rebuild(cursor.walk, ids)
