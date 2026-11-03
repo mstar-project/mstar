@@ -1047,6 +1047,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1293,12 +1294,20 @@ class APIServer:
                 if next_expiry is not None:
                     wait_s = min(wait_s, next_expiry - time.time())
                 self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
                 # the next pass goes after the back-off, without a wait: the
-                # prune may not have run
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its

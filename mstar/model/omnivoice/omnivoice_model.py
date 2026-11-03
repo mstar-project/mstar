@@ -105,6 +105,18 @@ def output_shaping(kwargs: dict) -> dict:
 UNMASK_KNOBS = ("guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature", "class_temperature")
 
 
+def requested_num_step(kwargs: dict, defaults) -> int:
+    """The request's ``num_step``, unclamped. ``process_prompt`` reads it too,
+    so a value that is not an integer fails the request before it generates."""
+    value = kwargs.get("num_step", defaults.num_step)
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"num_step must be an integer, not {value!r}") from None
+
+
 def unmask_knobs(kwargs: dict, defaults) -> dict[str, float]:
     """The request's ``UNMASK_KNOBS`` over the checkpoint's ``defaults``.
     ``process_prompt`` reads them too, so a value that is not a finite number
@@ -380,6 +392,7 @@ class OmniVoiceModel(Model):
         if set(output_modalities) != {"audio"}:
             raise ValueError("OmniVoice generates audio only")
         output_shaping(kwargs)
+        requested_num_step(kwargs, self.config.generation)
         unmask_knobs(kwargs, self.config.generation)
 
         self._ensure_data_worker_assets()
@@ -555,7 +568,7 @@ class OmniVoiceModel(Model):
         )
 
         defaults = self.config.generation
-        requested_steps = int(model_kwargs.get("num_step", defaults.num_step))
+        requested_steps = requested_num_step(model_kwargs, defaults)
         num_step = max(1, min(requested_steps, defaults.max_num_step))
         if num_step != requested_steps:
             logger.info(

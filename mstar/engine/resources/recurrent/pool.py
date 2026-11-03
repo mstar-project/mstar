@@ -383,10 +383,13 @@ class RecurrentStatePool(Resource):
             self._version += 1
 
     def _zero_slot(self, index: int) -> None:
-        # One launch per dtype rather than per block, over views built once
-        # per slot: a Qwen3-TTS codec stream's state is 38 blocks, and
-        # zeroing them one by one cost ~0.25 ms of the main thread per
-        # teardown (the fused zero only takes a list of one dtype).
+        # One _foreach_zero_ call per dtype rather than a Python zero_ per
+        # block, over views built once per slot: a Qwen3-TTS codec stream's
+        # state is 38 blocks, and zeroing them one by one cost ~0.25 ms of the
+        # main thread per teardown. The fused kernel takes only dense views of
+        # one dtype; a block of more than one layer (GDN's conv and ssm) gives
+        # a strided ``[:, index]`` view, which still launches once per block,
+        # just from C++.
         groups = self._slot_views.get(index)
         if groups is None:
             by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}

@@ -148,6 +148,8 @@ def test_a_clients_value_for_a_model_internal_key_never_reaches_the_model_or_con
     # a non-finite unmask knob
     ({"position_temperature": float("inf")}, "position_temperature"),
     ({"layer_penalty_factor": "steep"}, "layer_penalty_factor"),
+    # parsed at the conductor, where the raise hangs the client
+    ({"num_step": "many"}, "num_step"),
 ])
 def test_omnivoice_refuses_a_bad_request_value_before_it_generates(kwargs, field):
     """``postprocess`` shapes the waveform after the whole unmask loop, which

@@ -30,6 +30,7 @@ from torch import nn
 
 from mstar.model.components.audio_features import sinusoid_positions
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.utils.h2d import to_device_nonblocking
 
 
 @dataclass
@@ -302,9 +303,7 @@ class AuTEncoder(nn.Module):
         x = x + self.positional_embedding[:t].to(x.dtype)
         # each real chunk's leading valid rows, as flat indices into (chunk, row)
         keep = (torch.arange(t) < torch.tensor(valid).unsqueeze(1)).flatten().nonzero().squeeze(1)
-        if x.is_cuda:
-            keep = keep.pin_memory()
-        return x.reshape(b * t, -1).index_select(0, keep.to(x.device, non_blocking=True))
+        return x.reshape(b * t, -1).index_select(0, to_device_nonblocking(keep, x.device))
 
     def encode(self, hidden_states: torch.Tensor, cu_seqlens) -> torch.Tensor:
         """The transformer stack and projector over a packed sequence:
