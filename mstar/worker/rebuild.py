@@ -39,8 +39,9 @@ class KeptIds:
 
 @dataclass(slots=True)
 class RebuildCursor:
-    """A rebuild under way: the policy's walk, the ids it writes but the last, which the next decode step reads,
-    the dtype the walk reads them in, and the end of its chunks that have landed, 0 before the first."""
+    """A rebuild under way: the policy's walk, the request's kept ids, the dtype the walk reads them in, and the
+    end of its chunks that have landed, 0 before the first. It writes every id but the last (``total``), which
+    the next decode step reads."""
     walk: str
     ids: array
     dtype: torch.dtype
@@ -165,8 +166,6 @@ class Rebuilds:
             return f"it keeps no ids on {node}"
         if not kept.prompt.has_landed():
             return "its ids haven't reached the host"
-        if (node, rid) in self._cursors:
-            return "its rebuild is in progress"
         if walk not in self._loop_walks[node]:
             return f"it is in walk {walk!r}, where loop {policy.loop!r} doesn't run {node}"
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:

@@ -1687,7 +1687,7 @@ class MicroScheduler:
 
     def _waiting_rebuilds(self) -> Iterator[tuple[str, int, RebuildCursor]]:
         """(node, rid, cursor) of each rebuild whose next chunk could run now: its request isn't held, failed,
-        being removed, or in a step in flight, which offers its next chunk itself."""
+        being removed, or in a step in flight."""
         now = time.monotonic()
         held, removing, failed, in_flight = self.held_until, self.pending_removes, self.failed_rids, self.in_flight_rids
         for (node, rid), cursor in self.rebuilds.cursors():
@@ -2080,7 +2080,8 @@ class MicroScheduler:
             scan_exclude = exclude_target
         if self._backlog_has_schedulable(exclude_target, exclude_walk):
             return True
-        # as for the backlog: the chain takes its own walk's rebuilds, or under a mix its key's
+        # A waiting rebuild yields the step unless the chain takes it: one of the chain's own walk, or under a mix
+        # one of its key.
         if any(
             self._key(node, cursor.walk) != exclude_target or exclude_walk not in (None, cursor.walk)
             for node, _, cursor in self._waiting_rebuilds()

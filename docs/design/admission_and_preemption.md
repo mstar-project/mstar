@@ -235,7 +235,7 @@ No field holds the state: residency, the host pool, the queue and the log's rebu
 
 Lifecycle:
 
-- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and its log refuses a second drop.
+- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then.
 - Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check

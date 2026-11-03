@@ -3375,8 +3375,11 @@ class KVManager(AttentionResource):
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
                 "would leave them holding different pages"
             )
-        if self.is_offloaded(rid):
+        residency = self.residency(rid)
+        if residency is Residency.ON_HOST:
             return f"KV {self.name}: {rid} has a host copy, which a drop would leave behind"
+        if residency is Residency.DROPPED:
+            return f"KV {self.name}: {rid} is dropped already, and its rebuild hasn't landed"
         with self._lock:
             if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
                 return f"KV {self.name}: {rid} has a step or a read in flight on its pages"

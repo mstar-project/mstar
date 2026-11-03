@@ -125,6 +125,17 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
+def test_a_second_drop_before_the_rebuild_lands_is_refused():
+    kv = _manager()
+    _prefill(kv, "r", PAGE_SIZE, kind="ids")
+    kv.drop("r")
+    held = kv._dropped["r"]
+
+    with pytest.raises(RuntimeError):
+        kv.drop("r")
+    assert kv._dropped["r"] == held, "a second drop would overwrite what the rebuild has to write again"
+
+
 @pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
 def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
     kv = _manager()

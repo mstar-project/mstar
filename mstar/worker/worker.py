@@ -1993,8 +1993,7 @@ class Worker:
                 engine.release_chunk_inputs(rid, batch.node_name)
 
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
-        """Return a whole batch's nodes to the ready set (admit refusal, OOM). Its rebuild rows have no
-        node there, and the log offers them again once the step is no longer in flight."""
+        """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
         rows = batch.graph_rows()
         self._graph_runtime.push_back_node(batch.node_name, list(rows), list(rows.values()))
 
@@ -2886,7 +2885,6 @@ class Worker:
         # completion per rid.
         groups = batch.rids_by_walk()
         if batch.rebuild_rids:
-            # but the rebuild rows, which the runtime holds no node of
             rebuild = batch.rebuild_rids
             groups = {walk: kept for walk, rids in groups.items() if (kept := [r for r in rids if r not in rebuild])}
             if not groups:
@@ -3493,8 +3491,7 @@ class Worker:
     @staticmethod
     def _wg_ids_of(batch: ScheduledBatch) -> list[int]:
         """``set_in_flight``'s worker graphs: one id for a step of one walk
-        (a node in a walk lives in one worker graph), else one per rid the
-        runtime holds."""
+        (a node in a walk lives in one worker graph), else one per rid."""
         rid_to_wg = batch.graph_rows()
         if batch.request_walks or not rid_to_wg:
             return list(rid_to_wg.values())
@@ -3750,8 +3747,8 @@ class Worker:
         _pp_stage("after_output_copy")
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it, since the graph runtime holds none of them, and advance their
-        rebuilds. A rebuild's last chunk lands it and lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
+        lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:

@@ -120,13 +120,11 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     assert landed == [R], "the rebuilt request would never be ready to decode again"
 
 
-@pytest.mark.parametrize("why", ["no ids", "backlog", "rebuilding", "prefill walk", "samples short"])
+@pytest.mark.parametrize("why", ["no ids", "backlog", "prefill walk", "samples short"])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
     w._rebuilds._kept[NODE].update({} if why == "no ids" else {R: _kept(5)})
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
-    if why == "rebuilding":
-        w._rebuilds.start(R, NODE)
     w.infos[R].graph_walk = PREFILL if why == "prefill walk" else DECODE
     w.infos[R].dynamic_loop_iter_counts["loop"] = 1 if why == "samples short" else 0
 
