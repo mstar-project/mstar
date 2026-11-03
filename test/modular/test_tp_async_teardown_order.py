@@ -265,6 +265,31 @@ def test_rank_0_tears_down_after_admitting_the_step_its_stamp_names(monkeypatch)
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
 
 
+def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
+    """A refused step can leave rank 0's journal holding a victim's drop when "idle" is removed. Each follower
+    replays the drop with the next step and tears "idle" down after the step the removal is stamped with, so rank 0
+    holds the removal until N goes out with the drop, and sends no step of moves alone ahead of N."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[[RemoveRequest(request_id="idle")]])
+    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
+    w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
+    owed = {NODE}
+    w._tp_followers = {NODE: ["rank1"]}
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
+    w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])
+    broadcast = w.maybe_send_zmq_to_tp_followers
+
+    def _logged(node_batch, **kwargs):
+        owed.clear()
+        log.append(("broadcast", broadcast(node_batch, **kwargs), len(node_batch.request_ids)))
+        return log[-1][1]
+
+    w.maybe_send_zmq_to_tp_followers = _logged
+    _run(w)
+
+    assert log.index(("broadcast", 0, len(STEP_N))) < log.index(("teardown", "idle")), log
+    assert ("forward", "idle", 0) in log, log
+
+
 def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
     """Here before this rank has even popped N+1: held until it has, then torn down behind
     the admit fence of the next pass."""
