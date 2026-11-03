@@ -58,6 +58,7 @@ from mstar.model.higgs_audio.config import (
     SAMPLER,
     HiggsAudioModelConfig,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
@@ -190,6 +191,14 @@ class HiggsAudioModel(Model):
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
         )}}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # One step prefills the text around the audio and the audio. Its rebuild reads the text before the audio and
+        # the encoder's output from host copies, and the samples follow the text after it.
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({"prefill_audio"}), ids_input="text_post", sample_output="new_token", loop="decode_loop",
+            copy_bytes_per_slot={"prefill_audio": 2 * self.config.hidden_size},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [
