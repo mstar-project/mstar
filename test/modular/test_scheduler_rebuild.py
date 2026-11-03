@@ -1,7 +1,8 @@
 """A rebuild runs as rows mid-prefill that the worker's log holds, offered where a chunk in flight is.
 
-Readiness answers a dropped request with a rebuild. The scheduler parks the request's decode row, as it parks a
-row waiting for capacity, and opens the rebuild in the log. From then on the log offers the rebuild's next chunk
+Readiness answers a dropped request with a rebuild. The scheduler opens the rebuild in the log, and the request's
+decode row waits until the log lands it, even if the request is let back in for room meanwhile. From then on the
+log offers the rebuild's next chunk
 the way the scheduler offers a speculation's chunk in flight, so the walk's caps, token budget and pick treat it
 as a prompt mid-prefill. Nothing popped it, so nothing pushes it back or parks it in a backlog, and a chunk in
 flight is offered again only as its step's continuation.
@@ -83,7 +84,7 @@ def _rebuilding(sched, rid=R, total=20, done=0):
     sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(PREFILL, array("i", range(total + 1)), torch.int64, done)
 
 
-def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
+def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
     sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
     prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
     sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 12), prompt, None), torch.int64, array("i", [4]))
@@ -93,15 +94,15 @@ def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
 
     assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
-    assert engine.asked.count("d0") == 1, "a parked decode row asks the engine on every pass"
+    assert engine.asked.count("d0") == 1, "a waiting decode row asks the engine on every pass"
 
 
-def test_a_parked_decode_row_runs_once_its_rebuild_lands():
+def test_a_decode_row_runs_once_its_rebuild_lands():
     sched, runtime, state, engine = _scheduler({"d0": DECODE})
-    sched.parked[NODE] = {"d0"}
+    _rebuilding(sched, "d0")
 
-    assert sched.get_next_batch(state) is None and not engine.asked
-    sched.note_rebuilt(NODE, "d0")
+    assert sched.get_next_batch(state).rebuild_rids == {"d0"} and not engine.asked
+    sched.rebuilds.land_chunk("d0", NODE, None)
 
     assert _rids(sched.get_next_batch(state)) == ["d0"], "the rebuilt request would never decode again"
 

@@ -3835,7 +3835,6 @@ class Worker:
             for rid in landed:
                 engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
-                self.scheduler.note_rebuilt(node, rid)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)
