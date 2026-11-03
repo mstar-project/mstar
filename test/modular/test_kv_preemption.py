@@ -20,6 +20,8 @@ import test_kv_host_index as host
 from test_kv_admission import _remove, _runner
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.engine import Engine
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
@@ -122,6 +124,19 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
     _runner(kv).readmit("b", NODE)
 
     assert "b" in kv._allotments and not _ready(kv, "c"), "c passed the request dropped ahead of it"
+
+
+def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
+    kv = _pool()
+    engine = Engine.__new__(Engine)
+    engine._runner, engine._submodules = _runner(kv), {}
+    # a's second partition sends it again
+    for rid, arrival in (("v", 2), ("r", 0), ("a", 1), ("x", None), ("a", 1)):
+        info = CurrentForwardPassInfo(rid, WALK, 0, 0, 1, arrival=arrival)
+        Engine.add_request(engine, rid, {"kv": KVReqConfig()}, info)
+
+    assert engine.newer_than("x") is None, "a request the conductor gave no number was offered victims"
+    assert engine.newer_than("r") == ["v", "a"], "the requests after r aren't listed newest first"
 
 
 def _short(kv, rid: str) -> int:
