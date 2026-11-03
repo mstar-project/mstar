@@ -36,7 +36,7 @@ from mstar.utils.ipc_format import (
     ScheduleTPNode,
 )
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -736,10 +736,7 @@ class _Rank:
 
 
 def _oom(rank, referenced_rids=frozenset()):
-    batch = SimpleNamespace(
-        node_name="node", graph_walk="walk",
-        request_to_worker_graph={"r0": "wg", "r1": "wg"},
-    )
+    batch = ScheduledBatch(node_name="node", graph_walk="walk", request_to_worker_graph={"r0": "wg", "r1": "wg"})
     node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 

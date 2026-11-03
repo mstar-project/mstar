@@ -631,7 +631,7 @@ def test_engine_stop_check_takes_the_batched_path():
     failures = {}
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
-        register_failure=failures.setdefault, step_context=SimpleNamespace(rebuild_rids=frozenset()),
+        register_failure=failures.setdefault,
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([EOT, 1234, 0])  # a padding row past the real ones
@@ -667,7 +667,7 @@ def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
     failures = {}
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
-        register_failure=failures.setdefault, step_context=SimpleNamespace(rebuild_rids=frozenset()),
+        register_failure=failures.setdefault,
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([1234, 99])

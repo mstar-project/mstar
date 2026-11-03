@@ -1,16 +1,18 @@
 """What a worker keeps so a request dropped from a node's KV can be rebuilt there, as the node's
-`RebuildPolicy` declares."""
+`RebuildPolicy` declares, and how far each rebuild has run."""
 
 from __future__ import annotations
 
 from array import array
-from collections.abc import Collection, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from collections.abc import Collection, ItemsView, Mapping, MutableMapping
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
@@ -35,17 +37,23 @@ class KeptIds:
     sampled: array
 
 
-class RebuildRow(NamedTuple):
-    """A row of the policy's walk that recomputes a dropped request's KV. Its input is the request's kept
-    ids without the last one."""
-    node: str
+@dataclass(slots=True)
+class RebuildCursor:
+    """A rebuild under way: the policy's walk, the ids it writes but the last, which the next decode step reads,
+    the dtype the walk reads them in, and the end of its chunks that have landed, 0 before the first."""
     walk: str
-    inputs: NameToTensorList
+    ids: array
+    dtype: torch.dtype
+    done: int = 0
+
+    @property
+    def total(self) -> int:
+        return len(self.ids) - 1
 
 
 class Rebuilds:
     """The kept ids of each request on the nodes that declare a `RebuildPolicy`, checked against the
-    graph when the worker starts."""
+    graph when the worker starts, and the rebuilds under way."""
 
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
@@ -60,6 +68,8 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
+        # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
+        self._cursors: dict[tuple[str, int], RebuildCursor] = {}
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
         """Copy the prompt of each row of the policy's walk whose request keeps no ids yet to the host, once
@@ -136,24 +146,65 @@ class Rebuilds:
             return f"it keeps no ids on {node}"
         if not kept.prompt.has_landed():
             return "its ids haven't reached the host"
+        if (node, rid) in self._cursors:
+            return "its rebuild is in progress"
         if walk not in self._loop_walks[node]:
             return f"it is in walk {walk!r}, where loop {policy.loop!r} doesn't run {node}"
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def rebuild(self, rid: int, node: str) -> tuple[Rebuild, RebuildRow]:
-        """What ``rid``'s rebuild row on ``node`` writes, and the row."""
-        policy = self._policies[node]
-        kept = self._kept[node][rid]
+    def start(self, rid: int, node: str) -> Rebuild:
+        """Open ``rid``'s rebuild on ``node``, and return what it writes."""
+        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        kept, walk = self._kept[node][rid], self._policies[node].walk
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(kept.dtype)
-        row = RebuildRow(node, policy.walk, {policy.ids_input: [to_device_nonblocking(tokens, self._pool.device)]})
-        return Rebuild(policy.walk, ids), row
+        self._cursors[(node, rid)] = RebuildCursor(walk, ids, kept.dtype)
+        return Rebuild(walk, ids)
+
+    def rebuilding(self, rid: int, node: str) -> bool:
+        return (node, rid) in self._cursors
+
+    def cursors(self) -> ItemsView[tuple[str, int], RebuildCursor]:
+        return self._cursors.items()
+
+    def host_inputs(self, rid: int, node: str) -> NameToTensorList:
+        """The input of ``rid``'s rebuild row on the host, which its length is measured from."""
+        return {self._policies[node].ids_input: [_row_ids(self._cursors[(node, rid)])]}
+
+    def fill(
+        self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
+        inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
+    ) -> None:
+        """Give each rebuild row of ``rids`` the policy's walk, and its ids on the device when it runs its first
+        chunk or runs whole. A later chunk is cut from the input the engine prepared on the first."""
+        ids_input = self._policies[node].ids_input
+        for rid in rids:
+            cursor = self._cursors[(node, rid)]
+            infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
+            chunk = chunk_ranges.get(rid)
+            if chunk is None or chunk.is_first:
+                ids = _row_ids(cursor).to(cursor.dtype)
+                inputs[rid] = {ids_input: [to_device_nonblocking(ids, self._pool.device)]}
+
+    def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> bool:
+        """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return whether
+        the rebuild has finished."""
+        cursor = self._cursors[(node, rid)]
+        cursor.done = cursor.total if chunk is None else chunk.end
+        if cursor.done < cursor.total:
+            return False
+        del self._cursors[(node, rid)]
+        return True
 
     def remove_request(self, rid: int) -> None:
-        for kept in self._kept.values():
+        for node, kept in self._kept.items():
             ids = kept.pop(rid, None)
             if ids is not None:
                 self._pool.give(ids.prompt.slice)
+            self._cursors.pop((node, rid), None)
+
+
+def _row_ids(cursor: RebuildCursor) -> torch.Tensor:
+    return torch.frombuffer(cursor.ids, dtype=torch.int32)[:-1]

@@ -460,7 +460,7 @@ def test_engine_stop_check_takes_the_batched_path():
     failures = {}
     batch = SimpleNamespace(
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
-        register_failure=failures.setdefault, step_context=SimpleNamespace(rebuild_rids=frozenset()),
+        register_failure=failures.setdefault,
     )
     engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])

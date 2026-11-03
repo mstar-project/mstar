@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.runtime.base import SpeculationOutput  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 
@@ -37,7 +38,7 @@ def _scheduler():
     """The real ``label_for`` over an empty combined-walk map: these batches
     are uniform, so it labels each with its own walk and carries no
     per-row walks."""
-    scheduler = SimpleNamespace(combined_walk_of={})
+    scheduler = SimpleNamespace(combined_walk_of={}, rebuilds=Rebuilds({}, {}))
     for name in ("label_for", "_key"):
         setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
     return scheduler

@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import Engine
 from mstar.engine.resources.base import EngineResourceInfo, Rebuild, Residency
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
@@ -33,7 +33,6 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.base import LabelLayout, Span
-from mstar.model.submodule_base import HostRows
 
 PAGE_SIZE = 16
 WALK = "prefill"
@@ -225,24 +224,6 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     assert (rebuilt.chain.keys, rebuilt.chain.unkeyed) == (want.chain.keys, want.chain.unkeyed), (
         "the rebuilt pages would be filed under keys another request with these ids can't match"
     )
-
-
-def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():
-    kv = _manager()
-    kv.ingest_request("r", _config(list(range(20)), cap=50))
-    kv.ingest_request("a", _config(list(range(50, 70)), cap=50))
-    _write(kv, "r", 20, 1)
-    kv.drop("r")
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(20), 100, 101])))
-    ctx = StepContext(request_ids=("r", "a"), graph_walk=WALK, slot=0, capture=False, rebuild_rids=frozenset({"r"}))
-    batch = ExecutingBatch(node_name=NODE, per_request_info={}, step_context=ctx)
-
-    rows = HostRows(("r", "a"), {"text_inputs": torch.tensor([[7], [8]])})
-    Engine.extend_prefix_chains(SimpleNamespace(_runner=StepRunner({"kv": kv})), batch, {}, host_rows=rows)
-    kv.flush_chain_backlog()
-
-    assert kv._streams["r"]["main"].chain.unkeyed == [16, 17, 18, 19, 100, 101], "it would key a discarded sample"
-    assert kv._streams["a"]["main"].chain.covered_len == 21, "the other row's sample went unkeyed"
 
 
 def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pages():

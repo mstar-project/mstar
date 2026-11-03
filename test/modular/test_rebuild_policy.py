@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
@@ -169,11 +170,13 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     rebuilds = _rebuilds()
     rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
 
-    rebuild, row = rebuilds.rebuild(R, NODE)
+    rebuild = rebuilds.start(R, NODE)
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
+    rebuilds.fill(NODE, {R}, {}, inputs, infos)
 
     assert rebuild == Rebuild(PREFILL, array("i", [1, 2, 3, 4, 5])), "the KV would lay out other ids"
-    assert (row.node, row.walk) == (NODE, PREFILL) and list(row.inputs) == ["text_inputs"]
-    [tokens] = row.inputs["text_inputs"]
+    assert infos[R].graph_walk == PREFILL and list(inputs[R]) == ["text_inputs"]
+    [tokens] = inputs[R]["text_inputs"]
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
 
 

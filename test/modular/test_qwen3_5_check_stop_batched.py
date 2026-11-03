@@ -96,7 +96,6 @@ def test_engine_falls_back_and_attributes_failures():
         # what both stop paths read: the iteration counts current for this batch
         per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(rebuild_rids=frozenset()),
     )
     sub = SimpleNamespace(
         check_stop_batched=lambda *a: LLMSubmodule.check_stop_batched(_sub(), *a),

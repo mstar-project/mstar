@@ -17,7 +17,7 @@ from mstar.utils.ipc_format import (
     TensorReceived,
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
-from mstar.worker.rebuild import RebuildRow, Rebuilds
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -172,7 +172,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._rebuilds = Rebuilds({}, {})
     w._rebuilds._kept = {"n": {a: None, b: None}}
-    w.scheduler.queue_rebuild(a, RebuildRow("n", "prefill", {}))
+    w._rebuilds._cursors[("n", a)] = None
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -190,7 +190,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
-    assert not w.scheduler.rebuilds, "the next request would run this one's rebuild row"
+    assert not w._rebuilds._cursors, "the next request would run this one's rebuild"
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a

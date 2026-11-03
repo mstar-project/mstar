@@ -8,7 +8,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -49,6 +49,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
+    FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
 )
@@ -316,14 +317,6 @@ class ForwardPassInfoWrapper:
         if name == "dynamic_loop_iter_counts":
             return self.metadata.dynamic_loop_iter_counts
         return getattr(self.info, name)
-
-
-def _runtime_rids(batch: "ExecutingBatch") -> Sequence[int]:
-    """``batch.request_ids`` without the rebuild rows."""
-    rebuild = batch.step_context.rebuild_rids
-    if not rebuild:
-        return batch.request_ids
-    return [rid for rid in batch.request_ids if rid not in rebuild]
 
 
 @dataclass
@@ -1267,7 +1260,9 @@ class Engine:
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
         steps = self._loopback_steps
-        rids = _runtime_rids(batch)
+        # a rebuild row leaves its request's entry for the decode step it resumes
+        rebuild = batch.step_context.rebuild_rids
+        rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
         if batch.rows_only:
             steps.update(dict.fromkeys(
                 rids, (batch.node_name, batch.step_context.graph_walk),
@@ -1401,7 +1396,7 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
-        rids = _runtime_rids(batch)
+        rids = batch.request_ids
         if skip_rids:
             rids = [rid for rid in rids if rid not in skip_rids]
             if not rids:
@@ -2233,11 +2228,10 @@ class Engine:
         on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
-        rids = _runtime_rids(batch)
         if host_rows is not None:
             try:
                 batched = submodule.check_stop_batched(
-                    rids, batch.per_request_info_wrapped, host_rows,
+                    batch.request_ids, batch.per_request_info_wrapped, host_rows,
                 )
             except Exception:
                 logger.debug(
@@ -2253,7 +2247,7 @@ class Engine:
                 return batched
         stops: dict[str, set[str]] = {}
         withheld: dict[str, tuple[str, ...]] = {}
-        for rid in rids:
+        for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
                 continue
@@ -2771,10 +2765,10 @@ class Engine:
 
         An offloaded request is brought back first; it stays not-ready until
         that fits, which is the scheduler's cue to run something else (and,
-        on OOM, to evict). A dropped request stays not-ready until its
-        rebuild lands. Then each resource takes in whatever the request
-        published elsewhere — a KV transfer from a prefill worker, say — and
-        reports whether that has landed.
+        on OOM, to evict). A dropped request is not ready: the caller
+        rebuilds it from its token ids. Then each resource takes in whatever
+        the request published elsewhere — a KV transfer from a prefill worker,
+        say — and reports whether that has landed.
 
         The outcome, not a bool: a resource can report the request
         unservable (``AdmitRuntimeError``), and the caller has to fail it
@@ -2782,7 +2776,7 @@ class Engine:
         """
         residency = self.residency(node_name, request_id)
         if residency is Residency.DROPPED:
-            return FULL_ADMIT_NOT_READY
+            return FULL_ADMIT_REBUILD if allow_reload else FULL_ADMIT_NOT_READY
         if residency is Residency.ON_HOST:
             if not allow_reload:
                 return FULL_ADMIT_NOT_READY
