@@ -21,6 +21,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
 from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
@@ -336,6 +337,49 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
 
+def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
+    """The image copies queued every input of every prefill row at once, behind which the next step's output copy
+    waited on the device's one copy engine. They share the allowance #876's page writes keep to, and go first."""
+    allowance = StepAllowance(24)
+    rebuilds = _copying(R)
+    rebuilds._allowance = allowance
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.arange(8, dtype=torch.float32)]
+
+    rebuilds.keep_copies(step)
+    rebuilds.flush()
+
+    assert allowance.left == 0, "the step's copies would run past its allowance"
+    assert not rebuilds._kept[NODE][R].copies.ready(), "the request could be dropped with part of its image copied"
+    allowance.refill()
+    rebuilds.flush()
+    copies = rebuilds._kept[NODE][R].copies
+    assert copies.ready() and copies.inputs["embeds"][0].tolist() == list(range(8)), "the split copy lost bytes"
+    assert allowance.left == 24 - 8, "the cached pages' writes would get less than the copies left them"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_media_copy_split_across_two_steps_lands_whole():
+    pool = HostPool(1 << 22, torch.device("cuda"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance=(allowance := StepAllowance(1 << 20)))
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1]), pool.take(1 << 21)
+    embeds = torch.arange(3 << 17, dtype=torch.float32, device="cuda")
+    step_done = torch.Event(device="cuda")
+    step_done.record()
+    step = _vision_step((R,), {}, completion_event=step_done)
+    step.per_request_input_tensors[R]["embeds"] = [embeds]
+
+    rebuilds.keep_copies(step)
+    rebuilds.flush()
+    allowance.refill()
+    rebuilds.flush()
+    del step
+    torch.cuda.synchronize()
+
+    copies = rebuilds._kept[NODE][R].copies
+    assert copies.ready() and torch.equal(copies.inputs["embeds"][0], embeds.cpu()), "the second half never landed"
+
+
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
@@ -367,7 +411,9 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     with side:
         # a cached block for the copy back, since allocating a block waits for the device
         torch.full((rows,), -1.0, device="cuda")
-    step = _vision_step((R,), {})
+    step_done = torch.Event(device="cuda")
+    step_done.record()
+    step = _vision_step((R,), {}, completion_event=step_done)
     step.per_request_input_tensors[R]["embeds"] = [embeds]
     # a busy side stream keeps the copy queued past the point where the worker lets go of the step's tensors
     with side:
