@@ -1,8 +1,12 @@
-"""V-JEPA 2 video preprocessing on synthetic frames (CPU).
+"""V-JEPA 2 video preprocessing on synthetic uint8 frames (CPU).
 
-The AC model takes the official repo's central square crop; the HF-checkpoint
-model keeps HF's resize-and-crop, which sees less of a non-square frame.
+The HF checkpoints' frames go through their own video processor; the AC model
+takes the official repo's central square crop, which sees more of a non-square
+frame than the processor's resize and crop.
 """
+
+import sys
+import types
 
 import pytest
 import torch
@@ -10,38 +14,118 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import TensorPointerInfo
 from mstar.model.vjepa2.submodules import VJepa2EncoderSubmodule
-from mstar.model.vjepa2.vjepa2_model import _IMAGENET_MEAN, _IMAGENET_STD, VJepa2ACModel, _preprocess_video
+from mstar.model.vjepa2.vjepa2_model import (
+    _IMAGENET_MEAN,
+    _IMAGENET_STD,
+    VJepa2ACModel,
+    VJepa2Model,
+    _central_square,
+)
 
 _MEAN = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
 _STD = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
 
 
 def _frames(h: int, w: int, t: int = 2) -> torch.Tensor:
-    """[T, 3, H, W] in [0, 1]: grey, with the central square's border rows and columns marked."""
-    frames = torch.full((t, 3, h, w), 0.5)
+    """uint8 [T, 3, H, W]: grey, with the central square's border rows and columns marked."""
+    frames = torch.full((t, 3, h, w), 128, dtype=torch.uint8)
     side = min(h, w)
     top, left = (h - side) // 2, (w - side) // 2
-    frames[:, :, top, left : left + side] = 0.0
-    frames[:, :, top + side - 1, left : left + side] = 1.0
-    frames[:, :, top : top + side, left] = 0.25
-    frames[:, :, top : top + side, left + side - 1] = 0.75
+    frames[:, :, top, left : left + side] = 0
+    frames[:, :, top + side - 1, left : left + side] = 255
+    frames[:, :, top : top + side, left] = 64
+    frames[:, :, top : top + side, left + side - 1] = 191
     return frames
 
 
+def _clip(t: int, h: int, w: int) -> torch.Tensor:
+    """uint8 [T, 3, H, W]: smooth gradients plus noise."""
+    g = torch.Generator().manual_seed(h * w)
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, h), torch.linspace(0, 1, w), indexing="ij")
+    base = torch.stack([yy, xx, (yy + xx) / 2]) * 200 + 20
+    return (base + torch.randn(t, 3, h, w, generator=g) * 20).clamp(0, 255).round().to(torch.uint8)
+
+
 def _pixels(out: torch.Tensor) -> torch.Tensor:
+    """Normalized frames back in [0, 1]."""
     return out * _STD + _MEAN
+
+
+@pytest.fixture
+def hf_model(tmp_path):
+    """The HF-checkpoint model, with its processor read from a checkpoint
+    directory's video_preprocessor_config.json through AutoVideoProcessor."""
+    processing = pytest.importorskip("transformers.models.vjepa2.video_processing_vjepa2")
+    processing.VJEPA2VideoProcessor().save_pretrained(tmp_path)
+    return VJepa2Model(str(tmp_path), skip_weight_loading=True)
+
+
+@pytest.mark.parametrize("hw", [(180, 320), (320, 180), (256, 256), (480, 640)])
+def test_preprocess_matches_hf_processor(hf_model, hw):
+    """Same pixels as HF's processor. Being within one uint8 step is not enough:
+    the float resize this replaced was, and cost ~0.1 of embedding cosine."""
+    from transformers.models.vjepa2.video_processing_vjepa2 import VJEPA2VideoProcessor
+
+    frames = _clip(8, *hw)
+    ref = VJEPA2VideoProcessor()(videos=frames, return_tensors="pt")["pixel_values_videos"][0]
+    # channels last, as torchcodec decodes them
+    decoded = frames.permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2)
+    out = hf_model.process_prompt(None, ["video"], ["embedding"], tensors={"video_inputs": [decoded]})
+    ours = out.new_input_tensors["video_frames"][0]
+    assert ours.shape == ref.shape == (8, 3, 256, 256)
+    assert (ours - ref).abs().max().item() < 1e-4
+
+
+def test_hf_crop_is_narrower(hf_model):
+    """The processor crops 256 out of a 292-pixel short side, so the square's
+    top and bottom rows fall outside it."""
+    out = _pixels(hf_model._preprocess_video(_frames(180, 320), target_frames=2))
+    assert out.shape == (2, 3, 256, 256)
+    assert out[..., 0, :].min() > 0.4
+    assert out[..., -1, :].max() < 0.6
+
+
+def test_a_processor_that_crops_another_size_is_refused(tmp_path):
+    processing = pytest.importorskip("transformers.models.vjepa2.video_processing_vjepa2")
+    processing.VJEPA2VideoProcessor(crop_size=384).save_pretrained(tmp_path)
+    model = VJepa2Model(str(tmp_path), skip_weight_loading=True)
+    with pytest.raises(ValueError, match="crops"):
+        model._preprocess_video(_frames(180, 320), target_frames=2)
+
+
+def test_load_video_hands_over_the_decoded_bytes(monkeypatch):
+    """process_prompt gets the decoder's uint8 frames as they are, so no float
+    copy of the full-size clip is made."""
+    decoded = _clip(4, 36, 64)
+
+    class Decoder:
+        metadata = types.SimpleNamespace(num_frames=4, height=36, width=64)
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_frames_at(self, indices):
+            return types.SimpleNamespace(data=decoded[indices])
+
+    decoders = types.ModuleType("torchcodec.decoders")
+    decoders.VideoDecoder = Decoder
+    monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    video = VJepa2Model("unused", skip_weight_loading=True).load_video("clip.mp4", "cpu").data
+    assert video.dtype == torch.uint8
+    assert torch.equal(video, decoded)
 
 
 @pytest.mark.parametrize("hw", [(180, 320), (320, 180), (256, 256)])
 def test_ac_crop_is_the_whole_central_square(hw):
     """Upscaling keeps the square's edges as the output's edges, so all four
     marked borders land on the output's border."""
-    out = _pixels(_preprocess_video(_frames(*hw), crop_size=256, target_frames=2, central_square=True))
+    out = _pixels(_central_square(_frames(*hw), crop_size=256))
     assert out.shape == (2, 3, 256, 256)
     assert torch.allclose(out[..., 0, 2:-2], torch.tensor(0.0), atol=1e-5)
     assert torch.allclose(out[..., -1, 2:-2], torch.tensor(1.0), atol=1e-5)
-    assert torch.allclose(out[..., 2:-2, 0], torch.tensor(0.25), atol=1e-5)
-    assert torch.allclose(out[..., 2:-2, -1], torch.tensor(0.75), atol=1e-5)
+    assert torch.allclose(out[..., 2:-2, 0], torch.tensor(64 / 255), atol=1e-5)
+    assert torch.allclose(out[..., 2:-2, -1], torch.tensor(191 / 255), atol=1e-5)
 
 
 @pytest.mark.parametrize("hw", [(180, 320), (320, 180), (480, 640)])
@@ -50,26 +134,26 @@ def test_ac_crop_ignores_everything_outside_the_square(hw):
     side = min(h, w)
     top, left = (h - side) // 2, (w - side) // 2
     frames = _frames(h, w)
-    noisy = torch.rand_like(frames, generator=torch.Generator().manual_seed(0))
+    noisy = torch.randint(0, 256, frames.shape, dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
     noisy[:, :, top : top + side, left : left + side] = frames[:, :, top : top + side, left : left + side]
-    a = _preprocess_video(frames, crop_size=256, target_frames=2, central_square=True)
-    b = _preprocess_video(noisy, crop_size=256, target_frames=2, central_square=True)
-    assert torch.equal(a, b)
+    assert torch.equal(_central_square(frames, crop_size=256), _central_square(noisy, crop_size=256))
 
 
 def test_ac_crop_of_a_square_frame_only_normalizes():
-    frames = torch.rand(2, 3, 256, 256, generator=torch.Generator().manual_seed(1))
-    out = _preprocess_video(frames, crop_size=256, target_frames=2, central_square=True)
-    assert torch.allclose(out, (frames - _MEAN) / _STD, atol=1e-6)
+    frames = _clip(2, 256, 256)
+    out = _central_square(frames, crop_size=256)
+    assert torch.allclose(out, (frames / 255 - _MEAN) / _STD, atol=1e-5)
 
 
-def test_hf_crop_is_unchanged_and_narrower():
-    """The default path still crops 256 out of a 292-pixel short side, so the
-    square's top and bottom rows fall outside it."""
-    out = _pixels(_preprocess_video(_frames(180, 320), crop_size=256, target_frames=2))
-    assert out.shape == (2, 3, 256, 256)
-    assert out[..., 0, :].min() > 0.4
-    assert out[..., -1, :].max() < 0.6
+def test_ac_crop_resizes_the_bytes_as_floats_like_upstream():
+    """Upstream's make_transforms turns the whole clip into floats, channels
+    first, and resizes those. One frame at a time from the bytes gives the same
+    floats to the bit; resizing the bytes themselves would round them."""
+    frames = _clip(4, 180, 320)
+    clip = frames.permute(1, 0, 2, 3).to(torch.float32)[:, :, :, 70:250]
+    resized = torch.nn.functional.interpolate(clip, size=(256, 256), mode="bilinear", align_corners=False)
+    upstream = (resized.permute(1, 0, 2, 3) - _MEAN * 255.0) / (_STD * 255.0)
+    assert torch.equal(_central_square(frames, crop_size=256), upstream)
 
 
 def _pointer(tensor: torch.Tensor) -> TensorPointerInfo:
@@ -87,7 +171,7 @@ def test_ac_rollout_request_replays_the_encoder_capture(stream):
     model = VJepa2ACModel("unused", skip_weight_loading=True)
     kwargs = {"actions": [[0.1] * 7] * 4, "states": [[0.2] * 7] * 4, "rollout_horizon": 4, "stream_rollout": stream}
     out = model.process_prompt(
-        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.rand(16, 3, 180, 320)]}, **kwargs,
+        None, ["video"], ["embedding"], tensors={"video_inputs": [_clip(16, 180, 320)]}, **kwargs,
     ).new_input_tensors
     signals = {name: [_pointer(t) for t in tensors] for name, tensors in out.items()}
     args = model.get_initial_forward_pass_args("p0", ["video"], ["embedding"], signals, kwargs)
