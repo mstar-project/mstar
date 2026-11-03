@@ -23,6 +23,10 @@ model_kwargs:
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
   flow_shift_action: 5.0
+  # The policy takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): the robot_state comes in and the predicted rows go out in the
+  # robot's own values, the same state a pi0.5 DROID policy takes.
+  inverted_action_dims: [7]
 node_groups:
   # No reasoner: the policy checkpoint ships no vision encoder, so the chat
   # walks are not built and the DiT runs alone.
@@ -32,11 +36,11 @@ node_groups:
     ranks: [0]
 # The first policy request of a fresh server compiles the action denoise step
 # (about 9 s); this warms it at startup with the model card's example frame as
-# the observation, in the layout NVIDIA's RoboLab server sends (a state row,
-# 33 rows and frames, 736x544, 15 fps).
+# the observation, in the layout NVIDIA's RoboLab server sends (the robot
+# state, 32 predicted rows, 736x544, 15 fps).
 warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
-    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 8, action_chunk_size: 33,
-                   num_frames: 33, fps: 15, size: 736x544, action: [[0, 0, 0, 0, 0, 0, 0, 1]]}
+    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, action_chunk_size: 32, fps: 15,
+                   size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}
