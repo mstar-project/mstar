@@ -22,8 +22,8 @@ from mstar.engine.resources.base import Resource
 
 logger = logging.getLogger(__name__)
 
-# Final hidden state and every state write: one 4-layer block of Qwen3.5's kernels is 1.3% from
-# the eager modules, since the kernels sum fp32 partials in a free order.
+# On the final hidden state and every state the rows hold after the step. Qwen3.5's whole stack on
+# its block kernels is 1.2-1.4% from the eager modules there (fp32 partials summed in a free order).
 PARITY_REL_L2 = 0.02
 
 

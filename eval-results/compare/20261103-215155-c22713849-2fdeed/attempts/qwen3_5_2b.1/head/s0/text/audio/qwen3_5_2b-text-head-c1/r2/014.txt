@@ -1,0 +1,6 @@
+Here are three prime numbers greater than 50, along with the step-by-step verification of each:
+
+### 1. 53
+**Verification:**
+To check if 53 is prime, we test for divisibility by all prime numbers less than or equal to $\sqrt{53}$ (which is approximately 7.2). The primes to test are 2, 3, 5, and 7.
+*   **Divisible

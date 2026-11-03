@@ -1,0 +1,8 @@
+[2026-11-03T21:52:51Z] qwen3_5_2b: order ['base', 'head'], 1 session(s)
+[2026-11-03T22:01:10Z] base s0: healthy after 455.1 s
+[2026-11-03T22:01:25Z] base s0: text rc=0 15.1 s alive=True
+[2026-11-03T22:01:38Z] base s0: image_in rc=0 12.3 s alive=True
+[2026-11-03T22:04:17Z] head s0: healthy after 155.8 s
+[2026-11-03T22:04:32Z] head s0: text rc=0 15.0 s alive=True
+[2026-11-03T22:04:44Z] head s0: image_in rc=0 11.7 s alive=True
+[2026-11-03T22:04:48Z] qwen3_5_2b finished in 717 s

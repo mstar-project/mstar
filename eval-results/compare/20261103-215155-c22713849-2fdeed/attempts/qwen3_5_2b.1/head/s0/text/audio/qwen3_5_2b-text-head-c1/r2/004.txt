@@ -1,0 +1,1 @@
+Sunlight contains all colors of the visible spectrum, but it scatters more efficiently in shorter blue wavelengths when it hits the Earth's atmosphere. This scattering process, known as Rayleigh scattering, is why the sky appears blue to our eyes during the day.

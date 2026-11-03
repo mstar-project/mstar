@@ -1,0 +1,7 @@
+Here are three prime numbers greater than 50: **53**, **59**, and **61**.
+
+### Explanation of the Checking Process
+
+To verify if a number is prime, we must confirm that it has no positive divisors other than 1 and itself. Since we are looking for numbers greater than 50, we can check them by testing divisibility by prime numbers up to their square root.
+
+**1. Checking 53**

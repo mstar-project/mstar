@@ -1,0 +1,10 @@
+[e2e] warmup: 2 request(s) at c=1
+[e2e] c=1 repeat 0: errors=0, lat_p50_s=0.1571, lat_p90_s=0.3462, lat_mean_s=0.1903, ttft_p50_s=0.01797, req_per_s=5.251, audio_s_total=0
+[e2e] c=1 repeat 1: errors=0, lat_p50_s=0.1541, lat_p90_s=0.2641, lat_mean_s=0.1585, ttft_p50_s=0.0165, req_per_s=6.304, audio_s_total=0
+[e2e] c=1 repeat 2: errors=0, lat_p50_s=0.1225, lat_p90_s=0.2426, lat_mean_s=0.1395, ttft_p50_s=0.01457, req_per_s=7.163, audio_s_total=0
+wrote eval-results/compare/20261103-215155-c22713849-2fdeed/attempts/qwen3_5_2b.1/head/s0/text/e2e-qwen3_5_2b-text-head-c1.json
+[e2e] warmup: 16 request(s) at c=8
+[e2e] c=8 repeat 0: errors=0, lat_p50_s=0.1386, lat_p90_s=0.2426, lat_mean_s=0.1487, ttft_p50_s=0.02547, req_per_s=41.25, audio_s_total=0
+[e2e] c=8 repeat 1: errors=0, lat_p50_s=0.1719, lat_p90_s=0.285, lat_mean_s=0.1725, ttft_p50_s=0.02605, req_per_s=37.84, audio_s_total=0
+[e2e] c=8 repeat 2: errors=0, lat_p50_s=0.1693, lat_p90_s=0.2762, lat_mean_s=0.1745, ttft_p50_s=0.03115, req_per_s=37.57, audio_s_total=0
+wrote eval-results/compare/20261103-215155-c22713849-2fdeed/attempts/qwen3_5_2b.1/head/s0/text/e2e-qwen3_5_2b-text-head-c8.json

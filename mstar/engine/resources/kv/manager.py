@@ -4780,27 +4780,22 @@ class KVManager(AttentionResource):
     def page_size(self) -> int:
         return self.kv_cache.page_size
 
-    def row_state(self, rids: Sequence[int]) -> dict[str, torch.Tensor]:
+    def _row_pages(self, rids: Sequence[int]) -> torch.Tensor | None:
         with self._lock:
             pages = sorted({
                 page for rid in rids for stream in self._streams.get(rid, {}).values()
                 for page in stream.page_indices
             })
-        if not pages:
-            return {}
-        index = torch.tensor(pages, device=self.kv_cache.device)
-        return {"pages": self.kv_cache.tensor.index_select(1, index)}
+        return torch.tensor(pages, device=self.kv_cache.device) if pages else None
+
+    def row_state(self, rids: Sequence[int]) -> dict[str, torch.Tensor]:
+        index = self._row_pages(rids)
+        return {} if index is None else {"pages": self.kv_cache.tensor.index_select(1, index)}
 
     def load_row_state(self, rids: Sequence[int], state: Mapping[str, torch.Tensor]) -> None:
-        if "pages" not in state:
-            return
-        with self._lock:
-            pages = sorted({
-                page for rid in rids for stream in self._streams.get(rid, {}).values()
-                for page in stream.page_indices
-            })
-        index = torch.tensor(pages, device=self.kv_cache.device)
-        self.kv_cache.tensor.index_copy_(1, index, state["pages"])
+        index = self._row_pages(rids)
+        if index is not None and "pages" in state:
+            self.kv_cache.tensor.index_copy_(1, index, state["pages"])
 
     @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
