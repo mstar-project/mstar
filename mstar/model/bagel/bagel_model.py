@@ -842,6 +842,8 @@ class BagelModel(Model):
             size=(new_h, new_w),
             mode="bilinear",
             align_corners=False,
+            # filter before downsampling, as the reference's PIL resize does
+            antialias=True,
         )
         return resized.squeeze(0)
 
