@@ -201,8 +201,9 @@ You must implement these abstract methods:
    value that ``process_prompt`` moves onto a tensor edge must not travel there
    too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
    originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
-   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
-   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   lists ``robot_state``, and Cosmos3 lists ``action`` and ``robot_state`` (it passes
+   only their sizes on, as ``action_shape`` and ``robot_state_dim`` metadata). A tensor
+   left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
 
 .. note::
