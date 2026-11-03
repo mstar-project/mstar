@@ -283,4 +283,4 @@ def test_block_kernel_matches_the_stage_kernels(rows):
         assert (conv.float() - want[2].float()).abs().max().item() <= 0.0625
         assert (state - want[3]).abs().max().item() < 1e-3
         assert (kv.float() - want[4].float()).abs().max().item() <= 0.0625
-    assert not blk.cnt.any() and not blk.acc_a.any() and not blk.acc_m.any()
+    assert not blk.cnt.any() and not blk.scratch.acc_a.any() and not blk.scratch.acc_m.any()

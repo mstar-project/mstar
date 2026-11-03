@@ -728,6 +728,31 @@ class Engine:
             logger.warning("resident planning stays off on %s: %s", node_name, refused)
         runner.bind_resident(submodule_mgmt.resident)
 
+    def _bind_fused_decode(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
+        """Hand ``runner`` the fused decode buckets the submodule declares, if the
+        deployment lets it, the node is no lockstep instance and the submodule's
+        guard passes; one warning says why a node that declared some keeps its
+        graphs. Before sizing, so what its preparation allocates is planned around."""
+        submodule_mgmt = self._submodules[node_name]
+        submodule = submodule_mgmt.submodule
+        group = submodule_mgmt.joint_comm_group
+        configs = submodule.get_fused_decode_configs(self._device, group.world_size)
+        if not configs:
+            return
+        if knobs.fused_decode() == "off":
+            logger.info("fused decode is off on %s (knobs: fused_decode)", node_name)
+            return
+        if group.world_size > 1:
+            # the fused kernels hold no collective, and each rank's parity verdict is its own
+            logger.warning("fused decode stays off on %s: a lockstep instance of %d ranks keeps its graphs",
+                           node_name, group.world_size)
+            return
+        refusal = submodule.prepare_fused_decode(submodule_mgmt.resources)
+        if refusal is not None:
+            logger.warning("fused decode stays off on %s: %s", node_name, refusal)
+            return
+        runner.bind_fused_decode(configs)
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager
@@ -855,6 +880,7 @@ class Engine:
                 capture_stream=capture_stream,
             )
             self._build_resident_planner(node_name, runner)
+            self._bind_fused_decode(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )

@@ -23,6 +23,7 @@ KNOBS: dict[str, str] = {
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
     "resident_planning": "MSTAR_RESIDENT_PLANNING",
+    "fused_decode": "MSTAR_FUSED_DECODE",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -49,8 +50,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _step_thread_core_value(value)
         elif key == "idle_hold":
             out[key] = _idle_hold_value(value)
-        elif key == "resident_planning":
-            out[key] = _resident_planning_value(value)
+        elif key in ("resident_planning", "fused_decode"):
+            out[key] = _auto_or_off(key, value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -62,12 +63,12 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
     return out
 
 
-def _resident_planning_value(value: object) -> str:
+def _auto_or_off(key: str, value: object) -> str:
     # yaml reads a bare ``off`` as False
     text = "off" if value is False else str(value).strip().lower()
     if text in ("auto", "off"):
         return text
-    raise ValueError(f"`knobs: resident_planning` must be auto or off, got {value!r}")
+    raise ValueError(f"`knobs: {key}` must be auto or off, got {value!r}")
 
 
 def _step_thread_core_value(value: object) -> str:
@@ -248,4 +249,14 @@ def resident_planning() -> str:
     whose submodule names resident walks and every resource of which is
     resident-capable, and says why at startup when one is not; ``off`` keeps
     the host plan everywhere."""
-    return _resident_planning_value(_setting("resident_planning", "auto"))
+    return _auto_or_off("resident_planning", _setting("resident_planning", "auto"))
+
+
+def fused_decode() -> str:
+    """``fused_decode`` / ``MSTAR_FUSED_DECODE`` (default ``auto``): a captured
+    decode bucket a submodule declares in ``get_fused_decode_configs`` replays
+    its fused forward (a few persistent kernels for the layer stack) instead of
+    the compiled graph, where the submodule's guard passes, the capture runs and
+    the boot parity step agrees with the modules. ``off`` keeps the compiled
+    graph everywhere."""
+    return _auto_or_off("fused_decode", _setting("fused_decode", "auto"))

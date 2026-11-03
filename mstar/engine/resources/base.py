@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -401,6 +401,18 @@ class Resource(ResidentHooks, ABC):
     def reset_request(self, rid: str, free: bool=False):
         """For clearing dummy RIDs during cuda graph capture"""
         return
+
+    def row_state(self, rids: Sequence[int]) -> dict[str, torch.Tensor]:
+        """Copies of the device state ``rids`` hold here, by name, for comparing
+        what two runs of one step write (the engine checks a fused capture
+        against its graph this way, on capture rows). Empty for a resource with
+        no per-request device state."""
+        del rids
+        return {}
+
+    def load_row_state(self, rids: Sequence[int], state: Mapping[str, torch.Tensor]) -> None:
+        """Write ``state``, as ``row_state(rids)`` returned it, back into ``rids``' storage."""
+        del rids, state
 
     # Pre-planning
 

@@ -8,6 +8,7 @@ import torch
 from mstar.engine.resources.attn.base import (
     AttentionManager,
     AttentionWrapper,
+    DecodeTables,
     EagerSlotKey,
     captured_page_capacity,
 )
@@ -113,6 +114,10 @@ class FlashInferManager(AttentionManager):
             step.reads_tables = True
         else:
             step.host_planned = True
+
+    def decode_tables(self, label: str = "main") -> DecodeTables | None:
+        wrapper = self._current_plan_states.get(label)
+        return wrapper.tables() if isinstance(wrapper, FmhaDecodeWrapper) else None
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,

@@ -245,6 +245,13 @@ class AttentionManager(AttentionResource):
         """The current plan's query offsets per request, for backends that plan them."""
         raise NotImplementedError(f"{type(self).__name__} plans no query offsets (qo_indptr_buf)")
 
+    def decode_tables(self, label: str = "main") -> "DecodeTables | None":
+        """This step's decode rows as a kernel that reads the pages itself takes them: the
+        block table and lengths the planned decode wrapper holds (filled by the host plan, or
+        inside the graph on a resident step). None where the plan keeps no such table."""
+        del label
+        return None
+
     # Eager as a whole: a break inside it leaves a compiled frame that holds the
     # bucket's static token count beside its row count, which captured forwards
     # recompile per prefill bucket until Dynamo's recompile limit.
@@ -254,6 +261,15 @@ class AttentionManager(AttentionResource):
         for a backend whose ``qo_indptr_buf`` holds the plan's query offsets."""
         last = (self.qo_indptr_buf(label)[1:] - 1).long()
         return hidden.index_select(0, last)
+
+
+class DecodeTables(NamedTuple):
+    """A decode plan's rows: ``block_table[row, i]`` is the row's i-th page and ``lengths[row]``
+    its tokens, this step's included. ``max_seq_len`` is what the table is sized for."""
+    block_table: torch.Tensor
+    lengths: torch.Tensor
+    max_seq_len: int
+    page_size: int
 
 
 class PlanCacheKey(NamedTuple):

@@ -18,6 +18,8 @@ instruction cache and the later layers run far slower than the first.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -254,10 +256,15 @@ def _block_kernel(
             tt = tl.arange(0, CH)
             gq = tl.arange(0, 16)
             gmask = gq < GQ
-            for t in range(pid, B * KVH * MAXC, G):
-                b = t // (KVH * MAXC)
-                g = (t // MAXC) % KVH
-                c = t % MAXC
+            # tasks over the step's longest row only: MAXC covers the longest a row can be
+            live = (tl.load(lens_ptr) + CH - 1) // CH
+            for bb in tl.static_range(1, BB):
+                if bb < B:
+                    live = tl.maximum(live, (tl.load(lens_ptr + bb) + CH - 1) // CH)
+            for t in range(pid, B * KVH * live, G):
+                b = t // (KVH * live)
+                g = (t // live) % KVH
+                c = t % live
                 L = tl.load(lens_ptr + b)
                 nchunks = (L + CH - 1) // CH
                 if c < nchunks:
@@ -407,76 +414,191 @@ def _block_kernel(
                 tl.store(ssq_ptr + zs, tl.zeros([16 * HV], dtype=tl.float32))
                 zc = tl.arange(0, 4 * 128)
                 tl.store(cnt_ptr + zc, tl.zeros([4 * 128], dtype=tl.int32))
+
+
+class BlockGeometry(NamedTuple):
+    """The sizes one block launch compiles for (all but the row count)."""
+    H: int
+    I: int
+    HV: int
+    DK: int
+    DV: int
+    KD: int
+    VD: int
+    CONV: int
+    NIN: int
+    A_OFF: int
+    B_OFF: int
+    QH: int
+    KVH: int
+    D: int
+
+    @classmethod
+    def of(cls, hidden_size: int, intermediate_size: int, gdn, attn) -> "BlockGeometry":
+        """From one gated-delta-net mixer and one attention mixer of the stack."""
+        conv, vd, hv = gdn.conv_dim, gdn.value_dim, gdn.num_v_heads
+        nin = gdn.in_proj_fused.weight.shape[0]
+        a_off = conv + vd
+        # `b` sits after `a` and the alignment pad between them
+        b_off = a_off + hv + (nin - (conv + vd + 2 * hv))
+        return cls(
+            H=hidden_size, I=intermediate_size, HV=hv, DK=gdn.head_k_dim, DV=gdn.head_v_dim,
+            KD=gdn.key_dim, VD=vd, CONV=conv, NIN=nin, A_OFF=a_off, B_OFF=b_off,
+            QH=attn.num_heads, KVH=attn.num_kv_heads, D=attn.head_dim,
+        )
+
+
+class BlockWeights(NamedTuple):
+    """One block's weights: the three GDN layers' and four MLPs' stacked by layer, the attention
+    layer's as they are. ``wdt`` is the down projections transposed (``[4, I, H]``)."""
+    win: torch.Tensor
+    convw: torch.Tensor
+    alog: torch.Tensor
+    dtb: torch.Tensor
+    gnw: torch.Tensor
+    gwo: torch.Tensor
+    wqkv: torch.Tensor
+    qnw: torch.Tensor
+    knw: torch.Tensor
+    awo: torch.Tensor
+    wgu: torch.Tensor
+    wdt: torch.Tensor
+    wpost: torch.Tensor
+    wnext: torch.Tensor
+
+
+class BlockScratch(NamedTuple):
+    """What one launch keeps between its stages. Counters and accumulators must be zero when a
+    launch starts; the launch leaves them so, so one set serves launches back to back on a stream
+    (the blocks of a step, and step after step), never two launches at once."""
+    res_mid: torch.Tensor
+    acc_a: torch.Tensor
+    acc_m: torch.Tensor
+    ssq: torch.Tensor
+    cnt: torch.Tensor
+    qkv_s: torch.Tensor
+    z_s: torch.Tensor
+    ab_s: torch.Tensor
+    core_s: torch.Tensor
+    y_s: torch.Tensor
+    part_o: torch.Tensor
+    part_ml: torch.Tensor
+
+    @classmethod
+    def allocate(cls, geom: BlockGeometry, rows: int, max_chunks: int, zeros) -> "BlockScratch":
+        """``zeros(name, shape, dtype)`` hands out zero-filled buffers. The per-layer buffers have
+        room for ``MAX_ROWS`` rows (the kernel strides them so), the attention partials for
+        ``rows`` rows of ``max_chunks`` chunks."""
+        f32, bf16, i32 = torch.float32, torch.bfloat16, torch.int32
+        R = 4
+        return cls(
+            res_mid=zeros("res_mid", (3, R, geom.H), bf16),
+            acc_a=zeros("acc_a", (4, R, geom.H), f32),
+            acc_m=zeros("acc_m", (4, R, geom.H), f32),
+            ssq=zeros("ssq", (4, R, geom.HV), f32),
+            cnt=zeros("cnt", (4 * CSTRIDE,), i32),
+            qkv_s=zeros("qkv_s", (3, R, geom.CONV), bf16),
+            z_s=zeros("z_s", (3, R, geom.VD), bf16),
+            ab_s=zeros("ab_s", (3, R, 2 * geom.HV), f32),
+            core_s=zeros("core_s", (3, R, geom.VD), bf16),
+            y_s=zeros("y_s", (R, geom.QH * 2 * geom.D + 2 * geom.KVH * geom.D), bf16),
+            part_o=zeros("part_o", (rows * geom.QH * max_chunks, geom.D), f32),
+            part_ml=zeros("part_ml", (rows * geom.QH * max_chunks, 2), f32),
+        )
+
+
+class LaunchConfig(NamedTuple):
+    """Tile sizes and pipelining (the pilot's tuned values at 0.8B), and the grid (the SM count)."""
+    grid: int
+    ch: int = 32
+    rb: int = 8
+    ns: int = 3
+    vb: int = 16
+    ro: int = 128
+    roa: int = 64
+    rb_m: int = 4
+    ns_m: int = 3
+    num_warps: int = 4
+
+
+def max_chunks(max_len: int, ch: int) -> int:
+    """Split-KV chunks a row of ``max_len`` tokens can need, as the kernel strides its partials."""
+    return triton.next_power_of_2(-(-max_len // ch))
+
+
+def run_block(geom: BlockGeometry, w: BlockWeights, scratch: BlockScratch, cfg: LaunchConfig,
+              h_in, res_in, res_out, h_out, conv_pool, state_pool, gdn_idx0, slots, cos, sin, kv_layer,
+              table, lens, eps, chunks):
+    """One block over the step's rows: ``h_in``/``res_in`` the first layer's normed input and the
+    residual, written to ``h_out``/``res_out``. ``conv_pool``/``state_pool`` are the recurrent pool's
+    whole blocks (``[layers, slots, ...]``), the block's GDN layers starting at ``gdn_idx0``;
+    ``kv_layer`` is the attention layer's NHD pages and ``table``/``lens`` the rows' block table and
+    lengths (the new token included); ``chunks`` is what ``scratch`` was sized for."""
+    B = h_in.shape[0]
+    _block_kernel[(cfg.grid,)](
+        h_in, res_in, res_out, h_out, scratch.res_mid, scratch.acc_a, scratch.acc_m, scratch.ssq, scratch.cnt,
+        scratch.qkv_s, scratch.z_s, scratch.ab_s, scratch.core_s, scratch.y_s, scratch.part_o, scratch.part_ml,
+        w.win, w.convw, w.alog, w.dtb, w.gnw, w.gwo,
+        conv_pool[gdn_idx0], state_pool[gdn_idx0], slots,
+        conv_pool.stride(0), conv_pool.stride(1), state_pool.stride(0), state_pool.stride(1),
+        w.wqkv, w.qnw, w.knw, w.awo, cos, sin, kv_layer, table, lens, kv_layer.stride(0),
+        table.stride(0),
+        w.wgu, w.wdt, w.wpost, w.wnext, w.wnext,
+        eps, geom.D ** -0.5,
+        B=B, BB=triton.next_power_of_2(B), H=geom.H, I=geom.I, NIN=geom.NIN, CONV=geom.CONV, KD=geom.KD,
+        VD=geom.VD, HV=geom.HV, DK=geom.DK, DV=geom.DV, A_OFF=geom.A_OFF, B_OFF=geom.B_OFF,
+        QH=geom.QH, KVH=geom.KVH, D=geom.D, ROT=cos.shape[-1], P=kv_layer.shape[2], CH=cfg.ch, MAXC=chunks,
+        CB=min(16, chunks), RB=cfg.rb, NS=cfg.ns, VB=cfg.vb, RO=cfg.ro, ROA=cfg.roa,
+        RP_G=triton.next_power_of_2(-(-geom.NIN // cfg.grid)),
+        RP_A=triton.next_power_of_2(-(-(geom.QH * 2 * geom.D + 2 * geom.KVH * geom.D) // cfg.grid)),
+        RB_M=cfg.rb_m, NS_M=cfg.ns_m, num_warps=cfg.num_warps,
+    )
+
+
+def stack_block_weights(gdn_layers, attn_layer, mlps, post_norms, next_norms) -> BlockWeights:
+    """A block's weights as copies (the benchmarks' and tests' way; a served model re-points its
+    parameters into the stacks instead, see ``mstar.model.qwen3_5.fused_decode``)."""
+    st = lambda ts: torch.stack([t.detach() for t in ts]).contiguous()  # noqa: E731
+    a = attn_layer
+    return BlockWeights(
+        win=st([m.in_proj_fused.weight for m in gdn_layers]),
+        convw=st([m.conv1d.weight.squeeze(1) for m in gdn_layers]),
+        alog=st([m.A_log for m in gdn_layers]),
+        dtb=st([m.dt_bias for m in gdn_layers]),
+        gnw=st([m.norm.weight for m in gdn_layers]),
+        gwo=st([m.out_proj.weight for m in gdn_layers]),
+        wqkv=a.qkv_proj.weight.detach(), qnw=a.q_norm.weight.detach(), knw=a.k_norm.weight.detach(),
+        awo=a.o_proj.weight.detach(),
+        wgu=st([m.gate_up_proj.weight for m in mlps]),
+        wdt=st([m.down_proj.weight.t() for m in mlps]),
+        wpost=st([n.weight for n in post_norms]),
+        wnext=st([n.weight for n in next_norms]),
+    )
+
+
 class BlockMegakernel:
     """Stacked weights and scratch for one 4-layer block (layers ``first`` .. ``first + 3``)."""
 
     def __init__(self, cfg, gdn_layers, attn_layer, mlps, post_norms, next_norms, max_len, max_rows=4,
                  device="cuda", rb=8, ns=3, vb=16, ro=128, roa=64, ch=32, rb_m=4, ns_m=3, num_warps=4,
                  grid=None):
-        H, I = cfg["hidden_size"], cfg["intermediate_size"]
-        self.H, self.I = H, I
-        g0 = gdn_layers[0]
-        self.HV, self.DK, self.DV = g0.num_v_heads, g0.head_k_dim, g0.head_v_dim
-        self.KD, self.VD = g0.key_dim, g0.value_dim
-        self.CONV = g0.conv_dim
-        self.NIN = g0.in_proj_fused.weight.shape[0]
-        self.A_OFF = self.CONV + self.VD
-        self.B_OFF = self.A_OFF + self.HV + (self.NIN - (self.CONV + self.VD + 2 * self.HV))
-        st = lambda ts: torch.stack([t.detach() for t in ts]).contiguous()  # noqa: E731
-        self.win = st([m.in_proj_fused.weight for m in gdn_layers])
-        self.convw = st([m.conv1d.weight.squeeze(1) for m in gdn_layers])
-        self.alog = st([m.A_log for m in gdn_layers])
-        self.dtb = st([m.dt_bias for m in gdn_layers])
-        self.gnw = st([m.norm.weight for m in gdn_layers])
-        self.gwo = st([m.out_proj.weight for m in gdn_layers])
-        a = attn_layer
-        self.QH, self.KVH, self.D = a.num_heads, a.num_kv_heads, a.head_dim
-        self.wqkv, self.qnw, self.knw, self.awo = (a.qkv_proj.weight.detach(), a.q_norm.weight.detach(),
-                                                   a.k_norm.weight.detach(), a.o_proj.weight.detach())
-        self.wgu = st([m.gate_up_proj.weight for m in mlps])
-        self.wdt = st([m.down_proj.weight.t() for m in mlps])
-        self.wpost = st([n.weight for n in post_norms])
-        self.wnext = st([n.weight for n in next_norms])
-        self.CH = ch
-        self.MAXC = triton.next_power_of_2(-(-max_len // ch))
-        self.NQKV = self.QH * 2 * self.D + 2 * self.KVH * self.D
-        f = dict(device=device)
-        z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, **f)  # noqa: E731
-        self.res_mid = z(3, 4, H, dt=torch.bfloat16)
-        self.acc_a, self.acc_m = z(4, 4, H), z(4, 4, H)
-        self.ssq = z(4, 4, self.HV)
-        self.cnt = z(4 * 128, dt=torch.int32)
-        self.qkv_s = z(3, 4, self.CONV, dt=torch.bfloat16)
-        self.z_s = z(3, 4, self.VD, dt=torch.bfloat16)
-        self.ab_s = z(3, 4, 2 * self.HV)
-        self.core_s = z(3, 4, self.VD, dt=torch.bfloat16)
-        self.y_s = z(4, self.NQKV, dt=torch.bfloat16)
-        self.part_o = z(4 * self.QH * self.MAXC, self.D)
-        self.part_ml = z(4 * self.QH * self.MAXC, 2)
-        self.grid = grid or torch.cuda.get_device_properties(device).multi_processor_count
-        self.cfg = dict(rb=rb, ns=ns, vb=vb, ro=ro, roa=roa, rb_m=rb_m, ns_m=ns_m, num_warps=num_warps)
-        self.rot = None
+        self.geom = BlockGeometry.of(cfg["hidden_size"], cfg["intermediate_size"], gdn_layers[0], attn_layer)
+        self.weights = stack_block_weights(gdn_layers, attn_layer, mlps, post_norms, next_norms)
+        self.MAXC = max_chunks(max_len, ch)
+        self.scratch = BlockScratch.allocate(
+            self.geom, max_rows, self.MAXC,
+            lambda name, shape, dtype: torch.zeros(shape, dtype=dtype, device=device),
+        )
+        self.launch = LaunchConfig(
+            grid=grid or torch.cuda.get_device_properties(device).multi_processor_count,
+            ch=ch, rb=rb, ns=ns, vb=vb, ro=ro, roa=roa, rb_m=rb_m, ns_m=ns_m, num_warps=num_warps,
+        )
+
+    @property
+    def cnt(self) -> torch.Tensor:
+        return self.scratch.cnt
 
     def __call__(self, h_in, res_in, res_out, h_out, conv_pool, state_pool, gdn_idx0, slots, cos, sin, kv_layer,
                  table, lens, eps):
-        B = h_in.shape[0]
-        c = self.cfg
-        rot = cos.shape[-1]
-        _block_kernel[(self.grid,)](
-            h_in, res_in, res_out, h_out, self.res_mid, self.acc_a, self.acc_m, self.ssq, self.cnt,
-            self.qkv_s, self.z_s, self.ab_s, self.core_s, self.y_s, self.part_o, self.part_ml,
-            self.win, self.convw, self.alog, self.dtb, self.gnw, self.gwo,
-            conv_pool[gdn_idx0], state_pool[gdn_idx0], slots,
-            conv_pool.stride(0), conv_pool.stride(1), state_pool.stride(0), state_pool.stride(1),
-            self.wqkv, self.qnw, self.knw, self.awo, cos, sin, kv_layer, table, lens, kv_layer.stride(0),
-            table.stride(0),
-            self.wgu, self.wdt, self.wpost, self.wnext, self.wnext,
-            eps, self.D ** -0.5,
-            B=B, BB=triton.next_power_of_2(B), H=self.H, I=self.I, NIN=self.NIN, CONV=self.CONV, KD=self.KD,
-            VD=self.VD, HV=self.HV, DK=self.DK, DV=self.DV, A_OFF=self.A_OFF, B_OFF=self.B_OFF,
-            QH=self.QH, KVH=self.KVH, D=self.D, ROT=rot, P=kv_layer.shape[2], CH=self.CH, MAXC=self.MAXC,
-            CB=min(16, self.MAXC), RB=c["rb"], NS=c["ns"], VB=c["vb"], RO=c["ro"], ROA=c["roa"],
-            RP_G=triton.next_power_of_2(-(-self.NIN // self.grid)),
-            RP_A=triton.next_power_of_2(-(-self.NQKV // self.grid)), RB_M=c["rb_m"], NS_M=c["ns_m"],
-            num_warps=c["num_warps"],
-        )
+        run_block(self.geom, self.weights, self.scratch, self.launch, h_in, res_in, res_out, h_out, conv_pool,
+                  state_pool, gdn_idx0, slots, cos, sin, kv_layer, table, lens, eps, self.MAXC)

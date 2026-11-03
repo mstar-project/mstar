@@ -20,6 +20,7 @@ from mstar.engine.accelerator_graph_config import (
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    FusedDecodeConfig,
     PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
@@ -66,6 +67,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
+from mstar.model.qwen3_5.fused_decode import FusedDecodeStack, stack_refusal
 from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY, TEXT_PART, VIDEO_PART
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -150,6 +152,11 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_VISION_MAX_BATCH_SIZE = 4
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
+    # Decode buckets that replay one persistent kernel per 4-layer block instead
+    # of the compiled graph (`fused_decode.py`): measured faster at 1-2 rows, and
+    # slower from 4, where the kernels' GEMVs still reduce one row at a time.
+    FUSED_DECODE_BATCH_SIZES = (1, 2)
+
     def __init__(
         self,
         model: Qwen3_5ForCausalLM,
@@ -174,6 +181,8 @@ class LLMSubmodule(ARNodeSubmodule):
             walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
+        # set by `prepare_fused_decode`
+        self._fused: FusedDecodeStack | None = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -245,6 +254,33 @@ class LLMSubmodule(ARNodeSubmodule):
                 compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
         ]
+
+    def get_fused_decode_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[FusedDecodeConfig]:
+        sizes = tuple(bs for bs in self.FUSED_DECODE_BATCH_SIZES if bs in self.DECODE_CAPTURE_BATCH_SIZES)
+        return [FusedDecodeConfig(walk="decode", batch_sizes=sizes)] if sizes else []
+
+    def prepare_fused_decode(self, resources: Mapping[str, Any]) -> str | None:
+        if compile_deterministic():
+            # the kernels sum fp32 partials with atomics, in no fixed order
+            return "knobs: compile_deterministic asks for decode output that reproduces, which the kernels don't give"
+        kv, pool = resources.get(KV_CACHE), resources.get(GDN_STATE)
+        if kv is None or pool is None:
+            return "the node has no KV cache or no GDN state pool"
+        if pool.config.disable_sink_slot:
+            return "the GDN pool has no sink slot for a padding row"
+        try:
+            kv.layer_views()
+        except NotImplementedError as exc:
+            return str(exc)
+        refusal = stack_refusal(
+            self.model.model, self.get_device(), kv.page_size, pool.block("state").dtype,
+            adapters=bool(getattr(self, "lora_keys", ())),
+        )
+        if refusal is None:
+            self._fused = FusedDecodeStack(self.model.model, self.get_device())
+        return refusal
 
     # ------------------------------------------------------------------
     # Step declaration
@@ -627,6 +663,53 @@ class LLMSubmodule(ARNodeSubmodule):
             )
         }
 
+    def decode_hidden(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        fused: bool,
+        input_ids: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if input_ids is None:
+            input_ids = engine_inputs.resources[SAMPLER].loopback_tokens(engine_inputs.request_ids)
+        cos, sin = self._decode_cos_sin(engine_inputs, input_ids.shape[0])
+        embeds = self.model.model.embed_tokens(input_ids)
+        if not fused:
+            return self.model.model(embeds, label="main", cos_sin=(cos, sin))
+        h, residual = self.model.model.layers[0].input_layernorm.forward_residual(embeds.clone(), None)
+        return self._fused_stack(h, residual, cos, sin, engine_inputs)
+
+    @torch.compiler.disable
+    def _fused_stack(
+        self, h: torch.Tensor, residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        engine_inputs: ModelInputsFromEngine,
+    ) -> torch.Tensor:
+        resources = engine_inputs.resources
+        tables = resources[ATTN].decode_tables("main")
+        if tables is None:
+            raise RuntimeError("the decode plan keeps no block table for the fused stack to read (no fmha wrapper)")
+        pool = resources[GDN_STATE]
+        return self._fused.run(
+            h, residual, pool.block("conv"), pool.block("state"), pool.addressing("main").slot_indices[: h.shape[0]],
+            resources[KV_CACHE].layer_views(), tables.block_table, tables.lengths, tables.max_seq_len,
+            cos.contiguous(), sin.contiguous(), engine_inputs.fused_scratch,
+        )
+
+    def forward_fused(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor | None = None,
+        **kwargs,
+    ) -> BatchedModelOutput:
+        """A captured decode step with the layer stack on the fused kernels; the rest as
+        ``forward_batched`` runs it."""
+        hidden = self.decode_hidden(graph_walk, engine_inputs, True, input_ids=input_ids)
+        logits = self.model.lm_head(hidden)
+        new_tokens = engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+        return self._batched_output(new_tokens)
+
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
     ) -> bool:
@@ -655,6 +738,10 @@ class LLMSubmodule(ARNodeSubmodule):
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
+        return self._batched_output(new_tokens)
+
+    @staticmethod
+    def _batched_output(new_tokens: torch.Tensor) -> BatchedModelOutput:
         # Row i is request i: one clone and one D2H copy per step instead of
         # one per request.
         return BatchedModelOutput(

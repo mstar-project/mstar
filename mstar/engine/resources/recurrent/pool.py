@@ -276,9 +276,31 @@ class RecurrentStatePool(Resource):
 
     # Storage access
 
-    def block(self, name: str, layer_idx: int) -> torch.Tensor:
-        """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``."""
+    def block(self, name: str, layer_idx: int | None = None) -> torch.Tensor:
+        """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``;
+        with no layer, the whole block, ``[num_layers, max_slots + prefix_slots, *shape]``, for a
+        kernel that walks several layers and strides them itself."""
+        if layer_idx is None:
+            return self._blocks[name]
         return self._blocks[name][layer_idx]
+
+    def _held_slots(self, rids: Sequence[int]) -> list[int]:
+        return [state.index for rid in rids for state in self._slots.get(rid, {}).values()]
+
+    def row_state(self, rids: Sequence[int]) -> dict[str, torch.Tensor]:
+        slots = self._held_slots(rids)
+        if not slots:
+            return {}
+        index = torch.tensor(slots, device=self._device)
+        return {name: block.index_select(1, index) for name, block in self._blocks.items()}
+
+    def load_row_state(self, rids: Sequence[int], state: Mapping[str, torch.Tensor]) -> None:
+        slots = self._held_slots(rids)
+        if not slots:
+            return
+        index = torch.tensor(slots, device=self._device)
+        for name, value in state.items():
+            self._blocks[name].index_copy_(1, index, value)
 
     def gather(
         self, name: str, layer_idx: int = 0, *, label: str = "main", start: torch.Tensor | None = None,

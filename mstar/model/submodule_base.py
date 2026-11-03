@@ -141,9 +141,14 @@ class BatchedStopCheck(NamedTuple):
 
 
 if TYPE_CHECKING:
-    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        FusedDecodeConfig,
+        PiecewiseAcceleratorGraphConfig,
+    )
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.fused_decode import FusedScratch
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -791,6 +796,10 @@ class ModelInputsFromEngine:
     # Every row is a dummy request (CUDA-graph capture or warmup), not real traffic.
     synthetic: bool = False
 
+    # The capture's scratch for a fused forward's kernels (``FusedDecodeConfig``),
+    # one set per captured slot; None for every other forward.
+    fused_scratch: "FusedScratch | None" = None
+
     # Real requests' token count; they lead the batch, later rows are replay padding.
     # None: no padding.
     real_seq_len: int | None = None
@@ -1259,6 +1268,33 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
         return []
+
+    def get_fused_decode_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[FusedDecodeConfig]:
+        """Captured buckets that may replay a fused forward instead of the
+        compiled graph (``mstar.engine.fused_decode``). None by default. A
+        submodule that names some implements ``prepare_fused_decode``,
+        ``decode_hidden`` and the config's forward method. Lockstep (TP/SP)
+        instances keep their graphs."""
+        del device, tp_world_size
+        return []
+
+    def prepare_fused_decode(self, resources: Mapping[str, Resource]) -> str | None:
+        """Before the engine sizes its captures: get ready to run the fused
+        forward over ``resources`` (stack the weights its kernels read, say),
+        or say why it can't, and the node keeps its graphs."""
+        del resources
+        return f"{type(self).__name__} has no fused forward"
+
+    def decode_hidden(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, fused: bool, **static_inputs: Any,
+    ) -> torch.Tensor:
+        """The final hidden state of one planned step, through the fused
+        kernels or through the modules the graph compiles, from the same static
+        inputs. Writes the resource state a forward would and samples nothing;
+        the engine's boot parity step compares the two."""
+        raise NotImplementedError(f"{type(self).__name__} declares fused decode buckets but no decode_hidden")
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,

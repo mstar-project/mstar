@@ -20,11 +20,13 @@ from mstar.engine.accelerator_graph_config import (
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
+    FusedDecodeConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
+from mstar.engine.fused_decode import FusedScratch, format_errors, fused_parity, parity_failure
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
@@ -678,6 +680,7 @@ class WarmedSpec(NamedTuple):
     peak: int
     # bytes of what it returned
     returned: int
+    engine_inputs: ModelInputsFromEngine | None = None
 
 
 class AcceleratorGraphRunner:
@@ -773,6 +776,14 @@ class AcceleratorGraphRunner:
         # `declare_inputs_for`.
         self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
 
+        # (walk, bs) -> the fused forward that captures in that bucket's place
+        # (`bind_fused_decode`); the buckets that replay it once captured; one
+        # scratch set per captured (bucket, slot); config_idx -> compiled fused forward
+        self._fused: dict[tuple[str, int], FusedDecodeConfig] = {}
+        self.fused_buckets: set[BucketKey] = set()
+        self._fused_scratch: dict[tuple[BucketKey, int], FusedScratch] = {}
+        self._compiled_fused: dict[int, Any] = {}
+
         self.max_bs = max(
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
@@ -795,6 +806,22 @@ class AcceleratorGraphRunner:
     def bind_resident(self, planner: ResidentPlanner | None) -> None:
         """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
         self._resident = planner
+
+    def bind_fused_decode(self, configs: Collection[FusedDecodeConfig]) -> None:
+        """Before any capture: these buckets capture the fused forward after their
+        graph, and replay it if it captures and agrees with the modules."""
+        for config in configs:
+            for bs in config.batch_sizes:
+                self._fused[(config.walk, bs)] = config
+
+    def _fused_config(self, spec: CGSlotSpec) -> FusedDecodeConfig | None:
+        """The fused forward ``spec`` captures after its graph: a declared bucket of a
+        batched capture of the walk, with no adapters (`LoraBaseOnly` keys stay)."""
+        if not self._fused or spec.config.get_config_type() != AcceleratorGraphConfigType.BASIC_BATCHED:
+            return None
+        if spec.bucket.cg_key_info != spec.config.additional_key_info:
+            return None
+        return self._fused.get((spec.bucket.graph_walk, spec.bs))
 
     # ── Capture ─────────────────────────────────────────────────────────
 
@@ -1018,6 +1045,12 @@ class AcceleratorGraphRunner:
                     self._submodule_name, spec, exc_info=True
                 )
                 continue
+            fused = self._fused_config(spec)
+            if fused is not None:
+                graph_slot = slot
+                slot = self._capture_fused(spec, fused, graph_slot)
+                if slot is not graph_slot:
+                    self.fused_buckets.add(spec.bucket)
 
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
             if  len(captured[spec.bucket]) == self._num_slots:
@@ -1146,9 +1179,11 @@ class AcceleratorGraphRunner:
             )
 
     @contextmanager
-    def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:
+    def _warmed(
+        self, spec: CGSlotSpec, forwards: int, fused: FusedDecodeConfig | None = None,
+    ) -> Iterator[WarmedSpec]:
         """Prepare ``spec`` and run its forward eagerly ``forwards`` times, as
-        its first capture needs."""
+        its first capture needs; ``fused``'s forward instead of the config's."""
         walk = spec.bucket.graph_walk
         config = spec.config
         dummy_rids = self._dummy_rows.ensure(
@@ -1156,6 +1191,10 @@ class AcceleratorGraphRunner:
         )
         dummy_inputs = config.get_node_inputs(spec.bs, spec.num_tokens)
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
+        if fused is not None:
+            engine_inputs.fused_scratch = self._fused_scratch.setdefault(
+                (spec.bucket, spec.slot), FusedScratch(self._device),
+            )
 
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
         step = engine_step(
@@ -1207,7 +1246,7 @@ class AcceleratorGraphRunner:
                 if isinstance(value, torch.Tensor)
             )
 
-            forward = self._forward_for(spec)
+            forward = self._forward_for(spec) if fused is None else self._fused_forward_for(spec, fused)
             planner = self._resident
             resident = (
                 planner.capture_step(spec.bucket, spec.slot, step)
@@ -1251,6 +1290,7 @@ class AcceleratorGraphRunner:
                 dummy_metadata=engine_inputs.per_request_info,
                 peak=peak,
                 returned=returned,
+                engine_inputs=engine_inputs,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
@@ -1279,6 +1319,88 @@ class AcceleratorGraphRunner:
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
         )
+
+    def _fused_forward_for(self, spec: CGSlotSpec, fused: FusedDecodeConfig):
+        """The fused forward, compiled as the bucket's config compiles its forward
+        (the fused kernels run uncompiled inside it), once per config."""
+        forward = getattr(self._submodule, fused.forward_method)
+        if not spec.config.compile:
+            return forward
+        if spec.config_idx not in self._compiled_fused:
+            self._compiled_fused[spec.config_idx] = torch.compile(
+                forward, **compile_kwargs(spec.config.compile_mode),
+            )
+        return with_inductor_overrides(self._compiled_fused[spec.config_idx], spec.num_tokens)
+
+    def _capture_fused(
+        self, spec: CGSlotSpec, fused: FusedDecodeConfig, graph_slot: AcceleratorGraphSlot,
+    ) -> AcceleratorGraphSlot:
+        """The fused forward captured in ``spec``'s place, if it warms up and
+        captures and its parity step agrees with the modules; else ``graph_slot``.
+
+        Its own warm-up even after sizing: sizing ran the graph's forward, and
+        this one compiles and builds its kernels on its first call."""
+        name = f"{self._submodule_name} {spec.bucket} slot {spec.slot}"
+        try:
+            with self._warmed(spec, self.NUM_WARMUP, fused=fused) as warmed:
+                torch.accelerator.empty_cache()
+                graph, output = capture_into_graph(
+                    warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                    node_name=self._submodule_name, stream=self._capture_stream,
+                )
+                errors = self._fused_parity(spec, warmed)
+        except Exception:
+            logger.warning("fused decode: %s failed to capture; it keeps its graph", name, exc_info=True)
+            return graph_slot
+        failure = parity_failure(errors)
+        if failure is not None:
+            logger.warning(
+                "fused decode: %s disagrees with the modules (%s); it keeps its graph. Parity: %s",
+                name, failure, format_errors(errors),
+            )
+            return graph_slot
+        logger.info("fused decode: %s replays the fused forward. Parity: %s", name, format_errors(errors))
+        return self._build_slot_from_capture(
+            output=BatchedModelOutput.coerce(output),
+            graph=graph,
+            static_inputs=warmed.static_inputs,
+            static_input_keys=warmed.static_input_keys,
+            dummy_rids=warmed.dummy_rids,
+            dummy_metadata=warmed.dummy_metadata,
+            config_idx=spec.config_idx,
+        )
+
+    def _fused_parity(self, spec: CGSlotSpec, warmed: WarmedSpec) -> dict[str, float]:
+        """``fused_parity`` over the capture's rows, on the capture's lease and
+        static inputs. A capture row reserves nothing and addresses the sinks,
+        which every row shares, so the rows are planned here as ordinary ones,
+        each with a slot and pages of its own, and give them back after."""
+        walk, rids = spec.bucket.graph_walk, warmed.dummy_rids
+        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
+        step = engine_step(
+            self._submodule, graph_walk=walk, request_ids=rids,
+            inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
+            slot_lease=lease, per_request_info=warmed.dummy_metadata,
+        )
+        step = replace(step, _ctx=StepContext(
+            request_ids=tuple(rids), graph_walk=walk, slot=spec.slot, capture=False, slot_lease=lease,
+        ))
+        self._dummy_rows.reset(rids)
+        outcome = self._step_runner.admit(step)
+        if not outcome.ok:
+            raise RuntimeError(f"parity admit failed for {spec.bucket}: {outcome.reason}")
+        try:
+            self._step_runner.plan(step)
+            engine_inputs = replace(warmed.engine_inputs, step=step)
+            with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+                errors = fused_parity(
+                    self._submodule, walk, engine_inputs, warmed.static_inputs, self._resources, rids,
+                )
+            self._graph_backend.synchronize()
+        finally:
+            self._step_runner.rollback_admit(step)
+            self._dummy_rows.reset(rids, free=True)
+        return errors
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,

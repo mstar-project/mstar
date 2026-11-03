@@ -16,6 +16,7 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 
 import functools
 import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -24,6 +25,9 @@ import triton.language as tl
 
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.platforms import current_platform
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.attn.base import DecodeTables
 
 logger = logging.getLogger(__name__)
 
@@ -780,6 +784,12 @@ class FmhaDecodeWrapper:
             slots, kv_len, store, self._table, self._lens,
             STRIDE=stride, BLOCK=block_col, PAGE=self._page_size, WIDTH=self._table.shape[1], num_warps=1,
         )
+
+    def tables(self) -> "DecodeTables":
+        """The table and lengths a replay reads, for another kernel to read the same rows."""
+        from mstar.engine.resources.attn.base import DecodeTables
+
+        return DecodeTables(self._table, self._lens, self._max_seq_len, self._page_size)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:

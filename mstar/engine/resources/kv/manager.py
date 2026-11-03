@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -4768,6 +4768,39 @@ class KVManager(AttentionResource):
             self.kv_cache.layer_view(layer_idx), state.token_to_page, state.token_to_cache,
             int(state.total_tokens),
         )
+
+    def layer_views(self) -> list[torch.Tensor]:
+        """Every layer's NHD pages, ``[max_pages, 2, page_size, num_kv_heads, head_dim]``, for a
+        kernel that reads and writes several layers' pages itself off an attention's block table."""
+        if self.kv_cache.layout != KVLayout.NHD or len(self._groups) > 1:
+            raise NotImplementedError("layer_views needs one group of NHD pages")
+        return [self.kv_cache.layer_view(i) for i in range(self.kv_cache.num_layers)]
+
+    @property
+    def page_size(self) -> int:
+        return self.kv_cache.page_size
+
+    def row_state(self, rids: Sequence[int]) -> dict[str, torch.Tensor]:
+        with self._lock:
+            pages = sorted({
+                page for rid in rids for stream in self._streams.get(rid, {}).values()
+                for page in stream.page_indices
+            })
+        if not pages:
+            return {}
+        index = torch.tensor(pages, device=self.kv_cache.device)
+        return {"pages": self.kv_cache.tensor.index_select(1, index)}
+
+    def load_row_state(self, rids: Sequence[int], state: Mapping[str, torch.Tensor]) -> None:
+        if "pages" not in state:
+            return
+        with self._lock:
+            pages = sorted({
+                page for rid in rids for stream in self._streams.get(rid, {}).values()
+                for page in stream.page_indices
+            })
+        index = torch.tensor(pages, device=self.kv_cache.device)
+        self.kv_cache.tensor.index_copy_(1, index, state["pages"])
 
     @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:

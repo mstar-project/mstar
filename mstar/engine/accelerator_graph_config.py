@@ -244,6 +244,22 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             self.make_node_input(n) for n in seq_lens
         ]
 
+@dataclass(frozen=True)
+class FusedDecodeConfig:
+    """Captured buckets of ``walk`` at ``batch_sizes`` that replay the submodule's
+    ``forward_method`` in place of the compiled graph.
+
+    The fused forward takes the walk's static inputs and returns what its capture
+    forward does, reading the same planned resources; only how the layer stack runs
+    differs. The engine captures it after the bucket's graph, checks a step of it
+    against the modules (``NodeSubmodule.decode_hidden``) and keeps the graph where
+    either fails. A bucket here must also be a batched capture of ``walk``.
+    """
+    walk: str
+    batch_sizes: tuple[int, ...]
+    forward_method: str = "forward_fused"
+
+
 class PiecewiseConfigType(Enum):
     BATCHED = "batched"
     PACKED = "packed"
