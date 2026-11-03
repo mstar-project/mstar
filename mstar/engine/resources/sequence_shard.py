@@ -78,7 +78,7 @@ class SeqShardSpec(NodeResourceSpec):
     for ``axis`` 1), so no rank gets an empty range. ``min_tokens`` is a ``resources:`` override.
 
     ``exchange``, also a ``resources:`` override, is how a split step's tokens reach the node's
-    paged attentions, from the storage of their KV:
+    paged attentions, from the storage of the node's pools (``NodeResourceSpec.storage``):
 
     - ``auto`` (the default): Ulysses over KV stored by head; over KV stored by position
       (``context_parallel``) the node runs copied, so splitting there is the deployment's to opt into;
@@ -86,8 +86,10 @@ class SeqShardSpec(NodeResourceSpec):
       stored position): split;
     - ``none``: never split.
 
-    A ragged attention's own ``sp_exchange`` is the model's, which ``exchange`` doesn't change;
-    a shard that never splits stops it splitting too.
+    Where the node splits, a resource over a pool every rank stores whole (``copied``) takes its own
+    exchange whatever this one is: an attention gathers the step's keys (``kv_gather``), a recurrent
+    layer its ``sp_exchange``. So does a ragged attention, by its model's ``sp_exchange``; a shard
+    that never splits stops them all splitting.
 
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
@@ -146,12 +148,14 @@ class SeqShardSpec(NodeResourceSpec):
 
     def node_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
         """``exchange`` over the storage of the pools on its nodes, from raw fields."""
-        return self.exchange_over(any(spec.places_positions for spec in specs.values() if spec.nodes & self.nodes))
+        return self.exchange_over(
+            any(spec.storage == "by_position" for spec in specs.values() if spec.nodes & self.nodes)
+        )
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # from raw fields alone, so it doesn't matter which spec derives first
         ours = [spec for spec in specs.values() if spec.nodes & self.nodes]
-        by_position = any(spec.places_positions for spec in ours)
+        by_position = any(spec.storage == "by_position" for spec in ours)
         exchanges = [(spec, spec.resolve_exchange(specs)) for spec in ours]
         self.splits = self.node_exchange(specs) != "none" and any(e != "none" for _, e in exchanges)
         self.eager_splits = self.splits and not all(spec.captures_split_steps(specs) for spec in ours)

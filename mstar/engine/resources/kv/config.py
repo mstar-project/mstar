@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.sequence_shard import SeqShardSpec
+    from mstar.engine.resources.spec import Storage
 
 
 class KVLayout(Enum):
@@ -695,9 +696,15 @@ class KVSpec(NodeResourceSpec):
         return KVManager
 
     @property
-    def places_positions(self) -> bool | None:
-        # a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank
-        return self.config.context_parallel if isinstance(self.config, PagedKVConfig) else None
+    def storage(self) -> "Storage | None":
+        # a paged pool's (`PagedKVConfig.context_parallel`); an MLA pool's one latent is every head's,
+        # so whole on every rank; a ring keeps every position on each rank
+        cfg = self.config
+        if not isinstance(cfg, PagedKVConfig):
+            return None
+        if cfg.context_parallel:
+            return "by_position"
+        return "copied" if cfg.layout == KVLayout.MLA else "by_head"
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         # stored by position, a split step's packed tokens are gathered or passed round; stored by
@@ -713,8 +720,8 @@ class KVSpec(NodeResourceSpec):
                     "split (axis 0) only"
                 ]
             return []
-        if cfg.layout == KVLayout.MLA:
-            # one latent, whole on every rank: its attention answers for the query heads (kv_gather)
+        if self.storage == "copied":
+            # whole on every rank: its attention answers for the query heads (kv_gather)
             return []
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:

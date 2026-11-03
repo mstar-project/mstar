@@ -704,10 +704,11 @@ def gather_merge(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> torc
 
 def position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
     """``node``'s resources that hold token positions, each to whether it places them
-    (``NodeResourceSpec.places_positions``). Raises when one is placed and another isn't."""
+    (``NodeResourceSpec.storage`` by position or by head; a copied one goes with either). Raises
+    when one is placed and another isn't."""
     pools = {
-        spec.resource_key: placed for spec in specs
-        if node in spec.nodes and (placed := spec.places_positions) is not None
+        spec.resource_key: spec.storage == "by_position" for spec in specs
+        if node in spec.nodes and spec.storage in ("by_head", "by_position")
     }
     if any(pools.values()) and not all(pools.values()):
         raise ValueError(

@@ -22,7 +22,6 @@ from mstar.engine.resources.base import (
     CGSlotSpec,
     EngineResourceInfo,
     Resource,
-    head_shards,
 )
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
@@ -144,7 +143,7 @@ class RecurrentStatePool(Resource):
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
     ) -> "RecurrentStatePool":
         config = spec.config
-        config.shard(head_shards(info.joint_comm_group, places_positions=True))
+        config.shard(info.head_shards)
         world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
         # no snapshot slots where the engine keeps them from serving a hit
         if spec.resource_key not in info.prefix_caches:

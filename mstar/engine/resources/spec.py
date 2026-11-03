@@ -11,7 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.attn.config import SpExchange
@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
+
+# how a resource stores its per-request state over a node's ranks (`NodeResourceSpec.storage`)
+Storage = Literal["by_head", "by_position", "copied"]
 
 
 @dataclass(frozen=True)
@@ -135,10 +138,15 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
-    def places_positions(self) -> bool | None:
-        """Whether this resource places its token positions over ranks that would otherwise hold
-        the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
-        positions to place. A node whose resources place them runs replicated across its SP ranks."""
+    def storage(self) -> "Storage | None":
+        """How this resource stores its per-request state over a node's ranks: ``by_head`` (each
+        rank a slice of the heads, over TP x SP), ``by_position`` (each a share of every page's
+        token positions over ranks that would otherwise hold the same heads, heads over TP:
+        ``mstar.engine.resources.context_parallel``), or ``copied`` (heads over TP, every SP rank the
+        whole state: a recurrent pool, MLA's one latent). None for one holding none. A resource
+        over pools that are all ``copied`` shards its heads over TP (``EngineResourceInfo.head_shards``),
+        and a node whose pools store by position runs copied unless its shard's exchange splits it.
+        From raw fields, as the shard's hooks."""
         return None
 
     def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":

@@ -536,7 +536,7 @@ def _sequence_parallel(
     groups: dict[int, tuple[int, int, set[str]]] = {}
     for wg in worker_graphs:
         groups.setdefault(wg._group_id, (wg._tp_comm_size, wg.sp_size, set()))[2].update(wg.section.get_nodes())
-    placed_pools = [spec for spec in specs if spec.places_positions]
+    placed_pools = [spec for spec in specs if spec.storage == "by_position"]
     for i, (tp, sp, nodes) in sorted(groups.items()):
         for spec in placed_pools:
             if spec.nodes & nodes:

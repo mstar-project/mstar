@@ -372,10 +372,9 @@ class FlashInferMLAManager(AttentionManager):
     def bind_dependencies(self, resources) -> None:
         super().bind_dependencies(resources)
         if self._shard is not None and self._split_exchange == "kv_gather":
-            # the pool is stored by head (heads over TP x SP), but the latent is whole on every rank:
-            # each attends its TP rank's query heads, a split step its own queries
-            self._wrapper_kwargs["num_qo_heads"] = self._kv_config.num_qo_heads * self._shard.group.world_size
-            self._check_rank_plans("its split steps' gathered latents", self._wrapper_kwargs["num_qo_heads"])
+            # the latent is whole on every rank, the query heads over TP: a split step plans each
+            # rank's own queries
+            self._check_rank_plans("its split steps' gathered latents", self._kv_config.num_qo_heads)
 
     def _check_rank_plans(self, what: str, heads: int) -> None:
         """Where each rank plans its own lengths (a placed pool, or ``kv_gather``'s own queries), so

@@ -288,13 +288,21 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
 
 def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what_cant_split(tmp_path, monkeypatch):
     """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
-    is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
-    is refused."""
+    is copied over SP ranks) where its KV's are over TP x SP, and so do an MLA pool's (its one
+    latent copied too) and its attention's; a resource holding no split strategy is refused."""
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
+    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources() + [
+        KVSpec(resource_key="mla_kv", nodes={NODE}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=LATENT, max_seq_len=256, num_qo_heads=4, max_num_pages=8,
+            page_size=PAGE_SIZE, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE,
+        )),
+        AttentionSpec(resource_key="mla_attn", nodes={NODE}, config=AttentionConfig(
+            kv_cache="mla_kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5,
+        )),
+    ]
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
-    pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
+    pool, mla = (spec for spec in specs if spec.resource_key in (GDN_STATE, "mla_kv"))
     heads = pool.config.blocks["state"].shape[0]
 
     def load(specs):
@@ -304,6 +312,7 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
 
     load(specs)
     assert pool.config.blocks["state"].shape[0] == heads
+    assert mla.config.num_qo_heads == 4
     with pytest.raises(ValueError, match="'dependent'.*does not support steps split over SP ranks"):
         load([*specs, _DependentSpec(resource_key="dependent", nodes={NODE}, supports=True)])
 
@@ -452,7 +461,8 @@ def _cp_attention(
         dependencies["shard"] = SeqShardSpec("shard", {NODE}, ("main",), 0, exchange=exchange)
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies=dependencies,
-        head_shards=joint.tp_group.world_size if placed else joint.world_size,
+        # heads over TP for a pool placed by position or copied (MLA), as the engine shards them
+        head_shards=joint.world_size if kv.storage == "by_head" else joint.tp_group.world_size,
     )
     attn = AttentionManager.build(spec, info)
     placement = kv.config.place(joint, "kv") if placed else None

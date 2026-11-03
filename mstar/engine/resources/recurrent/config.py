@@ -16,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.spec import Storage
 
 
 @dataclass
@@ -288,6 +289,12 @@ class RecurrentStateConfig:
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
+
+    @property
+    def storage(self) -> "Storage":
+        # heads over TP, every SP rank the whole state: decode reads it with no collective, and a
+        # split step leaves every replica the same bytes (`linear_attn.base`)
+        return "copied"
 
     @property
     def resource_class(self) -> "type[Resource]":

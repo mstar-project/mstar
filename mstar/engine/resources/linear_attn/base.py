@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from mstar.distributed.communication import gather_sequence
-from mstar.engine.resources.base import AttentionResource, EngineResourceInfo, Resource, head_shards
+from mstar.engine.resources.base import AttentionResource, EngineResourceInfo, Resource
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnSpec,
@@ -87,9 +87,9 @@ class LinearAttnManager(AttentionResource):
     @classmethod
     def _build_variant(cls, spec: LinearAttnSpec, info: EngineResourceInfo):
         # the pool's own config, not a copy; `shard` is idempotent so both builders can call it.
-        # Heads over TP alone: the pool is copied over SP ranks
+        # Heads over TP alone, the pool's being copied over SP ranks (`head_shards`)
         pool_config = info.dependency(spec.config.recurrent_state).config
-        pool_config.shard(head_shards(info.joint_comm_group, places_positions=True))
+        pool_config.shard(info.head_shards)
 
         backend = spec.config.backend
         if backend is not LinearAttnBackend.FLASHINFER:

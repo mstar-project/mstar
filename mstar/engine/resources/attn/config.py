@@ -108,13 +108,12 @@ class AttentionSpec(NodeResourceSpec):
         return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
-        """Its node's sequence shard's ``exchange`` over its pool's storage; over an MLA pool stored
-        by head, whose one latent every rank holds whole, ``kv_gather`` wherever the node splits."""
+        """Its node's sequence shard's ``exchange`` over its pool's storage; over a pool every rank
+        stores whole (``copied``: MLA's one latent), ``kv_gather`` wherever the node splits."""
         from mstar.engine.resources.sequence_shard import shard_exchange
 
-        kv = specs[self.config.kv_cache]
         exchange = shard_exchange(self, specs)
-        if exchange != "none" and _mla(kv) and not kv.places_positions:
+        if exchange != "none" and specs[self.config.kv_cache].storage == "copied":
             return "kv_gather"
         return exchange
 
@@ -166,11 +165,6 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
-
-
-def _mla(kv: NodeResourceSpec) -> bool:
-    """Whether ``kv`` is a pool of MLA latents."""
-    return getattr(getattr(kv, "config", None), "layout", None) == KVLayout.MLA
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
