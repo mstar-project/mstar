@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -27,7 +27,6 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
     LinearSpExchange,
 )
-from mstar.engine.resources.linear_attn.wrappers import ConvMetadata, conv_metadata
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
 from mstar.engine.resources.sequence_shard import (
@@ -40,6 +39,9 @@ from mstar.engine.resources.sequence_shard import (
 )
 from mstar.engine.resources.step import StepContext
 from mstar.utils.h2d import to_device_nonblocking
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.linear_attn.wrappers import ConvMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,8 @@ class LinearAttnManager(AttentionResource):
     ) -> SplitRows | None:
         """``label``'s split on this rank, or None where the step runs it copied. Raises, at every
         SP size, for a step that doesn't declare the node's shard."""
+        from mstar.engine.resources.linear_attn.wrappers import conv_metadata
+
         if self._shard_key is None:
             return None
         plan = check_shard_plan(f"linear attention over pool {self._pool_key!r}", self._shard_key, ctx)
