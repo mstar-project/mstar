@@ -97,6 +97,8 @@ _HF_KEY_RENAMES: dict[str, str] = {
     "num_attention_heads": "num_qo_heads",
     "num_key_value_heads": "num_kv_heads",
     "intermediate_size": "pali_intermediate_size",
+    # lerobot's name for openpi's action_horizon (50 for pi05_base, 15 for pi05_droid)
+    "chunk_size": "action_horizon",
 }
 
 # Pi05Config field names — computed once from the dataclass.
