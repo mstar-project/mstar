@@ -1017,6 +1017,38 @@ def test_a_placed_pool_keeping_a_window_stripes_its_full_layers_and_keeps_the_wi
         cfg.place(joint, "kv")
 
 
+def test_the_startup_fit_check_pages_a_placed_pools_window_as_the_worker_does():
+    """Placed over 2 SP ranks, a window group's pages hold half the tokens, so a request at full
+    length holds 8 full and 16 window pages rather than 8 and 8: 2 requests and the sink need 49
+    of a 40-page arena, which the check refuses on SP ranks and passes on one rank."""
+    import logging
+
+    from mstar.model.utils import check_kv_pools_fit
+
+    def resources():
+        return [
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=20, page_size=8,
+                context_parallel=True,
+            )),
+            AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+            AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+                kv_cache="kv", sliding_window=8, layers=(1,),
+            )),
+        ]
+
+    model = types.SimpleNamespace(get_node_resources=resources)
+    log = logging.getLogger(__name__)
+    for sp, fits in ((1, True), (P, False)):
+        config = {"max_concurrent_requests": 2,
+                  "node_groups": [{"node_names": [NODE], "ranks": list(range(sp)), "sp_size": sp}]}
+        if fits:
+            check_kv_pools_fit(model, config, "cfg.yaml", log)
+        else:
+            with pytest.raises(ValueError, match="need 25 pages of resources.kv"):
+                check_kv_pools_fit(model, config, "cfg.yaml", log)
+
+
 # the MLA case on CPU runs the MLA wrapper's own torch fallback, which these rows check the same way
 LAYOUTS = pytest.mark.parametrize("mla", [False, True], ids=["gqa", "mla"])
 
