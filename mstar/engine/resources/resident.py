@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain
 
 import numpy as np
@@ -124,36 +124,61 @@ class ResidentTable:
         return slot * self.stride + self.col + col
 
 
-class ResidentWrites:
-    """What one step changes. ``rows`` are rewritten whole by `flush`, from
-    their first column; ``cells`` and ``values`` are single cells, which ride
-    the graph's own scatter."""
+class ResidentStream:
+    """One resource's stream on a resident bucket's steps, fixed by its capture."""
 
-    __slots__ = ("label", "rows", "cells", "values", "kv_len")
+    __slots__ = ("label", "reads")
 
-    def __init__(self, label: str):
+    def __init__(self, label: str, reads: bool):
         self.label = label
-        self.rows: list[tuple[int, list[int]]] = []
+        # declared at span 0: the step reads the stream and appends nothing
+        self.reads = reads
+
+
+class ResidentWrites:
+    """What one step changes. ``rows`` are runs (slot, first column, cells)
+    that `flush` writes whole; ``cells`` and ``values`` are single cells, which
+    ride the graph's own scatter. ``streams`` is each resource's stream, by
+    resource key."""
+
+    __slots__ = ("streams", "rows", "cells", "values", "kv_len")
+
+    def __init__(self, streams: Mapping[str, ResidentStream]):
+        self.streams = streams
+        self.rows: list[tuple[int, int, list[int]]] = []
         self.cells: list[int] = []
         self.values: list[int] = []
-        # the stored length of the row being rewritten, for the owners after the KV cache
-        self.kv_len = 0
+        # each KV pool's stored length of the row being rewritten, for the owners after it
+        self.kv_len: dict[str, int] = {}
 
     def put(self, cell: int, value: int) -> None:
         self.cells.append(cell)
         self.values.append(value)
 
+    def run(self, slot: int, col: int, cells: list[int]) -> None:
+        """``slot``'s row from column ``col``. A run that starts where the one
+        before it ends joins it, so a row of narrow cells and one block table
+        is still one copy. Takes ``cells``, which a later run may extend."""
+        rows = self.rows
+        if rows:
+            last_slot, last_col, last = rows[-1]
+            if last_slot == slot and last_col + len(last) == col:
+                last.extend(cells)
+                return
+        rows.append((slot, col, cells))
+
 
 @dataclass(slots=True)
 class ResidentBuffers:
-    """What one (bucket, slot) capture reads per step. ``cells`` is `[2, 2 * bs]`,
-    flat cells then values, so a step's single-cell writes are one copy: a row
-    has at most a length and a new column to write. Unused entries write zero
+    """What one (bucket, slot) capture reads per step. ``cells`` is flat cells
+    then values, so a step's single-cell writes are one copy: a row has at most
+    a length and a new column to write per KV pool. Unused entries write zero
     to cell zero, a trash cell, and ``dirty`` says whether any entry is in use."""
     slots: torch.Tensor
     cells: torch.Tensor
-    # the rows' stored lengths this step: the graph writes them, for what reads them after
-    kv_len: torch.Tensor
+    # each KV pool's stored lengths of the rows this step, by resource key: the
+    # graph writes them, for what reads them after
+    kv_len: dict[str, torch.Tensor]
     # the host row ``slots`` holds: a steady batch keeps one array, so no H2D and no compare
     staged: np.ndarray | None = None
     dirty: bool = False
@@ -171,8 +196,8 @@ class ResidentPlan:
     # rows written whole by this plan, and rows whose length alone it refreshes
     taken: set[int]
     moved: set[int]
-    # (rows, pages after the step) of the step's crossings, for `resident_advance`
-    crossed: tuple[np.ndarray, np.ndarray] | None = None
+    # each KV pool's (rows, pages after the step) of its crossings, for `resident_advance`
+    crossed: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -180,14 +205,17 @@ class CapturedResidentStep:
     """What one capture's kernels share, at warmup and capture only."""
     bucket: BucketKey
     slot: int
-    label: str
     slots: torch.Tensor
     buffers: ResidentBuffers
-    # the store and the block table, for attention that reads a row's pages itself
-    store: torch.Tensor | None = None
-    block_table: ResidentTable | None = None
-    # set by an owner whose kernel runs off the tables alone: nothing plans this bucket
-    host_plan_free: bool = False
+    store: torch.Tensor
+    # each resource's stream, by resource key
+    streams: Mapping[str, ResidentStream]
+    # each KV pool's block table, by resource key, for attention that reads a row's pages itself
+    block_tables: dict[str, ResidentTable] = field(default_factory=dict)
+    # How each attention read its pages: off the tables alone, or through a
+    # host plan of the step. Nothing plans the bucket only if none needed one.
+    reads_tables: bool = False
+    host_planned: bool = False
 
 
 class ResidentPlanner:
@@ -213,12 +241,17 @@ class ResidentPlanner:
         self.device = device
         # request rows plus the trash row
         self.max_slots = 2 * max_bs + 1
+        self._keys = tuple(resources)
         self._owners = tuple(resources.values())
         self._tables: list[ResidentTable] = []
+        # the KV pools whose stored lengths a capture gathers, as they bind
+        self._length_keys: list[str] = []
         self._store: torch.Tensor | None = None
         # columns of the one-cell tables, which a rewritten row always covers
         self.narrow_cols = 0
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
+        # each resource's stream on a bucket's steps, by bucket then resource key, from its capture
+        self._streams: dict[BucketKey, dict[str, ResidentStream]] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
 
@@ -241,12 +274,12 @@ class ResidentPlanner:
         self._last_rids: tuple[int, ...] | None = None
         self._last_slots: np.ndarray | None = None
 
-        for resource in self._owners:
-            resource.bind_resident(self)
+        for key, resource in resources.items():
+            resource.bind_resident(self, key)
         self._seal()
         # the largest flush up front, plus a cells row: growing the stager waits
         # out its copies, which on the GPU thread would be a sync in the step path
-        self._stager = PinnedStager(torch.long, numel=max_bs * self._stride + 4 * max_bs)
+        self._stager = PinnedStager(torch.long, numel=max_bs * self._stride + 2 * self._cells_width(max_bs))
 
     # Tables
 
@@ -258,11 +291,16 @@ class ResidentPlanner:
         self._tables.append(table)
         return table
 
+    def length_table(self, key: str) -> ResidentTable:
+        """KV pool ``key``'s table of stored lengths, which each capture
+        gathers into a buffer of its own (`ResidentBuffers.kv_len`)."""
+        self._length_keys.append(key)
+        return self.table()
+
     def _seal(self) -> None:
-        # the one wide table last, so a row's used cells are contiguous from column 0
+        # The narrow tables first, then a span per wide table, so a row's used
+        # cells are a run per span and the narrow cells join the first one.
         wide = [t for t in self._tables if t.width > 1]
-        if len(wide) > 1:
-            raise ValueError("a resident row holds one wide table")
         narrow = [t for t in self._tables if t.width == 1]
         self.narrow_cols = len(narrow)
         stride = self._stride = sum(t.width for t in self._tables)
@@ -363,15 +401,21 @@ class ResidentPlanner:
 
     # The step
 
+    def _cells_width(self, bs: int) -> int:
+        """Single-cell writes a step of ``bs`` rows can queue: a length and a
+        new column a row per KV pool."""
+        return 2 * bs * max(1, len(self._length_keys))
+
     def buffers(self, bucket: BucketKey, slot: int) -> ResidentBuffers:
         """The per-step rows of one capture, every slot at the trash row until staged."""
         key = (bucket, slot)
         found = self._buffers.get(key)
         if found is None:
+            bs, device = bucket.bs, self.device
             found = self._buffers[key] = ResidentBuffers(
-                slots=torch.full((bucket.bs,), TRASH_SLOT, dtype=torch.long, device=self.device),
-                cells=torch.zeros((2, 2 * bucket.bs), dtype=torch.long, device=self.device),
-                kv_len=torch.zeros(bucket.bs, dtype=torch.long, device=self.device),
+                slots=torch.full((bs,), TRASH_SLOT, dtype=torch.long, device=device),
+                cells=torch.zeros((2, self._cells_width(bs)), dtype=torch.long, device=device),
+                kv_len={pool: torch.zeros(bs, dtype=torch.long, device=device) for pool in self._length_keys},
             )
         return found
 
@@ -389,7 +433,7 @@ class ResidentPlanner:
                 return
             # the step it was for never ran, or something ran first
             self._restore(staged)
-        plan = self._build(rids, key, step.segments[0].label, ctx)
+        plan = self._build(rids, key, self._streams[lease.bucket], ctx)
         ctx.resident_plan = plan
         if ctx.is_preplan:
             self._staged = plan
@@ -414,7 +458,7 @@ class ResidentPlanner:
         if buffers is not None:
             buffers.staged = None
 
-    def _build(self, rids: tuple[int, ...], key: tuple, label: str, ctx) -> ResidentPlan:
+    def _build(self, rids: tuple[int, ...], key: tuple, streams: Mapping[str, ResidentStream], ctx) -> ResidentPlan:
         lease = ctx.slot_lease
         laps = PhaseLaps(f"{ctx.plan_phase}.resident.")
         with self._lock:
@@ -443,7 +487,7 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
-        plan = ResidentPlan(key, rids, slots, seq, self._commits, ResidentWrites(label), taken, refreshed)
+        plan = ResidentPlan(key, rids, slots, seq, self._commits, ResidentWrites(streams), taken, refreshed)
         laps.lap("rows")
         try:
             for rid, slot in rows:
@@ -466,12 +510,13 @@ class ResidentPlanner:
         return plan
 
     def rewrite(self, rid: int, slot: int, writes: ResidentWrites) -> None:
-        """Queue ``rid``'s row whole. The narrow columns come first, then the
-        wide table's used cells, which its owner appends."""
+        """Queue ``rid``'s row whole: the narrow columns as one run, which the
+        owners fill, and each wide table's used cells as a run its owner adds."""
         row = [0] * self.narrow_cols
+        if row:
+            writes.run(slot, 0, row)
         for resource in self._owners:
             resource.resident_row(rid, slot, row, writes)
-        writes.rows.append((slot, row))
 
     def _stage_cells(self, plan: ResidentPlan, buffers: ResidentBuffers) -> None:
         """One copy, on the plan stream: the graph scatters these first thing."""
@@ -491,9 +536,9 @@ class ResidentPlanner:
         rows = plan.writes.rows
         if not rows:
             return
-        stride = self._stride
-        dsts = [self._store[slot * stride: slot * stride + len(row)] for slot, row in rows]
-        self._stager.copy_runs_(dsts, np.fromiter(chain.from_iterable(r for _, r in rows), dtype=np.int64))
+        stride, store = self._stride, self._store
+        dsts = [store[slot * stride + col: slot * stride + col + len(cells)] for slot, col, cells in rows]
+        self._stager.copy_runs_(dsts, np.fromiter(chain.from_iterable(c for _, _, c in rows), dtype=np.int64))
 
     def commit(self, step: SubmoduleStep, ctx) -> None:
         """After the resources' commit, before the step's commit event: the
@@ -525,18 +570,13 @@ class ResidentPlanner:
 
     def capture_step(self, bucket: BucketKey, slot: int, step: SubmoduleStep) -> CapturedResidentStep:
         """What a capture of ``bucket`` records around its forward. Refuses a
-        walk whose declared step isn't one token per row in one stream, each
-        row advancing alone: a captured step can't hold anything else."""
+        walk whose declared step isn't, for each resource, one stream that it
+        appends one token a row to or only reads, each row advancing alone: a
+        captured step can't hold anything else."""
         if step is None:
             raise ValueError(f"resident walk {bucket.graph_walk!r} on {self.node} declares no step")
-        segments = step.segments or next(iter(step.steps.values())).segments
-        labels = {seg.label for seg in segments}
-        if len(labels) != 1 or any(seg.span != 1 for seg in segments):
-            raise ValueError(
-                f"resident walk {bucket.graph_walk!r} on {self.node} declares "
-                f"{len(segments)} segments over labels {sorted(labels)}; a resident step is "
-                "one token per row in one stream"
-            )
+        # once per bucket: each of its captures, and every step it replays, reads these
+        streams = self._streams.get(bucket) or self._declared_streams(bucket, step)
         for key, resource_step in step.steps.items():
             refusal = next(
                 (
@@ -551,13 +591,37 @@ class ResidentPlanner:
                     f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "
                     f"{refusal}, which a resident step can't carry"
                 )
+        self._streams[bucket] = streams
         buffers = self.buffers(bucket, slot)
-        return CapturedResidentStep(bucket, slot, labels.pop(), buffers.slots, buffers)
+        return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams)
+
+    def _declared_streams(self, bucket: BucketKey, step: SubmoduleStep) -> dict[str, ResidentStream]:
+        """Each resource's stream on ``bucket``'s steps: the label of its own
+        segments, or of the step's when it names none, and whether it appends
+        one token a row (span 1) or only reads (span 0)."""
+        streams = {}
+        for key in self._keys:
+            resource_step = step.steps.get(key)
+            segments = (resource_step.segments if resource_step is not None else None) or step.segments or ()
+            labels = {seg.label for seg in segments}
+            spans = {seg.span for seg in segments}
+            if len(labels) != 1 or spans not in ({1}, {0}):
+                raise ValueError(
+                    f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "
+                    f"{len(segments)} segments over labels {sorted(labels)} and spans {sorted(spans)}; "
+                    "a resident step is one token per row in one stream a resource, or a stream it only reads"
+                )
+            streams[key] = ResidentStream(labels.pop(), reads=spans == {0})
+        return streams
 
     def gather(self, step: CapturedResidentStep) -> None:
+        if self._length_keys:
+            # before the owners' reads: a row that crossed writes into its new
+            # page. Only a KV pool queues single cells.
+            scatter_cells(self._store, step.buffers.cells)
         for resource in self._owners:
             resource.resident_gather(step)
-        if step.host_plan_free:
+        if step.reads_tables and not step.host_planned:
             self.host_plan_free.add(step.bucket)
 
     def commit_in_graph(self, step: CapturedResidentStep) -> None:

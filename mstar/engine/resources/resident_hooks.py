@@ -22,13 +22,16 @@ class ResidentHooks:
         """Why a node holding this resource can't run on resident tables, or None if it can."""
         return f"{type(self).__name__} keeps no resident table"
 
-    def bind_resident(self, planner: ResidentPlanner) -> None:
-        """Declare this resource's tables on the node's planner, once, at load."""
+    def bind_resident(self, planner: ResidentPlanner, key: str) -> None:
+        """Declare this resource's tables on the node's planner, once, at load.
+        ``key`` is its resource key, under which each step and capture name its
+        stream (`ResidentWrites.streams`, `CapturedResidentStep.streams`)."""
         return
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
         """Set this resource's cells of ``rid``'s row: it is new or stale. ``row``
-        has the planner's narrow columns; the owner of the wide table appends."""
+        has the planner's narrow columns; the owner of a wide table queues its
+        used cells as a run of their own (`ResidentWrites.run`)."""
         return
 
     def resident_stage(self, plan: ResidentPlan) -> None:
@@ -38,7 +41,9 @@ class ResidentHooks:
 
     def resident_gather(self, step: CapturedResidentStep) -> None:
         """Record, inside the capture, the reads that fill what the step's forward
-        addresses. Runs at warmup and capture only; a replay repeats the kernels."""
+        addresses. Runs at warmup and capture only; a replay repeats the kernels.
+        An attention sets `CapturedResidentStep.reads_tables` or ``host_planned``,
+        for whether its kernel reads its pages off the tables or a host plan."""
         return
 
     def resident_commit(self, step: CapturedResidentStep) -> None:

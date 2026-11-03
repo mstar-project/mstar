@@ -577,7 +577,7 @@ def test_the_captured_kernels_match_the_torch_ops():
         gather_column(store, slots, 7, 2, small, plus=out)
         advance_column(store, slots, 7, 1)
         tables = SimpleNamespace(
-            planner=SimpleNamespace(store=store), page_size=4,
+            planner=SimpleNamespace(store=store), page_size=4, key="kv",
             block_table=SimpleNamespace(stride=7, col=3), kv_len=SimpleNamespace(stride=7, col=1),
         )
         store[slots * 7 + 1] = torch.tensor([9, 5, 0, 0], device=device)
@@ -585,8 +585,8 @@ def test_the_captured_kernels_match_the_torch_ops():
         offsets = torch.zeros(4, dtype=torch.long, device=device)
         step = SimpleNamespace(
             slots=slots, bucket=SimpleNamespace(bs=4), buffers=SimpleNamespace(
-                cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len=out,
-            ),
+                cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len={"kv": out},
+            ), streams={"kv": resident_mod.ResidentStream("main", reads=False)}, block_tables={},
         )
         KVResidentTables.gather(tables, step, pages, offsets)
         return [t.tolist() for t in (store, out, small, pages, offsets)]
@@ -897,7 +897,7 @@ def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
     stride = planner._tables[0].stride
     assert planner._stager._numel >= 4 * stride + 4 * 4
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
-    rows = [(slot, list(range(stride))) for slot in range(1, 5)]
+    rows = [(slot, 0, list(range(stride))) for slot in range(1, 5)]
     plan = SimpleNamespace(writes=SimpleNamespace(rows=rows))
     planner.flush(plan)
     assert planner.store.view(9, stride)[1:5].tolist() == [list(range(stride))] * 4
@@ -915,7 +915,7 @@ def test_a_flush_of_the_largest_step_stages_on_the_device_without_growing(monkey
     planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=4)
     stride = planner._tables[0].stride
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
-    rows = [(slot, list(range(100, 100 + stride))) for slot in range(1, 5)]
+    rows = [(slot, 0, list(range(100, 100 + stride))) for slot in range(1, 5)]
     planner.flush(SimpleNamespace(writes=SimpleNamespace(rows=rows)))
     planner._stager.copy_(planner.buffers(BucketKey(WALK, 4, 4), 0).cells, [0] * 16)
     torch.cuda.synchronize()
@@ -951,15 +951,15 @@ def test_a_stream_wider_than_a_row_raises():
     planner = ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
     tables = kv._resident
     assert tables.block_table.width == 2
+    writes = resident_mod.ResidentWrites({"kv": resident_mod.ResidentStream("main", reads=False)})
     with pytest.raises(ValueError, match="fit a block table row"):
-        tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols)
+        tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols, writes)
     plan = SimpleNamespace(
-        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=resident_mod.ResidentWrites("main"),
-        crossed=None,
+        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
     )
     tables.host_len[1], tables.host_cols[1] = 8, 2
     with pytest.raises(ValueError, match="fit a block table row"):
-        tables.stage_step(plan, lambda rid: [1, 2, 3], planner.rewrite)
+        tables.stage_step(plan, lambda rid: 8, lambda rid: [1, 2, 3], planner.rewrite)
     assert not plan.writes.cells
 
 
@@ -1246,6 +1246,406 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
     delta.add_offloaded("1")
     assert engine.apply_resident_delta("n", delta)
     assert planner.slot_of(1) is None
+
+
+# ---- two KV pools on a node ----
+
+def _pool(name: str, max_seq_len: int = 512, max_num_pages: int = 64) -> KVManager:
+    kv = KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
+            max_num_pages=max_num_pages, page_size=PAGE,
+        ),
+        name=name, joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
+    )
+    kv._cg_max_seq_len = 64
+    return kv
+
+
+def _decoder(positions: str = "kv"):
+    """A decoder's resources: the self-attention pool ``kv``, a second pool
+    ``ctx`` holding each request's context, and positions over ``positions``."""
+    rope = RopeManager(PositionConfig(kv_cache=positions), CPU, max_seq_len=512, head_dim=8)
+    rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
+    return {"kv": _pool("kv"), "ctx": _pool("ctx", max_seq_len=64), "rope": rope}
+
+
+def _decoder_setup(prompts: dict[int, tuple[int, int]], positions: str = "kv"):
+    """Each request's prompt and context prefilled on resident resources and a
+    host-planned reference. ``prompts`` is rid -> (prompt tokens, context tokens)."""
+    live, ref = _decoder(positions), _decoder(positions)
+    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "ctx", "rope")}, CPU, max_bs=4)
+    for res in (live, ref):
+        for rid, (prompt, context) in prompts.items():
+            res["kv"].ingest_request(rid, KVReqConfig())
+            res["ctx"].ingest_request(rid, KVReqConfig())
+            res["rope"].ingest_request(rid, None)
+            _decoder_host_step(res, [rid], [prompt], [context])
+    return live, ref, planner
+
+
+def _decoder_host_step(res, rids, spans, context_spans, walk="prefill"):
+    ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
+    segments = tuple(Segment(r, "main", n) for r, n in zip(rids, spans, strict=True))
+    context = tuple(Segment(r, "main", n) for r, n in zip(rids, context_spans, strict=True))
+    kv, cx, rope = KVStep(segments=segments), KVStep(segments=context), PositionStep(segments=segments)
+    assert res["kv"].admit(kv, ctx).ok
+    assert res["ctx"].admit(cx, ctx).ok
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    ctx.plan_results["ctx"] = res["ctx"].plan(cx, ctx)
+    res["rope"].plan(rope, ctx)
+    for key, resource_step in (("kv", kv), ("ctx", cx), ("rope", rope)):
+        res[key].commit(resource_step, ctx)
+    return SubmoduleStep(steps={"kv": kv, "ctx": cx, "rope": rope}, segments=list(segments)), ctx
+
+
+def _decoder_step(res, planner, rids, slot, bs, context_span=0):
+    """One captured decode step: ``kv`` appends a token a row, and ``ctx`` is read
+    at span 0, or appended to as well at span 1. With a planner, the replay of a
+    resident capture; without one, the host plan of the same step."""
+    padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
+    bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
+    lease = SlotLease(slot=slot, bucket=bucket)
+    ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
+    ctx.set_padded_rids(padded)
+    segments = tuple(Segment(r, "main", 1) for r in padded)
+    context = tuple(Segment(r, "main", context_span) for r in padded)
+    kv, cx, rope = KVStep(segments=segments), KVStep(segments=context), PositionStep(segments=segments)
+    step = SubmoduleStep(steps={"kv": kv, "ctx": cx, "rope": rope}, segments=list(segments))
+    assert res["kv"].admit(kv, ctx).ok
+    assert res["ctx"].admit(cx, ctx).ok
+    if (bucket, slot) not in res.setdefault("captured", set()):
+        res["captured"].add((bucket, slot))
+        first = StepContext(request_ids=padded, graph_walk=WALK, slot=slot, capture=True, slot_lease=lease)
+        first.plan_results["kv"] = res["kv"].plan(kv, first)
+        first.plan_results["ctx"] = res["ctx"].plan(cx, first)
+        res["rope"].plan(rope, first)
+    captured = None
+    if planner is not None:
+        captured = planner.capture_step(bucket, slot, step)
+        ctx.resident = planner
+        planner.plan(step, ctx)
+    ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+    ctx.plan_results["ctx"] = res["ctx"].plan(cx, ctx)
+    res["rope"].plan(rope, ctx)
+    if planner is not None:
+        planner.flush(ctx.resident_plan)
+        planner.gather(captured)
+    out = SimpleNamespace(plan=ctx.resident_plan, captured=captured, lens={})
+    ck = CGSlotKey(bucket=bucket, slot=slot, label="main")
+    out.positions = res["rope"]._static_pos_ids[ck][:bs].tolist()
+    for key in ("kv", "ctx") if context_span else ("kv",):
+        state = res[key]._static_plan_state(slot, ("main", 0))
+        out.lens[key] = None
+        setattr(out, f"{key}_pages", state.token_to_page[:bs].tolist())
+        setattr(out, f"{key}_offsets", state.token_to_cache[:bs].tolist())
+    if planner is not None:
+        out.lens = {key: lens[:bs].tolist() for key, lens in captured.buffers.kv_len.items()}
+        planner.commit_in_graph(captured)
+    for key, resource_step in (("kv", kv), ("ctx", cx), ("rope", rope)):
+        res[key].commit(resource_step, ctx)
+    if planner is not None:
+        planner.commit(step, ctx)
+    return out
+
+
+def _assert_pool_row(planner, live, key: str, rid: int) -> None:
+    """``key``'s cells of ``rid``'s row hold its stream: the stored length, and
+    every page holding a token."""
+    tables, stream = live[key]._resident, live[key]._streams[rid]["main"]
+    slot = planner.slot_of(rid)
+    n = int(tables.kv_len.view[slot, 0])
+    assert n == stream.stored_len
+    assert tables.block_table.view[slot, : -(-n // PAGE)].tolist() == stream.page_indices[: -(-n // PAGE)]
+
+
+def _assert_trash_row(live) -> None:
+    for key in ("kv", "ctx"):
+        tables = live[key]._resident
+        assert int(tables.kv_len.view[TRASH_SLOT, 0]) == 0
+        assert tables.block_table.view[TRASH_SLOT].eq(SINK_PAGE).all()
+
+
+def test_two_pools_lay_out_a_span_each_after_the_narrow_columns():
+    live, _, planner = _decoder_setup({})
+    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    assert planner.narrow_cols == 3
+    assert kv.block_table.col == 3 and kv.block_table.width == 63
+    assert ctx.block_table.col == 3 + 63 and ctx.block_table.width == 16
+    assert planner._stride == 3 + 63 + 16
+    assert {kv.kv_len.col, ctx.kv_len.col, live["rope"]._resident_delta.col} == {0, 1, 2}
+    for table in (kv.block_table, ctx.block_table, kv.kv_len, ctx.kv_len):
+        assert table.view.data_ptr() == planner.store.data_ptr() + 8 * table.col
+
+
+def test_a_self_attention_pool_and_a_context_pool_run_through_captured_steps():
+    """``kv`` appends a token a step, ``ctx`` is read: every step addresses what
+    the host plan does and gathers both pools' lengths, a padding row reads the
+    trash row, and after every step both rows hold their streams."""
+    prompts = {1: (3, 9), 2: (6, 13), 3: (8, 1)}
+    live, ref, planner = _decoder_setup(prompts)
+    rids, contexts = [1, 2, 3], [9, 13, 1]
+    crossed = 0
+    for t in range(14):
+        before = [live["kv"]._streams[rid]["main"].stored_len for rid in rids]
+        a = _decoder_step(live, planner, rids, slot=t % 2, bs=4)
+        b = _decoder_step(ref, None, rids, slot=t % 2, bs=4)
+        assert a.kv_pages[:3] == b.kv_pages[:3] and a.kv_offsets[:3] == b.kv_offsets[:3]
+        assert a.positions[:3] == b.positions[:3]
+        assert a.lens == {"kv": before + [0], "ctx": contexts + [0]}
+        # the padding row
+        assert (a.kv_pages[3], a.kv_offsets[3], a.positions[3]) == (SINK_PAGE, 0, 0)
+        assert set(a.plan.crossed) <= {"kv"}
+        crossed += "kv" in a.plan.crossed
+        for rid in rids:
+            _assert_pool_row(planner, live, "kv", rid)
+            _assert_pool_row(planner, live, "ctx", rid)
+        _assert_trash_row(live)
+    ctx = live["ctx"]._resident
+    assert [int(ctx.host_len[planner.slot_of(rid)]) for rid in rids] == contexts
+    assert crossed >= 3
+
+
+def test_a_crossing_on_the_appending_pool_writes_its_table_alone():
+    live, ref, planner = _decoder_setup({1: (2, 9)})
+    del ref
+    for t in range(2):
+        _decoder_step(live, planner, [1], slot=t % 2, bs=1)
+    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    slot = planner.slot_of(1)
+    held = planner.store.view(planner.max_slots, planner._stride)[slot].clone()
+    # stored 4 of a page of 4: this step's token goes to the row's second page
+    s = _decoder_step(live, planner, [1], slot=0, bs=1)
+    assert list(s.plan.crossed) == ["kv"]
+    assert s.plan.writes.cells == [kv.block_table.cell(slot, 1)]
+    row = planner.store.view(planner.max_slots, planner._stride)[slot]
+    changed = (row != held).nonzero().flatten().tolist()
+    assert changed == [kv.kv_len.col, kv.block_table.col + 1]
+    assert row[ctx.block_table.col: ctx.block_table.col + 3].tolist() == live["ctx"]._streams[1]["main"].page_indices
+    _assert_pool_row(planner, live, "kv", 1)
+    _assert_pool_row(planner, live, "ctx", 1)
+
+
+def test_a_stale_row_is_rewritten_whole_with_both_spans():
+    live, ref, planner = _decoder_setup({1: (3, 9), 2: (6, 13)})
+    del ref
+    for t in range(3):
+        _decoder_step(live, planner, [1, 2], slot=t % 2, bs=2)
+    slot = planner.slot_of(2)
+    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    # whatever the device row held, a stale row comes back from the streams
+    planner.store.view(planner.max_slots, planner._stride)[slot].fill_(77)
+    planner.mark_stale(2)
+    s = _decoder_step(live, planner, [1, 2], slot=1, bs=2)
+    runs = [(col, len(cells)) for row_slot, col, cells in s.plan.writes.rows if row_slot == slot]
+    assert runs == [(0, 3 + 9 // PAGE + 1), (ctx.block_table.col, 4)]
+    assert kv.block_table.col == 3
+    _assert_pool_row(planner, live, "kv", 2)
+    _assert_pool_row(planner, live, "ctx", 2)
+    assert int(live["rope"]._resident_delta.view[slot, 0]) == 0
+    _assert_pool_row(planner, live, "kv", 1)
+
+
+def test_a_context_moved_by_a_host_step_is_rewritten_and_an_unmoved_one_is_not():
+    """A host step that ran a row one token leaves it to the next resident step
+    to refresh; the context pool compares its own stream, which nothing but a
+    host step moves, and rewrites the row only if it changed."""
+    live, ref, planner = _decoder_setup({1: (3, 9), 2: (6, 13)})
+    del ref
+    for t in range(2):
+        _decoder_step(live, planner, [1, 2], slot=t % 2, bs=2)
+    # one token on each self stream; request 2's context grows by a page's worth, 1's doesn't
+    step, ctx = _decoder_host_step(live, [1, 2], [1, 1], [0, 5], walk="mixed")
+    planner.commit(step, ctx)
+    assert planner._moved == {1, 2}
+    s = _decoder_step(live, planner, [1, 2], slot=0, bs=2)
+    assert s.plan.taken == {2}
+    assert s.lens["ctx"] == [9, 18]
+    for rid in (1, 2):
+        _assert_pool_row(planner, live, "kv", rid)
+        _assert_pool_row(planner, live, "ctx", rid)
+
+
+def test_a_context_the_step_only_reads_has_no_advance_and_no_write_addressing():
+    live, ref, planner = _decoder_setup({1: (3, 7)})
+    del ref
+    ctx = live["ctx"]._resident
+    for t in range(6):
+        s = _decoder_step(live, planner, [1], slot=t % 2, bs=2)
+    slot = planner.slot_of(1)
+    assert int(ctx.kv_len.view[slot, 0]) == int(ctx.host_len[slot]) == 7
+    assert int(ctx.host_cols[slot]) == 2
+    assert s.captured.streams["ctx"].reads and not s.captured.streams["kv"].reads
+    assert "ctx" in s.captured.block_tables and "kv" in s.captured.block_tables
+
+
+@pytest.mark.parametrize("positions", ["kv", "ctx"])
+def test_positions_follow_the_pool_their_config_names(positions):
+    """Two pools that both append, at different lengths: the position offset is
+    taken against, and gathered with, the length of the pool positions name."""
+    live, ref, planner = _decoder_setup({1: (3, 11), 2: (9, 2)}, positions=positions)
+    for t in range(8):
+        a = _decoder_step(live, planner, [1, 2], slot=t % 2, bs=4, context_span=1)
+        b = _decoder_step(ref, None, [1, 2], slot=t % 2, bs=4, context_span=1)
+        assert a.positions[:2] == b.positions[:2]
+        for key in ("kv", "ctx"):
+            assert getattr(a, f"{key}_pages")[:2] == getattr(b, f"{key}_pages")[:2]
+            assert getattr(a, f"{key}_offsets")[:2] == getattr(b, f"{key}_offsets")[:2]
+    assert planner.buffers(BucketKey(WALK, 4, 4), 0).cells.shape == (2, 2 * 4 * 2)
+
+
+def test_positions_over_a_pool_the_step_only_reads_refuse_at_capture():
+    live, ref, planner = _decoder_setup({1: (3, 7)}, positions="ctx")
+    del ref
+    with pytest.raises(ValueError, match="advance with the stream"):
+        _decoder_step(live, planner, [1], slot=0, bs=1)
+
+
+def test_capture_takes_a_label_for_each_resource():
+    live, _, planner = _decoder_setup({})
+    del live
+    rows = [Segment(1, "self", 1)]
+    step = SubmoduleStep(
+        steps={"kv": KVStep(), "ctx": KVStep(segments=(Segment(1, "context", 0),)), "rope": PositionStep()},
+        segments=rows,
+    )
+    captured = planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
+    streams = {key: (s.label, s.reads) for key, s in captured.streams.items()}
+    assert streams == {"kv": ("self", False), "ctx": ("context", True), "rope": ("self", False)}
+    assert planner._streams[BucketKey(WALK, 1, 1)] is captured.streams
+
+
+def test_capture_refuses_two_labels_on_one_resource():
+    live, _, planner = _decoder_setup({})
+    del live
+    rows = [Segment(1, "main", 1)]
+    two = (Segment(1, "main", 1), Segment(1, "aux", 1))
+    step = SubmoduleStep(steps={"kv": KVStep(segments=two), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
+    with pytest.raises(ValueError, match="resource 'kv' declares 2 segments over labels"):
+        planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
+    mixed = (Segment(1, "main", 1), Segment(2, "main", 0))
+    step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(segments=mixed), "rope": PositionStep()}, segments=rows)
+    with pytest.raises(ValueError, match="resource 'ctx'"):
+        planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
+
+
+class _Fmha:
+    """A captured fmha decode wrapper's gather, recorded."""
+
+    def __init__(self):
+        self.calls = []
+
+    def gather_resident(self, store, slots, kv_len, stride, block_col):
+        self.calls.append((kv_len, block_col))
+
+
+def _fmha_manager(pool: str, wrapper):
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._kv_cache_name = pool
+    manager._cg_plan_states = {CGSlotKey(bucket=BucketKey(WALK, 2, 2), slot=0, label="main"): wrapper}
+    return manager
+
+
+@pytest.mark.parametrize("pool", ["kv", "ctx"])
+def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool):
+    from mstar.engine.resources.attn import flashinfer as flashinfer_mod
+
+    monkeypatch.setattr(flashinfer_mod, "FmhaDecodeWrapper", _Fmha)
+    live, _, planner = _decoder_setup({})
+    wrapper = _Fmha()
+    manager = _fmha_manager(pool, wrapper)
+    segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
+    # both pools append here, so either can be read off the tables
+    step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=segments)
+    captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
+    for key in ("kv", "ctx"):
+        live[key].resident_gather(captured)
+    manager.resident_gather(captured)
+    assert wrapper.calls == [(captured.buffers.kv_len[pool], live[pool]._resident.block_table.col)]
+    assert captured.reads_tables and not captured.host_planned
+
+
+def test_an_fmha_wrapper_over_a_pool_the_step_only_reads_keeps_its_host_plan(monkeypatch):
+    from mstar.engine.resources.attn import flashinfer as flashinfer_mod
+
+    monkeypatch.setattr(flashinfer_mod, "FmhaDecodeWrapper", _Fmha)
+    _, _, planner = _decoder_setup({})
+    wrapper = _Fmha()
+    manager = _fmha_manager("ctx", wrapper)
+    segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
+    context = (Segment(1, "main", 0), Segment(2, "main", 0))
+    steps = {"kv": KVStep(), "ctx": KVStep(segments=context), "rope": PositionStep()}
+    captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps=steps, segments=segments))
+    manager.resident_gather(captured)
+    assert not wrapper.calls and captured.host_planned
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel runs on CUDA")
+def test_the_fmha_gather_kernel_reads_the_second_pools_table():
+    from mstar.engine.resources.attn.wrappers import FmhaDecodeWrapper
+
+    device = torch.device("cuda")
+    store = torch.zeros(5 * 20, dtype=torch.long, device=device)
+    rows = store.view(5, 20)
+    # the first pool's table at columns 4-9 and the second's at 10-19, one row of each per slot
+    rows[:, 4:10] = torch.arange(5 * 6, device=device).view(5, 6) + 1000
+    rows[:, 10:20] = torch.arange(5 * 10, device=device).view(5, 10) + 2000
+    wrapper = FmhaDecodeWrapper.__new__(FmhaDecodeWrapper)
+    wrapper.batch_size, wrapper._page_size = 3, 4
+    wrapper._table = torch.zeros((3, 10), dtype=torch.int32, device=device)
+    wrapper._lens = torch.zeros(3, dtype=torch.int32, device=device)
+    slots = torch.tensor([2, 4, 0], device=device)
+    kv_len = torch.tensor([5, 12, 0], device=device)
+    wrapper.gather_resident(store, slots, kv_len, 20, 10)
+    torch.cuda.synchronize()
+    assert wrapper._lens.tolist() == [6, 13, 1]
+    assert wrapper._table[0, :2].tolist() == rows[2, 10:12].tolist()
+    assert wrapper._table[1, :4].tolist() == rows[4, 10:14].tolist()
+    assert wrapper._table[2, :1].tolist() == rows[0, 10:11].tolist()
+
+
+class _Attention(Resource):
+    @classmethod
+    def build(cls, spec, info):
+        return cls()
+
+    def __init__(self, reads_tables: bool):
+        self._reads = reads_tables
+
+    def resident_refusal(self):
+        return None
+
+    def resident_gather(self, step):
+        if self._reads:
+            step.reads_tables = True
+        else:
+            step.host_planned = True
+
+
+@pytest.mark.parametrize("attentions,free", [
+    ((True,), True), ((True, True), True), ((True, False), False), ((False, True), False), ((), False),
+])
+def test_a_bucket_is_host_plan_free_only_when_every_attention_reads_the_tables(attentions, free):
+    resources = {f"attn{i}": _Attention(reads) for i, reads in enumerate(attentions)}
+    planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=2)
+    step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
+    planner.gather(planner.capture_step(BucketKey(WALK, 1, 1), 0, step))
+    assert (BucketKey(WALK, 1, 1) in planner.host_plan_free) is free
+
+
+def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    manager._kv_cache_name, manager._query_kv_cache_name = "ctx", "kv"
+    assert manager.resident_refusal() is None
+    manager._query_kv_cache_name = "ctx"
+    assert "second stream" in manager.resident_refusal()
+    step = SimpleNamespace(reads_tables=False, host_planned=False)
+    FlashInferCrossManager.resident_gather(manager, step)
+    assert step.host_planned and not step.reads_tables
 
 
 # ---- refusals ----

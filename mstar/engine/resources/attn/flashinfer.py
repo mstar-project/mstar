@@ -104,11 +104,15 @@ class FlashInferManager(AttentionManager):
         return None
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label))
-        if isinstance(wrapper, FmhaDecodeWrapper):
-            table = step.block_table
-            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len, table.stride, table.col)
-            step.host_plan_free = True
+        # planned per label of its KV cache's plan, so its wrapper is under that stream's label
+        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.reads_tables = True
+        else:
+            step.host_planned = True
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,

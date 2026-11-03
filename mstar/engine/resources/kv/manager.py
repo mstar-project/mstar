@@ -2947,7 +2947,8 @@ class KVManager(AttentionResource):
             for g, outputs in enumerate(res.groups):
                 self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
         else:
-            # the replay fills the slot's addressing, so no reuse may skip re-staging it
+            # the replay fills the slot's addressing (a stream the step only
+            # reads has none), so no reuse may skip re-staging it
             for label in res:
                 self._staged_outputs.pop((ctx.slot_lease.slot, (label, 0)), None)
         laps.lap("setup_states")
@@ -4512,39 +4513,50 @@ class KVManager(AttentionResource):
             return "a pool read across nodes takes pages a resident row doesn't track"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner") -> None:
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
         # the pool's own context or override (not the serving config's top-level
         # `max_seq_len`), and a stream's pages are distinct pages of the pool
         width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
-        self._resident = KVResidentTables(planner, page_size, width)
+        self._resident = KVResidentTables(planner, key, page_size, width)
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        stream = self._streams[rid][writes.label]
+        tables = self._resident
+        label = writes.streams[tables.key].label
+        stream = self._streams[rid][label]
         if stream.released:
             raise ValueError(
-                f"KV {self.name}: {rid}/{writes.label} released {stream.released} tokens, "
+                f"KV {self.name}: {rid}/{label} released {stream.released} tokens, "
                 "which a block table row can't address"
             )
-        writes.kv_len = stream.stored_len
-        self._resident.row(stream.stored_len, stream.page_indices, slot, row)
+        tables.row(stream.stored_len, stream.page_indices, slot, row, writes)
 
     def resident_stage(self, plan: "ResidentPlan") -> None:
-        tables, streams, label = self._resident, self._streams, plan.writes.label
-        planner = tables.planner
-        for rid in plan.moved:
-            tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
-        tables.stage_step(plan, lambda rid: streams[rid][label].page_indices, planner.rewrite)
+        tables, streams = self._resident, self._streams
+        stream = plan.writes.streams[tables.key]
+        label, planner = stream.label, tables.planner
+        if not stream.reads:
+            for rid in plan.moved:
+                tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
+        tables.stage_step(
+            plan, lambda rid: streams[rid][label].stored_len, lambda rid: streams[rid][label].page_indices,
+            planner.rewrite,
+        )
         if _DEBUG_ASSERTS:
             for rid, slot in zip(plan.rids, plan.slots.tolist(), strict=True):
                 held, stored = int(tables.host_len[slot]), streams[rid][label].stored_len
                 assert held == stored, f"KV {self.name}: resident row of {rid} at {held}, its stream at {stored}"
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        state = self._static_plan_state(step.slot, (step.label, 0))
-        self._resident.gather(step, state.token_to_page, state.token_to_cache)
+        tables = self._resident
+        stream = step.streams[tables.key]
+        if stream.reads:
+            tables.gather(step, None, None)
+            return
+        state = self._static_plan_state(step.slot, (stream.label, 0))
+        tables.gather(step, state.token_to_page, state.token_to_cache)
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)

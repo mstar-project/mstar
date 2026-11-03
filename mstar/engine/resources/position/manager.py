@@ -367,19 +367,29 @@ class RopeManager(PositionManager):
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner") -> None:
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         self._resident_store = planner
+        self._resident_key = key
         self._resident_delta = planner.table()
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        row[self._resident_delta.col] = self.position(rid, writes.label) - writes.kv_len
+        # the KV pool binds ahead of this, its dependent, and sets its length first
+        label = writes.streams[self._resident_key].label
+        row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label)
+        own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
+        if own.label != pool.label or own.reads or pool.reads:
+            # the offset holds only while both advance a token a step, as one stream
+            raise ValueError(
+                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
+                "a resident step's positions advance with the stream their KV cache appends to"
+            )
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
         table = self._resident_delta
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
-            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len,
+            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
