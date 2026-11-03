@@ -51,6 +51,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.video_encode import mux_rgb_frames
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -501,11 +502,7 @@ class Wan22Model(Model):
         stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
         stream.height, stream.width = frames.shape[1], frames.shape[2]
         stream.pix_fmt = "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():  # flush encoder delay
-            container.mux(packet)
+        mux_rgb_frames(container, stream, frames)
         container.close()
         return buffer.getvalue()
 

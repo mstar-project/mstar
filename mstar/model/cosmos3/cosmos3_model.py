@@ -90,6 +90,7 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
+from mstar.model.components.video_encode import mux_rgb_frames
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -163,11 +164,7 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
         stream.width, stream.height = arr.shape[2], arr.shape[1]
         stream.pix_fmt = "yuv420p"
         stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
-        for frame in arr:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
+        mux_rgb_frames(container, stream, arr)
     return buf.getvalue()
 
 class Cosmos3Model(Model):

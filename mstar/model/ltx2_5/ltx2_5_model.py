@@ -49,6 +49,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.video_encode import mux_rgb_frames
 from mstar.model.ltx2_5.config import (
     AUDIO_DECODER_NODE,
     DENOISE_LOOP,
@@ -502,11 +503,7 @@ class LTX25Model(Model):
         # multithreaded ultrafast preset is several times faster than the default (121 frames
         # at 544x960 in 0.23 s), all of it on the request's critical path.
         stream.options = {"crf": "18", "preset": "ultrafast", "threads": "0"}
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
+        mux_rgb_frames(container, stream, frames)
         container.close()
         return buffer.getvalue()
 
