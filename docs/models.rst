@@ -743,12 +743,13 @@ Qwen3-TTS notes
 - The codec decoder runs in float32 by default: a stream's audio is the
   reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs:
   {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay
-  float32). Its dilated convs run as undilated ones over their interleaved
-  subsequences: cuDNN takes some bfloat16 dilated convs (384 and 768
-  channels) through a direct kernel without tensor cores, about 100x slower
-  on an H100. On a B300 the bf16 codec measured slower while those convs
-  still ran dilated; measure there before switching. The decode is compiled
-  (Inductor) once per chunk width, its batch dimension dynamic.
+  float32), which ``configs/qwen3tts_1p7b.yaml`` serves. Its dilated convs
+  run as undilated ones over their interleaved subsequences: cuDNN takes some
+  bfloat16 dilated convs (384 and 768 channels) through a direct kernel
+  without tensor cores, about 100x slower on an H100. On a B300 the bf16
+  codec measured slower while those convs still ran dilated; measure there
+  before switching. The decode is compiled (Inductor) once per chunk width, its
+  batch dimension dynamic.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 

@@ -246,7 +246,8 @@ def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
             (CONFIG_PATH.parent / yaml_name).read_text(encoding="utf-8")
         )
         assert deployment["model"] == key
-        assert deployment["resources"] == base_yaml["resources"]
+        # the same attention backend; pool sizes are per deployment
+        assert deployment["resources"]["talker_attn"] == base_yaml["resources"]["talker_attn"]
         ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
         base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
         assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
