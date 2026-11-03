@@ -32,7 +32,7 @@ from test_kv_preemption import (  # noqa: F401
     _stub_transfer,
 )
 
-from mstar.engine.engine import PagedKVCache
+from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import Segment
@@ -219,6 +219,30 @@ def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_o
 
     assert kv.residency("r") is Residency.RESIDENT and "n" not in kv._allotments, (
         "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
+
+
+def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
+    """A dropped request asks again at its drop, so its next readiness check parks it in the queue. Once the pool
+    admits it, the check starts its rebuild, and the rebuild's landing lets it run. A second path that readmitted
+    dropped requests left the admitted request parked, and it never ran again."""
+    kv, w = _preempting()
+    assert kv.residency("v") is Residency.DROPPED and _step(kv, "r", 1).ok
+    engine = w.engine_manager.get_engine(NODE)
+    engine._runner, engine.residency = _runner(kv), lambda node, rid: kv.residency(rid)
+    engine.prepare_rebuild = lambda node, rid, rebuild: None
+    engine.check_ready = lambda node, rid, info, allow_reload=True: Engine.check_ready(engine, node, rid, info)
+    scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds)
+    for name in ("_check_ready", "_unpark", "note_rebuilt"):
+        setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
+    info = w.request_state.get_fwd_info("v", "p")
+
+    assert not scheduler._check_ready(NODE, "v", info) and "v" in scheduler.parked[NODE], "v wasn't parked"
+    _remove(kv, "r")
+    scheduler._unpark(w.request_state)
+    assert not scheduler._check_ready(NODE, "v", info) and w._rebuilds.rebuilding("v", NODE), "v was never rebuilt"
+    scheduler.note_rebuilt(NODE, "v")
+
+    assert "v" not in scheduler.parked[NODE], "v's rebuild landed, but v stays parked and never runs again"
 
 
 def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_request():
