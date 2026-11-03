@@ -265,34 +265,6 @@ def test_rank_0_tears_down_after_admitting_the_step_its_stamp_names(monkeypatch)
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
 
 
-def test_rank_0_sends_an_owed_drop_before_the_loop_top_removes_its_victim(monkeypatch):
-    """A pass that raised can leave rank 0 owing its followers a victim's drop. The next loop top sends it before any
-    removal applies, so the removal is stamped with the step that carries the drop."""
-    w, log = _rank(monkeypatch, tp_rank=0, inbox=[])
-    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
-    w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
-    owed = {NODE}
-    w._tp_followers = {NODE: ["rank1"]}
-    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
-    w._pending_removes = {HANDLES["gone"]: None}
-    w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])
-    broadcast = w.maybe_send_zmq_to_tp_followers
-
-    def _logged(node_batch, **kwargs):
-        owed.clear()
-        log.append(("broadcast", broadcast(node_batch, **kwargs)))
-        return log[-1][1]
-
-    def _stop(pending, consecutive, fair):
-        raise _Stop
-
-    w.maybe_send_zmq_to_tp_followers = _logged
-    w._build_speculation = _stop
-    _run(w)
-
-    assert log.index(("broadcast", 0)) < log.index(("forward", "gone", 0)), log
-
-
 def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
     """Here before this rank has even popped N+1: held until it has, then torn down behind
     the admit fence of the next pass."""

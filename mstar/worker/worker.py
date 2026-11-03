@@ -1078,12 +1078,14 @@ class Worker:
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
         # A follower tears down in rank 0's order, so never ahead of one it deferred
-        # earlier.
+        # earlier. Rank 0 tears down nothing while its journal holds moves: each
+        # follower replays them with the next step and tears down after the step a
+        # removal is stamped with, so the pages leave in the same order on every rank.
         behind = (
             self.is_tp_follower
             and next(iter(self._pending_removes), request_id) != request_id
         )
-        if request_id in self._in_flight_rids or behind:
+        if request_id in self._in_flight_rids or behind or self._owes_tp_moves():
             self._pending_removes.setdefault(request_id)
             return
 
@@ -4722,7 +4724,10 @@ class Worker:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
         an in-flight GPU step, in the order they were deferred. Removes for
         in-flight rids stay deferred and are reattempted next iter; on a
-        follower, so do the ones after them, which rank 0 tore down later."""
+        follower, so do the ones after them, which rank 0 tore down later. On
+        rank 0, all of them wait while its journal holds moves."""
+        if self._owes_tp_moves():
+            return
         for rid in list(self._pending_removes):
             if rid in in_flight_rids or rid in self._in_flight_rids:
                 if self.is_tp_follower:
@@ -5243,8 +5248,6 @@ class Worker:
                 self._await_admit_settled(pending)
                 self._count_turn(pending)
                 laps.skip()
-                # A pass that raised may still owe the followers a victim's drop. Send it before any removal applies.
-                self._flush_tp_moves()
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )

@@ -998,6 +998,7 @@ class _ForwardingLeader:
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
     _mark_removed = Worker._mark_removed
+    _owes_tp_moves = Worker._owes_tp_moves
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
@@ -1425,11 +1426,11 @@ def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatc
 
 def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps_ahead(monkeypatch):
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
-    # r leaves, and its earmark leaves the journal with it, so v's history and a page fit
-    for engine in (lead, follow):
-        engine.remove_request("r")
-    assert _returns(leader, "v")
+    # rank 0 tears r down once the step carrying the drop has gone out, and then v's history and a page fit
     delta = lead.take_resident_delta()
+    lead.remove_request("r")
+    assert _returns(leader, "v")
+    delta.extend(lead.take_resident_delta())
     step, ctx = KVStep(segments=(Segment("v", "main", 0),)), StepContext(("v",), "prefill", 0, False)
     assert follower.admit(step, ctx).ok
 
@@ -1439,8 +1440,8 @@ def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps
 
     follower.rollback_admit(step, ctx)
     assert follow.apply_resident_delta(delta, _kept)
-    # r left before v's drop here and after it on rank 0, so only the free list's order differs
-    assert _counts(leader)[:-1] == _counts(follower)[:-1]
+    follow.remove_request("r")
+    assert _counts(leader) == _counts(follower)
 
 
 @pytest.mark.parametrize("in_step", [False, True], ids=["at once", "once its step there lands"])
@@ -1508,18 +1509,6 @@ def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followe
     leader.unreserve("x")
 
     assert not lead.take_resident_delta(), "two moves per pass would pile up for each follower to replay"
-
-
-def test_rank_0_strips_a_removed_requests_moves_from_its_journal(monkeypatch):
-    leader, lead = _pool_rank(monkeypatch, 0)
-    _ingest((leader,), "x", 1, arrival=1)
-    _ingest((leader,), "y", 1, arrival=2)
-    assert _admits(leader, "x")
-    assert _admits(leader, "y")
-
-    lead.remove_request("x")
-
-    assert lead.take_resident_delta().rids == ["y"], "a follower would wait for a request it has torn down"
 
 
 def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):

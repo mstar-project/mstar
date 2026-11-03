@@ -228,11 +228,6 @@ class OffloadDelta:
         self.victims.append(list(victims))
         self.nodes.append(node)
 
-    def discard(self, rid: str) -> None:
-        keep = [i for i, other in enumerate(self.rids) if other != rid]
-        for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
-            column[:] = [column[i] for i in keep]
-
     def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
         """Drop the last move if it is ``kind`` on ``rid`` in ``pool``, and return whether a move was dropped."""
         if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)):

@@ -3206,9 +3206,9 @@ class Engine:
             move = delta.peek_left()
             wire_rid, kind, node_name = move.rid, move.kind, move.node
             # Wire strings, not handles: a handle is minted per worker, so rank
-            # 0's is meaningless here. Rank 0 strips a request's moves from its
-            # journal when it removes the request, so None means this rank hasn't
-            # ingested the request yet, and the move waits for it.
+            # 0's is meaningless here. Rank 0 removes a request only once its
+            # journal has gone out, so None means this rank hasn't ingested the
+            # request yet, and the move waits for it.
             rid = self._graph_runtime.get_rid_handle(wire_rid)
             if rid is None:
                 logger.debug(
@@ -3362,8 +3362,6 @@ class Engine:
         held pages of that the teardown hands back, which `reclaimable` counts:
         a KV cache whose pages reach the free list or are left to the prefix
         index alone. An offloaded request, or one that never ran, frees none."""
-        if self._resident_delta:
-            self._resident_delta.discard(self._graph_runtime.get_rid_string(request_id))
         self._loopback_steps.pop(request_id, None)
         freed = {
             key for key, resource in self._resources.items()

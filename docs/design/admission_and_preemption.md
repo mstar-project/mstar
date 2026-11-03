@@ -323,7 +323,7 @@ class OffloadDelta:
 ```
 
 - Every rank checks each grant against the reservations. Only rank 0 queues, runs the fit check, chooses victims and makes a request wait.
-- Rank 0 drops a victim as it sends the next step of the victim's node.
+- Rank 0 moves a victim in the call that chose it, as at one rank, and tears no request down while its journal holds moves.
 - `ScheduleTPNode` carries the step's rebuild rows. Each rank builds them from its own kept ids, which match, since every rank samples rank 0's token.
 - A follower whose counts can't take a move exits.
 
@@ -332,7 +332,7 @@ With speculation on, rank 0 decides only where pages already move today, after t
 Why this shape:
 
 - **Rank 0 decides.** Victims chosen from per-rank state could differ between ranks, which AGENTS.md invariant 11 rules out.
-- **The drop goes out with the next step.** Applied on rank 0 the moment its step lands, a drop would free pages before removals a follower applies ahead of the delta, and the ranks' free lists would hand out different pages.
+- **A removal waits for the journal.** A follower replays the journal before the step that carries it, and tears a request down after the step rank 0 stamped the removal with. A removal rank 0 applied while moves waited in its journal would free pages ahead of those moves there and behind them on a follower, and the ranks' free lists would hand out different pages.
 - **No kept ids on the wire.** Every rank already holds them.
 
 ---
