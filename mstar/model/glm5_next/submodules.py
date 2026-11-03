@@ -61,7 +61,6 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
-_VERDICT_TIMEOUT_S = 120.0
 
 
 def _real_row_values(last: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -626,17 +625,19 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        deadline = time.monotonic() + _VERDICT_TIMEOUT_S
+        # No timeout, as with a collective: every read follows the step's launch (a pre-plan
+        # waits on its commit), so only a hung device or peer delays the verdict, and a rank
+        # giving up alone would leave the others in the next all-reduce.
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                raise RuntimeError(
+                # a broken invariant, not a request's failure: failing this rank's batch alone
+                # would leave the other ranks in its collective
+                raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it "
                     "was read")
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"MTP verdict of step {seq} never arrived")
             time.sleep(0)
         table = verdicts[:max(p[2] for p in pending) + 1].tolist()
         k1 = self.mtp_block
