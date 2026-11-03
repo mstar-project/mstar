@@ -690,8 +690,8 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.HostLens"><code class="docutils literal notranslate"><span class="pre">HostLens</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.columns"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.columns</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cpu_indptrs</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cuda_indptrs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.decode_offsets"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.decode_offsets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.decode_pages"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.decode_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.get_total_len"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.get_total_len()</span></code></a></li>
@@ -714,7 +714,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indptr</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_last_page_len"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_last_page_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.qo_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.qo_indptr</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.to_device"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.to_device()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.to_kwargs_dict"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.to_kwargs_dict()</span></code></a></li>
 </ul>
 </li>
@@ -811,7 +810,7 @@ dispatch (about 6 us a call) and treat it as a plain tensor.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">KVPlanOutput</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu_indptrs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">views</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cuda_indptrs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode_offsets</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">view_builder</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#KVPlanOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">KVPlanOutput</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu_indptrs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">views</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode_offsets</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">view_builder</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">columns</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#KVPlanOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Output of KVManager.plan for a single label</p>
 <dl class="field-list simple">
@@ -819,18 +818,18 @@ dispatch (about 6 us a call) and treat it as a plain tensor.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>cpu_indptrs</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><em>PagedIndptrs</em></a>)</p></li>
 <li><p><strong>views</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><em>SequenceView</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
-<li><p><strong>cuda_indptrs</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><em>PagedIndptrs</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>decode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs">
-<span class="sig-name descname"><span class="pre">cpu_indptrs</span></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput.columns">
+<span class="sig-name descname"><span class="pre">columns</span></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput.columns" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs">
-<span class="sig-name descname"><span class="pre">cuda_indptrs</span></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs">
+<span class="sig-name descname"><span class="pre">cpu_indptrs</span></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -967,16 +966,6 @@ no-op — see <code class="docutils literal notranslate"><span class="pre">Flash
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PagedIndptrs.qo_indptr">
 <span class="sig-name descname"><span class="pre">qo_indptr</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.plan.PagedIndptrs.qo_indptr" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.PagedIndptrs.to_device">
-<span class="sig-name descname"><span class="pre">to_device</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#PagedIndptrs.to_device"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.PagedIndptrs.to_device" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p>
-</dd>
-</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1219,8 +1208,8 @@ will read <cite>plan</cite> output of KV</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.HostLens"><code class="docutils literal notranslate"><span class="pre">HostLens</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.columns"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.columns</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cpu_indptrs</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cuda_indptrs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.decode_offsets"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.decode_offsets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.decode_pages"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.decode_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.get_total_len"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.get_total_len()</span></code></a></li>
@@ -1243,7 +1232,6 @@ will read <cite>plan</cite> output of KV</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_indptr</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.paged_kv_last_page_len"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.paged_kv_last_page_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.qo_indptr"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.qo_indptr</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.to_device"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.to_device()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.PagedIndptrs.to_kwargs_dict"><code class="docutils literal notranslate"><span class="pre">PagedIndptrs.to_kwargs_dict()</span></code></a></li>
 </ul>
 </li>

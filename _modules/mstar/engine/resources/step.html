@@ -1169,6 +1169,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">real</span></div>
 
 
+<div class="viewcode-block" id="StepContext.real_rows">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext.real_rows">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">real_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``request_ids`` as a set when the step has padding rows, else None</span>
+<span class="sd">        (no row is padding)."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_padded_request_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">real</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_real_rids</span>
+        <span class="k">if</span> <span class="n">real</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">real</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_real_rids</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">real</span></div>
+
+
 <div class="viewcode-block" id="StepContext.is_padding_row">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext.is_padding_row">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_padding_row</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>

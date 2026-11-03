@@ -984,6 +984,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">time</span><span class="w"> </span><span class="kn">import</span> <span class="n">perf_counter</span><span class="p">,</span> <span class="n">thread_time</span>
@@ -994,7 +995,51 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># Per-phase wall-clock samples (MSTAR_PHASE_TIMING), shared process-wide so the</span>
 <span class="c1"># engine's threads can record into the same buffer the worker flushes.</span>
 <span class="n">PHASE_PERIOD</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_PHASE_TIMING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"0"</span><span class="p">)</span>
-<span class="n">_PHASE_BUF</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="nb">list</span><span class="p">)</span>
+
+<span class="c1"># the step (``step.&lt;node&gt;.&lt;walk&gt;``) each thread is working on, if any</span>
+<span class="n">_STEP</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">local</span><span class="p">()</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_BothSamples</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A sample list that appends to two: the phase's and the step's copy."""</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"_a"</span><span class="p">,</span> <span class="s2">"_b"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">a</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span> <span class="n">b</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_a</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_b</span> <span class="o">=</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">append</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_a</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_b</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_PhaseBuffer</span><span class="p">(</span><span class="n">defaultdict</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Samples by phase name. While a thread has a step key set</span>
+<span class="sd">    (``set_step_key``), every phase it records is also recorded as</span>
+<span class="sd">    ``&lt;key&gt;.&lt;name&gt;``: a worker that runs several nodes or walks pools them in</span>
+<span class="sd">    every phase otherwise. ``unkeyed`` is for a sample about another step."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="n">samples</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__getitem__</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">_STEP</span><span class="p">,</span> <span class="s2">"key"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"step."</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">samples</span>
+        <span class="k">return</span> <span class="n">_BothSamples</span><span class="p">(</span><span class="n">samples</span><span class="p">,</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__getitem__</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">unkeyed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__getitem__</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+
+
+<span class="n">_PHASE_BUF</span><span class="p">:</span> <span class="n">_PhaseBuffer</span> <span class="o">=</span> <span class="n">_PhaseBuffer</span><span class="p">(</span><span class="nb">list</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="set_step_key">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.set_step_key">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">set_step_key</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Record this thread's phases under ``key`` too, from now until it is</span>
+<span class="sd">    set to None."""</span>
+    <span class="n">_STEP</span><span class="o">.</span><span class="n">key</span> <span class="o">=</span> <span class="n">key</span></div>
+
 
 
 <div class="viewcode-block" id="nvtx_enabled">

@@ -1142,6 +1142,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.piecewise_leases"><code class="docutils literal notranslate"><span class="pre">StepContext.piecewise_leases</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_phase"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_phase</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.real_rows"><code class="docutils literal notranslate"><span class="pre">StepContext.real_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>
@@ -4699,6 +4700,18 @@ should reserve, address and commit nothing on its behalf.</p>
 <span class="sig-name descname"><span class="pre">plan_results</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.StepContext.plan_results" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepContext.real_rows">
+<span class="sig-name descname"><span class="pre">real_rows</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#StepContext.real_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepContext.real_rows" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">request_ids</span></code> as a set when the step has padding rows, else None
+(no row is padding).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.StepContext.request_ids">
 <span class="sig-name descname"><span class="pre">request_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><span class="pre">Sequence</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.StepContext.request_ids" title="Link to this definition">#</a></dt>
@@ -6010,6 +6023,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.piecewise_leases"><code class="docutils literal notranslate"><span class="pre">StepContext.piecewise_leases</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_phase"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_phase</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.real_rows"><code class="docutils literal notranslate"><span class="pre">StepContext.real_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>

@@ -702,6 +702,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.phase_start"><code class="docutils literal notranslate"><span class="pre">phase_start()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.range_pop"><code class="docutils literal notranslate"><span class="pre">range_pop()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.range_push"><code class="docutils literal notranslate"><span class="pre">range_push()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.set_step_key"><code class="docutils literal notranslate"><span class="pre">set_step_key()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -745,6 +746,9 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.profiler.range_push" title="mstar.utils.profiler.range_push"><code class="xref py py-obj docutils literal notranslate"><span class="pre">range_push</span></code></a>(name, *[, synchronize])</p></td>
 <td><p>Push an NVTX range, optionally syncing before the marker.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.profiler.set_step_key" title="mstar.utils.profiler.set_step_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_step_key</span></code></a>(key)</p></td>
+<td><p>Record this thread's phases under <code class="docutils literal notranslate"><span class="pre">key</span></code> too, from now until it is set to None.</p></td>
 </tr>
 </tbody>
 </table>
@@ -941,6 +945,21 @@ via <code class="docutils literal notranslate"><span class="pre">torch.cuda.sync
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.profiler.set_step_key">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.profiler.</span></span><span class="sig-name descname"><span class="pre">set_step_key</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/profiler.html#set_step_key"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.profiler.set_step_key" title="Link to this definition">#</a></dt>
+<dd><p>Record this thread’s phases under <code class="docutils literal notranslate"><span class="pre">key</span></code> too, from now until it is
+set to None.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1004,6 +1023,7 @@ via <code class="docutils literal notranslate"><span class="pre">torch.cuda.sync
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.phase_start"><code class="docutils literal notranslate"><span class="pre">phase_start()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.range_pop"><code class="docutils literal notranslate"><span class="pre">range_pop()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.range_push"><code class="docutils literal notranslate"><span class="pre">range_push()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.profiler.set_step_key"><code class="docutils literal notranslate"><span class="pre">set_step_key()</span></code></a></li>
 </ul>
   </nav></div>
 

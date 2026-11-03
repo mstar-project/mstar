@@ -1071,18 +1071,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># rebuild it with torch ops.</span>
     <span class="n">kv_lens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
-<div class="viewcode-block" id="PagedIndptrs.to_device">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PagedIndptrs.to_device">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_device</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">PagedIndptrs</span><span class="p">(</span>
-            <span class="n">qo_indptr</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
-            <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_indptr</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
-            <span class="n">paged_kv_indices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
-            <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_last_page_len</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
-            <span class="n">kv_lens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_lens</span><span class="p">,</span>
-        <span class="p">)</span></div>
-
-
 <div class="viewcode-block" id="PagedIndptrs.to_kwargs_dict">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PagedIndptrs.to_kwargs_dict">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">to_kwargs_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1259,12 +1247,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Output of KVManager.plan for a single label</span>
 <span class="sd">    """</span>
 
-    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"cpu_indptrs"</span><span class="p">,</span> <span class="s2">"_views"</span><span class="p">,</span> <span class="s2">"_view_builder"</span><span class="p">,</span> <span class="s2">"cuda_indptrs"</span><span class="p">,</span> <span class="s2">"decode_pages"</span><span class="p">,</span> <span class="s2">"decode_offsets"</span><span class="p">,</span> <span class="s2">"rows"</span><span class="p">)</span>
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">"cpu_indptrs"</span><span class="p">,</span> <span class="s2">"_views"</span><span class="p">,</span> <span class="s2">"_view_builder"</span><span class="p">,</span> <span class="s2">"decode_pages"</span><span class="p">,</span> <span class="s2">"decode_offsets"</span><span class="p">,</span>
+        <span class="s2">"rows"</span><span class="p">,</span> <span class="s2">"_decode"</span><span class="p">,</span> <span class="s2">"columns"</span><span class="p">,</span>
+    <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">cpu_indptrs</span><span class="p">:</span> <span class="n">PagedIndptrs</span><span class="p">,</span> <span class="n">views</span><span class="p">:</span> <span class="s2">"list[SequenceView] | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">cuda_indptrs</span><span class="p">:</span> <span class="s2">"PagedIndptrs | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">decode_pages</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">decode_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">rows</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">view_builder</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">decode_pages</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">decode_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">rows</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">view_builder</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cpu_indptrs</span> <span class="o">=</span> <span class="n">cpu_indptrs</span>
         <span class="c1"># packing in plan order w/h 1 view per segment covered by plan; a plan</span>
@@ -1272,9 +1263,6 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># made on first use (the FlashInfer path never asks for them)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="n">views</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_view_builder</span> <span class="o">=</span> <span class="n">view_builder</span>
-        <span class="c1"># only the packed write addressing needs these on device, and only the</span>
-        <span class="c1"># resource that builds them reads them; see KVManager._setup_plan_states</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">cuda_indptrs</span> <span class="o">=</span> <span class="n">cuda_indptrs</span>
         <span class="c1"># a decode step planned off the previous one (KVManager's plan cache):</span>
         <span class="c1"># each row's write page and offset in it, so staging need not walk the views</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decode_pages</span> <span class="o">=</span> <span class="n">decode_pages</span>
@@ -1282,6 +1270,13 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (request_id, label, to_compute) per view, for consumers that need no</span>
         <span class="c1"># pages or lengths (the position resource); None means read the views</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rows</span> <span class="o">=</span> <span class="n">rows</span>
+        <span class="c1"># whether every row computes one token, when the plan already knows;</span>
+        <span class="c1"># None reads the views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span> <span class="o">=</span> <span class="n">decode</span>
+        <span class="c1"># the plan's host arrays (``PlanColumns``), when it was built from</span>
+        <span class="c1"># columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a</span>
+        <span class="c1"># later plan rewrites, they stay valid as long as the output does.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">columns</span> <span class="o">=</span> <span class="n">columns</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">views</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"list[SequenceView]"</span><span class="p">:</span>
@@ -1303,6 +1298,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span>
         <span class="k">return</span> <span class="nb">all</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">to_compute</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">views</span><span class="p">)</span></div>
 
 

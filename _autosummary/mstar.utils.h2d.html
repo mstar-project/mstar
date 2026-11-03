@@ -695,6 +695,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager"><code class="docutils literal notranslate"><span class="pre">PinnedStager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.MIN_SEGMENT_BYTES"><code class="docutils literal notranslate"><span class="pre">PinnedStager.MIN_SEGMENT_BYTES</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_runs_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_runs_()</span></code></a></li>
 </ul>
@@ -736,7 +737,7 @@ values a destination already holds, as in a steady decode batch.</p>
 <td><p>What the stager last copied into one device destination.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.h2d.PinnedStager" title="mstar.utils.h2d.PinnedStager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PinnedStager</span></code></a>(dtype[, numel, depth])</p></td>
-<td><p>A small ring of persistent pinned buffers for one dtype.</p></td>
+<td><p>A persistent pinned arena for one dtype, used as a ring of segments.</p></td>
 </tr>
 </tbody>
 </table>
@@ -749,7 +750,10 @@ values a destination already holds, as in a steady decode batch.</p>
 <p>Lets <code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_</span></code> skip a copy whose values the destination
 already holds. Only sound for a destination nothing but that stager writes,
 and that lives as long as its mirror – hence an object the owner keeps
-with it, not a cache keyed by address (the allocator reuses addresses).</p>
+with it, not a cache keyed by address (the allocator reuses addresses).
+A skip is recorded when the copy is issued, possibly on another stream;
+the engine orders each step after every earlier pre-plan’s copies
+(<code class="docutils literal notranslate"><span class="pre">Engine._order_after_pre_plans</span></code>), which makes it sound across streams.</p>
 <dl class="field-list simple">
 </dl>
 <dl class="py method">
@@ -801,12 +805,17 @@ with it, not a cache keyed by address (the allocator reuses addresses).</p>
 <dt class="sig sig-object py" id="mstar.utils.h2d.PinnedStager">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.h2d.</span></span><span class="sig-name descname"><span class="pre">PinnedStager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">numel</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">256</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">depth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#PinnedStager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.PinnedStager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>A small ring of persistent pinned buffers for one dtype.</p>
-<p><code class="docutils literal notranslate"><span class="pre">copy_</span></code> writes values into the next buffer and issues one non-blocking
-H2D copy from it on the current stream. Each buffer records an event after
-its copy and is not rewritten until that event has completed, so a copy
-still in flight never sees its source change. Thread-safe: the plan thread
+<p>A persistent pinned arena for one dtype, used as a ring of segments.</p>
+<p><code class="docutils literal notranslate"><span class="pre">copy_</span></code> writes values at the arena’s cursor and issues one non-blocking
+H2D copy from there on the current stream. Events are per segment, not per
+copy: when the cursor leaves a segment it records one on each stream that
+copied out of it, and a segment is not rewritten until those have
+completed, so a copy still in flight never sees its source change. Most
+copies therefore make no event call at all. Thread-safe: the plan thread
 and the GPU thread may share one.</p>
+<p>On CUDA the copy is a direct <code class="docutils literal notranslate"><span class="pre">cudaMemcpyAsync</span></code>: the torch <code class="docutils literal notranslate"><span class="pre">copy_</span></code> of
+two slices costs several times the copy itself in dispatch, and records
+a host-allocator event of its own. Elsewhere it is the torch copy.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -816,6 +825,11 @@ and the GPU thread may share one.</p>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.h2d.PinnedStager.MIN_SEGMENT_BYTES">
+<span class="sig-name descname"><span class="pre">MIN_SEGMENT_BYTES</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">32768</span></span><a class="headerlink" href="#mstar.utils.h2d.PinnedStager.MIN_SEGMENT_BYTES" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.utils.h2d.PinnedStager.copy_">
 <span class="sig-name descname"><span class="pre">copy_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dst</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pad_value</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mirror</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#PinnedStager.copy_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.PinnedStager.copy_" title="Link to this definition">#</a></dt>
@@ -844,9 +858,8 @@ ahead of anything that reads <code class="docutils literal notranslate"><span cl
 <dt class="sig sig-object py" id="mstar.utils.h2d.PinnedStager.copy_runs_">
 <span class="sig-name descname"><span class="pre">copy_runs_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dsts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#PinnedStager.copy_runs_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.PinnedStager.copy_runs_" title="Link to this definition">#</a></dt>
 <dd><p>Fill each of <code class="docutils literal notranslate"><span class="pre">dsts</span></code> from consecutive <code class="docutils literal notranslate"><span class="pre">values</span></code>, in order: one
-non-blocking copy per destination, all out of one pinned buffer. On a
-stream behind a running graph the copies queue there, and a buffer per
-copy would have <code class="docutils literal notranslate"><span class="pre">copy_</span></code> wait out that graph once the ring wraps.</p>
+non-blocking copy per destination, all out of one claim on the arena,
+so a flush of many runs takes the lock and checks the ring once.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -951,6 +964,7 @@ is a plain <code class="docutils literal notranslate"><span class="pre">.to(devi
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager"><code class="docutils literal notranslate"><span class="pre">PinnedStager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.MIN_SEGMENT_BYTES"><code class="docutils literal notranslate"><span class="pre">PinnedStager.MIN_SEGMENT_BYTES</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_runs_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_runs_()</span></code></a></li>
 </ul>
