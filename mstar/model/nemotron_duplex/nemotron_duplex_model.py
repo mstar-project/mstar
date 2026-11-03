@@ -825,8 +825,8 @@ class NemotronDuplexModel(Model):
         # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
         # its speaker warm-up
         prompt_len = ids.numel() if prompt else 0
-        # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, which no session
-        # writes.
+        # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, and no session
+        # writes that margin.
         frames = self.max_session_frames + 1
         nano = LabelLayout(
             spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),

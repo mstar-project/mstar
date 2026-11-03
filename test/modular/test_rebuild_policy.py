@@ -144,8 +144,8 @@ def test_removing_a_request_gives_its_slice_back():
 
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
 def test_a_request_no_drop_can_free_keeps_no_ids(why):
-    """Kirill 4448985161. A guaranteed request kept a host copy of its prompt and appended every sample, each
-    step, though no drop could ever use them."""
+    """A guaranteed request kept a host copy of its prompt and appended every sample, each step, though no drop
+    could ever use them."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     # a prompt written in a walk the policy doesn't prefill is one no rebuild can write again
     walk = PREFILL if why == "its output can't pause" else "audio"

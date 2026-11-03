@@ -107,7 +107,7 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles a drop there can free, the only ones whose ids it keeps
+        # node -> the handles whose pages a drop there can free. Only these keep their ids.
         self._droppable: dict[str, set[int]] = {node: set() for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
@@ -135,11 +135,12 @@ class Rebuilds:
         layouts: Mapping[str, Collection[StreamLayout]], unpausable: bool,
     ) -> dict[str, bool]:
         """For each paged KV cache in ``writes``, whether a drop here can free ``rid``'s pages there: one
-        rebuild row can lay out its ``layouts`` there again, and every node that writes them can write again all
-        that the node writes. A node that writes nothing for the request isn't asked.
+        rebuild row can lay out the request's ``layouts`` in that cache again, and every node that writes those
+        layouts can redo all of its writes. A node that writes nothing for the request isn't asked.
 
-        A drop takes every cache of its node, so a node is judged by what it writes in all of them, and keeps
-        ``rid``'s ids only when a drop can free its pages in each and its output can pause."""
+        A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps
+        ``rid``'s ids only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
+        is False."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
         for key, nodes in writes.items():
@@ -159,8 +160,9 @@ class Rebuilds:
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy the prompt of each row of the policy's walk whose request a drop here can free and keeps no ids
-        yet to the host, once the step that read it completes. A row the pool can't hold keeps none."""
+        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in the
+        policy's walk, a drop here can free its request's pages, and the request keeps no ids yet. A row the pool can't
+        hold keeps none."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
             return

@@ -271,8 +271,8 @@ POOLS = pytest.mark.parametrize("key, labels, loop", [
 
 
 def _sessions(monkeypatch, key: str, labels: tuple[str, ...], loop: str):
-    """DEFAULT_SESSIONS sessions with the longest system prompt, laid out as `process_prompt` lays them out, on
-    the pool of ``key`` the model sizes. Returns the model, the pool and whether each session was admitted."""
+    """DEFAULT_SESSIONS sessions with the longest system prompt, in the layout `process_prompt` gives them, on the
+    pool of ``key`` the model sizes. Returns the model, the pool and whether each session was admitted."""
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     model = NemotronDuplexModel.__new__(NemotronDuplexModel)
     model.config = NemotronDuplexConfig()
@@ -313,8 +313,8 @@ def test_every_session_of_the_longest_length_fits_its_pool_at_once(monkeypatch, 
 
 @POOLS
 def test_a_session_reserves_what_its_frames_write_and_no_page_for_its_loop_caps_margin(monkeypatch, key, labels, loop):
-    """A loop's cap runs LOOP_ITERS_MARGIN past the session's frames, which no session writes. Reserving it took
-    a page a talker stream, 1.75 GiB over 32 sessions."""
+    """A loop's cap runs LOOP_ITERS_MARGIN past the session's frames, and no session writes that margin. Reserving
+    it took a page a talker stream, 1.75 GiB over 32 sessions."""
     model, kv, _ = _sessions(monkeypatch, key, labels, loop)
     prefix = model.TALKER_WARMUP_POSITIONS if key == TALKER_KV else model.max_prompt_tokens
     per_stream = -(-(prefix + model.max_session_frames + 1) // DEFAULT_PAGE_SIZE)

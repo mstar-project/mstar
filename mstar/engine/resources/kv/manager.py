@@ -605,7 +605,7 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        # dropped request -> the tokens its laid-out label held, which its rebuild writes again, until it lands
+        # dropped request, until its rebuild lands -> the tokens its laid-out label held, which the rebuild writes again
         self._dropped: dict[str, int] = {}
         # A stream holds its pages in group g at `CacheStream.groups[g]`, and a plan's at
         # `KVPlanOutputs.groups[g]`; write addressing is keyed (label, g).
@@ -3413,7 +3413,7 @@ class KVManager(AttentionResource):
         """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
         one, keyed as a prompt of those ids would be.
 
-        The growth loop's cap and the layout's growth bound drop by what the span now covers, so the
+        The growth loop's cap and the layout's ``max_growth`` drop by what the span now covers, so the
         footprint stays the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
@@ -3682,8 +3682,8 @@ class KVManager(AttentionResource):
         return needed
 
     def _return_pages(self, rid: str) -> int:
-        """Pages a request returning from the host may take beyond its reload, 0 for any other: its footprint,
-        which it asks for, less its pages on the host."""
+        """Pages a request returning from the host may take beyond its reload, 0 for any other: the footprint the
+        request asks for, less its pages on the host."""
         footprint = self._asks.get(rid)
         if footprint is None:
             return 0
@@ -4298,7 +4298,7 @@ class KVManager(AttentionResource):
         return ASKS
 
     def _footprint(self, rid: str) -> int:
-        """The pages ``rid`` holds at the caps of the loops this worker runs."""
+        """The pages ``rid`` would hold once the loops this worker runs reach their caps."""
         overrides = self._overrides[rid]
         caps = {loop: cap if loop in self.local_loops else 0 for loop, cap in (overrides.loop_caps or {}).items()}
         return overrides.pages(self._nodes, caps, self.config)
@@ -4530,8 +4530,9 @@ class KVManager(AttentionResource):
         """Release ``rid``'s leases and give up its allotment, so that ``rid`` asks again, once a drop or a move
         to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move.
 
-        A request a drop or a move took off the device comes back guaranteed, once its footprint fits. With less,
-        its next page would find no room, and as the newest request holding pages it would move again.
+        A request a drop or a move took off the device comes back guaranteed, once its footprint fits. A request
+        that came back with less than its footprint would run short on its next page, and as the newest request
+        holding pages it would move again.
         """
         for stream in self._streams[rid].values():
             self._release_lease(rid, stream)
@@ -4612,9 +4613,9 @@ class KVManager(AttentionResource):
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        A guaranteed request's allotment keeps every page its walks write until its lease becomes its pages,
-        since a cut leaves the walk to write them again. So an evictable page comes out of the room alone,
-        and every page is lent.
+        A guaranteed request's allotment keeps every page the request's walks write until the request adopts its
+        lease, since a cut leaves the walk to write the cut pages again. So an evictable page comes out of the room
+        alone, and every page is lent.
         """
         if self._decides:
             evictable = self._index.evictable()

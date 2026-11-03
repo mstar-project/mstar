@@ -421,7 +421,7 @@ class KVReqConfig(ResourceReqConfig):
                     keyed_spans=keyed_spans,
                     max_growth=max_growth[0] if max_growth else None,
                 )
-                # the growth bound is optional, as a span row's later fields are
+                # a row may leave out the growth bound, as a span row may leave out its later fields
                 for label, (spans, growth, scratch, retention, keyed_spans, *max_growth) in kv_layout.items()
                 if label in opened
             }

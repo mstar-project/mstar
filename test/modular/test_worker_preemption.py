@@ -341,8 +341,9 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
 
 @pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
 def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
-    """A drop lays the pool's one label out again as one span of the policy's walk. The second label is written
-    in a walk and a loop this worker doesn't run, so only the pool's own layout refuses it."""
+    """A drop lays the pool's one label out again as one span of the policy's walk. In the two labels case, the
+    second label is written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses
+    the request."""
     kv = _pool()
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
