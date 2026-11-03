@@ -55,15 +55,19 @@ def _sharding_config():
     return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
 
-def _worker():
-    section = GraphNode(name=NODE, input_names={"prompt"}, outputs=[])
-    worker_graph = WorkerGraph(
-        section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
-    )
-    all_walks = {WG_ID: {WALK}}
-    all_nodes = {WG_ID: {NODE}}
-    all_loops = {WG_ID: set()}
-    node_to_partition = {NODE: "default"}
+def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
+    """``graphs``: (worker graph id, node, walk, partition) per worker graph."""
+    worker_graphs = [
+        WorkerGraph(
+            section=GraphNode(name=node, input_names={"prompt"}, outputs=[]),
+            graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        )
+        for wg_id, node, walk, _ in graphs
+    ]
+    all_walks = {wg_id: {walk} for wg_id, _, walk, _ in graphs}
+    all_nodes = {wg_id: {node} for wg_id, node, _, _ in graphs}
+    all_loops = {wg_id: set() for wg_id, *_ in graphs}
+    node_to_partition = {node: partition for _, node, _, partition in graphs}
 
     w = Worker.__new__(Worker)
     w.worker_id = WORKER
@@ -71,7 +75,7 @@ def _worker():
     w.tensor_manager = _StubTensorManager()
     w._graph_runtime = PythonGraphRuntime(
         my_worker_id=WORKER,
-        my_worker_graphs=[worker_graph],
+        my_worker_graphs=worker_graphs,
         all_wg_ids_to_graph_walks=all_walks,
         all_wg_ids_to_dyn_loops=all_loops,
         all_wg_ids_to_nodes=all_nodes,
@@ -106,15 +110,16 @@ def _worker():
     return w
 
 
-def _new_request(request_id="r1"):
+def _new_request(request_id="r1", graph=(WG_ID, NODE, WALK, "default"), worker_graph_ids=(WG_ID,)):
+    wg_id, _, walk, partition = graph
     return NewRequest(
         request_id=request_id,
         request_info=CurrentForwardPassInfo(
-            request_id=request_id, graph_walk=WALK, fwd_index=0,
-            random_seed=0, max_tokens=1, partition_name="default",
+            request_id=request_id, graph_walk=walk, fwd_index=0,
+            random_seed=0, max_tokens=1, partition_name=partition,
         ),
-        partition_worker_graph_ids=[WG_ID],
-        worker_graph_to_workers={WG_ID: [WORKER]},
+        partition_worker_graph_ids=[wg_id],
+        worker_graph_to_workers={gid: [WORKER] for gid in worker_graph_ids},
         initial_inputs=[],
         loop_caps={},
     )
@@ -172,3 +177,35 @@ def test_admit_is_refused_after_a_drain():
     w._add_new_request(_new_request("r1"))
     assert w._rid("r1") is None
     assert w.tensor_manager.registered == []
+
+
+THINKER = (0, "thinker", "thinker", "Thinker")
+TALKER = (1, "talker", "talker", "Talker")
+
+
+def test_a_second_partition_opens_nothing_twice():
+    """Qwen3-Omni with the Thinker and the Talker on one worker gets a
+    NewRequest for each, and the Talker's can land after the Thinker ran a
+    step. The tensor manager and the engine open the request on the first
+    only, since opening it again resets what the Thinker's steps left there."""
+    w = _worker((THINKER, TALKER))
+    opened = []
+    w.engine_manager.add_request = lambda rid, cfgs, info: opened.append((rid, info.partition_name))
+
+    w._add_new_request(_new_request("r1", THINKER, (0, 1)))
+    w._add_new_request(_new_request("r1", TALKER, (0, 1)))
+
+    rid = w._rid("r1")
+    assert w.tensor_manager.registered == [rid]
+    assert opened == [(rid, "Thinker")]
+    # each partition still gets its own forward-pass info and worker graph
+    assert w.request_state.get_fwd_info(rid, "Thinker").graph_walk == "thinker"
+    assert w.request_state.get_fwd_info(rid, "Talker").graph_walk == "talker"
+    assert all(rid in w._graph_runtime._queues[wg].per_request_queues for wg in (0, 1))
+
+    # the next request to get the handle opens it again
+    w._remove_request(RemoveRequest(request_id="r1"))
+    w._add_new_request(_new_request("r2", TALKER, (0, 1)))
+    assert w._rid("r2") == rid
+    assert w.tensor_manager.registered == [rid, rid]
+    assert opened == [(rid, "Thinker"), (rid, "Talker")]
