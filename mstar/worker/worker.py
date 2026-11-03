@@ -2018,9 +2018,13 @@ class Worker:
         """Whether the journal of the lockstep instance this rank leads holds moves no step has carried."""
         return any(self.engine_manager.get_engine(node).owes_moves() for node in self._lockstep_led)
 
-    def _flush_tp_moves(self) -> None:
-        """Send the instance's followers a step with no rows while the journal holds moves. A step of any of the
-        instance's nodes carries every move, so it goes to one this rank has sent a step to."""
+    def _flush_tp_moves(self, pending: PendingBatch | None = None) -> None:
+        """Send the instance's followers a step with no rows while the journal holds moves, unless ``pending``
+        is a step of the instance's own. That step still waits for its speculation decision, which a step with no
+        rows sent first would read as none. A step of any of the instance's nodes carries every move, so the
+        flush goes to one this rank has sent a step to."""
+        if pending is not None and pending.node_name in self._lockstep_led:
+            return
         node_name = next((node for node in self._lockstep_led if node in self._tp_followers), None)
         if node_name is not None and self._owes_tp_moves():
             self.maybe_send_zmq_to_tp_followers(self._make_executing_batch(
@@ -5169,6 +5173,8 @@ class Worker:
                 self._await_admit_settled(pending)
                 self._count_turn(pending)
                 laps.skip()
+                # removals held for the journal would otherwise wait out a chain of another node's steps
+                self._flush_tp_moves(pending)
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
