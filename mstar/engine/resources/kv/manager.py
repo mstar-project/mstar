@@ -35,6 +35,7 @@ from mstar.engine.resources.kv.config import (
     SpanKind,
     StreamLayout,
     rebuild_refusal,
+    step_end,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
@@ -173,14 +174,11 @@ class SpanCursor:
     probed: int | None = None
 
     def next_step(self, walk: str) -> tuple[PrefixSpan, ...]:
-        """The spans from ``done`` on that one step of ``walk`` writes: a row can
-        hold several, text around an attachment, up to the next span that opens a step."""
-        end = self.done
-        while end < len(self.spans) and self.spans[end].walk == walk and (
-            end == self.done or not self.spans[end].opens_step
-        ):
-            end += 1
-        return self.spans[self.done:end]
+        """The spans from ``done`` on that one step of ``walk`` writes (`step_end`), none when the next span
+        is another walk's."""
+        if self.done == len(self.spans) or self.spans[self.done].walk != walk:
+            return ()
+        return self.spans[self.done:step_end(self.spans, self.done)]
 
     def advance(self, start: int, end: int) -> list[tuple[int, int]]:
         """Return ``(index, end)`` for each span a write over ``[start, end)`` touched. A span

@@ -352,6 +352,15 @@ class PrefixSpan:
         object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
+def step_end(spans: Sequence[PrefixSpan], start: int) -> int:
+    """Where the step that writes ``spans[start]`` stops. One step writes a span and each span after it in the
+    same walk that doesn't open a step, in one row, as text around an attachment is written."""
+    end = start + 1
+    while end < len(spans) and spans[end].walk == spans[start].walk and not spans[end].opens_step:
+        end += 1
+    return end
+
+
 @dataclass
 class KVReqConfig(ResourceReqConfig):
     # NOTE: this may need to be refined
@@ -772,6 +781,15 @@ class StreamLayout:
         return sum(span.advance for span in self.spans) + sum(
             slots * caps[loop] for loop, slots in self.growth
         )
+
+    def steps(self) -> tuple[tuple[PrefixSpan, ...], ...]:
+        """The spans grouped by the step that writes them (`step_end`), in walk order."""
+        steps, start = [], 0
+        while start < len(self.spans):
+            end = step_end(self.spans, start)
+            steps.append(self.spans[start:end])
+            start = end
+        return tuple(steps)
 
     def rebuilt(self, ids: int) -> "StreamLayout":
         """This layout once its rebuild rows have written ``ids`` ids into it: the last span, which
