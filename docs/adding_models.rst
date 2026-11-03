@@ -1870,15 +1870,17 @@ other walk of the combined walk must be one token per row.
 **Steps beside the chain.** A worker's main loop runs one chain of steps, and any step on it
 costs a pass of the loop and holds the next one behind its kernels. A node that shares a
 worker with a heavier one can set ``side_stream_walks`` on its submodule to the walks that
-should run beside the chain instead: such a step neither takes a turn on the chain nor
+may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
+on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
 makes it yield, runs on a second stream, and the windows that come ready while it runs
 batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
-walk that nothing on the chain reads, such as a codec. ``EngineManager.build`` refuses a walk
-that is not one node's alone or a node that holds resources, since a side step is neither
-speculated nor planned ahead. The declaration does nothing on a worker with no other node,
-on a device without streams, or on a parallel node, which stays on the chain because every
-rank of a lockstep instance has to agree on when a step lands.
+walk that nothing on the chain reads, such as a codec. Where the config asks,
+``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
+speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+alone on its worker, a device without streams, a node with chain walks or resources, and a
+side walk that is not the node's alone, sits in a combined walk, or has output spans or a
+stop check. A config without the field keeps the node on the chain, whatever it declares.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific

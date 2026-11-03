@@ -240,7 +240,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
+       true`` runs the group's node beside the worker's main chain of steps (see
+       below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -590,6 +592,25 @@ and quit the daemon at shutdown. The daemon uses a private pipe directory, so ot
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
 Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+
+**A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
+group runs that node's steps on a lane of their own instead of the worker's main chain:
+they take no turn on it, run on a second CUDA stream beside its steps, and whatever
+comes ready meanwhile batches into the next one. It applies to the walks the node's
+submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
+``codec_chunk``, and its colocated configs set the field), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. Startup fails with a
+``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
+alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn't the node's alone, is part of a
+combined walk, or has output spans or a stop check. Without the field the node runs on
+the chain:
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
+     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
