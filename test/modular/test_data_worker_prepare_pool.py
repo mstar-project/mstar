@@ -344,3 +344,17 @@ def test_a_stopping_thread_refuses_a_request_it_can_no_longer_prepare(worker):
 def test_a_thread_built_without_init_prepares_inline():
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     assert wt._prepare_pool is None and wt._release_prepared() is False
+
+
+@pytest.mark.parametrize("workers", ["auto", 0, -2, True, 2.0])
+def test_a_bad_preprocess_workers_fails_startup(workers, tmp_path):
+    """Refused where the server starts, not by the data-worker thread, which
+    would end on it and leave every request waiting."""
+    from mstar.api_server.data_worker import PreprocessWorker
+    from mstar.communication.communicator import CommProtocol
+
+    with pytest.raises(ValueError, match="preprocess_workers"):
+        PreprocessWorker(
+            model=_Model(), model_config={"preprocess_workers": workers},
+            tensor_comm_protocol=CommProtocol.SHM, socket_path_prefix=str(tmp_path / "pw"),
+        )

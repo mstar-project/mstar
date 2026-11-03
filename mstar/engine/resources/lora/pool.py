@@ -494,9 +494,6 @@ class LoraAdapterPool(Resource):
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
         adapter = overrides.adapter if isinstance(overrides, LoraReqConfig) else None
         with self._lock:
-            # idempotent: one NewRequest per partition
-            if rid in self._adapter_of:
-                return
             if adapter is not None and adapter not in self._serving:
                 raise ValueError(
                     f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
