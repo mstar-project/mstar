@@ -21,7 +21,6 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
-from mstar.engine.resources import Residency
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
@@ -394,10 +393,10 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
 
 @pytest.mark.parametrize("hit", ["held", "evictable"])
 def test_a_guaranteed_request_whose_lease_is_cut_writes_the_cut_pages_within_its_reservation(hit):
-    """Qwen3.5's recurrent snapshots cut a hit to what they cover, and the walk writes the cut pages itself. A
-    guaranteed request was charged for its hits at the probe, which gave their room to the pool, and a cut page
-    that another request still held came off its allotment. So it ran short later and could neither move nor be
-    dropped."""
+    """Qwen3.5's recurrent snapshots cut a hit to what they cover, and the walk writes the cut pages itself. The
+    probe charged a guaranteed request for its hits and gave that room to the pool, and a cut page another request
+    still held came off the guaranteed request's allotment. That request then ran short and could neither move nor
+    be dropped."""
     kv, tokens = _pool(), list(range(3 * PAGE_SIZE))
     _running(kv, "h", 3, arrival=0, keyed=tokens)
     if hit == "evictable":
@@ -421,17 +420,15 @@ def test_a_guaranteed_request_whose_lease_is_cut_writes_the_cut_pages_within_its
         assert _step(kv, "g", PAGE_SIZE).ok, "g ran short of the pages its reservation held for the cut ones"
 
 
-def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_the_offload_leaves_it():
-    """`reclaimable` answered 0 for a guaranteed request on the rank that decides only, so a follower's replay read
-    another number, and a teardown needed a second hook to count its pages."""
+def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_is_no_eviction_candidate():
+    """`reclaimable` answered 0 for a guaranteed request only on the rank that decides, so a follower's replay read
+    the request's pages instead, and a teardown needed a second hook to count them."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(64)
     _running(kv, "g", 2, arrival=0, guaranteed=True)
 
     assert kv.reclaimable("g") == len(kv._streams["g"]["main"].pages()), "reclaimable answered by class"
-    assert kv.offload("g") == 0 and kv.residency("g") is Residency.RESIDENT, (
-        "a guaranteed request was moved to the host"
-    )
+    assert not kv.can_offload("g"), "the offload of the least recently active request could move g to the host"
 
 
 def test_a_guaranteed_request_that_wrote_nothing_keeps_its_allotment_when_an_older_one_runs_short():
@@ -513,9 +510,8 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
 
 
 def test_a_request_back_from_the_host_waits_until_its_footprint_fits_and_is_never_moved_again():
-    """Kirill's Qwen3-Omni ITL p99 on #875. A request came back from the host once its pages and one more page fit.
-    Its next page found no room, and as the newest request holding pages it moved itself to the host again, a
-    copy of all its pages both ways for each page of decode."""
+    """A request came back from the host once its pages and one more page fit. On its next page the pool had no
+    room, so the request, the newest holding pages, moved to the host again."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(64)
     _running(kv, "o", 5, arrival=0)

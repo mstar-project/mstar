@@ -959,7 +959,7 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
         laps.lap("worker_state")
-        self._set_rebuildable(body.request_info.resource_configs)
+        self._set_rebuildable(request_id, body.request_info.resource_configs)
         try:
             self.engine_manager.add_request(
                 request_id, body.request_info.resource_configs, body.request_info,
@@ -1159,11 +1159,11 @@ class Worker:
             self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
             kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
 
-    def _set_rebuildable(self, configs: dict[str, ResourceReqConfig]) -> None:
-        layouts = {
-            key: (config.kv_layout or {}).values() for key, config in configs.items() if isinstance(config, KVReqConfig)
-        }
-        for key, rebuildable in self._rebuilds.rebuildable(self._kv_writes, layouts).items():
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
+        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        unpausable = any(config.unpausable for config in kv_configs.values())
+        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:
                 configs[key].rebuildable = rebuildable
 
@@ -1807,7 +1807,8 @@ class Worker:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active
+            if engine.reclaimable(node_name, rid, affected_resources) and engine.can_offload(node_name, rid)
         ]
 
         if not candidates:
@@ -1823,21 +1824,18 @@ class Worker:
             return None
 
         # prefer evicting requests that aren't currently executing
-        untried = [rid for rid in candidates if rid not in batch_ids] or candidates
-        while untried:
-            victim_id = self._select_eviction_victim(node_name, graph_walk, untried)
-            freed = engine.offload_request(node_name, victim_id)
-            if freed > 0:
-                break
-            untried.remove(victim_id)
-        else:
-            # No candidate would move. The usual cause is the host pool being
-            # full (see ``CPUPagePool.place``) - different from having no
-            # candidate, and fixed by a larger ``cpu_offload_pages`` rather than
-            # by scheduling less. A pool also never moves a request it guarantees.
+        external = [rid for rid in candidates if rid not in batch_ids]
+        victim_id = self._select_eviction_victim(node_name, graph_walk, external or candidates)
+        freed = engine.offload_request(node_name, victim_id)
+        if freed <= 0:
+            # A victim was found and would not move. The usual cause is the host
+            # pool being full (see ``CPUPagePool.place``) - different
+            # from having no candidate, and fixed by a larger
+            # ``cpu_offload_pages`` rather than by scheduling less.
             logger.warning(
-                "No eviction candidate on %s moved, and the host pool is most likely "
-                "full. Raise cpu_offload_pages for the resource that ran out.", node_name,
+                "Eviction victim %s on %s freed nothing — the host pool is "
+                "most likely full. Raise cpu_offload_pages for the resource "
+                "that ran out.", victim_id, node_name,
             )
             return None
         logger.info(

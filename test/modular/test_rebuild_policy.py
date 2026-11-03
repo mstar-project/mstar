@@ -16,6 +16,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
+from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
@@ -25,7 +26,7 @@ from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
-from mstar.worker.rebuild import KeptIds, Rebuilds
+from mstar.worker.rebuild import KeptIds, NodeWrites, Rebuilds
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
 R, A, B = 7, 8, 9
@@ -84,8 +85,14 @@ def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
 
-def _rebuilds() -> Rebuilds:
-    return Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+def _rebuilds(pool_bytes: int = 1 << 10) -> Rebuilds:
+    """`Rebuilds` with ``R``, ``A`` and ``B`` taken in as requests a drop on ``NODE`` can free."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(pool_bytes, torch.device("cpu")))
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))}}
+    layouts = {"kv": [StreamLayout(spans=(PrefixSpan(3, 3, PREFILL),), growth=(("decode_loop", 1),))]}
+    for rid in (R, A, B):
+        assert rebuilds.ingest_request(rid, writes, layouts, unpausable=False) == {"kv": True}
+    return rebuilds
 
 
 def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNamespace:
@@ -118,7 +125,7 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
 
 
 def test_a_full_pool_keeps_no_ids():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = _rebuilds(16)
 
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
 
@@ -126,13 +133,30 @@ def test_a_full_pool_keeps_no_ids():
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = _rebuilds(16)
     rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
 
     rebuilds.remove_request(R)
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
 
     assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
+
+
+@pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
+def test_a_request_no_drop_can_free_keeps_no_ids(why):
+    """A guaranteed request kept a host copy of its prompt and appended every sample, each step, though no drop
+    could ever use them."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    # a prompt written in a walk the policy doesn't prefill is one no rebuild can write again
+    walk = PREFILL if why == "its output can't pause" else "audio"
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE, "audio"}), frozenset({"decode_loop"}))}}
+    layouts = {"kv": [StreamLayout(spans=(PrefixSpan(3, 3, walk),), growth=(("decode_loop", 1),))]}
+    rebuilds.ingest_request(R, writes, layouts, unpausable=why == "its output can't pause")
+
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
+    rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [torch.tensor([9])]}}, None)
+
+    assert R not in rebuilds._kept[NODE], f"a request kept its ids though {why}"
 
 
 def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:

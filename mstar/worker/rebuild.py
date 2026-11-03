@@ -110,6 +110,8 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
+        # node -> the handles whose pages a drop there can free. Only these keep their ids.
+        self._droppable: dict[str, set[int]] = {node: set() for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
 
@@ -131,14 +133,17 @@ class Rebuilds:
             and all(span.walk == policy.walk for layout in layouts for span in layout.spans)
         )
 
-    def rebuildable(
-        self, writes: Mapping[str, Mapping[str, NodeWrites]], layouts: Mapping[str, Collection[StreamLayout]],
+    def ingest_request(
+        self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
+        layouts: Mapping[str, Collection[StreamLayout]], unpausable: bool,
     ) -> dict[str, bool]:
-        """For each paged KV cache in ``writes``, whether a drop here can free a request's pages there: one
-        rebuild row can lay out its ``layouts`` there again, and every node that writes them can write again all
-        that the node writes. A node that writes nothing for the request isn't asked.
+        """For each paged KV cache in ``writes``, whether a drop here can free ``rid``'s pages there: one
+        rebuild row can lay out the request's ``layouts`` in that cache again, and every node that writes those
+        layouts can redo all of its writes. A node that writes nothing for the request isn't asked.
 
-        A drop takes every cache of its node, so a node is judged by what it writes in all of them."""
+        A drop takes every cache of its node, so a node is judged by what it writes in all of them. A node keeps
+        ``rid``'s ids only when a drop can free ``rid``'s pages in every cache the node writes, and ``unpausable``
+        is False."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
         writers: dict[str, list[str]] = defaultdict(list)
         for key, nodes in writes.items():
@@ -148,23 +153,29 @@ class Rebuilds:
                     written[node] += laid_out
                     writers[key].append(node)
         refused = {node for node, laid_out in written.items() if not self.can_rebuild(node, laid_out)}
-        return {
+        rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
+        if not unpausable:
+            for node in written.keys() - refused:
+                if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
+                    self._droppable[node].add(rid)
+        return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy the prompt of each row of the policy's walk whose request keeps no ids yet to the host, once
-        the step that read it completes. A row the pool can't hold keeps none."""
+        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in the
+        policy's walk, a drop here can free its request's pages, and the request keeps no ids yet. A row the pool can't
+        hold keeps none."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
             return
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk != policy.walk and policy.walk not in walks.values():
             return
-        kept = self._kept[node_batch.node_name]
+        kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
         for rid, row in node_batch.per_request_input_tensors.items():
             # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or walks.get(rid, walk) != policy.walk:
+            if not row or rid in kept or rid not in droppable or walks.get(rid, walk) != policy.walk:
                 continue
             prompt = row[policy.ids_input][0]
             copy = self._pool.copy_out(prompt, node_batch.completion_event, torch.int32)
@@ -279,6 +290,7 @@ class Rebuilds:
 
     def remove_request(self, rid: int) -> None:
         for node, kept in self._kept.items():
+            self._droppable[node].discard(rid)
             ids = kept.pop(rid, None)
             if ids is not None:
                 self._pool.give(ids.prompt.slice)
