@@ -188,7 +188,7 @@ class QuantLinear(nn.Module, LoraCapable):
         return self._lora_target
 
     def lora_local_shape(self) -> tuple[int, int]:
-        # the stored weight is packed; the delta is over the linear's own shape
+        # the stored weight is packed; the delta is over the linear's own widths
         return self.in_features, self.out_features
 
     def quant_capability(self) -> QuantCapability:
