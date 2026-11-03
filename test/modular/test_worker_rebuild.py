@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Residency, StepContext
 from mstar.model.rebuild import RebuildPolicy
@@ -58,6 +59,7 @@ def _worker():
     eng.drop_request = lambda _, rid: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     eng.release_chunk_inputs = lambda rid, node: eng.released.append(rid)
+    eng.release_cached_prefix = lambda batch: None
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
     w._in_flight_rids = set()
@@ -65,11 +67,18 @@ def _worker():
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
-    # holds no row, so any routing, stop or loop-count call fails the test
-    w._graph_runtime = SimpleNamespace(cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None,
-                                       get_rid_string=str, push_back_node=lambda node, rids, wgs: w.pushed.extend(rids))
+    # keeps the rows the worker hands it in ``w.seen``, and holds no row, so any routing, stop or loop-count
+    # call fails the test
+    w._graph_runtime = SimpleNamespace(
+        cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None, get_rid_string=str,
+        push_back_node=lambda node, rids, wgs: w.seen.extend(rids),
+        set_in_flight=lambda node, rids, wgs, value: w.seen.extend(rids),
+        commit_speculation=lambda spec_id, ok, dropped, node, wg_ids, scheduled_rids: w.seen.extend(scheduled_rids),
+        speculate_node=lambda node, walks, rows, counts, strides: w.seen.extend(rows) or [],
+    )
+    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
     w.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
-    w.pushed, w.failed, w.rebuilt = [], {}, []
+    w.seen, w.failed, w.rebuilt = [], {}, []
     w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set(),
                                   note_rebuilt=lambda node, rid: w.rebuilt.append(rid))
     w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
@@ -134,6 +143,95 @@ def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
 
     assert eng.landed == [R] and w.rebuilt == [R], "the request would never be ready to decode again"
     assert w.infos[R].graph_walk == DECODE, "the runtime's view of the request left its decode walk"
+
+
+def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing():
+    w, eng = _worker()
+    w._rebuilds._kept[NODE][R] = _kept(4, 5)
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE)
+    batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+    batch.chunk_ranges[R] = ChunkRange(0, 2, 4, 2)
+    node_batch = w._build_executing_batch(batch)
+
+    w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+
+    assert not (eng.landed or eng.released or w.rebuilt), "the request would decode over KV the rebuild hasn't written"
+    assert w._rebuilds._cursors[(NODE, R)].done == 2, "the next chunk would start over"
+
+
+@pytest.mark.parametrize(
+    "chunk", [None, ChunkRange(0, 2, 4, 2), ChunkRange(2, 4, 4, 2)], ids=["whole", "first", "later"],
+)
+def test_a_rebuild_rows_ids_go_to_the_device_on_its_first_chunk_only(chunk):
+    w, eng = _worker()
+    w._rebuilds._kept[NODE][R] = _kept(4, 5)
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE)
+    batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+    if chunk is not None:
+        batch.chunk_ranges[R] = chunk
+
+    inputs = w._build_executing_batch(batch).per_request_input_tensors[R]
+
+    if chunk is None or chunk.start == 0:
+        assert inputs["text_inputs"][0].tolist() == [1, 2, 3, 4]
+    else:
+        assert not inputs, "a later chunk is cut from the input the engine prepared on the first"
+
+
+def test_a_skipped_rebuild_row_fails_its_request():
+    w, eng, batch, node_batch = _rebuilding()
+    # as the engine leaves a row whose prepare_inputs returned None
+    node_batch.request_ids = []
+    node_batch.skipped_rids.add(R)
+
+    w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+
+    assert R in w.failed and not eng.landed, "the request would wait on a rebuild that never runs"
+
+
+@pytest.mark.parametrize("site", ["push back", "in flight", "settle", "spec target", "unsubmitted speculation"])
+def test_the_graph_runtime_never_sees_a_rebuild_row(site):
+    w, _ = _worker()
+    batch = ScheduledBatch(NODE, DECODE, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
+    speculation = Speculation(scheduled_batch=batch, node_batch=None, consumed_edges=set(), continuing_rids=set(),
+                              partition="p", is_new_iter=False, is_same_node=False)
+    if site == "push back":
+        w._push_back_batch(batch)
+    elif site == "in flight":
+        w._set_in_flight_flag(batch, True)
+    elif site == "settle":
+        w._settle_speculation(speculation, success=True)
+    elif site == "spec target":
+        w._choose_spec_target(batch)
+    else:
+        w._handle_main_loop_error(RuntimeError("boom"), (), None, speculation)
+
+    assert A in w.seen and R not in w.seen, "the runtime would hold a node for a row it never scheduled"
+    assert not w.failed, "the rebuild of a step that never ran stays in the log for the next step"
+
+
+def test_a_terminal_refusal_of_a_rebuild_row_fails_only_its_request():
+    w, _ = _worker()
+    batch = ScheduledBatch(NODE, PREFILL, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
+
+    w._handle_unservable(batch, SimpleNamespace(request_ids=(R,), message="too long"))
+
+    assert w.failed.keys() == {R} and w.seen == [A], "the other row would fail, or go back as a row it never was"
+
+
+def test_a_refused_rebuild_row_is_held_like_any_row():
+    from test_admit_failure_handling import _alloc_failed, _HoldingWorker
+
+    worker, held = _HoldingWorker(), []
+    worker.scheduler.hold_requests = held.extend
+    batch = ScheduledBatch(NODE, PREFILL, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
+
+    worker._handle_allocation_failure(batch, SimpleNamespace(node_name=NODE, failed_resource="kv",
+                                                             admit_error=_alloc_failed(R)))
+
+    assert held == [R] and worker._graph_runtime.pushed_back == [A], "the retry would be refused the same way"
 
 
 def test_a_rebuild_row_stays_out_of_the_runtime_and_publishes_nothing():
