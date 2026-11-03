@@ -142,7 +142,7 @@ selected. Within the selected directories:
   `pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=...)`;
 - a module that imports an optional package at module level calls
   `pytest.importorskip("<module>")` with the import name (`flashinfer`,
-  `misaki`, `qwen_tts`, `mstar_rust`, ...) before that import;
+  `misaki`, `qwen_tts`, ...) before that import;
 - a single test that needs one makes the same call at its top, and a
   real-weights test skips when the checkpoint isn't cached;
 - a test that is broken on `main` gets `@pytest.mark.skip(reason=...)` in its

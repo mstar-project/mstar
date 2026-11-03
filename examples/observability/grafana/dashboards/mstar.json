@@ -1451,7 +1451,7 @@
     {
       "type": "timeseries",
       "title": "Data worker queue depth vs requests in flight",
-      "description": "Requests submitted and not yet taken up by the data worker (read at scrape), against every request the API server holds.",
+      "description": "Inputs (requests and client-stream appends) waiting in the data worker: submitted, and neither being prepared nor handed on to the conductor yet (read at scrape), against every request the API server holds.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2569,7 +2569,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2645,19 +2645,19 @@
           "range": true
         }
       ],
-      "id": 46
+      "id": 48
     },
     {
       "type": "timeseries",
       "title": "KV rebuilds: tokens prefilled and cached pages found",
-      "description": "Tokens of kept history the rebuild rows prefilled per second, cache hits included; dashed: pages a rebuild row found in the prefix cache per second.",
+      "description": "Tokens the rebuild rows prefilled per second, cache hits included; dashed: pages a rebuild row found in the prefix cache per second.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
       },
       "gridPos": {
         "x": 12,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -2748,7 +2748,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 141,
+        "y": 149,
         "w": 24,
         "h": 1
       },
@@ -2765,7 +2765,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2823,7 +2823,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2891,7 +2891,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 150,
+        "y": 158,
         "w": 12,
         "h": 8
       },
@@ -2963,7 +2963,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 150,
+        "y": 158,
         "w": 12,
         "h": 8
       },
@@ -3031,7 +3031,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 158,
+        "y": 166,
         "w": 24,
         "h": 1
       },
@@ -3049,7 +3049,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 159,
+        "y": 167,
         "w": 12,
         "h": 8
       },
@@ -3228,7 +3228,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 159,
+        "y": 167,
         "w": 12,
         "h": 8
       },
@@ -3284,7 +3284,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 167,
+        "y": 175,
         "w": 24,
         "h": 8
       },
