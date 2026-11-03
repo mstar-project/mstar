@@ -284,7 +284,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
         step=None, preplan_event=None, preplanned_rids=None,
         step_context=SimpleNamespace(
             graph_walk="decode", padded_request_ids=["a"], is_preplan=False,
-            set_padded_rids=lambda rids: None,
+            set_padded_rids=lambda rids: None, resident=None,
         ),
     )
     submodule.step_is_input_free = lambda walk: False
