@@ -61,8 +61,7 @@ def _graphs() -> dict:
 
 def _record(prompt=(1, 2, 3)) -> RowRecord:
     """A prefill step that read ``prompt`` as int64 ids."""
-    ids = torch.tensor(prompt, dtype=torch.int32)
-    return RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {"is_prefill": True})
+    return RowRecord({"text_inputs": [torch.tensor(prompt)]}, {"is_prefill": True})
 
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:

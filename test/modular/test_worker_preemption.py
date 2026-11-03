@@ -66,8 +66,7 @@ class _Engine(SimpleNamespace):
 
 def _kept(tokens: int) -> KeptIds:
     """A request's prompt of ``tokens`` ids, recorded in its one prefill step, and one sample."""
-    ids = torch.arange(tokens, dtype=torch.int32)
-    record = RowRecord({"text_inputs": [ids]}, {"text_inputs": torch.long}, {})
+    record = RowRecord({"text_inputs": [torch.arange(tokens)]}, {})
     return KeptIds((LayoutRow("prefill", tokens),), [record], array("i", [0]))
 
 

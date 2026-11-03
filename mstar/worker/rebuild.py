@@ -45,11 +45,10 @@ class LayoutRow(NamedTuple):
 @dataclass(slots=True)
 class RowRecord:
     """One prefill step of a request as it ran, kept so its rebuild can run the step again: host copies of every
-    input the node read in it, in the request's slice, the dtype each was read in, and the step's metadata. Ids,
-    read as int64, are kept as int32. ``queued`` counts the copies that haven't started, and ``landed`` is recorded
-    after the last that has, None where the copies run in place."""
+    input the node read in it, as the step read it, in the request's slice, and the step's metadata. ``queued``
+    counts the copies that haven't started, and ``landed`` is recorded after the last that has, None where the
+    copies run in place."""
     inputs: NameToTensorList
-    dtypes: dict[str, torch.dtype]
     step_metadata: dict
     queued: int = 0
     landed: torch.Event | None = None
@@ -241,15 +240,19 @@ class Rebuilds:
         )
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> HostSlice | None:
-        """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span as int32 and the host
-        copies for its other spans. None when the pool can't hold it, or when the request has spans other than ids and
-        the node's dtype is unknown."""
+        """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span and the host copies for
+        its other spans. None when the pool can't hold it, or when the request has spans other than ids and the
+        node's dtype is unknown.
+
+        The ids' dtype isn't known until a step reads them, so each takes 8 B, enough for int64, the widest dtype a
+        step reads ids in. What the steps don't use goes back to the pool once the last is recorded."""
         spans = [span for layout in layouts for span in layout.spans]
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if dtype is None and any(span.kind != SpanKind.IDS for span in spans):
             return None
         return self._pool.take(sum(
-            aligned(4 * span.length) if span.kind == SpanKind.IDS else span.length * width[span.walk] * dtype.itemsize
+            aligned(span.length * torch.long.itemsize) if span.kind == SpanKind.IDS
+            else span.length * width[span.walk] * dtype.itemsize
             for span in spans
         ))
 
@@ -329,7 +332,7 @@ class Rebuilds:
                 (name, tensor.reshape(-1) if name == ids_input else tensor)
                 for name in names for tensor in inputs.get(name, ())
             ]
-            nbytes = sum(aligned(tensor.numel() * _kept_dtype(tensor).itemsize) for _, tensor in tensors)
+            nbytes = sum(aligned(tensor.nbytes) for _, tensor in tensors)
             if (
                 walk != row.walk or (chunk is not None and chunk.total != row.length)
                 or not all(name in inputs for name in names)
@@ -339,15 +342,12 @@ class Rebuilds:
             assert kept.used + nbytes <= piece.nbytes, (
                 f"{node} read more in {walk!r} than its rebuild policy's copy_width says"
             )
-            record = RowRecord(
-                {name: [] for name in names}, {name: tensor.dtype for name, tensor in tensors},
-                dict(node_batch.per_request_info[rid].step_metadata),
-            )
+            record = RowRecord({name: [] for name in names}, dict(node_batch.per_request_info[rid].step_metadata))
             for name, tensor in tensors:
-                dtype = _kept_dtype(tensor)
-                into = HostSlice(piece.offset + kept.used, tensor.numel() * dtype.itemsize)
-                if dtype != tensor.dtype:
-                    copy = self._pool.copy_out(tensor, into, node_batch.completion_event, dtype)
+                into = HostSlice(piece.offset + kept.used, tensor.nbytes)
+                # The ids are few, so they go now. The copies of the other inputs share the step's host-write allowance.
+                if name == ids_input:
+                    copy = self._pool.copy_out(tensor, into, node_batch.completion_event)
                     record.inputs[name].append(copy.view)
                     record.landed = copy.landed
                 else:
@@ -531,15 +531,16 @@ class Rebuilds:
     ) -> NameToTensorList:
         ids_input, inputs = self._policies[node].ids_input, {}
         for name, views in record.inputs.items():
-            host, dtype = list(views), record.dtypes[name]
-            if name == ids_input and cursor.row == len(cursor.rows) - 1 and len(cursor.sampled) > 1:
-                host[-1] = torch.cat([host[-1], torch.frombuffer(cursor.sampled, dtype=torch.int32)[:-1]])
+            if name == ids_input:
+                ids = list(views)
+                if cursor.row == len(cursor.rows) - 1 and len(cursor.sampled) > 1:
+                    sampled = torch.frombuffer(cursor.sampled, dtype=torch.int32)[:-1]
+                    ids[-1] = torch.cat([ids[-1], sampled.to(ids[-1].dtype)])
+                inputs[name] = [to_device_nonblocking(tensor, self._pool.device) for tensor in ids]
+                continue
             inputs[name] = []
-            for tensor in host:
-                if tensor.dtype != dtype:
-                    inputs[name].append(to_device_nonblocking(tensor.to(dtype), self._pool.device))
-                    continue
-                tensor, landed = self._pool.copy_in(tensor)
+            for view in views:
+                tensor, landed = self._pool.copy_in(view)
                 inputs[name].append(tensor)
                 ready += [landed] if landed is not None else []
         return inputs
@@ -564,7 +565,3 @@ class Rebuilds:
             self._cursors.pop((node, rid), None)
 
 
-
-def _kept_dtype(tensor: torch.Tensor) -> torch.dtype:
-    """The dtype a log keeps ``tensor`` in: ids, read as int64, as int32."""
-    return torch.int32 if tensor.dtype == torch.int64 else tensor.dtype
