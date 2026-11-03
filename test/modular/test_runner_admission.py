@@ -65,6 +65,15 @@ class _StubPool(Resource):
             self.unreserve(rid)
 
 
+class _PassingPool(_StubPool):
+    """A `_StubPool` that lets a request pass while a unit is left for the first request."""
+
+    def reserve_past(self, rid, node_name, graph_walk, published):
+        if self.needs.get(rid, 1) + 1 > self.free:
+            return self.free
+        return self.reserve(rid, node_name, graph_walk, published)
+
+
 def _runner(nodes: dict[str, list[str]] | None = None, **pools: _StubPool) -> StepRunner:
     return StepRunner(pools, node_resources=nodes or {NODE: list(pools)})
 
@@ -187,3 +196,26 @@ def test_a_request_one_pool_refuses_keeps_no_place_in_another_pools_queue():
 
     assert runner.admit_waiting(_nothing) == [(NODE, "next")], "a refused request kept the next one waiting"
     assert slots.held == {"next"}
+
+
+def test_a_first_request_whose_pool_grew_passes_where_it_waits_behind_another():
+    kv, slots = _PassingPool(0), _PassingPool(2, needs={"g": 3})
+    runner = _runner({"one": ["kv", "slots"], "two": ["slots"]}, kv=kv, slots=slots)
+    assert runner.admit_retrieve("g", "two", WALK).queued
+    assert runner.admit_retrieve("h", "one", WALK).queued
+    kv.free = 1
+
+    started = runner.admit_waiting(_nothing)
+
+    assert ("one", "h") in started, "h waits behind g, which can't start, though its own pool grew"
+
+
+def test_a_request_turned_away_by_an_out_of_date_mark_can_leave_before_it_is_tried_again():
+    kv = _PassingPool(0, needs={"head": 2})
+    runner = _runner(kv=kv)
+    assert runner.admit_retrieve("head", NODE, WALK).queued
+    kv.free = 1  # the head's mark is out of date, and the head still doesn't fit
+    assert runner.admit_retrieve("p", NODE, WALK).queued
+    runner.remove_request("p")
+
+    assert runner.admit_waiting(_nothing) == [], "a request that left was tried again"

@@ -49,8 +49,8 @@ class Admission:
         # `_passes` holds the resources that override `Resource.reserve_past`, whose queues a request may pass.
         # `_pass_short` maps each resource that refused a request passing since the last pass sweep to the
         # distinct marks it refused against.
-        # `_unpassed` holds the requests not tried for passing because a first request's resource had grown
-        # since it didn't fit, which `admit_waiting` tries once that request has been measured again.
+        # `_unpassed` holds the requests not tried for passing because a first request ahead of them may fit
+        # now, which `admit_waiting` tries once that request has been measured again.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
         self._numbered: list[str] = []
@@ -158,6 +158,9 @@ class Admission:
             return started
         for key in grown:
             del self._short[key]
+        # a first request whose resource grew may now pass in a queue where it isn't first
+        unpassed = self._unpassed.union(self._queues[key][0] for key in grown)
+        self._unpassed = set()
         admitted = True
         while admitted:
             admitted = False
@@ -174,7 +177,6 @@ class Admission:
                     admitted = True
         # the last sweep admitted nothing, so it tried every queue's first request
         passable, self._untried = passable or self._untried, False
-        unpassed, self._unpassed = self._unpassed, set()
         if not passable and not unpassed:
             return started
         blocked = self._blocked()
@@ -200,7 +202,6 @@ class Admission:
             self._leave(rid, entry.asked)
         self._admitted.pop(rid, None)
         self._started.pop(rid, None)
-        self._unpassed.discard(rid)
         arrival = self._arrival.pop(rid, None)
         if arrival is not None and not arrival[0]:
             self._numbered.remove(rid)
@@ -282,3 +283,4 @@ class Admission:
                 if len(queue) > 1:
                     self._untried = True
             queue.remove(rid)
+        self._unpassed.discard(rid)
