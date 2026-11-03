@@ -355,6 +355,18 @@ def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     )
 
 
+def test_the_page_check_catches_a_host_page_counted_as_room_that_eviction_cant_free():
+    """The host's room counts the evictable set its arena keeps current, so a page counted there that eviction
+    can't free would send a victim to a host that can't take it."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    kv.assert_pages_conserved()
+    kv._cpu_pool.index.evictable().add(0)
+
+    with pytest.raises(AssertionError, match="eviction reaches 0 of the 1 pages"):
+        kv.assert_pages_conserved()
+
+
 def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
     """A request waiting in the queue on the host holds no page on the device. A move that copied only some of its
     pages would leave the request holding a device page, which the debug page check raises on."""
