@@ -34,6 +34,7 @@ from test_kv_prefix_lease import (
     _seed,
     _StubTransfer,
 )
+from test_sampler_admission import _resource as _sampler
 
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
@@ -296,6 +297,20 @@ def test_a_request_passes_beside_a_recurrent_pool_only_while_a_slot_is_left_for_
         kv_layout={"main": StreamLayout((PrefixSpan(56, 56, WALK),), (("decode_loop", 1),), keyed_spans=1)}))
 
     assert _ready(kv, "short") is passes, "the head would wait for a slot a request passing it took"
+
+
+@pytest.mark.parametrize("rows, passes", [(4, True), (3, False)], ids=["a row left for the head", "none left"])
+def test_a_request_passes_beside_the_samplers_rows_only_while_one_is_left_for_the_head(monkeypatch, rows, passes):
+    """Since #938 every request on a captured node asks the sampler for an in-graph row, the head included."""
+    kv = _manager(max_num_pages=16)
+    sampler = _sampler(monkeypatch, slots=rows, max_bs=1)
+    for rid in ("r", "fill", "head", "short"):
+        sampler.ingest_request(rid)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "sampler": sampler}, node_resources={NODE: ["kv", "sampler"]}))
+    kv = _passing(free=3, head=5, kv=kv)
+    _short_chat(kv, "short", [8] * 8)
+
+    assert _ready(kv, "short") is passes, "a request that passes beside the KV waited behind the head for a row"
 
 
 class _Slots(Resource):

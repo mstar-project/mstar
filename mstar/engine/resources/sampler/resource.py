@@ -343,8 +343,16 @@ class SamplerResource(Resource):
         return ASKS
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        return self._reserve(rid, 1)
+
+    def reserve_past(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        """`reserve`, leaving the first waiting request its row."""
+        return self._reserve(rid, 2)
+
+    def _reserve(self, rid: str, requests: int) -> int | None:
+        """Give ``rid`` a row when there are rows for ``requests`` requests."""
         room = self._cg_buffers.free_rows
-        if room <= 0:
+        if room < requests:
             return room
         self._cg_buffers.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
         return None
