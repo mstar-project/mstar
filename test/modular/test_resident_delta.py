@@ -1246,13 +1246,13 @@ def _pool_rank(monkeypatch, rank: int) -> tuple[KVManager, Engine]:
     return kv, engine
 
 
-def _ingest(kvs, rid: str, pages: int, arrival: int) -> None:
+def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True) -> None:
     """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
     for kv in kvs:
         _ENGINES[id(kv)]._runner.ingest_request(rid, {"kv": KVReqConfig(
-            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE},
+            kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, rebuildable=rebuildable,
         )}, arrival)
 
 
@@ -1453,6 +1453,26 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     assert follower.is_resident("v"), "the follower didn't replay rank 0's return"
     assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
+
+
+def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
+    """Rank 0 asks the host to set room aside at a request's first ask, and a follower asks for the request only
+    as it replays its reservation. Here x asks first and takes the host's room, and b, older, then reserves first.
+    A follower asking its own host for b would find x's room still free and keep b preemptible, where rank 0
+    guaranteed it."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(8)
+    _ingest((leader, follower), "b", 1, arrival=1, rebuildable=False)
+    _ingest((leader, follower), "x", 1, arrival=2, rebuildable=False)
+    assert leader.ask("x", NODE, "prefill") is not None
+    assert _admits(leader, "b")
+    assert "b" in leader._guaranteed and "x" in leader._cpu_pool.reserved, "the host had room for both"
+
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+
+    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower set other host room aside"
+    assert follower._guaranteed == leader._guaranteed, "a request rank 0 never preempts is preemptible here"
 
 
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
