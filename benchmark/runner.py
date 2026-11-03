@@ -475,12 +475,13 @@ class Benchmark:
         requests = dataset.get_requests()[: self.config.num_requests]
         self._assign_output_lengths(requests)
 
-        # Bump the connection-pool cap so closed-loop runs at high
-        # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
-        connector_limit = max(100, (self.config.max_concurrency or 1) + 10)
+        # No connection-pool cap (limit=0): the profiling mode alone sets how
+        # many requests are in flight. A capped pool would hold an offline
+        # batch or an online burst back on the client, and that wait would be
+        # counted as server latency.
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300),
-            connector=aiohttp.TCPConnector(limit=connector_limit),
+            connector=aiohttp.TCPConnector(limit=0),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
             await self._warmup(session, requests)
