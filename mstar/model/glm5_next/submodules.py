@@ -165,27 +165,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if pool is None:
             return None
         # A prefill takes only the slots free now, so a TP follower that refuses one has
-        # diverged from rank 0. With prefill graphs, also no more rows than one captures: an
-        # eager prefill's last layer would compile the MoE decode kernels for its row count.
+        # diverged from rank 0. The engine also holds a captured prefill to its largest
+        # graph's rows: past them, the eager last layer would compile the MoE decode
+        # kernels for its row count mid-serve.
         if graph_walk == "prefill":
-            rows = self._captured_prefill_rows()
-            free = pool.num_free_slots
-            return free if rows is None else min(free, rows)
+            return pool.num_free_slots
         return pool.config.usable_slots
 
     def batch_cap_varies(self, graph_walk: str) -> bool:
         # the prefill cap follows the free KDA slots
         return graph_walk == "prefill"
-
-    def _captured_prefill_rows(self) -> int | None:
-        """The most rows a captured prefill takes, or None while prefill runs eager."""
-        if not self.config.prefill_graphs or not self._kda_prefill_capturable():
-            return None
-        # no prefill graph (reference MoE, the MLA fallback): an eager prefill is not held
-        # to the captured rows
-        if getattr(self, "_prefill_captured", True) is False:
-            return None
-        return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -195,7 +184,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: reference MoE dispatch active; decode runs eager "
                 "(set moe_quant_kernel=auto for the capturable fused kernel)"
             )
-            self._prefill_captured = False
             return []
         # The MLA fallback bakes page indices into its plan, so a captured
         # replay would attend the capture's pages (the resource refuses).
@@ -205,7 +193,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: MLA is on the SDPA fallback, which cannot be "
                 "captured; decode runs eager"
             )
-            self._prefill_captured = False
             return []
         max_slots = self._kda_max_slots()
         batch_sizes = [
@@ -230,7 +217,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # captured replay would run the capture's dummy spans.
             logger.warning("glm5_next: fused KDA prefill off; prefill runs eager")
         elif self.config.prefill_graphs:
-            # One graph per (rows, token bucket); a batch past every bucket
+            # One graph per (rows, token bucket); a batch past every token bucket
             # runs eager rather than being split.
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
@@ -245,10 +232,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                                 or PREFILL_CAPTURE_BATCH_SIZES)
                     if max_slots is None or b <= max_slots
                 ],
-                caps_eager_batch_size=False,
                 compile=False,
             ))
-        self._prefill_captured = any(c.capture_graph_walk == "prefill" for c in configs)
         return configs
 
     # -- dtype discipline -------------------------------------------------
