@@ -174,7 +174,10 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
 
 
 @pytest.mark.parametrize("config, side", [
-    ("qwen3tts_1p7b.yaml", ()),
+    ("qwen3tts.yaml", (("Codec", "codec_chunk"),)),
+    ("qwen3tts_1p7b.yaml", (("Codec", "codec_chunk"),)),
+    ("qwen3tts_base.yaml", (("Codec", "codec_chunk"),)),
+    ("qwen3tts_voicedesign.yaml", (("Codec", "codec_chunk"),)),
     ("qwen3tts_1p7b_split.yaml", ()),
 ])
 def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, side):
