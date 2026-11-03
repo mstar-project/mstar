@@ -40,7 +40,7 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -455,6 +455,31 @@ class TestCheckStop:
         assert sub.check_stop("r", _info("r", max_tokens=3, decode_iters=None), out) == set()
         # ignore_eos does not touch the budget
         assert sub.check_stop("r", _info("r", max_tokens=5, ignore_eos=True, decode_iters=3), out) == {"decode_loop"}
+
+    def test_check_stop_batched_agrees_with_check_stop(self):
+        """One tolist for the batch, the same answer per request; a request with no row is
+        skipped, as the per-request path skips one without outputs."""
+        _model, lm, cfg = _build_model(seed=4)
+        sub = Glm5NextLLMSubmodule(lm, cfg)
+        eos = cfg.eos_token_ids[0]
+        word = next(t for t in range(cfg.vocab_size) if t not in cfg.eos_token_ids)
+        infos = {
+            "eos": _info("eos"), "mid": _info("mid"),
+            "budget": _info("budget", max_tokens=8, decode_iters=6),
+            "ignored": _info("ignored", ignore_eos=True), "ended": _info("ended"),
+            "absent": _info("absent"),
+        }
+        sub.request_state("ended").add("ended_at_prefill", True)
+        rows = ("eos", "mid", "budget", "ignored", "ended")
+        tokens = torch.tensor([eos, word, word, eos, word, 0])  # a padding row last
+        batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
+        per_request = {
+            rid: loops for rid, token in zip(rows, tokens, strict=False)
+            if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
+        }
+        assert batched == per_request == {
+            "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
+        }
 
 
 class TestDtype:

@@ -45,6 +45,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
 )
@@ -719,7 +720,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        # check_stop gets host tensors, so .item() here does not sync
         state = self.request_states.get(request_id)
         if state is not None and state.get("ended_at_prefill"):
             return {"decode_loop"}
@@ -727,7 +727,35 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return set()
         if self.mtp_k > 0:
             return self._mtp_check_stop(request_id, request_info, outputs["new_token"][0])
-        token = outputs["new_token"][0].item()
+        # check_stop gets host tensors, so .item() here does not sync
+        return self._stops(request_id, request_info, outputs["new_token"][0].item())
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for the batch off one ``tolist`` of its tokens."""
+        if self.mtp_k > 0:
+            return None  # a verify step's row holds several tokens
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
+            return None
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            if loops := self._stops(rid, request_infos[rid], token):
+                stops[rid] = loops
+        return stops
+
+    def _stops(
+        self, request_id: str, request_info: CurrentForwardPassInfo, token: int,
+    ) -> set[str]:
+        """The loops a plain step's emitted ``token`` stops."""
+        state = self.request_states.get(request_id)
+        if state is not None and state.get("ended_at_prefill"):
+            return {"decode_loop"}
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if request_info.graph_walk == "prefill":
