@@ -24,6 +24,7 @@ mstar.utils.knobs
       kv_pinned_indptrs
       kv_plan_cache
       pre_plan_enabled
+      resident_planning
       sampler_ingraph_scatter
       sampler_slots
       step_thread_core

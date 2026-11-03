@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.engine.resources.dsa" href="mstar.engine.resources.dsa.html" />
-    <link rel="prev" title="mstar.engine.resources.attn.xpu" href="mstar.engine.resources.attn.xpu.html" />
+    <link rel="prev" title="mstar.engine.resources.attn.workspace" href="mstar.engine.resources.attn.workspace.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -251,7 +251,6 @@
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
@@ -263,6 +262,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.resident_hooks.html">mstar.engine.resources.resident_hooks</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -403,7 +403,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1189,7 +1188,7 @@ writes are keyed, and the growth walks whose sampled ids extend the keys.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">Resource</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.resident_hooks.html#mstar.engine.resources.resident_hooks.ResidentHooks" title="mstar.engine.resources.resident_hooks.ResidentHooks"><code class="xref py py-class docutils literal notranslate"><span class="pre">ResidentHooks</span></code></a>, <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.admit">
 <span class="sig-name descname"><span class="pre">admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.admit" title="Link to this definition">#</a></dt>
@@ -2038,12 +2037,12 @@ the stop buffers. Read right after the forward and not cloned.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.engine.resources.attn.xpu.html"
+       href="mstar.engine.resources.attn.workspace.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.engine.resources.attn.xpu</p>
+        <p class="prev-next-title">mstar.engine.resources.attn.workspace</p>
       </div>
     </a>
     <a class="right-next"

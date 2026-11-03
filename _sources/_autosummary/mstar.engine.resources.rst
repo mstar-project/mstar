@@ -37,6 +37,8 @@ mstar.engine.resources
    lora
    position
    recurrent
+   resident
+   resident_hooks
    rms_norm
    runner
    sampler

@@ -38,6 +38,7 @@ mstar.engine.resources.kv
    page_copier
    plan
    prefix_index
+   resident
    ring
    routing
    transfer

@@ -1,7 +1,7 @@
-mstar.engine.resources.attn.flashinfer
+mstar.engine.resources.resident\_hooks
 ======================================
 
-.. automodule:: mstar.engine.resources.attn.flashinfer
+.. automodule:: mstar.engine.resources.resident_hooks
 
    
    
@@ -17,7 +17,7 @@ mstar.engine.resources.attn.flashinfer
 
    .. autosummary::
    
-      FlashInferManager
+      ResidentHooks
    
    
 

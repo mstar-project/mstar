@@ -251,7 +251,6 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
@@ -263,6 +262,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.resident_hooks.html">mstar.engine.resources.resident_hooks</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -403,7 +403,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -699,6 +698,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_pinned_indptrs"><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_plan_cache"><code class="docutils literal notranslate"><span class="pre">kv_plan_cache()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.pre_plan_enabled"><code class="docutils literal notranslate"><span class="pre">pre_plan_enabled()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.resident_planning"><code class="docutils literal notranslate"><span class="pre">resident_planning()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_ingraph_scatter"><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_slots"><code class="docutils literal notranslate"><span class="pre">sampler_slots()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.step_thread_core"><code class="docutils literal notranslate"><span class="pre">step_thread_core()</span></code></a></li>
@@ -756,13 +756,16 @@ non-empty <code class="docutils literal notranslate"><span class="pre">MSTAR_*</
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.pre_plan_enabled" title="mstar.utils.knobs.pre_plan_enabled"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pre_plan_enabled</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">pre_plan</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_PRE_PLAN_SPEC</span></code> (default on): the worker pre-plans the speculative batch on a plan thread while the previous step replays, and the engine double-buffers the resources that support it.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="mstar.utils.knobs.sampler_ingraph_scatter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.resident_planning" title="mstar.utils.knobs.resident_planning"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resident_planning</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">resident_planning</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_RESIDENT_PLANNING</span></code> (default <code class="docutils literal notranslate"><span class="pre">auto</span></code>): a captured decode step reads its rows off per-request tables held on the device instead of having them rebuilt on the plan thread (<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.resident</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="mstar.utils.knobs.sampler_ingraph_scatter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default on): the captured sampler gathers its RNG offsets from the slot masters and scatters the advanced offsets and the sampled tokens back inside the graph, so a replayed step issues none of those launches on the gpu thread (each is a GIL release the main thread's postprocess can win).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): request rows of the masters a captured graph indexes when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>), so the most requests admitted at once on its node.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.step_thread_core" title="mstar.utils.knobs.step_thread_core"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step_thread_core</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.step_thread_core" title="mstar.utils.knobs.step_thread_core"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step_thread_core</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code> (default <code class="docutils literal notranslate"><span class="pre">auto</span></code>): pin each worker's main, GPU and plan threads, and the API server's result threads, to CPUs of their own.</p></td>
 </tr>
 </tbody>
@@ -947,6 +950,23 @@ extra thread is just GIL contention.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.knobs.resident_planning">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">resident_planning</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#resident_planning"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.resident_planning" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">resident_planning</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_RESIDENT_PLANNING</span></code> (default <code class="docutils literal notranslate"><span class="pre">auto</span></code>):
+a captured decode step reads its rows off per-request tables held on the
+device instead of having them rebuilt on the plan thread
+(<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.resident</span></code>). <code class="docutils literal notranslate"><span class="pre">auto</span></code> turns it on for a node
+whose submodule names resident walks and every resource of which is
+resident-capable, and says why at startup when one is not; <code class="docutils literal notranslate"><span class="pre">off</span></code> keeps
+the host plan everywhere.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.sampler_ingraph_scatter">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">sampler_ingraph_scatter</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#sampler_ingraph_scatter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default
@@ -1056,6 +1076,7 @@ nothing and logs why for this host (see <code class="docutils literal notranslat
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_pinned_indptrs"><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_plan_cache"><code class="docutils literal notranslate"><span class="pre">kv_plan_cache()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.pre_plan_enabled"><code class="docutils literal notranslate"><span class="pre">pre_plan_enabled()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.resident_planning"><code class="docutils literal notranslate"><span class="pre">resident_planning()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_ingraph_scatter"><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_slots"><code class="docutils literal notranslate"><span class="pre">sampler_slots()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.step_thread_core"><code class="docutils literal notranslate"><span class="pre">step_thread_core()</span></code></a></li>
