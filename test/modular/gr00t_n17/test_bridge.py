@@ -32,7 +32,7 @@ from mstar.model.gr00t_n17.submodules import (
 from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
-from .helpers import BACKBONE, SegmentAttention, randomize, relative_gap
+from .helpers import BACKBONE, RECORDINGS, RUNS, SegmentAttention, randomize, relative_gap
 
 _BLOCKS = 4  # the checkpoint's `vl_self_attention_cfg.num_layers`
 # spelled out rather than imported from the module under test: the point of the eps
@@ -485,7 +485,7 @@ def test_more_image_rows_than_feature_rows_is_refused_where_they_arrive():
 # ----------------------------------------------------------------------------
 
 # Twenty prefills recorded off the reference, outside the checkpoint download.
-_DUMP = Path.home() / "gr00t-runs/dump"
+_DUMP = RUNS / "dump"
 _RECORDED = sorted(_DUMP.glob("req_*.pt")) if _DUMP.is_dir() else []
 _HAVE_RECORDED = bool(_RECORDED) and BACKBONE is not None
 
@@ -555,7 +555,7 @@ def _image_rows(request: _Request) -> torch.Tensor:
     return prepared.tensor_inputs["image_rows"]
 
 
-@pytest.mark.skipif(not _HAVE_RECORDED, reason="recorded requests or backbone not cached")
+@pytest.mark.skipif(not _HAVE_RECORDED, reason=f"recorded requests in {_DUMP} or backbone not cached ({RECORDINGS})")
 @pytest.mark.parametrize("path", _RECORDED, ids=[path.stem for path in _RECORDED])
 @torch.no_grad()
 def test_the_split_is_the_references_image_token_predicate(path):

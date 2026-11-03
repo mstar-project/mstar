@@ -44,11 +44,10 @@ from mstar.model.gr00t_n17.gr00t_n17_model import LLM, VISION_ENCODER, VL_BRIDGE
 from mstar.model.qwen3_5.config import VISION_ATTN
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
-from .helpers import BACKBONE, GR00T, SegmentAttention
+from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS, SegmentAttention
 
-_RUNS = Path.home() / "gr00t-runs"
-_ORACLE_FP32, _ORACLE_BF16 = _RUNS / "oracle_fp32_seed7", _RUNS / "oracle_bf16_seed7"
-_DUMP = _RUNS / "dump"
+_ORACLE_FP32, _ORACLE_BF16 = RUNS / "oracle_fp32_seed7", RUNS / "oracle_bf16_seed7"
+_DUMP = RUNS / "dump"
 _REQUESTS = 20
 
 # What each stage reads off the two runs; the batched two are recorded with a batch dim of 1.
@@ -91,7 +90,7 @@ _RECORDED = _recorded_keys()
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and GR00T.exists() and bool(BACKBONE) and _complete(_DUMP)),
-    reason=f"the backbone stages need CUDA, the cached checkpoint and the {_REQUESTS} dumps in {_DUMP}",
+    reason=f"the backbone stages need CUDA, the cached checkpoint and the {_REQUESTS} dumps in {_DUMP} ({RECORDINGS})",
 )
 
 
@@ -101,7 +100,7 @@ def _needs(*keys: str) -> pytest.MarkDecorator:
         bool(missing),
         reason=(
             f"{_ORACLE_BF16.name} and {_ORACLE_FP32.name} do not both record {missing} on all "
-            f"{_REQUESTS} requests; the module docstring says what they must hold"
+            f"{_REQUESTS} requests; the module docstring says what they must hold ({RECORDINGS})"
         ),
     )
 

@@ -1,4 +1,5 @@
 import glob
+import os
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,12 @@ GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67
 BACKBONE = next(iter(glob.glob(str(_HUB / "models--nvidia--Cosmos-Reason2-2B/snapshots/*"))), None)
 
 needs_checkpoint = pytest.mark.skipif(not (GR00T.exists() and BACKBONE), reason="checkpoint not cached")
+
+# NVIDIA's reference runs, made by test/gr00t_n17/record_dumps.py and record_oracle.py, and its
+# source, found as upstream's other reference tests find theirs (WAYPOINT_ORACLE_DIR)
+RUNS = Path(os.environ.get("GR00T_N17_ORACLE_DIR", Path.home() / "gr00t-runs"))
+REFERENCE_SRC = Path(os.environ.get("GR00T_N17_REFERENCE_SRC", Path.home() / "ref/Isaac-GR00T"))
+RECORDINGS = "set GR00T_N17_ORACLE_DIR; test/gr00t_n17/record_dumps.py and record_oracle.py make them"
 
 
 def randomize(module: nn.Module, seed: int, scale: float) -> None:

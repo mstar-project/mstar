@@ -1,7 +1,6 @@
 import copy
 import json
 import types
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,10 +8,10 @@ import torch
 
 from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 
-from .helpers import BACKBONE, GR00T, needs_checkpoint
+from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS, needs_checkpoint
 
 # The 20 recorded DROID requests the decode's parity bar is measured on.
-_DUMPS = sorted((Path.home() / "gr00t-runs/dump").glob("req_*.pt"))
+_DUMPS = sorted((RUNS / "dump").glob("req_*.pt"))
 
 # Tiny three-embodiment checkpoint. "grip" is constant under q01/q99 but not under min/max.
 KWARGS = {
@@ -505,7 +504,10 @@ def test_a_degenerate_rotation_is_refused_rather_than_decoded_to_nan(rot6d, fram
         _pre().unapply("eefbot", _pose_chunk([1.0, 0.0, 0.0], rot6d), {"pose": np.array([[frame]], np.float32)})
 
 
-@pytest.mark.skipif(not (GR00T.exists() and len(_DUMPS) == 20), reason="checkpoint or the 20 requests missing")
+@pytest.mark.skipif(
+    not (GR00T.exists() and len(_DUMPS) == 20),
+    reason=f"checkpoint or the 20 requests in {RUNS / 'dump'} missing ({RECORDINGS})",
+)
 def test_the_decode_matches_the_reference_on_the_twenty_recorded_droid_requests():
     """Our decode against the reference's own ``decoded_action`` on 20 recorded DROID
     requests, byte-identical inputs. Measured bars, never to be loosened:
