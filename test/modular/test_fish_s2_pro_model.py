@@ -716,6 +716,8 @@ def test_the_shipped_request_cap_fits_the_codec_streams():
     cfg = yaml.safe_load(CONFIG_PATH.read_text())
     model = tiny_model()
     model.validate_config_yaml(cfg, str(CONFIG_PATH))
+    # a null override means the default pool, as apply_yaml_overrides reads it
+    model.validate_config_yaml({**cfg, "resources": {CODEC_STATE: {"max_slots": None}}}, str(CONFIG_PATH))
     small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         model.validate_config_yaml(small, str(CONFIG_PATH))
