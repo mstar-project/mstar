@@ -19,6 +19,8 @@ import logging
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.platforms import current_platform
@@ -665,6 +667,23 @@ class FlashInferDecodeWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
+@triton.jit
+def _gather_block_rows_kernel(
+    slots_ptr, kv_len_ptr, store_ptr, table_ptr, lens_ptr,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, WIDTH: tl.constexpr,
+):
+    i = tl.program_id(0)
+    n = tl.load(kv_len_ptr + i) + 1
+    tl.store(lens_ptr + i, n.to(tl.int32))
+    row = tl.load(slots_ptr + i) * STRIDE + BLOCK
+    pages = (n + PAGE - 1) // PAGE
+    for start in tl.range(0, pages, 32):
+        cols = start + tl.arange(0, 32)
+        keep = cols < pages
+        values = tl.load(store_ptr + row + cols, mask=keep, other=0)
+        tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=keep)
+
+
 class FmhaDecodeWrapper:
     """Captured decode attention on FlashInfer's trtllm-gen fmha kernel.
 
@@ -750,6 +769,17 @@ class FmhaDecodeWrapper:
         self._planned = True
         self.dtype = dtype
         self._window_left = window_left
+
+    def gather_resident(
+        self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+    ) -> None:
+        """Inside a resident step's capture: this step's rows off the tables,
+        into the table and lengths the kernel holds the addresses of. Only the
+        columns a row reads; the rest of the table is never looked at."""
+        _gather_block_rows_kernel[(self.batch_size,)](
+            slots, kv_len, store, self._table, self._lens,
+            STRIDE=stride, BLOCK=block_col, PAGE=self._page_size, WIDTH=self._table.shape[1], num_warps=1,
+        )
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:

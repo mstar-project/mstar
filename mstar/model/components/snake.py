@@ -35,17 +35,38 @@ if triton is not None:
         s = libdevice.sin(x * alpha)
         tl.store(out_ptr + offsets, (x + inv_beta * (s * s)).to(out_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _snake_channels_last_kernel(x_ptr, out_ptr, alpha_ptr, inv_beta_ptr, channels, numel, BLOCK: tl.constexpr):
+        # a contiguous channels-last [B, C, 1, T]: an element's place in memory says its channel
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < numel
+        channel = offsets % channels
+        alpha = tl.load(alpha_ptr + channel, mask=mask, other=0.0)
+        inv_beta = tl.load(inv_beta_ptr + channel, mask=mask, other=0.0)
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        s = libdevice.sin(x * alpha)
+        tl.store(out_ptr + offsets, (x + inv_beta * (s * s)).to(out_ptr.dtype.element_ty), mask=mask)
+
 
 _BLOCK = 1024
 
 
 def snake(x: torch.Tensor, alpha: torch.Tensor, inv_beta: torch.Tensor) -> torch.Tensor:
-    """``x + inv_beta * sin(alpha * x)^2`` for ``x`` ``[B, C, T]``, with ``alpha``
-    and ``inv_beta`` fp32 ``[C]``. Eager off CUDA."""
+    """``x + inv_beta * sin(alpha * x)^2`` for ``x`` ``[B, C, T]`` or ``[B, C, 1, T]``,
+    with ``alpha`` and ``inv_beta`` fp32 ``[C]``. Eager off CUDA."""
     if triton is None or not x.is_cuda:
-        a = alpha.to(x.dtype)[None, :, None]
-        b = inv_beta.to(x.dtype)[None, :, None]
+        view = (1, -1) + (1,) * (x.dim() - 2)
+        a = alpha.to(x.dtype).view(view)
+        b = inv_beta.to(x.dtype).view(view)
         return x + b * torch.sin(x * a).pow(2)
+    if x.dim() == 4:
+        x = x.contiguous(memory_format=torch.channels_last)
+        out = torch.empty_like(x)
+        numel = x.numel()
+        _snake_channels_last_kernel[(triton.cdiv(numel, _BLOCK),)](
+            x, out, alpha.contiguous(), inv_beta.contiguous(), x.shape[1], numel, BLOCK=_BLOCK, num_warps=8,
+        )
+        return out
     x = x.contiguous()
     out = torch.empty_like(x)
     batch, channels, length = x.shape

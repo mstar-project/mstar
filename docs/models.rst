@@ -772,6 +772,8 @@ Qwen3-TTS notes
   It is the same component as Qwen3-Omni's code predictor
   (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
   the depth sequence opens with the Talker hidden state in a one-token pass
+  (on Blackwell, Qwen3-TTS only, one pass over it and group 0's embedding;
+  it was measured only there, ``blackwell_path_measured``)
   and takes one token per group after it, each layer's q/k norm, RoPE and KV write
   run in one launch and attention in ``cp_attention``, and the frame's 16 codec
   embeddings are summed in one launch per group. Each Talker keeps the sum it
@@ -785,11 +787,18 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
-- The codec decoder runs in float32 by default, reproducing the reference
-  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
-  B300 that is slower, not faster: cuDNN's heuristics run several of its
-  convs on a kernel without tensor cores, so measure before switching.
+- The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
+  KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
+  the position resource, which declares the checkpoint's.
+- The codec decoder runs in float32 by default. On CUDA its conv stack runs
+  channels-last (``ChannelsLastConvStack``), a fifth to a third off a captured
+  decode on a B300 at 80+ dB PSNR against the reference decoder; off CUDA it
+  runs the reference stack, bit for bit. ``model_kwargs: {codec_dtype:
+  bfloat16}`` in the deployment YAML selects a bf16 codec (the Talker is bf16
+  either way). Channels-last on a B300, bf16 is another 7-17% faster but
+  further off: 57 dB median and 36 dB worst PSNR against fp32 over 200
+  sentences. Off that stack it is slower, not faster, because cuDNN's
+  heuristics run several of its convs on a kernel without tensor cores.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
@@ -77,8 +79,33 @@ class Platform:
         ``/sys/bus/pci/devices``; None where the platform doesn't say."""
         return None
 
+    def reachable_pci_addresses(self) -> frozenset[str]:
+        """The PCI addresses of the GPUs this container can open, whatever
+        ``CUDA_VISIBLE_DEVICES`` says; empty where the platform doesn't say.
+        sysfs lists the host's GPUs even in a container given two of them."""
+        return frozenset()
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
+
+
+def _nvidia_reachable(proc: Path = Path("/proc/driver/nvidia/gpus"), dev: Path = Path("/dev")) -> frozenset[str]:
+    """The GPUs with a device node here. procfs lists the host's GPUs in a
+    container too, each with its minor; only the node's presence is per
+    container."""
+    reachable = set()
+    try:
+        gpus = list(proc.iterdir())
+    except OSError:
+        return frozenset()
+    for gpu in gpus:
+        try:
+            minor = re.search(r"^Device Minor:\s*(\d+)", (gpu / "information").read_text(), re.MULTILINE)
+        except OSError:
+            continue
+        if minor is not None and (dev / f"nvidia{minor[1]}").exists():
+            reachable.add(gpu.name)
+    return frozenset(reachable)
 
 
 def _torch_pci_address(device_index: int) -> str | None:
@@ -109,6 +136,9 @@ class CudaPlatform(Platform):
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)
+
+    def reachable_pci_addresses(self) -> frozenset[str]:
+        return _nvidia_reachable()
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images

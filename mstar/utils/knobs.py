@@ -21,6 +21,8 @@ KNOBS: dict[str, str] = {
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
+    "idle_hold": "MSTAR_IDLE_HOLD",
+    "resident_planning": "MSTAR_RESIDENT_PLANNING",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -45,6 +47,10 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
     for key, value in settings.items():
         if key == "step_thread_core":
             out[key] = _step_thread_core_value(value)
+        elif key == "idle_hold":
+            out[key] = _idle_hold_value(value)
+        elif key == "resident_planning":
+            out[key] = _resident_planning_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -56,17 +62,34 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
     return out
 
 
+def _resident_planning_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    text = "off" if value is False else str(value).strip().lower()
+    if text in ("auto", "off"):
+        return text
+    raise ValueError(f"`knobs: resident_planning` must be auto or off, got {value!r}")
+
+
 def _step_thread_core_value(value: object) -> str:
     # yaml reads a bare ``off`` as False
     if isinstance(value, bool):
         return "auto" if value else "off"
     if isinstance(value, int) and value >= 0:
         return str(value)
-    if isinstance(value, str) and value.strip().lower() in ("auto", "off"):
+    if isinstance(value, str) and value.strip().lower() in ("auto", "always", "siblings", "off"):
         return value.strip().lower()
     raise ValueError(
-        f"`knobs: step_thread_core` must be auto, off or a CPU number, got {value!r}"
+        f"`knobs: step_thread_core` must be auto, always, siblings, off or a CPU number, got {value!r}"
     )
+
+
+def _idle_hold_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    if value is False:
+        return "off"
+    if isinstance(value, str) and value.strip().lower() in ("qos", "off"):
+        return value.strip().lower()
+    raise ValueError(f"`knobs: idle_hold` must be qos or off, got {value!r}")
 
 
 def configure(settings: Mapping[str, object] | None) -> None:
@@ -191,16 +214,38 @@ def pre_plan_enabled() -> bool:
 
 
 def step_thread_core() -> str | int:
-    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):
+    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``auto``):
     pin each worker's main, GPU and plan threads, and the API server's result
-    threads, to CPUs of their own. ``auto`` places them by the GPU's rank on
-    its NUMA node, a number is the first worker's CPU (see
-    ``mstar.utils.cpus``)."""
-    value = _setting("step_thread_core", "off").strip().lower()
-    if value in ("auto", "off"):
+    threads, to CPUs of their own. ``always`` places them by the GPU's rank on
+    its NUMA node, a worker's three on three cores of their own;
+    ``siblings`` places them the same way with a worker's three on one core's
+    hardware threads; a number is the first worker's core. ``auto`` pins
+    nothing and logs why for this host (see ``mstar.utils.cpus``)."""
+    value = _setting("step_thread_core", "auto").strip().lower()
+    if value in ("auto", "always", "siblings", "off"):
         return value
     if value.isdigit():
         return int(value)
     raise ValueError(
-        f"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got {value!r}"
+        f"MSTAR_STEP_THREAD_CORE must be auto, always, siblings, off or a CPU number, got {value!r}"
     )
+
+
+def idle_hold() -> str:
+    """``idle_hold`` / ``MSTAR_IDLE_HOLD`` (default ``off``): ``qos`` has the
+    API server hold a PM QoS CPU latency request for its life
+    (``cpus.hold_idle``), which keeps every CPU of the host out of deep idle
+    states."""
+    value = _setting("idle_hold", "off").strip().lower()
+    if value in ("qos", "off"):
+        return value
+    raise ValueError(f"MSTAR_IDLE_HOLD must be qos or off, got {value!r}")
+def resident_planning() -> str:
+    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
+    a captured decode step reads its rows off per-request tables held on the
+    device instead of having them rebuilt on the plan thread
+    (``mstar.engine.resources.resident``). ``auto`` turns it on for a node
+    whose submodule names resident walks and every resource of which is
+    resident-capable, and says why at startup when one is not; ``off`` keeps
+    the host plan everywhere."""
+    return _resident_planning_value(_setting("resident_planning", "auto"))

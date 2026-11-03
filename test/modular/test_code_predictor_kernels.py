@@ -104,14 +104,16 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 
 
+@pytest.mark.parametrize("two_token_first_pass", [False, True], ids=["one_token", "two_tokens"])
 @pytest.mark.parametrize("embed_sum_dtype", [None, torch.float32])
-def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype):
+def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype, two_token_first_pass):
     """The depth loop drives the kernels with the predictor's own head counts,
     eps and RoPE theta, through an input projection (Qwen3-TTS 1.7B's widths):
     a frame's groups, teacher-forced, against the same layers over the whole
     depth sequence at once, norms, RoPE and causal attention in fp32. The
     embedding sum is each Talker's: rounded after every add (Qwen3-TTS's
-    M* sum) or summed in fp32 and rounded once (Qwen3-Omni)."""
+    M* sum) or summed in fp32 and rounded once (Qwen3-Omni). Positions 0 and 1
+    may share a pass, each attending its own prefix."""
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.config import Qwen3TTSCodePredictorConfig
 
@@ -121,6 +123,7 @@ def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype):
     predictor = ResidualCodePredictor(
         cp, width, max_batch_size=4, embed_sum_dtype=embed_sum_dtype,
     ).to("cuda", torch.bfloat16).eval()
+    predictor.two_token_first_pass = two_token_first_pass
     for name, param in predictor.named_parameters():
         if name.endswith("norm.weight"):
             param.data.uniform_(0.5, 1.5)  # a skipped or swapped norm weight shows

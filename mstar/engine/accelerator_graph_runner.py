@@ -28,6 +28,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
+from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -696,6 +697,7 @@ class AcceleratorGraphRunner:
         self._submodule_name = submodule_name
         self._submodule = submodule
         self._comm_group = joint_comm_group
+        self._resident: ResidentPlanner | None = None
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -775,6 +777,17 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def max_capture_bs(self, walks: Collection[str]) -> int:
+        """The widest capture of any of ``walks``, 0 when none of them has one."""
+        return max(
+            (max(self._batch_sizes(config)) for config in self._capture_configs if config.capture_graph_walk in walks),
+            default=0,
+        )
+
+    def bind_resident(self, planner: ResidentPlanner | None) -> None:
+        """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
+        self._resident = planner
 
     # ── Capture ─────────────────────────────────────────────────────────
 
@@ -1186,13 +1199,24 @@ class AcceleratorGraphRunner:
             )
 
             forward = self._forward_for(spec)
+            planner = self._resident
+            resident = (
+                planner.capture_step(spec.bucket, spec.slot, step)
+                if planner is not None and planner.covers(spec.bucket)
+                else None
+            )
 
             def run_forward():
-                return forward(
+                if resident is not None:
+                    planner.gather(resident)
+                out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
                     **static_inputs,
                 )
+                if resident is not None:
+                    planner.commit_in_graph(resident)
+                return out
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
