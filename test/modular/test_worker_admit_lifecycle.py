@@ -4,9 +4,8 @@ This path had no coverage at all: every other worker test stubs
 ``_add_new_request`` out. That is how eight constructor-keyword breakages
 from the rid refactor stayed invisible behind a green suite.
 
-It also pins the ownership split the graph-runtime port introduced: the
-runtime mints the handle and owns the per-request QUEUE lifecycle, while
-RequestStateManager owns per_request_info and shares the same queues dict.
+It also pins the ownership split: the runtime mints the handle and owns the
+per-request graph state, while RequestStateManager owns per_request_info.
 """
 import sys
 from types import SimpleNamespace
@@ -14,12 +13,12 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import torch  # noqa: F401  (import order: torch before mstar internals)
+from rust_runtime import build_runtime
 
 from mstar.communication.tensor_store import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
@@ -55,29 +54,33 @@ def _sharding_config():
     return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
 
-def _worker():
-    section = GraphNode(name=NODE, input_names={"prompt"}, outputs=[])
-    worker_graph = WorkerGraph(
-        section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
-    )
-    all_walks = {WG_ID: {WALK}}
-    all_nodes = {WG_ID: {NODE}}
-    all_loops = {WG_ID: set()}
-    node_to_partition = {NODE: "default"}
+def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
+    """``graphs``: (worker graph id, node, walk, partition) per worker graph."""
+    worker_graphs = [
+        WorkerGraph(
+            section=GraphNode(name=node, input_names={"prompt"}, outputs=[]),
+            graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        )
+        for wg_id, node, walk, _ in graphs
+    ]
+    all_walks = {wg_id: {walk} for wg_id, _, walk, _ in graphs}
+    all_nodes = {wg_id: {node} for wg_id, node, _, _ in graphs}
+    all_loops = {wg_id: set() for wg_id, *_ in graphs}
+    node_to_partition = {node: partition for _, node, _, partition in graphs}
 
     w = Worker.__new__(Worker)
     w.worker_id = WORKER
     w.is_tp_follower = False
     w.tensor_manager = _StubTensorManager()
-    w._graph_runtime = PythonGraphRuntime(
+    w._graph_runtime = build_runtime(
+        bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
-        my_worker_graphs=[worker_graph],
+        my_worker_graphs=worker_graphs,
         all_wg_ids_to_graph_walks=all_walks,
         all_wg_ids_to_dyn_loops=all_loops,
         all_wg_ids_to_nodes=all_nodes,
         node_to_partition=node_to_partition,
         sharding_config=_sharding_config(),
-        tensor_manager=w.tensor_manager,
     )
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
@@ -106,15 +109,16 @@ def _worker():
     return w
 
 
-def _new_request(request_id="r1"):
+def _new_request(request_id="r1", graph=(WG_ID, NODE, WALK, "default"), worker_graph_ids=(WG_ID,)):
+    wg_id, _, walk, partition = graph
     return NewRequest(
         request_id=request_id,
         request_info=CurrentForwardPassInfo(
-            request_id=request_id, graph_walk=WALK, fwd_index=0,
-            random_seed=0, max_tokens=1, partition_name="default",
+            request_id=request_id, graph_walk=walk, fwd_index=0,
+            random_seed=0, max_tokens=1, partition_name=partition,
         ),
-        partition_worker_graph_ids=[WG_ID],
-        worker_graph_to_workers={WG_ID: [WORKER]},
+        partition_worker_graph_ids=[wg_id],
+        worker_graph_to_workers={gid: [WORKER] for gid in worker_graph_ids},
         initial_inputs=[],
         loop_caps={},
     )
@@ -132,7 +136,7 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
     assert body.request_info.rid_handle == rid
 
     # The split: the runtime owns the graph state...
-    assert rid in w._graph_runtime._queues[WG_ID].per_request_queues
+    assert w._graph_runtime.is_partition_idle(rid, "default")
     assert w._graph_runtime.get_sharding_config(rid) is not None
     # ...and RequestStateManager owns only what cannot live behind the
     # contract: the wire fwd_info and the tensor-holding stream buffers.
@@ -150,8 +154,8 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
     w._remove_request(RemoveRequest(request_id="r1"))
 
     assert w._rid("r1") is None
-    assert rid not in w._graph_runtime._queues[WG_ID].per_request_queues, \
-        "the runtime must drop the per-request queue on removal"
+    assert w._graph_runtime.get_sharding_config(rid) is None, \
+        "the runtime must drop the request's state on removal"
     assert w._graph_runtime.get_sharding_config(rid) is None
     assert rid not in w.request_state.per_request_info
     assert w.tensor_manager.cleaned == [rid]
@@ -172,3 +176,35 @@ def test_admit_is_refused_after_a_drain():
     w._add_new_request(_new_request("r1"))
     assert w._rid("r1") is None
     assert w.tensor_manager.registered == []
+
+
+THINKER = (0, "thinker", "thinker", "Thinker")
+TALKER = (1, "talker", "talker", "Talker")
+
+
+def test_a_second_partition_opens_nothing_twice():
+    """Qwen3-Omni with the Thinker and the Talker on one worker gets a
+    NewRequest for each, and the Talker's can land after the Thinker ran a
+    step. The tensor manager and the engine open the request on the first
+    only, since opening it again resets what the Thinker's steps left there."""
+    w = _worker((THINKER, TALKER))
+    opened = []
+    w.engine_manager.add_request = lambda rid, cfgs, info: opened.append((rid, info.partition_name))
+
+    w._add_new_request(_new_request("r1", THINKER, (0, 1)))
+    w._add_new_request(_new_request("r1", TALKER, (0, 1)))
+
+    rid = w._rid("r1")
+    assert w.tensor_manager.registered == [rid]
+    assert opened == [(rid, "Thinker")]
+    # each partition still gets its own forward-pass info and worker graph
+    assert w.request_state.get_fwd_info(rid, "Thinker").graph_walk == "thinker"
+    assert w.request_state.get_fwd_info(rid, "Talker").graph_walk == "talker"
+    assert all(w._graph_runtime.is_partition_idle(rid, p) for p in ("Thinker", "Talker"))
+
+    # the next request to get the handle opens it again
+    w._remove_request(RemoveRequest(request_id="r1"))
+    w._add_new_request(_new_request("r2", TALKER, (0, 1)))
+    assert w._rid("r2") == rid
+    assert w.tensor_manager.registered == [rid, rid]
+    assert opened == [(rid, "Thinker"), (rid, "Talker")]

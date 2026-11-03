@@ -15,13 +15,14 @@ if not torch.cuda.is_available():
     pytest.skip("needs CUDA", allow_module_level=True)
 
 from mstar.engine.resources.attn import wrappers  # noqa: E402
+from mstar.engine.resources.attn.workspace import Workspace  # noqa: E402
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
 
 PAGE, BS, QO, KV, HD, PAGES = 16, 8, 8, 2, 128, 512
 
 
 def _wrapper():
-    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    ws = Workspace(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "test")
     return FlashInferDecodeWrapper(
         ws, num_qo_heads=QO, num_kv_heads=KV, head_dim=HD, page_size=PAGE,
         batch_size=BS, max_num_pages=PAGES, device=torch.device("cuda"), accelerator_graph=True,
@@ -61,7 +62,7 @@ def test_direct_plan_matches_flashinfer_plan():
 
 
 def _prefill_wrapper(backend):
-    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    ws = Workspace(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "test")
     return wrappers.FlashInferPrefillWrapper(
         ws, num_qo_heads=QO, num_kv_heads=KV, head_dim=HD, page_size=PAGE,
         batch_size=BS, max_total_tokens=TOKENS, max_num_pages=PAGES,

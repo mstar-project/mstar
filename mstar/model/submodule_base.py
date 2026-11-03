@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.resources.lora.config import LoraStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -551,7 +552,7 @@ NO_CHUNKING = ChunkingPolicy()
 
 # A chunk Loop's count before its prompt's first chunk sets the real cap (the
 # prompt's length), and the stride of a row that runs whole: it ends the Loop.
-# Within the u32 both runtimes hold loop counters in.
+# Within the u32 the runtime holds loop counters in.
 CHUNK_LOOP_END = 2**31 - 1
 
 
@@ -844,7 +845,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
-    # the LoRA pools among this node's resources; set by `bind_node_resources`
+    # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
+    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
+    # and to each piecewise region's (``lora_rows``), from its segments: in order, the
+    # rows the adapted linears see, each a request's span of tokens (a request may have
+    # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
+    # declares its own ``LoraStep`` under the pool's key.
     lora_keys: tuple[str, ...] = ()
 
     def __init__(self):
@@ -876,9 +882,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
-        from mstar.engine.resources.lora.pool import LoraAdapterPool
+        from mstar.model.components.lora.modules import bind_module_lora
 
-        self.lora_keys = tuple(k for k, r in resources.items() if isinstance(r, LoraAdapterPool))
+        self.lora_keys = bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1273,10 +1279,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         precision; the node's resources are bound but nothing is admitted or
         planned, so it must not read or change resource state. On a lockstep
         node every rank calls it in the same order, so it may run the
-        collectives its forward runs. It runs outside a planned step, so a
-        node serving LoRA adapters runs no adapted linear here: an eager delta
-        refuses the call, and a compiled one would read another step's
-        addressing. Default: nothing."""
+        collectives its forward runs. A node serving LoRA adapters runs its
+        adapted linears here as in a step whose rows name no adapter. Default:
+        nothing."""
 
     def can_use_accelerator_graphs(
         self,
@@ -1373,7 +1378,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
@@ -1400,6 +1405,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
+
+        ``outputs`` is read-only, and each name's host copy is made when the
+        check first reads it.
 
         Default: no stops.
         """
@@ -1447,6 +1455,27 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self.request_states.pop(request_id, None)
 
 
+def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
+    """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
+    itself, its rows the step's segments, as a new step (a declaration reused across
+    calls keeps its own). A step without segments gets none: an adapted module it runs
+    refuses for want of a plan (``LoraLayerDelta``)."""
+    if lora_keys and step is not None and step.segments is not None:
+        segments = tuple(step.segments)
+        added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
+        if added:
+            step = replace(step, steps={**step.steps, **added})
+    return step
+
+
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+    """What the engine calls for a node's step: its ``declare_step``, with the LoRA
+    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
+    no LoRA step."""
+    # the engine drives duck-typed submodules too
+    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+
+
 class ARNodeSubmodule(NodeSubmodule):
     # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
     # The engine probes the prefix cache for a walk that carries them only then.
@@ -1459,6 +1488,29 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set by a submodule whose decode walk reads its last sampled token back on
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
+
+    # The packed token counts a prefill capture is built at, which
+    # ``__init__``'s ``prefill_token_buckets`` replaces per instance. A
+    # submodule that takes that kwarg must read its capture ladder off
+    # ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.
+    PREFILL_TOKEN_BUCKETS: list[int]
+
+    def __init__(self, prefill_token_buckets: Sequence[int] | None = None):
+        """``prefill_token_buckets``: a deployment's own captured prefill ladder
+        (``model_kwargs.prefill_token_buckets``), in place of the class's
+        ``PREFILL_TOKEN_BUCKETS``."""
+        super().__init__()
+        if prefill_token_buckets is not None:
+            buckets = prefill_token_buckets
+            if (
+                not isinstance(buckets, (list, tuple)) or not buckets
+                or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in buckets)
+                or len(set(buckets)) < len(buckets)
+            ):
+                raise ValueError(
+                    f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
+                )
+            self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
@@ -1529,7 +1581,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         stop = self.token_stop
         if stop is None:

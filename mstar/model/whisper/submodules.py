@@ -501,7 +501,15 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         if graph_walk == ALIGN_WALK:
-            return None  # eager pass over its own inputs; touches no cache
+            # an eager pass over its own inputs that touches no cache; its segment is
+            # the rows the decoder's projections see, for a LoRA pool's rows
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                    for rid, inp in zip(request_ids, inputs, strict=True)
+                ],
+                steps={},
+            )
         context_segments = tuple(
             Segment(
                 request_id=rid,

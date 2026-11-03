@@ -291,8 +291,11 @@ class LoraSpec(NodeResourceSpec):
     ``max_slots`` adapters are resident on the device at once, beside a zero adapter that
     base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.
     ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``
-    places each checkpoint module on a target; ``convert_keys`` rewrites a model-native
-    checkpoint layout first.
+    places each checkpoint module on a target; a node's spec comes from
+    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
+    ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver
+    is refused as the deployment's specs are declared, ``declared_lora_specs``).
+    ``convert_keys`` rewrites a model-native checkpoint layout first.
     """
 
     num_layers: int
