@@ -1,9 +1,10 @@
 """EDGE_ITEMS: a step's streamed tensors to one peer worker, as columns.
 
-The sender side (``EdgeItemsBuilder``) mirrors the Rust runtime's
-``frames::EdgeItems``: both runtimes send a step's plain streamed edges this
-way, so a receiver decodes, reads and routes them once per step instead of
-once per (request, worker) INPUT_SIGNALS. The reader side turns a frame back
+The graph runtime sends a step's plain streamed edges this way
+(``frames::EdgeItems`` in Rust), so a receiver decodes, reads and routes them
+once per step instead of once per (request, worker) INPUT_SIGNALS.
+``EdgeItemsBuilder`` is a Python encoder of the same frame, which tests build
+frames with and check Rust's against. The reader side turns a frame back
 into rows, and a row back into what INPUT_SIGNALS carried, for the paths that
 still want that (a request not known yet, a transport without a batched read).
 """
@@ -15,12 +16,6 @@ from typing import NamedTuple
 from mstar.communication.wire import _dtype_from_name, _dtype_name
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.ipc_format import EdgeItems, InputSignals
-
-
-def edge_items_eligible(edge: GraphEdge) -> bool:
-    """Whether a streamed edge can ride EDGE_ITEMS: unsharded, one
-    producer, with items."""
-    return bool(edge.tensor_info) and edge._shard_dim is None and edge._total_fanin == 1
 
 
 class EdgeItemsBuilder:

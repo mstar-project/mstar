@@ -44,8 +44,11 @@ logger = logging.getLogger(__name__)
 # copy, norm, divide, cast); compiled, one. Not dynamic=True: a symbolic head dim
 # made the reduction ~3x slower; the token count goes dynamic on its own at the
 # second size.
-def _l2norm(t: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.normalize(t.float(), dim=-1).to(t.dtype)
+def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Both in one compiled call, so a layer pays one guard check, not two."""
+    def norm(t):
+        return torch.nn.functional.normalize(t.float(), dim=-1).to(t.dtype)
+    return norm(q), norm(k)
 
 
 # What each arch's chunked prefill kernel will read as its packed state.
@@ -363,7 +366,7 @@ class GDNManager(LinearAttnManager):
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
-            q, k = compiled(_l2norm)(q), compiled(_l2norm)(k)
+            q, k = compiled(_l2norm_qk)(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
         if not plan.takes_strided_inputs:

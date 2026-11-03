@@ -38,21 +38,26 @@ def test_lazy_host_outputs_copy_only_the_names_read():
     }
     copied = []
 
-    def copy_name(name):
-        copied.append(name)
-        return {rid: [t.clone() for t in row[name]] for rid, row in source.items()
-                if isinstance(row, dict) and name in row}
+    def copy_names(names):
+        copied.append(names)
+        return {name: {rid: [t.clone() for t in row[name]] for rid, row in source.items()
+                       if isinstance(row, dict) and name in row} for name in names}
 
-    lazy = _LazyHostOutputs(source, copy_name)
+    lazy = _LazyHostOutputs(source, copy_names)
     row = lazy.get(1)
     assert row and "latents" in row and len(row) == 2 and set(row) == {"new_token", "latents"}
     assert copied == [], "presence, length and iteration must not copy"
     assert row["new_token"][0].item() == 5
     assert lazy[2]["new_token"][0].item() == 6
-    assert copied == ["new_token"], "a name is copied once, for every row"
+    assert copied == [["new_token"]], "a name is copied once, for every row"
     assert lazy.get(3) == "not-a-dict" and lazy.get(4) is None
     assert set(lazy.landed()) == {1, 2}
     assert all(set(names) == {"new_token"} for names in lazy.landed().values())
+
+    copied.clear()
+    lazy = _LazyHostOutputs(source, copy_names)
+    lazy.landed(["new_token", "latents"])
+    assert copied == [["new_token", "latents"]], "the missing names land in one copy and one sync"
 
 
 class _ReachedStoreError(Exception):
@@ -67,11 +72,12 @@ def test_a_host_transport_gets_each_routed_output_in_one_copy(host_transport):
     source = {rid: {"new_token": [torch.tensor([rid])], "latents": [torch.ones(2)]} for rid in (1, 2)}
     copied = []
 
-    def copy_name(name):
-        copied.append(name)
-        return {rid: [t.clone() for t in row[name]] for rid, row in source.items()}
+    def copy_names(names):
+        copied.extend(names)
+        return {name: {rid: [t.clone() for t in row[name]] for rid, row in source.items()}
+                for name in names}
 
-    lazy = _LazyHostOutputs(source, copy_name)
+    lazy = _LazyHostOutputs(source, copy_names)
     assert lazy[1]["new_token"][0].item() == 1  # the stop check's read
     landed = {}
 

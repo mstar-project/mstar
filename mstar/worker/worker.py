@@ -21,7 +21,7 @@ import torch
 from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
-from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.communicator import CommProtocol, make_communicator, requested_transport
 from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
 from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
@@ -59,8 +59,7 @@ from mstar.graph.runtime.base import (
     SpeculationOutput,
     SpeculationPrepInput,
 )
-from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
+from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import (
     END_PARTITION,
@@ -169,20 +168,19 @@ def _make_graph_runtime(
     tensor_manager,
     **kwargs,
 ) -> GraphRuntime:
-    """The runtime ``MSTAR_RUST_GRAPH`` selects (see
-    ``resolve_graph_runtime_type``).
+    """The Rust graph runtime.
 
-    Rust requires the Rust communicator and the Rust bookkeeper: it sends
+    It requires the Rust communicator and the Rust bookkeeper: it sends
     WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
     transport, and settles refcounts on a share of the same bookkeeper, rather
     than hopping back into Python for either. A Python one of either has no
-    such object to share, so asking for Rust with one raises.
+    such object to share, so this raises on one.
     """
-    if resolve_graph_runtime_type(log=True) == GraphRuntimeType.PYTHON:
-        return PythonGraphRuntime(
-            communicator=communicator,
-            tensor_manager=tensor_manager,
-            **kwargs,
+    require_rust_extension()
+    if requested_transport() == "0":
+        raise ValueError(
+            "MSTAR_RUST_ZMQ=0 pins the pyzmq communicator, which the graph "
+            "runtime cannot run on. Set MSTAR_RUST_ZMQ to 1 or AUTO."
         )
 
     from mstar.communication.rust_communicator import RustZMQCommunicator
@@ -190,19 +188,19 @@ def _make_graph_runtime(
 
     if not isinstance(communicator, RustZMQCommunicator):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
+            "The graph runtime needs the Rust communicator, but this worker "
             f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
         )
     if not issubclass(communicator.codec, WireCodec):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the msgpack codec, but this worker "
+            "The graph runtime needs the msgpack codec, but this worker "
             f"built a {communicator.codec.__name__}. Set "
             "MSTAR_WIRE_CODEC=msgpack."
         )
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "The graph runtime needs the Rust TensorBookkeeping: it "
             "holds a share of it, so a Python one cannot be handed over. "
             f"Got {type(bookkeeping).__name__}."
         )
@@ -371,8 +369,8 @@ class _LazyPerRid(Mapping):
 
 
 class _LazyHostOutputs(Mapping):
-    """Per-rid host copies of a step's outputs, copied one output name at a time
-    on first read (``copy_name(name) -> {rid: host value}``).
+    """Per-rid host copies of a step's outputs, copied by output name on first
+    read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
 
     The stop check reads at most the sampled token, and a loop that stops on
     its iteration count reads nothing, so copying every output down each step
@@ -380,25 +378,27 @@ class _LazyHostOutputs(Mapping):
     copied by the send instead; ``landed`` hands it what was copied here.
     """
 
-    __slots__ = ("_source", "_copy_name", "_landed")
+    __slots__ = ("_source", "_copy_names", "_landed")
 
-    def __init__(self, source: dict, copy_name: Callable[[str], dict]):
+    def __init__(self, source: dict, copy_names: Callable[[list[str]], dict]):
         self._source = source
-        self._copy_name = copy_name
+        self._copy_names = copy_names
         self._landed: dict[str, dict] = {}
 
+    def _copy(self, names) -> None:
+        missing = [n for n in dict.fromkeys(names) if n not in self._landed]
+        if missing:
+            self._landed.update(self._copy_names(missing))
+
     def _host(self, name: str) -> dict:
-        landed = self._landed.get(name)
-        if landed is None:
-            landed = self._landed[name] = self._copy_name(name)
-        return landed
+        self._copy((name,))
+        return self._landed[name]
 
     def landed(self, names=()) -> dict[int, NameToTensorList]:
-        """What was copied, ``names`` first copied too: one batched copy per
-        name for a host transport, which would otherwise copy each tensor on
-        its own."""
-        for name in names:
-            self._host(name)
+        """What was copied, ``names`` first copied too, in one batched copy
+        and one sync for a host transport, which would otherwise copy each
+        tensor on its own."""
+        self._copy(names)
         out: dict[int, NameToTensorList] = {}
         for name, by_rid in self._landed.items():
             for rid, value in by_rid.items():
@@ -840,8 +840,7 @@ class Worker:
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
-        # model here rather than asked of the graph runtime per step -- which
-        # also keeps it identical under both runtimes.
+        # model here rather than asked of the graph runtime per step.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
@@ -4519,35 +4518,37 @@ class Worker:
         # one pinned buffer.
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
 
-        def copy_name(name: str) -> dict:
-            host: dict = {}
+        def copy_names(names: list[str]) -> dict[str, dict]:
+            host: dict[str, dict] = {name: {} for name in names}
             with side:
-                for rid, name_to_list in source.items():
-                    if not isinstance(name_to_list, dict) or name not in name_to_list:
-                        continue
-                    tensors = name_to_list[name]
-                    if not isinstance(tensors, list):
-                        host[rid] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.device.type == self.device.type:
-                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
-                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    host[rid] = new_list
+                for name in names:
+                    for rid, name_to_list in source.items():
+                        if not isinstance(name_to_list, dict) or name not in name_to_list:
+                            continue
+                        tensors = name_to_list[name]
+                        if not isinstance(tensors, list):
+                            host[name][rid] = tensors
+                            continue
+                        new_list = []
+                        for t in tensors:
+                            if torch.is_tensor(t) and t.device.type == self.device.type:
+                                # by size class, not shape: a per-shape count gives
+                                # two shapes in one class the same buffer
+                                key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
+                                idx = buffer_indices[key]
+                                buffer_indices[key] += 1
+                                cpu_t = self._get_pinned_d2h_buffer(
+                                    "check_stop", t.shape, t.dtype, idx,
+                                )
+                                cpu_t.copy_(t, non_blocking=True)
+                                new_list.append(cpu_t)
+                            else:
+                                new_list.append(t)
+                        host[name][rid] = new_list
             side.synchronize()
             return host
 
-        return _LazyHostOutputs(source, copy_name), None
+        return _LazyHostOutputs(source, copy_names), None
 
     def _removal_step_reached(self, body: RemoveRequest) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages
