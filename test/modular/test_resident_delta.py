@@ -1539,3 +1539,57 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
         scheduler.settle_tp_follow_delta(caught_up=True)
+
+
+def _follower_of(follow) -> MicroScheduler:
+    """A follower's scheduler over ``follow``, whose log keeps v's ids and runs no rebuild."""
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.rebuilds = SimpleNamespace(kept_count=_kept, rebuilding=_rebuilds_none)
+    return scheduler
+
+
+def _send(scheduler, lead, seq: int) -> None:
+    scheduler.register_tp_follow(ScheduleTPNode(
+        NODE, "decode", [], spec_seq=seq, resident_delta=lead.take_resident_delta(), page_trails=lead.page_trails(NODE),
+    ))
+
+
+def _follow_next(scheduler) -> None:
+    assert scheduler.settle_tp_follow_delta(caught_up=True)
+    scheduler.pop_tp_follow_head()
+
+
+def test_a_follower_lands_a_rebuild_between_the_steps_rank_0_landed_it_between(monkeypatch):
+    """Rank 0 lands v's rebuild when it post-processes the rebuild's step K, after it has sent the step it built
+    during K (a yield-away, under async scheduling). A follower post-processes K before it takes that step, so a
+    follower that landed v there would check rank 0's trail holding one dropped request fewer, and stop."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    scheduler = _follower_of(follow)
+    _send(scheduler, lead, 0)
+    _follow_next(scheduler)
+
+    _send(scheduler, lead, 1)
+    for engine in (lead, follow):
+        engine.land_rebuild(NODE, "v")
+    _follow_next(scheduler)
+    _send(scheduler, lead, 2)
+    _follow_next(scheduler)
+
+    assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
+
+
+def test_a_follower_whose_rebuild_still_runs_when_rank_0_lands_it_stops(monkeypatch):
+    """The follower's own rebuild of v hasn't finished when rank 0's land arrives, so it ran other rows than rank 0,
+    and would take v's next decode row for a rebuild row."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    scheduler = _follower_of(follow)
+    _send(scheduler, lead, 0)
+    _follow_next(scheduler)
+    scheduler.rebuilds.rebuilding = lambda rid, node: rid == "v"
+
+    lead.land_rebuild(NODE, "v")
+    _send(scheduler, lead, 1)
+
+    with pytest.raises(SystemExit, match="rank 0 landed v's rebuild on LLM, and this rank's is still running"):
+        scheduler.settle_tp_follow_delta(caught_up=True)
