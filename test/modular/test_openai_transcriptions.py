@@ -248,6 +248,14 @@ def test_transcription_json(client_and_stub):
     assert saved.endswith("_speech.wav") and not Path(saved).exists()
 
 
+@pytest.mark.parametrize("prompt", ["2024", "true", "null"])
+def test_a_text_form_field_is_not_parsed_as_json(client_and_stub, prompt):
+    client, stub = client_and_stub
+    stub.next_chunks = _text("<|en|>", " Hello")
+    r = _post(client, {"model": "whisper_large", "prompt": prompt})
+    assert r.status_code == 200 and stub.last_submit["model_kwargs"]["initial_prompt"] == prompt
+
+
 def test_transcription_text_format(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _text(" Plain", " words")

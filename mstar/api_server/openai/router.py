@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# a transcription form's declared text fields stay text: a prompt of "2024" is not a number
+_TRANSCRIPTION_TEXT_FIELDS = frozenset(
+    name for name, f in TranscriptionRequest.model_fields.items() if f.annotation in (str, str | None)
+)
+
 
 def _api():
     # The server runs either as the package module (console scripts ``mstar`` /
@@ -165,6 +170,9 @@ async def audio_transcriptions(request: Request):
             # OpenAI clients send list fields as repeated ``name[]`` keys.
             if key.endswith("[]"):
                 fields.setdefault(key[:-2], []).append(value)
+                continue
+            if key in _TRANSCRIPTION_TEXT_FIELDS:
+                fields[key] = value
                 continue
             try:
                 fields[key] = json.loads(value)
