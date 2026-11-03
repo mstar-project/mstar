@@ -16,9 +16,8 @@ states is what the modules cannot:
   (``ignore``);
 * the vision targets' names, kept as the shipped serving configs spell them (``names``).
 
-The loader's rules are passed explicitly (the Qwen3.5 roots state no
-``checkpoint_rules()`` yet); they are the same objects ``weight_loader`` loads with.
-Every embedding call is in the step (a vision prompt's ids are embedded in
+Adapters land where the roots' ``checkpoint_rules()`` load the checkpoint. Every
+embedding call is in the step (a vision prompt's ids are embedded in
 ``preprocess``), so the token embedding is an ordinary target.
 """
 
@@ -32,13 +31,8 @@ from mstar.model.components.lora.modules import (
     meta_root,
     module_lora_spec,
 )
-from mstar.model.loader.base import CheckpointRules, StackedParamRule
+from mstar.model.loader.base import StackedParamRule
 from mstar.model.qwen3_5.config import LORA, VISION_LORA, Qwen3_5Config, Qwen3_5VisionConfig
-from mstar.model.qwen3_5.weight_loader import (
-    _STACKED_PARAMS,
-    qwen3_5_name_remapper,
-    qwen3_5_vision_name_remapper,
-)
 
 _TEXT = "model.language_model."
 # the released checkpoint, the inner multimodal model, the text-only causal LM, the
@@ -70,7 +64,6 @@ def qwen3_5_lora_spec(config: Qwen3_5Config) -> LoraSpec:
     root = meta_root(lambda _: Qwen3_5ForCausalLM(config))
     return module_lora_spec(
         root, resource_key=LORA, nodes={"LLM"}, root_path="model",
-        rules=CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper),
         adapter_stacked_params=SPLIT_QKV_RULES,
         adapter_roots=TEXT_ROOTS,
         # Tinker's name for the head
@@ -88,7 +81,6 @@ def qwen3_5_vision_lora_spec(config: Qwen3_5VisionConfig) -> LoraSpec:
     root = meta_root(lambda _: Qwen3_5VisionModel(config))
     return module_lora_spec(
         root, resource_key=VISION_LORA, nodes={"vision_encoder"}, root_path="model",
-        rules=CheckpointRules(remap=qwen3_5_vision_name_remapper),
         adapter_roots=VISION_ROOTS,
         rows={"merger.*": config.merge_unit},
         names=VISION_NAMES,
