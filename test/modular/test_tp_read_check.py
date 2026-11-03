@@ -268,7 +268,7 @@ def _log(kept):
     """A rebuild log keeping ids for ``kept``, which starts each rebuild once."""
     cursors = {}
 
-    def start(rid, node):
+    def start(rid, node, prefilling):
         assert (node, rid) not in cursors, f"{rid}'s rebuild started twice"
         cursors[(node, rid)] = None
         return Rebuild(WALK, array("i", [1, 2]))

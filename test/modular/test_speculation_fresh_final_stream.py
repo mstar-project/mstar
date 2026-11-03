@@ -176,6 +176,7 @@ def _follower_speculation(final: bool):
         pop_tp_follow_head=lambda: head,
         combined_walk_of={},
         rebuilds=Rebuilds({}, {}),
+        follow_rebuilds=lambda request_state, node, rids: frozenset(),
     )
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()

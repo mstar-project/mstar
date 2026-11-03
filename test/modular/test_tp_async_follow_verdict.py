@@ -37,6 +37,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MoveKind, OffloadDelta, RemoveRequest, ScheduleTPNode, TPNoSpeculation  # noqa: E402
@@ -60,6 +61,7 @@ class _FakeEngineManager:
         return types.SimpleNamespace(
             check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None,
             prefix_cache_open=lambda node: self.cache_open, apply_resident_delta=self._apply,
+            residency=lambda node, rid: Residency.RESIDENT,
         )
 
     def _apply(self, delta, kept_count):
@@ -105,6 +107,7 @@ def _stub(cache_open: bool = False):
     stub._check_ready_tensors = lambda: None
     stub._poll_stream_buffers = lambda: None
     stub.build_results = []   # what _try_follow_speculation returns, in order
+    stub.request_state = None   # read only for a dropped row
 
     def _process_messages():
         while stub.communicator.inbox:

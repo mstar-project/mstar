@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
 from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -26,7 +27,8 @@ from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
-from mstar.worker.rebuild import KeptIds, NodeWrites, Rebuilds
+from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, Rebuilds
+from mstar.worker.worker import _LazyHostOutputs
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
 R, A, B = 7, 8, 9
@@ -179,6 +181,17 @@ def test_only_a_rows_kept_sample_is_appended(sampled):
     assert not (kept[A].sampled or kept[B].sampled), "it kept a discarded sample"
 
 
+def test_a_sample_is_kept_from_the_host_outputs_the_worker_copies_on_read():
+    rebuilds = _rebuilds()
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
+    row = {"new_token": [torch.tensor([9])]}
+    outputs = _LazyHostOutputs({R: row}, lambda names: {name: {R: row[name]} for name in names})
+
+    rebuilds.keep_samples(_batch((R,)), outputs, None)
+
+    assert list(rebuilds._kept[NODE][R].sampled) == [9], "every drop would be refused for the samples it missed"
+
+
 @pytest.mark.parametrize("host", [True, False])
 def test_a_sample_of_more_than_one_id_is_refused(host):
     rebuilds = _rebuilds()
@@ -203,9 +216,9 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
     if sampled is not None:
         rebuilds._kept[NODE][R] = _kept([1, 2], *[5] * sampled)
 
-    assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters})
+    assert why in rebuilds.refusal(R, node, walk, {"decode_loop": iters}, None)
     rebuilds._kept[NODE][R] = _kept([1, 2], 5, 6)
-    assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}) is None, "a request its ids cover was refused"
+    assert rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 1}, None) is None, "a request its ids cover was refused"
 
 
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
@@ -214,7 +227,7 @@ def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
     rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
 
-    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}), (
+    assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"
     )
 
@@ -223,7 +236,7 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     rebuilds = _rebuilds()
     rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
 
-    rebuild = rebuilds.start(R, NODE)
+    rebuild = rebuilds.start(R, NODE, None)
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
     rebuilds.fill(NODE, {R}, {}, inputs, infos)
 
@@ -231,6 +244,23 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     assert infos[R].graph_walk == PREFILL and list(inputs[R]) == ["text_inputs"]
     [tokens] = inputs[R]["text_inputs"]
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
+
+
+def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its_prompt_stood():
+    rebuilds = _rebuilds()
+    prefilling = Prefilling(PREFILL, 4, 10)
+
+    why = rebuilds.refusal(R, NODE, PREFILL, {}, prefilling)
+    rebuild = rebuilds.start(R, NODE, prefilling)
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)}
+    rebuilds.fill(NODE, {R}, {R: ChunkRange(0, 4, 4, 4)}, inputs, infos)
+
+    assert why is None, "the newest request would keep its pages while an older one drops itself"
+    assert rebuild is None and inputs == {R: {}}, "the rebuild would lay out and read ids the request never kept"
+    cursor = rebuilds.cursor(R, NODE)
+    assert (cursor.walk, cursor.total, cursor.length, cursor.resumes_prefill) == (PREFILL, 4, 10, True), (
+        "the rebuild would run past where the prompt stood, or release the input the prompt's next chunk reads"
+    )
 
 
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():

@@ -1,7 +1,8 @@
 """A rebuild runs as rows mid-prefill that the worker's log holds, offered where a chunk in flight is.
 
-Readiness answers a dropped request with a rebuild. The scheduler parks the request's decode row, as it parks a
-row waiting for capacity, and opens the rebuild in the log. From then on the log offers the rebuild's next chunk
+Readiness answers a dropped request with a rebuild. The scheduler opens the rebuild in the log, and the request's
+decode row waits until the log lands it, even if the request is let back in for room meanwhile. From then on the
+log offers the rebuild's next chunk
 the way the scheduler offers a speculation's chunk in flight, so the walk's caps, token budget and pick treat it
 as a prompt mid-prefill. Nothing popped it, so nothing pushes it back or parks it in a backlog, and a chunk in
 flight is offered again only as its step's continuation.
@@ -18,8 +19,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 from test_rebuild_policy import POLICY, _graphs
-from test_scheduler_room import NODE, _rids, _Runtime, _State
+from test_scheduler_room import NODE, _rids, _Runtime
 from test_scheduler_room import _Engine as _RoomEngine
+from test_scheduler_room import _State as _RoomState
 
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
@@ -32,8 +34,16 @@ PREFILL, DECODE, MIXED = POLICY.walk, "decode", "mixed"
 R = "r"
 
 
+class _State(_RoomState):
+    """Forward-pass infos that name each request's walk, which a rebuild starts from."""
+
+    def get_fwd_info(self, rid, partition):
+        return SimpleNamespace(graph_walk=self.runtime.walks.get(rid))
+
+
 class _Engine(_RoomEngine):
-    """Readiness that answers ``dropped`` with a rebuild, a token budget, and lengths read off the row's ids."""
+    """Readiness that answers ``dropped`` with a rebuild, a token budget, and ``cached`` tokens of every rebuild
+    in the prefix cache."""
 
     def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=()):
         super().__init__(max_bs)
@@ -52,9 +62,8 @@ class _Engine(_RoomEngine):
     def walk_token_caps(self, node_name, graph_walk):
         return None
 
-    def input_sequence_len(self, node_name, graph_walk, info, inputs, rid=None):
-        tokens = inputs[POLICY.ids_input][0].shape[0]
-        return InputSeqLenInfo(tokens - self.cached, cached_prefix=self.cached)
+    def unserved_len(self, node_name, graph_walk, info, rid, length, end):
+        return InputSeqLenInfo(end - self.cached, cached_prefix=self.cached)
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         self.asked.append(rid)
@@ -80,10 +89,12 @@ def _scheduler(walks, combined=False, **engine):
 
 def _rebuilding(sched, rid=R, total=20, done=0):
     """``rid``'s rebuild on ``NODE``, ``done`` of its ``total`` tokens in."""
-    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(PREFILL, array("i", range(total + 1)), torch.int64, done)
+    sched.rebuilds._cursors[(NODE, rid)] = RebuildCursor(
+        PREFILL, total, total, array("i", range(total + 1)), torch.int64, done,
+    )
 
 
-def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
+def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
     sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
     prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
     sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 12), prompt, None), torch.int64, array("i", [4]))
@@ -93,17 +104,28 @@ def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
 
     assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
-    assert engine.asked.count("d0") == 1, "a parked decode row asks the engine on every pass"
+    assert engine.asked.count("d0") == 1, "a waiting decode row asks the engine on every pass"
 
 
-def test_a_parked_decode_row_runs_once_its_rebuild_lands():
+def test_a_decode_row_runs_once_its_rebuild_lands():
     sched, runtime, state, engine = _scheduler({"d0": DECODE})
-    sched.parked[NODE] = {"d0"}
+    _rebuilding(sched, "d0")
 
-    assert sched.get_next_batch(state) is None and not engine.asked
-    sched.note_rebuilt(NODE, "d0")
+    assert sched.get_next_batch(state).rebuild_rids == {"d0"} and not engine.asked
+    sched.rebuilds.land_chunk("d0", NODE, None)
 
     assert _rids(sched.get_next_batch(state)) == ["d0"], "the rebuilt request would never decode again"
+
+
+def test_a_request_let_back_in_for_room_mid_rebuild_starts_no_second_rebuild():
+    sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
+    _rebuilding(sched, "d0")
+    sched.parked[NODE] = {"d0"}  # it asked for room again, and the room is there now
+    engine.admit_waiting = lambda published_of: [(NODE, "d0")]
+
+    batch = sched.get_next_batch(state)
+
+    assert batch.rebuild_rids == {"d0"} and not engine.asked, "the decode row would run before its KV is back"
 
 
 def test_a_rebuild_row_shares_a_step_with_its_walks_decode_rows():
@@ -145,6 +167,30 @@ def test_a_rebuild_starts_past_its_cached_prefix():
     batch = sched.get_next_batch(state)
 
     assert batch.chunk_ranges[R] == ChunkRange(8, 16, 20, 16), "the rebuild would recompute what the cache holds"
+
+
+class _Prefilling(_Runtime):
+    """Every prompt stands 4 tokens into its 10 on its chunk Loop."""
+
+    def loop_progress(self, node_name, rids, graph_walks, loop_names):
+        return [4] * len(rids), [10] * len(rids)
+
+
+def test_a_prompt_dropped_mid_prefill_runs_its_chunks_again_up_to_where_its_loop_stands():
+    sched, _, _, engine = _scheduler({}, budget=8, dropped={R})
+    sched.runtime = runtime = _Prefilling({R: PREFILL})
+    sched.chunk_loop_walks = {NODE: frozenset({PREFILL})}
+    state = _State(runtime)
+
+    rebuild = sched.get_next_batch(state)
+
+    assert sched.rebuilds.rebuilding(R, NODE) and not engine.prepared, (
+        "the KV would lay the prompt out again over unkept ids"
+    )
+    assert rebuild.rebuild_rids == {R} and rebuild.chunk_ranges[R] == ChunkRange(0, 4, 4, 4), (
+        "the rebuild would run past where the prompt stood, or whole, with no input of its own"
+    )
+    assert (R, NODE) in sched.chunk_started, "the prompt's next chunk would lose its place ahead of newer prompts"
 
 
 def test_a_chunk_in_flight_is_offered_only_as_its_steps_continuation():
@@ -230,3 +276,18 @@ def test_pending_rows_and_a_refill_count_waiting_rebuilds():
 
     assert sched.pending_rows()[NODE] == 2, "the worker would report its node idle with a rebuild waiting"
     assert sched.could_refill(NODE, PREFILL, {"p0"}), "a refused step would hold its row though the rebuild refills it"
+
+
+def test_a_chain_takes_a_rebuild_and_leaves_the_requests_parked_decode_row_queued():
+    sched, runtime, state, _ = _scheduler({"c0": DECODE, "d0": DECODE, "d1": DECODE}, combined=True, budget=64)
+    queues = runtime.get_ready_nodes
+    runtime.get_ready_nodes = lambda exclude, target=None, exclude_target=None: queues(exclude)  # all one mixed key
+    runtime.ready.discard("c0")  # the chain's own row, in flight
+    sched.parked[NODE] = {"d0"}
+    _rebuilding(sched, "d0")
+
+    chain = sched.pick_chain_step(state, (NODE, DECODE), ["c0"])
+    batch = sched.take_chain_step(state, chain, pre_existing_batch_size=1)
+
+    assert _rids(batch) == ["d0", "d1"] and batch.rebuild_rids == {"d0"}
+    assert "d0" in runtime.ready, "the parked decode row would be popped into its own rebuild's step"

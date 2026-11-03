@@ -56,7 +56,7 @@ from mstar.worker.worker import Worker
 
 
 def _keeps_none(node, rid):
-    return None
+    return 0
 
 
 def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:

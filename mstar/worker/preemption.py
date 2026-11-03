@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.node_manager_utils import RequestStateManager
-    from mstar.worker.rebuild import Rebuilds
+    from mstar.worker.rebuild import Prefilling, Rebuilds
 
 
 @dataclass(slots=True)
@@ -69,7 +69,7 @@ class Preemption:
         nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
 
         def droppable(rid: int) -> bool:
-            held = [node for node in nodes if self._rebuilds.kept(rid, node) is not None]
+            held = self._held(rid, nodes)
             return bool(held) and all(
                 self._rebuild_refusal(rid, node) is None and engine.drop_refusal(node, rid) is None for node in held
             )
@@ -95,37 +95,49 @@ class Preemption:
             counts.preempted_again += record.times == 2
             kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
             counts.returns_preempted += kept is not None and record.returned_at == len(kept.sampled)
-        self._move(kv, victims, reason.pages_short)
+        self._move(kv, nodes, victims, reason.pages_short)
         return True
 
-    def rebuilt(self, rid: int, node_name: str) -> None:
-        """Count the tokens of ``rid``'s rebuild on ``node_name``, which has landed: every kept id but the last,
-        which its next decode step reads."""
+    def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
+        """Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""
+        self.counts[node_name].rebuild_tokens += tokens
         kept = self._rebuilds.kept(rid, node_name)
-        self.counts[node_name].rebuild_tokens += len(kept) - 1
-        if rid in self._preempted:
+        if rid in self._preempted and kept is not None:
             self._preempted[rid].returned_at = len(kept.sampled)
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)
 
-    def _rebuild_refusal(self, rid: int, node_name: str) -> str | None:
-        """Why ``rid``'s kept ids on ``node_name`` can't rebuild its KV there now, or None."""
+    def _held(self, rid: int, nodes: list[str]) -> list[str]:
+        """The nodes of ``nodes`` where a rebuild can write ``rid``'s KV again: it keeps ids there, or its prompt
+        is mid-prefill there."""
+        return [node for node in nodes if self._rebuilds.kept(rid, node) is not None or self._prefilling(rid, node)]
+
+    def _prefilling(self, rid: int, node_name: str) -> Prefilling | None:
         info = self._request_state.get_fwd_info(rid, self._request_state.get_partition_for_node(node_name))
-        return self._rebuilds.refusal(rid, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
+        return self._scheduler.prefilling(node_name, rid, info.graph_walk)
+
+    def _rebuild_refusal(self, rid: int, node_name: str) -> str | None:
+        """Why a rebuild can't write ``rid``'s KV on ``node_name`` again, or None."""
+        info = self._request_state.get_fwd_info(rid, self._request_state.get_partition_for_node(node_name))
+        return self._rebuilds.refusal(
+            rid, node_name, info.graph_walk, info.dynamic_loop_iter_counts,
+            self._scheduler.prefilling(node_name, rid, info.graph_walk),
+        )
 
     def _drop(self, rid: int, node_name: str) -> int:
-        """Drop ``rid``'s KV on ``node_name``, which its kept ids can rebuild, and return the pages freed."""
+        """Drop ``rid``'s KV on ``node_name``, which a rebuild can write again, and return the pages freed."""
         why = self._rebuild_refusal(rid, node_name)
         if why is not None:
             raise RuntimeError(f"{self._rid_str(rid)} can't be dropped on {node_name}, since {why}")
         if any(rid in batch.request_to_worker_graph for (node, _), batch in self._scheduler.backlog.items()
                if node == node_name):
             raise RuntimeError(f"{self._rid_str(rid)} is in a backlog on {node_name}")
-        kept = len(self._rebuilds.kept(rid, node_name))
-        return self._engine_manager.get_engine(node_name).drop_request(node_name, rid, kept)
+        return self._engine_manager.get_engine(node_name).drop_request(
+            node_name, rid, self._rebuilds.kept_count(rid, node_name),
+        )
 
-    def _move(self, kv: PagedKVCache, victims: Victims, pages_short: int) -> None:
+    def _move(self, kv: PagedKVCache, nodes: list[str], victims: Victims, pages_short: int) -> None:
         """Move each victim to the host, drop it, or ask the node's resources again for one that gave back its
         allotment, as `KVManager.preempt` decided. A backlogged row goes back to the runtime first, so it doesn't
         run on pages the move gave up."""
@@ -141,16 +153,15 @@ class Preemption:
                     node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
                 )
         for rid in victims.to_drop:
-            for node_name in kv.nodes:
-                if self._rebuilds.kept(rid, node_name) is not None:
-                    freed = self._drop(rid, node_name)
-                    self.counts[node_name].drops += 1
-                    self._log(
-                        self._moves_logged, node_name,
-                        "KV short on node=%s: dropped %s, %d pages freed for a shortage of %d, "
-                        "preempted %d times (%d earlier moves not logged)",
-                        node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
-                    )
+            for node_name in self._held(rid, nodes):
+                freed = self._drop(rid, node_name)
+                self.counts[node_name].drops += 1
+                self._log(
+                    self._moves_logged, node_name,
+                    "KV short on node=%s: dropped %s, %d pages freed for a shortage of %d, "
+                    "preempted %d times (%d earlier moves not logged)",
+                    node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
+                )
         for rid in victims.to_ask:
             for node_name in kv.nodes:
                 self._engine_manager.get_engine(node_name).readmit_request(node_name, rid)

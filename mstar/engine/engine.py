@@ -1304,6 +1304,7 @@ class Engine:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
         (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any.
+        A rebuild of a prompt mid-prefill is cut from the prompt's input, which its first chunk finds prepared.
 
         Raises when the prepared input is not the length the scheduler cut it
         by (``get_input_sequence_len`` disagreeing with ``prepare_inputs``):
@@ -1312,7 +1313,7 @@ class Engine:
         key = (rid, batch.node_name)
         full = self._chunking.prepared.get(key)
         start, end, total = chunk.start, chunk.end, chunk.total
-        if full is None:
+        if chunk.is_first and full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
                 fwd_info=batch.per_request_info_wrapped[rid],
@@ -1328,6 +1329,9 @@ class Engine:
                     f"{batch.node_name}/{walk}: the row was measured at {total} tokens "
                     f"and chunked by that, but its prepared inputs hold {full.input_seq_len}"
                 )
+            self._chunking.prepared[key] = full
+            batch.first_chunk_rids.add(rid)
+        if chunk.is_first:
             if walk in self._keyed_walks.get(batch.node_name, ()):
                 # a first chunk starts past what `input_sequence_len` matched;
                 # the probe answers the same again, now checked against the prepared inputs
@@ -1352,8 +1356,6 @@ class Engine:
                     prefix = prefix._replace(tokens=0, position=prefix.position - prefix.tokens)
                 # a declined or uncuttable walk writes over the lease (prefix None)
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
-            self._chunking.prepared[key] = full
-            batch.first_chunk_rids.add(rid)
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -1390,7 +1392,7 @@ class Engine:
         self.extend_prefix_chains(batch, outputs, host_rows=host_rows, skip_rids=skip_rids)
 
     def extend_prefix_chains(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
         skip_rids: Collection[int] = (),
     ) -> None:
@@ -1421,7 +1423,7 @@ class Engine:
             return
         for rid in rids:
             per_rid = outputs.get(rid)
-            if isinstance(per_rid, dict):
+            if isinstance(per_rid, Mapping):
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
@@ -1725,11 +1727,14 @@ class Engine:
     def _exec_per_request(
         self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
-        """Full step cycle per request, eager (no lease), outputs merged.
+        """Full step cycle per request, without a whole-forward lease, outputs merged.
 
-        The unbatchable fallback: no capture applies (a lease would have set
-        ``running_batched``), so each request declares/admits/plans/commits on
-        its own, keeping the plan matched to its single-request forward.
+        The unbatchable fallback: no whole-forward capture applies (a lease
+        would have set ``running_batched``), so each request declares/admits/
+        plans/commits on its own, keeping the plan matched to its
+        single-request forward. Each request still takes its own
+        piecewise-region leases in ``_declare_and_admit``, so a captured inner
+        loop can replay per request.
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
@@ -2216,7 +2221,7 @@ class Engine:
         return None if mgmt is None else mgmt.submodule.get_stop_policies(graph_walk)
 
     def check_stop_for_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
@@ -2746,24 +2751,31 @@ class Engine:
         write over the lease the walks before it were served from."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        if info is None or rid is None:
+            return info
+        return self.unserved_len(node_name, graph_walk, request_info, rid, info.seq_len, info.seq_len)
+
+    def unserved_len(
+        self, node_name: str, graph_walk: str, request_info: CurrentForwardPassInfo, rid: int,
+        length: int, end: int,
+    ) -> InputSeqLenInfo:
+        """The tokens up to ``end`` of ``rid``'s ``length``-token row, as `input_sequence_len` measures them. A
+        rebuild of a prompt mid-prefill writes only the tokens before ``end``."""
         policy = self._chunking.policy(node_name, graph_walk)
         if (
-            info is None or rid is None
-            or graph_walk not in self._keyed_walks.get(node_name, ())
+            graph_walk not in self._keyed_walks.get(node_name, ())
             # the manager's, not the policy's: a walk the deployment does not
             # chunk is never cut, so it starts at its first token
             or not self._chunking.chunkable(node_name, graph_walk)
             or (policy.reuses_cached_prefix is not None
                 and not policy.reuses_cached_prefix(request_info))
         ):
-            return info
+            return InputSeqLenInfo(end)
         prefix = self._runner.resolve_cached_prefix(
-            rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
+            rid, node_name, graph_walk, _MeasuredRow(length),
         )
-        matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
-        if matched <= 0:
-            return info
-        return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
+        matched = min(prefix.tokens if prefix is not None else 0, end)
+        return InputSeqLenInfo(end - matched, cached_prefix=matched)
 
     def check_ready(
         self, node_name: str, request_id: str,
@@ -3207,12 +3219,12 @@ class Engine:
         return bool(self._resident_delta)
 
     def apply_resident_delta(
-        self, delta: OffloadDelta, kept_count: Callable[[str, int], int | None],
+        self, delta: OffloadDelta, kept_count: Callable[[str, int], int],
     ) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``kept_count(node, rid)`` is how many ids this rank keeps of a request on a node, or None.
+        ``kept_count(node, rid)`` is how many ids this rank keeps of a request on a node.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()

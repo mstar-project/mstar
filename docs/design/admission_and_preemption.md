@@ -276,18 +276,21 @@ class RebuildPolicy:
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, opens the rebuild in the worker's log, and parks the request's decode row, as it parks a row waiting for capacity, until the rebuild lands.
+A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, and opens the rebuild in the worker's log. Readiness answers the request's decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.
 
 The rebuild prefills the kept ids minus the last, under the policy's walk, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
+
+A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
 The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
 
 Why this shape:
 
-- **The graph runtime never sees the rows.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back. Every call that hands a step's rows to the runtime takes `ScheduledBatch.graph_rows`, which leaves them out.
+- **The graph runtime never sees the rows.** Switching the request's runtime walk for one step would touch the runtime, the output edges, `WORKER_GRAPHS_DONE` and the loop-back. Every call that hands a step's rows to the runtime takes `ScheduledBatch.graph_rows`, which leaves them out.
 - **The prefill walk.** Each model's decode walk breaks a multi-token row in its own way. Bagel's declares a span of 1, the Qwen3-Omni Thinker's embeds every id at one position, and Qwen3.5's with device loop-back reads one token off the sampler.
 - **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids after the step that read them, on a stream of the pool's own. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
 - **Not a remove and re-ingest.** The sampler's RNG offset and repetition mask would be lost.
+- **A prompt mid-prefill reruns its own chunks.** Restarting it at chunk 0 would move its chunk Loop back, which only the graph runtime can do.
 
 > Note: a rebuild's first chunk starts past its cached prefix, measured as a fresh prompt's is on each try, so it recomputes only what the GPU index doesn't hold, and Qwen3.5 restores a recurrent snapshot for the prefix.
 

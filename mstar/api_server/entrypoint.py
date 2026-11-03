@@ -1048,6 +1048,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1224,6 +1225,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1281,20 +1285,30 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its

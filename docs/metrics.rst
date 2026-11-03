@@ -298,7 +298,7 @@ tensor or sequence parallel instance count once: the instance's first rank repor
    its client goes away.
 
 ``mstar_kv_rebuild_tokens_total{model_name, component}``
-   Counter. Tokens of kept history the rebuild rows prefilled, cache hits included.
+   Counter. Tokens the rebuild rows prefilled, cache hits included.
 
 ``mstar_kv_rebuild_cached_pages_total{model_name, component}``
    Counter. Pages a rebuild row found in the prefix cache.
@@ -323,8 +323,7 @@ producer. Workers report through the conductor (up to two seconds old); the API 
 adds what its data worker read since metrics were enabled, which the data worker
 publishes once a second. ``src`` is the node that produced the tensors, ``dst``
 the node that reads them, and ``api_server`` stands for the request's inputs (as
-``src``) and its results (as ``dst``). The Python and Rust runtimes report the same
-series.
+``src``) and its results (as ``dst``).
 
 ``mstar_transfer_bytes_total{model_name, src, dst, transport}``
    Counter, bytes. Tensor bytes read over the edge.

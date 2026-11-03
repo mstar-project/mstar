@@ -43,19 +43,32 @@ class KeptIds:
         return self.prompt.view.numel() + len(self.sampled)
 
 
+class Prefilling(NamedTuple):
+    """A prompt mid-prefill on a node: the walk it prefills in, the tokens its chunks have run, and its length."""
+    walk: str
+    done: int
+    total: int
+
+
 @dataclass(slots=True)
 class RebuildCursor:
-    """A rebuild under way: the policy's walk, the request's kept ids, the dtype the walk reads them in, and the
-    end of its chunks that have landed, 0 before the first. It writes every id but the last (``total``), which
-    the next decode step reads."""
+    """A rebuild under way: the walk its rows run, the tokens it writes (``total``) of an input ``length`` long,
+    and the end of its chunks that have landed, 0 before the first.
+
+    A rebuild from kept ids reads ``ids`` in ``dtype`` and writes every id but the last, which the next decode
+    step reads. A rebuild of a prompt mid-prefill has no ``ids``: it runs its prompt's chunks again, cut from the
+    input the engine keeps for the prompt, up to where the prompt stood."""
     walk: str
-    ids: array
-    dtype: torch.dtype
+    total: int
+    length: int
+    ids: array | None = None
+    dtype: torch.dtype | None = None
     done: int = 0
 
     @property
-    def total(self) -> int:
-        return len(self.ids) - 1
+    def resumes_prefill(self) -> bool:
+        """Whether its request's prompt goes on past it, from the input the engine keeps for the prompt."""
+        return self.total < self.length
 
 
 def policies_run_here(
@@ -123,6 +136,12 @@ class Rebuilds:
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
 
+    def kept_count(self, rid: int, node: str) -> int:
+        """How many ids ``rid`` keeps on ``node``, which rank 0 journals with a drop for each follower to check.
+        A request dropped mid-prefill can keep none."""
+        kept = self.kept(rid, node)
+        return 0 if kept is None else len(kept)
+
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
         and its loop grows labels one rebuild row can lay out again, written in the policy's walk."""
@@ -183,8 +202,8 @@ class Rebuilds:
                 kept[rid] = KeptIds(copy, prompt.dtype, array("i"))
 
     def keep_samples(
-        self, node_batch: ExecutingBatch, cpu_outputs, host_rows: HostRows | None,
-        skip_rids: Collection[int] = (),
+        self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
+        host_rows: HostRows | None, skip_rids: Collection[int] = (),
     ) -> None:
         """Append each kept row's sample, from the stop check's host copy, to its kept ids. ``skip_rids``
         are rows whose sample is not real, as for `Engine.step_finished`."""
@@ -207,7 +226,7 @@ class Rebuilds:
             pairs = []
             for rid in node_batch.request_ids:
                 out = cpu_outputs.get(rid)
-                if not isinstance(out, dict) or not out.get(name):
+                if not isinstance(out, Mapping) or not out.get(name):
                     continue
                 sample = out[name][0]
                 if sample.numel() != 1:
@@ -226,13 +245,18 @@ class Rebuilds:
             "prefills one id per sample"
         )
 
-    def refusal(self, rid: int, node: str, walk: str, loop_iters: Mapping[str, int]) -> str | None:
-        """Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None when its kept ids cover its
-        KV: the prefill and each iteration of the policy's loop sample one id, and the KV holds all but
-        the last."""
+    def refusal(
+        self, rid: int, node: str, walk: str, loop_iters: Mapping[str, int], prefilling: Prefilling | None,
+    ) -> str | None:
+        """Why ``rid``, in ``walk``, can't be dropped on ``node`` now, or None. A request ``prefilling`` its
+        prompt is rebuilt from the input the engine keeps for the prompt, which covers what its KV holds. Any
+        other is rebuilt from its kept ids, which cover its KV when the prefill and each iteration of the
+        policy's loop sampled one id, since the KV holds all but the last."""
         policy = self._policies.get(node)
         if policy is None:
             return f"{node} declares no rebuild policy"
+        if prefilling is not None:
+            return None
         kept = self._kept[node].get(rid)
         if kept is None:
             return f"it keeps no ids on {node}"
@@ -244,49 +268,52 @@ class Rebuilds:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def start(self, rid: int, node: str) -> Rebuild:
-        """Open ``rid``'s rebuild on ``node``, and return what it writes."""
+    def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
+        """Open ``rid``'s rebuild on ``node``, and return what it writes from its kept ids, or None when it runs
+        the chunks its prompt was ``prefilling`` again, which the request's layout already describes."""
         assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        if prefilling is not None:
+            self._cursors[(node, rid)] = RebuildCursor(prefilling.walk, prefilling.done, prefilling.total)
+            return None
         kept, walk = self._kept[node][rid], self._policies[node].walk
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
-        self._cursors[(node, rid)] = RebuildCursor(walk, ids, kept.dtype)
+        self._cursors[(node, rid)] = RebuildCursor(walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype)
         return Rebuild(walk, ids)
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors
 
+    def cursor(self, rid: int, node: str) -> RebuildCursor:
+        return self._cursors[(node, rid)]
+
     def cursors(self) -> ItemsView[tuple[str, int], RebuildCursor]:
         return self._cursors.items()
-
-    def host_inputs(self, rid: int, node: str) -> NameToTensorList:
-        """The input of ``rid``'s rebuild row on the host, which its length is measured from."""
-        return {self._policies[node].ids_input: [_row_ids(self._cursors[(node, rid)])]}
 
     def fill(
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
     ) -> None:
-        """Give each rebuild row of ``rids`` the policy's walk, and its ids on the device when it runs its first
-        chunk or runs whole. A later chunk is cut from the input the engine prepared on the first."""
+        """Give each rebuild row of ``rids`` its walk, and its kept ids on the device when it runs its first
+        chunk or runs whole. A later chunk is cut from the input the engine prepared on the first, and every
+        chunk of a prompt's rebuild from the input the engine keeps for the prompt."""
         ids_input = self._policies[node].ids_input
         for rid in rids:
             cursor = self._cursors[(node, rid)]
             infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
             chunk = chunk_ranges.get(rid)
-            if chunk is None or chunk.is_first:
+            if cursor.ids is not None and (chunk is None or chunk.is_first):
                 ids = _row_ids(cursor).to(cursor.dtype)
                 inputs[rid] = {ids_input: [to_device_nonblocking(ids, self._pool.device)]}
 
-    def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> bool:
-        """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return whether
-        the rebuild has finished."""
+    def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RebuildCursor | None:
+        """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its
+        cursor once the rebuild has finished."""
         cursor = self._cursors[(node, rid)]
         cursor.done = cursor.total if chunk is None else chunk.end
         if cursor.done < cursor.total:
-            return False
-        del self._cursors[(node, rid)]
-        return True
+            return None
+        return self._cursors.pop((node, rid))
 
     def remove_request(self, rid: int) -> None:
         for node, kept in self._kept.items():

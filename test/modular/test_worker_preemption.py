@@ -43,7 +43,7 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -90,6 +90,7 @@ def _worker(kv):
     w.scheduler = SimpleNamespace(
         backlog={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
         could_refill=lambda *args: False, cap_batch=lambda *args: None, limit_batch=lambda *args: None,
+        prefilling=lambda node, rid, walk: None,
     )
     w.request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
@@ -223,6 +224,28 @@ def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_o
         "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
 
 
+def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_not_itself():
+    """A newer request between two chunks of its prompt keeps no ids from a sample yet. It was refused as a victim,
+    so the older decode dropped itself and paid a rebuild of its whole history, where the newer one reruns only
+    the chunks it ran."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    del w._rebuilds._kept[NODE]["v"]
+    w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
+        rid == "v") else None
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.DROPPED and kv.residency("r") is Residency.RESIDENT, (
+        "the older decode dropped itself while the newest request kept its pages")
+    assert _step(kv, "r", 1).ok
+
+
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     """A dropped request asks again at its drop, so its next readiness check parks it in the queue. Once the pool
     admits it, the check starts its rebuild, and the rebuild's landing lets it run. A second path that readmitted
@@ -233,8 +256,8 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     engine._runner, engine.residency = _runner(kv), lambda node, rid: kv.residency(rid)
     engine.prepare_rebuild = lambda node, rid, rebuild: None
     engine.check_ready = lambda node, rid, info, allow_reload=True: Engine.check_ready(engine, node, rid, info)
-    scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds)
-    for name in ("_check_ready", "_start_rebuild", "_unpark", "note_rebuilt"):
+    scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={})
+    for name in ("_check_ready", "_start_rebuild", "_unpark", "prefilling"):
         setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
     info = w.request_state.get_fwd_info("v", "p")
 
@@ -242,7 +265,7 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     _remove(kv, "r")
     scheduler._unpark(w.request_state)
     assert not scheduler._check_ready(NODE, "v", info) and w._rebuilds.rebuilding("v", NODE), "v was never rebuilt"
-    scheduler.note_rebuilt(NODE, "v")
+    w._rebuilds.land_chunk("v", NODE, None)
 
     assert "v" not in scheduler.parked[NODE], "v's rebuild landed, but v stays parked and never runs again"
 
