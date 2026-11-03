@@ -35,6 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms import current_platform
 from mstar.utils.quant_fp8 import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
@@ -634,10 +635,18 @@ CONFIG_DIR = Path(__file__).parent / "configs"
 
 
 def device_config_name() -> str | None:
-    """This GPU's name as table files spell it, or None without a GPU."""
+    """This GPU's name as table files spell it, or None without a GPU.
+
+    An AMD GPU passed to a VM through SR-IOV reports its name with " VF"
+    appended ("AMD Instinct MI325X VF"). It is the same silicon, so it reads
+    the table tuned for the bare GPU's name.
+    """
     if not torch.cuda.is_available():
         return None
-    return torch.cuda.get_device_name().replace(" ", "_")
+    name = torch.cuda.get_device_name()
+    if current_platform.is_rocm():
+        name = name.removesuffix(" VF")
+    return name.replace(" ", "_")
 
 
 def config_path(E: int, N: int, K: int, device_name: str) -> Path:

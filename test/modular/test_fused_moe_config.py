@@ -118,3 +118,41 @@ def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
 
     with pytest.raises(AssertionError, match="BLOCK_SIZE_M"):
         fused_experts(x, w1, w2, weights, ids, alignment=alignment._replace(block_m=block_m * 2))
+
+
+class _Platform:
+    def __init__(self, rocm):
+        self._rocm = rocm
+
+    def is_rocm(self):
+        return self._rocm
+
+
+@pytest.mark.parametrize(("gpu", "rocm", "expected"), [
+    ("AMD Instinct MI325X VF", True, "AMD_Instinct_MI325X"),
+    ("AMD Instinct MI325X", True, "AMD_Instinct_MI325X"),
+    ("AMD Instinct MI300X VF", True, "AMD_Instinct_MI300X"),
+    # only AMD names drop the suffix
+    ("Some GPU VF", False, "Some_GPU_VF"),
+])
+def test_a_virtual_function_reads_its_gpus_table(monkeypatch, gpu, rocm, expected):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: gpu)
+    monkeypatch.setattr(kernels, "current_platform", _Platform(rocm))
+    assert kernels.device_config_name() == expected
+
+
+def test_the_mi325x_vf_picks_its_tuned_entries_per_batch(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "AMD Instinct MI325X VF")
+    monkeypatch.setattr(kernels, "current_platform", _Platform(True))
+    for shape in [(128, 1536, 2048), (128, 768, 1024)]:  # the Thinker's and Talker's w1
+        path = kernels.config_path(*shape, "AMD_Instinct_MI325X")
+        raw = json.loads(path.read_text())
+        assert kernels.tuned_configs(*shape) == {int(m): entry for m, entry in raw.items()}
+        for m, entry in ((1, "1"), (8, "8"), (32, "32"), (64, "64"), (30, "32"), (48, "32"), (100, "128")):
+            up, down = kernels.get_config(M=m, E=shape[0], N=shape[1], K=shape[2], top_k=8)
+            want = {k: v for k, v in raw[entry].items() if k != "down"}
+            assert up == want, (shape, m)
+            assert down == {**want, **raw[entry].get("down", {}), "BLOCK_SIZE_M": want["BLOCK_SIZE_M"]}
+            assert up != kernels.get_default_config(m, *shape, top_k=8)
