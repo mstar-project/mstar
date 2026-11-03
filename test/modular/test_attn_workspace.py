@@ -448,6 +448,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     engine._enable_nvtx = False
     engine._resources = {"attn": _Resource()}
     engine._runner = None
+    engine._side_stream_nodes = frozenset()
     engine._submodules = {"dit": SimpleNamespace(
         submodule=SimpleNamespace(warmup_compiles=lambda: None), resources={}, joint_comm_group=None, num_slots=2,
         fp32_precision=None, node_dtype=None, lora_pools=(),
