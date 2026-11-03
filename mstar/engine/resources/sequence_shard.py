@@ -520,20 +520,28 @@ class SequenceShard(Resource):
             return None
         return plan.ranges.get(label)
 
-    def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None):
+    def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """This rank's share of each of ``xs`` (whole on every rank) along ``dim`` (the spec's
         axis by default), when this step splits ``label`` (``SeqRange.local``); the inputs
         unchanged otherwise.
-        One tensor in, one out; several in, a tuple out. None passes through."""
-        if not self.can_split:
+        One tensor in, one out; several in, a tuple out. None passes through.
+
+        ``walk``, the step's walk where the caller's frame is compiled per walk: a walk the shard
+        never splits (outside ``walks``) traces straight through, as at one SP rank, rather than
+        breaking the frame."""
+        if not self._may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=True)
 
-    def gather(self, label: str, *xs: torch.Tensor | None, dim: int | None = None):
+    def gather(self, label: str, *xs: torch.Tensor | None, dim: int | None = None, walk: str | None = None):
         """``scatter``'s inverse: every rank's share of each of ``xs`` back whole."""
-        if not self.can_split:
+        if not self._may_split(walk):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=False)
+
+    def _may_split(self, walk: str | None) -> bool:
+        # from what is fixed at bind and the frame's walk, so a compiled frame specializes on it
+        return self.can_split and (walk is None or self.walks is None or walk in self.walks)
 
     @torch.compiler.disable
     def _bracket(self, label: str, xs: tuple, dim: int | None, scatter: bool):

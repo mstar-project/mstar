@@ -785,6 +785,22 @@ def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed
         assert by_key["linear"].depends_on() == {"state", "shard"}
 
 
+def test_a_walk_the_shard_never_splits_traces_the_bracket_straight_through():
+    """On SP ranks the bracket breaks a compiled frame (it reads the step's plan), except given a
+    walk the shard never splits (outside ``walks``), whose frame a model compiles apart: Qwen3.5's
+    decode, which stays one graph."""
+    shard = _shard(walks=("prefill",))
+
+    def bracket(x, walk):
+        return shard.gather("main", shard.scatter("main", x, walk=walk) * 2, walk=walk)
+
+    x = torch.arange(4.0)
+    decode = torch.compile(lambda x: bracket(x, "decode"), fullgraph=True, backend="eager")
+    assert torch.equal(decode(x), 2 * x)
+    with pytest.raises(torch._dynamo.exc.Unsupported):
+        torch.compile(lambda x: bracket(x, "prefill"), fullgraph=True, backend="eager")(x)
+
+
 @pytest.mark.parametrize("end", ["commit", "capture"])
 def test_a_split_plan_ends_with_its_step(end):
     """Outside a step the bracket is the identity (Cosmos3's warmup compile runs after the

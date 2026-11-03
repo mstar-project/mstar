@@ -592,8 +592,9 @@ class LLMSubmodule(ARNodeSubmodule):
         # a step split over the SP ranks runs the stack on this rank's range of its tokens; the
         # attention and recurrent resources exchange what they need. Identity on a copied step
         shard: SequenceShard = engine_inputs.resources[LLM_SHARD]
-        embeds, cos_3d, sin_3d = shard.scatter("main", embeds, cos_3d, sin_3d)
-        hidden = shard.gather("main", self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d)))
+        embeds, cos_3d, sin_3d = shard.scatter("main", embeds, cos_3d, sin_3d, walk=graph_walk)
+        hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
+        hidden = shard.gather("main", hidden, walk=graph_walk)
 
         if graph_walk != "decode":
             # only the last token of each prefill row feeds the head

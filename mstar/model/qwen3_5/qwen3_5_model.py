@@ -72,6 +72,7 @@ from mstar.model.qwen3_5.config import (
     LLM_SHARD,
     ROPE,
     SAMPLER,
+    SPLIT_WALKS,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -272,8 +273,9 @@ class Qwen3_5DenseModel(Model):
                 enable_repetion_penalty=True,
             ),
             # a step split over the LLM's SP ranks; one SP rank, or KV stored by position under the
-            # shard's default exchange (auto), runs every step copied
-            SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0),
+            # shard's default exchange (auto), runs every step copied. Decode never splits, so its
+            # compiled frame traces the bracket straight through
+            SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=SPLIT_WALKS),
             *self._vision_resources(),
         ]
 
