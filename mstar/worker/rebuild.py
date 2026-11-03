@@ -458,7 +458,7 @@ class Rebuilds:
     def fill(
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
-    ) -> list[torch.Event]:
+    ) -> tuple[torch.Event, ...]:
         """Give each rebuild row of ``rids`` its walk and its inputs, and return the events the step waits on before
         it reads them.
 
@@ -486,7 +486,7 @@ class Rebuilds:
                     tensor, landed = self._pool.copy_in(view)
                     inputs[rid][name].append(tensor)
                     ready += [landed] if landed is not None else []
-        return ready
+        return tuple(ready)
 
     def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RebuildCursor | None:
         """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its

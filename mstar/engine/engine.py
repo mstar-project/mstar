@@ -397,7 +397,7 @@ class ExecutingBatch:
 
     admit_error: AdmitFailedReason | None = None
     # recorded once inputs copied to the device for this step have landed, which the step waits on
-    input_ready: list[torch.Event] = field(default_factory=list)
+    input_ready: tuple[torch.Event, ...] = ()
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
