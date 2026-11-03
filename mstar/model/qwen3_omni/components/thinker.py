@@ -27,6 +27,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.rms_norm import run_fused_add_rms_norm
 from mstar.model.components import (
     MoeParallelConfig,
     MoeParallelMixin,
@@ -36,6 +37,7 @@ from mstar.model.components import (
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
+from mstar.platforms import current_platform
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
@@ -149,6 +151,38 @@ class Qwen3OmniThinkerLayer(nn.Module):
 
         return hidden_states
 
+    def forward_fused_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        mrope_section: Optional[list[int]] = None,
+        token_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` with each residual add deferred into the next norm.
+
+        Takes the previous layer's MLP output and the residual stream (None
+        for the first layer, whose input is the stream) and returns this
+        layer's MLP output and the stream; their sum is what ``forward``
+        returns. On a GPU both inputs are updated in place.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm.forward_residual(hidden_states, residual)
+        hidden_states = self.self_attn(
+            hidden_states,
+            cos_sin_3d=cos_sin_3d,
+            mrope_section=mrope_section,
+        )
+        hidden_states, residual = self.post_attention_layernorm.forward_residual(hidden_states, residual)
+        if token_valid is not None and self.is_moe:
+            hidden_states = self.mlp(hidden_states, token_valid=token_valid)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
 
 class Qwen3OmniThinkerTextModel(nn.Module):
     """Inner text model (maps to ``thinker.model.*`` in HF weights)."""
@@ -195,6 +229,14 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         self.accept_hidden_layer = config.accept_hidden_layer
 
         self.model = Qwen3OmniThinkerTextModel(config, comm_group=comm_group, moe_parallel=moe_parallel)
+        # On AMD GPUs the residual adds go into the norms (one fused add+norm
+        # kernel per norm instead of an add and a norm, 96 fewer launches a
+        # decode step). Elsewhere the layers run as before.
+        self.fused_residual = current_platform.is_rocm()
+        if self.fused_residual:
+            # picked now rather than on the first call, which runs inside a
+            # compiled forward where the pick's lock breaks the graph
+            run_fused_add_rms_norm.resolve()
 
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
@@ -248,6 +290,10 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         # the label once, advance the index per layer. Passing them as
         # arguments instead would make inductor specialize on the int.
         self.model.layers[0].self_attn.attend.bind_step(label)
+        if self.fused_residual:
+            return self._forward_fused_residual(
+                hidden_states, layer_0_embed, cos_sin_3d, mrope_section, deepstack_visual_embeds, token_valid,
+            )
         for layer_idx, decoder_layer in enumerate(self.model.layers):
             decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
@@ -271,4 +317,36 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         # Final layer norm
         hidden_states = self.model.norm(hidden_states)
 
+        return hidden_states, layer_0_embed, layer_n_hidden
+
+    def _forward_fused_residual(
+        self,
+        hidden_states: torch.Tensor,
+        layer_0_embed: torch.Tensor,
+        cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        mrope_section: Optional[list[int]],
+        deepstack_visual_embeds: list[torch.Tensor] | None,
+        token_valid: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """``forward``'s layer loop on the deferred residual stream. The stream
+        starts as ``input_embeds`` itself, which the GPU kernels update in
+        place; callers build that tensor per step and do not read it after."""
+        layer_n_hidden = None
+        residual = None
+        for layer_idx, decoder_layer in enumerate(self.model.layers):
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states, residual = decoder_layer.forward_fused_residual(
+                hidden_states,
+                residual,
+                cos_sin_3d=cos_sin_3d,
+                mrope_section=mrope_section,
+                token_valid=token_valid,
+            )
+            # the layer's output is hidden_states + residual, so adding the
+            # visual features to either term adds them to the output
+            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+                hidden_states = self._deepstack_process(hidden_states, deepstack_visual_embeds[layer_idx])
+            if layer_idx == self.accept_hidden_layer:
+                layer_n_hidden = residual + hidden_states
+        hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
         return hidden_states, layer_0_embed, layer_n_hidden
