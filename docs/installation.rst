@@ -512,6 +512,12 @@ in ``rust-toolchain.toml``):
    uv pip install maturin
    maturin develop --release -m rust/Cargo.toml
 
+Rebuild whenever ``rust/`` changes, pulled or your own: in a checkout, the
+conductor and each worker refuse an extension built from other ``rust/``
+sources (compared by content, ``mstar_rust.BUILD_SOURCE_HASH``), which would
+otherwise import fine and fail mid-request. An installed wheel has no ``rust/``
+beside ``mstar`` and is not checked.
+
 The CPU test suites build a graph runtime too, so contributors need it as well,
 Mac contributors included: install ``cargo`` through rustup and run the same
 command. Build with ``--release`` — an unoptimized debug build (maturin's

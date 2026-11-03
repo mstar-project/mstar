@@ -15,6 +15,7 @@ pub mod communicator;
 #[cfg(feature = "python")]
 pub mod graph;
 pub mod shm;
+pub mod source_hash;
 #[cfg(feature = "python")]
 pub mod tensors;
 

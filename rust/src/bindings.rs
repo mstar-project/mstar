@@ -309,9 +309,19 @@ impl PySegmentedShmArena {
     }
 }
 
+/// The content hash of the sources in `rust_dir`, as build.rs computed
+/// BUILD_SOURCE_HASH for this build (src/source_hash.rs).
+#[pyfunction]
+fn source_hash(rust_dir: std::path::PathBuf) -> PyResult<String> {
+    Ok(crate::source_hash::source_hash(&rust_dir)?)
+}
+
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // What a checkout compares with source_hash over its own rust/.
+    m.add("BUILD_SOURCE_HASH", env!("MSTAR_RUST_SOURCE_HASH"))?;
+    m.add_function(wrap_pyfunction!(source_hash, m)?)?;
     m.add_class::<PyZmqCommunicator>()?;
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
