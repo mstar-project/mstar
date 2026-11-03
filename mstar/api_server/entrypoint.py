@@ -912,7 +912,7 @@ class APIServer:
             size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
             self._check_call_input(size)
             req.input_bytes = size
-            req.last_input_time = time.time()
+            req.last_input_time = time.monotonic()
             req.open_streams -= ending
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
@@ -1429,7 +1429,7 @@ class APIServer:
     async def _iter_result_chunk_batches(
         self, request_id: str, key: str | None, own: PendingRequest | None,
     ):
-        start = time.time()
+        start = time.monotonic()
         last_activity = start
         finished = False
         # An error chunk ends the response: whatever follows it for this
@@ -1447,7 +1447,7 @@ class APIServer:
                 own.wake = wake
         try:
             while True:
-                if time.time() - last_activity > self.timeout_seconds:
+                if time.monotonic() - last_activity > self.timeout_seconds:
                     timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
@@ -1649,7 +1649,7 @@ class APIServer:
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
         return its chunks. Disconnecting or timing out releases engine state."""
-        start = time.time()
+        start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
         # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
@@ -1673,7 +1673,7 @@ class APIServer:
                 done = req.event.is_set() if req else True
             if done:
                 break
-            now = time.time()
+            now = time.monotonic()
             if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
