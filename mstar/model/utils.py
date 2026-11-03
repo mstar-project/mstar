@@ -537,6 +537,70 @@ def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -
             hook(device)
 
 
+def resolve_checkpoint(model_path_hf: str | None, cache_dir: str | None = None) -> str | None:
+    """A local checkpoint directory as given, a Hub id as its snapshot (fetched if not cached),
+    None for no path."""
+    if not model_path_hf:
+        return None
+    if Path(model_path_hf).exists():
+        return str(model_path_hf)
+    from mstar.utils.hf_snapshot import resolve_snapshot_dir
+
+    return str(resolve_snapshot_dir(model_path_hf, cache_dir=cache_dir))
+
+
+def read_fp8_block_quant_config(checkpoint_dir: str):
+    """The ``Fp8BlockQuantConfig`` in ``checkpoint_dir/config.json``, or None: no file, none
+    declared, or unreadable (the weights then load as they are, bf16)."""
+    from mstar.utils.fp8_block import Fp8BlockQuantConfig
+
+    path = Path(checkpoint_dir) / "config.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        logger.warning("could not read %s: %s", path, e)
+        return None
+    return Fp8BlockQuantConfig.from_hf_config_dict(raw.get("quantization_config"))
+
+
+def load_snapshot_tokenizer(model_path_hf: str, cache_dir: str | None = None):
+    """The checkpoint's tokenizer, through ``AutoTokenizer`` or, where transformers 4.x
+    cannot build the backend class a transformers-5 ``tokenizer_config.json`` names,
+    ``fast_tokenizer_from_snapshot``."""
+    from transformers import AutoTokenizer
+
+    from mstar.utils.hf_snapshot import resolve_snapshot_dir
+
+    source = str(resolve_snapshot_dir(model_path_hf, cache_dir=cache_dir))
+    try:
+        return AutoTokenizer.from_pretrained(source, cache_dir=cache_dir)
+    except ValueError:
+        return fast_tokenizer_from_snapshot(source)
+
+
+def fast_tokenizer_from_snapshot(source: str):
+    """A fast tokenizer from ``tokenizer.json``, which is version-independent, with the
+    snapshot's chat template and the special tokens ``tokenizer_config.json`` declares."""
+    from transformers import PreTrainedTokenizerFast
+
+    snap = Path(source)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(snap / "tokenizer.json"))
+    template = snap / "chat_template.jinja"
+    if template.is_file():
+        tokenizer.chat_template = template.read_text()
+    # built from tokenizer.json alone, the tokenizer has no special tokens, so the
+    # detokenizer would print <|user|> and the other turn markers into replies
+    config = snap / "tokenizer_config.json"
+    if config.is_file():
+        cfg = json.loads(config.read_text())
+        special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
+        tokenizer.add_special_tokens(
+            {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
+    return tokenizer
+
+
 # The 25 European languages of NVIDIA's Granary-trained speech checkpoints
 # (canary-1b-v2, parakeet-tdt-0.6b-v3).
 GRANARY_LANGUAGES = (

@@ -38,8 +38,8 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_snapshot_tokenizer, read_fp8_block_quant_config, resolve_checkpoint
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -158,42 +158,8 @@ class Glm52Model(Model):
         # Lazy: weights AND tokenizer load on demand so the conductor process
         # never touches the 750 GB checkpoint or HF IO in dummy/byte mode.
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            tokenizer_source = str(
-                resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_source, cache_dir=self.cache_dir,
-                )
-            except ValueError:
-                # The checkpoint's tokenizer_config declares transformers-5's
-                # TokenizersBackend class, which transformers 4.x cannot
-                # construct — but the underlying tokenizer.json is
-                # version-independent, so building a fast tokenizer straight
-                # from it encodes identically.
-                self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
+            self._tokenizer = load_snapshot_tokenizer(self.model_path_hf, self.cache_dir)
         return self._tokenizer
-
-    @staticmethod
-    def _fast_tokenizer_fallback(source: str):
-        from transformers import PreTrainedTokenizerFast
-
-        snap = Path(source)
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(snap / "tokenizer.json"))
-        template = snap / "chat_template.jinja"
-        if template.is_file():
-            tokenizer.chat_template = template.read_text()
-        # built from tokenizer.json alone, the tokenizer has no special tokens, so the
-        # detokenizer would print <|user|> and the other turn markers into replies
-        config = snap / "tokenizer_config.json"
-        if config.is_file():
-            cfg = json.loads(config.read_text())
-            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
-            tokenizer.add_special_tokens(
-                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
-        return tokenizer
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -621,30 +587,12 @@ class Glm52Model(Model):
         language_model.load_weights(weights)
 
     def _resolve_checkpoint(self) -> str | None:
-        path = getattr(self, "model_path_hf", None)
-        if not path:
-            return None
-        if Path(path).exists():
-            return str(path)
-        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
+        return resolve_checkpoint(self.model_path_hf, self.cache_dir)
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        from mstar.utils.fp8_block import Fp8BlockQuantConfig
-
         if self.config.quantization_config is not None:
             return
-        config_json = Path(source) / "config.json"
-        if not config_json.is_file():
-            return
-        try:
-            with open(config_json) as f:
-                raw = json.load(f)
-        except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
-            logger.warning("Glm52Model: could not read %s: %s", config_json, e)
-            return
-        quant = Fp8BlockQuantConfig.from_hf_config_dict(
-            raw.get("quantization_config"),
-        )
+        quant = read_fp8_block_quant_config(source)
         if quant is not None:
             self.config.quantization_config = quant
             logger.info(
