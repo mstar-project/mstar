@@ -32,7 +32,7 @@ from test_kv_preemption import (  # noqa: F401
 )
 
 from mstar.engine.engine import PagedKVCache
-from mstar.engine.resources.kv.config import KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
@@ -264,6 +264,22 @@ def test_a_pool_reserves_growth_only_for_the_loops_its_worker_runs(walks, loops)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
     _worker(kv)._set_kv_writes(model, walks)
     assert kv.local_loops == loops, "a guaranteed request would reserve growth its worker never runs"
+
+
+def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
+    """Bagel's CFG nodes share the LLM's pool and declare no rebuild policy. A text chat writes only the LLM's
+    main label, in the policy's walks, so placing the CFG nodes on the LLM's rank must not change its class."""
+    kv = _pool()
+    w = _worker(kv)
+    w._kv_caches = {"kv": PagedKVCache("kv", frozenset({NODE, "LLM_cfg_text"}), kv)}
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode"), ("LLM_cfg_text", "cfg_text")})
+    layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
+    configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64})}
+
+    w._guarantee(configs)
+
+    assert not configs["kv"].guaranteed, "a node that writes nothing for the request made it guaranteed"
 
 
 def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
