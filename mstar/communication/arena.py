@@ -26,16 +26,20 @@ Ceilings are PER-ENTITY and multiply across a node: with E entities
 ``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx
 ``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin
 more than its own arena holds). With neither ``MAX_SEGMENTS`` nor
-``SEGMENT_MB`` set, both come from /dev/shm's free space when the entity
-starts, so that four entities' ceilings fit in it (``_default_sizing``); set
-by hand, construction fails fast when one entity's ceiling already exceeds
-/dev/shm. Either way it warns when the ceiling exceeds current free space or
-when the pin budget is an outsized share of physical RAM.
+``SEGMENT_MB`` set, the API server sizes every arena of its deployment once,
+before any exists (``export_arena_plan``): /dev/shm's free space split among
+the deployment's arenas plus one share kept for spill files. Each entity
+measuring free space for itself would give the ones that start later less,
+since a first segment's pages are committed when it is created. An entity
+started without that plan falls back to its own measurement. Set by hand,
+construction fails fast when one entity's ceiling already exceeds /dev/shm.
+Either way it warns when the ceiling exceeds current free space or when the
+pin budget is an outsized share of physical RAM.
 
 An entity can also run without an arena of its own: when its first segment
-cannot be created (or /dev/shm has under 64 MiB free), and on devices other
-than CPU and CUDA (``_arena_supported``), which use the file path until the
-arena is measured there. It then sends every tensor as a per-uuid file and
+cannot be created (or /dev/shm is too small for a 16 MiB share), and on
+devices other than CPU and CUDA (``_arena_supported``), which use the file
+path until the arena is measured there. It then sends every tensor as a per-uuid file and
 still reads its peers' arenas, so it mixes with entities that have one.
 
 Selection: ``create_tensor_communication_manager`` builds this manager for
@@ -77,51 +81,88 @@ logger = logging.getLogger(__name__)
 _CUDA_HOST_ALREADY_REGISTERED = 712
 _sizing_logged = False
 
+#: ``<segment MiB>x<max segments>`` for every arena of one deployment, ``0x0``
+#: for none; set by ``export_arena_plan`` and inherited by the processes the
+#: API server starts.
+ARENA_PLAN_ENV = "MSTAR_SHM_ARENA_PLAN"
+#: Without a plan an entity takes a quarter of the free space it finds: its
+#: arena and two others, plus the spill share.
+_UNPLANNED_ENTITIES = 3
 
-def _default_sizing(shm_free: int) -> tuple[int, int] | None:
-    """(segment MiB, max segments) when neither knob is set: 256 MiB segments,
-    as many as let four entities' ceilings fit in /dev/shm's free space (1 to
-    32). Where four entities cannot have one 256 MiB segment each, one segment
-    of the largest power-of-two MiB that fits four times. None where that is
-    under 16 MiB: the entity sends by files."""
-    share_mb = (shm_free >> 20) // 4
+
+def _default_sizing(budget: int, entities: int) -> tuple[int, int] | None:
+    """(segment MiB, max segments) for each of ``entities`` arenas sharing
+    ``budget`` bytes, with one more share left for the files sends spill to:
+    256 MiB segments, 1 to 32 of them, or where a share is under 256 MiB, one
+    segment of the largest power-of-two MiB that fits. None where a share is
+    under 16 MiB: the entities send by files."""
+    share_mb = (budget >> 20) // (entities + 1)
     if share_mb < 16:
         return None
     segment_mb = 256 if share_mb >= 256 else 1 << (share_mb.bit_length() - 1)
     return segment_mb, min(32, share_mb // segment_mb)
 
 
+def _shm_space() -> tuple[int | None, int | None]:
+    """/dev/shm's total and free bytes, or Nones where it cannot be read."""
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return None, None
+    return st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
+
+
+def export_arena_plan(worker_devices: list[str] | None) -> None:
+    """Size every arena of this deployment once, from /dev/shm's free space
+    before any of them exists, and hand the sizes to the processes the caller
+    starts (``ARENA_PLAN_ENV``). Called by the API server, which holds one
+    arena itself, for its workers on ``worker_devices``; None (no deployment
+    config) drops a plan an earlier server in this process left."""
+    os.environ.pop(ARENA_PLAN_ENV, None)
+    _, avail = _shm_space()
+    if worker_devices is None or avail is None:
+        return
+    entities = 1 + sum(map(_arena_supported, worker_devices))
+    sizes = _default_sizing(avail, entities) or (0, 0)
+    os.environ[ARENA_PLAN_ENV] = f"{sizes[0]}x{sizes[1]}"
+    logger.info(
+        "ARENA: /dev/shm has %d MiB free for %d arenas and their spill files; "
+        "each arena grows to %d segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS "
+        "and _SEGMENT_MB override)", avail >> 20, entities, sizes[1], sizes[0])
+
+
 def _arena_sizing() -> tuple[int, int, int | None, int | None]:
     """Segment MiB, max segments, and /dev/shm's total and free bytes. Knobs
     the user set are taken as given (the constructor fails fast if they do not
-    fit); with neither set the sizes come from /dev/shm's free space, so a
-    small or busy tmpfs (a Kubernetes pod gets 64 MiB) runs a small arena, or
-    none (0 segments of 0 MiB), and spills to files instead of refusing to
-    start."""
+    fit); with neither set the deployment's plan applies, and without one the
+    sizes come from /dev/shm's free space now. Either way a small or busy
+    tmpfs (a Kubernetes pod gets 64 MiB) runs a small arena, or none (0
+    segments of 0 MiB), and spills to files instead of refusing to start."""
     global _sizing_logged
-    try:
-        st = os.statvfs("/dev/shm")
-        total, avail = st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
-    except OSError:
-        total = avail = None
+    total, avail = _shm_space()
     segment_env = os.environ.get("MSTAR_SHM_ARENA_SEGMENT_MB")
     max_env = os.environ.get("MSTAR_SHM_ARENA_MAX_SEGMENTS")
-    if not segment_env and not max_env and avail is not None:
-        sizes = _default_sizing(avail)
-        if sizes is None:
-            return 0, 0, total, avail
-        segment_mb, max_segments = sizes
-        if not _sizing_logged:
-            _sizing_logged = True
-            logger.info(
-                "ARENA: /dev/shm has %d MiB free; each entity's arena grows "
-                "to %d segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and "
-                "_SEGMENT_MB override)", avail >> 20, max_segments, segment_mb)
+    if segment_env or max_env:
+        segment_mb, max_segments = int(segment_env or 256), int(max_env or 32)
+        if segment_mb < 1 or max_segments < 1:
+            raise ValueError("MSTAR_SHM_ARENA_SEGMENT_MB and _MAX_SEGMENTS "
+                             "must be at least 1")
         return segment_mb, max_segments, total, avail
-    segment_mb, max_segments = int(segment_env or 256), int(max_env or 32)
-    if segment_mb < 1 or max_segments < 1:
-        raise ValueError("MSTAR_SHM_ARENA_SEGMENT_MB and _MAX_SEGMENTS must "
-                         "be at least 1")
+    if plan := os.environ.get(ARENA_PLAN_ENV):
+        segment_mb, _, max_segments = plan.partition("x")
+        return int(segment_mb), int(max_segments), total, avail
+    if avail is None:
+        return 256, 32, total, avail
+    sizes = _default_sizing(avail, _UNPLANNED_ENTITIES)
+    if sizes is None:
+        return 0, 0, total, avail
+    segment_mb, max_segments = sizes
+    if not _sizing_logged:
+        _sizing_logged = True
+        logger.info(
+            "ARENA: /dev/shm has %d MiB free; each entity's arena grows "
+            "to %d segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and "
+            "_SEGMENT_MB override)", avail >> 20, max_segments, segment_mb)
     return segment_mb, max_segments, total, avail
 
 
@@ -453,9 +494,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 current_platform.name)
         elif not segment_mb:
             logger.warning(
-                "ARENA: /dev/shm has %d MiB free, under the 64 MiB that four "
-                "16 MiB arenas need; this entity sends by per-uuid files",
-                shm_avail >> 20)
+                "ARENA: /dev/shm has %s MiB free, too little for a 16 MiB "
+                "arena per entity and room for spill files; this entity sends "
+                "by per-uuid files",
+                "?" if shm_avail is None else shm_avail >> 20)
         else:
             try:
                 self._arena = SegmentedShmArena.create(

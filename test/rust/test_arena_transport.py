@@ -253,6 +253,7 @@ def _fake_dev_shm(monkeypatch, mib, segment_mb=None, max_segments=None,
     monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
         f_frsize=4096, f_blocks=blocks, f_bavail=free))
     monkeypatch.setattr(arena, "_sizing_logged", False)
+    monkeypatch.delenv(arena.ARENA_PLAN_ENV, raising=False)
     for k, v in (("SEGMENT_MB", segment_mb), ("MAX_SEGMENTS", max_segments)):
         if v is None:
             monkeypatch.delenv(f"MSTAR_SHM_ARENA_{k}", raising=False)
@@ -286,6 +287,57 @@ def test_sizing_knobs_set_by_hand_are_taken_as_given(monkeypatch, tmp_path):
         ArenaShmCommunicationManager(
             my_entity_id="big", hostname="localhost", device="cpu",
             communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize("budget_mib, entities, sizes", [
+    (1024, 9, (64, 1)), (64 << 10, 9, (256, 25)), (64, 1, (32, 1)),
+    (1024, 3, (256, 1)), (150, 9, None),
+])
+def test_a_budget_is_split_among_arenas_and_a_spill_share(budget_mib, entities, sizes):
+    from mstar.communication import arena
+
+    assert arena._default_sizing(budget_mib << 20, entities) == sizes
+
+
+def test_the_plan_counts_the_api_server_and_each_arena_worker(monkeypatch, fake_rocm):
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    arena.export_arena_plan(["cpu"] * 8)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "64x1"  # 1024 MiB // (8 + 1 + 1)
+    arena.export_arena_plan(["cuda:0", "cuda:1"])  # ROCm workers send by files
+    assert os.environ[arena.ARENA_PLAN_ENV] == "256x2"  # 1024 MiB // (1 + 1)
+    arena.export_arena_plan(None)  # no deployment config
+    assert arena.ARENA_PLAN_ENV not in os.environ
+    _fake_dev_shm(monkeypatch, 150).export_arena_plan(["cpu"] * 8)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "0x0"
+
+
+@pytest.mark.parametrize("planned", [True, False])
+def test_planned_arenas_do_not_depend_on_start_order(monkeypatch, tmp_path, planned):
+    """An arena commits its first segment when it is built, so each one that
+    sizes itself from the free space it finds gets less than the last."""
+    from types import SimpleNamespace
+
+    arena = _fake_dev_shm(monkeypatch, 1024, free_mib=160)
+    if planned:
+        arena.export_arena_plan(["cpu"] * 8)
+    free_mib = [160]
+    monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=1 << 20, f_blocks=1024, f_bavail=free_mib[0]))
+    sizes = []
+    for i in range(4):
+        mgr = ArenaShmCommunicationManager(
+            my_entity_id=f"p{i}", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+        sizes.append(mgr._segment_bytes >> 20)
+        free_mib[0] -= sizes[-1]
+        mgr.close()
+    assert sizes == ([16] * 4 if planned else [32, 32, 16, 16])
+
+
+def test_sizing_knobs_set_by_hand_override_the_plan(monkeypatch):
+    arena = _fake_dev_shm(monkeypatch, 1024, 1, 4)
+    monkeypatch.setenv(arena.ARENA_PLAN_ENV, "64x1")
+    assert arena._arena_sizing()[:2] == (1, 4)
 
 
 def test_a_small_dev_shm_gets_an_arena_that_spills(monkeypatch, tmp_path):
@@ -375,8 +427,8 @@ def test_under_four_minimum_segments_free_sends_by_files_without_trying(
             communicator=_NullCommunicator(), shm_dir=str(tmp_path))
     assert mgr._arena is None
     assert _arena_warnings(caplog) == [
-        "ARENA: /dev/shm has 60 MiB free, under the 64 MiB that four 16 MiB "
-        "arenas need; this entity sends by per-uuid files"]
+        "ARENA: /dev/shm has 60 MiB free, too little for a 16 MiB arena per "
+        "entity and room for spill files; this entity sends by per-uuid files"]
     (info,) = mgr.store_and_return_tensor_info("r", {"x": [torch.ones(8)]})["x"]
     mgr.register_for_send("r", [info])
     assert info.shm_segment is None and info.uuid in mgr._shm_files
