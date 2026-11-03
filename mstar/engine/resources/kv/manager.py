@@ -4574,8 +4574,6 @@ class KVManager(AttentionResource):
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):
             return None
-        if self._world_size > 1 and not any(stream.page_indices for stream in streams):
-            return None
         pages = 0
         for stream in streams:
             chain = stream.chain
