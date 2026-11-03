@@ -16,6 +16,7 @@ host-side index arithmetic done at plan time.
 import torch
 
 from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim
+from mstar.engine.resources.attn.workspace import Workspace
 
 
 def block_causal_layout(
@@ -73,7 +74,7 @@ class RaggedBlockCausalWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -101,11 +102,12 @@ class RaggedBlockCausalWrapper:
         self.max_total_tokens = max_total_tokens
         self._num_segments = 0
         self._total_tokens = 0
+        self._workspace = workspace_buffer
 
         if not accelerator_graph:
             self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD", backend=backend,
+                self._workspace.tensor, "NHD", backend=backend,
             )
             return
 
@@ -120,7 +122,7 @@ class RaggedBlockCausalWrapper:
         self._kv_indices_buf = torch.zeros(self.max_indices, **i32)
         self._last_page_len_buf = torch.ones(self.max_blocks, **i32)
         self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, "NHD", use_cuda_graph=True,
+            self._workspace.tensor, "NHD", use_cuda_graph=True,
             qo_indptr_buf=self._qo_indptr_buf,
             paged_kv_indptr_buf=self._kv_indptr_buf,
             paged_kv_indices_buf=self._kv_indices_buf,
@@ -177,7 +179,8 @@ class RaggedBlockCausalWrapper:
             n_blocks = self.max_blocks
         self._num_segments = n_seg
         self._total_tokens = total
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             self._pinned(qo),
             self._pinned(kv),
             self._pinned(indices),

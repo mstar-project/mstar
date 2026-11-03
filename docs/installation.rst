@@ -150,7 +150,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
+       comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
+       Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
