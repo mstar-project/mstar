@@ -2277,12 +2277,13 @@ class Worker:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end = self._gpu_spans[0]
+            start, end, walk = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
             self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+            self._phase_record(f"gpu_exec.{walk}", start.elapsed_time(end) / 1000)
 
     def _execute_on_gpu_thread(
         self,
@@ -2393,7 +2394,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._gpu_spans.append((gpu_start, gpu_end, batch.graph_walk))
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
