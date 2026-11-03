@@ -89,6 +89,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -498,7 +499,7 @@ class Cosmos3Model(Model):
         prefill_cond_video = _prefill_cond_walk("video_inputs")
 
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
-        # threads the latents + denoise-step index back to itself each iteration;
+        # threads the latents + the scheduler's state back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
         # upper bound — each request stops the loop at its own denoise-step count
         # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
@@ -523,11 +524,8 @@ class Cosmos3Model(Model):
                         # iteration (no per-step transfer).
                         section=GraphNode(
                             name=DIT_NODE,
-                            input_names=["latents", "time_index", "cond_latents"],
-                            outputs=[
-                                GraphEdge(next_node=DIT_NODE, name="latents"),
-                                GraphEdge(next_node=DIT_NODE, name="time_index"),
-                            ],
+                            input_names=self._denoise_inputs("latents"),
+                            outputs=self._denoise_loop_back("latents"),
                             enable_async_scheduling=True,
                         ),
                         max_iters=self.config.max_inference_steps,
@@ -563,12 +561,8 @@ class Cosmos3Model(Model):
                     name=VIDEO_SOUND_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "sound_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="sound_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "sound_latents"),
+                        outputs=self._denoise_loop_back("latents", "sound_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -617,12 +611,8 @@ class Cosmos3Model(Model):
                     name=ACTION_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -653,12 +643,8 @@ class Cosmos3Model(Model):
                     name=ACTION_VIDEO_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "action_latents", "time_index", "cond_latents"],
-                        outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="action_latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
-                        ],
+                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
                     max_iters=self.config.max_inference_steps,
@@ -699,6 +685,18 @@ class Cosmos3Model(Model):
             walks.update(self._windowed_walks())
         return walks
 
+    def _denoise_inputs(self, *bands: str) -> list[str]:
+        """A denoise loop body's inputs: what it advances, its scheduler's state and
+        the external ``cond_latents``."""
+        return [*bands, *self._solver_state(), "cond_latents"]
+
+    def _denoise_loop_back(self, *bands: str) -> list[GraphEdge]:
+        return [GraphEdge(next_node=DIT_NODE, name=name) for name in (*bands, *self._solver_state())]
+
+    def _solver_state(self) -> tuple[str, ...]:
+        # the distilled SDE sampler carries nothing between steps but the sample
+        return () if self.config.distilled_sigmas else SOLVER_STATE
+
     def _windowed_walks(self) -> dict[str, GraphSection]:
         """Windowed AR video: the same denoise loop, run window by window. On
         each window's last iteration the DiT emits the finished window's
@@ -711,10 +709,9 @@ class Cosmos3Model(Model):
                     name=VIDEO_GEN_AR_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=["latents", "time_index", "cond_latents"],
+                        input_names=self._denoise_inputs("latents"),
                         outputs=[
-                            GraphEdge(next_node=DIT_NODE, name="latents"),
-                            GraphEdge(next_node=DIT_NODE, name="time_index"),
+                            *self._denoise_loop_back("latents"),
                             StreamingGraphEdge(
                                 next_node=VAE_DECODER_AR_NODE,
                                 name="window_latents",
@@ -1770,17 +1767,15 @@ class Cosmos3Model(Model):
                 metadata.graph_walk = self.VIDEO_GEN_WALK
             else:
                 metadata.graph_walk = self.IMAGE_GEN_WALK
-            # The first denoise iteration's initial noise + step index are
+            # The first denoise iteration's initial noise and scheduler state are
             # sampled inside the DiT submodule's preprocess. Action and sound
             # walks also thread their extra latents through the loop.
-            inputs = [
-                GraphEdge(next_node=DIT_NODE, name="latents"),
-                GraphEdge(next_node=DIT_NODE, name="time_index"),
-            ]
             if joint_action:
-                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="action_latents"))
+                inputs = self._denoise_loop_back("latents", "action_latents")
             elif metadata.graph_walk == self.VIDEO_SOUND_GEN_WALK:
-                inputs.insert(1, GraphEdge(next_node=DIT_NODE, name="sound_latents"))
+                inputs = self._denoise_loop_back("latents", "sound_latents")
+            else:
+                inputs = self._denoise_loop_back("latents")
             # The vae_encoder node's clean conditioning latents (persisted at
             # the conductor during the prefill walk) seed the loop's first
             # iteration; unconditioned requests carry an empty edge.

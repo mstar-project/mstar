@@ -31,6 +31,7 @@ from mstar.engine.resources.kv.transfer import (
     MooncakeKVTransferInfo,
     ShmKVTransferInfo,
 )
+from mstar.engine.resources.lora.config import LoraReqConfig
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
@@ -40,6 +41,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ContinueGeneration,
     DrainRequest,
+    EdgeItems,
     EnableMetrics,
     FailRequests,
     GetGenerationState,
@@ -77,6 +79,7 @@ _TYPES: dict[str, type] = {
     "remove_request": RemoveRequest,
     "drain_request": DrainRequest,
     "input_signals": InputSignals,
+    "edge_items": EdgeItems,
     "tensor_received": TensorReceived,
     "unpersist_tensors": UnpersistTensors,
     "stop_loops": StopLoops,
@@ -118,6 +121,7 @@ _TYPES: dict[str, type] = {
     "published_position": PublishedPositionInfo,
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,
+    "lora_req_config": LoraReqConfig,
 }
 
 for _tag, _cls in _TYPES.items():

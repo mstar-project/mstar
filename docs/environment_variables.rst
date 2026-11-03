@@ -151,6 +151,19 @@ Communication
        ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
        so one process can pin more than its own arena holds. Segments
        past the budget stay unpinned: copies work, without async overlap.
+   * - ``MSTAR_SHM_ARENA_GATHER_MAX_BYTES``
+     - ``16384``
+     - Largest item (bytes) a consumer gathers with others of the same
+       shape, dtype and segment into one pinned buffer and one H2D copy,
+       instead of a copy per item (``_read_many_from_arena``). The default
+       is the crossover measured on an H200 host; ``0`` disables the
+       gather. Read in ``ArenaShmCommunicationManager.__init__``.
+   * - ``MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES``
+     - ``512``
+     - Up to this item size (bytes, 8-byte aligned) the gather indexes
+       8-byte words in one pass; larger items are copied one slice each.
+       Measured on an H200 host. Read in
+       ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
      - ``0``
      - TTL backstop for abort-orphaned slots (a request aborted after
@@ -544,7 +557,8 @@ Worker scheduling
        last core of the mask. A number outside the mask, or too near its top
        for every worker, stops the server at startup. Threads and pools a
        pinned thread starts keep the process mask (``mstar.utils.threads``),
-       and the API server's intra-op and encode pools are sized from the
+       and the API server's intra-op and encode pools and FFmpeg's per-decode
+       threads (``media_limits.video_decode_threads``) are sized from the
        CPUs the pins leave (``CpuPlan`` in ``mstar.utils.cpus``). Each worker
        and the API server log their CPUs and why. Read by
        ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
@@ -580,12 +594,14 @@ Worker scheduling
        worker starts and ``5`` is used; a negative value is raised to ``0``
        with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
-     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - ``32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
        graph (one per bucket and batch size). A prompt past the top bucket
        prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
-       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
-       8192; narrow it to save graph memory and capture time, or extend it.
+       spends 78 ms of wall time on 36 ms of kernels. 2176, 4352 and 8704 add
+       1/16 of slack above the powers of two from 2048 up, for a mixed step's
+       decode rows and for batches a few tokens over. Narrow it to save graph
+       memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
      - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
@@ -637,7 +653,7 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
        Whisper, which also keeps its timestamp rule state in the sampler's
        declared loop-back state) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
@@ -645,20 +661,33 @@ Worker scheduling
        master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured decode step builds its rotary tables inside the graph from
-       the position resource's planned positions instead of staging them.
-       Experiment knob, measured and gated on its own.
+     - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
+       inside the graph from the position resource's planned positions instead
+       of building them before the replay (``LLMSubmodule._rope_in_graph``); a
+       captured decode step always does. Experiment knob, measured and gated
+       on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``1``
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
-       postprocess wins). Padding rows then address a trash master row and
-       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
-       ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
-       cap with this on). Only with the device
-       loop-back on. An experiment knob; measure before turning it on.
+       postprocess wins). Padding rows, and the rows a step drops
+       (``SamplerStep.kept_rids``), write a trash master row. The offset and
+       last-token masters, which the captured graphs index, are allocated
+       once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
+       when the runner admits it (``SamplerResource.reserve``): past them it
+       waits, as for a recurrent state slot, until a removed request frees
+       one. Only for a node that reads its tokens back on the device
+       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
+       rank: above one, where admission doesn't decide, the masters grow and
+       the scatter runs after the replay, as with ``0``.
+   * - ``MSTAR_SAMPLER_SLOTS``
+     - config's ``knobs: sampler_slots``, else ``4096``
+     - Request rows of the sampler masters a captured graph indexes when
+       ``MSTAR_SAMPLER_INGRAPH_SCATTER`` is on (at least the node's largest
+       capture batch): the most requests admitted at once on such a node; the
+       rest wait to be admitted. Read by ``knobs.sampler_slots``.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the
@@ -703,6 +732,13 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``MSTAR_COMPILE_DETERMINISTIC``
+     - config's ``knobs: compile_deterministic``, else ``0``
+     - ``1``: Qwen3.5's decode capture compiles in Inductor's deterministic
+       mode, as its prefill, mixed and vision captures always do, so greedy
+       output reproduces across server processes and the cold start shrinks,
+       at the cost of one-row decode speed. Only Qwen3.5's text walks read it
+       (``knobs.compile_deterministic``).
    * - ``TRITON_PTXAS_BLACKWELL_PATH``
      - torch's ptxas, when needed
      - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas

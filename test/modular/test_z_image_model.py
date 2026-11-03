@@ -124,8 +124,9 @@ def test_postprocess_png_and_adapter():
 def test_text_node_pads_prompts_to_the_reference_length():
     """The pipeline encodes 512-padded prompts; the kernel's accumulation order depends on it."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
     from mstar.model.z_image.config import ZImageConfig
-    from mstar.model.z_image.submodules import TEXT_INPUTS, ZImageTextEncoderSubmodule
+    from mstar.model.z_image.submodules import ZImageTextEncoderSubmodule
 
     config = ZImageConfig()
     node = ZImageTextEncoderSubmodule(None, config)
@@ -137,7 +138,6 @@ def test_text_node_pads_prompts_to_the_reference_length():
         rows.append(node.prepare_inputs("encode_text", info, {TEXT_INPUTS: [torch.arange(1, n + 1)]}))
     batch = node.preprocess("encode_text", None, rows)
     assert batch[TEXT_INPUTS].shape == (2, config.text_encoder.max_sequence_length) == batch["text_mask"].shape
-    assert batch["lengths"] == [40, 7]
     assert batch["text_mask"].sum(dim=1).tolist() == [40, 7]
     assert (batch[TEXT_INPUTS][1, 7:] == config.text_encoder.pad_token_id).all()
 
@@ -191,7 +191,7 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     config = ZImageConfig()
     vae = RecordingVae()
     node = ZImageVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-                                     decode_batch_sizes=(1, 2))
+                                     max_batch_size=2)
     c, p = config.transformer.in_channels, config.transformer.patch_size
     h, w = config.latent_grid(1024, 1024)
     assert len(vae.compiled) == 2 and vae.eager == []

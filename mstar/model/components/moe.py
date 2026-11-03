@@ -111,6 +111,12 @@ class TopKRouter(nn.Module):
             to (top-k).
         norm_topk_prob: if True, renormalize the top-k probabilities so
             they sum to 1.
+        fused_softmax_topk: on CUDA, route through one Triton kernel
+            (``mstar::moe_router_topk``) instead of softmax, ``torch.topk``
+            and the renormalize. Equal probabilities go to the lower expert
+            id, where ``torch.topk`` may pick another; bf16 logits tie often,
+            so a model opts in once it has checked how often its outputs
+            diverge.
     """
 
     def __init__(
@@ -119,11 +125,13 @@ class TopKRouter(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         norm_topk_prob: bool = True,
+        fused_softmax_topk: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
+        self.fused_softmax_topk = fused_softmax_topk
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(
@@ -145,6 +153,13 @@ class TopKRouter(nn.Module):
         """
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
+        if self.fused_softmax_topk and router_logits.is_cuda:
+            from mstar.utils.fused_moe.decode import router_topk
+
+            routing_weights, router_indices = router_topk(
+                router_logits, None, self.top_k, 1.0, self.norm_topk_prob, softmax=True,
+            )
+            return routing_weights, router_indices, None
         router_logits = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
