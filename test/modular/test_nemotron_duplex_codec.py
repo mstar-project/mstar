@@ -94,6 +94,7 @@ class _Talker:
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
         self.captured = captured
+        self.opened = set()  # calls whose state is open: once per request, as the worker does
 
     def step(self, rids: list, inputs: list, codes: torch.Tensor) -> dict:
         n = len(rids)
@@ -107,7 +108,9 @@ class _Talker:
             codes = torch.cat([codes, torch.zeros(bs - n, codes.shape[1], dtype=codes.dtype)])
             inputs = inputs + [inputs[0]] * (bs - n)
         for rid in rids:
-            self.pool.ingest_request(rid)
+            if rid not in self.opened:
+                self.opened.add(rid)
+                self.pool.ingest_request(rid)
         step = SubmoduleStep(steps={CODEC_STATE: self.node.declare_step("talker_decode", rows, inputs).get(
             CODEC_STATE)})
         step.set_ctx(ctx)
@@ -133,6 +136,7 @@ class _Talker:
 
     def end(self, rid):
         """The engine's teardown of a finished call."""
+        self.opened.discard(rid)
         self.pool.remove_request(rid)
         self.node.cleanup_request(rid)
 
