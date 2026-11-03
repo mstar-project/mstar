@@ -41,7 +41,12 @@ def with_inductor_overrides(
 
 @functools.cache
 def compiled(fn: Callable[..., Any], dynamic: bool | None = None) -> Callable[..., Any]:
-    """``torch.compile(fn)`` under the platform's inductor overrides, built on
-    first call and cached, for a module-level helper run outside a compiled
-    forward (the engine compiles forwards itself)."""
-    return with_inductor_overrides(torch.compile(fn, dynamic=dynamic))
+    """``torch.compile(fn)`` in Inductor's deterministic mode under the
+    platform's inductor overrides, built on first call and cached, for a
+    module-level helper that a resource runs eagerly (``torch.compiler.disable``)
+    inside a captured forward. Deterministic as Qwen3.5's captures are, so the
+    helpers keep their output the same across server processes too."""
+    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+    options = deterministic_inductor_options()
+    return with_inductor_overrides(torch.compile(fn, dynamic=dynamic, options=options or None))
