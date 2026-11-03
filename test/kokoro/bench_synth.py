@@ -42,6 +42,7 @@ def main() -> None:
     model = KokoroTTS(config)
     load_kokoro_weights(model, local_dir / config.weights_file)
     model = model.to(args.device).eval()
+    model.fuse_lstm_directions()
     if args.compile:
         model.decode_frames = torch.compile(model.decode_frames, dynamic=True)
     if args.compile_text:

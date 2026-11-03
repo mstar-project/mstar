@@ -36,6 +36,7 @@ from test_kv_prefix_lease import (
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -47,7 +48,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -486,7 +487,7 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     kv.ingest_request("a", KVReqConfig(
         kv_layout={label: _layout(16 * n)["main"] for label, n in (("main", 2), ("cfg_img", 1), ("cfg_text", 3))},
         needed_labels_per_node_walk={
-            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg"): ["cfg_text"],
+            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg2"): ["cfg_text"],
         },
     ))
 

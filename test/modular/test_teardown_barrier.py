@@ -57,7 +57,9 @@ def _conductor(requests, drain_ttl_s=120.0):
     c.communicator = types.SimpleNamespace(
         send=lambda entity_id, msg: c.sent.append((entity_id, msg))
     )
-    c.requests = dict(requests)
+    c.requests = {}
+    for rid, request_data in requests.items():
+        c._register_request(rid, request_data)
     c.draining = {}
     c._drain_ttl_s = drain_ttl_s
     c._early_reads_done = {}
@@ -294,7 +296,7 @@ def test_bad_value_registered_but_not_dispatched_is_a_400():
     c = _conductor({})
 
     def bad_config(body):
-        c.requests[body.request_id] = _request_data(workers=("w0",))
+        c._register_request(body.request_id, _request_data(workers=("w0",)))
         raise ValueError("top_p must be a finite number in (0, 1]; got -1")
     c._do_ingest_request = bad_config
     c._ingest_request(_new_request("r1"))
@@ -320,7 +322,7 @@ def test_ingest_error_after_dispatch_drains_like_a_worker_failure():
     c = _conductor({})
 
     def boom(body):
-        c.requests[body.request_id] = _request_data(workers=("w0",))
+        c._register_request(body.request_id, _request_data(workers=("w0",)))
         c.requests[body.request_id].dispatched = True
         raise ValueError("half dispatched")
     c._do_ingest_request = boom

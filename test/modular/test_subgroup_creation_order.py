@@ -80,6 +80,7 @@ def _graph(node: str, ranks: list[int], tp: int, sp: int) -> SimpleNamespace:
         _tp_ranks=[ranks[s * tp:(s + 1) * tp] for s in range(sp)] if tp > 1 else [],
         _sp_ranks=[ranks[t::tp] for t in range(tp)] if sp > 1 else [],
         _instance_ranks=[ranks],
+        replica_ranks=[ranks],
     )
 
 

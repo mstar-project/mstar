@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -74,8 +74,10 @@ class Rebuilds:
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs, host_rows: HostRows | None,
+        skip_rids: Collection[int] = (),
     ) -> None:
-        """Append each kept row's sample, from the stop check's host copy, to its kept ids."""
+        """Append each kept row's sample, from the stop check's host copy, to its kept ids. ``skip_rids``
+        are rows whose sample is not real, as for `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
@@ -110,7 +112,7 @@ class Rebuilds:
             # the host rows are the forward's, which can hold a row the worker has since taken out of the step
             if (
                 kept is not None and ctx.is_real_row(rid) and (kept_rows is None or rid in kept_rows)
-                and rid not in rebuild
+                and rid not in rebuild and rid not in skip_rids
             ):
                 kept.sampled.append(token)
 

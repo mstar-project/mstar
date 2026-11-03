@@ -221,7 +221,7 @@ models:
     config: configs/qwen3omni_colocated.yaml
     family: Omni
     tags: [omni, llm, text, image-in, audio-in, video-in, speech-out, sse, big]
-    requires: [flash_attn, qwen_omni_utils, audioread]
+    requires: [qwen_omni_utils, audioread]
     est_min: 16
     cases:
       - id: text
@@ -313,7 +313,7 @@ models:
     env: {MSTAR_ALLOW_REMOTE: "1"}
     family: Omni
     tags: [omni, rust-frontend, image-in, sse, big]
-    requires: [flash_attn, qwen_omni_utils]
+    requires: [qwen_omni_utils]
     est_min: 14
     cases:
       - id: text
@@ -458,7 +458,7 @@ models:
     optional: true
     family: Omni
     tags: [mooncake, transport, omni, image-in, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, mooncake.engine]
+    requires: [qwen_omni_utils, mooncake.engine]
     est_min: 10
     cases:
       - id: text
@@ -540,7 +540,7 @@ models:
     case_timeout_s: 900
     family: Omni
     tags: [multi-gpu, tp, omni, image-in, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, audioread]
+    requires: [qwen_omni_utils, audioread]
     est_min: 16
     conc: [1, 16]
     cases:
@@ -634,7 +634,7 @@ models:
     case_timeout_s: 900
     family: Omni
     tags: [multi-gpu, disaggregated, omni, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, audioread]
+    requires: [qwen_omni_utils, audioread]
     est_min: 16
     cases:
       - id: text
@@ -879,7 +879,7 @@ models:
     health: true
     family: Omni
     tags: [w2w, transport, shm, disaggregated, omni, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, audioread]
+    requires: [qwen_omni_utils, audioread]
     est_min: 18
     cases: &qwen3omni_pd_w2w
       - id: text
@@ -917,7 +917,7 @@ models:
     health: true
     family: Omni
     tags: [w2w, transport, disaggregated, omni, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, audioread, mooncake.engine]
+    requires: [qwen_omni_utils, audioread, mooncake.engine]
     est_min: 18
     cases: *qwen3omni_pd_w2w
 
@@ -931,7 +931,7 @@ models:
     health: true
     family: Omni
     tags: [rdma, disaggregated, omni, speech-out, big]
-    requires: [flash_attn, qwen_omni_utils, audioread, mooncake.engine, rdma_nic]
+    requires: [qwen_omni_utils, audioread, mooncake.engine, rdma_nic]
     est_min: 18
     cases: *qwen3omni_pd_w2w
 

@@ -19,6 +19,7 @@ Entries marked *open PR* are not on `main` yet. Check the checkout; if your port
 | | `RaggedBlockCausalAttentionSpec` (#381, *open PR*) | each block attends its span's prefix of blocks |
 | a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #383, *open PR*) | rows at any position in one batch; per-row source; a per-distance score term |
 | fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`) |
+| per-request adapter weights (LoRA) | `LoraSpec` / `LoraAdapterPool` | a slot per resident adapter, held for a request's lifetime; the step's tokens grouped by slot for the kernels |
 | frame rings (Waypoint) | `RingKVManager` | to be merged into bounded KV |
 
 A resource that holds per-request state gives models operations driven by the step (`gather` / `scatter_`, `attend` over the current plan). It never asks a model to index its storage or to hold and select rows of its plans.
@@ -56,6 +57,7 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 ## Ragged (cacheless) attention
 
 - **A ragged resource plans one layout per label.** A step declares, per request, the spans its layers attend over as `(label, length)` segments; the manager plans each label across the batch and a layer asks for its label's callable. Spans with different head geometries need separate resources, since a resource has one head layout.
+- **A wrapper skips a plan it already holds.** `_RaggedPrefillBase._plan` compares the layout with what that (label, slot)'s schedule describes, since `run` only reads it. A new wrapper on that base gets this for free; anything that invalidates a schedule without a plan has to clear it (`forget_plan`, as a dropped pre-plan does: its H2Ds ran on the plan stream and nothing orders the replacing step against them).
 - **Cross-attention between spans of a request is its own kind** (`RaggedCrossAttentionSpec`, #372): its step names `(q_label, kv_label)` pairs and plans each pair under `cross_label(q, kv)`. It keeps the self-attention resource's API unchanged; extending a resource that almost fits this way beats a model calling SDPA (see AGENTS.md invariant 1).
 
 ## Scope

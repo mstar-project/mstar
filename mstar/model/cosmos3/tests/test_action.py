@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mstar.model.components.diffusion.unipc import SOLVER_STATE, initial_state
 from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
@@ -347,12 +348,14 @@ def test_action_engine_matches_fused() -> None:
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
     latents, action_latents = cond_latent.clone(), a_noise.clone()
-    time_index = torch.zeros(1, dtype=torch.long, device=device)
-    for _ in range(steps):
+    solver = initial_state(dit._packed(latents, action_latents))
+    for k in range(steps):
+        fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
         ni = dit.prepare_inputs("action_gen", fwd, {
-            "latents": [latents], "action_latents": [action_latents], "time_index": [time_index]})
+            "latents": [latents], "action_latents": [action_latents], **{n: [t] for n, t in solver.items()}})
         out = _forward_step(dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
-        latents, action_latents, time_index = out["latents"][0], out["action_latents"][0], out["time_index"][0]
+        latents, action_latents = out["latents"][0], out["action_latents"][0]
+        solver = {n: out[n][0] for n in solver}
     dit.cleanup_request(rid)
     # The loop emits the full action latents (self-edge); trim to the raw action
     # width to compare with the fused pipeline's trimmed output.
@@ -548,15 +551,18 @@ def test_action_cross_request_batch_matches_individual() -> None:
             model, [rid], device, dtype, max_num_pages=128,
         )
         fwd = _prefill(rid, idx, resources)
-        lat = act = ti = None
-        for _ in range(steps):
+        lat = act = None
+        solver = {}
+        for k in range(steps):
+            fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
             inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
-                   else {"latents": [lat], "action_latents": [act], "time_index": [ti]})
+                   else {"latents": [lat], "action_latents": [act], **{n: [t] for n, t in solver.items()}})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
             out = _forward_step(
                 dit, "action_gen", resources, [rid], {rid: fwd}, [ni],
             )
-            lat, act, ti = out["latents"][0], out["action_latents"][0], out["time_index"][0]
+            lat, act = out["latents"][0], out["action_latents"][0]
+            solver = {n: out[n][0] for n in SOLVER_STATE}
         dit.cleanup_request(rid)
         return act[:, :, :raw].float().cpu()
 
@@ -569,19 +575,23 @@ def test_action_cross_request_batch_matches_individual() -> None:
             fwds[rid] = _prefill(rid, i, resources)
         lat = {r: None for r in rids}
         act = {r: None for r in rids}
-        ti = {r: None for r in rids}
-        for _ in range(steps):
+        solver = {r: {} for r in rids}
+        for k in range(steps):
             inputs = []
             for rid in rids:
+                fwds[rid].dynamic_loop_iter_counts["action_gen_loop"] = k
                 inp = {"cond_latents": [cond_lat[rid]]} if lat[rid] is None else {
-                    "latents": [lat[rid]], "action_latents": [act[rid]], "time_index": [ti[rid]]}
+                    "latents": [lat[rid]], "action_latents": [act[rid]],
+                    **{n: [t] for n, t in solver[rid].items()},
+                }
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
             out = _forward_step(
                 dit, "action_gen", resources, rids, fwds, inputs, batched=True,
             )
             for rid in rids:
                 o = out[rid]
-                lat[rid], act[rid], ti[rid] = o["latents"][0], o["action_latents"][0], o["time_index"][0]
+                lat[rid], act[rid] = o["latents"][0], o["action_latents"][0]
+                solver[rid] = {n: o[n][0] for n in SOLVER_STATE}
         res = {rid: act[rid][:, :, :raw].float().cpu() for rid in rids}
         for rid in rids:
             dit.cleanup_request(rid)
