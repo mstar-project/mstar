@@ -147,8 +147,9 @@ class KimiDeltaAttention(nn.Module):
             self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False, dtype=dtype)
         self.o_norm = KDAGatedRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False, dtype=dtype)
-        # q | k | v | b | f_a | gate input, built by process_weights_after_loading.
-        self._in_proj_weight: torch.Tensor | None = None
+        # q | k | v | b | f_a | gate input, built by process_weights_after_loading; a buffer
+        # so `.to()` moves it
+        self.register_buffer("_in_proj_weight", None, persistent=False)
         # bound once at load, by `bind_resources`
         self._kda_key, self._state_key = kda_key, state_key
         self.mix: KDACallable | None = None
@@ -165,19 +166,31 @@ class KimiDeltaAttention(nn.Module):
             return self.g_proj(hidden_states)
         return self.g_b_proj(self.g_a_proj(hidden_states))
 
-    def process_weights_after_loading(self, device) -> None:
-        """Concatenate the six input projections for the fused kernels, zero-padded to a
-        multiple of 16 rows: Triton only vectorizes loads from the projected activations when
-        their row stride is a multiple of 16 elements."""
-        del device
-        weights = [
+    def _in_proj_parts(self) -> list[nn.Parameter]:
+        return [
             self.q_proj.weight, self.k_proj.weight, self.v_proj.weight, self.b_proj.weight,
             self.forget_gate.f_a_proj.weight, self._gate_input().weight,
         ]
+
+    def process_weights_after_loading(self, device) -> None:
+        """Concatenate the six input projections for the fused kernels, zero-padded to a
+        multiple of 16 rows: Triton only vectorizes loads from the projected activations when
+        their row stride is a multiple of 16 elements. The projections then view their rows of
+        it, so the layer holds one copy."""
+        del device
+        weights = self._in_proj_parts()
         pad = -sum(w.shape[0] for w in weights) % 16
         weights.append(weights[0].new_zeros(pad, self.hidden_size))
         self._in_proj_weight = torch.cat(weights).detach()
+        self._view_in_proj()
         self._params = None
+
+    def _view_in_proj(self) -> None:
+        start = 0
+        for weight in self._in_proj_parts():
+            rows = weight.shape[0]
+            weight.data = self._in_proj_weight[start:start + rows]
+            start += rows
 
     def init_state(
         self, batch_size: int, device: torch.device | str | None = None
@@ -363,5 +376,8 @@ class KimiDeltaAttention(nn.Module):
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
+        if self._in_proj_weight is not None:
+            # `_apply` moved the projections apart from the fused weight
+            self._view_in_proj()
         self._params = None
         return result
