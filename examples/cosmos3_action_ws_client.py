@@ -9,19 +9,23 @@ observation is in flight while the current chunk executes.
 Requests are built the way NVIDIA's RoboLab server (cosmos-framework
 ``action_policy_server_robolab.py``) conditions the released DROID policies:
 the wrist frame above the two exterior frames at half size, resized to 640x540
-and reflection-padded into the 736x544 bucket; the current 7 joint positions
-and ``1 - gripper`` as a clean first action row; 15 fps; and the task followed
-by the view, duration and resolution text, as a JSON caption for Edge.
+and reflection-padded into the 736x544 bucket; the robot's current state (the
+7 joint positions and the gripper position, as DROID records them) as
+``robot_state``; and the task followed by the view, duration and resolution
+text, as a JSON caption for Edge. The server takes the 32-row chunk, the 15 fps
+and the DROID domain from the checkpoint, and the deployment's config maps the
+gripper to the policy's ``1 - gripper`` and back, so the state and the reply are
+in the robot's own values, as a pi0.5 DROID policy takes them.
 
     python examples/cosmos3_action_ws_client.py --host localhost --port 8000 \\
         --wrist wrist.png --exterior-1 ext1.png --exterior-2 ext2.png \\
         --joints=-0.07,0.26,0.02,-2.21,0.02,2.48,0.79 --gripper 0.0 \\
         --prompt "put the marker in the pot" --iters 20
-    # Edge (cosmos-framework cookbook): add --json-prompt --guidance-interval 960 1001
+    # Edge (cosmos-framework cookbook): add --json-prompt
 
-The server leaves the state row out of the reply, so each ``action`` payload
-is float32 ``[32, action_dim_padded]``. The first 8 columns are the 7 joint
-positions and the gripper, which this client flips back from ``1 - gripper``.
+Each ``action`` payload is float32 ``[32, action_dim_padded]``: the predicted
+rows after the current state. The first 8 columns are the 7 joint positions and
+the gripper.
 """
 
 from __future__ import annotations
@@ -37,7 +41,9 @@ import numpy as np
 import websockets.sync.client
 from PIL import Image
 
-CHUNK = 32  # predicted rows; the request adds the state row in front
+# The checkpoint's chunk and observation fps, which the server defaults to; the
+# prompt's duration text and the reply's rows follow them.
+CHUNK = 32
 FPS = 15.0
 COMPOSITE_HW = (540, 640)
 BUCKET_HW = (544, 736)  # the 480p bucket closest to 540x640
@@ -108,11 +114,11 @@ def main() -> None:
     ap.add_argument("--gripper", type=float, required=True, help="gripper position in [0, 1]")
     ap.add_argument("--prompt", default="pick up the object")
     ap.add_argument("--json-prompt", action="store_true", help="JSON caption, as the Edge policy is served")
-    ap.add_argument("--domain", default="droid_lerobot")
+    ap.add_argument("--domain", default=None, help="embodiment (default: the checkpoint's, droid_lerobot)")
     ap.add_argument("--steps", type=int, default=None, help="denoise steps (default: the server's policy default)")
     ap.add_argument("--guidance", type=float, default=None)
     ap.add_argument("--guidance-interval", type=float, nargs=2, default=None, metavar=("LO", "HI"),
-                    help="apply guidance only at timesteps in [LO, HI]")
+                    help="apply guidance only at timesteps in [LO, HI] (default: the server's)")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--pipeline", type=int, default=1, help="observations in flight (1 = strict request/response)")
     ap.add_argument("--warmup", type=int, default=1,
@@ -126,12 +132,9 @@ def main() -> None:
     buf = io.BytesIO()
     Image.fromarray(compose_observation(*views)).save(buf, format="PNG")
     obs_bytes = buf.getvalue()
-    model_kwargs = {
-        "action_mode": "policy", "domain_name": args.domain, "raw_action_dim": 8,
-        "action_chunk_size": CHUNK + 1, "num_frames": CHUNK + 1, "fps": FPS,
-        "size": f"{BUCKET_HW[1]}x{BUCKET_HW[0]}",
-        "action": [joints + [1.0 - args.gripper]],
-    }
+    model_kwargs = {"size": f"{BUCKET_HW[1]}x{BUCKET_HW[0]}", "robot_state": joints + [args.gripper]}
+    if args.domain is not None:
+        model_kwargs["domain_name"] = args.domain
     if args.steps is not None:
         model_kwargs["num_inference_steps"] = args.steps
     if args.guidance is not None:
@@ -168,8 +171,7 @@ def main() -> None:
             if "error" in reply:
                 raise RuntimeError(reply["error"])
             if reply.get("modality") == "action":
-                actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(CHUNK, -1)[:, :8].copy()
-                actions[:, 7] = 1.0 - actions[:, 7]
+                actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(CHUNK, -1)[:, :8]
                 latencies.append(time.perf_counter() - sent[reply["request_id"]])
                 print(f"{reply['request_id']}: actions {actions.shape} first={actions[0, :3]} "
                       f"latency {latencies[-1] * 1000:.0f} ms")
