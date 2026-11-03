@@ -128,7 +128,7 @@ def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: boo
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
     a global config change. ``deterministic`` also builds them with the engine's
-    deterministic compile option (``accelerator_graph_runner.
+    deterministic compile option (``mstar.platforms.compile.
     deterministic_inductor_options``): no on-device benchmarking that changes
     numerics, so every process compiles the same kernels.
     """
@@ -136,7 +136,7 @@ def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: boo
 
     options = {"emulate_precision_casts": eager_rounding}
     if deterministic:
-        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+        from mstar.platforms.compile import deterministic_inductor_options
 
         options.update(deterministic_inductor_options())
 

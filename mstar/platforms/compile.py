@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
 from mstar.platforms import current_platform
+
+logger = logging.getLogger(__name__)
 
 
 def with_inductor_overrides(
@@ -40,13 +43,32 @@ def with_inductor_overrides(
 
 
 @functools.cache
+def _has_deterministic_mode() -> bool:
+    import torch._inductor.config as inductor_config
+
+    if hasattr(inductor_config, "deterministic"):
+        return True
+    logger.warning(
+        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
+        "their kernels instead, so their output can differ between server processes",
+        torch.__version__,
+    )
+    return False
+
+
+def deterministic_inductor_options() -> dict[str, Any]:
+    """Inductor options for its deterministic mode (the engine's
+    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
+    empty, with a warning, on a torch without the mode."""
+    return {"deterministic": True} if _has_deterministic_mode() else {}
+
+
+@functools.cache
 def compiled(fn: Callable[..., Any], dynamic: bool | None = None) -> Callable[..., Any]:
     """``torch.compile(fn)`` in Inductor's deterministic mode under the
     platform's inductor overrides, built on first call and cached, for a
     module-level helper that a resource runs eagerly (``torch.compiler.disable``)
-    inside a captured forward. Deterministic as Qwen3.5's captures are, so the
-    helpers keep their output the same across server processes too."""
-    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
-
+    inside a captured forward. Deterministic, so the helpers keep their output
+    the same across server processes."""
     options = deterministic_inductor_options()
     return with_inductor_overrides(torch.compile(fn, dynamic=dynamic, options=options or None))
