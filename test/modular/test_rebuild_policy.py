@@ -234,6 +234,20 @@ def test_removing_a_request_gives_its_slice_back():
     )
 
 
+def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
+    """A slice held 4 B for each prompt id, the int32 the pool's stream cast the prompt to. That cast made every later
+    step slower on the device, so the prompt is now kept as its walk read it, as int64, which a slice of 4 B per id
+    can't hold."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    assert _ingest(rebuilds, R, (PrefixSpan(5, 5, PREFILL),))
+    assert rebuilds._droppable[NODE][R].piece.nbytes == 40, "keeping the prompt would overflow its slice"
+
+    rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(5)]}}))
+
+    kept = rebuilds._kept[NODE][R].prompt.view
+    assert kept.dtype == torch.long and kept.tolist() == [0, 1, 2, 3, 4], "the rebuild would prefill other ids"
+
+
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
 def test_a_request_no_drop_can_free_keeps_no_ids(why):
     """A guaranteed request kept a host copy of its prompt and appended every sample, each step, though no drop
