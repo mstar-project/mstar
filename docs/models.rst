@@ -616,8 +616,8 @@ Qwen3-Omni notes
   concurrent requests hold more than 128k tokens of Thinker KV, serve
   ``configs/qwen3omni_2gpu_large_kv.yaml``, which keeps 2,048 pages (256k tokens)
   on the GPU and no host pages; it should fit beside its captures on an H200.
-  On 80 GB GPUs such as the H100, serve ``configs/qwen3omni_2gpu_h100.yaml``. Its 512-page Thinker pool (64k
-  tokens) was sized on an H100 when the encoders shared the Thinker's GPU and its
+  On 80 GB GPUs such as the H100, serve ``configs/qwen3omni_2gpu_h100.yaml``.
+  Its 512-page Thinker pool (64k tokens) was sized on an H100 when the encoders shared the Thinker's GPU and its
   text ladder ran to 8192: beside 1,024 pages 27 Thinker captures, all among those
   of 4096 tokens and more (text and vision), ran eagerly, and 640 pages still left
   two vision buckets out. Chunked prefill now caps a Thinker step at 1,024
