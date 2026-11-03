@@ -690,8 +690,8 @@ class Worker:
             HostPool(host_mb << 20, self.device) if host_mb and policies else None,
         )
         self._preemption = Preemption(
-            self.engine_manager, self._rebuilds, self.scheduler, self._drop, self._rebuild_refusal,
-            self._log_throttled, self._rid_str,
+            self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
+            self._rid_str,
         )
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
@@ -1129,29 +1129,6 @@ class Worker:
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
         laps.lap("runtime")
-
-    def _drop(self, request_id: int, node_name: str) -> int:
-        """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
-        the pages freed."""
-        why = self._rebuild_refusal(request_id, node_name)
-        if why is not None:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, since {why}"
-            )
-        backlogged = any(
-            request_id in batch.request_to_worker_graph
-            for (node, _), batch in self.scheduler.backlog.items() if node == node_name
-        )
-        if backlogged:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a backlog on {node_name}"
-            )
-        return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
-
-    def _rebuild_refusal(self, request_id: int, node_name: str) -> str | None:
-        """Why the request's kept ids on ``node_name`` can't rebuild its KV there now, or None."""
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        return self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
 
     def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
         """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since

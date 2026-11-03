@@ -175,8 +175,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._rebuilds._kept = {"n": {a: None, b: None}}
     w._rebuilds._cursors[("n", a)] = None
     w._preemption = Preemption(
-        SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)), w._rebuilds, w.scheduler, w._drop,
-        w._rebuild_refusal, w._log_throttled, w._rid_str,
+        SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)), w._rebuilds, w.scheduler, w.request_state,
+        w._log_throttled, w._rid_str,
     )
     w._preemption._preempted[a] = Preempted()
     w.streaming_buffers = {a: {}}

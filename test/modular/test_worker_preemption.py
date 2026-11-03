@@ -110,7 +110,7 @@ def _worker(kv):
 def _preemption(w) -> None:
     """The worker's `Preemption`, over its rebuilds and its own drop."""
     w._preemption = Preemption(
-        w.engine_manager, w._rebuilds, w.scheduler, w._drop, w._rebuild_refusal, w._log_throttled, w._rid_str,
+        w.engine_manager, w._rebuilds, w.scheduler, w.request_state, w._log_throttled, w._rid_str,
     )
 
 

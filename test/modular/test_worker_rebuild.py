@@ -24,6 +24,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
@@ -66,7 +67,6 @@ def _worker():
     w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
-    w._preemption = SimpleNamespace(rebuilt=lambda rid, node: None, remove_request=lambda rid: None)
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # keeps the rows the worker hands it in ``w.seen``, and holds no row, so any routing, stop or loop-count
     # call fails the test
@@ -78,12 +78,13 @@ def _worker():
         speculate_node=lambda node, walks, rows, counts, strides: w.seen.extend(rows) or [],
     )
     w.parallel_nodes, w.parallel_leader_nodes = set(), set()
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: eng, engine=SimpleNamespace(paged_kv_caches=list))
     w.seen, w.failed, w.rebuilt = [], {}, []
     w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set(),
                                   note_rebuilt=lambda node, rid: w.rebuilt.append(rid))
     w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: w.infos[r])
+    w._preemption = Preemption(w.engine_manager, w._rebuilds, w.scheduler, w.request_state, w._log_throttled, str)
     w._fail_requests = w.failed.update
     return w, eng
 
@@ -130,7 +131,7 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w.infos[R].dynamic_loop_iter_counts["loop"] = 1 if why == "samples short" else 0
 
     with pytest.raises(RuntimeError):
-        w._drop(R, NODE)
+        w._preemption._drop(R, NODE)
     assert not eng.dropped, "the request would lose pages a step still reads, or come back as nothing or wrongly keyed"
 
 
