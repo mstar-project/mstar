@@ -95,6 +95,7 @@ from mstar.model.components.video_encode import encode_mp4
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
     ACTION_MODES,
     resolve_action_domain_id,
@@ -852,6 +853,13 @@ class Cosmos3Model(Model):
 
         negative_prompt = kwargs.get("negative_prompt")
         p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        video = (tensors or {}).get("video_inputs")
+        if p.get("action_mode") == ACTION_MODE_INVERSE_DYNAMICS and video and video[0].shape[0] < p["num_frames"]:
+            # the encoder takes the clip's first num_frames frames; a shorter one encodes too few latent frames
+            raise ValueError(
+                f"Cosmos3 inverse_dynamics needs a video of at least num_frames={p['num_frames']} frames, "
+                f"got {video[0].shape[0]}; send a smaller num_frames or action_chunk_size."
+            )
         # The chat system prompt and the resolution/duration metadata sentences
         # are opt-in, off by default: the model sees the bare user prompt, which
         # matches the reference serving pipeline (its system-prompt and
