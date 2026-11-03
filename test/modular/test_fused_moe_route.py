@@ -215,3 +215,18 @@ def test_without_renormalizing_it_takes_router_topk():
 def test_with_nothing_to_align_against_it_takes_router_topk():
     router = _router(device="cuda")
     assert _takes_router_topk(router, torch.randn(4, 256, device="cuda", dtype=torch.bfloat16), None)
+
+
+@cuda
+def test_a_batch_fused_experts_runs_per_pair_takes_router_topk():
+    """Up to ``ROUTED_MAX_TOKENS`` tokens of a shape the per-pair GEMVs fit, ``fused_experts`` reads no
+    alignment, so the router doesn't build one; past that the batch takes the one-kernel route."""
+    from mstar.utils.fused_moe import decode
+
+    router = _router(hidden=1024, device="cuda")
+    w1 = torch.zeros(128, 256, 1024, device="cuda", dtype=torch.bfloat16)
+    assert decode.routed_fits(1024, 128)
+    small = torch.randn(decode.ROUTED_MAX_TOKENS, 1024, device="cuda", dtype=torch.bfloat16)
+    assert _takes_router_topk(router, small, w1)
+    larger = torch.randn(decode.ROUTED_MAX_TOKENS + 1, 1024, device="cuda", dtype=torch.bfloat16)
+    assert router.route(larger, w1)[2] is not None

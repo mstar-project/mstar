@@ -686,8 +686,9 @@ Qwen3-Omni notes
   ladder. Each bucket adds captures, graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
-  the lower expert id where ``torch.topk`` may pick another. A decode batch on
-  one GPU also gets its block alignment from that kernel.
+  the lower expert id where ``torch.topk`` may pick another. On one GPU a
+  decode batch of 8 to 16 tokens also gets its block alignment from that
+  kernel; a smaller one runs its experts as per-pair GEMVs, which need none.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At

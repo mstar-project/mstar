@@ -91,6 +91,7 @@ try:
     from mstar.utils.fused_moe import MoeAlignment, moe_block_m
     from mstar.utils.fused_moe import fused_experts as _fused_experts
     from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
+    from mstar.utils.fused_moe.runner import runs_per_pair
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
@@ -162,15 +163,17 @@ class TopKRouter(nn.Module):
 
         With ``fused_softmax_topk`` on CUDA, a batch of up to ``ROUTE_ALIGN_MAX_SLOTS``
         renormalized slots whose block can consume an alignment (it passes its
-        ``gate_up_proj`` as ``align_w1``, and its flat batch) takes ``route_align``, any
-        other takes ``router_topk``, and with the flag off it's softmax, ``torch.topk``
-        and the renormalize.
+        ``gate_up_proj`` as ``align_w1``, and its flat batch) takes ``route_align``,
+        unless ``fused_experts`` runs it as per-pair GEMVs, which read no alignment.
+        Any other batch takes ``router_topk``, and with the flag off it's softmax,
+        ``torch.topk`` and the renormalize.
         """
         fused = self.fused_softmax_topk and hidden_states.is_cuda
         tokens = hidden_states.shape[0]
         if (
             fused and _HAS_FUSED and align_w1 is not None and self.norm_topk_prob
             and tokens * self.top_k <= ROUTE_ALIGN_MAX_SLOTS
+            and not runs_per_pair(hidden_states, align_w1)
         ):
             router_logits = F.linear(hidden_states, self.weight)
             # int: the kernel's block sizes are constants, and a compile that keeps the
