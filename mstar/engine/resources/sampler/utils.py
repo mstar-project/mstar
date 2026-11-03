@@ -771,15 +771,15 @@ def _fused_draw(
     seed: torch.Tensor | None, offset: torch.Tensor | None,
     rep_penalty: torch.Tensor | None, seen_tokens: torch.Tensor | None,
     min_p: torch.Tensor | None, history: HistoryRows | None, order: FilterOrder | None,
-    return_probs: bool, fused: bool,
+    return_probs: bool, fused_draw: bool,
 ) -> torch.Tensor | None:
-    """``fused_sample``'s draw when ``fused`` and it covers the step, else None
+    """``fused_sample``'s draw when ``fused_draw`` and it covers the step, else None
     (FlashInfer draws). A node's eager and captured samplers pass the same
-    ``fused``, which ``SamplerResource`` decides from the node's spec (none of
+    ``fused_draw``, which ``SamplerResource`` decides from the node's spec (none of
     the processors ``fused_sample`` lacks), so a request's eager and captured
     steps draw through the same kernel whatever its batch asks for."""
     if (
-        not fused or logits.shape[1] > FUSED_SAMPLE_MAX_VOCAB or seed is None or offset is None
+        not fused_draw or logits.shape[1] > FUSED_SAMPLE_MAX_VOCAB or seed is None or offset is None
         or min_p is not None or history is not None or order is not None or return_probs
     ):
         return None
@@ -1264,7 +1264,8 @@ class Sampler(BaseSampler):
     history: GenerationHistory | None = None
     stop_ids: torch.Tensor | None = None
     enable_top_p_first: bool = False
-    # The node's draw kernel choice (``_fused_draw``), as its captured sampler's.
+    # Whether the node draws through ``fused_sample`` where it covers the step
+    # (``SamplerResource.fused_draw``), as its captured sampler does.
     fused_draw: bool = True
     # The last ``sample``'s sampled-token log-probs, NaN in a row that did not
     # ask; None when no row asked.
@@ -1394,7 +1395,7 @@ class Sampler(BaseSampler):
             history=history,
             order=order,
             return_probs=any(processed),
-            fused=self.fused_draw,
+            fused_draw=self.fused_draw,
         )
         tokens, probs = tokens if any(processed) else (tokens, None)
 
@@ -1517,7 +1518,7 @@ def _sample_cuda(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
-    fused: bool = True,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
     """Sample normalized CUDA inputs with ``fused_sample`` where it covers the
     step (``_fused_draw``), else FlashInfer; with ``return_probs``, also the distribution the
@@ -1533,7 +1534,7 @@ def _sample_cuda(
         penalty = repetition_penalty if seen_token_mask is not None else None
         drawn = _fused_draw(
             logits, temperature, top_k, top_p, seed, rand_offset, penalty, seen_token_mask,
-            min_p, history, order, return_probs, fused,
+            min_p, history, order, return_probs, fused_draw,
         )
         if drawn is not None:
             return drawn
@@ -1695,7 +1696,7 @@ def sample_tokens(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
-    fused: bool = True,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -1726,7 +1727,7 @@ def sample_tokens(
         order: Optional ``FilterOrder`` (CUDA only): HF's top-p-first order.
         return_probs: (CUDA only) also return the distribution the filters
             ran on, for ``processed_logprobs``.
-        fused: (CUDA only) False draws through FlashInfer even where
+        fused_draw: (CUDA only) False draws through FlashInfer even where
             ``fused_sample`` covers the step (``_fused_draw``).
 
     Returns:
@@ -1762,7 +1763,7 @@ def sample_tokens(
             history=history,
             order=order,
             return_probs=return_probs,
-            fused=fused,
+            fused_draw=fused_draw,
         )
     elif logits.device.type == "xpu":
         if history is not None or order is not None:
@@ -1825,11 +1826,11 @@ def sample_accelerator_graphable_gpu(
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
     return_probs: bool = False,
-    fused: bool = True,
+    fused_draw: bool = True,
 ) -> torch.Tensor | Draw:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    On CUDA with ``fused``, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
+    On CUDA with ``fused_draw``, a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB`` without
     ``min_p``, ``history``, ``order`` or ``return_probs`` draws in one
     ``fused_sample`` launch (``_fused_draw``, which the eager ``Sampler``
     path shares): per-row seeds, so batch-invariant.
@@ -1866,7 +1867,7 @@ def sample_accelerator_graphable_gpu(
             caller advances ``history`` with the sampled tokens.
         return_probs: (CUDA only) also return the distribution the filters
             ran on, for ``processed_logprobs``.
-        fused: as in ``sample_tokens``.
+        fused_draw: as in ``sample_tokens``.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -1894,7 +1895,7 @@ def sample_accelerator_graphable_gpu(
             drawn = _fused_draw(
                 logits, temperature, top_k, top_p, seed, offset,
                 rep_penalty if apply_penalty else None, seen_tokens if apply_penalty else None,
-                min_p, history, order, return_probs, fused,
+                min_p, history, order, return_probs, fused_draw,
             )
             if drawn is not None:
                 return drawn
@@ -1971,7 +1972,8 @@ class AcceleratorGraphableSampler(BaseSampler):
     slot_idx_view: torch.Tensor | None = None
     scatter_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
-    # The node's draw kernel choice (``_fused_draw``), as its eager sampler's.
+    # Whether the node draws through ``fused_sample`` where it covers the step
+    # (``SamplerResource.fused_draw``), as its eager sampler does.
     fused_draw: bool = True
 
     # Set during graph capture, and used by the cuda graph runner to determine
@@ -2016,7 +2018,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             history=self.history,
             order=self.order,
             return_probs=processed,
-            fused=self.fused_draw,
+            fused_draw=self.fused_draw,
         )
         codes, probs = codes if processed else (codes, None)
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))

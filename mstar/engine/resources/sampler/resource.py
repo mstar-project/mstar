@@ -78,7 +78,7 @@ class SamplerResource(Resource):
         # Decided once for the node, so its eager and captured steps draw through
         # the same kernel: fused_sample (small vocabularies) lacks these processors,
         # so a node that enables one draws through FlashInfer, asked for or not.
-        self._fused_draw = not (
+        self.fused_draw = not (
             enable_min_p or self._history is not None or enable_top_p_first or enable_processed_logprobs
         )
         self._sampler = Sampler(
@@ -87,7 +87,7 @@ class SamplerResource(Resource):
             history=self._history,
             stop_ids=self._stop_ids,
             enable_top_p_first=enable_top_p_first,
-            fused_draw=self._fused_draw,
+            fused_draw=self.fused_draw,
         )
         # Two flags, because they have different lifetimes.
         #
@@ -206,7 +206,7 @@ class SamplerResource(Resource):
             cg_slots=self._cg_slots,
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter() and self._decides,
             loopback_state=self._loopback_state,
-            fused_draw=self._fused_draw,
+            fused_draw=self.fused_draw,
             **self._scalar_options(),
         )
         self._cg_buffers.cells = self._cells

@@ -123,14 +123,14 @@ def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
         res.remove_request(RID + 1)
 
 
-@pytest.mark.parametrize("spec,fused", [({}, True), ({"enable_min_p": True}, False)], ids=["plain", "min_p"])
-def test_eager_and_captured_steps_pick_the_same_draw_kernel(monkeypatch, ingraph, spec, fused):
+@pytest.mark.parametrize("spec,fused_draw", [({}, True), ({"enable_min_p": True}, False)], ids=["plain", "min_p"])
+def test_eager_and_captured_steps_pick_the_same_draw_kernel(monkeypatch, ingraph, spec, fused_draw):
     """The draw kernel is the node's: a node that enables min-p draws through
     FlashInfer on an eager step too, though no row in its batch sets min-p."""
     picked = []
 
-    def entry(logits, *args, fused=None, **kwargs):
-        picked.append(fused)
+    def entry(logits, *args, fused_draw=None, **kwargs):
+        picked.append(fused_draw)
         return torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
 
     monkeypatch.setattr(sampler_utils, "sample_tokens", entry)
@@ -138,7 +138,7 @@ def test_eager_and_captured_steps_pick_the_same_draw_kernel(monkeypatch, ingraph
     res = _resource(torch.device("cpu"), ingraph, **spec)
     _ingest(res, RID, seed=1)
     _run(res, RID, "EC")
-    assert picked == [fused, fused]
+    assert picked == [fused_draw, fused_draw]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
