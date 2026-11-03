@@ -354,7 +354,13 @@ class LLMSubmodule(ARNodeSubmodule):
         ids = torch.cat([inp.tensor_inputs["prompt_ids"] for inp in inputs])
         rows = torch.cat([inp.tensor_inputs["vision_rows"] for inp in inputs])
         embeds = self.model.model.embed_tokens(ids.clamp(min=0))
-        return embeds.masked_scatter_((ids < 0).unsqueeze(-1), rows)
+        # the nth vision row goes where the running count of -1s first reaches n + 1:
+        # found on device, so no host sync, and no scratch the size of `embeds` (which
+        # `masked_scatter_` allocates for its prefix sum)
+        at = torch.searchsorted(
+            (ids < 0).cumsum(0), torch.arange(1, rows.shape[0] + 1, device=ids.device),
+        )
+        return embeds.index_copy_(0, at, rows)
 
     # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
     # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
