@@ -165,14 +165,14 @@ class Earmark:
     victims: set[str]   # the victims whose moves cover it
 ```
 
-When the victims' moves land, the earmark joins R's reservation, so R's next grant can't fail again. Without it, the head of the queue could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
 A victim with a step or a KV read in flight moves or is dropped once that lands, and the worker composes it into no further step until then.
 
 Lifecycle:
 
 1. Created with its victims when the worker handles R's failed grant.
-2. Joins R's reservation when its victims' moves land.
+2. Grows R's reservation as each victim's move lands, and closes once the last one has.
 3. Removed with R.
 
 ---
