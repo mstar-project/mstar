@@ -1,21 +1,17 @@
-"""Length masks for padded batches.
+"""Zeroing, and reversing around, the padded tail of a batch.
 
 Every Kokoro block runs over a padded ``[B, C, T]`` (or ``[B, T, C]``) batch in
 which row ``b`` is valid up to ``lengths[b]``. The reference implementation
 processes one request at a time, so its convolutions see zero padding only at
 the true end of the sequence. Re-zeroing the padded tail after every op that
-can write into it keeps a padded batch equal to a stack of single requests.
+can write into it keeps a padded batch equal to a stack of single requests;
+``reverse_padded`` likewise reverses only each row's valid prefix, so a
+bidirectional LSTM's backward direction starts at the row's own end.
 """
 
 from __future__ import annotations
 
 import torch
-
-
-def length_mask(lengths: torch.Tensor, size: int) -> torch.Tensor:
-    """``[B, size]`` boolean mask, True where ``t < lengths[b]``."""
-    positions = torch.arange(size, device=lengths.device)
-    return positions[None, :] < lengths[:, None]
 
 
 def mask_channels(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

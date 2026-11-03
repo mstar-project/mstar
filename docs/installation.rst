@@ -391,6 +391,9 @@ default. That backend needs the **flash-attn-4** package, which provides
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
 PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
 
+Install it after ``flash-attn`` (FA2): the FA2 package ships an older
+``flash_attn/cute`` that overwrites flash-attn-4's.
+
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with ``Block sparse tensors ...
 require explicit sparse_block_size[0]``. Note this rules out the flash-attn
@@ -474,9 +477,9 @@ Rust extension
 --------------
 
 Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
-runtime is Rust and every process sends on its ZeroMQ transport, so each one
-raises at startup without it. Importing ``mstar`` does not need it. The
-extension carries (see :doc:`environment_variables` for the flags):
+runtime is Rust and every process sends on its ZeroMQ transport, so the
+conductor refuses to start without it. Importing ``mstar`` does not need it.
+The extension carries (see :doc:`environment_variables` for the flags):
 
 * **Graph runtime**: graph state, scheduling, routing and speculation, and the
   frames a worker sends. It holds a share of the Rust transport and of the Rust

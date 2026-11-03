@@ -88,11 +88,12 @@ def post_process(
     designed or automatic voice has no reference to match and is peak-normalised
     to 0.5 instead.
 
-    Imported from the ``omnivoice`` package rather than re-ported: the silence
-    trim is pydub-based and re-implementing it would drift from the reference
-    for no gain.
+    The fade and pad are the ``omnivoice`` package's own; the silence trim is
+    a sample-exact vectorized port of its pydub-based one (``silence.py``),
+    which cost ~14 ms of Python per second of audio.
     """
-    from omnivoice.utils.audio import fade_and_pad_audio, remove_silence
+    from mstar.model.omnivoice.components.silence import remove_silence
+    from omnivoice.utils.audio import fade_and_pad_audio
 
     audio = waveform
     if audio.ndim == 1:

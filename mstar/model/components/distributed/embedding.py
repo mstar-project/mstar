@@ -22,9 +22,11 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.resources.lora.config import LoraTarget
+from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
 
 
-class VocabParallelEmbedding(nn.Module):
+class VocabParallelEmbedding(nn.Module, LoraCapable):
     """Row-parallel token embedding.
 
     Each rank holds rows ``[tp_rank * V/tp : (tp_rank + 1) * V/tp]`` of
@@ -32,6 +34,10 @@ class VocabParallelEmbedding(nn.Module):
     contributions for tokens outside this rank's slice and ``all_reduce``
     sums shards into the replicated full embedding.
     """
+
+    # bound, its delta (the token's column of A) is whole on every rank and added after
+    # the all-reduce
+    lora_twin = LoraOutputAdd
 
     def __init__(
         self,
@@ -114,3 +120,12 @@ class VocabParallelEmbedding(nn.Module):
         # no contribution to the all-reduce.
         local_output = local_output * mask.unsqueeze(-1).to(local_output.dtype)
         return self.comm_group.all_reduce(local_output)
+
+    def lora_target(self) -> LoraTarget:
+        return LoraTarget(
+            in_features=self.num_embeddings, out_slices=(self.embedding_dim,),
+            parallel="none", kind="embedding",
+        )
+
+    def lora_local_shape(self) -> tuple[int, int]:
+        return self.num_embeddings, self.embedding_dim

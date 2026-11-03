@@ -32,7 +32,8 @@ node_groups:
     ranks:
       - 0
     graph_walks:
-      - image_gen_cfg
+      - image_gen_cfg2
+      - image_gen_cfg3
 
   - node_names:
       - LLM_cfg_text
@@ -41,7 +42,8 @@ node_groups:
       - 3
     tp_size: 2
     graph_walks:
-      - image_gen_cfg
+      - image_gen_cfg2
+      - image_gen_cfg3
 
   - node_names:
       - LLM_cfg_img
@@ -50,4 +52,4 @@ node_groups:
       - 5
     tp_size: 2
     graph_walks:
-      - image_gen_cfg
+      - image_gen_cfg3

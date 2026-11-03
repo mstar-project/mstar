@@ -1,6 +1,7 @@
 import atexit
 import hashlib
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -34,9 +35,21 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
-from mstar.engine.resources.spec import apply_yaml_overrides
+from mstar.engine.resources.lora.config import (
+    LORA_ADAPTER_KWARG,
+    LORA_RESOURCE_KEY,
+    LoraReqConfig,
+    LoraSpec,
+)
+from mstar.engine.resources.lora.serving import lora_specs, served_lora_targets
+from mstar.engine.resources.lora.store import check_adapters
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.base import (
+    ForwardPassArgs,
+    Model,
+    WorkerGraph,
+    serving_resources,
+)
 from mstar.model.submodule_base import chunk_tick_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -432,6 +445,7 @@ class Conductor:
         tensor_comm_protocol=CommProtocol.RDMA,
         tcp_transfer_device="",
         status_interval_s: float | None = None,
+        lora_adapter_digests: dict[str, str] | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
@@ -489,6 +503,7 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        self._settle_lora_adapters(lora_adapter_digests)
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -655,11 +670,12 @@ class Conductor:
         return specs
 
     def _node_resources(self) -> list:
-        """The model's resource specs after this deployment's YAML, each with all of its nodes."""
+        """The deployment's resource specs (``serving_resources``), each with all of its nodes."""
         built = getattr(self, "_node_resources_cache", None)
         if built is None:
-            built = self._node_resources_cache = self.model.get_node_resources() or []
-            apply_yaml_overrides(built, self.model_config)
+            built = self._node_resources_cache = serving_resources(
+                self.model, getattr(self, "model_config", None) or {}
+            )
         return built
 
     def _streamed_partitions(self) -> frozenset[str]:
@@ -704,7 +720,8 @@ class Conductor:
         is a deployment-wide property the model declares in its resource specs.
 
         A KV resource with declared labels gets a config even when the model
-        returned none, or its keys and layout would have nowhere to go.
+        returned none, or its keys and layout would have nowhere to go. So does
+        a declared LoRA pool, from the ``lora_adapter`` kwarg.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
@@ -716,7 +733,48 @@ class Conductor:
             raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
+        # the adapter config is the conductor's to fill, like the KV configs above,
+        # so a model that declares a LoRA spec needs no request code of its own; every
+        # node with a LoRA pool (an LLM, its vision encoder) runs the request's adapter
+        adapter = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
+        specs = {s.resource_key: s for s in self._node_resources()}
+        if LORA_RESOURCE_KEY in specs:
+            for key, spec in specs.items():
+                if isinstance(spec, LoraSpec):
+                    configs.setdefault(key, LoraReqConfig(adapter=adapter))
+        elif adapter is not None:
+            raise ValueError(
+                f"the request asks for LoRA adapter {adapter!r}, but this deployment "
+                "serves no LoRA adapters"
+            )
         return configs
+
+    def _settle_lora_adapters(self, digests: dict[str, str] | None) -> None:
+        """Check the serving config's LoRA adapters before any worker starts, unless the
+        API server already did (``digests``, name -> hex), so a bad adapter fails the
+        deployment at startup with every bad adapter named.
+
+        The digests go into the config the workers are spawned with
+        (``adapter_digests``), so every read a worker makes, at startup or after the
+        adapter left its host tier, serves the weights the API server keyed the prefix
+        cache under, the same on every rank. So do the targets the adapters touch, when
+        runtime updates are off (``served_lora_targets``): computed here once, every
+        process and rank builds the same specs."""
+        block = (self.model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
+        if not block.get("adapters"):
+            return
+        # every node's LoRA spec, the one keyed `lora` first: each serves the adapters
+        specs = lora_specs(self.model, self.model_config)
+        if digests is None:
+            digests = {
+                name: d.hex() for name, d in check_adapters(specs[0], others=specs[1:]).items()
+            }
+        # one block sizes every LoRA spec, so each spec's pools pin the same digests
+        block["adapter_digests"] = dict(digests)
+        targets = served_lora_targets(specs)
+        if targets is not None:
+            logger.info("LoRA: serving only the targets the adapters touch: %s", targets)
+            block["targets"] = targets
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -1320,6 +1378,8 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
+                # the LoRA adapter the chains were keyed under, the same for all
+                prefix_root=kwargs.get("prefix_root"),
                 prefix_cache=prefix_cache,
                 kv_layout=kv_layout.get(key),
                 loop_caps=loop_caps,
@@ -2248,6 +2308,23 @@ class Conductor:
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])
 
+    def _ms_to_next_timed_check(self) -> int:
+        """How long the run loop can wait for a message: until the liveness
+        check, the earliest expiry deadline or the metrics status.
+
+        At least 1 ms. The transports read a negative timeout as forever or as
+        an error, and a check left due by a pass that raised before reaching it
+        must not turn the loop into a spin."""
+        due = self._next_liveness_check
+        if self._status_interval_s is not None:
+            due = min(due, self._next_status)
+        for deadlines in (
+            self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
+        ):
+            if deadlines:
+                due = min(due, deadlines[0][0])
+        return max(1, math.ceil((due - time.perf_counter()) * 1000))
+
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
 
@@ -2315,4 +2392,6 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            time.sleep(0.001)
+            # No wakeup event is registered: nothing in this process makes work
+            # outside a message, and what isn't a message is a timed check.
+            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())

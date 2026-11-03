@@ -374,7 +374,8 @@ def _on_white(image: torch.Tensor) -> torch.Tensor:
 
 
 def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
-    """A request image as uint8 ``[C, H, W]``, refused first if it is too large.
+    """A request image as uint8 ``[C, H, W]``, refused first if it is too large
+    (a ``ValueError``, as is a file that does not decode).
 
     ``rgb`` forces three channels, with any transparency composited on white
     as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
@@ -387,22 +388,25 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
     import torchvision
 
     fmt, animated, pil_mode, transparent = _check_image_header(filepath, IMAGE_FORMATS)
-    # torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it
-    trns_color = rgb and transparent and pil_mode in ("L", "RGB")
-    if fmt == "GIF" or (fmt == "WEBP" and animated) or trns_color:
-        import numpy as np
-        from PIL import Image
+    try:
+        # torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it
+        trns_color = rgb and transparent and pil_mode in ("L", "RGB")
+        if fmt == "GIF" or (fmt == "WEBP" and animated) or trns_color:
+            import numpy as np
+            from PIL import Image
 
-        with Image.open(filepath) as image:
-            array = np.array(image.convert("RGBA"))
-        return _on_white(torch.from_numpy(array).permute(2, 0, 1))
-    if not rgb:
-        mode = torchvision.io.ImageReadMode.UNCHANGED
-    else:
-        # only a file with transparency is read with alpha: a CMYK JPEG's
-        # four channels are not RGBA
-        mode = torchvision.io.ImageReadMode.RGB_ALPHA if transparent else torchvision.io.ImageReadMode.RGB
-    image = torchvision.io.decode_image(filepath, mode=mode)
+            with Image.open(filepath) as image:
+                array = np.array(image.convert("RGBA"))
+            return _on_white(torch.from_numpy(array).permute(2, 0, 1))
+        if not rgb:
+            mode = torchvision.io.ImageReadMode.UNCHANGED
+        else:
+            # only a file with transparency is read with alpha: a CMYK JPEG's
+            # four channels are not RGBA
+            mode = torchvision.io.ImageReadMode.RGB_ALPHA if transparent else torchvision.io.ImageReadMode.RGB
+        image = torchvision.io.decode_image(filepath, mode=mode)
+    except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+        raise ValueError("could not decode image: the file is corrupt or truncated") from exc
     if image.dtype == torch.uint16:
         # a 16-bit PNG: its high byte, as Pillow reads a 16-bit RGB PNG
         image = (image.to(torch.int32) >> 8).to(torch.uint8)

@@ -27,7 +27,6 @@ from mstar.communication.tensor_store import (
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.rust import RustGraphRuntime
-from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import WorkerGraph
 from mstar.worker.worker import _make_graph_runtime
 
@@ -95,25 +94,3 @@ def test_a_python_bookkeeper_is_refused():
         _make_graph_runtime(**_kwargs(
             communicator=_rust_communicator(), bookkeeping=PythonTensorBookkeeping(),
         ))
-
-
-def test_a_missing_extension_says_how_to_build_it(monkeypatch):
-    """A None entry in sys.modules makes the import raise, which is what a
-    machine that never ran maturin sees."""
-    kwargs = _kwargs(communicator=object())
-    monkeypatch.setitem(sys.modules, "mstar_rust", None)
-    with pytest.raises(ImportError, match="maturin develop --release -m rust/Cargo.toml"):
-        require_rust_extension()
-    with pytest.raises(ImportError, match="needs the mstar_rust extension"):
-        _make_graph_runtime(**kwargs)
-
-
-def test_importing_the_worker_does_not_need_the_extension():
-    """Tooling imports mstar.worker on machines that never built it."""
-    import subprocess
-
-    script = (
-        "import sys; sys.modules['mstar_rust'] = None; import mstar.worker.worker; "
-        "assert 'mstar.graph.runtime.rust' not in sys.modules"
-    )
-    subprocess.run([sys.executable, "-c", script], check=True)

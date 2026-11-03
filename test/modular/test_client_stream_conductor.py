@@ -71,6 +71,9 @@ class _StubComm:
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
 
+    def poll_for_messages(self, timeout_ms):
+        return bool(self.batches)
+
 
 class _ScriptDoneError(Exception):
     pass
@@ -328,6 +331,8 @@ def _stub_worker(sbuf):
         ),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
+    # the real one, not a copy: it reads the stub's scheduler and tensor manager
+    stub._ack_unbuffered = Worker._ack_unbuffered.__get__(stub)
     return stub, reads
 
 
@@ -455,7 +460,7 @@ def test_the_worker_acks_a_stream_it_has_no_buffer_for_unread(caplog, failed_her
     stub.request_state.per_request_info[7].stream_buffers = {}
     stub.scheduler = SimpleNamespace(failed_rids={7} if failed_here else set())
     acked = []
-    stub.tensor_manager.ack_unread_tensors = lambda rid, edges: acked.append((rid, edges))
+    stub.tensor_manager.ack_unread_tensors = acked.append
     info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
                                   max_tokens=8, partition_name="Ear")
     chunk = GraphEdge(next_node="ear", name="audio_in", tensor_info=[_info(1)], is_streaming=True)
@@ -463,9 +468,7 @@ def test_the_worker_acks_a_stream_it_has_no_buffer_for_unread(caplog, failed_her
         Worker._process_new_inputs(stub, InputSignals(request_id="r", inputs=[chunk], request_info=info,
                                                       partition_name="Ear"))
     assert reads == []
-    # The ack goes on the wire, so it names the request by its string id,
-    # never by this worker's handle.
-    assert acked == [("r", [chunk])] and isinstance(acked[0][0], str)
+    assert acked == [[chunk]]
     assert ("no stream buffer" in caplog.text) is not failed_here
 
 
