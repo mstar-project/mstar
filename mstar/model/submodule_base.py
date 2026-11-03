@@ -1443,6 +1443,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         ``outputs`` is read-only, and each name's host copy is made when the
         check first reads it.
+        ``outputs`` are the request's outputs after ``postprocess``, except on
+        a step whose forward set ``check_stop_buffers``: there they are that
+        request's rows of those buffers, under the names the forward gave them.
 
         Default: no stops.
         """
