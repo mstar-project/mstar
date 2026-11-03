@@ -890,7 +890,8 @@ the saved WAVs with ``benchmark/tts_speech_wer.py``::
 
    python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
        --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
-       --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+       --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json \
+       --save-audio-dir results/mstar_c8_wav
 
 Fish Audio S2-Pro notes
 -----------------------
