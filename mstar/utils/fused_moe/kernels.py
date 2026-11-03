@@ -271,6 +271,23 @@ def _grid_rows(sorted_token_ids: torch.Tensor, topk_ids: torch.Tensor, block_m: 
     return min(sorted_token_ids.shape[0], topk_ids.numel() * block_m)
 
 
+def _launch_options(config: Dict[str, Any]) -> Dict[str, Any]:
+    """``config`` as launch keywords, without ``num_warps`` and ``num_stages``
+    on a traced launch.
+
+    The table lookup graph-breaks, so under a dynamic-shape compile the config
+    enters the traced frame as an input whose ints dynamo makes symbols, and
+    its Triton wrapper takes launch options only as constants. A traced launch
+    keeps the tuned tiles with Triton's default warps and stages; eager
+    launches keep them all. (Under dynamo a symbolic int is not an
+    ``isinstance`` of ``torch.SymInt``, so they cannot be dropped only when
+    symbolic.)
+    """
+    if torch.compiler.is_compiling():
+        return {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
+    return config
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -325,16 +342,6 @@ def invoke_fused_moe_kernel(
 
     K = B.shape[2]
     even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
-    if torch.compiler.is_compiling():
-        # The table lookup graph-breaks, so under a dynamic-shape compile the
-        # config enters this frame as an input whose ints dynamo makes symbols,
-        # and its Triton wrapper takes launch options only as constants. A
-        # traced launch keeps the tuned tiles with Triton's default warps and
-        # stages; eager launches keep them all. (Under dynamo a symbolic int is
-        # not an ``isinstance`` of ``torch.SymInt``, so the options cannot be
-        # dropped only when symbolic.)
-        config = {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
-
     fused_moe_kernel[grid](
         A,
         B,
@@ -358,7 +365,7 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=even_Ks,
-        **config,
+        **_launch_options(config),
     )
 
 
