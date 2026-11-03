@@ -275,6 +275,33 @@ def _grid_rows(sorted_token_ids: torch.Tensor, topk_ids: torch.Tensor, block_m: 
     return min(sorted_token_ids.shape[0], topk_ids.numel() * block_m)
 
 
+# Triton's compiler options for AMD GPUs, which tuned tables set beside the
+# tiles. As launch keywords they reach the compiler in eager calls only: in a
+# compiled frame torch moves num_warps and num_stages into the kernel's config
+# and drops keywords that aren't kernel arguments. Inductor does forward these
+# options from an autotuner config, so a config that sets them launches
+# fused_moe_kernel inside a one-config autotuner holding every compile option.
+AMD_COMPILE_OPTIONS = ("waves_per_eu", "matrix_instr_nonkdim", "kpack")
+_COMPILE_OPTIONS = ("num_warps", "num_stages", *AMD_COMPILE_OPTIONS)
+# Those autotuners by compile options. A table's are built when it loads,
+# outside compiled frames, which only look them up.
+_KERNELS_WITH_OPTIONS: dict[tuple, Any] = {}
+
+
+def kernel_for(config: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+    """The kernel to launch for ``config`` and the keywords to launch it with."""
+    if not any(k in config for k in AMD_COMPILE_OPTIONS):
+        return fused_moe_kernel, config
+    key = tuple(config.get(k) for k in _COMPILE_OPTIONS)
+    kernel = _KERNELS_WITH_OPTIONS.get(key)
+    if kernel is None:
+        amd = {k: config[k] for k in AMD_COMPILE_OPTIONS if k in config}
+        # Triton's HIP defaults where the config leaves them out
+        options = triton.Config(amd, num_warps=config.get("num_warps", 4), num_stages=config.get("num_stages", 2))
+        kernel = _KERNELS_WITH_OPTIONS[key] = triton.autotune(configs=[options], key=[])(fused_moe_kernel)
+    return kernel, {k: v for k, v in config.items() if k not in _COMPILE_OPTIONS}
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -329,8 +356,9 @@ def invoke_fused_moe_kernel(
 
     K = B.shape[2]
     even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
+    kernel, launch = kernel_for(config)
 
-    fused_moe_kernel[grid](
+    kernel[grid](
         A,
         B,
         C,
@@ -353,7 +381,7 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=even_Ks,
-        **config,
+        **launch,
     )
 
 
@@ -665,7 +693,11 @@ def tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
     if not path.is_file():
         return None
     logger.info("fused MoE: tuned Triton configs from %s", path.name)
-    return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+    tuned = {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+    for m in tuned:
+        for config in nearest_config(tuned, m):
+            kernel_for(config)
+    return tuned
 
 
 def nearest_config(tuned: dict[int, dict], M: int) -> tuple[Dict[str, int], Dict[str, int]]:
