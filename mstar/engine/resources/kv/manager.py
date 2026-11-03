@@ -2102,6 +2102,9 @@ class KVManager(AttentionResource):
                 labels = streams.get(rid)
                 stream = labels.get(label) if labels else None
                 if stream is None:
+                    if ctx.is_preplan:
+                        # as the fork loop above: an abandoned stage removes it
+                        self._preplan_new_labels.append((rid, label))
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
