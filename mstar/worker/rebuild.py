@@ -362,7 +362,7 @@ class Rebuilds:
             cursor.walk, cursor.step_metadata = kept.copies.walk, kept.copies.step_metadata
             cursor.copied = kept.copies.to_device(self._pool.device, self._side_stream())
         self._cursors[(node, rid)] = cursor
-        return Rebuild(cursor.walk, ids)
+        return Rebuild(kept.sampled)
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors

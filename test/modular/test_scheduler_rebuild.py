@@ -69,7 +69,7 @@ class _Engine(_RoomEngine):
         return FULL_ADMIT_REBUILD if rid in self.dropped else FULL_ADMIT_OK
 
     def prepare_rebuild(self, node_name, rid, rebuild):
-        self.prepared.append((rid, list(rebuild.ids)))
+        self.prepared.append((rid, list(rebuild.sampled)))
 
     def admit_waiting(self, published_of):
         return []
@@ -101,7 +101,7 @@ def test_a_dropped_requests_decode_row_parks_and_starts_one_rebuild():
     sched.get_next_batch(state)
     sched.get_next_batch(state)
 
-    assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
+    assert engine.prepared == [("d0", [4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
     assert engine.asked.count("d0") == 1, "a parked decode row asks the engine on every pass"
 

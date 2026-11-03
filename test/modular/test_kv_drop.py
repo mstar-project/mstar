@@ -190,7 +190,7 @@ class _Recording:
 
 def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
     first, second = _Recording(), _Recording()
-    engine, rebuild = Engine.__new__(Engine), Rebuild(WALK, array("i", [1, 2, 3]))
+    engine, rebuild = Engine.__new__(Engine), Rebuild(array("i", [1, 2, 3]))
     engine._submodules = {NODE: SimpleNamespace(resources={"first": first, "second": second})}
 
     engine.prepare_rebuild(NODE, "r", rebuild)
@@ -251,7 +251,7 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
     kv.drop("r")
 
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
+    kv.prepare_rebuild("r", Rebuild(array("i", sampled)))
     fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29))
     fresh._streams["f"]["main"].chain.extend(sampled[-1:], PAGE_SIZE)
     rebuilt, want = kv._streams["r"]["main"], fresh._streams["f"]["main"]
@@ -275,8 +275,8 @@ def test_a_rebuild_keeps_an_image_prompts_spans_and_writes_its_samples_after_its
     _image_prompt(kv, decoded=2)
     footprint = kv._streams["r"]["main"].footprint
 
-    # the prompt's 5 ids, then the prefill's sample and one per decode step
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+    # the prefill's sample and one per decode step
+    kv.prepare_rebuild("r", Rebuild(array("i", [100, 101, 102])))
 
     assert kv._overrides["r"].kv_layout["main"].spans == (PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(4, 4, WALK)), (
         "the image would lose its slots or its advance, or the samples would land at other positions"
@@ -298,7 +298,7 @@ def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
     _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
     kv.drop("r")
 
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
+    kv.prepare_rebuild("r", Rebuild(array("i", sampled)))
 
     assert kv._streams["r"]["main"].footprint == footprint, (
         "the rebuild would hold more pages than the request declared"
@@ -320,14 +320,14 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
     assert rope._counters["r"] == {} and not kv._streams["r"]["main"].page_indices, "the rebuild would start past 0"
 
 
-@pytest.mark.parametrize("ids", [20, 22])
-def test_a_rebuild_that_would_write_other_than_what_the_label_held_raises(ids):
+@pytest.mark.parametrize("samples", [0, 3])
+def test_a_rebuild_that_would_write_other_than_what_the_label_held_raises(samples):
     kv = _manager()
     _prefill(kv, "r", 20)
     kv.drop("r")
 
     with pytest.raises(RuntimeError, match="held 20"):
-        kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(ids))))
+        kv.prepare_rebuild("r", Rebuild(array("i", range(samples))))
 
 
 def test_removing_a_dropped_or_relaid_request_leaks_no_page():
@@ -335,7 +335,7 @@ def test_removing_a_dropped_or_relaid_request_leaks_no_page():
     for rid in ("dropped", "relaid"):
         _prefill(kv, rid, 20)
         kv.drop(rid)
-    kv.prepare_rebuild("relaid", Rebuild(WALK, array("i", range(21))))
+    kv.prepare_rebuild("relaid", Rebuild(array("i", [20])))
     kv.land_rebuild("relaid")
     assert kv.residency("relaid") is Residency.RESIDENT, "a rebuilt request would never be ready again"
 
@@ -351,7 +351,7 @@ def test_a_dropped_request_reads_as_dropped_until_its_rebuild_lands():
     engine = _engine({"kv": kv, "rope": RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)})
     _prefill(kv, "r", 20)
     kv.drop("r")
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(21))))
+    kv.prepare_rebuild("r", Rebuild(array("i", [20])))
 
     assert engine.residency(NODE, "r") is Residency.DROPPED, "the request would read as resident mid-rebuild"
     kv.land_rebuild("r")

@@ -784,10 +784,9 @@ class StreamLayout:
             start = end
         return tuple(steps)
 
-    def rebuilt(self, ids: int) -> "StreamLayout":
-        """This layout once a rebuild row has written ``ids`` ids into it: the last span, which
-        `rebuild_refusal` requires to be ids, grows by the ids sampled since the layout was laid out."""
-        grown = ids - sum(span.length for span in self.spans if span.kind == SpanKind.IDS)
+    def rebuilt(self, grown: int) -> "StreamLayout":
+        """This layout once a rebuild has written ``grown`` ids sampled since it was laid out at the end of its
+        last span, which `rebuild_refusal` requires to be ids."""
         *spans, last = self.spans
         return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 

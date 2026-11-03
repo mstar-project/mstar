@@ -287,7 +287,7 @@ def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_m
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
     rebuilds.fill(NODE, {R}, {}, inputs, infos)
 
-    assert rebuild == Rebuild(VISION, array("i", range(1, 8))) and infos[R].graph_walk == VISION
+    assert rebuild == Rebuild(array("i", [6, 7])) and infos[R].graph_walk == VISION
     assert [t.tolist() for t in inputs[R]["text_inputs"]] == [[1, 2, 3], [4, 5, 6]], (
         "the samples would follow the image instead of the prompt's last text, or decode would read the last id twice"
     )
@@ -407,7 +407,7 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
     rebuilds.fill(NODE, {R}, {}, inputs, infos)
 
-    assert rebuild == Rebuild(PREFILL, array("i", [1, 2, 3, 4, 5])), "the KV would lay out other ids"
+    assert rebuild == Rebuild(array("i", [4, 5])), "the KV would lay out other ids"
     assert infos[R].graph_walk == PREFILL and list(inputs[R]) == ["text_inputs"]
     [tokens] = inputs[R]["text_inputs"]
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
