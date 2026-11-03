@@ -1309,17 +1309,19 @@ class Cosmos3Model(Model):
         if action_mode is not None:
             # An action request predicts one action token per frame, so the
             # frame count and the chunk length are coupled (num_frames = chunk
-            # or chunk + 1) and default off each other; 16 predicted rows when
-            # neither is sent (the reference action default). The chunk is the
-            # rows the reply carries: a policy request's robot_state is one
-            # more token, clean in front of them at frame 0, so then
-            # num_frames = chunk + 1.
+            # or chunk + 1) and default off each other; when neither is sent,
+            # the policy checkpoint's chunk for a policy request, else 16 rows
+            # (the reference action default). The chunk is the rows the reply
+            # carries: a policy request's robot_state is one more token, clean
+            # in front of them at frame 0, so then num_frames = chunk + 1.
             raw_chunk = mk.get("action_chunk_size")
             raw_frames = mk.get("num_frames")
             if raw_chunk is not None:
                 action_chunk = int(raw_chunk)
             elif raw_frames is not None:
                 action_chunk = int(raw_frames) - 1
+            elif action_mode == ACTION_MODE_POLICY and self.config.policy_action_chunk_size:
+                action_chunk = int(self.config.policy_action_chunk_size)
             else:
                 action_chunk = 16
             if action_chunk <= 0:
@@ -1372,11 +1374,14 @@ class Cosmos3Model(Model):
             steps, default_guidance = self._resolve_distilled_params(
                 mk, steps, action_mode, input_modalities, output_modalities,
             )
+        default_fps = self.config.fps
+        if action_mode == ACTION_MODE_POLICY and self.config.policy_conditioning_fps:
+            default_fps = self.config.policy_conditioning_fps
         params = {
             "width": int(mk.get("width", width)),
             "height": int(mk.get("height", height)),
             "num_frames": num_frames,
-            "fps": float(mk.get("fps", self.config.fps)),
+            "fps": float(mk.get("fps", default_fps)),
             "guidance_scale": float(mk.get("guidance_scale", default_guidance)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
@@ -1441,17 +1446,19 @@ class Cosmos3Model(Model):
             params["guidance_interval"] = (float(gi[0]), float(gi[1]))
         # Action requests must name their embodiment explicitly — the domain
         # conditions the action pathway, and a silent default would predict
-        # actions for the wrong robot. ``domain_name`` resolves through the
-        # published embodiment table; a numeric ``domain_id`` wins. The raw
-        # action width is likewise required (forward-dynamics can infer it
-        # from its conditioning ``action`` array) and bounded by the model's
-        # padded action dim.
+        # actions for the wrong robot — except a policy request to a policy
+        # checkpoint that names the one it was trained for. ``domain_name``
+        # resolves through the published embodiment table; a numeric
+        # ``domain_id`` wins. The raw action width is likewise required (a
+        # robot_state or a forward-dynamics ``action`` array carries it) and
+        # bounded by the model's padded action dim.
         if action_mode is not None:
             params["action_mode"] = action_mode
             params["action_chunk_size"] = action_chunk
-            params["domain_id"] = resolve_action_domain_id(
-                mk.get("domain_id"), mk.get("domain_name")
-            )
+            domain_name = mk.get("domain_name")
+            if domain_name is None and mk.get("domain_id") is None and action_mode == ACTION_MODE_POLICY:
+                domain_name = self.config.policy_domain_name
+            params["domain_id"] = resolve_action_domain_id(mk.get("domain_id"), domain_name)
             raw_dim = mk.get("raw_action_dim")
             if raw_dim is None and state_dim:
                 raw_dim = state_dim
