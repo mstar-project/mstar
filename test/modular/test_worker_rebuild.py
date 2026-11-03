@@ -79,10 +79,8 @@ def _worker():
     )
     w.parallel_nodes, w.parallel_leader_nodes = set(), set()
     w.engine_manager = SimpleNamespace(get_engine=lambda node: eng, engine=SimpleNamespace(paged_kv_caches=list))
-    w.seen, w.failed, w.rebuilt = [], {}, []
-    w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set(),
-                                  note_rebuilt=lambda node, rid: w.rebuilt.append(rid),
-                                  prefilling=lambda node, rid, walk: None)
+    w.seen, w.failed = [], {}
+    w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set(), prefilling=lambda node, rid, walk: None)
     w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: w.infos[r])
     w._preemption = Preemption(w.engine_manager, w._rebuilds, w.scheduler, w.request_state, w._log_throttled, str)
@@ -109,7 +107,6 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies, w._rebuilds._kept = {node: POLICY}, {node: {1: _kept()}}
     w._rebuilds._cursors[(node, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long)
-    w.scheduler.note_rebuilt = lambda node, rid: None
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, 1: 0, 2: 0}, rebuild_rids=frozenset({R})), batch, node,
@@ -141,7 +138,7 @@ def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
 
     w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
 
-    assert eng.landed == [R] and w.rebuilt == [R], "the request would never be ready to decode again"
+    assert eng.landed == [R] and not w._rebuilds.rebuilding(R, NODE), "the request would never be ready to decode again"
     assert w.infos[R].graph_walk == DECODE, "the runtime's view of the request left its decode walk"
 
 
@@ -156,7 +153,7 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
 
     w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
 
-    assert not (eng.landed or eng.released or w.rebuilt), "the request would decode over KV the rebuild hasn't written"
+    assert not (eng.landed or eng.released), "the request would decode over KV the rebuild hasn't written"
     assert w._rebuilds._cursors[(NODE, R)].done == 2, "the next chunk would start over"
 
 
@@ -171,7 +168,7 @@ def test_a_prompts_rebuild_lands_and_leaves_the_prompts_input_to_its_last_chunk(
 
     w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
 
-    assert eng.landed == [R] and w.rebuilt == [R], "the prompt's next chunk would wait for good"
+    assert eng.landed == [R] and not w._rebuilds.rebuilding(R, NODE), "the prompt's next chunk would wait for good"
     assert not eng.released, "the prompt's next chunk would find no input to be cut from"
     assert w._preemption.counts[NODE].rebuild_tokens == 4
 

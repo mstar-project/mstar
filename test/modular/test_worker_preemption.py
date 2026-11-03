@@ -255,7 +255,7 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     engine.prepare_rebuild = lambda node, rid, rebuild: None
     engine.check_ready = lambda node, rid, info, allow_reload=True: Engine.check_ready(engine, node, rid, info)
     scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={})
-    for name in ("_check_ready", "_unpark", "note_rebuilt", "prefilling"):
+    for name in ("_check_ready", "_unpark", "prefilling"):
         setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
     info = w.request_state.get_fwd_info("v", "p")
 
@@ -263,7 +263,7 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     _remove(kv, "r")
     scheduler._unpark(w.request_state)
     assert not scheduler._check_ready(NODE, "v", info) and w._rebuilds.rebuilding("v", NODE), "v was never rebuilt"
-    scheduler.note_rebuilt(NODE, "v")
+    w._rebuilds.land_chunk("v", NODE, None)
 
     assert "v" not in scheduler.parked[NODE], "v's rebuild landed, but v stays parked and never runs again"
 
