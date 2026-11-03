@@ -15,6 +15,8 @@ mstar_rust = pytest.importorskip(
 from mstar.graph.runtime.utils import require_rust_extension  # noqa: E402
 
 RUST = Path(__file__).resolve().parents[2] / "rust"
+if not (RUST / "Cargo.toml").is_file():
+    pytest.skip("needs the checkout's rust/ (the wheel job copies test/ alone)", allow_module_level=True)
 
 
 def test_a_fresh_build_matches_its_checkout():
