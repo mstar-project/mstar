@@ -319,8 +319,8 @@ class Qwen3_5DenseModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # A prompt with images is rebuilt from host copies of the encoder's output, one bf16 embedding per slot.
-        # A video's frames are rows, which no rebuild recomputes.
+        # A prompt with images or video is rebuilt from host copies of the encoder's output, one bf16 embedding
+        # per slot.
         return {"LLM": RebuildPolicy(
             walks=frozenset({"prefill_text", "prefill_vision"}), ids_input="text_inputs", sample_output="new_token",
             loop="decode_loop", copy_bytes_per_slot={"prefill_vision": 2 * self.config.hidden_size},

@@ -144,9 +144,8 @@ IMAGE = PrefixSpan(6, 4, WALK, kind="digest", opens_step=False)
     ("two loops", "more than one label or growth loop"),
     ("two walks", "more than one walk"),
     ("two steps", "more than one step"),
-    ("image last", "ends on a digest span"),
+    ("image last", "ends on a span of no ids"),
     ("keyed text around an image", "can't key again"),
-    ("rows", "no rebuild recomputes"),
 ])
 def test_a_layout_one_row_couldnt_write_again_is_refused(layout, why):
     main = _config(list(range(PAGE_SIZE))).kv_layout["main"]
@@ -159,7 +158,6 @@ def test_a_layout_one_row_couldnt_write_again_is_refused(layout, why):
         "two steps": [replace(main, spans=(text, text))],  # as a prompt prefilled over two rows
         "image last": [replace(main, spans=(text, IMAGE))],
         "keyed text around an image": [replace(main, spans=(text, IMAGE, tail), keyed_spans=3)],
-        "rows": [replace(main, spans=(text, replace(IMAGE, kind="rows"), tail))],  # as a video's frames
     }[layout]
 
     assert why in (rebuild_refusal(layouts) or ""), f"one rebuild row would write {layout} again"

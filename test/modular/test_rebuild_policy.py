@@ -110,8 +110,7 @@ IMAGE_CHAT = (
     (POLICY, IMAGE_CHAT, False),
     (MEDIA, (replace(IMAGE_CHAT[0], walk="vit"), *IMAGE_CHAT[1:]), False),
     (POLICY, (PrefixSpan(4, 4, PREFILL),), True),
-    (MEDIA, (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], kind="rows"), IMAGE_CHAT[2]), False),
-], ids=["copied walk", "walk not copied", "two walks", "ids alone", "video"])
+], ids=["copied walk", "walk not copied", "two walks", "ids alone"])
 def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and_copies(policy, spans, rebuildable):
     rebuilds = Rebuilds({NODE: policy}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
 
@@ -122,6 +121,15 @@ def test_only_a_request_whose_layout_a_rebuild_can_write_again_keeps_its_ids_and
     assert (R in rebuilds._kept[NODE]) == rebuildable, (
         "a request that is never dropped would hold its ids and a host copy of its frames for its life"
     )
+
+
+def test_a_video_on_a_walk_whose_inputs_are_copied_can_be_rebuilt():
+    """A Qwen3.5 video's frame groups are `rows` spans on the vision walk, which reads the encoder's output for them as
+    it does for an image. `rows` only says a span has no digest key, so a rebuild from the same copies writes them."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    video = (IMAGE_CHAT[0], replace(IMAGE_CHAT[1], kind="rows"), IMAGE_CHAT[2])
+
+    assert _ingest(rebuilds, R, video), "a video on the copied walk stays guaranteed"
 
 
 @pytest.mark.parametrize("model_class, attrs", [
