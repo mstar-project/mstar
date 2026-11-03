@@ -36,6 +36,7 @@ from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -55,15 +56,12 @@ class _Stop(BaseException):
 
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
-    scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
-        request_to_worker_graph={rid: 0 for rid in rids},
-        chunk_ranges={}, incomplete_node_rids=set(),
-        rids_by_walk=lambda: {WALK: list(rids)},
+    scheduled = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, request_to_worker_graph={rid: 0 for rid in rids},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None, read_check_rids=None, rebuild_rids=frozenset(),
+        launch_started_event=None, read_check_rids=None,
     )
     return scheduled, executing
 
@@ -142,7 +140,7 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers = {}
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -216,7 +214,7 @@ def _rank(
             w._remove_request(body)
 
     w._process_messages = _process_messages
-    w._build_executing_batch = lambda batch, rebuild=None: _batch(
+    w._build_executing_batch = lambda batch: _batch(
         batch.tp_seq, list(batch.request_to_worker_graph))[1]
     w.maybe_send_zmq_to_tp_followers = _broadcast
     w._build_speculation = _build_speculation
@@ -349,7 +347,7 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 
-    def _executing(batch, rebuild=None):
+    def _executing(batch):
         node_batch = build_executing(batch)
         if batch.tp_seq == 0:
             node_batch.failed_requests = {HANDLES["also"]: "failed"}

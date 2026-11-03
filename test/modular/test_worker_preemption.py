@@ -33,11 +33,13 @@ from test_kv_preemption import (  # noqa: F401
 )
 
 from mstar.engine.engine import PagedKVCache
+from mstar.engine.resources import Residency
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
+from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
@@ -60,6 +62,12 @@ class _Engine(SimpleNamespace):
     __hash__ = object.__hash__
 
 
+def _kept(tokens: int) -> KeptIds:
+    """A request's prompt of ``tokens`` ids on the host, and one sample."""
+    view = torch.arange(tokens, dtype=torch.int32)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", [0]))
+
+
 def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
     engine = _Engine(
@@ -73,16 +81,14 @@ def _worker(kv):
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
-    w._rebuilds._kept[NODE] = {rid: KeptIds(torch.arange(5 * PAGE_SIZE), array("i", [0])) for rid in "rv"}
-    w._in_flight_rids, w._dropped, w._hold_logged, w._rid_str = set(), {}, {}, str
+    w._rebuilds._kept[NODE] = {rid: _kept(5 * PAGE_SIZE) for rid in "rv"}
+    w._in_flight_rids, w._hold_logged, w._rid_str = set(), {}, str
     w.held, w.tried, w.failed = [], [], {}
     w._is_tearing_down, w._fail_requests = lambda rid: False, w.failed.update
     w.scheduler = SimpleNamespace(
-        backlog={}, rebuilds={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
+        backlog={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
         could_refill=lambda *args: False, cap_batch=lambda *args: None, limit_batch=lambda *args: None,
     )
-    for name in ("queue_rebuild", "take_rebuilds", "rebuild_queued"):  # the real rebuild queue
-        setattr(w.scheduler, name, getattr(MicroScheduler, name).__get__(w.scheduler))
     w.request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
         get_fwd_info=lambda rid, p: SimpleNamespace(
@@ -143,16 +149,17 @@ def test_only_a_deciding_kv_pool_preempts(case):
 
     if case == "deciding kv pool":
         assert not w.tried, "a pool that decides chose its victim by recency"
-        assert w._dropped == {"v": NODE} and not w.held, "r's shortage didn't drop v"
+        assert kv.residency("v") is Residency.DROPPED and not w.held, "r's shortage didn't drop v"
         assert _step(kv, "r", 1).ok, "r didn't get the page v's drop freed"
         assert w._preemption.counts[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
     elif case == "a node where no request keeps ids":
         # the node's policy decides how it preempts, whichever requests keep ids now
-        assert not w.tried and not w.held and _queue(kv) == ["r"] and kv.is_resident("v"), (
+        assert not w.tried and not w.held and _queue(kv) == ["r"] and kv.residency("v") is Residency.RESIDENT, (
             "a node that rebuilds requests switched to the offload and the hold while none kept ids"
         )
     else:
-        assert w.tried and w.held == ["r"] and kv.is_resident("v"), f"{case} lost the offload and the hold"
+        resident = kv.residency("v") is Residency.RESIDENT
+        assert w.tried and w.held == ["r"] and resident, f"{case} lost the offload and the hold"
 
 
 @pytest.mark.parametrize("my_walks, rebuilds", [
@@ -175,7 +182,7 @@ def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_t
 
     Worker._handle_allocation_failure(w, batch, node_batch)
 
-    assert kv.is_offloaded("v") and not w._dropped and not w.held, "v wasn't moved to the host"
+    assert kv.residency("v") is Residency.ON_HOST and not w.held, "v wasn't moved to the host"
     assert not kv.can_reload("v"), "v could reload into the page r ran short of"
     assert _step(kv, "r", 1).ok
 
@@ -184,14 +191,15 @@ def test_a_request_that_can_only_wait_waits_in_the_queue_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         kv, w = _preempting("nothing to drop")
 
-    assert _queue(kv) == ["r"] and "r" in kv._allotments and not w.held and not w._dropped
+    assert _queue(kv) == ["r"] and "r" in kv._allotments and not w.held
     assert "r waits in the queue" in caplog.text, "a request that can only wait left no line"
 
 
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():
     kv, w = _preempting(in_flight=("r", "v"))
 
-    assert w._dropped == {"v": NODE} and _step(kv, "r", 1).ok, "v waited for a step that never ran to clear"
+    dropped = kv.residency("v") is Residency.DROPPED
+    assert dropped and _step(kv, "r", 1).ok, "v waited for a step that never ran to clear"
 
 
 def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_older_one_drops():
@@ -209,27 +217,8 @@ def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_o
 
     Worker._handle_allocation_failure(w, batch, node_batch)
 
-    assert kv.is_resident("r") and "n" not in kv._allotments, (
+    assert kv.residency("r") is Residency.RESIDENT and "n" not in kv._allotments, (
         "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
-
-
-def test_a_dropped_request_returns_once_its_history_and_a_page_fit():
-    kv, w = _preempting()
-    assert _step(kv, "r", 1).ok
-    w.rebuilt = []
-    w._rebuild = lambda rid, node: w.rebuilt.append((rid, node))
-    # the scheduler's pass hands a dropped request to the worker once the pool admits it
-    scheduler = SimpleNamespace(
-        parked={}, dropped=w._dropped, readmit=lambda rid, node: Worker._readmit(w, rid, node),
-        engine_manager=w.engine_manager,
-    )
-
-    MicroScheduler._unpark(scheduler, w.request_state)
-    assert not w.rebuilt, "v came back into the room r needs to grow"
-    _remove(kv, "r")
-    MicroScheduler._unpark(scheduler, w.request_state)
-
-    assert w.rebuilt == [("v", NODE)] and kv._allotments["v"].pages == 7, "v didn't return with its history and a page"
 
 
 def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_request():

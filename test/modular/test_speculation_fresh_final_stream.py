@@ -83,7 +83,6 @@ def _worker(scheduler, runtime):
     }
     worker = SimpleNamespace(
         worker_id="w0",
-        _rebuilds=Rebuilds({}, {}),
         scheduler=scheduler,
         _graph_runtime=runtime,
         tensor_manager=SimpleNamespace(
@@ -153,6 +152,7 @@ def _leader_speculation(final: bool):
             held_back=set(), ordered=False,
         ), []),
         take_chain_step=lambda state, chain, *_: fresh,
+        rebuilds=Rebuilds({}, {}),
     )
     runtime, target = _runtime()
     worker = _worker(scheduler, runtime)
@@ -175,6 +175,7 @@ def _follower_speculation(final: bool):
         ),
         pop_tp_follow_head=lambda: head,
         combined_walk_of={},
+        rebuilds=Rebuilds({}, {}),
     )
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()

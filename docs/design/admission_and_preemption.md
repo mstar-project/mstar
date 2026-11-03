@@ -187,9 +187,9 @@ class KVManager:
         of pages that reach the free list. Keyed pages stay in the index as
         evictable pages. Needs no host pool."""
 
-    def is_resident(self, rid: str) -> bool:
-        """False while rid is offloaded, and from its drop until its rebuild
-        step lands."""
+    def residency(self, rid: str) -> Residency:
+        """ON_HOST while rid is offloaded, DROPPED from its drop until its
+        rebuild lands, and RESIDENT otherwise."""
 ```
 
 A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
@@ -207,7 +207,9 @@ At a drop, the other resources:
 | Sampler | kept, since its RNG offset and repetition mask can't be recomputed |
 | Position counter | reset, and the rebuild moves it back to the end of the history |
 | Qwen3.5's recurrent state | zeroed in place, and the request keeps its slot, so its rebuild never waits for one |
-| Everything else | kept, as an offload keeps it |
+| Attention | kept, since it holds no state a rebuild writes again |
+| LoRA adapter pool | kept, so the rebuild runs under the request's adapter, which keeps its slot |
+| Anything else | refused at load: a node with a rebuild policy needs every resource it holds to support a drop (`Resource.supports_drop`) |
 
 Why this shape:
 
@@ -227,14 +229,14 @@ Why this shape:
 | running | resident, out of the queue |
 | on the host | its pages on the host, in the queue at its arrival position, no reservation |
 | dropped | not resident, in the queue at its arrival position, no reservation |
-| rebuilding | not resident, out of the queue, holding its return reservation, its rebuild row queued or in a step |
+| rebuilding | not resident, out of the queue, holding its return reservation, its rebuild under way in the worker's log |
 
-No field holds the state: residency, the host pool, the queue and the rebuild queue tell the four apart.
+No field holds the state: residency, the host pool, the queue and the log's rebuilds tell the four apart.
 
 Lifecycle:
 
-- A rebuilding request can be chosen again. Its queued row leaves the queue, and it gives up its return reservation and waits in the queue again.
-- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.
+- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and its log refuses a second drop.
+- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check
 
@@ -248,7 +250,7 @@ return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
 ```
 
-When it passes, V reserves `need(V)`, and the worker queues its rebuild row. The drop counts the history from the tokens V's KV held and the sample its next step writes.
+When it passes, V reserves `need(V)` and readiness starts its rebuild. The drop counts the history from the tokens V's KV held and the sample its next step writes.
 
 A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes, plus one page per stream, capped at its footprint, or its queued prompt if that is larger. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
 
@@ -272,18 +274,20 @@ class RebuildPolicy:
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup. A node without one never drops a request.
 
-The rebuild is one row of the engine's batch over the kept ids minus the last, under the policy's walk, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn't advance. Decoding resumes from the last kept id once the step lands.
+A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, opens the rebuild in the worker's log, and parks the request's decode row, as it parks a row waiting for capacity, until the rebuild lands.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, as one device copy per step shared by its rows, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`. A rebuild copies the prompt to the host once, for the KV's layout and keys.
+The rebuild prefills the kept ids minus the last, under the policy's walk, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
+
+The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
 
 Why this shape:
 
-- **The graph runtime never sees the row.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back.
+- **The graph runtime never sees the rows.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back. Every call that hands a step's rows to the runtime takes `ScheduledBatch.graph_rows`, which leaves them out.
 - **The prefill walk.** Each model's decode walk breaks a multi-token row in its own way. Bagel's declares a span of 1, the Qwen3-Omni Thinker's embeds every id at one position, and Qwen3.5's with device loop-back reads one token off the sampler.
-- **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids when the step runs. The copy stays on the device, and only a rebuild waits on a copy to the host. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
+- **The prompt's ids from the walk's input.** A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids after the step that read them, on a stream of the pool's own. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.
 - **Not a remove and re-ingest.** The sampler's RNG offset and repetition mask would be lost.
 
-> Note: the row's cache probe serves the kept ids' cached prefix first, so a rebuild recomputes only what the GPU index doesn't hold. Qwen3.5 rebuilds its whole history until its prefix caching (P2) lands.
+> Note: a rebuild's first chunk starts past its cached prefix, measured as a fresh prompt's is on each try, so it recomputes only what the GPU index doesn't hold, and Qwen3.5 restores a recurrent snapshot for the prefix.
 
 ### 5.4 Tokens after a rebuild
 
@@ -353,8 +357,8 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 ## 8. Trade-offs
 
 - **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
-- **Rebuild steps.** A rebuild runs in a step of its own, so the node's decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
-- **Kept ids.** A node with a rebuild policy keeps each request's prompt ids on the device, in the walk's input dtype, until the request finishes: 256 KB for a 32K-token request of int64 ids. A rebuild waits on one copy of them to the host.
+- **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 128 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

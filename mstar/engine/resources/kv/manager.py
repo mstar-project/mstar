@@ -20,6 +20,7 @@ from mstar.engine.resources.base import (
     KeyedWalks,
     PublishedInfo,
     Rebuild,
+    Residency,
 )
 from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, PageAllocator, held_pages, on_pages
@@ -3341,6 +3342,8 @@ class KVManager(AttentionResource):
     def supports_eviction(self):
         return self._cpu_pool is not None
 
+    supports_drop = True
+
     def is_offloaded(self, rid: str) -> bool:
         """True from the moment an offload claims the request, not just once
         its pages are on the host.
@@ -3361,11 +3364,10 @@ class KVManager(AttentionResource):
                 stream.offloaded for stream in self._streams.get(rid, {}).values()
             )
 
-    def is_resident(self, rid: str) -> bool:
-        """False once ``rid``'s offload is claimed or its drop is applied."""
+    def residency(self, rid: str) -> Residency:
         if rid in self._dropped:
-            return False
-        return self._cpu_pool is None or not self.is_offloaded(rid)
+            return Residency.DROPPED
+        return Residency.ON_HOST if self.is_offloaded(rid) else Residency.RESIDENT
 
     def check_drop(self, rid: str) -> str | None:
         if self._world_size > 1:
@@ -4491,7 +4493,7 @@ class KVManager(AttentionResource):
         """The host pages that moving every stream of ``rid`` takes, or None when ``rid`` can't move there: the
         pool has no host memory, ``rid`` isn't resident or holds no page, or a stream holds a cached image end
         `plan` hasn't copied."""
-        if self._cpu_pool is None or not self.is_resident(rid) or self._unwritten(rid):
+        if self._cpu_pool is None or self.residency(rid) is not Residency.RESIDENT or self._unwritten(rid):
             return None
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):

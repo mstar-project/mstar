@@ -101,21 +101,23 @@ class Preemption:
         self._move(kv, victims, reason.pages_short)
         return True
 
-    def returned(self, rid: int, node_name: str) -> None:
-        """Note that a preempted request was admitted again on ``node_name``, with the samples it has kept."""
+    def rebuilt(self, rid: int, node_name: str) -> None:
+        """Count the tokens of ``rid``'s rebuild on ``node_name``, which has landed: every kept id but the last,
+        which its next decode step reads."""
+        kept = self._rebuilds.kept(rid, node_name)
+        self.counts[node_name].rebuild_tokens += kept.prompt.view.numel() + len(kept.sampled) - 1
         if rid in self._preempted:
-            self._preempted[rid].returned_at = len(self._rebuilds.kept(rid, node_name).sampled)
+            self._preempted[rid].returned_at = len(kept.sampled)
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)
 
     def _move(self, kv: PagedKVCache, victims: Victims, pages_short: int) -> None:
         """Move each victim to the host, drop it, or ask the node's resources again for one that gave back its
-        allotment, as `KVManager.preempt` decided. A backlogged row goes back to the runtime and a queued rebuild
-        row leaves its queue first, so neither runs on pages the move gave up."""
+        allotment, as `KVManager.preempt` decided. A backlogged row goes back to the runtime first, so it doesn't
+        run on pages the move gave up."""
         for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
             self._scheduler.return_backlogged(rid)
-            self._scheduler.take_rebuilds((rid,))
         for rid in victims.to_host:
             for node_name in kv.nodes:
                 freed = self._engine_manager.get_engine(node_name).offload_request(node_name, rid)

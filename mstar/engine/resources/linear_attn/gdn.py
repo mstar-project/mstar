@@ -52,6 +52,9 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
+
     def __init__(
         self,
         config: LinearAttnConfig,
