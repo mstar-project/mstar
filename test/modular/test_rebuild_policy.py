@@ -30,7 +30,7 @@ from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice, aligned
 from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.worker import _LazyHostOutputs
 
@@ -510,8 +510,9 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     # the pool's copies run on ``side``, so a busy ``side`` holds them back
     pool._stream = side
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), LogRoom(pool.take(1 << 24), 0)
     rows = 1 << 22
+    # room for the prompt's one id and the copy
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), LogRoom(pool.take(aligned(4) + 4 * rows), 0)
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
     with side:
