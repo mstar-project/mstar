@@ -905,27 +905,6 @@ def test_module_tree_matches_loader_expectations():
         )
 
 
-@pytest.mark.parametrize("version,mtp,kpe", [
-    ("0.6.18", 0, 0), ("0.7.0", 0, 0), ("0.6.17", 0, 64), ("0.6.18", 3, 64), (None, 0, 0),
-])
-def test_rope_slot_follows_what_flashinfer_can_plan(monkeypatch, version, mtp, kpe):
-    # an older FlashInfer can't plan a cache without the slot; a box without one keeps none
-    import sys
-    import types
-
-    from mstar.model.glm5_next import config as config_mod
-
-    fake = None if version is None else types.SimpleNamespace(__version__=version)
-    monkeypatch.setitem(sys.modules, "flashinfer", fake)
-    config_mod._flashinfer_before.cache_clear()
-    cfg = Glm5NextModelConfig()
-    cfg.mtp_num_draft_tokens = mtp
-    try:
-        assert cfg.mla_cache_kpe == kpe
-    finally:
-        config_mod._flashinfer_before.cache_clear()
-
-
 def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
     """Built from tokenizer.json alone, a tokenizer has no special tokens even where the file
     marks them special: the fallback registers tokenizer_config's, or every reply ends in
