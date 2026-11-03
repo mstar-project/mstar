@@ -1,4 +1,5 @@
 import functools
+import itertools
 import logging
 import time
 from collections import Counter, defaultdict, deque
@@ -8,8 +9,9 @@ from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
-from mstar.model.submodule_base import InputMetadata, StepOrder
+from mstar.model.submodule_base import CHUNK_LOOP_END, InputMetadata, StepOrder, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -32,9 +34,14 @@ logger = logging.getLogger(__name__)
 # tolerated anywhere else -- an unknown rid off the wire is expected, an
 # unknown rid from local state is a bug and should still raise.
 REMOVED_RID = -1
+# The lane of the worker's main chain of steps; a side lane
+# (``mstar.worker.side_steps``) runs its keys' steps beside it
+CHAIN_LANE = 0
 
 # Below every turn and arrival: a sort key offset that puts a row ahead of them all
 _AHEAD = 1 << 62
+# between `_AHEAD`'s rows and the rest: a row mid-prefill under a token budget
+_MID_PREFILL = 1 << 61
 
 
 @dataclass
@@ -43,6 +50,27 @@ class ReadyNodeEntry:
     request_id: int
     worker_graph_id: int
     graph_walk: str
+
+
+class MidPrefillRow(NamedTuple):
+    """A row of the caller's in-flight step whose node needs another chunk:
+    the end of the chunk in flight, where its next one starts, and its
+    prompt's length."""
+    request_id: int
+    worker_graph_id: int
+    graph_walk: str
+    start: int
+    total: int
+
+
+class ContinuingRows(NamedTuple):
+    """The rows of an in-flight step that run again in the step speculated
+    after it, split by where their next step's inputs come from."""
+    # from the step's loop-back outputs, as decode's do
+    loop_back: list[int]
+    # from the inputs held since their first chunk; the chunk Loop's tick
+    # carries nothing, and the scheduler cuts their next chunk
+    mid_prefill: list[MidPrefillRow]
 
 
 @dataclass
@@ -79,6 +107,8 @@ class ScheduledBatch:
     request_walks: dict[int, str] = field(default_factory=dict)
     # real walk -> its output edge names, under a combined walk
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
+    # rid -> its measured InputSeqLenInfo, or None for no length; a waiting row's inputs do not change
+    row_lens: dict[int, Any] = field(default_factory=dict)
     # A TP follower's copy of ``ScheduleTPNode.read_check``: the leader's rows,
     # in its order, including those this rank could not read; None for no check
     read_check_rids: tuple[int, ...] | None = None
@@ -88,9 +118,71 @@ class ScheduledBatch:
     turn_order: list[int] | None = None
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
+    # Set once scheduled: rid -> the part of a chunked row's input this step
+    # runs; and the rows whose node needs at least one more chunk.
+    chunk_ranges: dict[int, ChunkRange] = field(default_factory=dict)
+    incomplete_node_rids: set[int] = field(default_factory=set)
+    # This node's walks that run as a chunk Loop on this worker, stamped when
+    # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
+    # not the scheduler, and every step that runs passes through there.
+    chunk_loop_walks: frozenset[str] = frozenset()
+
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
+
+    def loop_strides(self, rids: Iterable[int]) -> list[int] | None:
+        """``RouteInput.loop_strides`` for ``rids``, in that order: a row of a
+        chunk-Loop walk moves its Loop by its chunk (``chunk_loop_stride``),
+        and any other row its loop by one. None for a step with no row in a
+        chunk Loop, which is every decode step.
+
+        Keyed on the walk having a Loop rather than on the row having a chunk
+        range: a row with no range ran whole, which also ends the Loop -- a
+        walk with no token budget is never measured or cut.
+        """
+        walks = self.chunk_loop_walks
+        # one lookup for a single-walk step outside a chunk Loop (decode)
+        if not walks or (not self.request_walks and self.graph_walk not in walks):
+            return None
+        ranges = self.chunk_ranges
+        walk_of = self.walk_of
+        return [
+            chunk_loop_stride(ranges.get(rid)) if walk_of(rid) in walks else 1
+            for rid in rids
+        ]
+
+    def get_continuing_rows(
+        self, node_name: str, walk_rids: list[int],
+        tearing_down: Callable[[int], bool] | None,
+        speculated: Collection[tuple[str, str]],
+    ) -> ContinuingRows:
+        """This step's rows that continue into a speculated step on
+        ``node_name``: ``walk_rids`` (the target walk's rows) that loop back,
+        and the rows mid-prefill whose (node, walk) speculates its next chunk
+        (``speculate_mid_prefill``). ``tearing_down``: rows to leave out, or
+        None when none can be."""
+        held = self.incomplete_node_rids
+        if not held and tearing_down is None:
+            return ContinuingRows(walk_rids, [])
+        loop_back = [
+            r for r in walk_rids
+            if r not in held and (tearing_down is None or not tearing_down(r))
+        ]
+        if not held or node_name != self.node_name:
+            return ContinuingRows(loop_back, [])
+        mid_prefill = [
+            MidPrefillRow(
+                r, self.request_to_worker_graph[r], self.walk_of(r),
+                self.chunk_ranges[r].end, self.chunk_ranges[r].total,
+            )
+            for r in held
+            if r in self.request_to_worker_graph
+            and (tearing_down is None or not tearing_down(r))
+            and (node_name, self.walk_of(r)) in speculated
+        ]
+        return ContinuingRows(loop_back, mid_prefill)
+
 
     def rids_by_walk(self) -> dict[str, list[int]]:
         """The batch's rids grouped by real walk, in batch order. Shared:
@@ -110,6 +202,7 @@ class ScheduledBatch:
         grouping never goes stale; ``input_edges`` is the caller's."""
         self.request_to_worker_graph.pop(rid, None)
         self.request_walks.pop(rid, None)
+        self.row_lens.pop(rid, None)
         self._by_walk = None
 
     def relabel_if_uniform(self) -> None:
@@ -138,6 +231,7 @@ class ScheduledBatch:
         self.input_edges.extend(other.input_edges)
         self.request_walks.update(other.request_walks)
         self.walk_output_signals.update(other.walk_output_signals)
+        self.row_lens.update(other.row_lens)
         self._by_walk = None
 
     def split_off_first(
@@ -173,6 +267,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(taken)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(taken),
+            row_lens=self._row_lens_for(taken),
             # shared, not trimmed to the walks each half keeps: an extra entry
             # costs nothing, since outputs are only looked up for walks present
             walk_output_signals=self.walk_output_signals,
@@ -185,6 +280,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(left)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(left),
+            row_lens=self._row_lens_for(left),
             walk_output_signals=self.walk_output_signals,
         )
 
@@ -208,6 +304,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(rids)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(rids),
+            row_lens=self._row_lens_for(rids),
             walk_output_signals=self.walk_output_signals,
         )
 
@@ -215,6 +312,11 @@ class ScheduledBatch:
         if not self.request_walks:
             return {}
         return {rid: self.request_walks[rid] for rid in rids}
+
+    def _row_lens_for(self, rids: list[int]) -> dict[int, Any]:
+        if not self.row_lens:
+            return {}
+        return {rid: self.row_lens[rid] for rid in rids if rid in self.row_lens}
 
     def __len__(self):
         return len(self.request_to_worker_graph)
@@ -246,6 +348,56 @@ class ChainPick(NamedTuple):
     pick: StepPick
     # the target's ready-queue scan the pick ran over
     specs: list
+    # the caller's rows mid-prefill that the step took (``pick_chain_step``)
+    mid_prefill: Sequence[MidPrefillRow] = ()
+
+
+def runs_final_chunk(chunk: ChunkRange | None) -> bool:
+    """Whether a row with this range ends its prompt. No range means the row
+    runs whole, which is also its last chunk."""
+    return chunk is None or chunk.is_final
+
+
+def chunk_loop_stride(chunk: ChunkRange | None) -> int:
+    """How far a row of a chunk-Loop walk moves its Loop: its chunk's stride,
+    or to the end for a row that runs whole."""
+    return CHUNK_LOOP_END if chunk is None else chunk.stride
+
+
+def runs_first_chunk(chunk: ChunkRange) -> bool:
+    """Whether ``chunk`` is its prompt's first, which caps its chunk Loop. A
+    first chunk's stride runs from 0 even past a cached prefix; a later one's
+    is its own span, which starts past 0."""
+    return chunk.stride == chunk.end
+
+
+def tp_chunk_ranges(message: ScheduleTPNode, rids: list[int]) -> dict[int, ChunkRange]:
+    """The chunks the leader cut for ``message``'s rows, keyed by this rank's
+    handles for them (``rids``, from ``tp_rids``). Lists that do not match the
+    rows mean the ranks disagree on the step, so they raise."""
+    if not message.chunk_starts:
+        return {}
+    return {
+        rid: ChunkRange(start, end, total, stride)
+        for rid, start, end, total, stride in zip(
+            rids, message.chunk_starts, message.chunk_ends, message.chunk_totals,
+            message.chunk_strides, strict=True,
+        )
+        if start >= 0 and rid != REMOVED_RID
+    }
+
+
+def unfinished_chunk_rids(chunk_ranges: Mapping[int, ChunkRange]) -> set[int]:
+    """The rows of ``chunk_ranges`` whose prompt needs another chunk."""
+    return {rid for rid, chunk in chunk_ranges.items() if not runs_final_chunk(chunk)}
+
+
+def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
+    """The tokens a speculation chain's own ``n`` rows will run, as the
+    submodule estimates them (``speculative_input_seq_len``): their inputs do
+    not exist yet."""
+    # A row with no estimate (-1) guesses one token, a decode row.
+    return sum(s if s >= 0 else 1 for s in seq_lens) + n - len(seq_lens)
 
 
 class MicroScheduler:
@@ -273,11 +425,18 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # (node, walk) whose speculation chain merges the other walks of its
-        # combined walk; see `speculation_mixes`
+        # (node, walk) -> the lane its steps run on, for keys off the chain: a
+        # lane schedules only its own keys (``get_next_batch``), so the chain
+        # neither runs nor yields to another lane's
+        self.lane_of: dict[tuple[str, str], int] = {}
+        # (node, walk) -> whether its speculation chain merges the other walks
+        # of its combined walk: the config's settings, then each default as
+        # `speculation_mixes` first decides it
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
+        # scheduling key -> whether its steps run under a token budget; see `chunks`
+        self._budgeted: dict[tuple[str, str], bool] = {}
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
@@ -286,11 +445,24 @@ class MicroScheduler:
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
         self.runtime: "GraphRuntime | None" = None
+        # node -> the walks whose prefill runs as a chunk Loop there; the
+        # worker installs the ones its graphs build
+        self.chunk_loop_walks: dict[str, frozenset[str]] = {}
         # Looks up the handle for a wire request id; the worker installs the
         # runtime's. Only the TP-follow messages need it -- everything else
         # here already holds handles. Defaults to the identity so a scheduler
         # driven directly with its own keys (tests) needs no table.
         self.rid_of: Callable[[str], int | None] = lambda r: r
+        # Resolves a tensor uuid, for row lengths read from popped inputs; the
+        # worker installs the tensor manager's. None skips the room check.
+        self.get_tensor: Callable[[int], Any] | None = None
+        # (rid, node) -> when its prompt's first chunk was cut, for serving
+        # prompts in start order; held while the prompt is mid-prefill, and
+        # dropped once its last chunk is cut (`_assign_chunks`).
+        self.chunk_started: dict[tuple[int, str], int] = {}
+        self._chunk_starts = itertools.count()
+        # (rid, node) -> cached prefix a measured, not yet chunked row starts past
+        self.cached_prefix: dict[tuple[int, str], int] = {}
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -369,13 +541,13 @@ class MicroScheduler:
 
     def _parse_speculation_mixes_walks(
         self, setting: Mapping[str, Any],
-    ) -> frozenset[tuple[str, str]]:
+    ) -> dict[tuple[str, str], bool]:
         """The serving config's ``speculation_mixes_walks``: per node, one bool
         for every walk of its combined walks, or a mapping of walk -> bool."""
         walks_of_node: dict[str, set[str]] = defaultdict(set)
         for node, walk in self.combined_walk_of:
             walks_of_node[node].add(walk)
-        on = set()
+        out: dict[tuple[str, str], bool] = {}
         for node, value in setting.items():
             if node not in walks_of_node:
                 raise ValueError(
@@ -392,17 +564,37 @@ class MicroScheduler:
                     raise ValueError(
                         f"speculation_mixes_walks for {node}/{walk}: {mixes!r} is not a bool"
                     )
-                if mixes:
-                    on.add((node, walk))
-        return frozenset(on)
+                out[(node, walk)] = mixes
+        return out
 
     def speculation_mixes(self, node_name: str, graph_walk: str) -> bool:
         """Whether a speculation chain on ``(node_name, graph_walk)`` merges
-        ready rows of the other walks of its combined walk. Off (the default),
-        the chain takes only its own walk's rows, and another walk's ready rows
-        make it yield; steps then mix walks only when the scheduler builds one
-        fresh, which plans inline."""
-        return (node_name, graph_walk) in self._mixing_chains
+        ready rows of the other walks of its combined walk. Off, the chain
+        takes only its own walk's rows, and another walk's ready rows make it
+        yield; steps then mix walks only when the scheduler builds one fresh,
+        which plans inline.
+
+        Unless the config says otherwise, on wherever the combined walk has a
+        token budget: chunked prompts then ride in decode steps rather than
+        decode sitting out every chunk step. Without one a merged prompt runs
+        whole and stretches the decode step it joins."""
+        key = (node_name, graph_walk)
+        mixes = self._mixing_chains.get(key)
+        if mixes is None:
+            mixes = key in self.combined_walk_of and self.chunks(node_name, graph_walk)
+            self._mixing_chains[key] = mixes
+        return mixes
+
+    def chunks(self, node_name: str, graph_walk: str) -> bool:
+        """Whether steps of ``(node_name, graph_walk)`` run under a token
+        budget: its scheduling key's, which is the combined walk's under one.
+        A walk without one runs its prompts whole, even inside a chunk Loop."""
+        key = self._key(node_name, graph_walk)
+        budgeted = self._budgeted.get(key)
+        if budgeted is None:
+            budgeted = self.engine_manager.get_engine(key[0]).get_max_batch_tokens(*key) is not None
+            self._budgeted[key] = budgeted
+        return budgeted
 
     @property
     def last_consumed_tp_seq(self) -> int:
@@ -411,13 +603,13 @@ class MicroScheduler:
         ``Worker._removal_step_reached``."""
         return self._last_popped_tp_seq
 
-    def _select_node_rr(
+    def _node_rr_order(
         self, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
-    ) -> tuple[str, str] | None:
-        """The least recently scheduled (node, walk) with a ready row; ties go
-        to the first scanned."""
-        return min(
-            ready, default=None,
+    ) -> list[tuple[str, str]]:
+        """The (node, walk) keys with a ready row, least recently scheduled
+        first; ties go to the first scanned."""
+        return sorted(
+            ready,
             key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
         )
 
@@ -482,7 +674,19 @@ class MicroScheduler:
         # the rows holding the step, then the earliest request
         def arrival(rid: int) -> int:
             return arrived(rid, 0) - (_AHEAD if turns.get(rid, 0) >= holding else 0)
-        return LineOrder(arrival, strict=True)
+        if not self.chunks(*key):
+            return LineOrder(arrival, strict=True)
+        # Under a token budget a row mid-prefill comes next, in the order the
+        # prompts started, so prompts that haven't started (back from an OOM
+        # hold, say) can't take a mixed step's prompt rows ahead of it.
+        started, node = self.chunk_started, key[0]
+
+        def mid_prefill_next(rid: int) -> int:
+            at = started.get((rid, node))
+            if at is None or turns.get(rid, 0) >= holding:
+                return arrival(rid)
+            return at - _MID_PREFILL
+        return LineOrder(mid_prefill_next, strict=True)
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -756,6 +960,8 @@ class MicroScheduler:
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         rids = self.tp_rids(first_tp_node)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
@@ -776,7 +982,7 @@ class MicroScheduler:
 
         self.pop_tp_follow_head()
 
-        return ScheduledBatch(
+        batch = ScheduledBatch(
             node_name=first_tp_node.node_name,
             graph_walk=first_tp_node.graph_walk,
             request_to_worker_graph=request_to_worker_graph,
@@ -786,7 +992,12 @@ class MicroScheduler:
             request_walks=request_walks,
             walk_output_signals=walk_signals,
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
+            # the leader's chunks, so the chunk Loop ends on the same step here
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
+        self.cap_chunk_loops(batch)
+        return batch
 
     def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
         """The rows of ``head`` whose input read failed on this rank, which a
@@ -839,6 +1050,7 @@ class MicroScheduler:
         self,
         request_state: RequestStateManager,
         exclude_target: tuple[str, str] | None = None,
+        lane: int = CHAIN_LANE,
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -856,6 +1068,8 @@ class MicroScheduler:
         Args:
             exclude_target: If set, skip this (node_name, graph_walk) pair:
                 a yield-away from the speculation chain running it.
+            lane: whose keys to schedule (``lane_of``); TP follow steps are
+                the chain's.
         """
         # done before any early returns
         self._let_rows_back(request_state)
@@ -866,14 +1080,15 @@ class MicroScheduler:
         # skipped the batch because one of its rids failed locally would hang
         # the whole TP group. A popped ScheduleTPNode has no re-queue path
         # and must be submitted unconditionally.
-        tp_follow_batch = self._try_schedule_tp_follow(
-            request_state, exclude_target=exclude_target,
-        )
-        if tp_follow_batch is None:
-            self.num_consec_tp_follower_batches = 0
-        else:
-            self.num_consec_tp_follower_batches += 1
-            return tp_follow_batch
+        if lane == CHAIN_LANE:
+            tp_follow_batch = self._try_schedule_tp_follow(
+                request_state, exclude_target=exclude_target,
+            )
+            if tp_follow_batch is None:
+                self.num_consec_tp_follower_batches = 0
+            else:
+                self.num_consec_tp_follower_batches += 1
+                return tp_follow_batch
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
@@ -887,7 +1102,7 @@ class MicroScheduler:
         scan_exclude = scan_exclude or exclude_target
         # A queued row can be first in line even where a backlog fills the
         # step on its own (a row holding the step, back on its queue).
-        ready = self._scan_ready(request_state, None, scan_exclude)
+        ready = self._scan_ready(request_state, None, scan_exclude, lane)
 
         def schedule(key, entries):
             # a yield-away runs the other walks: the chain's own rows parked
@@ -901,19 +1116,34 @@ class MicroScheduler:
         # only a fairness hint, and finishing a split set beats fairness --
         # except under ARRIVAL, where the rows holding a key's step keep it: a
         # yield-away from the chain running it leaves that backlog to it.
-        keys = [k for k in self.backlog if not self._left_to_its_chain(k, exclude_target, skip_walk)]
+        keys = [
+            k for k in self.backlog
+            if self._lane(k) == lane and not self._left_to_its_chain(k, exclude_target, skip_walk)
+        ]
         for key in keys:
             scheduled = schedule(key, ready.get(key, []))
             if scheduled is not None:
                 return scheduled
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
-        rr_key = self._select_node_rr({
+        ready = {
             key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
-        })
-        if rr_key is None or rr_key in keys:
-            return None
-        return schedule(rr_key, ready.get(rr_key, []))
+        }
+        # Keep going down the round-robin order rather than idling behind the
+        # first node whose step comes out empty. That node is not marked
+        # scheduled, so round robin picks it again next pass anyway -- and
+        # under a colocated model the node behind it is the one that frees
+        # its pages (snac_decoder behind Orpheus's LLM).
+        for rr_key in self._node_rr_order(ready):
+            if rr_key in keys:
+                continue  # already tried above, off its backlog
+            scheduled = schedule(rr_key, ready.get(rr_key, []))
+            if scheduled is not None:
+                return scheduled
+        return None
+
+    def _lane(self, key: tuple[str, str]) -> int:
+        return self.lane_of.get(key, CHAIN_LANE)
 
     def _left_to_its_chain(
         self, key: tuple[str, str], exclude_key: tuple[str, str] | None,
@@ -931,6 +1161,7 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str] | None,
         exclude_target: tuple[str, str] | None,
+        lane: int = CHAIN_LANE,
     ) -> dict[tuple[str, str], list[ReadyNodeEntry]]:
         """Engine-ready rows on the queues, by scheduling key, in scan order."""
         ready: dict[tuple[str, str], list[ReadyNodeEntry]] = {}
@@ -940,7 +1171,7 @@ class MicroScheduler:
         exclude = self.failed_rids.union(self.pending_removes, self.held_until)
         # only rank 0 can initiate scheduling: a followed node's head is
         # served by _try_schedule_tp_follow
-        for spec in self._rows_here(self._ready_specs(exclude, target, exclude_target)):
+        for spec in self._rows_here(self._ready_specs(exclude, target, exclude_target, lane)):
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
@@ -977,12 +1208,16 @@ class MicroScheduler:
         self, exclude: set[int],
         target: tuple[str, str] | None,
         exclude_target: tuple[str, str] | None,
+        lane: int = CHAIN_LANE,
     ):
         """``runtime.get_ready_nodes`` for scheduling keys, which the runtime
-        matches against both real and combined walks."""
-        return self.runtime.get_ready_nodes(
+        matches against both real and combined walks, of ``lane`` only."""
+        specs = self.runtime.get_ready_nodes(
             exclude, target=target, exclude_target=exclude_target,
         )
+        if self.lane_of or lane != CHAIN_LANE:
+            specs = [spec for spec in specs if self._lane((spec.node_name, spec.graph_walk)) == lane]
+        return specs
 
     def _rows_here(
         self, specs: Iterable[ReadyNodeSpec],
@@ -1032,16 +1267,90 @@ class MicroScheduler:
                 backlogged = None  # every row failed
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
-        if backlogged is None and not fresh:
+        return self._build_step(request_state, node_walk, backlogged, fresh or None, pick)
+
+    def _build_step(
+        self, request_state: RequestStateManager, node_walk: tuple[str, str],
+        backlogged: ScheduledBatch | None, fresh: ScheduledBatch | None,
+        pick: StepPick, mid_prefill: Collection[MidPrefillRow] = (),
+        pre_existing_batch_size: int = 0,
+        pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
+    ) -> ScheduledBatch | None:
+        """The step ``pick`` chose out of ``backlogged``, ``fresh`` and the
+        caller's ``mid_prefill`` rows, under the node's token budget if it has
+        one. ``pre_existing_batch_size`` rows of a speculation chain run in it
+        too; ``pre_existing_seq_lens`` estimates their spans, asked for only
+        when the budget needs them (estimating walks every chain row, and a
+        steady decode step usually brings no other row)."""
+        engine = self.engine_manager.get_engine(node_walk[0])
+        max_tokens = engine.get_max_batch_tokens(*node_walk)
+        row_tokens: dict[int, int] = {}
+        chunkable: set[int] = set()
+        started: dict[int, int] = {}
+        # rid -> (start, total) of a popped or backlogged row mid-prefill
+        resumed: dict[int, tuple[int, int]] = {}
+        continuing, starts = self._mid_prefill_rows(
+            node_walk, mid_prefill, row_tokens, chunkable, started,
+        )
+        if backlogged is None and not fresh and continuing is None:
             return None
+        # only for the chunk sizing below, never to gate admission, so a walk
+        # with no budget skips it: measuring a row costs an input-tensor build
+        # and a cached-prefix probe (memoized for a backlogged row, `_row_lens`)
+        if max_tokens is not None:
+            taken = set(pick.taken)
+            for batch in (backlogged, fresh):
+                if batch:
+                    tokens, chunks = self._measure_rows(request_state, batch, started, resumed, taken)
+                    row_tokens.update(tokens)
+                    chunkable |= chunks
+        min_chunk = 1
+        if max_tokens is not None and row_tokens:
+            min_chunk = engine.min_chunk_tokens(max_tokens)
+            seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
+            max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
+        budgeted = max_tokens is not None and bool(row_tokens)
         return self._build_and_schedule(BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
-            backlog=backlogged, fresh=fresh or None, pick=pick,
-        ))
+            backlog=backlogged, fresh=fresh, pick=pick, continuing=continuing,
+            max_batch_tokens=max_tokens if budgeted else None,
+            walk_max_tokens=engine.walk_token_caps(*node_walk) if budgeted else None,
+            row_tokens=row_tokens,
+            chunkable=chunkable,
+            min_chunk_tokens=min_chunk,
+            start_order=started,
+        ), starts, resumed)
+
+    def _mid_prefill_rows(
+        self, node_walk: tuple[str, str], rows: Collection[MidPrefillRow],
+        row_tokens: dict[int, int], chunkable: set[int], started: dict[int, int],
+    ) -> tuple[ScheduledBatch | None, dict[int, tuple[int, int]]]:
+        """``rows`` as a batch to build from, measured from where each next
+        chunk starts; not popped, since their nodes are in flight. Returns the
+        batch, or None for no row, and rid -> (its next chunk's start, its
+        prompt's length)."""
+        node = node_walk[0]
+        rows = [row for row in rows if row.start < row.total]
+        if not rows:
+            return None, {}
+        batch = ScheduledBatch(
+            node_name=node, graph_walk=node_walk[1],
+            request_to_worker_graph={row.request_id: row.worker_graph_id for row in rows},
+        )
+        if node_walk in self._walks_of_key:
+            batch.request_walks = {row.request_id: row.graph_walk for row in rows}
+        for row in rows:
+            rid = row.request_id
+            row_tokens[rid] = row.total - row.start
+            started[rid] = self.chunk_started.get((rid, node), 0)
+            chunkable.add(rid)
+        return batch, {row.request_id: (row.start, row.total) for row in rows}
+
 
     def pick_chain_step(
         self, request_state: RequestStateManager,
         target: tuple[str, str], continuing: Sequence[int],
+        mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -1053,6 +1362,15 @@ class MicroScheduler:
         a row waiting at the chain's target can get the step while the chain
         runs. Unless the chain mixes walks (`speculation_mixes`), only rows of
         its own walk are in it; another walk's rows make it yield instead.
+
+        ``mid_prefill``: the chain's step's rows whose chunk is in flight.
+        Their nodes are off the ready queue until it lands, so without them
+        the next chunk would wait a step. They wait first in line, ahead of
+        the backlog, and are never popped.
+
+        ``next_iter_of``: the loop the chain's step runs its rows one
+        iteration on in, if it does; their capture group is the one they have
+        there (``_chain_capture_group``).
         """
         self._let_rows_back(request_state)
         key = self._key(*target)
@@ -1061,9 +1379,17 @@ class MicroScheduler:
         live = [] if backlogged is None else self._backlog_candidates(
             backlogged, only_walk=own_walk,
         )
+        mid = [
+            row for row in mid_prefill
+            if (own_walk is None or row.graph_walk == own_walk)
+            and self._key(target[0], row.graph_walk) == key
+            and row.start < row.total
+        ] if mid_prefill else []
+        if mid:
+            live = [row.request_id for row in mid] + live
         specs = []
         # a chain holding every request here has nothing waiting on the queues
-        if len(request_state.per_request_info) > len(continuing):
+        if len(request_state.per_request_info) > len(continuing) + len(mid):
             exclude = self.failed_rids.union(self.pending_removes, self.held_until)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
@@ -1075,23 +1401,36 @@ class MicroScheduler:
         walk_of = None
         if key in self._walks_of_key:
             walks = {rid: spec.graph_walk for spec in specs for rid in spec.rids}
+            walks.update((row.request_id, row.graph_walk) for row in mid)
             walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
+        ready = self._readiness(request_state, target[0])
+        if mid:
+            check, in_flight = ready, {row.request_id for row in mid}
+            ready = lambda rid: rid in in_flight or check(rid)  # noqa: E731
         pick = self.batch_builder.pick(self._step_candidates(
             request_state, key, backlog=live, queued=queued, walk_of=walk_of,
-            ready=self._readiness(request_state, target[0]),
+            ready=ready,
             continuing=continuing, own_walk=target[1],
-            one_walk=own_walk,
+            one_walk=own_walk, next_iter_of=next_iter_of,
         ))
-        return ChainPick(key, pick, specs)
+        if mid:
+            took = set(pick.taken)
+            mid = [row for row in mid if row.request_id in took]
+        return ChainPick(key, pick, specs, mid)
 
     def take_chain_step(
         self, request_state: RequestStateManager, chain: "ChainPick",
+        pre_existing_batch_size: int = 0,
+        pre_existing_seq_lens: Callable[[], Collection[int]] | None = None,
     ) -> ScheduledBatch | None:
         """The backlogged and queued rows ``chain`` chose, popped as one batch:
         the rows that join the chain's step, or the step itself when the
         chain gave all of it away. Queued rows it held back (another capture
         group, a walk the step can't mix) are popped and parked, so the chain
-        yields to them (``backlog_splits_from``) rather than run past them."""
+        yields to them (``backlog_splits_from``) rather than run past them.
+        The chain's rows mid-prefill that it took join from their held inputs;
+        the chain's own ``pre_existing_batch_size`` rows count against a token
+        budget (``_build_step``)."""
         key = chain.key
         own = set(chain.pick.continuing)
         taken = [rid for rid in chain.pick.taken if rid not in own]
@@ -1113,24 +1452,25 @@ class MicroScheduler:
         else:
             backlogged = None
         fresh = self._assemble_batch(request_state, *key, entries) if entries else None
-        if backlogged is None and not fresh:
-            return None
-        return self._build_and_schedule(BatchBuildRequest(
-            node_name=key[0], graph_walk=key[1],
-            backlog=backlogged, fresh=fresh or None, pick=chain.pick,
-        ))
+        return self._build_step(
+            request_state, key, backlogged, fresh or None, chain.pick,
+            chain.mid_prefill, pre_existing_batch_size, pre_existing_seq_lens,
+        )
 
     def _step_candidates(
         self, request_state: RequestStateManager, key: tuple[str, str], *,
         backlog: Sequence[int], queued: Sequence[int],
         walk_of: Callable[[int], str] | None, ready: Callable[[int], bool],
         continuing: Sequence[int] = (), own_walk: str | None = None,
-        one_walk: str | None = None,
+        one_walk: str | None = None, next_iter_of: str | None = None,
     ) -> StepCandidates:
         node, walk = key
         if key not in self._walks_of_key:
             one_walk = walk
         engine = self.engine_manager.get_engine(node)
+        capture_group = None
+        if engine.splits_by_capture_key(node, walk):
+            capture_group = self._chain_capture_group(request_state, node, walk, continuing, next_iter_of)
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1138,10 +1478,7 @@ class MicroScheduler:
             walk_of=walk_of or (lambda _: walk),
             one_walk=one_walk,
             ready=ready,
-            capture_group=(
-                functools.partial(self._capture_group, request_state, node, walk)
-                if engine.splits_by_capture_key(node, walk) else None
-            ),
+            capture_group=capture_group,
             walk_caps=self._walk_caps(key),
             walk_row_caps=self._walk_row_caps(key),
             line_order=functools.partial(self._line_order, key),
@@ -1158,8 +1495,10 @@ class MicroScheduler:
 
     def _capture_group(
         self, request_state: RequestStateManager,
-        node_name: str, graph_walk: str, rid: int,
+        node_name: str, graph_walk: str, rid: int, next_iter_of: str | None = None,
     ) -> Any | None:
+        """``rid``'s capture group at ``graph_walk``; with ``next_iter_of``, at
+        the next iteration of that loop."""
         engine = self.engine_manager.get_engine(node_name)
         if not engine.splits_by_capture_key(node_name, graph_walk):
             return None
@@ -1168,18 +1507,39 @@ class MicroScheduler:
         )
         # a streamed input's chunk can decide the capture (a codec's window size)
         chunks = request_state.ingested_stream_chunks(rid, node_name)
-        return engine.capture_group(
-            node_name, graph_walk, rid, fwd_info,
-            input_metadata=InputMetadata(stream_chunks=chunks) if chunks else None,
+        if next_iter_of is None:
+            metadata = InputMetadata(stream_chunks=chunks) if chunks else None
+        else:
+            loops = dict(fwd_info.dynamic_loop_iter_counts)
+            loops[next_iter_of] = loops.get(next_iter_of, 0) + 1
+            metadata = InputMetadata(stream_chunks=chunks or {}, dynamic_loop_iter_counts=loops)
+        return engine.capture_group(node_name, graph_walk, rid, fwd_info, input_metadata=metadata)
+
+    def _chain_capture_group(
+        self, request_state: RequestStateManager, node_name: str, graph_walk: str,
+        chain: Collection[int], next_iter_of: str | None,
+    ) -> Callable[[int], Any]:
+        """``_capture_group`` for the rows of a speculation chain's step. The
+        chain's own rows run it one iteration on in ``next_iter_of`` (as the
+        step's input metadata has them), while their stored loop counters are
+        still the step in flight's; a group that changes with the iteration
+        (a step schedule's dtype) is the one they'll run in. Other rows run
+        the step where they stand."""
+        if next_iter_of is None or not chain:
+            return functools.partial(self._capture_group, request_state, node_name, graph_walk)
+        chain = frozenset(chain)
+        return lambda rid: self._capture_group(
+            request_state, node_name, graph_walk, rid, next_iter_of if rid in chain else None,
         )
 
     def backlog_splits_from(
         self, request_state: RequestStateManager,
-        target: tuple[str, str], rid: int,
+        target: tuple[str, str], rid: int, next_iter_of: str | None = None,
     ) -> bool:
         """Whether ``target``'s backlog holds a live rid a speculation chain
         anchored at ``rid`` would never merge (``chain_must_yield``), so the
-        chain has to yield for it to run.
+        chain has to yield for it to run. ``next_iter_of`` as in
+        ``pick_chain_step``.
         """
         target = self._key(*target)
         live = self._live_backlog(target)
@@ -1187,7 +1547,7 @@ class MicroScheduler:
             return False
         return self.batch_builder.chain_must_yield(
             self.backlog[target], live, rid,
-            functools.partial(self._capture_group, request_state, *target),
+            self._chain_capture_group(request_state, *target, (rid,), next_iter_of),
         )
 
     def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:
@@ -1200,6 +1560,91 @@ class MicroScheduler:
             r for r in waiting.request_to_worker_graph
             if r not in self.failed_rids and r not in self.pending_removes
             and self.held_until.get(r, 0.0) <= now
+        }
+
+    def _row_lens(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        rids: list[int],
+    ) -> dict[int, Any] | None:
+        """``rids``' lengths, for submodules that report them before prepare;
+        measured once per row and kept on ``batch``. None if not reported."""
+        engine = self.engine_manager.get_engine(batch.node_name)
+        if self.get_tensor is None or not engine.declares_input_sequence_len(batch.node_name):
+            return None
+        unmeasured = [rid for rid in rids if rid not in batch.row_lens]
+        if unmeasured:
+            partition = request_state.get_partition_for_node(batch.node_name)
+            inputs = batch.input_edges.to_input_tensors(
+                self.get_tensor, unmeasured, skip_missing=True,
+            ).by_rid
+            for rid in unmeasured:
+                batch.row_lens[rid] = engine.input_sequence_len(
+                    batch.node_name, batch.walk_of(rid),
+                    request_state.get_fwd_info(rid, partition), inputs.get(rid, {}),
+                    rid=rid,
+                )
+        return batch.row_lens
+
+    def _measure_rows(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        started: dict[int, int], resumed: dict[int, tuple[int, int]],
+        only: Collection[int],
+    ) -> tuple[dict[int, int], set[int]]:
+        """For a node that reports row lengths: the remaining tokens of each
+        of ``batch``'s rows in ``only`` (the step's), and the ones that may be
+        chunked. A row mid-prefill goes in ``started`` with its start order and
+        in ``resumed`` with where its chunk Loop stands
+        (``_chunk_loop_progress``)."""
+        node = batch.node_name
+        engine = self.engine_manager.get_engine(node)
+        rids = [rid for rid in batch.request_to_worker_graph if rid in only]
+        progress = self._chunk_loop_progress(batch, rids)
+        lens = self._row_lens(
+            request_state, batch, [rid for rid in rids if rid not in progress],
+        )
+        if lens is None:
+            return {}, set()
+        tokens: dict[int, int] = {}
+        chunkable: set[int] = set()
+        for rid in rids:
+            walk = batch.walk_of(rid)
+            at = progress.get(rid)
+            if at is not None:
+                tokens[rid] = at[1] - at[0]
+                started[rid] = self.chunk_started.get((rid, node), 0)
+                resumed[rid] = at
+            else:
+                info = lens[rid]
+                if info is None:
+                    continue
+                if info.cached_prefix:
+                    self.cached_prefix[(rid, node)] = info.cached_prefix
+                tokens[rid] = info.seq_len
+            if engine.supports_chunked_prefill(node, walk):
+                chunkable.add(rid)
+        return tokens, chunkable
+
+    def _chunk_loop_progress(
+        self, batch: ScheduledBatch, rids: list[int],
+    ) -> dict[int, tuple[int, int]]:
+        """rid -> (tokens run, the prompt's length) for the rows of ``rids``
+        mid-prefill, read off their chunk Loops. Nothing of theirs is in
+        flight: a row whose chunk runs is off the ready queue and out of the
+        backlog until the chunk lands, when the Loop has counted it."""
+        node = batch.node_name
+        walks = self.chunk_loop_walks.get(node)
+        if not walks:
+            return {}
+        rows = [rid for rid in rids if batch.walk_of(rid) in walks]
+        if not rows:
+            return {}
+        row_walks = [batch.walk_of(rid) for rid in rows]
+        counts, caps = self.runtime.loop_progress(
+            node, rows, row_walks, [chunk_loop_name(node, walk) for walk in row_walks],
+        )
+        return {
+            rid: (count, cap)
+            for rid, count, cap in zip(rows, counts, caps, strict=True) if count > 0
         }
 
     def _backlog_candidates(
@@ -1238,7 +1683,11 @@ class MicroScheduler:
                 batch.request_to_worker_graph.keys()
             )
 
-    def _build_and_schedule(self, request: BatchBuildRequest) -> ScheduledBatch | None:
+    def _build_and_schedule(
+        self, request: BatchBuildRequest,
+        mid_prefill_starts: dict[int, tuple[int, int]] | None = None,
+        resumed: dict[int, tuple[int, int]] | None = None,
+    ) -> ScheduledBatch | None:
         """Have the batch builder split what was popped for ``request``'s
         (node, walk) by its pick, and carry out its verdict.
 
@@ -1254,20 +1703,32 @@ class MicroScheduler:
             expected |= request.backlog.request_to_worker_graph.keys()
         if request.fresh is not None:
             expected |= request.fresh.request_to_worker_graph.keys()
+        if request.continuing is not None:
+            expected |= request.continuing.request_to_worker_graph.keys()
         result: BatchBuildResult = self.batch_builder.build_batch(request)
         self._refuse_lost_rows(node_walk, expected, result)
+        backlog, returned = result.backlog, result.returned
+        if mid_prefill_starts:
+            # left out, a row mid-prefill goes back to its queue when its chunk lands
+            if backlog is not None:
+                backlog, _ = backlog.split_off_first(None, exclude_rids=set(mid_prefill_starts))
+            if returned:
+                returned = {rid: wg for rid, wg in returned.items() if rid not in mid_prefill_starts}
         # Whatever was popped past this step has to be remembered here, or it
         # would never run.
-        if result.backlog is not None:
-            self._backlog(node_walk, result.backlog)
-        if result.returned:
-            self._set_in_flight(request.node_name, result.returned, False)
+        if backlog is not None:
+            self._backlog(node_walk, backlog)
+        if returned:
+            self._set_in_flight(request.node_name, returned, False)
             self.runtime.push_back_node(
-                request.node_name, list(result.returned),
-                list(result.returned.values()),
+                request.node_name, list(returned), list(returned.values()),
             )
         if result.scheduled is not None:
             self._mark_scheduled(*node_walk, len(result.scheduled))
+            self._assign_chunks(
+                result.scheduled, result.chunk_tokens or {}, request.row_tokens,
+                {**(resumed or {}), **(mid_prefill_starts or {})},
+            )
             result.scheduled.relabel_if_uniform()
         return result.scheduled
 
@@ -1293,6 +1754,63 @@ class MicroScheduler:
             raise AssertionError(
                 f"batch builder dropped rows for {node_walk}: "
                 f"lost {sorted(expected - got)}, invented {sorted(got - expected)}"
+            )
+
+    def _assign_chunks(
+        self, batch: ScheduledBatch, chunk_tokens: dict[int, int],
+        row_tokens: dict[int, int], resumed: dict[int, tuple[int, int]],
+    ) -> None:
+        """Stamp the ``ChunkRange`` each chunked row runs this step.
+
+        A row mid-prefill resumes at ``resumed``'s (start, total): where its
+        chunk Loop stands, or for a speculation the end of the chunk in
+        flight. A row first cut here starts past its cached prefix and caps
+        its chunk Loop at its whole input's length, which is what ends it.
+
+        A row whose walk has no token budget is never measured, so it gets no
+        range at all: it runs whole, and its stride ends its chunk Loop
+        (``chunk_loop_stride``).
+        """
+        if not (chunk_tokens or resumed or self.cached_prefix):
+            return
+        node = batch.node_name
+        for rid in batch.request_to_worker_graph:
+            at = resumed.get(rid)
+            if at is not None:
+                start, total = at
+                end = start + chunk_tokens.get(rid, total - start)
+                batch.chunk_ranges[rid] = ChunkRange(start, end, total, end - start)
+            else:
+                key = (rid, node)
+                cached = self.cached_prefix.pop(key, 0)
+                if rid not in chunk_tokens:
+                    continue
+                total = cached + row_tokens[rid]
+                end = cached + chunk_tokens[rid]
+                batch.chunk_ranges[rid] = ChunkRange(cached, end, total, end)
+                self.chunk_started[key] = next(self._chunk_starts)
+            if end < total:
+                batch.incomplete_node_rids.add(rid)
+            else:
+                self.chunk_started.pop((rid, node), None)
+        self.cap_chunk_loops(batch)
+
+    def cap_chunk_loops(self, batch: ScheduledBatch) -> None:
+        """Cap the chunk Loop of each row of ``batch`` on its first chunk at
+        its whole input's length, which is what ends the Loop. A TP follower
+        caps from the leader's chunks: the cap decides on which step the Loop
+        ends, so every rank of the instance has to set the same one."""
+        node = batch.node_name
+        loop_walks = self.chunk_loop_walks.get(node, ())
+        capped = [
+            rid for rid, chunk in batch.chunk_ranges.items()
+            if runs_first_chunk(chunk) and batch.walk_of(rid) in loop_walks
+        ]
+        if capped:
+            walks = [batch.walk_of(rid) for rid in capped]
+            self.runtime.set_loop_caps(
+                node, capped, walks, [chunk_loop_name(node, walk) for walk in walks],
+                [batch.chunk_ranges[rid].total for rid in capped],
             )
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
@@ -1455,6 +1973,8 @@ class MicroScheduler:
         under ``exclude_target`` are outside it."""
         now = time.monotonic()
         for node_walk, batch in self.backlog.items():
+            if self._lane(node_walk) != CHAIN_LANE:
+                continue
             only_other = node_walk == exclude_target and exclude_walk is not None
             if node_walk == exclude_target and not only_other:
                 continue
@@ -1484,7 +2004,10 @@ class MicroScheduler:
         always False, so speculation can run every iter.
 
         Does NOT pop or modify queue state. Mirrors the ready-scan in
-        get_next_batch but stops at the first match.
+        get_next_batch but stops at the first match. Its engine readiness
+        checks are real ones, though: a resource may act on them (a LoRA pool
+        claims a slot for the row it calls ready, held until that row's admit
+        or removal), as it would for a row the scan schedules.
 
         Backlogged chunks count too: their graph nodes came off the queues
         when they were assembled, so the scan below cannot see them. A chunk
@@ -1628,6 +2151,10 @@ class MicroScheduler:
         self.failed_rids.discard(rid)
         self.read_failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
+        for key in [key for key in self.chunk_started if key[0] == rid]:
+            del self.chunk_started[key]
+        for key in [key for key in self.cached_prefix if key[0] == rid]:
+            del self.cached_prefix[key]
         self.held_until.pop(rid, None)
         for turns in self.last_ran.values():
             turns.pop(rid, None)

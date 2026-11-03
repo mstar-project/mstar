@@ -12,7 +12,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.accelerator_graph_config import (
@@ -68,11 +67,9 @@ class AuTEncoderSubmodule(NodeSubmodule):
     def feature_inputs(self, features: torch.Tensor) -> NodeInputs:
         """This node's inputs for one request's ``(num_mel_bins, frames)``
         features, already on the encoder's device and in its dtype."""
-        num_frames = int(features.shape[-1])
         return NodeInputs(
             tensor_inputs={"audio_features": features},
-            kwargs={"num_frames": num_frames},
-            input_seq_len=self.encoder.config.tokens_for_frames(num_frames),
+            input_seq_len=self.encoder.config.tokens_for_frames(features.shape[-1]),
         )
 
     def declare_step(
@@ -102,13 +99,8 @@ class AuTEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        lens = [inp.kwargs["num_frames"] for inp in inputs]
-        longest = max(lens)
-        padded = torch.stack([
-            F.pad(inp.tensor_inputs["audio_features"], (0, longest - n))
-            for inp, n in zip(inputs, lens, strict=True)
-        ])
-        return {"audio_features": padded, "feature_lens": lens}
+        # the clips as they are; the frontend packs their frames
+        return {"audio_features": [inp.tensor_inputs["audio_features"] for inp in inputs]}
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
@@ -118,7 +110,7 @@ class AuTEncoderSubmodule(NodeSubmodule):
         count. At ASR clip lengths (13 tokens a second) its GEMMs are a few
         dozen rows, so eager it is launch-bound: a 7 s clip's 24-layer stack
         is ~6.3 ms eager and ~1.9 ms replayed. The conv frontend before it
-        runs eagerly. Batches past the largest bucket run eagerly too."""
+        runs eagerly. A clip past the largest bucket runs eagerly, alone."""
         d_model = self.encoder.config.d_model
         attn_key = self.attn_key
 
@@ -153,18 +145,13 @@ class AuTEncoderSubmodule(NodeSubmodule):
     def _replay_encode(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, windows: list[int],
     ) -> torch.Tensor | None:
-        """The stack replayed for the whole packed batch, or None if not leased.
-
-        A leased step declares nothing (`declare_step`), so ``engine_inputs.step``
-        is None; a bucket that fits is not enough, as ``can_lease`` may have
-        refused the batch."""
-        runner = engine_inputs.piecewise_runners.get(AUT_ENCODE)
-        bs = len(engine_inputs.request_ids)
-        if runner is None or engine_inputs.step is not None or not runner.can_run(bs, int(hidden.shape[0])):
+        """The stack replayed for the whole packed batch, or None if not leased."""
+        if AUT_ENCODE not in engine_inputs.piecewise_leases:
             return None
+        bs = len(engine_inputs.request_ids)
         # an owned copy: the encoder states leave this worker after the step,
         # and the buffer is the next replay's
-        return runner.run(
+        return engine_inputs.piecewise_runners[AUT_ENCODE].run(
             static_inputs={"hidden": hidden},
             request_ids=list(engine_inputs.request_ids),
             seq_lens=windows,
@@ -172,34 +159,34 @@ class AuTEncoderSubmodule(NodeSubmodule):
         ).get("embeds")
 
     def _encode(
-        self, audio_features: torch.Tensor, feature_lens: list[int],
+        self, audio_features: list[torch.Tensor],
         engine_inputs: ModelInputsFromEngine | None = None,
     ) -> list[torch.Tensor]:
         enc = self.encoder
-        layout = enc.layout(feature_lens)
-        hidden = enc.frontend(audio_features, feature_lens)
+        layout = enc.layout([clip.shape[-1] for clip in audio_features])
+        hidden = enc.frontend(audio_features)
         embeds = None
         if engine_inputs is not None:
             embeds = self._replay_encode(engine_inputs, hidden, layout.window_lengths)
         if embeds is None:
-            cu = torch.tensor(layout.cu_seqlens, dtype=torch.int32, device=hidden.device)
-            embeds = enc.encode(hidden, cu)
+            embeds = enc.encode(hidden, layout.cu_seqlens)
         return list(embeds.split(layout.tokens_per_request, dim=0))
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        feature_lens: list[int],
+        audio_features: list[torch.Tensor],
         **kwargs,
     ) -> NameToTensorList:
-        if audio_features.dim() == 2:
-            audio_features = audio_features.unsqueeze(0)
-        return {"audio_embeds": [self._encode(audio_features, feature_lens, engine_inputs)[0]]}
+        return {"audio_embeds": [self._encode(audio_features, engine_inputs)[0]]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
+        # A packed step holds at most the largest capture's tokens. Past it the
+        # clips run one by one, each replayed if it fits a bucket, so an eager
+        # step's activations are one clip's rather than the whole batch's.
+        tokens = sum(inp.input_seq_len for inp in model_inputs)
+        return len(model_inputs) <= 1 or tokens <= self.ENCODE_TOKEN_BUCKETS[-1]
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         del graph_walk
@@ -209,11 +196,10 @@ class AuTEncoderSubmodule(NodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        feature_lens: list[int],
+        audio_features: list[torch.Tensor],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        per_request = self._encode(audio_features, feature_lens, engine_inputs)
+        per_request = self._encode(audio_features, engine_inputs)
         return {
             rid: {"audio_embeds": [emb]}
             for rid, emb in zip(engine_inputs.request_ids, per_request, strict=True)

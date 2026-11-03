@@ -4,11 +4,11 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -23,7 +23,8 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
-from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
+from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -41,27 +42,35 @@ from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_re
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
+from mstar.engine.resources.resident import ResidentPlanner, build_planner
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
     AdmitOutcome,
+    PerReqSetting,
 )
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    ARNodeSubmodule,
     BatchedModelOutput,
     BatchedStopCheck,
+    ChunkingPolicy,
     HostRows,
     InputMetadata,
+    InputSeqLenInfo,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     StepOrder,
     StopCheck,
+    StopPolicy,
+    engine_step,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -81,6 +90,7 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -98,6 +108,36 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
+
+
+@contextmanager
+def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
+    """Hold the caching allocator to ``gpu_memory_fraction`` while a node that
+    asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
+    The search tries workspaces as large as the device has free, and the
+    allocator keeps them until sizing's ``empty_cache``, past the share a
+    co-located worker plans around. A try past the cap fails and cuDNN
+    skips that algorithm. Any other allocation past it fails too, so the
+    boot fails when the node's eager step does not fit in the share."""
+    if fraction is None or not submodule_mgmt.submodule.capture_cudnn_benchmark:
+        yield
+        return
+    previous = torch.cuda.get_per_process_memory_fraction(device)
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
+@contextmanager
+def _outside_steps(submodule_mgmt) -> Iterator[None]:
+    """A node's forwards run outside any step (compile warm-ups), with each of its LoRA
+    pools as in a base-only step (``LoraAdapterPool.base_only``)."""
+    with ExitStack() as stack:
+        for pool in submodule_mgmt.lora_pools:
+            stack.enter_context(pool.base_only())
+        yield
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -128,6 +168,12 @@ class PagedKVCache(NamedTuple):
     cache: "KVManager"
 
 
+class _MeasuredRow(NamedTuple):
+    """What a prefix probe reads of a row before its inputs are prepared."""
+    input_seq_len: int
+    custom_pos_ids: None = None
+
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -143,6 +189,8 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # the node's request slots and device tables, where it runs on them
+    resident: ResidentPlanner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -160,6 +208,8 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
+    # the LoRA pools bound to the node's modules, set at bind
+    lora_pools: tuple = ()
 
     def __post_init__(self):
         # Two hazards want a second slot, both of them the host running ahead of
@@ -315,8 +365,21 @@ class ExecutingBatch:
     # whose stop check returned END_PARTITION; this step reports the partition done
     partition_done_rids: set[int] = field(default_factory=set)
 
+    # rid -> the part of a chunked row's input this step runs
+    chunk_ranges: Mapping[int, ChunkRange] = field(default_factory=dict)
+    # rows whose whole input this step prepared (`_prepare_chunk`), on their
+    # first chunk: a refused admit drops it, so the retry checks it again
+    first_chunk_rids: set[int] = field(default_factory=set)
+
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # the rows ``inputs`` holds, in order, as prepared; ``seq_len_of`` maps
+    # them to their tokens on first use
+    prepared_rids: tuple[int, ...] = ()
+    _seq_lens: dict[int, int] | None = field(default=None, repr=False)
+    # the one object every row shares, when the step was prepared with the
+    # submodule's ``uniform_row_inputs``
+    uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -408,8 +471,21 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
-    def register_prepare_batch(self, inputs: list[NodeInputs]):
+    def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
+        self._seq_lens = None
+        self.uniform_inputs = uniform
+
+    def seq_len_of(self, rid: int) -> int:
+        """The tokens ``rid`` runs this step; -1 before it is prepared."""
+        if self._seq_lens is None:
+            if self.inputs is None:
+                return -1
+            self._seq_lens = {
+                r: inp.input_seq_len
+                for r, inp in zip(self.prepared_rids, self.inputs, strict=True)
+            }
+        return self._seq_lens.get(rid, -1)
 
     def release_waiters(self):
         """Let anything waiting on this step proceed.
@@ -478,12 +554,15 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
+        side_stream_nodes: Collection[str] = (),
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
+        # nodes whose steps run beside the worker's chain (``EngineManager.build``)
+        self._side_stream_nodes = frozenset(side_stream_nodes)
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -495,7 +574,12 @@ class Engine:
         self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
+        # node -> the event after its plan stream's latest pre-plan; see
+        # ``_order_after_pre_plans``
+        self._pre_plan_done: dict[str, Any] = {}
         self._graph_runtime = graph_runtime
+        # chunked prefill: per-walk policies and budgets, and rows mid-prefill
+        self._chunking = ChunkingManagement(self._submodules)
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
         # Only a TP leader drains this, to replicate its resident set onto the
@@ -556,6 +640,7 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    compute_dtype=self._compute_dtype(submodules, relevant_nodes),
                     needs_remote_transfer=(
                         parallel_groups.resource_needs_remote_transfer(
                             spec.nodes, relevant_nodes
@@ -612,13 +697,36 @@ class Engine:
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
-            if getattr(submodule, "reads_device_loopback", False):
+            self._submodules[node_name].lora_pools = tuple(
+                resources[key] for key in getattr(submodule, "lora_keys", ())
+            )
+            loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
+            if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
-                # reads them back on the device (see NodeSubmodule)
-                for resource in resources.values():
-                    enable = getattr(resource, "enable_device_loopback_reader", None)
-                    if enable is not None:
-                        enable()
+                # reads them back on the device (see DeviceLoopback)
+                resources[loopback.sampler].enable_device_loopback_reader()
+
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
+        """Put ``node_name`` on resident tables if it can and the deployment
+        lets it; the startup log says why a node that named walks stays on the
+        host. In `order`, so an owner runs after what it depends on. Built here
+        because the tables are sized by the node's captures, and ahead of them
+        because a capture holds the tables' addresses."""
+        if knobs.resident_planning() == "off":
+            return
+        submodule_mgmt = self._submodules[node_name]
+        walks = submodule_mgmt.submodule.resident_walks()
+        if not walks:
+            return
+        resources = submodule_mgmt.resources
+        submodule_mgmt.resident, refused = build_planner(
+            node_name, walks,
+            {key: resources[key] for key in self._runner.order if key in resources},
+            self._resource_nodes, self._device, runner.max_capture_bs(walks),
+        )
+        if submodule_mgmt.resident is None:
+            logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        runner.bind_resident(submodule_mgmt.resident)
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -629,6 +737,12 @@ class Engine:
             for key, resource in self._resources.items()
             if isinstance(resource, KVManager)
         ]
+
+    def lora_pools(self) -> list["LoraAdapterPool"]:
+        """Every LoRA adapter pool this engine built, for runtime adapter loads."""
+        from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+        return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -675,16 +789,59 @@ class Engine:
                     node_name, exc_info=True
                 )
 
+    def _compute_dtype(
+        self, submodules: Mapping[str, NodeSubmodule], nodes: Collection[str],
+    ) -> torch.dtype | None:
+        """The dtype ``nodes`` were cast to and run in, or None if they differ or one keeps
+        its own (``disable_autocast``)."""
+        dtypes = {resolve_node_dtype(submodules[n], self._autocast_dtype) for n in nodes}
+        return dtypes.pop() if len(dtypes) == 1 else None
+
+    def _compile_regions(self) -> None:
+        """Compile and warm each node's ``compile_regions`` with dynamic=True
+        (a whole-forward compile uses dynamic=None) in torch.compile's default
+        mode: the compile level (``MSTAR_COMPILE_LEVEL``) tunes captured
+        forwards, whose shapes are fixed per bucket."""
+        if not self.device_capability.is_available:
+            return
+        for node_name, submodule_mgmt in self._submodules.items():
+            submodule = submodule_mgmt.submodule
+            regions = submodule.compile_regions()
+            if regions and not submodule.disable_torch_compile:
+                raise ValueError(
+                    f"{node_name} declares compile_regions but its forward is compiled whole; "
+                    "set disable_torch_compile"
+                )
+            for path, examples in regions.items():
+                owner_path, _, name = path.rpartition(".")
+                owner = submodule
+                for part in filter(None, owner_path.split(".")):
+                    owner = getattr(owner, part)
+                target = getattr(owner, name)
+                if isinstance(target, torch.nn.Module):
+                    owner, name, target = target, "forward", target.forward
+                # an instance attribute shadows the method for every caller
+                setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
+                with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
+                    self._autocast_dtype_for(node_name), self._device.type, node_name,
+                ), _outside_steps(submodule_mgmt):
+                    for args in examples:
+                        getattr(owner, name)(*args)
+                logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
+
     def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
+        # before capture: a region inside a captured graph compiles in its warm-up
+        self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            ag_runners[node_name] = AcceleratorGraphRunner(
+            capture_stream = self._capture_stream_for(node_name)
+            runner = ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -695,9 +852,11 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
             )
+            self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
-                node_name, submodule_mgmt
+                node_name, submodule_mgmt, capture_stream,
             )
 
         # Every runner claims its static buffers before any of them captures:
@@ -711,6 +870,8 @@ class Engine:
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
         plan = self._plan_captures(ag_runners, piecewise)
+        for resource in self._resources.values():
+            resource.seal_capture_buffers()
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
@@ -758,7 +919,7 @@ class Engine:
         # graph runner compiles internally
         self._compile_submodules()
         for submodule_mgmt in self._submodules.values():
-            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+            with fp32_precision_scope(submodule_mgmt.fp32_precision), _outside_steps(submodule_mgmt):
                 submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
@@ -780,8 +941,11 @@ class Engine:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
-                # sizing runs the forwards and captures, so under the node's precision too
-                with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                # sizing runs the forwards and captures, so under the node's precision too,
+                # and it runs a node's only warm-up forwards, where cuDNN can time its convs
+                with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device), \
+                        cudnn_benchmark(submodule_mgmt.submodule.capture_cudnn_benchmark):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
@@ -846,8 +1010,22 @@ class Engine:
             took / 2**20, plan.predicted[pool] / 2**20,
         )
 
+    def _capture_stream_for(self, node_name: str) -> Any:
+        """The stream a node captures on; None for the backend's shared one.
+
+        Graphs captured on one stream share what the capture ties to it, so two
+        of them must never run at once. On the chain they can't, but a node
+        whose steps run beside it can overlap any graph of any other node, and
+        with a shared capture stream that silently changes the other graph's
+        result.
+        """
+        backend = self.device_capability.graph_backend
+        if node_name not in self._side_stream_nodes or backend is None or not backend.is_available():
+            return None
+        return backend.new_stream()
+
     def _build_piecewise_runners(
-        self, node_name: str, submodule_mgmt: SubmoduleManagement,
+        self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
     ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
         """One runner per region the submodule declares, not yet captured.
 
@@ -883,6 +1061,8 @@ class Engine:
                 node_name=node_name,
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
+                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner
         return runners
@@ -1027,7 +1207,8 @@ class Engine:
             batch.node_name, (),
         )
         loopback = self._loopback_rows(batch)
-        if not mixed and walk not in keyed_walks:
+        # a chunked row is cut from its whole input, so no uniform path
+        if not mixed and walk not in keyed_walks and not batch.chunk_ranges:
             uniform = submodule.uniform_row_inputs(
                 walk, has_loopback=loopback is not None and all(loopback),
             )
@@ -1036,7 +1217,8 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
-                batch.register_prepare_batch(node_inputs)
+                batch.register_prepare_batch(node_inputs, uniform=uniform)
+                batch.prepared_rids = tuple(batch.request_ids)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
                 )
@@ -1046,7 +1228,15 @@ class Engine:
         for i, rid in enumerate(batch.request_ids):
             row_walk = walk_of(rid) if mixed else walk
             probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
+            chunk = batch.chunk_ranges.get(rid)
             try:
+                if chunk is not None:
+                    req_inputs = self._prepare_chunk(batch, rid, row_walk, chunk)
+                    if req_inputs is None:
+                        batch.skipped_rids.add(rid)
+                    else:
+                        node_inputs.append(req_inputs)
+                    continue
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
@@ -1073,7 +1263,9 @@ class Engine:
                 node_inputs.append(req_inputs)
 
         batch.register_prepare_batch(node_inputs)
+        self._chunking.check_budget(batch, node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
+        batch.prepared_rids = tuple(batch.request_ids)
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
@@ -1124,6 +1316,73 @@ class Engine:
             return {}
         return mgmt.submodule.inline_client_signals(graph_walk)
 
+    def _prepare_chunk(
+        self, batch: ExecutingBatch, rid: int, walk: str, chunk: ChunkRange,
+    ) -> NodeInputs | None:
+        """One chunk of a row's input, cut from the whole input prepared once
+        on its first chunk and kept until the last one lands
+        (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any.
+
+        Raises when the prepared input is not the length the scheduler cut it
+        by (``get_input_sequence_len`` disagreeing with ``prepare_inputs``):
+        its chunks would miss tokens or run past the end, so the row fails."""
+        submodule = self._submodules[batch.node_name].submodule
+        key = (rid, batch.node_name)
+        full = self._chunking.prepared.get(key)
+        start, end, total = chunk.start, chunk.end, chunk.total
+        if full is None:
+            full = submodule.prepare_inputs(
+                graph_walk=walk,
+                fwd_info=batch.per_request_info_wrapped[rid],
+                inputs=batch.per_request_input_tensors.get(rid, {}),
+                resources=self._submodules[batch.node_name].resources,
+                is_final_stream_chunk=rid in batch.final_stream_rids,
+                input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
+            )
+            if full is None:
+                return None
+            if full.input_seq_len != total:
+                raise RuntimeError(
+                    f"{batch.node_name}/{walk}: the row was measured at {total} tokens "
+                    f"and chunked by that, but its prepared inputs hold {full.input_seq_len}"
+                )
+            if walk in self._keyed_walks.get(batch.node_name, ()):
+                # a first chunk starts past what `input_sequence_len` matched;
+                # the probe answers the same again, now checked against the prepared inputs
+                prefix = None
+                policy = self._chunking.policy(batch.node_name, walk)
+                declines = (
+                    policy.reuses_cached_prefix is not None
+                    and not policy.reuses_cached_prefix(batch.per_request_info_wrapped[rid])
+                )
+                if not declines and self._prefix_cuttable(full, batch.node_name, walk):
+                    prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, full)
+                matched = prefix.tokens if prefix is not None else 0
+                if matched != start:
+                    if start:
+                        raise RuntimeError(
+                            f"{batch.node_name}/{walk}: the row's chunks start past a "
+                            f"{start}-token cached prefix, but its prepared inputs match {matched}"
+                        )
+                    # Measured with no hit, and another request's pages landed
+                    # while it waited. Its chunks are cut from 0, so decline the
+                    # hit, keeping the chain so the row still keys its own pages.
+                    prefix = prefix._replace(tokens=0, position=prefix.position - prefix.tokens)
+                # a declined or uncuttable walk writes over the lease (prefix None)
+                self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
+            self._chunking.prepared[key] = full
+            batch.first_chunk_rids.add(rid)
+        part = submodule.split_inputs(
+            walk, batch.per_request_info_wrapped[rid], full, start, end,
+        )
+        part.graph_walk = walk
+        part.chunk_start = start
+        part.chunk_total = full.input_seq_len
+        return part
+
+    def release_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunking.release(rid, node_name)
+
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
@@ -1138,28 +1397,49 @@ class Engine:
         if batch.committed is not None:
             self._runner.after_output_copy(batch.committed)
 
-    def extend_prefix_chains(
+    def step_finished(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
-        host_rows: HostRows | None = None,
+        host_rows: HostRows | None = None, skip_rids: Collection[int] = (),
     ) -> None:
-        """Key what this step generated, from the stop check's host copy."""
+        """A step's outputs are on the host (the stop check's copy) and its
+        stops not yet decided: so a request ending here has its state up to
+        date, e.g. its pages indexed for prefix reuse. ``skip_rids`` as for
+        ``extend_prefix_chains``."""
+        self.extend_prefix_chains(batch, outputs, host_rows=host_rows, skip_rids=skip_rids)
+
+    def extend_prefix_chains(
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
+        host_rows: HostRows | None = None,
+        skip_rids: Collection[int] = (),
+    ) -> None:
+        """Key what this step generated, from the stop check's host copy.
+
+        ``skip_rids`` names rows whose sampled token is not a real sample -- a
+        prompt's non-final chunk -- so keying the chain on it would key a
+        token the request never generated.
+        """
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
+        rids = batch.request_ids
+        if skip_rids:
+            rids = [rid for rid in rids if rid not in skip_rids]
+            if not rids:
+                return
         # The batch call keys each row under its own walk, so a combined-walk
         # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
             ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name,
+                rids, batch.node_name,
                 # a step of one walk passes the walk: no call per row
                 ctx.walk_of if ctx.request_walks else ctx.graph_walk,
                 host_rows, outputs, keys=keys,
             )
             return
-        for rid in batch.request_ids:
+        for rid in rids:
             per_rid = outputs.get(rid)
-            if isinstance(per_rid, dict):
+            if isinstance(per_rid, Mapping):
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
@@ -1246,14 +1526,7 @@ class Engine:
         walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
-        assert isinstance(inputs, ARNodeInputs), (
-            f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
-            "for prefix reuse, but that walk's inputs are not a sequence to cut"
-        )
-        submodule = self._submodules[batch.node_name].submodule
-        if inputs.kwargs or inputs.resource_step_info or (
-            inputs.tensor_inputs and not getattr(submodule, "cuts_tensor_inputs", False)
-        ):
+        if not self._prefix_cuttable(inputs, batch.node_name, walk):
             self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs
         prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
@@ -1266,9 +1539,22 @@ class Engine:
         if matched >= inputs.input_seq_len:
             batch.cached_rids.add(rid)
             return None
-        return submodule.split_inputs(
+        return self._submodules[batch.node_name].submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
+        )
+
+    def _prefix_cuttable(self, inputs: NodeInputs, node_name: str, walk: str) -> bool:
+        assert isinstance(inputs, ARNodeInputs), (
+            f"{self._prefix_model} keys the {walk!r} walk of {node_name} "
+            "for prefix reuse, but that walk's inputs are not a sequence to cut"
+        )
+        submodule = self._submodules[node_name].submodule
+        return not (
+            inputs.kwargs or inputs.resource_step_info or (
+                inputs.tensor_inputs
+                and not getattr(submodule, "cuts_tensor_inputs", False)
+            )
         )
 
     def exec(
@@ -1359,7 +1645,7 @@ class Engine:
         inputs = batch.inputs
         req_info = batch.per_request_info_wrapped
         if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, req_info
             )
@@ -1455,11 +1741,14 @@ class Engine:
     def _exec_per_request(
         self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
-        """Full step cycle per request, eager (no lease), outputs merged.
+        """Full step cycle per request, without a whole-forward lease, outputs merged.
 
-        The unbatchable fallback: no capture applies (a lease would have set
-        ``running_batched``), so each request declares/admits/plans/commits on
-        its own, keeping the plan matched to its single-request forward.
+        The unbatchable fallback: no whole-forward capture applies (a lease
+        would have set ``running_batched``), so each request declares/admits/
+        plans/commits on its own, keeping the plan matched to its
+        single-request forward. Each request still takes its own
+        piecewise-region leases in ``_declare_and_admit``, so a captured inner
+        loop can replay per request.
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
@@ -1512,47 +1801,58 @@ class Engine:
         )
         slot_events: dict[int, Any] = {}
 
-        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
-            req_info = {rid: batch.per_request_info_wrapped[rid]}
-            slot = ctxs[rid].slot
-            submodule_mgmt.set_piecewise_slot(slot)
-            in_flight = slot_events.get(slot)
-            if in_flight is not None:
-                in_flight.synchronize()
+        # a raise outside the per-rid try fails the batch; the drain and
+        # `commit_done` still run
+        try:
+            for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+                req_info = {rid: batch.per_request_info_wrapped[rid]}
+                slot = ctxs[rid].slot
+                submodule_mgmt.set_piecewise_slot(slot)
+                in_flight = slot_events.get(slot)
+                if in_flight is not None:
+                    in_flight.synchronize()
 
-            if nvtx:
-                range_push(f"engine.per_request.{rid}")
-            try:
-                raw, _ = self._drive_step(
-                    batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
-                    lease=None, running_batched=False,
-                    step=steps[rid], set_launch=not launched,
-                )
-                if raw is None:
-                    continue
-                launched = True
-                if fence:
-                    slot_events[slot] = torch.Event(device=self._device)
-                    slot_events[slot].record()
-
-                merged.update(self._collect_outputs(
-                    submodule_mgmt, None, raw, [inp], req_info,
-                    request_ids=[rid], step_request_ids=(rid,),
-                    graph_walk=batch.step_context.graph_walk,
-                ))
-            finally:
                 if nvtx:
-                    range_pop()
+                    range_push(f"engine.per_request.{rid}")
+                try:
+                    raw, _ = self._drive_step(
+                        batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
+                        lease=None, running_batched=False,
+                        step=steps[rid], set_launch=not launched,
+                    )
+                    if raw is None:
+                        continue
+                    launched = True
 
-        # Releasing `commit_done` lets the plan thread pre-plan the next batch,
-        # which stages `next_slot` while this batch's work may still be queued.
-        # Only that slot needs draining: every other one the loop touched is
-        # re-consumed a batch or more later, by which point the worker has
-        # synced on this step.
-        event = slot_events.get(submodule_mgmt.next_slot)
-        if event is not None:
-            event.synchronize()
-        batch.commit_done.set()
+                    merged.update(self._collect_outputs(
+                        submodule_mgmt, None, raw, [inp], req_info,
+                        request_ids=[rid], step_request_ids=(rid,),
+                        graph_walk=batch.step_context.graph_walk,
+                    ))
+                except Exception as error:
+                    # this rid fails alone, as in prepare_inputs, and keeps its
+                    # admitted state (which queued kernels may still write) until
+                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # rank raises here.
+                    batch.register_failure(rid, error)
+                finally:
+                    # on every exit: a raise after plan can leave this slot's
+                    # staging copy queued
+                    if fence:
+                        slot_events[slot] = torch.Event(device=self._device)
+                        slot_events[slot].record()
+                    if nvtx:
+                        range_pop()
+        finally:
+            # Releasing `commit_done` lets the plan thread pre-plan the next
+            # batch, which stages `next_slot` while this batch's work may still
+            # be queued. Only that slot needs draining: every other one the loop
+            # touched is re-consumed a batch or more later, by which point the
+            # worker has synced on this step.
+            event = slot_events.get(submodule_mgmt.next_slot)
+            if event is not None:
+                event.synchronize()
+            batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
         if (
@@ -1585,7 +1885,8 @@ class Engine:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
-                step = submodule.declare_step(
+                step = engine_step(
+                    submodule,
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
@@ -1599,6 +1900,19 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
+        if batch.chunk_ranges:
+            walk_of = batch.step_context.walk_of
+            ctx.chunk_tokens_after = {
+                rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
+                for rid, inp in zip(rids, inputs, strict=True)
+                if not inp.is_final_chunk
+            }
+            ctx.reserve_whole_prefill = PerReqSetting.over(
+                ctx.chunk_tokens_after,
+                lambda rid: self._chunking.policy(
+                    batch.node_name, walk_of(rid),
+                ).reserve_whole_prefill,
+            )
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -1617,6 +1931,10 @@ class Engine:
             batch.register_admit_error(
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
+            # A retry prepares the row again, so its length and cached prefix
+            # are checked against the pages it then finds, not the ones before.
+            for rid in batch.first_chunk_rids:
+                self._chunking.release(rid, batch.node_name)
         return admit_outcome, step
 
     def _maybe_lease_piecewise_regions(
@@ -1642,7 +1960,7 @@ class Engine:
         leases = {}
         for label, runner in runners.items():
             # a batch the region refuses runs it eagerly, with no slot
-            if not runner.lease_before_step or not runner.can_lease(inputs):
+            if not runner.lease_before_step or not runner.can_lease(inputs, ctx.request_ids):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
@@ -1675,7 +1993,7 @@ class Engine:
         rids = list(ctx.padded_request_ids)
 
         if step is not None:
-            if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
+            if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
                 # The slot was leased from `cg_key_info` before the step was
                 # declared. If the two disagree the replay runs a graph that
                 # was planned for a different declaration — silently wrong
@@ -1686,6 +2004,15 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # before any copy this plan issues, the resident stage's included
+            self._order_after_pre_plans()
+            # promoted and inline plans per resource, apart
+            plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
+            if ctx.resident is not None:
+                ctx.plan_phase = plan_phase
+                t0 = phase_start()
+                ctx.resident.plan(step, ctx)
+                phase_end(f"{plan_phase}.resident", t0)
 
             # Admit was already done, can move on straight to plan
             if nvtx:
@@ -1696,7 +2023,7 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                self._runner.plan(step)
+                self._runner.plan(step, plan_phase)
             finally:
                 phase_end(
                     "engine.plan.promoted" if batch.preplan_event is not None
@@ -1712,6 +2039,7 @@ class Engine:
             per_request_info=req_info,
             resources=submodule_mgmt.resources,
             piecewise_runners=submodule_mgmt.piecewise_runners,
+            piecewise_leases=ctx.piecewise_leases,
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
@@ -1764,6 +2092,8 @@ class Engine:
             try:
                 self._runner.commit(step)
                 batch.committed = step
+                if submodule_mgmt.resident is not None:
+                    submodule_mgmt.resident.commit(step, ctx)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -1788,8 +2118,12 @@ class Engine:
         the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
+            ctx = batch.step_context
+            if ctx.resident is not None:
+                ctx.resident.flush(ctx.resident_plan)
             return cg_runner.run_forward(
-                lease, preprocessed, plan_done_event=batch.preplan_event,
+                lease, preprocessed,
+                plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -1835,7 +2169,12 @@ class Engine:
     ) -> None:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
+        failed = batch.failed_requests
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
+            if failed and rid in failed:
+                # its per-request forward raised: nothing to finish, and a
+                # second raise here would replace the error the client gets
+                continue
             try:
                 submodule.postprocess(
                     request_id=rid,
@@ -1899,8 +2238,15 @@ class Engine:
         laps.lap("tail")
         return outputs
 
+    def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
+        """The node's declared stop policies on ``graph_walk``
+        (``NodeSubmodule.get_stop_policies``); None when ``check_stop``
+        decides, or the node has no submodule here."""
+        mgmt = self._submodules.get(node_name)
+        return None if mgmt is None else mgmt.submodule.get_stop_policies(graph_walk)
+
     def check_stop_for_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
@@ -2060,6 +2406,11 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
+        # A row that ran nothing this step -- one the prefix cache served whole
+        # -- has no iteration here to publish, though its loop still stops.
+        request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
+        if not request_ids:
+            return
         published = self._runner.publish_after_stop(
             request_ids,
             node_name=batch.node_name,
@@ -2294,10 +2645,13 @@ class Engine:
 
     def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
         """Whether ``capture_group`` can tell this walk's requests apart: the
-        submodule opts in and the walk has a capture."""
+        submodule opts in and the node captures, the walk's whole forward or
+        any piecewise region (a region is not tied to a walk)."""
         submodule_mgmt = self._submodules[node_name]
         if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
             return False
+        if submodule_mgmt.piecewise_runners:
+            return True
         cg_runner = submodule_mgmt.accelerator_graph_runner
         return cg_runner is not None and cg_runner.captures_walk(graph_walk)
 
@@ -2308,19 +2662,17 @@ class Engine:
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
-        does not split by it.
+        does not split by it. On a node whose only capture is a piecewise
+        region it is a scheduler group, not a bucket.
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
         (``split_batches_by_capture_key``). ``input_metadata`` is the step's
         input facts the lease will see, e.g. the stream chunk it consumes.
         """
+        if not self.splits_by_capture_key(node_name, graph_walk):
+            return None
         submodule_mgmt = self._submodules[node_name]
-        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
-            return None
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
-            return None
         if input_metadata is None:
             return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
         return submodule_mgmt.submodule.cg_key_info(
@@ -2406,6 +2758,71 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
+        return self._chunking.max_batch_tokens(node_name, graph_walk)
+
+    def set_token_budgets(
+        self, overrides: Mapping[str, Any], walks: set[str],
+        combined_walk_of: Mapping[tuple[str, str], str] | None = None,
+        override_mixed: Collection[str] = (),
+        no_chunking: Collection[str] = (),
+        min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS,
+    ) -> None:
+        self._chunking.set_budgets(
+            overrides, walks, combined_walk_of, override_mixed, no_chunking,
+            min_chunk_tokens,
+        )
+
+    def min_chunk_tokens(self, budget: int) -> int:
+        return self._chunking.min_chunk_tokens(budget)
+
+    def set_chunking_policies(
+        self, policies: Mapping[tuple[str, str], ChunkingPolicy],
+    ) -> None:
+        self._chunking.set_policies(policies)
+
+    def walk_token_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
+        return self._chunking.walk_caps(node_name, graph_walk)
+
+    def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
+        return self._chunking.chunkable(node_name, graph_walk)
+
+    def declares_input_sequence_len(self, node_name: str) -> bool:
+        """Whether the node's submodule reports row lengths before prepare."""
+        impl = type(self._submodules[node_name].submodule).get_input_sequence_len
+        return impl is not NodeSubmodule.get_input_sequence_len
+
+    def input_sequence_len(
+        self, node_name: str, graph_walk: str,
+        request_info: CurrentForwardPassInfo, inputs: NameToTensorList,
+        rid: int | None = None,
+    ) -> InputSeqLenInfo | None:
+        """A row's length; a chunkable keyed row's leaves out the prefix the
+        cache holds, which ``rid``'s lease keeps until its first chunk applies it.
+        A row the cache holds whole measures 0, so the budget never cuts it and
+        prepare serves it (`_skip_cached_prefix`): a chunk cut from 0 would
+        write over the lease the walks before it were served from."""
+        submodule = self._submodules[node_name].submodule
+        info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        policy = self._chunking.policy(node_name, graph_walk)
+        if (
+            info is None or rid is None
+            or graph_walk not in self._keyed_walks.get(node_name, ())
+            # the manager's, not the policy's: a walk the deployment does not
+            # chunk is never cut, so it starts at its first token
+            or not self._chunking.chunkable(node_name, graph_walk)
+            or (policy.reuses_cached_prefix is not None
+                and not policy.reuses_cached_prefix(request_info))
+        ):
+            return info
+        prefix = self._runner.resolve_cached_prefix(
+            rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
+        )
+        matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
+        if matched <= 0:
+            return info
+        return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
+
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -2465,23 +2882,37 @@ class Engine:
         # business (bagel: guidance on/off) — and the lease is taken before the
         # step is declared, so the submodule is asked directly. It answers from
         # the same per-request facts its `declare_step` stamps on the step.
-        batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
+        key = submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info_wrapped,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
-        lease = cg_runner.lease_slot(
-            graph_walk=batch.step_context.graph_walk,
-            bs=len(batch.request_ids),
-            slot=batch.slot,
-            num_tokens=(
-                None if batch.inputs is None
-                else sum(inp.input_seq_len for inp in batch.inputs)
-            ),
-            cg_key_info=batch.cg_key_info,
+        num_tokens = (
+            None if batch.inputs is None
+            else sum(inp.input_seq_len for inp in batch.inputs)
         )
+        lease = None
+        pools = submodule_mgmt.lora_pools
+        if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
+            # no row names an adapter: the graph captured without LoRA kernels, when
+            # there is one (the pool checks the rows again at plan)
+            batch.cg_key_info = LoraBaseOnly(key)
+            lease = cg_runner.lease_slot(
+                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
+                slot=batch.slot, num_tokens=num_tokens, cg_key_info=batch.cg_key_info,
+            )
+        if lease is None:
+            batch.cg_key_info = key
+            lease = cg_runner.lease_slot(
+                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
+                slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
+            )
+        planner = submodule_mgmt.resident
+        ctx = batch.step_context
+        ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
+        ctx.resident_plan = None
         if lease is not None:
             batch.lease_slot(lease)
-            batch.step_context.force_prefill = cg_runner.is_packed(lease)
+            ctx.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
@@ -2496,6 +2927,14 @@ class Engine:
         if mgmt is None or mgmt.accelerator_graph_runner is None:
             return False
         return any(r.supports_preplan for r in mgmt.resources.values())
+
+    def speculative_input_seq_len(
+        self, node_name: str, graph_walk: str,
+        fwd_info: CurrentForwardPassInfo | None, prev_seq_len: int,
+    ) -> int | None:
+        return self._submodules[node_name].submodule.speculative_input_seq_len(
+            graph_walk, fwd_info, prev_seq_len,
+        )
 
     def pre_plan_for_batch(self, batch: ExecutingBatch) -> bool:
         """Admit and plan the pre-planning resources a step ahead.
@@ -2545,14 +2984,15 @@ class Engine:
         inputs = (
             cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs)
+            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
         )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
         laps.lap("pad")
         t0 = phase_start()
-        step = submodule_mgmt.submodule.declare_step(
+        step = engine_step(
+            submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
@@ -2583,16 +3023,47 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with stream if stream is not None else nullcontext():
-                self._runner.pre_plan(step)
+            ctx = batch.step_context
+            event = torch.Event(device=self._device)
+            try:
+                with stream if stream is not None else nullcontext():
+                    self._order_after_pre_plans()
+                    # A raise here takes what a raise from `pre_plan` below takes:
+                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # stays with its streams for exec's admit to find.
+                    if ctx.resident is not None:
+                        ctx.plan_phase = "res.pre_plan"
+                        t0 = phase_start()
+                        ctx.resident.plan(step, ctx)
+                        phase_end("res.pre_plan.resident", t0)
+                    self._runner.pre_plan(step)
+            finally:
+                # recorded even when the plan raised: its copies are in flight
+                event.record(stream)
+                self._pre_plan_done[batch.node_name] = event
             laps.skip()
-            batch.preplan_event = torch.Event(device=self._device)
-            batch.preplan_event.record(stream)
+            batch.preplan_event = event
             batch.preplanned_rids = tuple(batch.request_ids)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
+
+    def _order_after_pre_plans(self) -> None:
+        """Order the current stream after every copy a pre-plan has issued.
+
+        Resources skip a copy into a slot's buffer that already holds the
+        bytes (``H2DMirror``, ``_SlotBuffer.zero_prefix``), recorded when the
+        copy is issued. A pre-plan's copy runs on its node's plan stream, and
+        the pre-plan may be dropped before its batch runs, so nothing else
+        orders a later step that skips its own copy, or overwrites the buffer,
+        after it. Every plan stream is waited on, not just this node's: nodes
+        can share a resource and its slot buffers."""
+        events = tuple(self._pre_plan_done.values())
+        if events:
+            stream = torch.accelerator.current_stream(self._device)
+            for event in events:
+                stream.wait_event(event)
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""
@@ -2635,10 +3106,14 @@ class Engine:
     # worker's; the resources only move their own state. A node's resources
     # are reclaimed together, so a request is either resident or not.
 
-    def evictable(self, node_name: str) -> bool:
+    def evictable(self, node_name: str, resources: "Collection[str] | None" = None) -> bool:
+        """Whether offloading a request can free anything on ``node_name``, or, given
+        ``resources``, anything of those (a LoRA pool, say, never evicts)."""
+        owned = self._submodules[node_name].resources
         return any(
             resource.supports_eviction
-            for resource in self._submodules[node_name].resources.values()
+            for key, resource in owned.items()
+            if resources is None or key in resources
         )
 
     def is_offloaded(self, node_name: str, request_id: str) -> bool:
@@ -2664,11 +3139,19 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        if freed > 0:
+            self._release_resident_slot(node_name, request_id)
+            if node_name in self._resident_delta:
+                self._resident_delta[node_name].add_offloaded(
+                    self._graph_runtime.get_rid_string(request_id)
+                )
         return freed
+
+    def _release_resident_slot(self, node_name: str, request_id: int) -> None:
+        """An offloaded request needs no slot: a reload is written whole anyway."""
+        planner = self._submodules[node_name].resident
+        if planner is not None:
+            planner.release(request_id)
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
@@ -2801,6 +3284,7 @@ class Engine:
                             wire_rid, node_name, len(delta),
                         )
                         return False
+                    self._release_resident_slot(node_name, rid)
                     logger.info(
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
@@ -2897,8 +3381,11 @@ class Engine:
             if resource.reclaimable(request_id)
         }
         self._runner.remove_request(request_id)
+        self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+            if submodule_mgmt.resident is not None:
+                submodule_mgmt.resident.release(request_id)
         return freed
 
     def shutdown(self):

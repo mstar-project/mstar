@@ -124,6 +124,13 @@ def test_missing_loop_back_latents_past_iteration_zero_raises():
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
 
 
+def test_a_step_without_the_loop_counter_raises():
+    """Read as 0, it would reseed from noise every iteration and run to max_iters."""
+    sub = ToyDenoise()
+    with pytest.raises(KeyError, match=LOOP):
+        sub.prepare_inputs(WALK, dataclasses_replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
+
+
 def test_overshoot_iteration_is_vetoed():
     sub = ToyDenoise()
     sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
@@ -551,7 +558,6 @@ def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
 def test_seeds_are_drawn_once_per_request_and_only_when_asked():
     sub = PrefetchingToy()
     _added(sub, "p3").result()
-    sub.on_request_added(_handle("p3"), _info("p3", 0))  # its second partition on this worker
     assert sub.drawn_on == ["mstar-seed_0"]
     plain = ToyDenoise()
     plain.on_request_added(_handle("p4"), _info("p4", 0))

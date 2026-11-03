@@ -19,10 +19,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import (
-    EdgeSpec,
     GraphRuntime,
     SpeculationOutput,
     SpeculationPrepInput,
@@ -122,29 +122,36 @@ class SpeculationPreparer:
     def prepare(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None = None,
     ) -> PreparedSpeculation:
+        """``loop_strides``: ``candidates``' in N (``RouteInput.loop_strides``),
+        which decide whose loop N ends."""
         if self.rows_eligible():
             return self._prepare_rows(
                 batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+                loop_strides,
             )
         return self._prepare_dicts(
             batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+            loop_strides,
         )
 
     def _prepare_rows(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         ctx = self._ctx
         rows = ctx.graph_runtime.prep_spec_rows(
             spec_node_name, batch_N.node_name, graph_walk, candidates, max_continuing,
+            loop_strides,
         )
         laps.lap("prep_spec_rows")
         prep = PreparedSpeculation(rows.ready_rids, rows.spec_id, rows.wg_id)
         if rows.input_edges is not None and rows.ready_rids:
             # an input that is not the in-flight step's: per-row dicts
-            prep.per_request_inputs.update(rows.input_edges.to_input_tensors(
-                ctx.tensor_manager.get_tensor, rows.ready_rids,
+            prep.per_request_inputs.update(ctx.streams.input_tensors(
+                rows.input_edges, spec_node_name, rows.ready_rids,
             ).by_rid)
             prep.request_to_worker_graph.update(dict.fromkeys(rows.ready_rids, rows.wg_id))
             prep.rows_wg_id = None
@@ -153,12 +160,12 @@ class SpeculationPreparer:
     def _prepare_dicts(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         """``prep_spec_rids`` with the stream polls, filling the per-row dicts
         for the ready rids."""
         ctx = self._ctx
         streams = ctx.streams
-        # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
         if streams.possible():
@@ -175,14 +182,9 @@ class SpeculationPreparer:
             graph_walk=graph_walk,
             rids=candidates,
             room_for_continuing=max_continuing,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
+            loop_strides=loop_strides,
         ))
         laps.lap("prep_spec_rids")
 
@@ -199,8 +201,8 @@ class SpeculationPreparer:
 
         # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
         # an empty mapping -- what slicing a zero-length run used to give.
-        prepped_inputs = out.input_edges.to_input_tensors(
-            ctx.tensor_manager.get_tensor, out.ready_rids,
+        prepped_inputs = streams.input_tensors(
+            out.input_edges, spec_node_name, out.ready_rids,
         ).by_rid
         for i, r in enumerate(out.ready_rids):
             prep.per_request_inputs[r] = prepped_inputs[r]
@@ -225,14 +227,20 @@ class SpeculationBuilder:
         self, pending: PendingBatch, spec_target: SpeculationOutput,
         prep: PreparedSpeculation, other_walks: dict[int, str],
         fresh_final_edges: dict[int, set[str]],
+        chunk_ranges: dict[int, ChunkRange] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """The speculation from ``prep`` plus the fresh rows merged into its
         per-row dicts; ``other_walks`` maps the fresh rows of another walk (a
         mixing chain) to theirs, and ``fresh_final_edges`` the fresh rows whose
         final stream chunk was ingested before this step to its edges."""
-        if prep.rows_wg_id is not None and not other_walks and not fresh_final_edges:
+        if (
+            prep.rows_wg_id is not None and not other_walks and not fresh_final_edges
+            and not chunk_ranges
+        ):
             # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk takes the general assembly, which carries it
+            # stream chunk, or a cut chunk, takes the general assembly, which
+            # carries it
             return self.assemble_rows(
                 pending, spec_target, prep.ready_rids, prep.rows_wg_id,
                 fresh_request_to_worker_graph=prep.request_to_worker_graph,
@@ -255,6 +263,7 @@ class SpeculationBuilder:
             request_walks={
                 **dict.fromkeys(request_to_worker_graph, spec_target.graph_walk), **other_walks,
             } if other_walks else None,
+            chunk_ranges=chunk_ranges, incomplete_node_rids=incomplete_node_rids,
         )
 
     def assemble(
@@ -271,6 +280,8 @@ class SpeculationBuilder:
         spec_id: int = 0,
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
+        chunk_ranges: dict[int, ChunkRange] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order, which ``make_executing_batch``
         reorders for a split walk) into the ``Speculation`` the main loop runs.
@@ -292,6 +303,8 @@ class SpeculationBuilder:
             graph_walk=label,
             request_to_worker_graph=request_to_worker_graph,
             request_walks=request_walks,
+            chunk_ranges=dict(chunk_ranges) if chunk_ranges else {},
+            incomplete_node_rids=set(incomplete_node_rids) if incomplete_node_rids else set(),
             # Resolved here, on the main thread, so the GPU thread never asks
             # the runtime, which may be mid-call with the GIL released.
             walk_output_signals={
@@ -317,13 +330,14 @@ class SpeculationBuilder:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_edges={
-                rid: {se.edge.name for se in edges if se.chunk.is_final}
+                rid: {se.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
             } | fresh_final_edges,
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
             engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
+            chunk_ranges=chunk_ranges,
         )
         return Speculation(
             scheduled_batch=spec_batch,

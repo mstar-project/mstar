@@ -29,6 +29,7 @@ import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire ta
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage  # noqa: E402
 from mstar.communication import wire  # noqa: E402
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig  # noqa: E402
@@ -112,6 +113,7 @@ def _engine(resources=(), sub=None, keyed=False) -> Engine:
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"
+    eng._chunking = ChunkingManagement(eng._submodules)
     return eng
 
 
@@ -349,7 +351,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._execute_on_gpu_thread = gpu
-    w._postprocess_batch = lambda pending, outputs: postprocessed.append(pending.graph_walk)
+    w._postprocess_batch = lambda pending, outputs, **_: postprocessed.append(pending.graph_walk)
 
     def fail_loudly(error, *args):
         raise error

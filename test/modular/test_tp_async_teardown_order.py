@@ -57,6 +57,7 @@ def _batch(seq: int, rids: list[int]):
     scheduled = SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=seq,
         request_to_worker_graph={rid: 0 for rid in rids},
+        chunk_ranges={}, incomplete_node_rids=set(),
         rids_by_walk=lambda: {WALK: list(rids)},
     )
     executing = SimpleNamespace(

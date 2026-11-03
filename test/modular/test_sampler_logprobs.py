@@ -29,7 +29,7 @@ def _logits():
 
 @pytest.mark.parametrize("config, error", [
     (dict(return_logprobs=1), "return_logprobs must be true or false"),
-    (dict(return_logprobs=True, logprobs_mode="processed"), "logprobs_mode must be 'raw'"),
+    (dict(return_logprobs=True, logprobs_mode="final"), "logprobs_mode must be 'raw' or 'processed'"),
 ])
 def test_logprobs_fields_are_validated(config, error):
     with pytest.raises(ValueError, match=error):
@@ -47,6 +47,29 @@ def test_a_deployment_turns_logprobs_on():
         spec.apply_yaml_overrides(enable_logprob=True)
     spec.apply_yaml_overrides(enable_logprobs=True)
     SamplingReqConfig(return_logprobs=True).validate(spec)
+
+
+def test_processed_logprobs_need_their_own_capability():
+    spec = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=V, enable_logprobs=True)
+    processed = SamplingReqConfig(return_logprobs=True, logprobs_mode="processed")
+    with pytest.raises(ValueError, match="does not report processed logprobs"):
+        processed.validate(spec)
+    with pytest.raises(ValueError, match="needs enable_logprobs"):
+        SamplerSpec(resource_key="s", nodes={"lm"}, vocab_size=V).apply_yaml_overrides(enable_processed_logprobs=True)
+    spec.apply_yaml_overrides(enable_processed_logprobs=True)
+    processed.validate(spec)
+    # processed log-probs are CUDA-only, so this CPU node refuses even with it
+    res = SamplerResource(
+        vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
+        enable_logprobs=True, enable_processed_logprobs=True,
+    )
+    with pytest.raises(ValueError, match="CUDA-only"):
+        res.ingest_request(0, processed)
+    res.ingest_request(2, SamplingReqConfig(logprobs_mode="processed"))
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=4, max_seq_len=1)
+    assert res._cg_buffers.processed_logprobs is None, "left out of another device's captured sampler"
+    with pytest.raises(ValueError, match="enable_processed_logprobs=False"):
+        _resource().ingest_request(1, processed)
 
 
 # -- the sampler's rows ------------------------------------------------------

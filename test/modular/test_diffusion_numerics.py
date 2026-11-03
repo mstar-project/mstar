@@ -14,7 +14,12 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig, FlowMatchSchedule, euler_step  # noqa: E402
-from mstar.model.components.diffusion.image_io import encode_image, pixels_to_uint8, uint8_to_png  # noqa: E402
+from mstar.model.components.diffusion.image_io import (  # noqa: E402
+    encode_image,
+    image_output_format,
+    pixels_to_uint8,
+    uint8_to_png,
+)
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
 
 
@@ -142,12 +147,36 @@ def test_encode_image_honours_the_openai_output_knobs():
     image = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
     assert encode_image(image, None)[:8] == b"\x89PNG\r\n\x1a\n"
     torch.testing.assert_close(_decode(encode_image(image, {"png_compress_level": 0})), image, rtol=0, atol=0)
+    # an explicit null (JSON null in extra_body) is the default, as intake lets it through
+    torch.testing.assert_close(_decode(encode_image(image, {"png_compress_level": None})), image, rtol=0, atol=0)
     jpeg = encode_image(image, {"output_format": "jpeg", "output_compression": 90})
     assert jpeg[:3] == b"\xff\xd8\xff" and _decode(jpeg).shape == image.shape
     webp = encode_image(image, {"output_format": "webp"})
     assert webp[:4] == b"RIFF" and _decode(webp).shape == image.shape
     with pytest.raises(ValueError, match="output_format"):
         encode_image(image, {"output_format": "gif"})
+
+
+@pytest.mark.parametrize("fmt, knob, value, served", [
+    ("jpeg", "output_compression", 101, False), ("jpeg", "output_compression", "high", False),
+    ("png", "png_compress_level", 10, False), ("png", "png_compress_level", -1, False),
+    ("png", "png_compress_level", True, False), ("jpeg", "output_compression", 50.9, False),
+    ("jpeg", "output_compression", float("inf"), False),
+    # whole numbers that main read through int()
+    ("jpeg", "output_compression", 90.0, True), ("jpeg", "output_compression", "90", True),
+    ("png", "png_compress_level", 0.0, True),
+    # the other format's knob, which main ignored
+    ("png", "output_compression", 150, True), ("jpeg", "png_compress_level", 10, True),
+])
+def test_intake_refuses_only_an_output_knob_encode_image_cannot_apply(fmt, knob, value, served):
+    """Models check the request with image_output_format before generating, so it must
+    refuse what encode_image would refuse (or misapply) after the denoise, and serve the rest."""
+    kwargs = {"output_format": fmt, knob: value}
+    if served:
+        encode_image(torch.zeros(3, 16, 16, dtype=torch.uint8), kwargs)
+    else:
+        with pytest.raises(ValueError, match=knob):
+            image_output_format(kwargs)
 
 
 @pytest.mark.parametrize("shape", [(3, 40, 8), (3, 16, 4, 6)])

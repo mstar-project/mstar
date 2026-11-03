@@ -11,14 +11,15 @@ import torch
 
 sys.path.insert(0, ".")
 
+from rust_runtime import Inboxes
 from test_graph_runtime import (
     _build_on_real_manager,
     _complete,
     _fwd_info,
     _ingest,
-    _RecordingCommunicator,
 )
 
+from mstar.communication import tensor_store
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     AsyncMooncakeReader,
@@ -27,7 +28,7 @@ from mstar.communication.tensors import (
     TensorCommunicationManager,
 )
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
-from mstar.graph.runtime.base import FreedTensors, RouteOutput, SendInput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
@@ -49,6 +50,10 @@ class _Communicator(BaseCommunicator):
 
     def poll_for_messages(self, timeout_ms=20):
         return False
+
+
+class _StubRuntime(SimpleNamespace, PhasedPostprocess):
+    """Stubbed phase methods under the reference begin / resume."""
 
 
 class _Engine:
@@ -128,6 +133,7 @@ def test_the_worker_fails_only_the_refused_request():
         worker = Worker.__new__(Worker)
         worker._walk_drivers = {}
         worker._walk_driven_edges = {}
+        worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
         worker.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
         worker.tensor_manager = mgr
         worker.scheduler = SimpleNamespace(failed_rids=set())
@@ -148,14 +154,13 @@ def test_the_worker_fails_only_the_refused_request():
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_the_python_runtime_sends_nothing_for_a_failed_rid(tmp_path, failed):
+def test_the_runtime_sends_nothing_for_a_failed_rid(tmp_path, failed):
     section = GraphNode(
         name="gen", input_names={"tok"},
         outputs=[GraphEdge(name="out", next_node=EMIT_TO_CLIENT)],
     )
-    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path)
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
+    comm = Inboxes("worker_0", tmp_path)
+    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path, inboxes=comm)
     _ingest(runtime, rid, [GraphEdge(name="tok", next_node="gen")])
     _, out = _complete(tm, runtime, rid, "gen", {"out": [torch.ones(1)]}, ["out"])
 
@@ -180,6 +185,7 @@ def _postprocess_worker(refuse, follower=False):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
@@ -216,6 +222,7 @@ def _postprocess_worker(refuse, follower=False):
         materialize_publish=lambda *a: None,
         # like the engine's, reads each stopped rid's info
         finalize_stopped_requests=lambda nb, rids: [nb.per_request_info[r] for r in rids],
+        step_finished=lambda batch, outputs, **kwargs: None,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
 
@@ -255,7 +262,7 @@ def _postprocess_worker(refuse, follower=False):
         )
         return []
 
-    w._graph_runtime = SimpleNamespace(
+    w._graph_runtime = _StubRuntime(
         cleanup_consumed_inputs=lambda *a: FreedTensors.none(),
         clear_pending_loop_stops=lambda: None,
         stop_loops_batched=lambda **kw: list(kw["loop_names"].keys),
@@ -416,11 +423,13 @@ def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
 
 
 def _real_manager(monkeypatch, rust):
-    """Mooncake over TCP, with the bookkeeper the given graph runtime uses."""
+    """Mooncake over TCP, with the given bookkeeper: the Rust one a worker
+    uses, or the Python one a data worker falls back to."""
     pytest.importorskip("mooncake.engine")
     if rust:
         pytest.importorskip("mstar_rust")
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1" if rust else "0")
+    else:
+        monkeypatch.setattr(tensor_store, "_build_tensor_bookkeeping", tensor_store.PythonTensorBookkeeping)
     from mstar.communication.tensors import create_tensor_communication_manager
 
     mgr = create_tensor_communication_manager(
@@ -468,6 +477,7 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
     w.is_tp_follower = False
     w._rid = lambda wire: 3
