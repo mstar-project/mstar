@@ -396,6 +396,8 @@ class ExecutingBatch:
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
+    # recorded once inputs copied to the device for this step have landed, which the step waits on
+    input_ready: list[torch.Event] = field(default_factory=list)
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
@@ -1154,6 +1156,8 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
+        for ready in batch.input_ready:
+            torch.accelerator.current_stream(self._device).wait_event(ready)
         try:
             self._prepare_inputs(batch)
         finally:

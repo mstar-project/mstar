@@ -403,7 +403,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     pool = HostPool(1 << 25, torch.device("cuda"))
     # the pool's copies run on ``side``, so a busy ``side`` holds them back
     pool._stream = side
-    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, side_stream=lambda: side)
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), pool.take(1 << 24)
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
@@ -433,8 +433,9 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
 
     with side:
         torch.cuda._sleep(1 << 30)
-    on_device = copies.to_device(torch.device("cuda"), side)
-    assert torch.equal(on_device["embeds"][0].cpu(), expected), "the rebuild row would read its inputs before they land"
+    on_device, ready = pool.copy_in(copies.inputs["embeds"][0])
+    torch.cuda.current_stream().wait_event(ready)
+    assert torch.equal(on_device.cpu(), expected), "the rebuild row would read its inputs before they land"
 
 
 def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:

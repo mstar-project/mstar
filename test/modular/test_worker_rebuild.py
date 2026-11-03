@@ -206,7 +206,9 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
 def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
     w, _ = _worker()
     w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
-    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, step_metadata={})
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(
+        PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, copies=HostCopies({}, {}),
+    )
 
     node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})))
 

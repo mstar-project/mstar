@@ -71,6 +71,19 @@ class HostPool:
         assert nbytes <= into.nbytes, f"a copy of {nbytes} bytes doesn't fit the {into.nbytes} bytes it was given"
         return self._memory[into.offset:into.offset + nbytes].view(dtype).view(shape)
 
+    def copy_in(self, view: torch.Tensor) -> tuple[torch.Tensor, torch.Event | None]:
+        """A device copy of ``view``, a tensor in the pool, made on the pool's stream, and the event recorded once it
+        lands, None where the device is the host and ``view`` is returned as it is."""
+        if self.device.type == "cpu":
+            return view, None
+        if self._stream is None:
+            self._stream = torch.Stream(device=self.device)
+        with self._stream:
+            copy = view.to(self.device, non_blocking=True)
+        ready = torch.Event(device=self.device)
+        ready.record(self._stream)
+        return copy, ready
+
     def copy_out(
         self, src: torch.Tensor, into: HostSlice, after: torch.Event | None, dtype: torch.dtype | None = None,
     ) -> HostCopy:

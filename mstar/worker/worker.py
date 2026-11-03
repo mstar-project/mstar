@@ -760,7 +760,7 @@ class Worker:
             host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
         self._rebuilds = Rebuilds(
             policies, graphs,
-            HostPool(host_mb << 20, self.device) if host_mb and policies else None, self._side_stream,
+            HostPool(host_mb << 20, self.device) if host_mb and policies else None,
             self.engine_manager.engine.host_allowance,
         )
         self._preemption = Preemption(
@@ -4511,14 +4511,6 @@ class Worker:
         return 1 << max(numel - 1, 0).bit_length()
 
 
-    def _side_stream(self) -> torch.Stream | None:
-        """The stream host copies queue on, behind a step's own output copy, or None without a device."""
-        if not self.device_capability.is_available:
-            return None
-        if self._d2h_stream is None:
-            self._d2h_stream = torch.Stream(device=self.device)
-        return self._d2h_stream
-
     def _d2h_batched(
         self, buffers: dict, side: torch.Stream,
     ) -> dict[str, torch.Tensor]:
@@ -4623,7 +4615,9 @@ class Worker:
         if not source:
             return source, None
 
-        side = self._side_stream()
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.Stream(device=self.device)
+        side = self._d2h_stream
         side.wait_event(completion_event)
 
         if outputs.check_stop_buffers is not None and row_rids is not None:
