@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.model.components.diffusion import exact_norm
 from mstar.model.components.diffusion.compile_utils import (
     EXACT_OP_TYPES,
     exact_op_types,
@@ -204,6 +205,28 @@ def test_exact_rms_norm_matches_torch_bit_for_bit(scale):
     for x in (q, q.contiguous(), q[0], q.reshape(-1, 128)[:999]):
         assert torch.equal(exact_rms_norm(x, w, 1e-6), torch.nn.functional.rms_norm(x, (128,), w, 1e-6))
     assert torch.equal(exact_rms_norm(q, w, None), torch.nn.functional.rms_norm(q, (128,), w, None))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_first_call_under_capture_takes_torchs_kernel(monkeypatch):
+    """The replica's one-time check reads back to the host, so a first call that lands
+    in a capture records torch's kernel (the same result) and checks on the next eager call."""
+    monkeypatch.setattr(exact_norm, "_REPRODUCES", {})
+    x = torch.randn(64, 128, device="cuda").to(torch.bfloat16)
+    w = torch.randn(128, device="cuda").to(torch.bfloat16)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        torch.nn.functional.rms_norm(x, (128,), w, 1e-6)  # torch's own lazy init, outside the capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = exact_rms_norm(x, w, 1e-6)
+    graph.replay()
+    assert torch.equal(y, torch.nn.functional.rms_norm(x, (128,), w, 1e-6))
+    assert exact_norm._REPRODUCES == {}
+    exact_rms_norm(x, w, 1e-6)
+    assert (x.device, x.dtype) in exact_norm._REPRODUCES
 
 
 def test_knob_reaches_both_models():
