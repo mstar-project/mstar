@@ -741,9 +741,9 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
     assert parked == 0, f"{parked} completions left parked"
 
 
-def test_idle_counts_agree(pair):
+def test_idle_counts(pair):
     """What a weight reload waits on: registered requests and routing parked
-    for a send. Both runtimes count the same through admit, route and remove."""
+    for a send, counted through admit, route and remove."""
     rt, _book, _store = pair
     assert rt.idle_counts() == (0, 0, 0)
     first, second = _admit(rt, "r1"), _admit(rt, "r2")
