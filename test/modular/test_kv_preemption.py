@@ -4,8 +4,7 @@ A new prompt waits in the runner's queue for room, since a pool admits only its 
 A request that grows past what it was allotted can't wait that way: every request beside it
 may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
 them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait in the queue at their
-arrival position. A request on the host returns once its pages and one more page fit, and a dropped request
-once its whole history and one more page fit.
+arrival position, and come back guaranteed once their whole footprint fits, so none of them is preempted twice.
 So the oldest request always gets its page and finishes.
 """
 
@@ -165,8 +164,8 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _step(kv, "r", 1).ok, "the older request didn't get the page its victim freed"
     assert not _admitted(kv, "v"), "v came back into the room r needs to grow"
     _remove(kv, "r")
-    # its history is the prompt's 5 pages and the sample its next step writes
-    assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
+    # its prompt's 5 pages and its decode cap's 4
+    assert _admitted(kv, "v") and kv._allotments["v"].pages == 9, "v didn't reserve its footprint"
 
 
 def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
@@ -257,10 +256,9 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
         assert _queue(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait in the queue for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
-        returns = kv._dropped["r"].returns
-        assert kv._need("r", NODE, WALK, None) == returns, "r's wait for its shortage outlived its drop"
+        assert kv._need("r", NODE, WALK, None) == kv._footprint("r"), "r's wait for its shortage outlived its drop"
         _remove(kv, "older")
-        assert _admitted(kv, "r"), "r didn't return once its history and a page fit"
+        assert _admitted(kv, "r"), "r didn't return once its footprint fit"
     elif then == "waits":
         _remove(kv, "older")
         assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
@@ -309,14 +307,16 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
 
 
-def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_prompt():
+def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_footprint():
     kv = _pool()
     _request(kv, "v", 5, arrival=1)
     assert _ready(kv, "v") and _step(kv, "v", 2 * PAGE_SIZE).ok
 
     kv.drop("v")
 
-    assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
+    assert kv._need("v", NODE, WALK, None) == 9, (
+        "v would return with room for the pages it wrote and run short on the rest"
+    )
 
 
 def test_victims_that_share_pages_are_preempted_together():
@@ -507,9 +507,9 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
 
     _remove(kv, "r")
 
-    assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a"), (NODE, "b")], "b returned ahead of a"
-    assert _ready(kv, "a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
-    assert _ready(kv, "b") and not _queue(kv)
+    assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a")], "b returned ahead of a"
+    assert _ready(kv, "a") and kv._allotments["a"].remaining == 4, "a didn't reserve its footprint past its reload"
+    assert _queue(kv) == ["b"], "b came back without room for its footprint"
 
 
 @pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
