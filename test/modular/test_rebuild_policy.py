@@ -345,7 +345,8 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
 
 def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     """The image copies queued every input of every prefill row at once, behind which the next step's output copy
-    waited on the device's one copy engine. They share one allowance with #876's page writes, and go first."""
+    waited on the device's one copy engine. The image copies share one allowance with the cached pages' writes, and
+    go first."""
     allowance = StepAllowance(24)
     rebuilds = _copying(R)
     rebuilds._allowance = allowance
@@ -388,8 +389,8 @@ def test_a_media_copy_split_across_two_steps_lands_whole():
 
 def test_a_rebuild_of_ids_alone_runs_under_its_prefills_metadata():
     """A row of ids alone ran under the request's decode step's metadata and a row with images under its prefill's,
-    so the model and the sampler saw the two differently. Every kept request records its prefill row's metadata,
-    and a copy of it, since a later step may change the live one."""
+    so the model and the sampler saw the two differently. Every kept request records a copy of its prefill row's
+    metadata, since a later step may change the live one."""
     rebuilds = _rebuilds()
     prefill = _ran(PREFILL, _rows(R))
     rebuilds.keep_prompts(prefill)
@@ -441,7 +442,7 @@ class _CountingPool(HostPool):
 def test_the_copy_back_waits_for_the_step_that_reads_it():
     """The copy back to the device ran when the rebuild was queued and made the current stream wait then, so a step
     still being enqueued stalled behind it, and the copy held device memory outside the KV pool while the row
-    waited. It runs when the row's step is built, and only that step waits for it."""
+    waited. The copy back runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     copies = HostCopies(inputs={"embeds": [torch.ones(6, 2)]})

@@ -72,8 +72,8 @@ class HostPool:
         return self._memory[into.offset:into.offset + nbytes].view(dtype).view(shape)
 
     def copy_in(self, view: torch.Tensor) -> tuple[torch.Tensor, torch.Event | None]:
-        """A device copy of ``view``, a tensor in the pool, made on the pool's stream, and the event recorded once it
-        lands, None where the device is the host and ``view`` is returned as it is."""
+        """Copy ``view``, a tensor in the pool, to the device on the pool's stream, and return the copy with the event
+        recorded once it lands. Where the device is the host, return ``view`` as it is and no event."""
         if self.device.type == "cpu":
             return view, None
         if self._stream is None:

@@ -67,8 +67,8 @@ class KeptIds:
 
 
 class LogRoom(NamedTuple):
-    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and the slots of
-    its spans other than ids, which its rebuild writes from the host copies."""
+    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and how many slots
+    its spans other than ids hold, which its rebuild writes from the host copies."""
     piece: HostSlice
     copied_slots: int
 
