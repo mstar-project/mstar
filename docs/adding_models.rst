@@ -1654,7 +1654,10 @@ and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Ca
 turns it on only if every resource of the node can (``Resource.resident_refusal``) and
 the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
 otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
-stale, so the first resident step after them writes it.
+stale, so the first resident step after them writes it. The sampler takes part on its
+own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
+of the row, so a resident step stages none of them, while the RNG offset, the last token
+and the repetition-penalty mask stay by the sampler's own row of each request.
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:

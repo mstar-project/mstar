@@ -19,7 +19,8 @@ the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
 _admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,
-_moved} (purged by release), and WorkerProfileInfo.
+_moved} (purged by release), SamplerCells._cells (purged by the sampler's
+remove_request), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
