@@ -651,7 +651,9 @@ Qwen3-TTS notes
   that take turns, and a step costs most of its time whatever its rows.
   It also captures the codec at 12 and 24 windows
   (``codec_capture_batch_sizes``), since a padded row costs the conv stack what
-  a real one does.
+  a real one does, and batches each window width apart, narrowest first
+  (``codec_split_windows``): a request's first window padded into a replay of
+  wide windows takes about twice as long to reach the client.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a

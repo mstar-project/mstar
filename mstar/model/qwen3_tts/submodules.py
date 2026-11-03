@@ -1018,6 +1018,7 @@ class CodecSubmodule(ARNodeSubmodule):
         config: Qwen3TTSModelConfig,
         watermarker: AudioSealWatermarker | None = None,
         capture_batch_sizes: Sequence[int] | None = None,
+        split_windows: bool = False,
     ):
         super().__init__()
         # A padded row costs the conv stack what a real one does, so a deployment
@@ -1026,6 +1027,7 @@ class CodecSubmodule(ARNodeSubmodule):
             self.CAPTURE_BATCH_SIZES = sorted(capture_batch_sizes)
         self.decoder = decoder
         self.config = config
+        self.split_windows = split_windows
         # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
         # trimmed PCM in ``batch_postprocess``; None leaves it untouched.
         self.watermarker = watermarker
@@ -1305,6 +1307,19 @@ class CodecSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
         return self.MAX_BATCH_SIZE
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """With ``split_windows``, each window width batches apart: a row costs
+        what its replay's widest window costs, so a narrow window padded to a
+        wide one pays the whole pass."""
+        return self.split_windows and graph_walk == "codec_chunk"
+
+    def capture_group_order(self, graph_walk: str) -> tuple:
+        """Narrowest window first: a ramp window's stream has little audio
+        buffered, a request's first window none, and a wide window carries
+        seconds of it. Serving only the first window early moves the wait onto
+        the second, which then stalls playback."""
+        return tuple(self.windows) if graph_walk == "codec_chunk" else ()
 
     def cg_key_info(
         self,
