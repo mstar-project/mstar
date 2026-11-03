@@ -3475,6 +3475,9 @@ class KVManager(AttentionResource):
         Device pages go back to the arena only once every stream has been
         copied: a step admitted before the claim can still run its fork copy,
         and that copy reads one of these streams.
+
+        A victim `preempt` chose that doesn't move comes off its earmark with
+        nothing freed.
         """
         if self._cpu_pool is None or rid not in self._streams:
             return 0
@@ -3484,6 +3487,7 @@ class KVManager(AttentionResource):
                 # a victim with no pages on the device still gives up its lease and allotment
                 if rid in self._hosted and not any(stream.pages() for stream in self._streams[rid].values()):
                     self._vacate(rid, self._room())
+                self._settle(rid, 0)
             return 0
         released: set[str] = set()
         try:
@@ -3507,6 +3511,8 @@ class KVManager(AttentionResource):
             self._abandon_claims(
                 rid, [c.label for c in claimed if c.label not in released]
             )
+            with self._lock:
+                self._settle(rid, 0)
 
     def _offload_stream(
         self, rid: str, claim: ClaimedStream, rooted: list[bytes],
@@ -4404,7 +4410,7 @@ class KVManager(AttentionResource):
             newer = sorted(
                 (other for other, overrides in self._overrides.items()
                  if overrides.arrival is not None and overrides.arrival > arrival
-                 and self._holds(other)),
+                 and self._holds(other) and self._movable(other)),
                 key=lambda other: self._overrides[other].arrival, reverse=True,
             )
             # a victim not yet moved frees its pages for the request it was chosen for
@@ -4470,6 +4476,13 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         return (allotment is not None and allotment.remaining > 0) or any(
             stream.pages() or stream.lease for stream in self._streams[rid].values()
+        )
+
+    def _movable(self, rid: str) -> bool:
+        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, and no step or
+        read is in flight on its pages."""
+        return rid not in self._earmarks and not any(
+            stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
         )
 
     def _host_pages(self, rid: str) -> int | None:
