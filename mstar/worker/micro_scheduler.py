@@ -1425,7 +1425,8 @@ class MicroScheduler:
         specs = []
         # a chain holding every request here has nothing waiting on the queues
         if len(request_state.per_request_info) > len(continuing) + len(unpopped):
-            exclude = self.failed_rids.union(self.pending_removes, self.held_until)
+            # A rebuild's request also has its parked row on a queue, which the step mustn't pop.
+            exclude = self.failed_rids.union(self.pending_removes, self.held_until, unpopped)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
