@@ -29,7 +29,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayo
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.host_pool import HostPool
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import (
     KeptIds,
@@ -41,6 +41,7 @@ from mstar.worker.rebuild import (
     Rebuilds,
     RowRecord,
 )
+from mstar.worker.side_steps import SIDE_LANE
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
@@ -449,3 +450,17 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     Engine._record_loopback(engine, batch)
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
+
+
+def test_the_scheduler_sees_the_rows_every_lane_holds():
+    w = Worker.__new__(Worker)
+    shared = w._in_flight_rids = set()
+
+    w._hold_rows(CHAIN_LANE, [R])
+    w._hold_rows(SIDE_LANE, [A])
+    held = set(shared)
+    w._hold_rows(CHAIN_LANE, ())
+
+    assert w._in_flight_rids is shared and held == {R, A} and shared == {A}, (
+        "the scheduler shares the set, and would start a rebuild for a row a step in flight holds"
+    )

@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 # tolerated anywhere else -- an unknown rid off the wire is expected, an
 # unknown rid from local state is a bug and should still raise.
 REMOVED_RID = -1
+# The lane of the worker's main chain of steps; a side lane
+# (``mstar.worker.side_steps``) runs its keys' steps beside it
+CHAIN_LANE = 0
 
 # Below every turn and arrival: a sort key offset that puts a row ahead of them all
 _AHEAD = 1 << 62
@@ -434,6 +437,10 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
+        # (node, walk) -> the lane its steps run on, for keys off the chain: a
+        # lane schedules only its own keys (``get_next_batch``), so the chain
+        # neither runs nor yields to another lane's
+        self.lane_of: dict[tuple[str, str], int] = {}
         # (node, walk) -> whether its speculation chain merges the other walks
         # of its combined walk: the config's settings, then each default as
         # `speculation_mixes` first decides it
@@ -1112,6 +1119,7 @@ class MicroScheduler:
         self,
         request_state: RequestStateManager,
         exclude_target: tuple[str, str] | None = None,
+        lane: int = CHAIN_LANE,
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -1129,6 +1137,8 @@ class MicroScheduler:
         Args:
             exclude_target: If set, skip this (node_name, graph_walk) pair:
                 a yield-away from the speculation chain running it.
+            lane: whose keys to schedule (``lane_of``); TP follow steps are
+                the chain's.
         """
         # done before any early returns
         self._let_rows_back(request_state)
@@ -1139,14 +1149,15 @@ class MicroScheduler:
         # skipped the batch because one of its rids failed locally would hang
         # the whole TP group. A popped ScheduleTPNode has no re-queue path
         # and must be submitted unconditionally.
-        tp_follow_batch = self._try_schedule_tp_follow(
-            request_state, exclude_target=exclude_target,
-        )
-        if tp_follow_batch is None:
-            self.num_consec_tp_follower_batches = 0
-        else:
-            self.num_consec_tp_follower_batches += 1
-            return tp_follow_batch
+        if lane == CHAIN_LANE:
+            tp_follow_batch = self._try_schedule_tp_follow(
+                request_state, exclude_target=exclude_target,
+            )
+            if tp_follow_batch is None:
+                self.num_consec_tp_follower_batches = 0
+            else:
+                self.num_consec_tp_follower_batches += 1
+                return tp_follow_batch
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
@@ -1160,12 +1171,12 @@ class MicroScheduler:
         scan_exclude = scan_exclude or exclude_target
         # A queued row can be first in line even where a backlog fills the
         # step on its own (a row holding the step, back on its queue).
-        ready = self._scan_ready(request_state, None, scan_exclude)
-        # A key whose only work is a rebuild takes its turn too, except the key of a mixing chain
-        # yielded from, which takes its rebuilds itself.
+        ready = self._scan_ready(request_state, None, scan_exclude, lane)
+        # A key whose only work is a rebuild takes its turn too, on its own lane, except the key of a
+        # mixing chain yielded from, which takes its rebuilds itself.
         for node, _, cursor in self._waiting_rebuilds():
             key = self._key(node, cursor.walk)
-            if key != exclude_target or skip_walk is not None:
+            if self._lane(key) == lane and (key != exclude_target or skip_walk is not None):
                 ready.setdefault(key, [])
 
         def schedule(key, entries):
@@ -1180,7 +1191,10 @@ class MicroScheduler:
         # only a fairness hint, and finishing a split set beats fairness --
         # except under ARRIVAL, where the rows holding a key's step keep it: a
         # yield-away from the chain running it leaves that backlog to it.
-        keys = [k for k in self.backlog if not self._left_to_its_chain(k, exclude_target, skip_walk)]
+        keys = [
+            k for k in self.backlog
+            if self._lane(k) == lane and not self._left_to_its_chain(k, exclude_target, skip_walk)
+        ]
         for key in keys:
             scheduled = schedule(key, ready.get(key, []))
             if scheduled is not None:
@@ -1203,6 +1217,9 @@ class MicroScheduler:
                 return scheduled
         return None
 
+    def _lane(self, key: tuple[str, str]) -> int:
+        return self.lane_of.get(key, CHAIN_LANE)
+
     def _left_to_its_chain(
         self, key: tuple[str, str], exclude_key: tuple[str, str] | None,
         skip_walk: str | None,
@@ -1219,6 +1236,7 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str] | None,
         exclude_target: tuple[str, str] | None,
+        lane: int = CHAIN_LANE,
     ) -> dict[tuple[str, str], list[ReadyNodeEntry]]:
         """Engine-ready rows on the queues, by scheduling key, in scan order."""
         ready: dict[tuple[str, str], list[ReadyNodeEntry]] = {}
@@ -1228,7 +1246,7 @@ class MicroScheduler:
         exclude = self.failed_rids.union(self.pending_removes, self.held_until)
         # only rank 0 can initiate scheduling: a followed node's head is
         # served by _try_schedule_tp_follow
-        for spec in self._rows_here(self._ready_specs(exclude, target, exclude_target)):
+        for spec in self._rows_here(self._ready_specs(exclude, target, exclude_target, lane)):
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
@@ -1265,12 +1283,16 @@ class MicroScheduler:
         self, exclude: set[int],
         target: tuple[str, str] | None,
         exclude_target: tuple[str, str] | None,
+        lane: int = CHAIN_LANE,
     ):
         """``runtime.get_ready_nodes`` for scheduling keys, which the runtime
-        matches against both real and combined walks."""
-        return self.runtime.get_ready_nodes(
+        matches against both real and combined walks, of ``lane`` only."""
+        specs = self.runtime.get_ready_nodes(
             exclude, target=target, exclude_target=exclude_target,
         )
+        if self.lane_of or lane != CHAIN_LANE:
+            specs = [spec for spec in specs if self._lane((spec.node_name, spec.graph_walk)) == lane]
+        return specs
 
     def _rows_here(
         self, specs: Iterable[ReadyNodeSpec],
@@ -1439,7 +1461,7 @@ class MicroScheduler:
     def pick_chain_step(
         self, request_state: RequestStateManager,
         target: tuple[str, str], continuing: Sequence[int],
-        mid_prefill: Collection[MidPrefillRow] = (),
+        mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -1457,6 +1479,10 @@ class MicroScheduler:
         the next chunk would wait a step. They wait first in line, ahead of
         the backlog, and are never popped, as are the rebuilds the log holds
         at ``target``.
+
+        ``next_iter_of``: the loop the chain's step runs its rows one
+        iteration on in, if it does; their capture group is the one they have
+        there (``_chain_capture_group``).
         """
         self._let_rows_back(request_state)
         key = self._key(*target)
@@ -1500,7 +1526,7 @@ class MicroScheduler:
             request_state, key, backlog=live, queued=queued, walk_of=walk_of,
             ready=ready,
             continuing=continuing, own_walk=target[1],
-            one_walk=own_walk,
+            one_walk=own_walk, next_iter_of=next_iter_of,
         ))
         if unpopped:
             took = set(pick.taken)
@@ -1552,12 +1578,15 @@ class MicroScheduler:
         backlog: Sequence[int], queued: Sequence[int],
         walk_of: Callable[[int], str] | None, ready: Callable[[int], bool],
         continuing: Sequence[int] = (), own_walk: str | None = None,
-        one_walk: str | None = None,
+        one_walk: str | None = None, next_iter_of: str | None = None,
     ) -> StepCandidates:
         node, walk = key
         if key not in self._walks_of_key:
             one_walk = walk
         engine = self.engine_manager.get_engine(node)
+        capture_group = None
+        if engine.splits_by_capture_key(node, walk):
+            capture_group = self._chain_capture_group(request_state, node, walk, continuing, next_iter_of)
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1565,10 +1594,7 @@ class MicroScheduler:
             walk_of=walk_of or (lambda _: walk),
             one_walk=one_walk,
             ready=ready,
-            capture_group=(
-                functools.partial(self._capture_group, request_state, node, walk)
-                if engine.splits_by_capture_key(node, walk) else None
-            ),
+            capture_group=capture_group,
             walk_caps=self._walk_caps(key),
             walk_row_caps=self._walk_row_caps(key),
             line_order=functools.partial(self._line_order, key),
@@ -1585,8 +1611,10 @@ class MicroScheduler:
 
     def _capture_group(
         self, request_state: RequestStateManager,
-        node_name: str, graph_walk: str, rid: int,
+        node_name: str, graph_walk: str, rid: int, next_iter_of: str | None = None,
     ) -> Any | None:
+        """``rid``'s capture group at ``graph_walk``; with ``next_iter_of``, at
+        the next iteration of that loop."""
         engine = self.engine_manager.get_engine(node_name)
         if not engine.splits_by_capture_key(node_name, graph_walk):
             return None
@@ -1595,18 +1623,39 @@ class MicroScheduler:
         )
         # a streamed input's chunk can decide the capture (a codec's window size)
         chunks = request_state.ingested_stream_chunks(rid, node_name)
-        return engine.capture_group(
-            node_name, graph_walk, rid, fwd_info,
-            input_metadata=InputMetadata(stream_chunks=chunks) if chunks else None,
+        if next_iter_of is None:
+            metadata = InputMetadata(stream_chunks=chunks) if chunks else None
+        else:
+            loops = dict(fwd_info.dynamic_loop_iter_counts)
+            loops[next_iter_of] = loops.get(next_iter_of, 0) + 1
+            metadata = InputMetadata(stream_chunks=chunks or {}, dynamic_loop_iter_counts=loops)
+        return engine.capture_group(node_name, graph_walk, rid, fwd_info, input_metadata=metadata)
+
+    def _chain_capture_group(
+        self, request_state: RequestStateManager, node_name: str, graph_walk: str,
+        chain: Collection[int], next_iter_of: str | None,
+    ) -> Callable[[int], Any]:
+        """``_capture_group`` for the rows of a speculation chain's step. The
+        chain's own rows run it one iteration on in ``next_iter_of`` (as the
+        step's input metadata has them), while their stored loop counters are
+        still the step in flight's; a group that changes with the iteration
+        (a step schedule's dtype) is the one they'll run in. Other rows run
+        the step where they stand."""
+        if next_iter_of is None or not chain:
+            return functools.partial(self._capture_group, request_state, node_name, graph_walk)
+        chain = frozenset(chain)
+        return lambda rid: self._capture_group(
+            request_state, node_name, graph_walk, rid, next_iter_of if rid in chain else None,
         )
 
     def backlog_splits_from(
         self, request_state: RequestStateManager,
-        target: tuple[str, str], rid: int,
+        target: tuple[str, str], rid: int, next_iter_of: str | None = None,
     ) -> bool:
         """Whether ``target``'s backlog holds a live rid a speculation chain
         anchored at ``rid`` would never merge (``chain_must_yield``), so the
-        chain has to yield for it to run.
+        chain has to yield for it to run. ``next_iter_of`` as in
+        ``pick_chain_step``.
         """
         target = self._key(*target)
         live = self._live_backlog(target)
@@ -1614,7 +1663,7 @@ class MicroScheduler:
             return False
         return self.batch_builder.chain_must_yield(
             self.backlog[target], live, rid,
-            functools.partial(self._capture_group, request_state, *target),
+            self._chain_capture_group(request_state, *target, (rid,), next_iter_of),
         )
 
     def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:
@@ -2097,6 +2146,8 @@ class MicroScheduler:
         under ``exclude_target`` are outside it."""
         now = time.monotonic()
         for node_walk, batch in self.backlog.items():
+            if self._lane(node_walk) != CHAIN_LANE:
+                continue
             only_other = node_walk == exclude_target and exclude_walk is not None
             if node_walk == exclude_target and not only_other:
                 continue
