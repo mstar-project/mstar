@@ -1982,9 +1982,12 @@ of their own, since graphs captured on one stream must not overlap. It suits a s
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
 speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
-alone on its worker, a device without streams, a node with chain walks or resources, and a
-side walk that is not the node's alone, sits in a combined walk, or has output spans or a
-stop check. A config without the field keeps the node on the chain, whatever it declares.
+alone on its worker, a device without streams, a node with chain walks, resident walks or
+any resource but a recurrent state pool of its own (``RecurrentStateSpec`` declared for
+that node alone, with no KV-keyed snapshots), and a side walk that is not the node's alone,
+sits in a combined walk, or has output spans or a stop check. Such a pool is admitted,
+planned and committed by the side step itself, on the lane's stream. A config without the
+field keeps the node on the chain, whatever it declares.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
