@@ -134,7 +134,8 @@ def test_committed_steps_leave_nothing_to_unwind():
 
 def test_refusal_after_a_preplan_frees_the_preplans_slots():
     """The pre-plan pass reserved the slots; the full admit that follows
-    skips the pool, and a refusal after it must still give them back."""
+    skips the pool, and a refusal after it must still give them back, and drop
+    the stage, so the step retried plans the slots it then holds."""
     pool, after = build_pool(max_slots=4), _Refuser()
     run = runner(pool, after)
     for rid in "ab":
@@ -151,7 +152,10 @@ def test_refusal_after_a_preplan_frees_the_preplans_slots():
 
     assert pool.num_free_slots == 3
     assert slot_of(pool, "a") is None and slot_of(pool, "b") is None
-    pool.clear_preplan()
+    after.refuse = False
+    assert run.admit(st).ok
+    rows = run.plan(st)[POOL]["main"]
+    assert rows.slot_indices[:2].tolist() == [slot_of(pool, "a"), slot_of(pool, "b")]
 
 
 def test_a_request_removed_before_the_unwind_is_not_freed_twice():

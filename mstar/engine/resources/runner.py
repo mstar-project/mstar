@@ -510,7 +510,8 @@ class StepRunner:
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
-        the step reserved.
+        the step reserved, and drops its stage, whose plan addresses what it
+        gave back.
         """
         staged_key = self._drop_stale_preplan(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
@@ -543,6 +544,8 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 self._unwind(step, [*covered, *admitted, key])
+                if staged_key is not None:
+                    self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
