@@ -319,7 +319,7 @@ def test_a_request_removed_mid_prompt_drops_its_prepared_input():
             pass
 
     engine = _engine_with(_Sub(10))
-    engine._loopback_steps, engine._resident_delta = {}, {}
+    engine._loopback_steps, engine._resident_delta = {}, None
     engine._runner = SimpleNamespace(remove_request=lambda rid: None)
     engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
 

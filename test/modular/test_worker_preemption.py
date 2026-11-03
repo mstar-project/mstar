@@ -367,7 +367,8 @@ def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_
 
     sent = []
     w.maybe_send_zmq_to_tp_followers, w._make_executing_batch = sent.append, SimpleNamespace
-    w.engine_manager.get_engine(NODE).owes_moves = lambda node: True
+    w._tp_followers = {NODE: ["rank1"]}
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: True
     Worker._flush_tp_moves(w)
     assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, [])], (
         "the drop waits for a step that never comes"

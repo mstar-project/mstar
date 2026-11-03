@@ -2016,7 +2016,7 @@ class Worker:
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
-        resident_delta = engine.take_resident_delta(node_batch.node_name)
+        resident_delta = engine.take_resident_delta()
         # taken before the leases, since a follower checks it before it adopts them
         page_trails = engine.page_trails(node_batch.node_name)
         prefix_hits = engine.decide_cached_prefix(node_batch)
@@ -2080,14 +2080,19 @@ class Worker:
             )
         return seq
 
+    def _owes_tp_moves(self) -> bool:
+        """Whether the journal of the lockstep instance this rank leads holds moves no step has carried."""
+        return any(self.engine_manager.get_engine(node).owes_moves() for node in self._lockstep_led)
+
     def _flush_tp_moves(self) -> None:
-        """Send a TP node's followers a step with no rows while its journal holds moves no step has carried."""
-        for node_name in self._lockstep_led:
-            if self.engine_manager.get_engine(node_name).owes_moves(node_name):
-                self.maybe_send_zmq_to_tp_followers(self._make_executing_batch(
-                    node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
-                    per_request_info={},
-                ))
+        """Send the instance's followers a step with no rows while the journal holds moves. A step of any of the
+        instance's nodes carries every move, so it goes to one this rank has sent a step to."""
+        node_name = next((node for node in self._lockstep_led if node in self._tp_followers), None)
+        if node_name is not None and self._owes_tp_moves():
+            self.maybe_send_zmq_to_tp_followers(self._make_executing_batch(
+                node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
+                per_request_info={},
+            ))
 
     def _broadcast_tp_nospec(self, pending: PendingBatch) -> None:
         """Tell followers no speculative head will follow step ``pending.tp_seq``,

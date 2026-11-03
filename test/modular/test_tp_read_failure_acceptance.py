@@ -60,7 +60,7 @@ import pytest
 import torch
 
 from mstar.graph.runtime.base import PhasedPostprocess
-from mstar.utils.ipc_format import WorkerMessageType
+from mstar.utils.ipc_format import OffloadDelta, WorkerMessageType
 from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
@@ -348,7 +348,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     sub = _submodule_class()(group, rank)
     engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
     if rank == 0:
-        engine._tp_leader_nodes = {NODE}
+        engine._tp_leader_nodes, engine._resident_delta = {NODE}, OffloadDelta.new()
     else:
         engine._tp_follower_nodes = {NODE}
     engine._resources = {KV: kv}

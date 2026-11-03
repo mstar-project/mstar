@@ -272,7 +272,8 @@ def test_rank_0_sends_an_owed_drop_before_the_loop_top_removes_its_victim(monkey
     w.parallel_nodes = w.parallel_leader_nodes = {NODE}
     w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
     owed = {NODE}
-    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=owed.__contains__)
+    w._tp_followers = {NODE: ["rank1"]}
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
     w._pending_removes = {HANDLES["gone"]: None}
     w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])
     broadcast = w.maybe_send_zmq_to_tp_followers

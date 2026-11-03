@@ -548,7 +548,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
         get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
-        take_resident_delta=lambda n: OffloadDelta.new(),
+        take_resident_delta=OffloadDelta.new,
         decide_cached_prefix=lambda b: {}, page_trails=lambda n: {},
     ))
     w.tensor_manager = tm

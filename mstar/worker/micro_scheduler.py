@@ -547,8 +547,8 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
-        # pending resident deltas for TP follow nodes
-        self._pending_resident_deltas: dict[str, OffloadDelta] = {}
+        # rank 0's moves this rank has yet to replay, on any of the nodes it follows
+        self._pending_resident_delta = OffloadDelta.new()
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
@@ -830,17 +830,14 @@ class MicroScheduler:
         return self.tp_batches_pending_schedule[0]
 
     def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None=None) -> bool:
-        if node_name not in self._pending_resident_deltas:
-            self._pending_resident_deltas[node_name] = OffloadDelta.new()
-        delta = self._pending_resident_deltas[node_name]
+        delta = self._pending_resident_delta
         if new_delta is not None:
             delta.extend(new_delta)
 
         if not len(delta):
             return True
 
-        engine = self.engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta, functools.partial(self.rebuild_of, node_name))
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self.rebuild_of)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
         new_delta = None
