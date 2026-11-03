@@ -26,6 +26,12 @@ model_kwargs:
   # flips it): the robot_state comes in and the predicted rows go out in the
   # robot's own values, the same state a pi0.5 DROID policy takes.
   inverted_action_dims: [7]
+  # The policy request defaults the Edge DROID checkpoint ships in its
+  # checkpoint.json (this checkpoint's file is empty), which NVIDIA's RoboLab
+  # server sends to both: 32 predicted rows, 15 fps observations, DROID.
+  policy_action_chunk_size: 32
+  policy_conditioning_fps: 15.0
+  policy_domain_name: droid_lerobot
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
