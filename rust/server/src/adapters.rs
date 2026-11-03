@@ -377,9 +377,9 @@ impl Adapter {
         match self {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
-            Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
-            Adapter::Cosmos3Edge => {
-                // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
+            Adapter::Bagel => text_chat(req, upload_dir, allow_remote),
+            Adapter::Qwen3_5 | Adapter::Cosmos3Edge => {
+                // How vLLM-style clients toggle thinking; a flat enable_thinking wins.
                 // Read before the attachments are saved, since a malformed value
                 // refuses the request.
                 let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
@@ -693,7 +693,7 @@ fn text_chat(
     })
 }
 
-/// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
+/// `chat_template_kwargs.enable_thinking` read as `_template_enable_thinking` does:
 /// `(kwargs or {})`, then `bool(kwargs["enable_thinking"])` when it has the
 /// key. A falsy value is no kwargs; a value Python cannot look the key up in
 /// is the `TypeError` that answers 400 there.
@@ -966,8 +966,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cosmos3_edge_chat_reads_enable_thinking_from_the_template_kwargs() {
-        let chat = |fields: &str| Adapter::Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+    fn a_thinking_chat_reads_enable_thinking_from_the_template_kwargs() {
+        for adapter in [Adapter::Qwen3_5, Adapter::Cosmos3Edge] {
+            template_kwargs_cases(adapter);
+        }
+    }
+
+    fn template_kwargs_cases(adapter: Adapter) {
+        let chat = |fields: &str| adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
         let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
         for (fields, want) in [
             (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),

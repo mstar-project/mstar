@@ -151,6 +151,18 @@ def test_extra_body_non_standard_knobs_pass_through(tmp_path):
     assert mk["talker_top_k"] == 50 and mk["talker_repetition_penalty"] == 1.05
 
 
+@pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
+@pytest.mark.parametrize(("template_kwargs", "want"), [
+    ({"enable_thinking": False}, {"enable_thinking": False}),
+    # bool(), as the Rust frontend reads it (Qwen3.5's template thinks only on a real true)
+    ({"enable_thinking": 1}, {"enable_thinking": True}),
+], ids=["false", "truthy"])
+def test_a_thinking_chat_reads_enable_thinking_from_the_template_kwargs(adapter, template_kwargs, want, tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], chat_template_kwargs=template_kwargs)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert mk == want
+
+
 def test_text_chat_maps_text_and_sampling(tmp_path):
     adapter = adapters.TextChatAdapter()
     assert adapter.supports_chat

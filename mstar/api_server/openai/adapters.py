@@ -217,6 +217,15 @@ def _refuse_unserved_chat(req) -> None:
         raise ValueError("tool calling is not supported for this model")
 
 
+def _template_enable_thinking(mk: dict) -> None:
+    """``chat_template_kwargs.enable_thinking`` onto a flat ``enable_thinking``,
+    which wins. vLLM-style clients toggle thinking this way."""
+    template_kwargs = mk.pop("chat_template_kwargs", None) or {}
+    if "enable_thinking" in template_kwargs:
+        # bool(), as Cosmos3's reasoner and the Rust frontend read it: Qwen3.5's template thinks only on a true
+        mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+
+
 def _apply_sampling(
     req,
     mk: dict,
@@ -504,16 +513,17 @@ class Qwen3_5Adapter(OpenAIAdapter):
     * ``top_k``; ``min_p`` is refused (the sampler has no min-p filter).
     * ``repetition_penalty`` — counts the prompt's tokens as well as the
       generated ones unless ``penalize_prompt`` is false.
-    * ``enable_thinking`` (default true) — the chat template opens a
-      ``<think>`` block. Set it false for short answers.
+    * ``enable_thinking`` (default true; or ``chat_template_kwargs.enable_thinking``)
+      — the chat template opens a ``<think>`` block. Set it false for short answers.
     """
 
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         _refuse_unserved_chat(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _template_enable_thinking(mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         _apply_sampling(req, mk)
         return SubmitArgs(
             text=text,
@@ -1063,14 +1073,8 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
         _refuse_unserved_chat(req)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
-        # Clients written for the Edge model's serving recipe toggle thinking
-        # through ``chat_template_kwargs``; accept it alongside a flat
-        # ``enable_thinking``. Read before the attachments are saved, since a
-        # malformed value refuses the request.
-        template_kwargs = mk.pop("chat_template_kwargs", None) or {}
-        if "enable_thinking" in template_kwargs:
-            # raw, not bool(): the model refuses a non-boolean rather than reading "false" as true
-            mk.setdefault("enable_thinking", template_kwargs["enable_thinking"])
+        # Read before the attachments are saved, since a malformed value refuses the request.
+        _template_enable_thinking(mk)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, Qwen3_5Adapter
 from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationRequest
 from mstar.integrations.dynamo.bridges import (
     TENSOR_SPECS,
@@ -510,8 +510,8 @@ def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
     ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
 
 
-def _chat_through_bridge(server, fields):
-    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+def _chat_through_bridge(server, fields, adapter=ADAPTER_REGISTRY["qwen3_omni"]):
+    bridge = RequestBridge(server, adapter, "q3o")
 
     async def run():
         return [out async for out in bridge.generate({
@@ -544,6 +544,14 @@ def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
     assert server.submitted, "a client's default tool fields refused a plain chat"
+
+
+def test_a_chat_s_template_kwargs_reach_the_model(tmp_path):
+    """Dynamo forwards a client's chat_template_kwargs as chat_template_args (its serde
+    alias), which was stripped: Qwen3.5 and Cosmos3-Edge thought whatever the client asked."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"chat_template_args": {"enable_thinking": False}}, adapter=Qwen3_5Adapter())
+    assert server.submitted[0]["model_kwargs"]["enable_thinking"] is False
 
 
 def test_images_cancel_before_first_chunk(tmp_path):

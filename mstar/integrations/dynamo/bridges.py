@@ -71,7 +71,7 @@ _STRIP_KEYS = {
     # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",
     "token_ids", "batch_token_ids", "bootstrap_info", "multi_modal_data",
-    "guided_decoding", "chat_template_kwargs", "chat_template_args",
+    "guided_decoding",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
     # OpenAI-standard, no M* mapping today
@@ -193,6 +193,10 @@ class RequestBridge:
 
     async def _chat(self, request: dict, context):
         body = _clean(request)
+        # Dynamo reads a client's chat_template_kwargs into chat_template_args and
+        # forwards it under that name; Qwen3.5 and Cosmos3-Edge read enable_thinking from it
+        if "chat_template_args" in body:
+            body.setdefault("chat_template_kwargs", body.pop("chat_template_args"))
         modalities = body.get("modalities")
         if modalities and set(modalities) != {"text"}:
             # Dynamo's chat stream delta carries no audio/image fields, so
