@@ -1336,7 +1336,6 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
     out.positions = res["rope"]._static_pos_ids[ck][:bs].tolist()
     for key in ("kv", "ctx") if context_span else ("kv",):
         state = res[key]._static_plan_state(slot, ("main", 0))
-        out.lens[key] = None
         setattr(out, f"{key}_pages", state.token_to_page[:bs].tolist())
         setattr(out, f"{key}_offsets", state.token_to_cache[:bs].tolist())
     if planner is not None:
@@ -1466,7 +1465,7 @@ def test_a_context_moved_by_a_host_step_is_rewritten_and_an_unmoved_one_is_not()
         _assert_pool_row(planner, live, "ctx", rid)
 
 
-def test_a_context_the_step_only_reads_has_no_advance_and_no_write_addressing():
+def test_a_context_the_step_only_reads_never_advances():
     live, ref, planner = _decoder_setup({1: (3, 7)})
     del ref
     ctx = live["ctx"]._resident
