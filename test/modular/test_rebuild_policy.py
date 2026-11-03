@@ -30,8 +30,8 @@ from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
-from mstar.worker.host_pool import HostCopy, HostPool
-from mstar.worker.rebuild import HostCopies, KeptIds, NodeWrites, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.worker import _LazyHostOutputs
 
 NODE, PREFILL, VISION, DECODE, MIXED = "LLM", "prefill", "vision", "decode", "mixed"
@@ -256,7 +256,7 @@ def _copying(*rids: int) -> Rebuilds:
     pool = HostPool(1 << 10, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     for rid in rids:
-        rebuilds._kept[NODE][rid], rebuilds._droppable[NODE][rid] = _media(), pool.take(64)
+        rebuilds._kept[NODE][rid], rebuilds._droppable[NODE][rid] = _media(), LogRoom(pool.take(64), 0)
     return rebuilds
 
 
@@ -271,7 +271,7 @@ def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_
     assert kept.prompt.view.tolist() == [1, 2, 3, 4, 5] and kept.lengths == (3, 2), (
         "the rebuild row would read other text"
     )
-    assert kept.walk == VISION and kept.copies == HostCopies(), "a rebuild row would leave out the image"
+    assert kept.walk == VISION and kept.copies == HostCopies(6), "a rebuild row would leave out the image"
     kept.sampled.append(6)
     assert "haven't landed" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
         "a drop would leave nothing to rebuild the image"
@@ -323,7 +323,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
 
     # five ids at 4 B, aligned to 24, and the image's six slots at 8 B
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R].nbytes == 24 + 48
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 24 + 48), 6)
     assert _ingest(rebuilds, A, IMAGE_CHAT)
     assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
@@ -335,7 +335,9 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.keep_copies(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].nbytes == 24 + 32, "the sentinels' room would stay taken for the request's life"
+    assert rebuilds._droppable[NODE][R].piece.nbytes == 24 + 32, (
+        "the sentinels' room would stay taken for the request's life"
+    )
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
 
@@ -364,7 +366,7 @@ def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
 def test_a_media_copy_split_across_two_steps_lands_whole():
     pool = HostPool(1 << 22, torch.device("cuda"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance=(allowance := StepAllowance(1 << 20)))
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1]), pool.take(1 << 21)
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1]), LogRoom(pool.take(1 << 21), 0)
     embeds = torch.arange(3 << 17, dtype=torch.float32, device="cuda")
     step_done = torch.Event(device="cuda")
     step_done.record()
@@ -418,7 +420,7 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
     waited. It runs when the row's step is built, and only that step waits for it."""
     pool = _CountingPool()
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
-    copies = HostCopies({"embeds": [torch.ones(6, 2)]})
+    copies = HostCopies(inputs={"embeds": [torch.ones(6, 2)]})
     rebuilds._kept[NODE][R] = replace(_media([1, 2, 3, 4, 5], 6, copies=copies), lengths=(3, 2))
 
     rebuilds.start(R, NODE, None)
@@ -432,7 +434,7 @@ def test_the_copy_back_waits_for_the_step_that_reads_it():
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
-    copies = HostCopies({"embeds": [embeds]})
+    copies = HostCopies(inputs={"embeds": [embeds]})
     rebuilds._kept[NODE][R] = replace(
         _media([1, 2, 3, 4, 5], 6, 7, copies=copies), lengths=(3, 2), step_metadata=metadata,
     )
@@ -455,7 +457,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     # the pool's copies run on ``side``, so a busy ``side`` holds them back
     pool._stream = side
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), pool.take(1 << 24)
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), LogRoom(pool.take(1 << 24), 0)
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()

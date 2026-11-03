@@ -37,9 +37,10 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 @dataclass(slots=True)
 class HostCopies:
-    """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row. Empty
-    until the row's step has run. ``queued`` counts the tensors whose copy hasn't started, and ``landed`` is
-    recorded after the last copy that has, None where the copies run in place."""
+    """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
+    ``slots`` of its KV. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
+    started, and ``landed`` is recorded after the last copy that has, None where the copies run in place."""
+    slots: int = 0
     inputs: NameToTensorList | None = None
     queued: int = 0
     landed: torch.Event | None = None
@@ -63,6 +64,13 @@ class KeptIds:
     copies: HostCopies | None = None
 
 
+class LogRoom(NamedTuple):
+    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and the slots of
+    its spans other than ids, which its rebuild writes from the host copies."""
+    piece: HostSlice
+    copied_slots: int
+
+
 class QueuedCopy(NamedTuple):
     """A device tensor's bytes still to be copied into ``into`` once ``after`` completes, for ``copies``."""
     src: torch.Tensor
@@ -80,8 +88,9 @@ class Prefilling(NamedTuple):
 
 @dataclass(slots=True)
 class RebuildCursor:
-    """A rebuild under way: the walk its rows run, the tokens it writes (``total``) of an input ``length`` long,
-    and the end of its chunks that have landed, 0 before the first.
+    """A rebuild under way: the walk its rows run, the slots it writes (``total``) of an input ``length`` long,
+    the end of its chunks that have landed, 0 before the first, and the slots those chunks ran (``ran``), which
+    leave out a cached prefix.
 
     A rebuild from kept ids reads ``ids`` in ``dtype``, split into tensors of ``lengths``, and any host ``copies``,
     runs under its prefill's ``step_metadata``, and writes every id but the last, which the next decode step
@@ -96,6 +105,7 @@ class RebuildCursor:
     copies: HostCopies | None = None
     step_metadata: dict | None = None
     done: int = 0
+    ran: int = 0
 
     @property
     def resumes_prefill(self) -> bool:
@@ -168,9 +178,8 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free, each with the slice of the pool its ids and host
-        # copies go to. Only these keep them.
-        self._droppable: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
+        # node -> the handles whose pages a drop there can free, each with its `LogRoom`. Only these keep ids.
+        self._droppable: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         self._allowance = StepAllowance() if allowance is None else allowance
@@ -198,15 +207,15 @@ class Rebuilds:
             )
         )
 
-    def _log_bytes(self, node: str, layouts: Iterable[StreamLayout]) -> int:
-        """The host bytes ``node``'s log takes for a request of ``layouts``: its prompt's ids as int32, and the
-        host copies of what each other span's walk read."""
+    def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
+        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
+        and the host copies of what each other span's walk read, or None when the pool can't hold it."""
+        spans = [span for layout in layouts for span in layout.spans]
+        ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
         per_slot = self._policies[node].copy_bytes_per_slot
-        ids = sum(span.length for layout in layouts for span in layout.spans if span.kind == SpanKind.IDS)
-        return aligned(4 * ids) + sum(
-            span.length * per_slot[span.walk]
-            for layout in layouts for span in layout.spans if span.kind != SpanKind.IDS
-        )
+        others = [span for span in spans if span.kind != SpanKind.IDS]
+        piece = self._pool.take(aligned(4 * ids) + sum(span.length * per_slot[span.walk] for span in others))
+        return None if piece is None else LogRoom(piece, sum(span.length for span in others))
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -232,19 +241,19 @@ class Rebuilds:
         taken = {}
         if not unpausable:
             for node in written.keys() - refused:
-                piece = None if self._pool is None else self._pool.take(self._log_bytes(node, written[node]))
-                if piece is None:
+                room = None if self._pool is None else self._log_room(node, written[node])
+                if room is None:
                     refused.add(node)
                 else:
-                    taken[node] = piece
+                    taken[node] = room
         rebuildable = {
             key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
         }
-        for node, piece in taken.items():
+        for node, room in taken.items():
             if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                self._droppable[node][rid] = piece
+                self._droppable[node][rid] = room
             else:
-                self._pool.give(piece)
+                self._pool.give(room.piece)
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
@@ -265,11 +274,12 @@ class Rebuilds:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
             prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, droppable[rid], node_batch.completion_event, torch.int32)
+            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event, torch.int32)
             copies = bool(self._copied[node_batch.node_name][row_walk])
             kept[rid] = KeptIds(
                 copy, row_walk, prompt.dtype, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
-                tuple(map(len, tensors)) if len(tensors) > 1 else None, HostCopies() if copies else None,
+                tuple(map(len, tensors)) if len(tensors) > 1 else None,
+                HostCopies(droppable[rid].copied_slots) if copies else None,
             )
             if not copies:
                 self._trim(node_batch.node_name, rid, aligned(copy.view.nbytes))
@@ -297,7 +307,7 @@ class Rebuilds:
             ):
                 rows.append((rid, kept))
         for rid, kept in rows:
-            piece, inputs = self._droppable[node][rid], node_batch.per_request_input_tensors[rid]
+            piece, inputs = self._droppable[node][rid].piece, node_batch.per_request_input_tensors[rid]
             tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
             used = aligned(kept.prompt.view.nbytes)
             if used + sum(aligned(tensor.nbytes) for _, tensor in tensors) > piece.nbytes:
@@ -335,19 +345,19 @@ class Rebuilds:
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes, once its log has all it
         keeps."""
-        piece = self._droppable[node][rid]
-        if used < piece.nbytes:
-            self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
-            self._droppable[node][rid] = HostSlice(piece.offset, used)
+        room = self._droppable[node][rid]
+        if used < room.piece.nbytes:
+            self._pool.give(HostSlice(room.piece.offset + used, room.piece.nbytes - used))
+            self._droppable[node][rid] = room._replace(piece=HostSlice(room.piece.offset, used))
 
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
         if kept is not None and kept.copies is not None and kept.copies.queued:
             # its slice goes back to the pool, so no copy may start into it
             self._queued = deque(queued for queued in self._queued if queued.copies is not kept.copies)
-        piece = self._droppable[node].pop(rid, None)
-        if piece is not None:
-            self._pool.give(piece)
+        room = self._droppable[node].pop(rid, None)
+        if room is not None:
+            self._pool.give(room.piece)
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -428,8 +438,10 @@ class Rebuilds:
         kept = self._kept[node][rid]
         ids = array("i", kept.prompt.view.numpy().tobytes())
         ids.extend(kept.sampled)
+        # the row writes every id but the last, and the slots its host copies fill
+        slots = len(ids) - 1 + (0 if kept.copies is None else kept.copies.slots)
         cursor = RebuildCursor(
-            kept.walk, len(ids) - 1, len(ids) - 1, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
+            kept.walk, slots, slots, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
         )
         self._cursors[(node, rid)] = cursor
         return Rebuild(cursor.walk, ids)
@@ -477,6 +489,7 @@ class Rebuilds:
         """Record that ``rid``'s rebuild ran ``chunk``, or the rest of its ids with no chunk, and return its
         cursor once the rebuild has finished."""
         cursor = self._cursors[(node, rid)]
+        cursor.ran += cursor.total - cursor.done if chunk is None else chunk.end - chunk.start
         cursor.done = cursor.total if chunk is None else chunk.end
         if cursor.done < cursor.total:
             return None

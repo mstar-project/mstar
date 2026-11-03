@@ -3871,7 +3871,7 @@ class Worker:
                     engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
                 self.scheduler.note_rebuilt(node, rid)
-                self._preemption.rebuilt(rid, node, cursor.total)
+                self._preemption.rebuilt(rid, node, cursor.ran)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)
