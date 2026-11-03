@@ -40,6 +40,14 @@ def test_bagel_chat_decodes_image_input(tmp_path):
     assert "image" in sa.input_modalities and "text" in sa.input_modalities
 
 
+@pytest.mark.parametrize("ptype", ["image_url", "video_url", "audio_url"])
+def test_an_untyped_attachment_takes_its_part_s_modality(tmp_path, ptype):
+    """An application/octet-stream data URL (or object-store URL) was modality "unknown", a 400."""
+    url = "data:application/octet-stream;base64," + base64.b64encode(b"\x89PNG").decode()
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": [{"type": ptype, ptype: {"url": url}}]}])
+    assert adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).input_modalities == [ptype[:-4]]
+
+
 def test_a_chat_request_keeps_each_message_role(tmp_path):
     req = ChatCompletionRequest(model="bagel", messages=[
         {"role": "system", "content": "Be brief."},

@@ -141,21 +141,12 @@ def flatten_messages(
                 if ptype == "text":
                     if part.get("text"):
                         add_text(part["text"], role)
-                elif ptype == "image_url":
-                    url = (part.get("image_url") or {}).get("url", "")
+                elif ptype in ("image_url", "video_url", "audio_url"):  # video and audio are extensions
+                    url = (part.get(ptype) or {}).get("url", "")
                     if url:
                         mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "image", path)
-                elif ptype == "video_url":  # extension for video-capable models
-                    url = (part.get("video_url") or {}).get("url", "")
-                    if url:
-                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "video", path)
-                elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
-                    url = (part.get("audio_url") or {}).get("url", "")
-                    if url:
-                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                        add_file(mod or "audio", path)
+                        # a MIME that names no modality (application/octet-stream) takes the part's
+                        add_file(mod if mod != "unknown" else ptype.removesuffix("_url"), path)
                 elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
                     ia = part.get("input_audio") or {}
                     data, fmt = ia.get("data"), ia.get("format", "wav")
