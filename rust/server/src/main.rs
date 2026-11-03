@@ -1152,9 +1152,14 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     if content_type.starts_with("application/x-www-form-urlencoded") {
         // No file uploads on this path (files force multipart), matching how
         // these clients already behave.
-        let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        // through the extractor, so the MSTAR_MAX_BODY_MB layer applies
+        let body = match Bytes::from_request(req, &st).await {
             Ok(b) => b,
-            Err(e) => return detail_error(400, &format!("reading form body: {e}")),
+            Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                let mb = body_limit_mb();
+                return detail_error(413, &format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"));
+            }
+            Err(e) => return detail_error(400, &format!("reading form body: {}", e.body_text())),
         };
         for (k, v) in form_urlencoded::parse(&body) {
             match k.as_ref() {
@@ -1743,6 +1748,22 @@ mod tests {
             .header(CONTENT_TYPE, "multipart/form-data; boundary=XBOUNDARY")
             .body(Body::from(payload))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_urlencoded_generate_body_past_the_limit_is_413() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/generate", post(generate))
+            .layer(DefaultBodyLimit::max(1 << 20))
+            .with_state(state(None));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("text={}", "a".repeat(2 << 20))))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
