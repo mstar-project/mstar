@@ -1201,7 +1201,8 @@ Chatterbox notes
   the playback time to produce a bigger one, so a stream costs three or four
   flow solves instead of one per 25 tokens. Each chunk re-runs
   the flow decoder over all tokens so far with a fixed noise field, holds back
-  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  the three look-ahead tokens and crossfades the vocoder tail (which a first chunk
+  of at least 7 tokens fills), so the stream
   is continuous but not sample-identical to the whole-utterance decode;
   ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
   path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
