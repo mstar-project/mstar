@@ -1,7 +1,7 @@
 """Every output carries the weight version its request was admitted under.
 
-Workers stamp the version they hold on each result frame (both runtimes; the
-Rust one in ``test/rust/test_weight_version_outputs_rust.py``), and the conductor
+Workers stamp the version they hold on each result frame (the runtime's side is
+in ``test/rust/test_weight_version_outputs_rust.py``), and the conductor
 puts the version it admitted the request under on ``request_complete`` and
 ``request_failed``. Until a reload names a version nothing changes: no field on
 the wire, empty frame metadata, the same ``/generate`` body.
@@ -60,36 +60,6 @@ def test_a_result_tokens_frame_keeps_its_metadata():
         request_ids=["r1"], values=[7], loop_indices=[None], signal="new_token",
         modality="text", metadata={"weight_version": "v2"}))
     assert decode(encode(msg)).body.metadata == {"weight_version": "v2"}
-
-
-# -- the Python runtime ----------------------------------------------------------
-
-
-def _python_frames(version, inline):
-    from test_delivery_chunk_counts import SHAPES, drive, python_runtime
-
-    runtime, put, recorder = python_runtime(SHAPES["plain"][1])
-    if version is not None:
-        runtime.set_weight_version(version)
-    drive(runtime, put, *SHAPES["plain"], inline=inline)
-    chunks = recorder.chunks()
-    # the inline case must really send RESULT_TOKENS frames, or it checks nothing new
-    assert any(isinstance(c, ResultTokens) for c in chunks) == inline
-    return chunks
-
-
-@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
-def test_the_python_runtime_stamps_nothing_until_a_version_is_set(inline):
-    chunks = _python_frames(None, inline)
-    assert chunks and [c.metadata for c in chunks] == [{}] * len(chunks)
-
-
-@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
-def test_the_python_runtime_stamps_every_frame_once_set(inline):
-    chunks = _python_frames("v2", inline)
-    assert chunks and [c.metadata for c in chunks] == [{"weight_version": "v2"}] * len(chunks)
-    # the api server keeps each frame's metadata per tensor: no shared dict
-    assert len({id(c.metadata) for c in chunks}) == len(chunks)
 
 
 # -- the API server ------------------------------------------------------------
