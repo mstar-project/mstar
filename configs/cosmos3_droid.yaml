@@ -22,6 +22,10 @@ model_kwargs:
   # flow shift stays at the action default (5.0, the 480p training shift).
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
+  # The policy takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): the robot_state comes in and the predicted rows go out in the
+  # robot's own values, the same state a pi0.5 DROID policy takes.
+  inverted_action_dims: [7]
 node_groups:
   - node_names: ["dit"]
     ranks: [0]
