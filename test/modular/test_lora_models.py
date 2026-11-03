@@ -294,10 +294,11 @@ def _vision_node(model, resources=None) -> VisionEncoderSubmodule:
     return sub
 
 
-def _prompt(sub):
-    pixels = torch.randint(0, 256, (PATCHES, PATCH_NUMEL), generator=torch.Generator().manual_seed(5),
+def _prompt(sub, grids=GRIDS):
+    patches = sum(t * h * w for t, h, w in grids)
+    pixels = torch.randint(0, 256, (patches, PATCH_NUMEL), generator=torch.Generator().manual_seed(5),
                            dtype=torch.uint8)
-    fwd_info = SimpleNamespace(step_metadata={STEP_GRIDS_KEY: GRIDS})
+    fwd_info = SimpleNamespace(step_metadata={STEP_GRIDS_KEY: grids})
     return sub.prepare_inputs("encode", fwd_info, {"pixel_values": [pixels]})
 
 
@@ -380,6 +381,28 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
     if adapter is not None:  # control: the adapter moves the output far past the tolerance
         assert (want - _encode(_vision_node(tower()))).abs().max() > 1e-3
+
+
+def test_qwen3_5_compiled_patch_embed_with_an_adapter_row_matches_eager(tmp_path):
+    """The bound conv patch embed cuts its patches and adds its delta through views that
+    Inductor traces inside the ``model.embed`` region, compiled as ``compile_regions``
+    compiles it (dynamic in the patch count): equal to eager with an adapter row, at two
+    patch counts."""
+    path, _ = write_vision_adapter(tmp_path / "v")
+    lora_pool = _vision_pool({"v": path})
+    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    torch._dynamo.reset()
+    compiled = torch.compile(sub.model.embed, dynamic=True, backend="inductor")
+    for i, grids in enumerate(([(1, 4, 4)], GRIDS)):
+        rid, inp = f"r{i}", _prompt(sub, grids)
+        lora, ctx = _admit(lora_pool, engine_step(sub, "encode", [rid], [inp]), rid, "v")
+        assert lora_pool.active
+        kwargs = sub.preprocess("encode", _engine(rid), [inp])
+        args = [kwargs[k] for k in ("pixel_values", "indices", "weights", "position_ids")]
+        with torch.no_grad():
+            want, got = sub.model.embed(*args), compiled(*args)
+        lora_pool.commit(lora, ctx)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
 def test_qwen3_5_text_only_adapter_holds_no_vision_slot(tmp_path):
