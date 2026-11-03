@@ -59,10 +59,6 @@ class PlatformDispatch:
                 self._impl = factory()
             return self._impl
 
-    def resolve(self) -> Callable[..., Any]:
-        """Pick now, so the first call inside a compiled region has no lock to trace through."""
-        return self._impl or self._resolve()
-
     def reset(self) -> None:
         """Drop the cached implementation so the next call picks again."""
         with self._lock:

@@ -18,6 +18,7 @@ Per-request knobs (``model_kwargs``): ``width`` / ``height`` (multiples of 16),
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Hashable
 
@@ -31,9 +32,15 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
-from mstar.model.components.linear import LINEAR_PRECISIONS, apply_linear_precision
+from mstar.model.components.quant_linear import (
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    check_linear_keep,
+    quantize_linears,
+    select_linears,
+)
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.z_image.components.transformer import LOW_PRECISION_LINEARS
+from mstar.model.z_image.components.transformer import QUANTIZABLE_LINEARS
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
     IMAGE_OUTPUT,
@@ -71,14 +78,13 @@ class ZImageModel(Model):
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         async_scheduling: bool = True,
-        linear_precision: str = "bf16",
-        linear_precision_keep: list[str] | None = None,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
-        if linear_precision not in LINEAR_PRECISIONS:
-            raise ValueError(f"linear_precision must be one of {LINEAR_PRECISIONS}, got {linear_precision!r}")
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -98,9 +104,10 @@ class ZImageModel(Model):
         self.vae_compile = bool(vae_compile)
         # speculative scheduling of the image nodes, on by default (see Flux2KleinModel.async_scheduling)
         self.async_scheduling = bool(async_scheduling)
-        # the blocks' linears through a block-scaled GEMM (see Flux2KleinModel.linear_precision)
-        self.linear_precision = linear_precision
-        self.linear_precision_keep = tuple(linear_precision_keep or ())
+        # the blocks' linears in a low-precision format (see Flux2KleinModel.linear_dtype)
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -321,9 +328,13 @@ class ZImageModel(Model):
             )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
-            apply_linear_precision(
-                transformer, self.linear_precision, LOW_PRECISION_LINEARS, self.linear_precision_keep,
+            selection = select_linears(
+                transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, "Z-Image transformer",
             )
+            # a schedule's bf16 steps run a copy taken before quantizing; nothing quantized, every step is bf16
+            step_dtypes = self.step_dtypes if selection.names else None
+            bf16_transformer = copy.deepcopy(transformer) if step_dtypes is not None else None
+            quantize_linears(transformer, selection)
             return ZImageDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
@@ -331,6 +342,7 @@ class ZImageModel(Model):
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
+                step_dtypes=step_dtypes, bf16_transformer=bf16_transformer,
             )
         logger.warning("Z-Image has no submodule for node %r; running it dummy", node_name)
         return None

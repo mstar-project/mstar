@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -24,7 +24,11 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    ExactOps,
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
@@ -44,6 +48,7 @@ from mstar.model.components.diffusion.image_io import (
 )
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
@@ -61,7 +66,6 @@ class KleinShape:
     grid: tuple[int, int]                       # (h, w) latent tokens of the generated image
     text_len: int
     ref_grids: tuple[tuple[int, int], ...] = ()  # per reference image, in order
-    bf16_step: bool = False                     # a leading step under linear_precision_bf16_steps
 
     @property
     def image_tokens(self) -> int:
@@ -149,17 +153,16 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
         bf16_transformer: nn.Module | None = None,
-        bf16_steps: int = 0,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
-        # A low-precision transformer's bf16 twin, for the leading steps of a request's loop.
+        # A low-precision transformer's bf16 twin, for the steps a schedule runs in bf16.
         self.bf16_transformer = bf16_transformer
-        self._bf16_steps = bf16_steps if bf16_transformer is not None else 0
         self.config = config
         self.rope = MultiAxisRoPE(config.transformer.rope_theta, config.transformer.axes_dims_rope)
         self._compiled_shapes: set[tuple] = set()
@@ -171,31 +174,12 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
                 if module is not None:
                     compile_transformer_forward(
                         module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
                     )
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
-
-    def _step_key(self, fwd_info: CurrentForwardPassInfo, key: KleinShape) -> KleinShape:
-        """A step's key: the request's, marked on the leading steps that run bf16. A request's own key stays unmarked,
-        since its schedule and seeds outlive any one step."""
-        return replace(key, bf16_step=True) if self.step_index(fwd_info) < self._bf16_steps else key
-
-    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs | None:
-        node_inputs = super().prepare_inputs(graph_walk, fwd_info, inputs, **kwargs)
-        if node_inputs is not None and self._bf16_steps:
-            node_inputs.resource_step_info = self._step_key(fwd_info, node_inputs.resource_step_info)
-        return node_inputs
-
-    def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None, **kwargs):
-        if not self._bf16_steps:
-            return super().cg_key_info(graph_walk, per_request_info, per_request_input_metadata, **kwargs)
-        # Padding rows carry no step metadata (see the base)
-        keys = [
-            self._step_key(info, self.bucket_key_for(info)) for info in per_request_info.values() if info.step_metadata
-        ]
-        return self._uniform_key(keys) if keys else None
 
     def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
         return FlowMatchSchedule.build(
@@ -252,7 +236,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        transformer = self.bf16_transformer if bucket_key.bf16_step else self.transformer
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
         velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
         velocity = velocity[:, : latents.shape[1]]
         return euler_step(latents, velocity, sigma, sigma_next)

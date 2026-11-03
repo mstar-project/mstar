@@ -1,5 +1,5 @@
-"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized;
-the MXFP8 and NVFP4 formats of cuBLASLt's block-scaled GEMMs, and their host-side quantizer.
+"""FP8 block-scale checkpoints: the ``quantization_config`` they declare, and their weights dequantized; the scale
+layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4).
 
 A block-scale checkpoint (DeepSeek-V3's format, GLM-5.x's) stores each linear weight as e4m3 with one fp32
 ``weight_scale_inv`` per ``weight_block_size`` block. Triton-free, so a model's config can import it on a
@@ -21,48 +21,19 @@ E8M0_DTYPE = torch.float8_e8m0fnu
 FP4_DTYPE = torch.float4_e2m1fn_x2
 
 
-@dataclass(frozen=True)
-class BlockFormat:
-    """One matrix format of a block-scaled GEMM: ``block`` values along K share one ``scale_dtype`` scale, and
-    ``packing`` values share one stored ``data_dtype`` element (NVFP4's K is half its value count)."""
-
-    name: str
-    data_dtype: torch.dtype
-    scale_dtype: torch.dtype
-    block: int
-    packing: int
-    data_max: float
-
-
-MXFP8 = BlockFormat("mxfp8", FP8_DTYPE, E8M0_DTYPE, block=32, packing=1, data_max=448.0)
-NVFP4 = BlockFormat("nvfp4", FP4_DTYPE, FP8_DTYPE, block=16, packing=2, data_max=6.0)
-BLOCK_FORMATS = {fmt.name: fmt for fmt in (MXFP8, NVFP4)}
-
-# The swizzled scale layout tiles blocks by this many along K and rows by 128.
+# The swizzled scale layout of cuBLASLt's block-scaled GEMMs (MXFP8, NVFP4) tiles blocks by this many along K and
+# rows by 128; ``model.components.block_scaled`` holds the formats.
 BLOCKS_PER_TILE = 4
 _ROWS_PER_TILE = 128
-_E8M0_MAX_BIASED = 253  # 254 would make the data's multiply-back 2^-127, which fp32 can't hold as a normal
-_E4M3_MAX_FINITE = 0x7E
 
 
 class BlockQuant(NamedTuple):
-    """One quantized matrix ``[rows, K // packing]``. ``scale`` is flat in the GEMM's swizzled layout;
+    """One block-scaled matrix ``[rows, K // packing]``. ``scale`` is flat in the GEMM's swizzled layout;
     ``tensor_scale`` is NVFP4's second level, a ``[1]`` fp32 (None under MXFP8)."""
 
     data: torch.Tensor
     scale: torch.Tensor
     tensor_scale: torch.Tensor | None = None
-
-
-def check_block_gemm(fmt: BlockFormat, k: int, n: int, dtype: torch.dtype) -> None:
-    """Refuse what the block-scaled GEMM and the quantizer can't run: the quantizer writes whole scale tiles, so K
-    is a multiple of ``BLOCKS_PER_TILE`` blocks; cuBLASLt wants N and the stored K to be multiples of 16."""
-    if dtype != torch.bfloat16:
-        raise ValueError(f"{fmt.name} replaces a bf16 GEMM; this linear's weight is {dtype}")
-    if k % (fmt.block * BLOCKS_PER_TILE) or (k // fmt.packing) % 16:
-        raise ValueError(f"{fmt.name} needs K a multiple of {fmt.block * BLOCKS_PER_TILE}; this linear's K is {k}")
-    if n % 16:
-        raise ValueError(f"{fmt.name} needs N a multiple of 16; this linear's N is {n}")
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -93,67 +64,6 @@ def unswizzle_block_scales(flat: torch.Tensor, rows: int, k_blocks: int) -> torc
     tiles = flat.view(-1, 32, 16).reshape(-1, 32, BLOCKS_PER_TILE, BLOCKS_PER_TILE).transpose(1, 2)
     padded = tiles.reshape(row_tiles, col_tiles, _ROWS_PER_TILE, BLOCKS_PER_TILE).permute(0, 2, 1, 3)
     return padded.reshape(row_tiles * _ROWS_PER_TILE, col_tiles * BLOCKS_PER_TILE)[:rows, :k_blocks]
-
-
-def _fp4_codes(u: torch.Tensor) -> torch.Tensor:
-    """fp32 to e2m1 codes, round to nearest even: ties go to 0, 1, 2 and 4."""
-    a = u.abs()
-    code = (
-        (a > 0.25).int() + (a >= 0.75).int() + (a > 1.25).int() + (a >= 1.75).int()
-        + (a > 2.5).int() + (a >= 3.5).int() + (a > 5.0).int() + (u < 0).int() * 8
-    )
-    return code.to(torch.uint8)
-
-
-def _fp4_values(codes: torch.Tensor) -> torch.Tensor:
-    table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=codes.device)
-    values = table[(codes & 7).long()]
-    return torch.where(codes & 8 != 0, -values, values)
-
-
-def quantize_block(
-    x: torch.Tensor, fmt: BlockFormat, tensor_scale: torch.Tensor | float | None = None,
-) -> BlockQuant:
-    """Quantize a row-major ``[rows, K]`` matrix, one scale per ``fmt.block`` values along K per row: an MXFP8 scale
-    is the power of two at or above ``amax / 448``, an NVFP4 scale the e4m3 at or above ``amax / 6`` in units of
-    ``tensor_scale`` (default: the tensor's own ``amax / (6 * 448)``, which gives the largest block the top of
-    e4m3's range). Rounding the scale up means no value clips. ``quant_fp8`` does this per call on the device."""
-    rows, k = x.shape
-    blocks = x.float().view(rows, k // fmt.block, fmt.block)
-    amax = blocks.abs().amax(dim=-1)
-    if fmt is MXFP8:
-        mantissa, exponent = torch.frexp(amax / fmt.data_max)
-        biased = (exponent - (mantissa == 0.5).to(exponent.dtype) + 127).clamp(1, _E8M0_MAX_BIASED)
-        biased = torch.where(amax == 0, torch.ones_like(biased), biased)
-        scale = torch.ldexp(torch.ones_like(amax), biased - 127)
-        data = (blocks / scale[..., None]).view(rows, k).to(fmt.data_dtype)
-        return BlockQuant(data, swizzle_block_scales(biased.to(torch.uint8)).view(fmt.scale_dtype))
-    if tensor_scale is None:
-        tensor_scale = (amax.max() / (fmt.data_max * 448.0)).clamp_min(torch.finfo(torch.float32).tiny)
-    tensor_scale = torch.as_tensor(tensor_scale, dtype=torch.float32, device=x.device).reshape(1)
-    want = amax / tensor_scale / fmt.data_max
-    code = want.to(FP8_DTYPE).view(torch.uint8).int()
-    code = (code + (code.to(torch.uint8).view(FP8_DTYPE).float() < want).int()).clamp(1, _E4M3_MAX_FINITE)
-    code = code.to(torch.uint8)
-    scale = code.view(FP8_DTYPE).float() * tensor_scale
-    nibbles = _fp4_codes((blocks / scale[..., None]).view(rows, k)).view(rows, k // 2, 2)
-    data = (nibbles[..., 0] | (nibbles[..., 1] << 4)).view(fmt.data_dtype)
-    return BlockQuant(data, swizzle_block_scales(code).view(fmt.scale_dtype), tensor_scale)
-
-
-def dequantize_block(q: BlockQuant, fmt: BlockFormat) -> torch.Tensor:
-    """The fp32 ``[rows, K]`` a :class:`BlockQuant` stands for."""
-    rows, stored = q.data.shape
-    k = stored * fmt.packing
-    scales = unswizzle_block_scales(q.scale, rows, k // fmt.block)
-    if fmt is MXFP8:
-        values = q.data.float()
-        scale = scales.float()
-    else:
-        raw = q.data.view(torch.uint8)
-        values = _fp4_values(torch.stack([raw & 15, raw >> 4], dim=-1)).view(rows, k)
-        scale = scales.float() * q.tensor_scale
-    return values * scale.repeat_interleave(fmt.block, dim=1)
 
 
 @dataclass(frozen=True)

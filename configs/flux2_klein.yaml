@@ -32,8 +32,9 @@ model_kwargs:
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
-  # linear_precision: bf16 (default), mxfp8 or nvfp4 runs the block linears through a block-scaled GEMM, faster and
-  # further from the bf16 image of the same seed; see docs/models.rst before turning it on
+  # linear_dtype: bf16 (default), mxfp8 or nvfp4 runs the block linears through a block-scaled GEMM, faster and
+  # further from the bf16 image of the same seed; linear_keep_bf16 and linear_dtype_steps keep some linears or steps
+  # in bf16. See docs/models.rst before turning it on
   # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout
   # safetensors; ``scale`` multiplies the adapter). Example:
   # lora:

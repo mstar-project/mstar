@@ -4,8 +4,9 @@ Per-token-group FP8: the e4m3 activation quant that feeds block-scale W8A8
 GEMMs (the fused MoE experts today).  Adapted from sglang's
 ``fused_moe_triton_kernels.py`` (Apache-2.0).
 
-Block-scaled, for cuBLASLt's MXFP8 and NVFP4 GEMMs (``quant_block``): the same
-idea with the scales in the GEMM's format and swizzled layout.
+Block-scaled, for cuBLASLt's MXFP8 and NVFP4 GEMMs (``quant_mxfp8``,
+``quant_nvfp4``): the same idea with the scales in the GEMM's format and
+swizzled layout. ``model.components.block_scaled`` holds the formats.
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ import triton.language as tl
 
 from mstar.utils.fp8_block import (
     BLOCKS_PER_TILE,
-    FP8_DTYPE,  # noqa: F401 - e4m3, re-exported for the kernels' importers
-    MXFP8,
-    BlockFormat,
+    E8M0_DTYPE,
+    FP4_DTYPE,
+    FP8_DTYPE,
     BlockQuant,
     swizzled_scale_elements,
 )
@@ -142,21 +143,22 @@ def _mxfp8_quant_kernel(
 
 @triton.jit
 def _nvfp4_quant_kernel(
-    y_ptr, q_ptr, s_ptr, rows, k, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+    y_ptr, q_ptr, s_ptr, ts_ptr, rows, k, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales rounded up. One read per
-    value."""
+    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales in units of the tensor scale
+    at ``ts_ptr``, rounded up. One read per value."""
     g = tl.program_id(0).to(tl.int64)
     col_tile = tl.program_id(1).to(tl.int64)
     row = g * ROWS + tl.arange(0, ROWS)
     live = (row < rows)[:, None]
     offs = row[:, None] * k + col_tile * (BLOCKS * BLOCK) + tl.arange(0, BLOCKS * BLOCK)[None, :]
     y = tl.reshape(tl.load(y_ptr + offs, mask=live, other=0.0).to(tl.float32), [ROWS, BLOCKS, BLOCK])
-    want = tl.max(tl.abs(y), axis=2) / 6.0
+    tensor_scale = tl.load(ts_ptr)
+    want = tl.max(tl.abs(y), axis=2) / 6.0 / tensor_scale
     code = want.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
     code = code + (code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) < want).to(tl.int32)
     code = tl.minimum(tl.maximum(code, 1), 0x7E)
-    scale = code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    scale = code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) * tensor_scale
     u = y / scale[:, :, None]
     a = tl.abs(u)
     nibble = (
@@ -170,26 +172,37 @@ def _nvfp4_quant_kernel(
     tl.store(s_ptr + _scale_tile_offsets(g, col_tile, col_tiles, ROWS, BLOCKS), code.to(tl.uint8), mask=live)
 
 
-@torch.compiler.disable
-def quant_block(x: torch.Tensor, fmt: BlockFormat) -> BlockQuant:
-    """Quantize a contiguous bf16 ``[rows, K]`` activation for a block-scaled GEMM; ``fp8_block.quantize_block`` is the
-    host-side reference. NVFP4's block scales are in units of one, with no ``tensor_scale`` returned: an activation
-    needs the range of e4m3 alone, and reading it twice for its maximum costs as much as quantizing it. Rows need not
-    fill a scale tile: the GEMM doesn't read scales past its M. A graph break, like ``per_token_group_quant_fp8``."""
+def _block_grid(x: torch.Tensor, block: int) -> tuple[tuple[int, int], int, torch.Tensor]:
+    """The quantizers' grid, column tiles and swizzled scale buffer for ``x``. Triton has no e8m0 or e2m1x2
+    pointers; both are written as bytes and viewed. Rows need not fill a scale tile: the GEMM doesn't read scales
+    past its M."""
     rows, k = x.shape
-    k_blocks = k // fmt.block
+    k_blocks = k // block
     col_tiles = k_blocks // BLOCKS_PER_TILE
-    grid = (triton.cdiv(rows, _BLOCK_QUANT_ROWS), col_tiles)
-    # Triton has no e8m0 or e2m1x2 pointers; both are written as bytes and viewed
     scale = torch.empty(swizzled_scale_elements(rows, k_blocks), dtype=torch.uint8, device=x.device)
-    if fmt is MXFP8:
-        data = torch.empty_like(x, dtype=fmt.data_dtype)
-        _mxfp8_quant_kernel[grid](
-            x, data, scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
-        )
-        return BlockQuant(data, scale.view(fmt.scale_dtype))
-    packed = torch.empty(rows, k // fmt.packing, dtype=torch.uint8, device=x.device)
-    _nvfp4_quant_kernel[grid](
-        x, packed, scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
+    return (triton.cdiv(rows, _BLOCK_QUANT_ROWS), col_tiles), col_tiles, scale
+
+
+def quant_mxfp8(x: torch.Tensor) -> BlockQuant:
+    """A contiguous bf16 ``[rows, K]`` activation as MXFP8: e4m3 data, one power-of-two e8m0 scale per 32 values.
+    ``block_scaled.Mxfp8Format.quantize`` is the host-side reference."""
+    rows, k = x.shape
+    grid, col_tiles, scale = _block_grid(x, 32)
+    data = torch.empty_like(x, dtype=FP8_DTYPE)
+    _mxfp8_quant_kernel[grid](
+        x, data, scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=32,
     )
-    return BlockQuant(packed.view(fmt.data_dtype), scale.view(fmt.scale_dtype))
+    return BlockQuant(data, scale.view(E8M0_DTYPE))
+
+
+def quant_nvfp4(x: torch.Tensor, tensor_scale: torch.Tensor) -> BlockQuant:
+    """A contiguous bf16 ``[rows, K]`` activation as NVFP4: packed e2m1 data, one e4m3 scale per 16 values in units
+    of ``tensor_scale`` (a ``[1]`` fp32 on the device, the linear's: reading the activation twice for its own
+    maximum costs as much as quantizing it). ``block_scaled.Nvfp4Format.quantize`` is the host-side reference."""
+    rows, k = x.shape
+    grid, col_tiles, scale = _block_grid(x, 16)
+    packed = torch.empty(rows, k // 2, dtype=torch.uint8, device=x.device)
+    _nvfp4_quant_kernel[grid](
+        x, packed, scale, tensor_scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=16,
+    )
+    return BlockQuant(packed.view(FP4_DTYPE), scale.view(FP8_DTYPE), tensor_scale)
