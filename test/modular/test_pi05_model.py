@@ -170,10 +170,18 @@ def test_pi05_vision_letterboxes_each_camera_at_its_own_resolution():
     assert torch.equal(pixels[1], submodule._prepare_one(tall)[0])
 
 
-def test_pi05_vision_refuses_more_cameras_than_its_slots():
-    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
-    with pytest.raises(ValueError, match="takes at most 2"):
-        submodule.prepare_inputs("prefill", None, {"image_inputs": [torch.zeros(3, 4, 4)] * 3})
+def test_pi05_vision_postprocess_keeps_the_images_its_inputs_name():
+    """postprocess trims by the num_images prepare_inputs recorded, which the KV layout
+    was counted for, and has no fallback to keeping every slot."""
+    from mstar.model.submodule_base import NodeInputs
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    emb = torch.arange(6.0).reshape(6, 1)  # two tokens per camera slot
+    outputs = {"img_emb": [emb]}
+    submodule.postprocess("r", None, outputs, inputs=NodeInputs(kwargs={"num_images": 2}))
+    assert torch.equal(outputs["img_emb"][0], emb[:4])
+    with pytest.raises(KeyError):
+        submodule.postprocess("r", None, {"img_emb": [emb]}, inputs=NodeInputs())
 
 
 def test_pi05_refuses_more_images_than_cameras_before_decoding():
