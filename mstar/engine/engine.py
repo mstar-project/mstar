@@ -3028,6 +3028,10 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
+    def newer_than(self, request_id: int) -> list[str] | None:
+        """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
+        return self._runner.newer_than(request_id)
+
     def readmit_request(self, node_name: str, request_id: int) -> None:
         """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
         `Admission.readmit`."""
@@ -3281,7 +3285,7 @@ class Engine:
     ) -> None:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
-        self._runner.ingest_request(request_id, overrides)
+        self._runner.ingest_request(request_id, overrides, None if request_info is None else request_info.arrival)
         if request_info is None:
             return
         try:

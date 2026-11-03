@@ -46,8 +46,8 @@ def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | N
     )
     _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
-        loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
-    )})
+        loop_caps={"decode": 4 * PAGE_SIZE},
+    )}, arrival)
 
 
 def _admitted(kv, rid: str) -> bool:
@@ -76,6 +76,11 @@ def _offload(kv, rid: str) -> int:
     freed = kv.offload(rid)
     _runner(kv).readmit(rid, NODE)
     return freed
+
+
+def _preempt(kv, rid: str, pages_short: int, droppable) -> Victims | None:
+    """`KVManager.preempt` over the runner's arrival order, as the worker calls it."""
+    return kv.preempt(rid, pages_short, _runner(kv).newer_than(rid), droppable)
 
 
 def _queue(kv) -> list[str]:
@@ -132,7 +137,7 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     _running(kv, "v", 5, arrival=2)
     assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows past its allotment into the room"
 
-    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
     _drop(kv, "v")
 
     assert kv._allotments["r"].remaining == 1, "the page v freed isn't reserved for r"
@@ -150,7 +155,7 @@ def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
     _running(kv, "v1", 3, arrival=2)
     _running(kv, "v2", 2, arrival=3)
     short = _step(kv, "r", 6 * PAGE_SIZE).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: True).to_drop == ["v2", "v1"]
+    assert _preempt(kv, "r", short, droppable=lambda rid: True).to_drop == ["v2", "v1"]
 
     _drop(kv, "v2")
     _admitted(kv, "v2")
@@ -164,12 +169,12 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     _running(kv, "r1", 3, arrival=1)
     _running(kv, "r2", 3, arrival=2)
     _running(kv, "v", 4, arrival=3)
-    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
+    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
 
-    waits = kv.preempt("r2", _short(kv, "r2"), droppable=lambda rid: True)
+    waits = _preempt(kv, "r2", _short(kv, "r2"), droppable=lambda rid: True)
     assert waits == Victims([], [], waits=True), "r2 took r1's victim or moved itself"
     _runner(kv).readmit("r2", NODE)
-    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], []), "r1 chose again"
+    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], []), "r1 chose again"
     _drop(kv, "v")
 
     assert not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
@@ -182,9 +187,9 @@ def test_a_request_waiting_on_its_own_victims_isnt_chosen_as_a_victim():
     _running(kv, "r", 3, arrival=1)
     _running(kv, "m", 3, arrival=2)
     _running(kv, "v", 4, arrival=3)
-    assert kv.preempt("m", _short(kv, "m"), droppable=lambda rid: True).to_drop == ["v"]
+    assert _preempt(kv, "m", _short(kv, "m"), droppable=lambda rid: True).to_drop == ["v"]
 
-    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True)
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
 
     assert "m" not in victims.to_drop, "m, which waits on the room its own victim frees, was chosen as a victim"
 
@@ -197,7 +202,7 @@ def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
     _running(kv, "v", 5, arrival=2)
     setattr(kv._streams["v"]["main"], flight, True)
 
-    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: False)
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False)
 
     assert "v" not in victims.to_host + victims.to_drop, f"v was chosen with its {flight}, so its move would be refused"
 
@@ -207,7 +212,7 @@ def test_a_victim_whose_move_fails_comes_off_the_earmark():
     kv._cpu_pool = host._HostPool(16)
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
-    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
     # the host fills before v moves
     kv._cpu_pool.arena.acquire(kv._cpu_pool.arena.num_free)
 
@@ -221,7 +226,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     _running(kv, "older", 5, arrival=0)
     _running(kv, "r", 5, arrival=1)
 
-    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
     drops = then == "drops itself"
     assert victims == Victims([], ["r"] if drops else [], waits=not drops), "r waits only when it can't drop itself"
@@ -246,7 +251,7 @@ def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fi
     _running(kv, "b", 4, arrival=1)
     _running(kv, "r", 5, arrival=2)
     short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: False).waits
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits
     _runner(kv).readmit("r", NODE)
 
     _remove(kv, "a")
@@ -262,7 +267,7 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     _running(kv, "r", 3, arrival=1)
     _running(kv, "v", 5, arrival=2)
     assert _step(kv, "r", 2 * PAGE_SIZE).ok
-    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
     if state in ("dropped", "rebuilding"):
         _drop(kv, "v")
     if state == "rebuilding":
@@ -276,7 +281,7 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     left = [
         state for state in (
             kv._earmarks, kv._victims, kv._ran_short, kv._asks, kv._dropped, kv._allotments,
-            admission._waiting, admission._admitted, admission._arrival, admission._queues["kv"],
+            admission._waiting, admission._admitted, admission._arrival, admission._numbered, admission._queues["kv"],
         ) if gone in state
     ]
     assert not left and not kv._earmarks and not kv._victims, f"{gone} left preemption state behind"
@@ -296,7 +301,7 @@ def test_victims_that_share_pages_are_preempted_together():
     assert _step(kv, "b", PAGE_SIZE).ok and kv._arena.num_free == 0, "b writes only its page past the shared three"
     short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
 
-    assert kv.preempt("r", short, droppable=lambda rid: True).to_drop == ["b", "a"], "a victim alone frees one page"
+    assert _preempt(kv, "r", short, droppable=lambda rid: True).to_drop == ["b", "a"], "a victim alone frees one page"
     alone, both = kv._frees(["a"]), kv._frees(["b", "a"])
     before = kv._arena.num_free + len(kv._index.evictable())
     _drop(kv, "b")
@@ -314,7 +319,7 @@ def test_a_page_the_failing_step_gives_back_is_no_release():
     outcome = kv.admit(step, ctx)
     kv.rollback_admit(step, ctx)
 
-    assert kv.preempt("r", outcome.reason.pages_short, droppable=lambda rid: True).to_drop == ["v"], (
+    assert _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: True).to_drop == ["v"], (
         "the page a's row gave back counted as room, so r waits on the step that will fail again"
     )
 
@@ -343,7 +348,7 @@ def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
     short = _step(kv, "r", 1).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: False).to_host == ["v"]
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).to_host == ["v"]
     _offload(kv, "v")
     assert "v" in kv._asks and kv.is_offloaded("v")
     kv.assert_pages_conserved()
@@ -360,7 +365,7 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     _running(kv, "a", 3, arrival=2)
     _running(kv, "b", 3, arrival=3)
     short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: False).to_host == ["b", "a"]
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).to_host == ["b", "a"]
     _offload(kv, "b")
     _offload(kv, "a")
     assert _queue(kv) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"

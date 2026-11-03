@@ -65,6 +65,7 @@ def _worker(kv):
         drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: _drop(kv, rid),
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
+        newer_than=lambda rid: _runner(kv).newer_than(rid),
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
         admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),
     )

@@ -120,12 +120,12 @@ Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-gra
 
 ```python
 @dataclass
-class KVReqConfig(ResourceReqConfig):
+class CurrentForwardPassInfo:
     ...
     arrival: int | None = None   # set by the conductor when it takes the request
 ```
 
-The conductor numbers each request from a single counter, in the order it takes them, and sets it on every pool's config. A dropped request keeps its number. Each pool's queue and its victim choice go by it.
+The conductor numbers each request from a single counter, in the order it takes them, and sends the number with the request. A dropped request keeps its number. The runner keeps the requests in that order, and each pool's queue and its victim choice go by it.
 
 A number set by each worker won't work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.
 

@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
@@ -4393,41 +4393,39 @@ class KVManager(AttentionResource):
 
     # Preemption
 
-    def preempt(self, rid: str, pages_short: int, droppable: Callable[[str], bool]) -> Victims | None:
-        """Choose newer requests to move off the device for ``rid``'s shortage of ``pages_short`` pages, newest
-        first, and earmark what they free for ``rid``. A victim the host can take whole moves there, and any
-        other is dropped, once ``droppable`` says its launched steps allow it.
+    def preempt(
+        self, rid: str, pages_short: int, newer: Iterable[str] | None, droppable: Callable[[str], bool],
+    ) -> Victims | None:
+        """Choose requests from ``newer``, the requests that arrived after ``rid``, newest first, to move off the
+        device for ``rid``'s shortage of ``pages_short`` pages, and earmark what they free for ``rid``. A victim
+        the host can take whole moves there, and any other is dropped, once ``droppable`` says its launched
+        steps allow it.
 
         Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none while ``rid`` waits
         for its earlier victims to move. When no move covers the shortage, ``rid`` keeps its allotment and asks
         for the shortage, and waits for it in the pool's queue once the runner asks again. None when the pool
-        doesn't decide or ``rid`` has no arrival number.
+        doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
         """
-        if not self._decides:
+        if not self._decides or newer is None:
             return None
         with self._lock:
-            overrides = self._overrides.get(rid)
-            if overrides is None or overrides.arrival is None:
-                return None
-            arrival = overrides.arrival
             room, then = self._room(), self._ran_short.pop(rid, None)
             if then is not None:
                 pages_short -= max(0, room - then)
             if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
                 return Victims([], [])
-            newer = sorted(
-                (other for other, overrides in self._overrides.items()
-                 if overrides.arrival is not None and overrides.arrival > arrival
-                 and self._holds(other) and self._movable(other)),
-                key=lambda other: self._overrides[other].arrival, reverse=True,
-            )
-            # a victim not yet moved frees its pages for the request it was chosen for
-            moving = any(other in self._victims for other in newer)
-            newer = [other for other in newer if other not in self._victims]
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
-            left, hosted = on_host, set()
+            left, hosted, moving = on_host, set(), False
             victims: list[str] = []
             for other in newer:
+                if not self._holds(other):
+                    continue
+                if other in self._victims:
+                    # a victim not yet moved frees its pages for the request it was chosen for
+                    moving = True
+                    continue
+                if not self._movable(other):
+                    continue
                 pages = self._host_pages(other)
                 if pages is not None and pages <= left:
                     left -= pages
@@ -4459,10 +4457,6 @@ class KVManager(AttentionResource):
             self._earmarks[rid] = earmark
             to_host = [victim for victim in victims if victim in hosted]
             return Victims(to_host, [victim for victim in victims if victim not in hosted])
-
-    def arrival(self, rid: str) -> int | None:
-        overrides = self._overrides.get(rid)
-        return None if overrides is None else overrides.arrival
 
     def _holds(self, rid: str) -> bool:
         allotment = self._allotments.get(rid)

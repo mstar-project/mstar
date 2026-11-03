@@ -1194,7 +1194,8 @@ class Worker:
                 for node_name in held
             )
 
-        victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
+        newer = engine.newer_than(reason.request_id)
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, droppable)
         if victims is None:
             return False
         if victims.waits:
@@ -1225,26 +1226,24 @@ class Worker:
             self.scheduler.return_backlogged(rid)
             self.scheduler.take_rebuilds((rid,))
         for rid in victims.to_host:
-            arrival = kv.cache.arrival(rid)
             for node_name in kv.nodes:
                 freed = self.engine_manager.get_engine(node_name).offload_request(node_name, rid)
                 self._log_throttled(
                     self._drop_logged, node_name,
-                    "KV short on node=%s: moved %s (arrival %s) to the host, %d pages freed for a shortage of %d, "
+                    "KV short on node=%s: moved %s to the host, %d pages freed for a shortage of %d, "
                     "preempted %d times (%d earlier moves not logged)",
-                    node_name, self._rid_str(rid), arrival, freed, pages_short, self._preempted[rid].times,
+                    node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
                 )
         for rid in victims.to_drop:
-            arrival = kv.cache.arrival(rid)
             for node_name in kv.nodes:
                 if self._rebuilds.kept(rid, node_name) is not None:
                     freed = self._drop(rid, node_name)
                     self._preemptions[node_name].drops += 1
                     self._log_throttled(
                         self._drop_logged, node_name,
-                        "KV short on node=%s: dropped %s (arrival %s), %d pages freed for a shortage of %d, "
+                        "KV short on node=%s: dropped %s, %d pages freed for a shortage of %d, "
                         "preempted %d times (%d earlier moves not logged)",
-                        node_name, self._rid_str(rid), arrival, freed, pages_short, self._preempted[rid].times,
+                        node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
                     )
 
     def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
