@@ -145,33 +145,30 @@ def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
 
 
-def _int_knob(kwargs: dict, name: str, default: int) -> int:
-    value = kwargs.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
-
-
-def image_output_options(request_kwargs: dict | None = None) -> tuple[str, int | None, int | None]:
-    """Parse the knobs :func:`encode_image` reads into ``(format, quality,
-    png_level)``; the one the format doesn't use is None. Models call this at
-    intake too, so a bad knob is a 400 before the GPU runs."""
+def image_output_format(request_kwargs: dict | None) -> str:
+    """The request's ``output_format`` (default ``png``; ``jpg`` means ``jpeg``), or ValueError
+    for one :func:`encode_image` cannot write, or a value it cannot apply for that format's
+    knob (``png_compress_level`` 0-9 for PNG, ``output_compression`` 0-100 otherwise). A model
+    calls it at intake too, so a bad value fails the request before generation rather than after."""
     kwargs = request_kwargs or {}
     fmt = str(kwargs.get("output_format") or "png").lower()
     if fmt == "jpg":
         fmt = "jpeg"
     if fmt not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
-    if fmt == "png":
-        level = _int_knob(kwargs, "png_compress_level", 1)
-        if not -1 <= level <= 9:
-            raise ValueError(f"png_compress_level must be -1 to 9, got {level}")
-        return fmt, None, level
-    quality = _int_knob(kwargs, "output_compression", 95 if fmt == "jpeg" else 80)
-    return fmt, max(0, min(100, quality)), None
+    key, top = ("png_compress_level", 9) if fmt == "png" else ("output_compression", 100)
+    value = kwargs.get(key)
+    if value is None:
+        return fmt
+    try:
+        # a whole number as encode_image's int() reads it (90, 90.0, "90"), not True or 50.9
+        ok = not isinstance(value, bool) and (isinstance(value, str) or int(value) == value)
+        ok = ok and 0 <= int(value) <= top
+    except (TypeError, ValueError, OverflowError):
+        ok = False
+    if not ok:
+        raise ValueError(f"{key} must be a whole number from 0 to {top}, got {value!r}")
+    return fmt
 
 
 def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> bytes:
@@ -182,13 +179,17 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     ``png_compress_level`` (0-9, default 1) selects the zlib level of the fast writer.
     Everything else decodes to the pixels the VAE produced (PNG losslessly).
     """
-    fmt, quality, level = image_output_options(request_kwargs)
+    kwargs = request_kwargs or {}
+    fmt = image_output_format(kwargs)
     if fmt == "png":
-        return uint8_to_png(image, compress_level=level)
+        level = kwargs.get("png_compress_level")
+        return uint8_to_png(image, compress_level=1 if level is None else int(level))
     from PIL import Image
 
     if image.ndim == 4:
         image = image[0]
+    quality = kwargs.get("output_compression")
+    quality = int(quality) if quality is not None else (95 if fmt == "jpeg" else 80)
     buffer = io.BytesIO()
     Image.fromarray(image.permute(1, 2, 0).contiguous().cpu().numpy(), mode="RGB").save(
         buffer, format=fmt.upper(), quality=quality,

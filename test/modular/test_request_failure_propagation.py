@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
@@ -34,9 +34,10 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
 
 # ── worker ─────────────────────────────────────────────────────────────────
@@ -122,7 +123,7 @@ def test_crashed_forward_fails_the_whole_batch():
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         w = _worker()
-        w._in_flight_rids = {"r1"}
+        w._hold_rows(CHAIN_LANE, {"r1"})
         pending = _pending_batch(["r1"], future=executor.submit(lambda: 1 / 0))
         try:
             pending.future.result()
@@ -169,7 +170,7 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
 def test_error_handler_also_fails_the_batch_built_this_iteration():
     w = _worker()
-    w._in_flight_rids = {"r1"}
+    w._hold_rows(CHAIN_LANE, {"r1"})
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r2": "wg"},
@@ -183,12 +184,11 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
 
 def _api_server(messages):
     s = make_test_api_server(
-        communicator=SimpleNamespace(
-            get_all_new_messages=lambda: messages.pop(0) if messages else []
-        ),
+        communicator=StandInSocket(lambda: messages.pop(0) if messages else []),
     )
     s.cleaned = []
     s.preprocess_worker = SimpleNamespace(
+        results_wakeup=EventWakeup(),
         get_profile_updates=lambda: [],
         get_result_chunks=lambda: [],
         has_pending_tensors=lambda rid: False,

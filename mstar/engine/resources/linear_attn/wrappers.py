@@ -12,6 +12,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from mstar.engine.resources.linear_attn.gdn_stage import stage_gdn_prefill_inputs
+from mstar.platforms.compile import compiled
+
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
 _CONV_BLOCK_M = 8
@@ -110,6 +113,32 @@ def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
 
 
+# The chunked path's elementwise work around its kernels, compiled into one
+# kernel each: run eagerly, it was a dozen launches per layer and about a
+# third of a long prefill's GPU time on Qwen3.5-0.8B. Pointwise only, so
+# dynamic=True costs nothing here (unlike a reduction over a symbolic head dim).
+
+
+def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """``x`` with its rows where ``mask`` is 0 zeroed, by select (they can hold inf)."""
+    return torch.where(mask[: x.shape[0], None].bool(), x, torch.zeros((), dtype=x.dtype, device=x.device))
+
+
+def _chunked_gates(
+    a: torch.Tensor, b: torch.Tensor,
+    a_log: torch.Tensor, dt_bias: torch.Tensor, mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The decay (exponentiated, as FlashInfer takes it) and the learning
+    rate the chunked kernel reads, from the raw gate projections. The decode
+    kernel forms them from the same two weights, so the formula lives here
+    and there alike. Masked tokens get decay 1 and rate 0."""
+    keep = mask[: a.shape[0], None].bool()
+    zero = torch.zeros((), dtype=torch.float32, device=a.device)
+    g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float())
+    beta = torch.sigmoid(b.float())
+    return torch.exp(torch.where(keep, g, zero)), torch.where(keep, beta, zero)
+
+
 class GDNPrefillWrapper(GDNWrapper):
     def __init__(
         self,
@@ -123,6 +152,7 @@ class GDNPrefillWrapper(GDNWrapper):
         has_sink_state: bool = True,
         accelerator_graph: bool=False,
         null_slot_id: int = 0,
+        stage_inputs: bool = False,
     ):
         super().__init__(
             device=device,
@@ -135,6 +165,11 @@ class GDNPrefillWrapper(GDNWrapper):
             null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
+        # `gdn_stage_applies`: one kernel prepares q/k/v and the gates. It also
+        # normalizes q and k and reads the strided views as they are.
+        self._stage_inputs = stage_inputs
+        self.qk_l2norm_in_kernel = stage_inputs
+        self.takes_strided_inputs = stage_inputs
         # What this arch's chunked kernel reads as its packed state; the
         # manager picks it off the device capability.
         self._prefill_dtype = prefill_dtype
@@ -146,11 +181,14 @@ class GDNPrefillWrapper(GDNWrapper):
         self._plan_state: GDNPrefillPlan | None = None
         self._plan_borrowed = 0
 
-        # Conv buffers
+        # Conv buffers: batch_ptr and offset_ptr are the two halves of one
+        # block, staged in one copy
+        self._conv_block: torch.Tensor | None = None
         self._batch_ptr: torch.Tensor | None = None
         self._offset_ptr: torch.Tensor | None  = None
         self._conv_metadata: ConvMetadata | None = None
         self._seqlens_cpu: torch.Tensor | None = None
+        self._stage = _PinnedIndexStage()
 
         # Snapshots: the kernel checkpoints every row's state each `_every`
         # tokens, and the ones a row keeps are scattered into snapshot slots.
@@ -185,24 +223,16 @@ class GDNPrefillWrapper(GDNWrapper):
             capacity = max(needed, 1)
 
         if capacity > self._capacity:
-            i32 = dict(dtype=torch.int32, device=self._device)
-            self._batch_ptr = torch.zeros(capacity, **i32)
-            self._offset_ptr = torch.zeros(capacity, **i32)
+            self._conv_block = torch.zeros(2 * capacity, dtype=torch.int32, device=self._device)
+            self._batch_ptr = self._conv_block[:capacity]
+            self._offset_ptr = self._conv_block[capacity:]
             self._capacity = capacity
 
-        pin = torch.accelerator.is_available()
-        self._batch_ptr.fill_(self._pad_slot_id)
-        self._offset_ptr.fill_(self._pad_slot_id)
-
-        if rows:
-            self._batch_ptr[: len(rows)].copy_(
-                torch.tensor(rows, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
-            self._offset_ptr[: len(offsets)].copy_(
-                torch.tensor(offsets, dtype=torch.int32, pin_memory=pin),
-                non_blocking=True,
-            )
+        # both halves whole, the tail on the pad id, in one copy
+        host = np.full(2 * self._capacity, self._pad_slot_id, dtype=np.int32)
+        host[:needed] = rows
+        host[self._capacity:self._capacity + needed] = offsets
+        self._stage.upload("conv", host, self._conv_block)
 
         self._seqlens_cpu = torch.tensor(spans, dtype=torch.int32)
         self._conv_metadata = ConvMetadata(
@@ -236,18 +266,9 @@ class GDNPrefillWrapper(GDNWrapper):
             )
             self._rows_capacity = capacity
 
-        cu = [0]
-        for span in spans:
-            cu.append(cu[-1] + span)
-
-        # same dtype as the device buffer: a converting copy is staged through
-        # a pageable temporary and stops being asynchronous
-        self._cu_buffer[: len(cu)].copy_(
-            torch.tensor(
-                cu, dtype=torch.int64, pin_memory=torch.accelerator.is_available()
-            ),
-            non_blocking=True,
-        )
+        cu = np.zeros(num_rows + 1, dtype=np.int64)
+        np.cumsum(spans, out=cu[1:])
+        self._stage.upload("cu", cu, self._cu_buffer)
 
     def _build_mask(
         self, total_tokens: int
@@ -262,8 +283,9 @@ class GDNPrefillWrapper(GDNWrapper):
                 capacity, dtype=torch.float32, device=self._device
             )
             self._mask_capacity = capacity
-        self._mask[:total_tokens].fill_(1.0)
-        self._mask[total_tokens:].zero_()
+        host = np.zeros(self._mask_capacity, dtype=np.float32)
+        host[:total_tokens] = 1.0
+        self._stage.upload("mask", host, self._mask)
 
     def plan(
         self,
@@ -283,14 +305,17 @@ class GDNPrefillWrapper(GDNWrapper):
         # buffers by `bs` so these are addressable however full the bucket is.
         spans = [span or 1 for span in spans]
 
-        self._plan_conv(spans)
-        self._build_cu_buffer(spans)
-        # a captured graph checkpoints whether or not the step keeps any
-        self._every = every if snapshots or self._accelerator_graph else 0
-        if self._every:
-            self._plan_snapshots(spans, snapshots, checkpoints)
-
-        self._build_mask(self._plan_tokens)
+        self._stage.begin()
+        try:
+            self._plan_conv(spans)
+            self._build_cu_buffer(spans)
+            # a captured graph checkpoints whether or not the step keeps any
+            self._every = every if snapshots or self._accelerator_graph else 0
+            if self._every:
+                self._plan_snapshots(spans, snapshots, checkpoints)
+            self._build_mask(self._plan_tokens)
+        finally:
+            self._stage.end()  # also on a raise; see `_PinnedIndexStage`
         num_rows = len(spans)
         self._plan_state = GDNPrefillPlan(
             slots=slots,
@@ -344,6 +369,12 @@ class GDNPrefillWrapper(GDNWrapper):
         )
         self._checkpoints = checkpoints
 
+    def _unpadded(self) -> bool:
+        """An eager step with no padding row: every token is real, so the
+        token mask is all ones and selecting by it is a full-size no-op copy
+        (~0.3 ms a layer on a 26k-token prefill)."""
+        return not self._accelerator_graph and not self._plan_borrowed
+
     def run_conv(
         self,
         x: torch.Tensor,
@@ -373,16 +404,16 @@ class GDNPrefillWrapper(GDNWrapper):
         )
 
         out = out.transpose(0, 1)
+        if self._unpadded():
+            return out
 
         # The kernel allocates its output with `empty_like` and writes only the
         # `cu_seqlens` range, so a capture bucket's padded tail keeps whatever
-        # the previous replay left in that memory.
-        # Select rather than multiply because the tail can hold inf.
-        return torch.where(
-            self._plan_state.token_mask[: out.shape[0], None].bool(),
-            out,
-            torch.zeros((), dtype=out.dtype, device=out.device),
-        )
+        # the previous replay left in that memory. The stage reads through the
+        # same mask, so the tail never reaches a kernel.
+        if self._stage_inputs:
+            return out
+        return compiled(_masked_rows, dynamic=True)(out, self._plan_state.token_mask)
 
     def _save_conv_snapshots(self, x: torch.Tensor, conv_layer: torch.Tensor):
         """A snapshot's conv state is the inputs before its boundary, the
@@ -394,15 +425,12 @@ class GDNPrefillWrapper(GDNWrapper):
         conv_layer.index_copy_(0, index[2], x[window].transpose(1, 2).to(conv_layer.dtype))
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        """The chunked delta rule over the plan's sequences. Unstaged, ``q``,
+        ``k`` and ``v`` must have the padded tail zeroed, as ``run_conv``'s
+        output has under capture (the tail can hold inf; ``run`` zeroes only
+        the gates'), and as ``GDNMixedWrapper``'s does, which writes only its
+        decode run's rows over it. The stage reads them through the token mask."""
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
-
-        # The chunked kernel takes the decay and the learning rate already
-        # formed, where the decode kernel takes `a`/`b` raw and forms them from
-        # the same two weights. Keep the formula here so the paths agree.
-        g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(
-            a.float() + dt_bias.float()
-        )
-        beta = torch.sigmoid(b.float())
 
         slots = self._plan_state.slots.to(torch.int64)
 
@@ -440,21 +468,17 @@ class GDNPrefillWrapper(GDNWrapper):
         rows = (
             self._plan_state.num_rows if self._accelerator_graph else self._plan_borrowed
         )
-        if rows:
-            q, k, v, g, beta = (
-                _with_room(t, rows) for t in (q, k, v, g, beta)
+        if self._stage_inputs:
+            q, k, v, alpha, beta = stage_gdn_prefill_inputs(
+                q, k, v, a, b, a_log, dt_bias, self._plan_state.token_mask, rows,
+                normalize=self._qk_l2norm,
             )
-
-        # zero the padded tail so inf there can't poison the result
-        keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
-        def blank(t, shape):
-            return torch.where(
-                keep.view(shape), t, torch.zeros((), dtype=t.dtype, device=t.device),
-            )
-
-        v = blank(v, (-1, 1, 1))
-        g = blank(g, (-1, 1))
-        beta = blank(beta, (-1, 1))
+        else:
+            if rows:
+                q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
+            # The padded tail is zeroed so inf there can't poison the result: q, k
+            # and v by `run_conv`, whose output they are, the gates here.
+            alpha, beta = compiled(_chunked_gates, dynamic=True)(a, b, a_log, dt_bias, self._plan_state.token_mask)
 
         snapshot_args = {}
         if self._every:
@@ -466,15 +490,14 @@ class GDNPrefillWrapper(GDNWrapper):
             )
         out, final = chunk_gated_delta_rule(
             q=q, k=k, v=v,
-            # FlashInfer wants the decay exponentiated; FLA's takes log space
-            g=torch.exp(g),
+            g=alpha,
             beta=beta,
             scale=self._sm_scale,
             initial_state=initial,
             output_final_state=True,
             cu_seqlens=self._plan_state.cu_seqlens,
-            # ignored by this kernel (see `qk_l2norm_in_kernel`); the caller
-            # has already normalised q and k
+            # ignored by this kernel (see `qk_l2norm_in_kernel`); q and k are
+            # normalised by now
             use_qk_l2norm_in_kernel=False,
             **snapshot_args,
         )
@@ -594,31 +617,43 @@ class _PinnedIndexStage:
     the wrapper owns. A packed step plans inline on the gpu thread behind the
     step still in flight, where a copy out of pageable memory would wait for
     that step to finish. ``done`` is recorded once the copies are issued; the
-    next stage waits on it before rewriting the buffers."""
+    next stage waits on it before rewriting the buffers. Callers pair
+    ``begin`` with ``end`` in a ``finally``: a plan that raises after an
+    upload still has that copy in flight. Device-generic: on any
+    accelerator the buffers are pinned and the event recorded, since a
+    non-blocking copy is free to read its source after it returns."""
 
     def __init__(self):
         self._bufs: dict[str, torch.Tensor] = {}
-        self._done = None
+        self._pinned = torch.accelerator.is_available()
+        self._done: torch.Event | None = None
+        # the accelerator the last stage copied to, if any
+        self._device: torch.device | None = None
 
     def begin(self) -> None:
-        if self._done is None:
-            self._done = torch.cuda.Event() if torch.cuda.is_available() else None
-        elif self._done is not None:
+        if self._done is not None:
             self._done.synchronize()
+        self._device = None
 
     def upload(self, name: str, values: np.ndarray, dst: torch.Tensor) -> None:
         n = len(values)
         buf = self._bufs.get(name)
         if buf is None or buf.shape[0] < n or buf.dtype != dst.dtype:
             buf = self._bufs[name] = torch.empty(
-                max(n, 64), dtype=dst.dtype, pin_memory=torch.cuda.is_available(),
+                max(n, 64), dtype=dst.dtype, pin_memory=self._pinned,
             )
         buf.numpy()[:n] = values
         dst[:n].copy_(buf[:n], non_blocking=True)
+        if dst.device.type != "cpu":
+            self._device = dst.device
 
     def end(self) -> None:
-        if self._done is not None:
-            self._done.record()
+        device = self._device
+        if device is None:
+            return
+        if self._done is None:
+            self._done = torch.Event(device=device)
+        self._done.record(torch.accelerator.current_stream(device))
 
 
 class GDNMixedWrapper(GDNWrapper):
@@ -642,11 +677,6 @@ class GDNMixedWrapper(GDNWrapper):
     cleared. A decode row after the run is a prompt row of one token.
     """
 
-    # the chunked half needs q/k normalised by the caller; the decode half is
-    # built not to normalise again
-    qk_l2norm_in_kernel: bool = False
-    takes_strided_inputs: bool = False
-
     def __init__(
         self,
         device: torch.device,
@@ -661,6 +691,7 @@ class GDNMixedWrapper(GDNWrapper):
         null_slot_id: int = 0,
         # the chunked half's prompt rows under capture; eagerly, the step's own
         max_prefill_rows: int | None = None,
+        stage_inputs: bool = False,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
@@ -670,17 +701,22 @@ class GDNMixedWrapper(GDNWrapper):
         if accelerator_graph and max_prefill_rows is None:
             raise ValueError("GDNMixedWrapper: a captured split needs max_prefill_rows")
         self._max_prefill_rows = max_prefill_rows
+        # A staged chunked half normalises its own q/k and reads the strided
+        # views, as the decode half can. Otherwise the caller normalises and
+        # copies, and the decode half is built not to normalise again.
+        self.qk_l2norm_in_kernel = stage_inputs
+        self.takes_strided_inputs = stage_inputs
         # one sequence more than the prompt rows: the decode run's
         self._prefill = GDNPrefillWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
             qk_l2norm=qk_l2norm, prefill_dtype=prefill_dtype,
             num_tokens=num_tokens, bs=max_prefill_rows + 1 if accelerator_graph else None,
             has_sink_state=has_sink_state, accelerator_graph=accelerator_graph,
-            null_slot_id=null_slot_id,
+            null_slot_id=null_slot_id, stage_inputs=stage_inputs,
         )
         self._decode = GDNDecodeWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
-            qk_l2norm=False, bs=bs, accelerator_graph=accelerator_graph,
+            qk_l2norm=qk_l2norm and stage_inputs, bs=bs, accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
         self._stage = _PinnedIndexStage()
@@ -752,11 +788,13 @@ class GDNMixedWrapper(GDNWrapper):
         pslot_buf = self._buf("pre_slots", seqs, torch.int32)
         phas_buf = self._buf("pre_has", seqs, torch.bool)
         self._stage.begin()
-        self._stage.upload("dec_slots", dec_slots, dslot_buf)
-        self._stage.upload("dec_mask", np.arange(width) < run, dmask_buf)
-        self._stage.upload("pre_slots", pre_slots, pslot_buf)
-        self._stage.upload("pre_has", pre_has, phas_buf)
-        self._stage.end()
+        try:
+            self._stage.upload("dec_slots", dec_slots, dslot_buf)
+            self._stage.upload("dec_mask", np.arange(width) < run, dmask_buf)
+            self._stage.upload("pre_slots", pre_slots, pslot_buf)
+            self._stage.upload("pre_has", pre_has, phas_buf)
+        finally:
+            self._stage.end()  # also on a raise; see `_PinnedIndexStage`
 
         self._num_rows = width
         self._num_seqs = seqs

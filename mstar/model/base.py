@@ -1,7 +1,8 @@
+import functools
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, NamedTuple, Type
 
@@ -18,6 +19,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -28,12 +30,111 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.model.media_limits import VideoBudget, decoding_upload, read_image
+from mstar.graph.special_destinations import EMPTY_DESTINATION
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.submodule_base import (
+    CHUNK_LOOP_END,
+    ChunkingPolicy,
+    chunk_loop_name,
+    chunk_tick_name,
+)
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
+
+
+def _wrap_node_in_loop(
+    section: GraphSection, node_name: str, graph_walk: str,
+    policy: "ChunkingPolicy",
+) -> GraphSection:
+    """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
+
+    The node's real edges move onto the Loop, which is what makes a chunk's
+    output the loop's business rather than the worker's: an edge the policy
+    gathers gets every chunk's tensors at the end, and any other gets the
+    final chunk's alone, earlier ones dropped as the loop advances. A
+    ``per_chunk_outputs`` edge is the exception: it stays on the body, so
+    every chunk routes it as it completes.
+
+    The body keeps a bare same-named edge to ``EMPTY_DESTINATION``. The Loop
+    caches by edge NAME, so the body has to emit the name for the Loop to have
+    anything to carry; the copy routes nowhere and drops every flag, since
+    persisting or counting a per-chunk tick would stage it and bill the
+    conductor for a token per chunk.
+
+    The Loop counts tokens rather than iterations: each chunk moves it by its
+    ``ChunkRange.stride``, and it ends at the prompt's length, which the
+    scheduler sets as its cap on the first chunk.
+
+    The body also routes ``chunk_tick_name`` back to itself, which is what
+    makes the next chunk a speculation target; see that function for why the
+    conductor seeds the first one. The submodule produces no tensor for it, and
+    a declared signal with no tensor still satisfies readiness, so it is free.
+    """
+    if isinstance(section, GraphNode):
+        if section.name != node_name:
+            return section
+        ticks, final, gathered = [], [], []
+        for edge in section.outputs:
+            if edge.name in policy.per_chunk_outputs:
+                ticks.append(edge)
+                continue
+            ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
+            dest = gathered if edge.name in policy.accumulated_outputs else final
+            dest.append(edge)
+        # a misspelt name would quietly carry only the final chunk
+        unknown = policy.accumulated_outputs - {edge.name for edge in section.outputs}
+        if unknown:
+            raise ValueError(
+                f"node {node_name!r} accumulates {sorted(unknown)} in walk "
+                f"{graph_walk!r}, which are not among its outputs there"
+            )
+        tick = chunk_tick_name(node_name, graph_walk)
+        ticks.append(GraphEdge(next_node=node_name, name=tick))
+        return Loop(
+            name=chunk_loop_name(node_name, graph_walk),
+            section=replace(
+                section, outputs=ticks,
+                input_names=set(section.input_names) | {tick},
+            ),
+            max_iters=CHUNK_LOOP_END,
+            outputs=final,
+            accumulated_outputs=gathered,
+        )
+    if isinstance(section, Sequential):
+        return Sequential([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Parallel):
+        return Parallel([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Loop):
+        # A chunkable node inside an existing Loop nests one loop in another,
+        # whose completion cascades into the parent's (rust/src/graph/state.rs).
+        # Chunking does not handle that, so refuse it.
+        if node_name in section.section.get_nodes():
+            raise ValueError(
+                f"node {node_name!r} is chunkable and already inside Loop "
+                f"{section.name!r}; nested chunk loops are not supported"
+            )
+        return section
+    raise TypeError(f"cannot wrap a chunkable node in {type(section).__name__}")
+
+
+def _applying_chunking(build):
+    """A model's own ``get_graph_walk_graphs``, its result passed through
+    ``Model.apply_chunking``."""
+    @functools.wraps(build)
+    def get_graph_walk_graphs(self):
+        return self.apply_chunking(build(self))
+    get_graph_walk_graphs._applies_chunking = True
+    return get_graph_walk_graphs
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.lora.config import LoraSpec
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -72,6 +173,10 @@ class ClientChunk(NamedTuple):
 class Span(NamedTuple):
     """One write to a KV stream. A layout lists them in the order the walks write.
 
+    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
+    the span before it then writes it too, in the same row, as text around an attachment is.
+    That span is of the same walk, since a step runs one.
+
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
     the tensor whose next entry an ids span keys, or the file of a digest span
@@ -88,6 +193,7 @@ class Span(NamedTuple):
     source: str | tuple[str, int]
     params: tuple = ()
     scratch: int = 0
+    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -112,11 +218,17 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
-        for span in self.spans:
+        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
+        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
+        worker keys the span."""
+        for i, span in enumerate(self.spans):
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
+            if not span.opens_step and (i == 0 or self.spans[i - 1].walk != span.walk):
+                raise ValueError(f"span {i} of walk {span.walk!r} opens no step, but " + (
+                    f"span {i - 1} before it is of walk {self.spans[i - 1].walk!r}: a step runs one walk"
+                    if i else "no span comes before it"
+                ))
             if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
                 raise ValueError(
                     f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
@@ -124,7 +236,7 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
@@ -179,6 +291,12 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
+def names_checkpoint(model: "Model") -> bool:
+    """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
+    which may download the checkpoint (BAGEL's does)."""
+    return type(model).checkpoint_path is not Model.checkpoint_path
+
+
 def video_metadata_dict(metadata_obj) -> dict:
     # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
     return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
@@ -201,8 +319,9 @@ class WorkerGraph:
     # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
     # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
     # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
-    # routing unit — every rank of an instance runs a request together). With
+    # ``_instance_ranks`` are the whole instances (every rank of an instance runs
+    # a request together; empty without TP/SP, so the data-parallel replicas the
+    # conductor routes to are ``replica_ranks``). With
     # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
     # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
     # __post_init__ to the instance size (tp*sp) so the conductor — which models
@@ -248,6 +367,12 @@ class WorkerGraph:
             self._tp_comm_size = tp
             # Conductor routes to the lockstep unit (the whole instance).
             self.tp_size = inst
+
+    @property
+    def replica_ranks(self) -> list[list[int]]:
+        """The ranks of each data-parallel replica: the lockstep instances, or
+        one rank apiece without TP/SP. The conductor routes a request to one."""
+        return self._instance_ranks or [[r] for r in self.ranks]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -362,7 +487,7 @@ def _divide_into_worker_graphs(
         # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
         # matching over a streamed latent) inexpressible. Honouring it instead
         # means changing this, Loop._is_streamed_input, and the Rust held_mask
-        # together, or the two runtimes disagree.
+        # together.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams
@@ -426,7 +551,62 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment's YAML turns on, before its ``resources:``
+    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
+    (``mstar.engine.resources.lora.serving``)."""
+    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+
+    specs = list(model.get_node_resources() or [])
+    lora = declared_lora_specs(model, model_config)
+    size_lora_specs(lora, model_config)
+    return specs + lora
+
+
+def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
+    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
+    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
+    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
+
+    return drop_lora_specs_without_targets(specs)
+
+
+def parse_autocast_dtype(value) -> torch.dtype | None:
+    """The serving YAML's ``autocast_dtype``, spelled as a string (``float16``). ``null``
+    stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
+
+
+def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
+    ``resources:`` overrides applied, as ``built_resources``.
+
+    Every process that reads specs resolves them here, so the conductor validates
+    requests against what the workers built. ``validate_deployment`` takes the same
+    steps, reporting every problem rather than the first.
+    """
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return built_resources(specs)
+
+
 class Model(ABC):
+    def __init_subclass__(cls, **kwargs):
+        # A chunkable node runs inside its chunk Loop wherever the walk graphs
+        # are read, so every model's declaration is wrapped here rather than
+        # each model having to call `apply_chunking` itself.
+        super().__init_subclass__(**kwargs)
+        build = cls.__dict__.get("get_graph_walk_graphs")
+        if build is not None and not getattr(build, "_applies_chunking", False):
+            cls.get_graph_walk_graphs = _applying_chunking(build)
+
     # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
     # Retain them locally for postprocessing, but do not send the original
     # values to the conductor alongside their tensor descriptors.
@@ -440,8 +620,8 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
-    # Request keys the conductor reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
+    # Request keys the conductor or data worker reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -449,6 +629,14 @@ class Model(ABC):
     # the model's config.yaml overrides either. See
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+    # ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt``
+    # may run for several requests at once. The data worker then prepares
+    # requests on a pool (``CpuPlan.prepare_workers`` at this process's intra-op
+    # thread count; ``preprocess_workers`` in the model's config.yaml overrides
+    # it) and still hands them to the
+    # conductor in arrival order. Declare it only once those calls are checked
+    # for shared state, and for the GIL: work that holds it gains nothing here.
+    PREPROCESS_PARALLEL: bool = False
 
     def _get_worker_graphs_for_graph_walk(
         self,
@@ -580,11 +768,27 @@ class Model(ABC):
         """
         pass
 
+    def get_lora_specs(self) -> list["LoraSpec"]:
+        """The per-request LoRA adapters this model can serve: a spec per node they
+        reach (none for a model that serves none), the first keyed
+        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
+        and the conductor opens a request with the same adapter on each.
+
+        Built only when the deployment's YAML has a ``resources: lora:`` block (see
+        ``serving_resources``): a deployment without one builds exactly what it did
+        before. Usually by ``module_lora_spec`` from each node's weights root, whose
+        LoRA-capable modules the node then binds itself. The conductor opens each
+        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
+        """
+        return []
+
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
 
         The prefix cache hashes the checkpoint's manifest into its root. None leaves
         the weights out, so the cache stays shut unless the deployment sets a salt.
+        An override returns a path: processes that must not download it read the
+        override alone (``names_checkpoint``).
         """
         return None
 
@@ -666,6 +870,72 @@ class Model(ABC):
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
 
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """``{node: (policy, ...)}``, each policy naming the walks it covers.
+
+        A node's prefill for a chunkable walk runs as a Loop, one iteration per
+        chunk, so the declaration has to be here rather than on the submodule:
+        the graph build reads it to wrap the node. Pass the walk dict through
+        ``get_graph_walk_graphs`` returns them wrapped (``apply_chunking``).
+        """
+        return {}
+
+    def chunking_policy_of(self) -> dict[tuple[str, str], ChunkingPolicy]:
+        """``(node, walk) -> policy``, validated."""
+        walks = self.get_graph_walk_graphs()
+        combined = self.get_combined_graph_walks()
+        out: dict[tuple[str, str], ChunkingPolicy] = {}
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: a chunking policy for node "
+                        f"{node!r} names no walks"
+                    )
+                for walk in policy.walks:
+                    # a combined walk carries a budget for the steps it batches,
+                    # and is not a walk of its own
+                    real = walk in walks and node in walks[walk].get_nodes()
+                    if not real and walk not in combined.get(node, {}):
+                        raise ValueError(
+                            f"{type(self).__name__}: chunking policy names walk "
+                            f"{walk!r}, which is neither a walk of node {node!r} "
+                            "nor a combined walk of it"
+                        )
+                    if policy.chunkable and not real:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} cannot chunk "
+                            f"combined walk {walk!r}; chunk its constituents"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} gets two "
+                            f"chunking policies for walk {walk!r}"
+                        )
+                    out[(node, walk)] = policy
+        return out
+
+    def apply_chunking(
+        self, walk_graphs: dict[str, GraphSection],
+    ) -> dict[str, GraphSection]:
+        """``get_graph_walk_graphs``'s result with every chunkable node wrapped
+        in a Loop, one iteration per chunk.
+
+        Applied to every model's ``get_graph_walk_graphs`` by ``Model``
+        itself, so a model returns its walks unwrapped. A node already in its
+        chunk Loop (a subclass building on its parent's walks) is left alone.
+        """
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.chunkable:
+                    continue
+                for walk in policy.walks:
+                    section = walk_graphs.get(walk)
+                    if section is None or chunk_loop_name(node, walk) in section.get_loops():
+                        continue
+                    walk_graphs[walk] = _wrap_node_in_loop(section, node, walk, policy)
+        return walk_graphs
+
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
@@ -697,8 +967,8 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
-        raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
+        ``image_grid_thw`` and ``audio_features`` from the raw
+        ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
             prompt: Raw text input from the user, or None if no text.
@@ -751,8 +1021,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        img = read_image(filepath, rgb=True)
-        img = img.to(device).float().div_(255.0)  # CxHxW
+        img = read_image(filepath, rgb=True).to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
@@ -772,7 +1041,7 @@ class Model(ABC):
         budget = VideoBudget()
         frames = []
         with decoding_upload(filepath, "the video", ffmpeg=True):
-            decoder = VideoDecoder(filepath, device=device)
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
             for frame in decoder:
                 budget.add(*frame.shape[-2:])
                 frames.append(frame)
@@ -1005,7 +1274,8 @@ class Model(ABC):
         the next graph walk, inputs, and whether the request is done.
 
         ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions. For single-partition models,
+        producer_done) for consumer partitions, one per stream from another
+        partition; a client stream has no entry. For single-partition models,
         this will be ``None`` or an empty list.
         """
         pass

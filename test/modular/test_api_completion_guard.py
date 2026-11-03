@@ -15,6 +15,7 @@ import queue
 import sys
 import threading
 import types
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,8 +23,9 @@ import pytest
 import torch
 from PIL import Image
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication.event import EventWakeup
 from mstar.model.base import Model
 
 
@@ -52,7 +54,8 @@ def _preprocess_failure(model, file_paths=None):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.in_queue = queue.Queue()
     wt._is_pending = lambda key: True
-    wt.out_queue = queue.Queue()
+    wt.out_queue = ResultQueue(EventWakeup())
+    wt.profile_queue = ResultQueue(EventWakeup())
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
     wt.abort_request_queue = queue.Queue()
@@ -60,9 +63,7 @@ def _preprocess_failure(model, file_paths=None):
     wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
     wt.timing_requested = threading.Event()
-    wt.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: [], send=lambda *args: None,
-    )
+    wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [], send=lambda *args: None)
     cleaned = []
     wt.tensor_manager = SimpleNamespace(
         force_cleanup_request=cleaned.append,
@@ -71,6 +72,7 @@ def _preprocess_failure(model, file_paths=None):
         take_failed_reads=lambda: [],
     )
     wt.model = model
+    wt._client_edges = frozenset()
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
@@ -78,8 +80,8 @@ def _preprocess_failure(model, file_paths=None):
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt._live_requests = {}
+    wt._preparing = deque()
     wt._keyed_labels = {}
-    wt._client_edges = frozenset()
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=file_paths,

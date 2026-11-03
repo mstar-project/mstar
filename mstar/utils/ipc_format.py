@@ -35,12 +35,14 @@ class WorkerMessageType(Enum):
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
+    EDGE_ITEMS = "edge_items"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
+    CLIENT_STREAM_ROUTE = "client_stream_route"
 
 
 @dataclass
@@ -70,8 +72,10 @@ class RemoveRequest(MessageBody):
 
 @dataclass
 class DrainRequest(MessageBody):
-    # Phase-1 teardown: stop reading this request and confirm no reads remain.
-    # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
+    # Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no
+    # read of it is in flight, starting none after (the data worker also stops
+    # reading its results and sending its client stream items). Hard cleanup
+    # (RemoveRequest) follows once every reader has ACKed.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -80,7 +84,8 @@ class DrainRequest(MessageBody):
 class InputSignals(MessageBody):
     request_id: str
     inputs: list[GraphEdge]
-    request_info: CurrentForwardPassInfo
+    # None for a signal with no non-streaming input, which reads none
+    request_info: CurrentForwardPassInfo | None
     partition_name: str = "default"
     # Producer partition names. Declared, not a bare ``set``: a bare one is
     # untyped on the wire, so an empty set a Rust sender writes came back a
@@ -92,8 +97,51 @@ class InputSignals(MessageBody):
 
 
 @dataclass
+class EdgeItems(MessageBody):
+    """One step's streamed tensors from a producer worker to one consumer
+    worker, as columns: a row per (request, streaming edge), and per row its
+    items, row-major. It carries what one INPUT_SIGNALS per (request, worker)
+    did for an edge that is nothing but streamed tensors -- unsharded, no
+    forward-pass info -- so the receiver decodes, reads and routes a step's
+    tokens once instead of once per request.
+
+    The fields above the columns are shared by every item: a row whose
+    tensors differ in them goes as INPUT_SIGNALS instead.
+    """
+
+    partition_name: str
+    source_session_id: str
+    source_entity: str
+    tp_size: int
+    tp_rank: int
+    source_node_name: str | None = None
+    # signal, node, walk and arena segment names the columns index
+    names: list[str] = field(default_factory=list)
+    # per row
+    request_ids: list[str] = field(default_factory=list)
+    signal_idx: list[int] = field(default_factory=list)
+    next_node_idx: list[int] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
+    num_items: list[int] = field(default_factory=list)
+    # per item
+    uuids: list[int] = field(default_factory=list)
+    addresses: list[int] = field(default_factory=list)
+    nbytes: list[int] = field(default_factory=list)
+    offsets: list[int] = field(default_factory=list)
+    ndims: list[int] = field(default_factory=list)
+    dims_flat: list[int] = field(default_factory=list)
+    stride_flat: list[int] = field(default_factory=list)
+    dtype_idx: list[int] = field(default_factory=list)
+    dtype_names: list[str] = field(default_factory=list)
+    # the arena segment each item is in (an index into names), -1 for none
+    shm_segment_idx: list[int] = field(default_factory=list)
+    shm_offsets: list[int] = field(default_factory=list)
+
+
+@dataclass
 class TensorReceived(MessageBody):
-    request_id: str
+    # Keyed by uuid, which is global, so one ack covers every request whose
+    # reads from this producer finished together.
     successful_tensors: dict[int, int] # uuid -> graph edge count
     failed_tensor_ids: list[int] # uuids
 
@@ -102,6 +150,21 @@ class TensorReceived(MessageBody):
 class UnpersistTensors(MessageBody):
     request_id: str
     uuid_to_ref_count: dict[int, int]
+
+
+@dataclass
+class ClientStreamRoute(MessageBody):
+    """The conductor telling the API server's data worker, the producer of a
+    request's client streams, where each one goes: once at dispatch, and
+    again with no ranks for a stream whose consuming partition has ended,
+    which then takes no more items."""
+    request_id: str
+    # client stream edge -> the consuming node's ranks for this request
+    workers: dict[str, list[str]]
+    # client stream edge -> that node, from the walks as the deployment shaped
+    # them; the data worker's copy of the model is the unshaped one
+    nodes: dict[str, str]
+
 
 @dataclass
 class StopLoops(MessageBody):
@@ -200,6 +263,15 @@ class ScheduleTPNode(MessageBody):
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
+    # Per request_ids entry, the chunk the leader cut for the row: [start, end)
+    # of a measured total, -1 when the row is not chunked; all empty when no
+    # row is. A follower runs these rather than cutting its own, and caps a
+    # row's chunk Loop on its first chunk from them.
+    chunk_starts: list[int] = field(default_factory=list)
+    chunk_ends: list[int] = field(default_factory=list)
+    chunk_totals: list[int] = field(default_factory=list)
+    # how far each chunk moves its row's chunk Loop (``ChunkRange.stride``)
+    chunk_strides: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -227,17 +299,6 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
-    CLIENT_STREAM_INPUT = "client_stream_input"
-
-
-@dataclass
-class ClientStreamInput(MessageBody):
-    """The next chunk of a running request's client streams (see
-    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
-    the streams that end after it. An ended stream takes no more chunks."""
-    request_id: str
-    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    ended: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -251,10 +312,9 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
-    # For a model with client streams, the opening's own client input: its
-    # first chunk and the streams it ends, forwarded once the request is
-    # admitted. A stream it leaves open makes it a live call.
-    client_input: ClientStreamInput | None = None
+    # A client stream the opening leaves open: a live call, which is refused
+    # rather than queued at max_concurrent_requests.
+    input_open: bool = False
 
 
 @dataclass
