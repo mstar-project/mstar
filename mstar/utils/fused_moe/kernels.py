@@ -328,13 +328,12 @@ def invoke_fused_moe_kernel(
     if torch.compiler.is_compiling():
         # The table lookup graph-breaks, so under a dynamic-shape compile the
         # config enters this frame as an input whose ints dynamo makes symbols,
-        # and its Triton wrapper takes launch options only as constants. Such a
-        # launch keeps the tuned tiles with Triton's default warps and stages;
-        # a static trace, where they stay plain ints, keeps them all.
-        config = {
-            k: v for k, v in config.items()
-            if not (k in ("num_warps", "num_stages") and isinstance(v, torch.SymInt))
-        }
+        # and its Triton wrapper takes launch options only as constants. A
+        # traced launch keeps the tuned tiles with Triton's default warps and
+        # stages; eager launches keep them all. (Under dynamo a symbolic int is
+        # not an ``isinstance`` of ``torch.SymInt``, so the options cannot be
+        # dropped only when symbolic.)
+        config = {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
 
     fused_moe_kernel[grid](
         A,
