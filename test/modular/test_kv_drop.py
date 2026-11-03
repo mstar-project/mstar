@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -206,6 +207,25 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     assert rebuilt.footprint == footprint, "the rebuild would hold more pages than the request declared"
     assert (rebuilt.chain.keys, rebuilt.chain.unkeyed) == (want.chain.keys, want.chain.unkeyed), (
         "the rebuilt pages would be filed under keys another request with these ids can't match"
+    )
+
+
+def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
+    """The rebuild's span covers what the loop wrote, so the growth bound drops by that as the loop's cap does.
+    Otherwise the stream would grow by those slots."""
+    kv = _manager()
+    prompt, sampled = list(range(20)), list(range(100, 130))
+    config = _config(prompt, cap=500)
+    config.kv_layout["main"] = replace(config.kv_layout["main"], max_growth=50)
+    kv.ingest_request("r", config)
+    footprint = kv._streams["r"]["main"].footprint
+    _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
+    kv.drop("r")
+
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
+
+    assert kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
     )
 
 

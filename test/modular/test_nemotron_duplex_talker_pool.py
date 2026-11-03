@@ -310,3 +310,13 @@ def test_every_session_of_the_longest_length_fits_its_pool_at_once(monkeypatch, 
 
     assert all(admitted), f"{admitted.count(False)} sessions wait for a stream's loop cap the pool wasn't sized for"
 
+
+@POOLS
+def test_a_session_reserves_what_its_frames_write_and_no_page_for_its_loop_caps_margin(monkeypatch, key, labels, loop):
+    """A loop's cap runs LOOP_ITERS_MARGIN past the session's frames, which no session writes. Reserving it took
+    a page a talker stream, 1.75 GiB over 32 sessions."""
+    model, kv, _ = _sessions(monkeypatch, key, labels, loop)
+    prefix = model.TALKER_WARMUP_POSITIONS if key == TALKER_KV else model.max_prompt_tokens
+    per_stream = -(-(prefix + model.max_session_frames + 1) // DEFAULT_PAGE_SIZE)
+
+    assert kv._allotments["s0"].pages == len(labels) * per_stream, "a session reserved pages for its loop caps' margin"
