@@ -1706,22 +1706,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
-        """Stop on codec_eos or the frame limit. The codec_eos frame stays out
-        of the Code2Wav stream: it is not a codebook index, and only this host
-        copy tells it from audio."""
+        """Stop on codec_eos. The frame budget is the loop's cap
+        (``Qwen3OmniModel.get_loop_caps``), which the graph runtime enforces.
+        The codec_eos frame stays out of the Code2Wav stream: it is not a
+        codebook index, and only this host copy tells it from audio."""
         if "layer0_codes" not in outputs:
             return set()
         token = outputs["layer0_codes"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
-        is_eos = eos_token_id is not None and eos_token_id == token
-        stops = set()
-        if is_eos or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
-            stops = {"talker_decode_loop"}
-        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
+        if eos_token_id is None or eos_token_id != token:
+            return set()
+        return StopCheck({"talker_decode_loop"}, withheld=("codec_tokens",))
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
