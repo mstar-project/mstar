@@ -939,7 +939,7 @@ def _record_vllm_omni_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
     usage = chunk.get("usage")
     if usage:
         ct = usage.get("completion_tokens")
-        if ct is not None:
+        if ct:  # audio chunks carry completion_tokens=0; keep the text count
             metrics.output_text_tokens = ct
         pt = usage.get("prompt_tokens")
         if pt is not None:
@@ -1426,7 +1426,7 @@ class SGLangOmni(InferenceSystem):
                     usage = chunk.get("usage")
                     if usage:
                         ct = usage.get("completion_tokens")
-                        if ct is not None:
+                        if ct:  # a completion_tokens=0 chunk must not reset the count
                             metrics.output_text_tokens = ct
                         pt = usage.get("prompt_tokens")
                         if pt is not None:
