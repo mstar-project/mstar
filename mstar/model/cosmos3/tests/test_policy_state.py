@@ -275,3 +275,53 @@ def test_action_guidance_interval() -> None:
         dit._forward_action_gen(None, st, step, latents, action_latents)
         assert len(labels) == branches, step
         assert dit._step_info(ACTION_GEN_WALK, st, step).cfg_active == (branches == 2)
+
+
+@pytest.mark.parametrize("steps, guided", [((1, 3), False), ((0, 3), True)])
+def test_batched_action_step_outside_the_interval_runs_the_conditional_branch(steps, guided) -> None:
+    """A batch none of whose rows is inside its guidance interval plans and runs
+    the conditional branch alone, as a single request does; one row inside it
+    keeps both branches for the batch, and only that row is guided."""
+    from mstar.model.cosmos3.submodules import ACTION_GEN_LOOP, UNCOND_LABEL
+
+    model = _model()
+    dit = _dit(model)
+    timesteps = types.SimpleNamespace(timesteps=torch.tensor([1000.0, 937.5, 833.3, 625.0]))
+    rids = [0, 1]
+    for rid in rids:
+        tensors, md, _ = _submit(
+            model, {**POLICY, "action_chunk_size": 32, "size": "64x64", "fps": 15,
+                    "guidance_scale": 3.0, "guidance_interval": [960, 1001], "robot_state": STATE},
+        )
+        st = _prefill(dit, md, tensors, rid)
+        st.add_all(scheduler=timesteps, domain_t=torch.tensor([8]))
+    infos = [dit._step_info(ACTION_GEN_WALK, dit.request_states[rid], k) for rid, k in zip(rids, steps, strict=True)]
+    declared = dit.declare_step(ACTION_GEN_WALK, rids, [types.SimpleNamespace(input_seq_len=4, resource_step_info=i)
+                                                       for i in infos])
+    labels = {seg.label for seg in declared.segments}
+    assert labels == ({COND_LABEL, UNCOND_LABEL} if guided else {COND_LABEL})
+
+    seen, combined = [], []
+
+    def batched(reqs, label, attn, with_cfg):
+        seen.append(with_cfg)
+        branch = (torch.zeros(1, 2), torch.ones(1, 33, 64))
+        return [[branch, (torch.zeros(1, 2), torch.zeros(1, 33, 64))] if with_cfg else [branch] for _ in reqs]
+
+    def step(st, lat, act, video_v, action_v, k, solver):
+        combined.append(float(action_v[0, 1, 0]))
+        return lat, act, solver
+
+    dit.transformer.denoise_step_action_batched = batched
+    dit._action_scheduler_step = step
+    dit._solver_state = ()
+    ei = types.SimpleNamespace(
+        request_ids=rids, per_request_states=None, step=None, resources={"attn": None},
+        per_request_info={rid: types.SimpleNamespace(dynamic_loop_iter_counts={ACTION_GEN_LOOP: k})
+                          for rid, k in zip(rids, steps, strict=True)},
+    )
+    zeros = {rid: torch.zeros(1, 2) for rid in rids}
+    dit._forward_batched_action(ACTION_GEN_WALK, ei, zeros, {rid: torch.zeros(1, 33, 64) for rid in rids}, {})
+    assert seen == [guided]
+    # cond 1, uncond 0, guidance 3: a guided row gets 3, the others the conditional 1
+    assert combined == ([3.0, 1.0] if guided else [1.0, 1.0])
