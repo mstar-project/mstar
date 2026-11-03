@@ -642,6 +642,12 @@ Qwen3-Omni notes
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
   is captured as a CUDA graph per token-count bucket; a request past the
   largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+- A request with no audio output decodes on its own walk, ``thinker_text_decode``:
+  its token stays on the device between steps and reaches the client inline, as
+  Qwen3.5's does, and nothing goes to the Talker. A request with audio output
+  keeps ``thinker_decode``, which streams every step's states to the Talker. A
+  captured step of either walk takes token ids and builds its embeds and rotary
+  tables in the graph.
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
   log-mel features: a step's clips (up to 8 requests) go through one packed
   forward, up to 4096 tokens. A step over 4096 tokens runs its clips one by
@@ -680,7 +686,9 @@ Qwen3-Omni notes
   ladder. Each bucket adds captures, graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
-  the lower expert id where ``torch.topk`` may pick another.
+  the lower expert id where ``torch.topk`` may pick another. On one GPU a
+  decode batch of 8 to 16 tokens also gets its block alignment from that
+  kernel; a smaller one runs its experts as per-pair GEMVs, which need none.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At

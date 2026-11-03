@@ -1053,8 +1053,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">stop_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="c1"># resource key of the sampler whose request config carries ``ignore_eos``</span>
     <span class="n">sampler</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="c1"># the only walk whose rows can stop the loop; None for every walk</span>
-    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># the only walk, or walks, whose rows can stop the loop; None for every walk</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># walks that sample the reply's first token before the loop exists. That</span>
     <span class="c1"># token counts toward the budget, so ``get_loop_caps`` gives the loop</span>
     <span class="c1"># ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one</span>
@@ -1075,7 +1075,15 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">withhold</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_check</span><span class="p">:</span>
             <span class="c1"># the runtime's check never calls check_stop, which is what withholds</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"a TokenStop that withholds outputs needs check_stop: drop runtime_check"</span><span class="p">)</span></div>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"a TokenStop that withholds outputs needs check_stop: drop runtime_check"</span><span class="p">)</span>
+
+<div class="viewcode-block" id="TokenStop.stops_on">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.TokenStop.stops_on">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stops_on</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether a row of ``graph_walk`` can stop the loop."""</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk</span>
+        <span class="k">return</span> <span class="n">walk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">graph_walk</span> <span class="o">==</span> <span class="n">walk</span> <span class="ow">or</span> <span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">)</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">)</span></div>
+</div>
 
 
 
@@ -2820,7 +2828,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
         <span class="k">if</span> <span class="n">stop</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">runtime_check</span> <span class="ow">or</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">prefill_walks</span><span class="p">:</span>
             <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">get_stop_policies</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="o">!=</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">stops_on</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">{}</span>  <span class="c1"># as `_token_stops`: only a row of ``walk`` ends the loop</span>
         <span class="c1"># the budget is the loop's cap, which the runtime enforces</span>
         <span class="k">return</span> <span class="p">{</span><span class="n">stop</span><span class="o">.</span><span class="n">loop</span><span class="p">:</span> <span class="n">StopPolicy</span><span class="p">(</span>
@@ -2889,7 +2897,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">prefill_walks</span><span class="p">:</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_reply_token</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
             <span class="c1"># only a row of ``walk`` ends the loop</span>
-            <span class="k">return</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">walk</span> <span class="o">==</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span>
+            <span class="k">return</span> <span class="n">stop</span><span class="o">.</span><span class="n">stops_on</span><span class="p">(</span><span class="n">walk</span><span class="p">)</span>
         <span class="c1"># the loop's cap is at least 1, so a one-token budget ends at the prefill</span>
         <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="n">prefill_walks</span><span class="p">)</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&lt;=</span> <span class="mi">1</span> <span class="ow">and</span> <span class="p">(</span>
             <span class="n">info</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">prefill_walks</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_reply_token</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
