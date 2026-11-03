@@ -682,7 +682,7 @@ def _fused_filter_kernel(
 def _fused_sample_kernel(
     logits_ptr, temperature_ptr, top_k_ptr, top_p_ptr, seed_ptr, offset_ptr,
     penalty_ptr, seen_ptr, out_ptr,
-    V, stride_l, seen_stride_b, seen_stride_v,
+    V, stride_b, stride_v, seen_stride_b, seen_stride_v,
     APPLY_PENALTY: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """One row's token, from its logits, in registers: the repetition penalty,
@@ -696,7 +696,7 @@ def _fused_sample_kernel(
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     valid = offs < V
-    x = tl.load(logits_ptr + row * stride_l + offs, mask=valid, other=-float("inf")).to(tl.float32)
+    x = tl.load(logits_ptr + row * stride_b + offs * stride_v, mask=valid, other=-float("inf")).to(tl.float32)
     if APPLY_PENALTY:
         seen = tl.load(
             seen_ptr + row * seen_stride_b + offs * seen_stride_v, mask=valid, other=0,
@@ -759,7 +759,7 @@ def fused_sample(
     _fused_sample_kernel[(B,)](
         logits, temperature, top_k, top_p, seed, offset,
         rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
-        V, logits.stride(0),
+        V, logits.stride(0), logits.stride(1),
         seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
         APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= 2048 else 8,
     )
