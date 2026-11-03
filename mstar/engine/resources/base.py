@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -494,6 +495,11 @@ class Resource(ABC):
     def seal_capture_buffers(self) -> None:
         """Every bucket on the device has been sized and none captured yet: from here on,
         what a captured graph reads keeps its address. Called once, by the engine."""
+        # A no-op is safe for a resource that never reallocates what a graph reads once it
+        # is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first
+        # plan during sizing). The one kind a plan grows is a FlashInfer workspace:
+        # `AttentionResource` seals the pools they come from, and the dense backend's own,
+        # outside a pool, is never captured.
         return
 
     def post_warmup_validate(self):
@@ -524,6 +530,10 @@ class AttentionResource(Resource):
 
     _default_label: str = "main"
     _default_layer_idx: int | None = None
+    # FlashInfer's float workspaces, on a resource that plans FlashInfer. Kept here so the
+    # seal is too: a workspace grows at a plan that overflows it, which past capture would
+    # free memory a graph reads.
+    _workspaces: WorkspacePool | None = None
 
     @property
     def default_label(self) -> str:
@@ -540,6 +550,10 @@ class AttentionResource(Resource):
     def reset_default_cursors(self) -> None:
         self._default_label = "main"
         self._default_layer_idx = None
+
+    def seal_capture_buffers(self) -> None:
+        if self._workspaces is not None:
+            self._workspaces.seal()
 
 
 class PublishedInfo(ABC):

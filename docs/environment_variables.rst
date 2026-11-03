@@ -620,9 +620,10 @@ Worker scheduling
        by ``workspace_bytes`` (``mstar/engine/resources/attn/workspace.py``). A floor: a plan
        at startup that asks for more grows that workspace to what it asked for. Raise it for
        an eager step that wants more than startup's plans left it, which raises with the bytes
-       it asked for, since a captured graph holds the workspace's address by then. Where a
-       ragged resource declares ``workspace_mb`` the larger of the two applies; with this
-       unset, the declaration does.
+       it asked for, since a captured graph holds the workspace's address by then. A ragged
+       resource that declares ``workspace_mb`` starts there instead, and this doesn't reach
+       it: LTX-2.5's twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
+       ``512`` and 24 GiB at ``2048`` if this applied.
    * - ``MSTAR_KV_PINNED_INDPTRS``
      - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,

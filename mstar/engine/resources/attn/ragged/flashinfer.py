@@ -35,9 +35,6 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
         self._kwargs["backend"] = config.flashinfer_backend
 
-    def seal_capture_buffers(self) -> None:
-        self._workspaces.seal()
-
     def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
         return super()._build_wrapper(
             label, slot, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,

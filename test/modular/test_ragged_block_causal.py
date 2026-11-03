@@ -32,6 +32,7 @@ from mstar.engine.resources.attn.ragged.block_causal import (
     max_blocks,
     max_prefix_tokens,
 )
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer requires CUDA")
@@ -86,7 +87,7 @@ def close(got, want, tol=TOL):
 
 def wrapper(**overrides) -> RaggedBlockCausalWrapper:
     kwargs = dict(
-        workspace_buffer=torch.empty(64 << 20, dtype=torch.uint8, device=DEVICE),
+        workspace_buffer=Workspace(torch.empty(64 << 20, dtype=torch.uint8, device=DEVICE), "test"),
         num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM, block_size=BLOCK,
         device=DEVICE, q_data_type=DTYPE,
     )

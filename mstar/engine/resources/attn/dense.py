@@ -208,12 +208,13 @@ class DenseAttentionManager(AttentionManager):
         if self._on_flashinfer:
             # One workspace for every wrapper, taken now rather than at the first
             # plan: it is scratch during `run` only (a plan writes the wrapper's
-            # own buffers), and the runs are serialized on the node's stream.
-            workspace = (
-                Workspace(torch.empty(workspace_bytes(), dtype=torch.uint8, device=device), kv_cache)
-                if self._on_cuda else None
+            # own buffers), and the runs are serialized on the node's stream. Off
+            # CUDA nothing runs, so it is empty.
+            buffer = (
+                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda
+                else torch.empty(0, dtype=torch.uint8)
             )
-            self._wrapper_kwargs.update(workspace_buffer=workspace, backend=flashinfer_backend)
+            self._wrapper_kwargs.update(workspace_buffer=Workspace(buffer, kv_cache), backend=flashinfer_backend)
             if self._on_cuda:
                 self._check_flashinfer_backend()
 

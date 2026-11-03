@@ -49,6 +49,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
 )
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 pytestmark = pytest.mark.skipif(
@@ -107,7 +108,7 @@ def close(got, want, tol=TOL):
 
 
 def workspace():
-    return torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    return Workspace(torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE), "test")
 
 
 def wrapper(**overrides) -> FlashInferRaggedPrefillWrapper:

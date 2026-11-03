@@ -66,7 +66,7 @@ class FlashInferMLAWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor | Workspace,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -102,7 +102,7 @@ class FlashInferMLAWrapper:
             return
         import flashinfer
 
-        self._workspace = Workspace.of(workspace_buffer)
+        self._workspace = workspace_buffer
         if use_cuda_graph:
             assert batch_size is not None and max_num_pages is not None
             self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
@@ -260,9 +260,6 @@ class FlashInferMLAManager(AttentionManager):
 
     def depends_on(self):
         return {self._kv_cache_name}
-
-    def seal_capture_buffers(self) -> None:
-        self._workspaces.seal()
 
     @property
     def uses_kernel(self) -> bool:
