@@ -14,13 +14,12 @@ states is what the modules cannot:
   split delta-net ``in_proj_q/k/v`` and its ``unembed_tokens`` head
   (``adapter_stacked_params``, ``aliases``), and the MTP head, which is never run
   (``ignore``);
-* the token embedding's delta is the node's to add (``deferred``): a vision prompt's
-  text is embedded in ``prepare_inputs``, before the step, so ``preprocess`` and
-  ``Qwen3_5LanguageModel.embed`` add it on the step's rows;
 * the vision targets' names, kept as the shipped serving configs spell them (``names``).
 
 The loader's rules are passed explicitly (the Qwen3.5 roots state no
 ``checkpoint_rules()`` yet); they are the same objects ``weight_loader`` loads with.
+Every embedding call is in the step (a vision prompt's ids are embedded in
+``preprocess``), so the token embedding is an ordinary target.
 """
 
 from __future__ import annotations
@@ -79,9 +78,6 @@ def qwen3_5_lora_spec(config: Qwen3_5Config) -> LoraSpec:
         rows={"lm_head": PER_SEGMENT},
         ignore=("mtp.*", "model.mtp.*"),
         embeddings=True,
-        # a vision prompt's text is embedded in prepare_inputs, before the step: the
-        # node adds the delta itself, on the step's rows (preprocess, and `embed`)
-        deferred=("model.embed_tokens",),
     )
 
 

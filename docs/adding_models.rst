@@ -1156,8 +1156,8 @@ placed exactly as weights are.
   ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned
   step, a text projection or a conditioning encoder run in ``prepare_inputs``.
   ``deferred``: modules called both before the step and in it, whose delta the node adds
-  itself where the step's rows are planned (Qwen3.5 embeds a vision prompt's text in
-  ``prepare_inputs``): bound as ``lora_deferred``, which the module's forward never adds.
+  itself where the step's rows are planned (an embedding also run in ``prepare_inputs``):
+  bound as ``lora_deferred``, which the module's forward never adds.
   ``embeddings=True`` only when every embedding call is in the step; a deferred
   embedding is served without it. ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes,
   names and split projections adapters write, rewritten to the checkpoint's before the

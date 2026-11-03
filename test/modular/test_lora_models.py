@@ -49,7 +49,7 @@ _SETUP = threading.Lock()
 
 
 def _bound(module) -> bool:
-    return getattr(module, "lora_delta", None) is not None or getattr(module, "lora_deferred", None) is not None
+    return getattr(module, "lora_delta", None) is not None
 
 
 def _unbound(stack, c, weights):
@@ -419,9 +419,50 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
     H.plan([lora_pool], [("r0", "h", 1), ("r1", "h", 1), ("r2", "h", 1)])  # three decode rows
     ids, hidden = torch.tensor([1, 2, 60]), H.rand(3, H.HIDDEN, seed=4)
     with torch.no_grad():
-        embeds, logits = model.model.embed(ids), model.lm_head(hidden)
+        embeds, logits = model.model.embed_tokens(ids), model.lm_head(hidden)
     table = base[embed + ".weight"]
     torch.testing.assert_close(embeds, H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"][ids])
     a, b, s = ref["lm_head"]
     torch.testing.assert_close(logits, hidden @ table.t() + s * (hidden @ a.t()) @ b.t())
     assert torch.equal(model.lm_head.weight, table)
+
+
+def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(tmp_path):
+    """A vision prompt's text and sentinels take their adapter's embedding delta in the
+    step, also when a capture bucket pads the step with a dummy row: three image prompts
+    on the bs-4 bucket, against merged weights. The image rows pass through as they are."""
+    from mstar.model.qwen3_5.config import ROPE
+    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    embed = f"{H.TEXT}embed_tokens"
+    path, ref = H.make_adapter(tmp_path / "e.safetensors", {embed: (H.HIDDEN, 64)}, 4, 8.0, 41, embedding=(embed,))
+    start, end = 60, 61
+    config = dataclasses.replace(H.tiny_config(), vision_start_token_id=start, vision_end_token_id=end,
+                                 mrope_section=[2, 1, 1])
+    base = H.hf_text_weights()
+    lora_pool = H.pool(H.lora_spec({"e": path}))
+    llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config())
+    llm.bind_node_resources({H.LORA: lora_pool})
+    llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: None)
+
+    table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]
+    rows, want = [], []
+    for i, grid in enumerate([(1, 4, 4), (1, 2, 4), (1, 4, 2)]):
+        texts = [torch.tensor([1 + i, 5]), torch.tensor([7, 8 + i, 9])]
+        image = H.rand(grid[1] * grid[2] // 4, H.HIDDEN, seed=50 + i)
+        fwd_info = SimpleNamespace(request_id=f"r{i}", step_metadata={
+            "prefill_order": (TEXT_PART, IMAGE_PART, TEXT_PART), STEP_GRIDS_KEY: [grid],
+        })
+        # prepare_inputs runs outside the planned step, before the plan below
+        rows.append(llm._vision_inputs(fwd_info, {"text_inputs": texts, "vision_embeds": [image]}))
+        want += [table[texts[0]], table[[start]], image, table[[end]], table[texts[1]]]
+    (config_v,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
+                   if c.capture_graph_walk == "prefill_vision"]
+    padded = [*rows, *config_v.get_node_inputs(1, 0)]
+    assert len(padded) == 4 and padded[-1].input_seq_len == 0
+
+    H.plan([lora_pool], [(f"r{i}", "e", row.input_seq_len) for i, row in enumerate(rows)])
+    with torch.no_grad():
+        out = llm.preprocess("prefill_vision", SimpleNamespace(captured=False), padded)
+    torch.testing.assert_close(out["input_embeds"], torch.cat(want))

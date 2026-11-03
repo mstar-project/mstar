@@ -345,37 +345,6 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
         node.fc(torch.ones(2, 4, dtype=F64))
 
 
-def test_qwen3_5_defers_the_embedding_prepare_inputs_runs():
-    """A vision prompt's text is embedded in ``prepare_inputs``, before the step: the
-    embedding is deferred, runs bare there, and the node's ``embed`` adds its delta.
-    Control: declared without the deferral, it is refused there."""
-    from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
-    from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-
-    config, ids = Q.tiny_config(), torch.tensor([1, 2, 3])
-    generic = qwen3_5_lora_spec(config)
-    assert {generic.module_map.bindings[p].target for p in generic.module_map.deferred} == {"embed_tokens"}
-
-    def bound(spec):
-        sub = LLMSubmodule(Qwen3_5ForCausalLM(config).double(), config)
-        sub.bind_node_resources({LORA: LoraAdapterPool.build(Q.serve(spec, {}), ENGINE_INFO)})
-        return sub.model.model
-
-    lm = bound(generic)
-    assert lm.embed_tokens.lora_delta is None and lm.embed_tokens.lora_deferred is not None
-    lm.embed_tokens(ids)  # as prepare_inputs embeds a vision prompt's text
-    with pytest.raises(RuntimeError, match="outside"):
-        lm.embed(ids)
-    with torch.device("meta"):
-        root = Qwen3_5ForCausalLM(config)
-    eager = module_lora_spec(root, resource_key=LORA, nodes={"LLM"}, root_path="model",
-                             rules=generic.module_map.rules, rows={"lm_head": PER_SEGMENT}, embeddings=True)
-    with pytest.raises(RuntimeError, match="outside"):
-        bound(eager).embed_tokens(ids)
-
-
 # --- base-only captures ------------------------------------------------------------------
 
 class _CountingBackend(LoraOpsBackend):

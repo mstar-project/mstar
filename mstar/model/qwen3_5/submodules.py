@@ -1,7 +1,7 @@
 """Qwen3.5's node submodules: the hybrid LLM and the vision encoder.
 
-``prefill_vision`` hands the LLM encoder embeddings rather than ids, so steps
-are declared off ``input_seq_len``. The rotation is Qwen3.5's interleaved 3D
+``prefill_vision`` hands the LLM encoder embeddings beside the prompt's ids, so
+steps are declared off ``input_seq_len``. The rotation is Qwen3.5's interleaved 3D
 MRoPE (``components/rope.py``): the position resource is only a per-request
 counter, and the 3D ids are built here and passed in as cos/sin.
 """
@@ -37,7 +37,6 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
-from mstar.model.components.lora.capable import apply_lora
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
@@ -164,7 +163,6 @@ class LLMSubmodule(ARNodeSubmodule):
             walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._sentinel_ids: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -183,10 +181,6 @@ class LLMSubmodule(ARNodeSubmodule):
         def vision_dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_seq_len=n,
-                input_embeds=torch.zeros(
-                    (n, self.config.hidden_size),
-                    device=device, dtype=self.model.model.embed_tokens.weight.dtype,
-                ),
                 custom_pos_ids=torch.zeros(
                     (3, n), dtype=torch.float, device=device,
                 ),
@@ -195,6 +189,12 @@ class LLMSubmodule(ARNodeSubmodule):
                     "mrope_advance": max(n - 2, 0),
                     "text_token_ids": torch.zeros(
                         n, dtype=torch.long, device=device,
+                    ),
+                    # every position an image row's, so a padding row (n = 0) adds none
+                    "prompt_ids": torch.full((n,), -1, dtype=torch.long, device=device),
+                    "vision_rows": torch.zeros(
+                        (n, self.config.hidden_size),
+                        device=device, dtype=self.model.model.embed_tokens.weight.dtype,
                     ),
                 },
             )
@@ -241,8 +241,8 @@ class LLMSubmodule(ARNodeSubmodule):
     # Step declaration
     # ------------------------------------------------------------------
 
-    def _sentinel_embeds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """``<|vision_start|>`` / ``<|vision_end|>`` embeddings, cached.
+    def _sentinel_ids(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``<|vision_start|>`` / ``<|vision_end|>`` ids on the device, cached.
 
         `split_around_spans` drops them with the pad interior, so this walk
         re-adds them.
@@ -252,15 +252,15 @@ class LLMSubmodule(ARNodeSubmodule):
                 [self.config.vision_start_token_id, self.config.vision_end_token_id],
                 dtype=torch.long, device=self.get_device(),
             )
-            embeds = self.model.model.embed_tokens(ids)
-            self._vision_sentinels = (embeds[:1], embeds[1:])
-            self._sentinel_ids = (ids[:1], ids[1:])
+            self._vision_sentinels = (ids[:1], ids[1:])
         return self._vision_sentinels
 
     def _vision_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
     ) -> ARNodeInputs:
-        """A whole multimodal prompt as one row, spliced in prompt order.
+        """A whole multimodal prompt as one row, in prompt order: each position's
+        token id, -1 where an image or video row goes (``prompt_ids``), and those rows
+        (``vision_rows``), which `preprocess` splices into the embedded ids.
 
         `prefill_order` tags each part text, image or video frame group; the
         nth tag of a kind takes the nth tensor of that kind, except that a
@@ -283,19 +283,15 @@ class LLMSubmodule(ARNodeSubmodule):
         texts = inputs.get("text_inputs", [])
         grids = fwd_info.step_metadata[STEP_GRIDS_KEY]
         packed = inputs["vision_embeds"][0].to(device)
-        start_embed, end_embed = self._sentinel_embeds()
+        start_id, end_id = self._sentinel_ids()
 
         pos = self.node_resources[ROPE].position(
             rid=fwd_info.request_id, label="main",
         )
         start_pos = pos
-        embeds: list[torch.Tensor] = []
+        ids: list[torch.Tensor] = []
         pos_ids: list[torch.Tensor] = []
         tracked: list[torch.Tensor] = []
-        # each position's token id (-1 on an image or video frame), for the adapter's
-        # embedding delta, which `preprocess` adds once the step's adapters are planned
-        embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None) is not None
-        ids_at: list[torch.Tensor] = []
         text_i = grid_i = 0
         # frame groups of the video at `grid_i` already placed
         group = 0
@@ -304,14 +300,12 @@ class LLMSubmodule(ARNodeSubmodule):
 
         for kind in fwd_info.step_metadata.get("prefill_order", ()):
             if kind == TEXT_PART:
-                ids = texts[text_i].to(device)
+                text = texts[text_i].to(device)
                 text_i += 1
-                span = ids.shape[0]
-                embeds.append(self.model.model.embed_tokens(ids))
+                span = text.shape[0]
+                ids.append(text)
                 pos_ids.append(text_position_ids(span, pos))
-                tracked.append(ids)
-                if embed_lora:
-                    ids_at.append(ids)
+                tracked.append(text)
                 pos += span
                 continue
             t, h, w = grids[grid_i]
@@ -325,12 +319,7 @@ class LLMSubmodule(ARNodeSubmodule):
             grid = torch.tensor((t, h, w))
             span = t * (h // merge) * (w // merge)
             advance = vision_position_advance(grid, merge)
-            embeds += [start_embed, packed[cursor:cursor + span], end_embed]
-            if embed_lora:
-                start_id, end_id = self._sentinel_ids
-                ids_at += [
-                    start_id, torch.full((span,), -1, dtype=torch.long, device=device), end_id,
-                ]
+            ids += [start_id, torch.full((span,), -1, dtype=torch.long, device=device), end_id]
             # built on the host, copied once below
             pos_ids += [
                 text_position_ids(1, pos),
@@ -341,25 +330,31 @@ class LLMSubmodule(ARNodeSubmodule):
             # two sentinels either side, and the image between them
             pos += advance + 2
 
-        input_embeds = torch.cat(embeds, dim=0)
-        tensor_inputs = {
-            "mrope_advance": pos - start_pos,
-            # Ids cannot ride `input_ids` — that is what `preprocess` keys
-            # the embeds-vs-ids branch on — so the repetition penalty
-            # takes them from here.
-            "text_token_ids": (
-                torch.cat(tracked) if tracked
-                else torch.zeros(0, dtype=torch.long, device=device)
-            ),
-        }
-        if embed_lora:
-            tensor_inputs["embed_ids"] = torch.cat([i.to(torch.long) for i in ids_at])
+        prompt_ids = torch.cat([i.long() for i in ids])
         return ARNodeInputs(
-            input_seq_len=input_embeds.shape[0],
-            input_embeds=input_embeds,
+            input_seq_len=prompt_ids.shape[0],
             custom_pos_ids=to_device_nonblocking(torch.cat(pos_ids, dim=1), device),
-            tensor_inputs=tensor_inputs,
+            tensor_inputs={
+                "mrope_advance": pos - start_pos,
+                # the text's ids alone, for the repetition penalty: `prompt_ids`
+                # also holds the sentinels and the image rows' -1s
+                "text_token_ids": (
+                    torch.cat(tracked) if tracked
+                    else torch.zeros(0, dtype=torch.long, device=device)
+                ),
+                "prompt_ids": prompt_ids,
+                "vision_rows": packed[:cursor],
+            },
         )
+
+    def _vision_embeds(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
+        """A ``prefill_vision`` step's embeddings: its rows' ``prompt_ids`` embedded
+        here, in the step, where a token-embedding adapter's rows are planned, with
+        each -1 taking the next of the rows' ``vision_rows``."""
+        ids = torch.cat([inp.tensor_inputs["prompt_ids"] for inp in inputs])
+        rows = torch.cat([inp.tensor_inputs["vision_rows"] for inp in inputs])
+        embeds = self.model.model.embed_tokens(ids.clamp(min=0))
+        return embeds.masked_scatter_((ids < 0).unsqueeze(-1), rows)
 
     # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
     # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
@@ -461,10 +456,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
         in_graph = self._rope_in_graph(engine_inputs, graph_walk)
-        first = inputs[0]
-        if first.input_embeds is None and (
-            first.input_ids is None or any(inp.input_ids is None for inp in inputs)
-        ):
+        if graph_walk == "prefill_vision":
+            out["input_embeds"] = self._vision_embeds(inputs)
+        elif inputs[0].input_ids is None or any(inp.input_ids is None for inp in inputs):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
@@ -485,27 +479,13 @@ class LLMSubmodule(ARNodeSubmodule):
             if in_graph:
                 # the captured forward builds the rotary tables itself
                 return out
-        elif inputs[0].input_ids is not None:
+        else:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
             if in_graph:
                 assert all(inp.custom_pos_ids is None for inp in inputs), (
                     "a text walk's rows take the planned 1D positions"
                 )
                 return out
-        else:
-            out["input_embeds"] = torch.cat(
-                [inp.input_embeds for inp in inputs], dim=0,
-            )
-            embed_lora = getattr(self.model.model.embed_tokens, "lora_deferred", None)
-            # a capture's dummy rows carry no ids, and add no delta
-            if embed_lora is not None and all("embed_ids" in inp.tensor_inputs for inp in inputs):
-                # the spliced text embeddings take their rows' adapters' embedding delta
-                # here, where the step's addressing is planned; images' -1 ids take none
-                out["input_embeds"] = apply_lora(
-                    embed_lora,
-                    torch.cat([inp.tensor_inputs["embed_ids"] for inp in inputs]),
-                    out["input_embeds"],
-                )
 
         laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
@@ -609,7 +589,7 @@ class LLMSubmodule(ARNodeSubmodule):
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
-            self.model.model.embed(input_ids)
+            self.model.model.embed_tokens(input_ids)
             if input_embeds is None
             else input_embeds
         )

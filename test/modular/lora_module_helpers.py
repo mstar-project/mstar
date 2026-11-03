@@ -792,7 +792,7 @@ def _chatterbox_t3():
 def _qwen3_5():
     """The gated q (the output gate inside each query head), the delta-net's
     ``[q|k|v|z|a|pad|b]`` in-projection (``a`` padded per rank), the LM head (one row
-    per request) and the token embedding, whose delta the node adds in the step. Its
+    per request) and the token embedding. Its
     released sizes, with the vision tower's spec, are the models test's own."""
     from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
     from mstar.model.qwen3_5.submodules import LLMSubmodule
@@ -804,7 +804,7 @@ def _qwen3_5():
     def run_(sub, rows):
         lengths, lm = [len(r) for r in rows], sub.model
         _stub_cores(lm, _Rows(lengths))
-        hidden = lm.model(lm.model.embed(torch.cat(rows)), label="main")
+        hidden = lm.model(lm.model.embed_tokens(torch.cat(rows)), label="main")
         return _per_row(hidden, lm.lm_head(_last(hidden, lengths)), lengths)
 
     return Stack(
