@@ -5,6 +5,7 @@ takes the official repo's central square crop, which sees more of a non-square
 frame than the processor's resize and crop.
 """
 
+import json
 import sys
 import types
 
@@ -51,13 +52,21 @@ def _pixels(out: torch.Tensor) -> torch.Tensor:
     return out * _STD + _MEAN
 
 
+def _checkpoint(path, crop_size: int | None = None) -> str:
+    """A checkpoint directory with a tiny config.json and, given a crop size,
+    the video processor's config. Constructing the model builds nothing."""
+    (path / "config.json").write_text(json.dumps({"model_type": "vjepa2", "crop_size": 256}))
+    if crop_size is not None:
+        processing = pytest.importorskip("transformers.models.vjepa2.video_processing_vjepa2")
+        processing.VJEPA2VideoProcessor(crop_size=crop_size).save_pretrained(path)
+    return str(path)
+
+
 @pytest.fixture
 def hf_model(tmp_path):
-    """The HF-checkpoint model, with its processor read from a checkpoint
-    directory's video_preprocessor_config.json through AutoVideoProcessor."""
-    processing = pytest.importorskip("transformers.models.vjepa2.video_processing_vjepa2")
-    processing.VJEPA2VideoProcessor().save_pretrained(tmp_path)
-    return VJepa2Model(str(tmp_path), skip_weight_loading=True)
+    """The HF-checkpoint model, with its processor read through AutoVideoProcessor
+    from the checkpoint directory at construction."""
+    return VJepa2Model(_checkpoint(tmp_path, crop_size=256))
 
 
 @pytest.mark.parametrize("hw", [(180, 320), (320, 180), (256, 256), (480, 640)])
@@ -85,12 +94,15 @@ def test_hf_crop_is_narrower(hf_model):
     assert out[..., -1, :].max() < 0.6
 
 
-def test_a_processor_that_crops_another_size_is_refused(tmp_path):
-    processing = pytest.importorskip("transformers.models.vjepa2.video_processing_vjepa2")
-    processing.VJEPA2VideoProcessor(crop_size=384).save_pretrained(tmp_path)
-    model = VJepa2Model(str(tmp_path), skip_weight_loading=True)
+def test_a_checkpoint_without_a_video_processor_is_refused_at_startup(tmp_path):
+    pytest.importorskip("transformers")
+    with pytest.raises(OSError, match="video processor"):
+        VJepa2Model(_checkpoint(tmp_path))
+
+
+def test_a_processor_that_crops_another_size_is_refused_at_startup(tmp_path):
     with pytest.raises(ValueError, match="crops"):
-        model._preprocess_video(_frames(180, 320), target_frames=2)
+        VJepa2Model(_checkpoint(tmp_path, crop_size=384))
 
 
 def test_load_video_hands_over_the_decoded_bytes(monkeypatch):
