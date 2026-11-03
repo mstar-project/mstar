@@ -120,7 +120,7 @@ class FlashInferPrefillWrapper:
     CUDA graph mode using static buffers. KV writes are the KVManager's job.
 
     Args:
-        workspace_buffer: FlashInfer workspace; a `Workspace` grows to what the first plan asks for
+        workspace_buffer: the `Workspace` it plans through, which grows to what a plan asks for
         num_qo_heads: number of query/output heads
         num_kv_heads: number of key/value heads
         head_dim: dimension per head
@@ -134,7 +134,7 @@ class FlashInferPrefillWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor | Workspace,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -158,7 +158,7 @@ class FlashInferPrefillWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
-        self._workspace = Workspace.of(workspace_buffer)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -443,7 +443,7 @@ class FlashInferDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor | Workspace,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -468,7 +468,7 @@ class FlashInferDecodeWrapper:
         self.dtype = None
         # set by the first plan when ``_plan_direct`` may take the later ones
         self._planner_args: list | None = None
-        self._workspace = Workspace.of(workspace_buffer)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -643,7 +643,7 @@ class FmhaDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -660,7 +660,7 @@ class FmhaDecodeWrapper:
         check_flashinfer_head_dim(head_dim, device)
         self.batch_size = batch_size
         self.dtype = torch.bfloat16
-        self._workspace = Workspace.of(workspace_buffer).tensor
+        self._workspace = workspace_buffer.tensor
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._scale = head_dim ** -0.5
@@ -795,8 +795,8 @@ class FlashInferMixedWrapper:
 
     def __init__(
         self,
-        decode_workspace: torch.Tensor | Workspace,
-        prefill_workspace: torch.Tensor | Workspace,
+        decode_workspace: Workspace,
+        prefill_workspace: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,

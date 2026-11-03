@@ -143,9 +143,6 @@ class FlashInferCrossManager(CrossAttentionManager):
             return {self._kv_cache_name}
         return {self._kv_cache_name, self._query_kv_cache_name}
 
-    def seal_capture_buffers(self) -> None:
-        self._workspaces.seal()
-
     @property
     def context_cache_key(self) -> str:
         """label of kv resource holding context so x-attention can find cache to read"""

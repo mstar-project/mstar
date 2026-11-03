@@ -98,9 +98,9 @@ class RaggedAttentionConfig:
     shard_over_sp: bool = True
 
     # Where each label's FlashInfer workspace starts, per slot; None takes
-    # MSTAR_WORKSPACE_BUFFER_MB. A floor: a plan that asks for more grows it. A ragged
-    # prefill only spends it on split-KV partials, so a resource with many labels can
-    # declare less.
+    # MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that
+    # asks for more grows it. A ragged prefill only spends it on split-KV partials, so a
+    # resource with many labels can declare less.
     workspace_mb: int | None = None
 
     def __post_init__(self):

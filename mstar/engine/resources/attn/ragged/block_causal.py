@@ -74,7 +74,7 @@ class RaggedBlockCausalWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor | Workspace,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -102,7 +102,7 @@ class RaggedBlockCausalWrapper:
         self.max_total_tokens = max_total_tokens
         self._num_segments = 0
         self._total_tokens = 0
-        self._workspace = Workspace.of(workspace_buffer)
+        self._workspace = workspace_buffer
 
         if not accelerator_graph:
             self._out_buf = None

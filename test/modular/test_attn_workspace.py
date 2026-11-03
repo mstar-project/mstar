@@ -13,13 +13,20 @@ import pytest
 import torch
 
 from mstar.engine import engine as engine_mod
+from mstar.engine.resources.attn import flashinfer as flashinfer_mod
 from mstar.engine.resources.attn import workspace as workspace_mod
 from mstar.engine.resources.attn import wrappers as wrappers_mod
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAWrapper
+from mstar.engine.resources.attn.cross import FlashInferCrossManager
+from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager, FlashInferMLAWrapper
 from mstar.engine.resources.attn.ragged.block_causal import RaggedBlockCausalWrapper
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
-from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
+from mstar.engine.resources.attn.ragged.flashinfer import (
+    FlashInferRaggedBlockCausalManager,
+    FlashInferRaggedCrossManager,
+    FlashInferRaggedManager,
+)
 from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
@@ -30,6 +37,8 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
 )
+from mstar.engine.resources.base import AttentionResource
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 
 MIB = 1024 * 1024
@@ -44,17 +53,21 @@ def _overflow(name: str, size: int, left: int) -> str:
 
 
 class _Planner:
-    """Allocates ``tmp_v``, then the 1/128 of it ``tmp_s`` takes, from ``tensor``."""
+    """Allocates a partial output, then its log-sum-exp (``tmp_v``, then the 1/128 of it ``tmp_s``
+    takes at head dim 128), from ``tensor``."""
 
-    def __init__(self, tensor: torch.Tensor, tmp_v: int):
+    def __init__(
+        self, tensor: torch.Tensor, tmp_v: int, head_dim: int = 128,
+        names: tuple[str, str] = ("batch_prefill_tmp_v", "batch_prefill_tmp_s"),
+    ):
         self.tensor = tensor
-        self.tmp_v = tmp_v
+        self.allocations = ((names[0], tmp_v), (names[1], tmp_v // head_dim))
         self.plans = 0
 
     def plan(self, *args, **kwargs) -> None:
         self.plans += 1
         left = self.tensor.numel()
-        for name, size in (("batch_prefill_tmp_v", self.tmp_v), ("batch_prefill_tmp_s", self.tmp_v // 128)):
+        for name, size in self.allocations:
             if size > left:
                 raise RuntimeError(_overflow(name, size, left))
             left -= size
@@ -62,11 +75,29 @@ class _Planner:
 
 def test_a_plan_grows_the_workspace_to_what_it_asked_for():
     workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
-    planner = _Planner(workspace.tensor, 5 * MIB)
+    planner = _Planner(workspace.tensor, 5 * MIB + 4096)
     workspace.plan(planner.plan)
-    # one retry, with room for both allocations, to the MiB
+    # the first allocation, to the MiB, leaves room for the second
     assert planner.plans == 2
-    assert 5 * MIB + 5 * MIB // 128 <= workspace.tensor.numel() <= 6 * MIB
+    assert workspace.tensor.numel() == 6 * MIB
+
+
+@pytest.mark.parametrize("head_dim, names", [
+    (128, ("batch_prefill_tmp_v", "batch_prefill_tmp_s")),
+    # tmp_s is 1/head_dim of tmp_v, so more than 1/32 of it below head dim 32
+    (16, ("batch_decode_tmp_v", "batch_decode_tmp_s")),
+    (64, ("holistic_partial_o", "holistic_partial_lse")),
+], ids=["prefill", "decode-head-dim-16", "holistic"])
+def test_a_plan_that_overflows_twice_fits_on_its_third(caplog, head_dim, names):
+    workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
+    # a partial output of whole MiB, so growing by it leaves nothing for its log-sum-exp
+    planner = _Planner(workspace.tensor, 5 * MIB, head_dim, names)
+    with caplog.at_level("INFO", logger=workspace_mod.logger.name):
+        workspace.plan(planner.plan)
+    assert planner.plans == 3
+    assert workspace.tensor.numel() == 6 * MIB
+    assert f"1 -> 5 MiB, a plan asked for {5 * MIB} bytes" in caplog.text
+    assert f"5 -> 6 MiB, a plan asked for {5 * MIB + 5 * MIB // head_dim} bytes" in caplog.text
 
 
 def test_a_plan_that_fits_changes_nothing():
@@ -106,7 +137,7 @@ def test_each_key_grows_on_its_own():
     assert pool.get("audio", 0).tensor.numel() == MIB
 
 
-def test_the_env_var_and_workspace_mb_are_floors(monkeypatch):
+def test_a_declared_workspace_mb_wins_over_the_env_var(monkeypatch):
     monkeypatch.delenv("MSTAR_WORKSPACE_BUFFER_MB", raising=False)
     assert workspace_bytes() == 512 * MIB
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "3")
@@ -114,34 +145,35 @@ def test_the_env_var_and_workspace_mb_are_floors(monkeypatch):
     from_env = WorkspacePool(CPU).get("main")
     declared = WorkspacePool(CPU, size_mb=2).get("main")
     assert from_env.tensor.numel() == 3 * MIB
-    # two floors: the larger holds, whichever said it
-    assert declared.tensor.numel() == 3 * MIB
+    # the env var is the default for a resource that declares nothing, smaller or larger
+    assert declared.tensor.numel() == 2 * MIB
     assert WorkspacePool(CPU, size_mb=5).get("main").tensor.numel() == 5 * MIB
-    monkeypatch.delenv("MSTAR_WORKSPACE_BUFFER_MB")
-    assert WorkspacePool(CPU, size_mb=2).get("main").tensor.numel() == 2 * MIB
     from_env.plan(_Planner(from_env.tensor, MIB).plan)
     assert from_env.tensor.numel() == 3 * MIB
-    # and neither is a cap
+    # and neither is a cap: a plan grows a declared workspace as it does any other
     declared.plan(_Planner(declared.tensor, 7 * MIB).plan)
     assert declared.tensor.numel() >= 7 * MIB
 
 
-def test_a_sealed_workspace_keeps_its_address_and_names_the_bytes_and_the_knob():
-    pool = WorkspacePool(CPU, size_mb=1, owner="dit_attn")
+@pytest.mark.parametrize("size_mb, knob", [
+    (None, "It starts at MSTAR_WORKSPACE_BUFFER_MB: set that to at least 6."),
+    (1, "It starts at the workspace_mb dit_attn declares: set that to at least 6."),
+])
+def test_a_sealed_workspace_keeps_its_address_and_names_the_bytes_and_the_knob(monkeypatch, size_mb, knob):
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    pool = WorkspacePool(CPU, size_mb=size_mb, owner="dit_attn")
     workspace = pool.get("main", 1)
     before = workspace.tensor.data_ptr()
     pool.seal()
-    planner = _Planner(workspace.tensor, 5 * MIB)
+    planner = _Planner(workspace.tensor, 5 * MIB + 4096)
     with pytest.raises(RuntimeError) as err:
         workspace.plan(planner.plan)
     assert workspace.tensor.data_ptr() == before and workspace.tensor.numel() == MIB
-    text = str(err.value)
-    # what a plan asked for, in bytes; which workspace; which settings; how far to raise them
-    asked = 5 * MIB + 5 * MIB // 32 + 4096
-    assert f"{asked} bytes" in text
-    assert "dit_attn/main_1" in text
-    assert "MSTAR_WORKSPACE_BUFFER_MB" in text and "workspace_mb" in text
-    assert f"at least {-(-asked // MIB)}" in text
+    # what a plan asked for, in bytes; which workspace; which setting; how far to raise it
+    assert str(err.value) == (
+        f"FlashInfer workspace dit_attn/main_1: a plan asks for {5 * MIB + 4096} bytes (6 MiB) and it holds "
+        f"{MIB} bytes; it can't grow once a captured graph can hold its address. {knob}"
+    )
     assert planner.plans == 1
 
 
@@ -153,22 +185,19 @@ def test_the_seal_says_what_a_pool_holds(caplog):
     assert "FlashInfer workspaces of dit_attn: 2, 2 MiB" in caplog.text
 
 
-def test_a_workspace_made_after_the_seal_can_grow():
+def test_a_workspace_made_after_the_seal_is_born_sealed():
+    """A wrapper made past the seal may still be captured over its key, so no later plan on
+    that key may move it."""
     pool = WorkspacePool(CPU, size_mb=1)
     pool.seal()
     workspace = pool.get("eager", 0)
-    workspace.plan(_Planner(workspace.tensor, 5 * MIB).plan)
-    assert workspace.tensor.numel() >= 5 * MIB
+    assert workspace.sealed
+    with pytest.raises(RuntimeError, match="captured graph can hold its address"):
+        workspace.plan(_Planner(workspace.tensor, 5 * MIB).plan)
+    assert workspace.tensor.numel() == MIB
 
 
-def test_a_bare_tensor_is_its_callers_to_size():
-    tensor = torch.empty(MIB, dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match="MSTAR_WORKSPACE_BUFFER_MB"):
-        Workspace.of(tensor).plan(_Planner(tensor, 5 * MIB).plan)
-    assert tensor.numel() == MIB
-
-
-def test_a_plan_still_short_after_growing_says_so():
+def test_a_plan_still_short_after_three_says_what_each_ran_short_of():
     workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
     calls = []
 
@@ -176,25 +205,55 @@ def test_a_plan_still_short_after_growing_says_so():
         calls.append(1)
         raise RuntimeError(_overflow("batch_prefill_tmp_v", (len(calls) * 10) * MIB, workspace.tensor.numel()))
 
-    with pytest.raises(RuntimeError, match="growing it once did not make room") as err:
+    with pytest.raises(RuntimeError) as err:
         workspace.plan(plan)
-    assert len(calls) == 2
-    assert f"{20 * MIB + 20 * MIB // 32 + 4096} bytes" in str(err.value)
+    assert len(calls) == 3
+    assert str(err.value) == (
+        f"FlashInfer workspace attention/main_0: a plan asks for {30 * MIB} bytes (30 MiB) and it holds "
+        f"{20 * MIB} bytes; 3 plans ran short, of batch_prefill_tmp_v ({10 * MIB} bytes), "
+        f"batch_prefill_tmp_v ({20 * MIB} bytes), batch_prefill_tmp_v ({30 * MIB} bytes). "
+        "It starts at the workspace_mb attention declares: set that to at least 30."
+    )
 
 
-def test_no_room_to_grow_says_what_it_asked_for(monkeypatch):
-    workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
+def _short_of_memory(monkeypatch, above: int) -> None:
+    """``torch.empty`` in the workspace module fails past ``above`` bytes, as a full GPU does."""
     real_empty = torch.empty
 
     def empty(size, **kwargs):
-        if size > MIB:
+        if size > above:
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
         return real_empty(size, **kwargs)
 
     monkeypatch.setattr(workspace_mod.torch, "empty", empty)
-    with pytest.raises(RuntimeError, match="no room to grow it: CUDA out of memory") as err:
-        workspace.plan(_Planner(workspace.tensor, 5 * MIB).plan)
-    assert f"holds {MIB} bytes" in str(err.value)
+
+
+def test_no_room_to_grow_says_what_it_asked_for_and_keeps_what_it_held(monkeypatch):
+    workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
+    planner = _Planner(workspace.tensor, 5 * MIB + 4096)
+    _short_of_memory(monkeypatch, above=MIB)
+    with pytest.raises(RuntimeError) as err:
+        workspace.plan(planner.plan)
+    assert str(err.value) == (
+        f"FlashInfer workspace attention/main_0: a plan asks for {5 * MIB + 4096} bytes (6 MiB) and it holds "
+        f"{MIB} bytes; the GPU has no room to grow it: CUDA out of memory"
+    )
+    # its bytes are back, so a plan that fitted before still does
+    assert workspace.tensor.numel() == MIB
+    planner.allocations = (("batch_prefill_tmp_v", MIB // 2),)
+    workspace.plan(planner.plan)
+
+
+def test_no_room_to_take_back_what_it_held_says_so(monkeypatch):
+    workspace = WorkspacePool(CPU, size_mb=1).get("main", 0)
+    _short_of_memory(monkeypatch, above=0)
+    with pytest.raises(RuntimeError) as err:
+        workspace.plan(_Planner(workspace.tensor, 5 * MIB + 4096).plan)
+    assert str(err.value).endswith(
+        f"and it holds 0 bytes; the GPU has no room to grow it: CUDA out of memory; nor to take back the {MIB} "
+        "bytes it held"
+    )
+    assert workspace.tensor.numel() == 0
 
 
 @pytest.mark.parametrize("message", [
@@ -220,7 +279,7 @@ def test_other_planner_errors_are_not_retried(message):
 class _NativeWrapper:
     """A FlashInfer wrapper as far as a plan goes, asking for ``asks`` of its workspace."""
 
-    asks = 5 * MIB
+    asks = 5 * MIB + 4096
     built: list[_NativeWrapper] = []
 
     def __init__(self, workspace_buffer, *args, **kwargs):
@@ -235,7 +294,7 @@ class _NativeWrapper:
 
 @pytest.fixture
 def native(monkeypatch):
-    _NativeWrapper.asks = 5 * MIB
+    _NativeWrapper.asks = 5 * MIB + 4096
     _NativeWrapper.built = []
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(
         BatchPrefillWithPagedKVCacheWrapper=_NativeWrapper,
@@ -315,11 +374,48 @@ def test_a_manager_refuses_to_move_a_workspace_past_the_seal(native):
     ragged.plan(bs=1, tokens=8)
     ragged.manager.seal_capture_buffers()
     native.asks = 3 * MIB
-    with pytest.raises(RuntimeError, match="dit_attn/main_0.*MSTAR_WORKSPACE_BUFFER_MB"):
+    with pytest.raises(RuntimeError, match="dit_attn/main_0.*the workspace_mb dit_attn declares"):
         ragged.plan(bs=2, tokens=16)
-    # a slot no plan has reached has no graph over it
-    ragged.plan(bs=2, tokens=16, slot=1)
-    assert ragged.manager._workspaces.get("main", 1).tensor.numel() >= 3 * MIB
+    # nor one a key's first wrapper makes after the seal
+    with pytest.raises(RuntimeError, match="dit_attn/main_1"):
+        ragged.plan(bs=2, tokens=16, slot=1)
+    assert ragged.manager._workspaces.get("main", 1).tensor.numel() == MIB
+
+
+_FLASHINFER_MANAGERS = [
+    FlashInferManager, FlashInferCrossManager, FlashInferMLAManager,
+    FlashInferRaggedManager, FlashInferRaggedCrossManager, FlashInferRaggedBlockCausalManager,
+]
+
+
+@pytest.mark.parametrize("manager_class", _FLASHINFER_MANAGERS, ids=lambda cls: cls.__name__)
+def test_every_flashinfer_manager_seals_its_pool_through_the_base(manager_class):
+    """The seal is the base's, so a manager can't hold a pool the engine doesn't seal."""
+    assert manager_class.seal_capture_buffers is AttentionResource.seal_capture_buffers
+    manager = manager_class.__new__(manager_class)
+    manager._workspaces = WorkspacePool(CPU, size_mb=1)
+    made = manager._workspaces.get("main", 0)
+    manager.seal_capture_buffers()
+    assert made.sealed and manager._workspaces.get("main", 1).sealed
+
+
+def test_a_captured_wrapper_made_after_the_seal_gets_a_sealed_workspace(monkeypatch):
+    """`FlashInferManager` as the engine builds it: a key its `_cg_wrapper` first reaches past
+    the seal can't grow either."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    kv_config = PagedKVConfig(
+        num_layers=1, head_dim=64, num_qo_heads=2, num_kv_heads=2, page_size=16, max_num_pages=4, max_seq_len=64,
+    )
+    manager = FlashInferManager("kv", CPU, torch.float32, kv_config)
+    built = []
+    monkeypatch.setattr(flashinfer_mod, "FlashInferPrefillWrapper", lambda **kwargs: built.append(kwargs))
+    bucket = BucketKey(graph_walk="prefill", cg_key_info=None, bs=1, num_tokens=16)
+    manager._cg_wrapper(SlotLease(slot=0, bucket=bucket), "main", 1, force_prefill=False)
+    manager.seal_capture_buffers()
+    manager._cg_wrapper(SlotLease(slot=1, bucket=bucket), "main", 1, force_prefill=False)
+    workspaces = [kwargs["workspace_buffer"] for kwargs in built]
+    assert workspaces == [manager._workspaces.get("main", 0), manager._workspaces.get("main", 1)]
+    assert all(workspace.sealed for workspace in workspaces)
 
 
 def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
@@ -410,15 +506,26 @@ def test_flashinfers_overflow_reads_as_the_bytes_it_needs():
         workspace.tensor, cu, cu, lens, TOKENS, SEGMENTS, HEADS, HEADS, 1, True, HEAD_DIM, HEAD_DIM,
         False, -1, -1, False, 0, 0,
     )
-    # at least what FlashInfer's own query says, and only the padding and the MiB over it
-    assert need <= workspace.tensor.numel() <= need * 33 // 32 + 2 * MIB
+    # at least what FlashInfer's own query says, and less than a MiB over it
+    assert need <= workspace.tensor.numel() < need + MIB
 
 
 @needs_flashinfer_gpu
-def test_a_bare_buffer_reports_flashinfers_number():
+def test_a_sealed_buffer_reports_flashinfers_number():
     pytest.importorskip("flashinfer")
+    workspace = Workspace(torch.empty(MIB, dtype=torch.uint8, device=GPU), "test", sealed=True)
     with pytest.raises(RuntimeError, match=r"a plan asks for \d+ bytes .*MSTAR_WORKSPACE_BUFFER_MB"):
-        _ragged_gpu(torch.empty(MIB, dtype=torch.uint8, device=GPU))
+        _ragged_gpu(workspace)
+
+
+@needs_flashinfer_gpu
+def test_a_gpu_with_no_room_leaves_the_workspace_what_it_held():
+    workspace = _small_workspace()
+    planner = _Planner(workspace.tensor, 2 * torch.cuda.get_device_properties(GPU).total_memory)
+    with pytest.raises(RuntimeError, match=r"the GPU has no room to grow it: CUDA out of memory") as err:
+        workspace.plan(planner.plan)
+    assert f"and it holds {MIB} bytes" in str(err.value)
+    assert workspace.tensor.numel() == MIB and workspace.tensor.device.type == "cuda"
 
 
 @needs_flashinfer_gpu

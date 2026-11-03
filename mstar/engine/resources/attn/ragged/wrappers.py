@@ -243,7 +243,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor | Workspace,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -254,7 +254,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     ):
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
         self.padded_head_dim = padded_head_dim(head_dim)
-        self._workspace = Workspace.of(workspace_buffer)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
