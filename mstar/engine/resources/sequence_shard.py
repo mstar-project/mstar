@@ -716,13 +716,21 @@ class ConvHalo(NamedTuple):
     inputs here, right-aligned; ``initial`` (``[L, W - 1]``) the window each row with a piece here
     starts from, and ``final`` (``[R, W - 1]``) the window each row ends with, both into the rows'
     stored windows followed by every rank's tails. ``rows`` (``[L]``) are the rows with a piece here
-    and ``spans`` their pieces, which the local conv runs over."""
+    and ``spans`` their pieces, which the local conv runs over. The three indices are host arrays
+    as planned (``conv_halo_plan``), and on the device the conv runs on once uploaded (``to``)."""
 
-    tails: np.ndarray
-    initial: np.ndarray
-    final: np.ndarray
+    tails: np.ndarray | torch.Tensor
+    initial: np.ndarray | torch.Tensor
+    final: np.ndarray | torch.Tensor
     rows: np.ndarray
     spans: np.ndarray
+
+    def to(self, device: torch.device) -> ConvHalo:
+        """The indices on ``device``, one non-blocking upload each, for ``conv_halo``."""
+        return self._replace(**{
+            name: to_device_nonblocking(getattr(self, name), device, torch.int64)
+            for name in ("tails", "initial", "final")
+        })
 
 
 def conv_halo_plan(pieces: np.ndarray, rank: int, taps: int) -> ConvHalo:
@@ -760,18 +768,15 @@ def conv_halo(conv: Callable, x: torch.Tensor, stored: torch.Tensor, halo: ConvH
     W - 1]`` in the pool's dtype, zeros for a row without state), and every row's final window,
     the same bytes on every rank. ``conv(x, initial)`` runs the conv over ``halo.rows`` from
     ``initial`` (``[L, C, W - 1]``). Returns its output and the final windows ``[R, C, W - 1]``.
-    The conv kernels read both in the pool's dtype, and so do the windows here."""
+    The conv kernels read both in the pool's dtype, and so do the windows here. ``halo``'s indices
+    are on ``x``'s device (``ConvHalo.to``)."""
     channels = x.shape[1]
     local = torch.cat([x.to(stored.dtype), x.new_zeros(1, channels, dtype=stored.dtype)])
-    tails = local[_index(halo.tails, x.device)]
+    tails = local[halo.tails]
     gathered = group.all_gather(tails.unsqueeze(0).contiguous(), dim=0)
     src = torch.cat([stored.transpose(1, 2).reshape(-1, channels), gathered.reshape(-1, channels)])
-    initial = src[_index(halo.initial, x.device)].transpose(1, 2).contiguous()
-    return conv(x, initial), src[_index(halo.final, x.device)].transpose(1, 2)
-
-
-def _index(index: np.ndarray, device: torch.device) -> torch.Tensor:
-    return to_device_nonblocking(np.ascontiguousarray(index), device, torch.int64)
+    initial = src[halo.initial].transpose(1, 2).contiguous()
+    return conv(x, initial), src[halo.final].transpose(1, 2)
 
 
 def state_passing(

@@ -311,7 +311,7 @@ def _halo(rank, world, spans):
     stored[1::2] = 0  # rows without state read their window as zeros
     want, want_final = _conv_rows(x, weight, stored, spans)
     r = SeqRange(group, tuple(sp_seq_split(sum(spans), world)), None)
-    halo = conv_halo_plan(r.row_pieces(spans), rank, width - 1)
+    halo = conv_halo_plan(r.row_pieces(spans), rank, width - 1).to(x.device)
 
     def conv(x, initial):
         return _conv_rows(x, weight, initial, halo.spans.tolist())[0]
@@ -328,6 +328,20 @@ def _halo(rank, world, spans):
 ], ids=["2", "3-a-row-on-rank-0-and-short-pieces", "3-a-window-over-three-ranks"])
 def test_conv_halo_gives_each_rank_the_windows_of_the_whole_rows(tmp_path, world, spans):
     _run(_halo, world, tmp_path / "store", spans)
+
+
+def test_conv_halo_indexes_on_the_device_its_tokens_are_on():
+    """The manager uploads the plan's indices (``ConvHalo.to``), and the halo indexes with them as
+    they are: a tensor on a device numpy can't read (``meta`` here, CUDA on a GPU) gets through,
+    shapes intact."""
+    from mstar.engine.resources.sequence_shard import conv_halo, conv_halo_plan
+
+    meta, channels, taps, spans = torch.device("meta"), 5, 3, [4, 6]
+    halo = conv_halo_plan(np.array([spans]), 0, taps).to(meta)
+    x = torch.empty(sum(spans), channels, device=meta)
+    out, final = conv_halo(lambda x, initial: x, x, torch.empty(2, channels, taps, device=meta), halo,
+                           CommGroup.trivial())
+    assert out.shape == x.shape and final.shape == (2, channels, taps) and final.device == meta
 
 
 def _delta_rule(state, q, k, v, g, beta):

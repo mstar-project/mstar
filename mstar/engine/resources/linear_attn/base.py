@@ -167,7 +167,7 @@ class LinearAttnManager(AttentionResource):
         taps = self.conv_taps
         host = conv_halo_plan(pieces, r.group.rank, taps)
         device = self._device
-        halo = ConvHalo(*(to_device_nonblocking(index, device, torch.int64) for index in host[:3]), *host[3:])
+        halo = host.to(device)
         rows = len(spans)
         return SplitRows(
             range=r,
