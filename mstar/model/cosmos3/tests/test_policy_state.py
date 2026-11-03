@@ -120,6 +120,17 @@ def test_domain_id_must_name_a_trained_domain() -> None:
         _model()._resolve_gen_params({**POLICY, "domain_id": 32, "robot_state": STATE}, *MODALITIES)
 
 
+@pytest.mark.parametrize("action", [None, [0.1] * 8, [[0.1] * 4] * 2, []])
+def test_forward_dynamics_needs_an_action_row_per_step_as_wide_as_the_robot(action) -> None:
+    """A narrow or 1-D action crashed the DiT batch (a 500 for every row), and a missing one conditioned on zeros."""
+    # a client's own action_shape doesn't stand in for the action: the data worker drops it
+    mk = {"action_mode": "forward_dynamics", "domain_id": 1, "raw_action_dim": 8, "action": action,
+          "action_shape": [16, 8]}
+    sent = {key: value for key, value in mk.items() if key not in Cosmos3Model.INTERNAL_KWARGS}
+    with pytest.raises(ValueError, match="action"):
+        _model()._resolve_gen_params(sent, ["image", "text"], ["video"])
+
+
 def _policy_checkpoint(root, policy):
     (root / "transformer").mkdir(parents=True)
     (root / "transformer" / "config.json").write_text(json.dumps({"_class_name": "Cosmos3OmniTransformer"}))
