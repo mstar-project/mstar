@@ -66,7 +66,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__()
+        super().__init__(config.prefill_token_buckets)
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
@@ -195,7 +195,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return []
         if self._moe_capture_blocked(tp_world_size):
             return []
-        prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
@@ -212,7 +211,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             _PackedPrefillConfig(
                 max_row_tokens=self._context_limit(),
                 capture_graph_walk="prefill",
-                capture_token_lengths=list(prefill_buckets),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,
