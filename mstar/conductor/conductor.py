@@ -504,6 +504,7 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        self._unpausable_outputs = frozenset(self.model_config.get("unpausable_outputs", model.UNPAUSABLE_OUTPUTS))
         self._settle_lora_adapters(lora_adapter_digests)
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
@@ -1393,7 +1394,10 @@ class Conductor:
             )
             for key, cfg in resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        mark_guaranteed(resource_configs, body.streaming, body.initial_output_modalities)
+        mark_guaranteed(
+            resource_configs,
+            body.streaming and not self._unpausable_outputs.isdisjoint(body.initial_output_modalities),
+        )
         for specs in self._resource_specs():
             for key, cfg in resource_configs.items():
                 cfg.validate(specs.get(key))

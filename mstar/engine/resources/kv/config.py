@@ -553,12 +553,9 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
     return None
 
 
-def mark_guaranteed(
-    configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
-) -> None:
-    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause in any pool is a
-    gap in playback."""
-    guaranteed = streaming and "audio" in output_modalities
+def mark_guaranteed(configs: Mapping[str, ResourceReqConfig], guaranteed: bool) -> None:
+    """Give every KV config in ``configs`` the class of the whole request. A request whose streamed output can't
+    pause is guaranteed in every pool, since a pause in any of them is heard."""
     for config in configs.values():
         if isinstance(config, KVReqConfig):
             config.guaranteed = guaranteed

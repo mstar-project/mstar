@@ -29,7 +29,6 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     SpanKind,
     StreamLayout,
-    mark_guaranteed,
 )
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -281,14 +280,13 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 29
 
 
-@pytest.mark.parametrize("streaming, outputs, guaranteed", [
-    (True, ["text", "audio"], True), (False, ["text", "audio"], False), (True, ["text"], False),
-])
-def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, guaranteed):
-    configs = {key: KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(PS, PS, "prefill"),))})
-               for key in ("kv", "talk")}
-    mark_guaranteed(configs, streaming, outputs)
-    assert [config.guaranteed for config in configs.values()] == [guaranteed] * 2, "a pool got another class"
+@pytest.mark.parametrize("streaming, outputs", [
+    (False, ["text", "audio"]), (True, ["text"]),
+], ids=["unstreamed audio", "streamed text"])
+def test_the_conductor_leaves_a_request_that_can_pause_preemptible(tmp_path, monkeypatch, streaming, outputs):
+    model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, streaming=streaming, outputs=outputs)
+    assert not new_request.request_info.resource_configs["kv"].guaranteed, "a request that can pause was guaranteed"
 
 
 def test_the_conductor_leaves_a_rows_span_to_the_pools_that_hold_it(tmp_path, monkeypatch):

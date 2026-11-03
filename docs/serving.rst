@@ -248,6 +248,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``unpausable_outputs``
+     - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
+       that streams one of them reserves its whole KV footprint and is never preempted (see
+       below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]`` unless the
+       model declares otherwise. ``[]`` gives a voice deployment a fast first chunk under KV
+       pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
@@ -448,9 +454,9 @@ its pages, and is otherwise dropped if it can be rebuilt from its token ids. The
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
 request on the host waits at its place in the queue until its pages and one more page fit, and
 its pages are then copied back. A dropped request waits until its history and one more page
-fit, then recomputes its KV in one prefill row. A request that streams audio out reserves its
-whole footprint in every pool, with every cache hit counted, and is never dropped or moved to
-the host. A request that holds KV made from media or another node's outputs does so in the pools
+fit, then recomputes its KV in one prefill row. A request that streams an output in
+``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
+and is never dropped or moved to the host. A request that holds KV made from media or another node's outputs does so in the pools
 of the node that writes it, and so does a request in the pools of a node that keeps no token ids
 to rebuild it. Voice requests then queue when the pool is short and are never preempted mid-stream.
 
