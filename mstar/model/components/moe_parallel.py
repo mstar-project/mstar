@@ -85,6 +85,7 @@ def instantiate_moe_block(
             router=router,
             comm_group=comm_group,
             moe_backend=moe_backend,
+            mask_padding=moe_parallel.mask_padding,
         )
     ep_group = moe_parallel.resolve_ep_group(comm_group)
     return ExpertParallelSparseMoeBlock(
