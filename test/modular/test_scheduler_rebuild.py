@@ -107,6 +107,17 @@ def test_a_decode_row_runs_once_its_rebuild_lands():
     assert _rids(sched.get_next_batch(state)) == ["d0"], "the rebuilt request would never decode again"
 
 
+def test_a_request_let_back_in_for_room_mid_rebuild_starts_no_second_rebuild():
+    sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
+    _rebuilding(sched, "d0")
+    sched.parked[NODE] = {"d0"}  # it asked for room again, and the room is there now
+    engine.admit_waiting = lambda published_of: [(NODE, "d0")]
+
+    batch = sched.get_next_batch(state)
+
+    assert batch.rebuild_rids == {"d0"} and not engine.asked, "the decode row would run before its KV is back"
+
+
 def test_a_rebuild_row_shares_a_step_with_its_walks_decode_rows():
     sched, runtime, state, _ = _scheduler({"d0": DECODE}, combined=True)
     _rebuilding(sched)
