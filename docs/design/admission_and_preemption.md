@@ -203,7 +203,9 @@ At a drop, the other resources:
 | Sampler | kept, since its RNG offset and repetition mask can't be recomputed |
 | Position counter | reset, and the rebuild moves it back to the end of the history |
 | Qwen3.5's recurrent state | zeroed in place, and the request keeps its slot, so its rebuild never waits for one |
-| Everything else | kept, as an offload keeps it |
+| Attention | kept, since it holds no state a rebuild writes again |
+| LoRA adapter pool | kept, so the rebuild runs under the request's adapter, which keeps its slot |
+| Anything else | refused at load: a node with a rebuild policy needs every resource it holds to support a drop (`Resource.supports_drop`) |
 
 Why this shape:
 

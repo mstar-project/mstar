@@ -3294,6 +3294,8 @@ class KVManager(AttentionResource):
     def supports_eviction(self):
         return self._cpu_pool is not None
 
+    supports_drop = True
+
     def is_offloaded(self, rid: str) -> bool:
         """True from the moment an offload claims the request, not just once
         its pages are on the host.

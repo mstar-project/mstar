@@ -456,6 +456,11 @@ class Resource(ABC):
     def supports_eviction(self):
         return False
 
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
     def residency(self, rid: str) -> Residency:
         return Residency.RESIDENT
 

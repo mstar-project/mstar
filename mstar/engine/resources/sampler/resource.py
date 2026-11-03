@@ -31,6 +31,8 @@ from mstar.utils.profiler import PhaseLaps
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # a rebuild row's draw never commits, so a drop has nothing here to discard
+    supports_drop = True
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None

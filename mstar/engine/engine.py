@@ -706,6 +706,30 @@ class Engine:
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
+        if model is not None:
+            self._check_rebuild_policies(model)
+
+    def _check_rebuild_policies(self, model: "Model") -> None:
+        """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
+        combined = model.combined_walk_of()
+        for node, policy in model.rebuild_policies().items():
+            mgmt = self._submodules.get(node)
+            if mgmt is None:
+                continue
+            refusing = sorted(key for key, resource in mgmt.resources.items() if not resource.supports_drop)
+            if refusing:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but {refusing} can't drop a "
+                    "request's state"
+                )
+            walks = {policy.walk, combined.get((node, policy.walk), policy.walk)}
+            split = sorted(walk for walk in walks if mgmt.submodule.split_batches_by_capture_key(walk))
+            if split:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but splits steps of {split} by "
+                    "capture key, which the scheduler reads from a request's forward-pass info, and that names "
+                    "the decode walk while the request is rebuilt"
+                )
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
