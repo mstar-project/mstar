@@ -697,11 +697,41 @@ def test_norm_stats_file_padded_like_openpi_covers_only_the_robot_dims(tmp_path)
         np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
 
 
-def test_norm_stats_with_no_robot_dims_are_refused():
+def test_norm_stats_file_with_no_robot_dims_is_refused(tmp_path):
+    import json
+
     from mstar.model.pi05.components.normalization import load_norm_stats
 
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": {"state": {"q01": [0.0, 0.0], "q99": [0.0, 0.0]}}}))
     with pytest.raises(ValueError, match="q01 equals q99 in every dim"):
-        load_norm_stats({"state": {"q01": [0.0, 0.0], "q99": [0.0, 0.0]}})
+        load_norm_stats(str(path))
+
+
+def test_inline_norm_stats_keep_a_joint_whose_q01_equals_q99(tmp_path):
+    """Only an openpi norm_stats.json is trimmed. Inline stats are the robot's own, so a
+    last joint with q01 == q99 still counts: the full state is not a 400, and that
+    joint's action goes through the stats."""
+    import json
+
+    import numpy as np
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    stats = {"state": {"q01": [-1.0, 0.5], "q99": [1.0, 0.5]}, "actions": {"q01": [-0.5, 0.25], "q99": [0.5, 0.25]}}
+    inline = load_norm_stats(stats)
+    assert inline.state.q01.numel() == inline.actions.q01.numel() == 2
+    model = _model_with_stats(stats)
+    model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.0, 0.5])
+    bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+    assert [int(b) for b in bins] == _openpi_state_bins([0.0, 0.5], [-1.0, 0.5], [1.0, 0.5])
+    actions = torch.zeros(model.config.action_horizon, model.config.action_dim)
+    out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+    np.testing.assert_allclose(out[:, 1], 0.25, atol=1e-6)  # through the stats, not passed through as 0
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": stats}))
+    assert load_norm_stats(str(path)).state.q01.numel() == 1  # in a file it is openpi's padding
 
 
 def test_load_pi05_config_takes_the_action_horizon_from_lerobot_chunk_size():
