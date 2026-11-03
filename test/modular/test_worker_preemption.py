@@ -391,6 +391,23 @@ def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_
     )
 
 
+def test_rank_0_sends_its_journal_unless_a_step_of_the_instance_waits_for_its_decision():
+    """At the top of a pass, the step in flight may be the instance's own, whose speculation decision hasn't gone
+    out: a follower would read a step with no rows sent first as no speculation. A step of a node outside the
+    instance waits for no decision, so the journal goes out at once, and the removals held for it don't wait out
+    that node's chain."""
+    w = _worker(_pool())
+    w._lockstep_led, w._tp_followers = frozenset({NODE}), {NODE: ["rank1"]}
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: True
+    sent = []
+    w.maybe_send_zmq_to_tp_followers, w._make_executing_batch = sent.append, SimpleNamespace
+
+    Worker._flush_tp_moves(w, SimpleNamespace(node_name=NODE))
+    assert not sent, "a step of moves alone went out ahead of the instance's speculation decision"
+    Worker._flush_tp_moves(w, SimpleNamespace(node_name="SNAC"))
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, [])], "the journal waits out SNAC's chain"
+
+
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():
     """Six requests decode 4 pages each on a 10-page pool with a host pool, one step a pass. Moving the least
     recently active request to the host, and reloading it as soon as it fit, sent one request back and forth every
