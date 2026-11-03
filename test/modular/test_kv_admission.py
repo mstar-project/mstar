@@ -257,7 +257,7 @@ def test_a_passer_finishing_tries_no_request_behind_the_head_again(monkeypatch):
 
 def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
     kv = _passing(free=3, head=5)
-    # "p"'s output fits, but not beside its three own pages past what "r" holds
+    # "p"'s output fits, but not beside the three pages "p" adds to what "r" holds
     _short_chat(kv, "p", list(range(7000, 7000 + 3 * PAGE_SIZE)))
     assert not _ready(kv, "p")
     measured = []

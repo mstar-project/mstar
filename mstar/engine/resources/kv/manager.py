@@ -688,8 +688,8 @@ class KVManager(AttentionResource):
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they
         #   restore it.
         # `_footprints` holds each request's `_footprint` as it was at intake.
-        # `_kept` counts the pages that requests admitted past the first waiting request freed while it waited.
-        #   Requests admitted past it later can't take them, admitted requests can, and its own allotment takes them.
+        # `_kept` counts the pages that passers freed while the head waited. Later passers can't take them, but
+        #   admitted requests can, and the head's allotment takes them.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
