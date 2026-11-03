@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from mstar.engine.resources.linear_attn.base import gather_rows, scatter_rows
 from mstar.engine.resources.linear_attn.gdn_stage import stage_gdn_prefill_inputs
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -440,31 +441,10 @@ class GDNPrefillWrapper(GDNWrapper):
 
         slots = self._plan_state.slots.to(torch.int64)
 
-        # static per pool, so safe to branch on under capture
-        if not self._has_sink_state:
-            # Without a sink a padding row carries -1, which index_select and
-            # index_copy_ cannot take; point it at a live row's slot and mask.
-            live = slots >= 0
-            any_live = live.any()
-            ref = torch.argmax(live.to(torch.uint8)).view(1)
-            ref_slot = torch.index_select(slots, 0, ref).clamp_min(0)
-            addr = torch.where(live, slots, ref_slot)
-            carried = self._plan_state.has_state & live
-        else:
-            addr = slots
-            carried = self._plan_state.has_state
-
         # SM90 takes packed, sequence-ordered state (`state_indices` is
-        # SM100/SM103 only), so gather here and scatter back.
-        initial = torch.index_select(state, 0, addr).to(self._prefill_dtype)
-
-        # zero the rows that start fresh, by select rather than boolean mask:
-        # `initial[~mask] = 0` is a data-dependent shape and cannot be captured
-        initial = torch.where(
-            carried.view(-1, 1, 1, 1),
-            initial,
-            torch.zeros((), dtype=initial.dtype, device=initial.device),
-        )
+        # SM100/SM103 only), so gather here and scatter back. A row that starts
+        # fresh, or a padding row on -1 (no sink), gathers zeros.
+        initial = gather_rows(state, slots, self._plan_state.has_state).to(self._prefill_dtype)
 
         # One spare row per batch row, so the token `plan` hands each padding
         # row is addressable even when the real batch fills the bucket exactly.
@@ -527,16 +507,12 @@ class GDNPrefillWrapper(GDNWrapper):
             **snapshot_args,
         )
 
-        if not self._has_sink_state:
-            # Padding rows write to `ref_slot` the live row's own result, or with
-            # no live row what is already there, so slot 0 is not disturbed.
-            padded = torch.where(
-                any_live,
-                torch.index_select(final, 0, ref),
-                torch.index_select(state, 0, ref_slot).to(final.dtype),
-            )
-            final = torch.where(live.view(-1, 1, 1, 1), final, padded)
-        state.index_copy_(0, addr, final.to(state.dtype))
+        # static per pool, so safe to branch on under capture: without a sink a
+        # padding row carries -1, which `scatter_rows` points at a live row's slot
+        if self._has_sink_state:
+            state.index_copy_(0, slots, final.to(state.dtype))
+        else:
+            scatter_rows(state, slots, final)
         if self._every:
             index = self._snapshot_index[:, : self._num_snapshots]
             state.index_copy_(0, index[2], checkpoints.index_select(0, index[0]).to(state.dtype))

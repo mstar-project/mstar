@@ -337,7 +337,7 @@ def gather_rows(layer: torch.Tensor, slots: torch.Tensor, has_state: torch.Tenso
 def scatter_rows(layer: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
     """``values``, a block a row, into a pool ``layer`` at ``slots``. A padding row on ``NO_SLOT``
     (-1, the sink off) writes a live row's slot with that row's own value, or with no live row
-    what the slot holds, as ``GDNPrefillWrapper.run`` does: no host sync, no other slot touched."""
+    what the slot holds: no host sync, no other slot touched."""
     slots = slots.long()
     live = slots >= 0
     ref = torch.argmax(live.to(torch.uint8)).view(1)
