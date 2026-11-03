@@ -40,7 +40,7 @@ from mstar.api_server.auth import (
     resolve_api_key,
     warn_if_no_api_key,
 )
-from mstar.api_server.body_limit import BodyLimitMiddleware
+from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -2808,6 +2808,8 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     return uvicorn.Config(
         app, host=host, port=port, access_log=False,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
+        # one /generate/ws message carries what an HTTP body would
+        ws_max_size=max_body_bytes(),
     )
 
 

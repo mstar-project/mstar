@@ -1807,3 +1807,10 @@ def test_websocket_deflate_is_a_serving_setting():
     assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {}).ws_per_message_deflate is True
     off = entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {"ws_per_message_deflate": False})
     assert off.ws_per_message_deflate is False
+
+
+def test_a_websocket_message_may_be_as_large_as_an_http_body(monkeypatch):
+    """Not uvicorn's 16 MiB: a larger message closes the socket, aborting
+    every request pipelined on it."""
+    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "200")
+    assert entrypoint._uvicorn_config(object(), "127.0.0.1", 8000, {}).ws_max_size == 200 << 20
