@@ -325,6 +325,20 @@ def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
     assert configs["kv"].rebuildable, "a node that writes nothing for the request made it guaranteed"
 
 
+@pytest.mark.parametrize("unpausable", [False, True])
+def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausable):
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
+    configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64}, unpausable=unpausable)}
+
+    w._set_rebuildable(1, configs)
+
+    assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+
+
 @pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
 def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
     """A drop lays the pool's one label out again as one span of the policy's walk. The second label is written

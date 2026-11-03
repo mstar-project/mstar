@@ -142,6 +142,23 @@ def test_removing_a_request_gives_its_slice_back():
     assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
 
 
+@pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
+def test_a_request_no_drop_can_free_keeps_no_ids(why):
+    """Kirill 4448985161. A guaranteed request kept a host copy of its prompt and appended every sample, each
+    step, though no drop could ever use them."""
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    # a prompt written in a walk the policy doesn't prefill is one no rebuild can write again
+    walk = PREFILL if why == "its output can't pause" else "audio"
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE, "audio"}), frozenset({"decode_loop"}))}}
+    layouts = {"kv": [StreamLayout(spans=(PrefixSpan(3, 3, walk),), growth=(("decode_loop", 1),))]}
+    rebuilds.ingest_request(R, writes, layouts, unpausable=why == "its output can't pause")
+
+    rebuilds.keep_prompts(_ran(PREFILL, _rows(R)))
+    rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [torch.tensor([9])]}}, None)
+
+    assert R not in rebuilds._kept[NODE], f"a request kept its ids though {why}"
+
+
 def _batch(rids, rebuild=frozenset()) -> SimpleNamespace:
     ctx = StepContext(request_ids=tuple(rids), graph_walk=DECODE, slot=0, capture=False, rebuild_rids=rebuild)
     return SimpleNamespace(node_name=NODE, request_ids=list(rids), step_context=ctx)
