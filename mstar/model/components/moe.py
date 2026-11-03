@@ -75,6 +75,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.platforms import current_platform
 from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,7 @@ class TopKRouter(nn.Module):
             to (top-k).
         norm_topk_prob: if True, renormalize the top-k probabilities so
             they sum to 1.
-        fused_softmax_topk: on CUDA, route through one Triton kernel
+        fused_softmax_topk: on NVIDIA GPUs, route through one Triton kernel
             (``mstar::moe_router_topk``) instead of softmax, ``torch.topk``
             and the renormalize. Equal probabilities go to the lower expert
             id, where ``torch.topk`` may pick another; bf16 logits tie often,
@@ -153,7 +154,8 @@ class TopKRouter(nn.Module):
         """
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
-        if self.fused_softmax_topk and router_logits.is_cuda:
+        # NVIDIA only: the AMD side turns it on once it has measured it there
+        if self.fused_softmax_topk and router_logits.is_cuda and current_platform.is_cuda():
             from mstar.utils.fused_moe.decode import router_topk
 
             routing_weights, router_indices = router_topk(
