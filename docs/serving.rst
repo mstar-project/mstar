@@ -383,7 +383,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Requests the data worker prepares at once, for a model that
        declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
        beside the API server's intra-op threads (``preprocess_torch_threads``),
-       at most 8; ``1`` prepares inline. See :doc:`adding_models`.
+       at most 8; ``1`` prepares inline. It must be a positive integer, for any
+       model: the server refuses to start on another value. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
@@ -690,7 +691,9 @@ Pi0.5 DROID variant fixes the action horizon:
      - {node_names: [LLM], ranks: [0]}
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`.
+client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
+it is batched with, so requests sent with the same seed and settings sample the same
+tokens; give each request its own seed for independent samples.
 
 Restarts and the compile cache
 ------------------------------
