@@ -1538,6 +1538,11 @@ class HiggsAudioAdapter(OpenAIAdapter):
     ``prompt`` is the transcription instruction (the model has a default)."""
 
     supports_transcriptions = True
+    # A transcript stops at 1,024 tokens (the reference's cap), some 5 minutes of
+    # speech, so longer uploads go as windows well under it. The model takes no
+    # previous text, so they run at once.
+    max_audio_seconds = 120.0
+    long_form = "parallel"
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         mk = _transcription_kwargs(req)
