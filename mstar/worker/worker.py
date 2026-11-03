@@ -2385,14 +2385,10 @@ class Worker:
             return False
         try:
             if pending is not None:
-                # A step N this slow (a long admit, say) skips the pre-plan rather than holding plan_executor, and
-                # exec plans N+1 inline. A TP rank that pre-plans a head that N voids keeps pages, so every TP rank
-                # waits for N's commit, or for N's future after a raise before the GPU thread's `try`.
+                # A step N this slow (a long admit, say) skips the pre-plan
+                # rather than holding plan_executor; exec plans N+1 inline.
                 with self._span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
-                    while not committed and pending.node_name in self.parallel_nodes and not pending.future.done():
-                        committed = pending.node_batch.commit_done.wait(timeout=10.0)
-                    committed = committed or pending.node_batch.commit_done.is_set()
                 if not committed:
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
@@ -3022,13 +3018,6 @@ class Worker:
     def _prefix_cache_open(self, node_name: str) -> bool:
         return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
 
-    def _builds_voided_head(self, node_name: str) -> bool:
-        """The leader pre-planned the head and drops the pre-plan. By then the pages the prefix cache read have
-        moved, and in a pool that counts reservations each continuing row keeps the next page its pre-admit took."""
-        return self._prefix_cache_open(node_name) or any(
-            self._kv_caches[key].cache.counts for key in self._kv_keys.get(node_name, ())
-        )
-
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -3046,26 +3035,17 @@ class Worker:
 
     def _verify_tp_async_sched_agrees(self) -> None:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
-        a decision the leader never sends, or get a head it cannot build. A
-        follower also builds a head that N voids, matching the leader's
-        pre-plan, so with async scheduling on MSTAR_PRE_PLAN_SPEC has to agree
-        as well."""
-        pre_plan = int(knobs.pre_plan_enabled())
+        a decision the leader never sends, or get a head it cannot build."""
         for node in sorted(self.parallel_nodes):
-            async_sched = int(self._tp_async_for(node))
-            checks = [("MSTAR_TP_ASYNC_SCHED", async_sched)]
-            if async_sched:
-                # the first check makes every rank agree on this, so each rank votes as often as the others
-                checks.append(("MSTAR_PRE_PLAN_SPEC", pre_plan))
+            on = int(self._tp_async_for(node))
             joint = self.parallel_groups.get_joint_group_for_node(node)
-            for name, value in checks:
-                lo, neg_hi = joint.agree([value, -value])
-                if lo != -neg_hi:
-                    raise RuntimeError(
-                        f"{name} disagrees across the ranks of {node!r} "
-                        f"(min {lo}, max {-neg_hi}); set it identically on every "
-                        "rank of the instance."
-                    )
+            lo, neg_hi = joint.agree([on, -on])
+            if lo != -neg_hi:
+                raise RuntimeError(
+                    f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
+                    f"(async min {lo}, max {-neg_hi}); set it identically on every "
+                    "rank of the instance."
+                )
 
     def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
         """``pending`` is a parallel batch this worker leads under TP async."""
@@ -3720,26 +3700,20 @@ class Worker:
     ) -> tuple[dict[int, NameToTensorList] | None, Speculation | None]:
         """Wait for step N and settle the leader's decision about N+1. Returns
         ``(outputs or None, armed head or None)``. Once N is done this never
-        returns without a decision: going serial early strands the leader.
-
-        If N raised where `_builds_voided_head` holds, this still settles the decision and returns no outputs, so
-        the caller's `result` raises with any head armed, and its error path drops the head."""
+        returns without a decision: going serial early strands the leader."""
         s = pending.tp_seq
         outputs: dict[int, NameToTensorList] | None = None
-        raised = False
         t_done = last_warn = 0.0
         while True:
-            if outputs is None and not raised and pending.future.done():
-                raised = pending.future.exception() is not None and self._builds_voided_head(pending.node_name)
-                if not raised:
-                    outputs = pending.future.result()
+            if outputs is None and pending.future.done():
+                outputs = pending.future.result()
                 t_done = last_warn = _time.perf_counter()
             if s in self._tp_nospec:
                 return outputs, None
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
                 void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None and not self._builds_voided_head(head.node_name):
+                if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
                     self.scheduler.void_tp_follow_head()
                     logger.debug(
@@ -3747,6 +3721,8 @@ class Worker:
                         self.worker_id, head.spec_seq, s, void,
                     )
                     return outputs, None
+                # With the prefix cache open, build the head even when N's verdict voids it, since the
+                # leader pre-plans every head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
@@ -3769,7 +3745,7 @@ class Worker:
             self._process_messages()
             self._check_ready_tensors()
             self._poll_stream_buffers()
-            if outputs is not None or raised:
+            if outputs is not None:
                 now = _time.perf_counter()
                 if now - last_warn > 2.0:
                     last_warn = now

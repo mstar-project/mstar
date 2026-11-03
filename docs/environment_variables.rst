@@ -508,10 +508,7 @@ Worker scheduling
        while the previous replay runs. ``0`` plans inline on the GPU
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
-       ``knobs.pre_plan_enabled``. With ``MSTAR_TP_ASYNC_SCHED`` on, set it
-       identically on every rank of a lockstep instance: a follower builds a
-       voided speculative step as rank 0 pre-planned it, so the workers compare
-       it at startup and refuse to start on a mismatch.
+       ``knobs.pre_plan_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``off``
      - Pin each worker's main, GPU and plan threads to one core's two

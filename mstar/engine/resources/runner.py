@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
+from dataclasses import replace
 from typing import Any
 
 from mstar.engine.resources.admission import Admission
@@ -140,7 +141,7 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
-        # (step key, ready) of the last pre_admit whose stage is still up
+        # (step key, ready, step) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
 
     def resolve_cached_prefix(
@@ -519,7 +520,11 @@ class StepRunner:
         return self._staged is not None
 
     def clear_preplan(self) -> None:
-        """Drop the staged pre-plan on every resource, and the record of it."""
+        """Drop the staged pre-plan on every resource, and the record of it. The staged step won't run, so
+        what its pre-admit took goes back as a refused admit's does."""
+        if self._pre_admitted is not None:
+            step = self._pre_admitted[2]
+            self._unwind(step, self._preplan_keys_for(step))
         self._staged = None
         self._pre_admitted = None
         for key in self._order:
@@ -540,6 +545,8 @@ class StepRunner:
         if pre is not None and staged_key is not None and pre[0] == staged_key:
             covered = self._preplan_keys_for(step)
             ready = pre[1]
+            # this admit owns the stage's reservations now, so a refusal below unwinds them once
+            self._pre_admitted = None
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -637,7 +644,8 @@ class StepRunner:
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
-        self._pre_admitted = (self._step_key(step), ready)
+        # with a copy of the context, since the batch can drop rows from its own before the stage is thrown away
+        self._pre_admitted = (self._step_key(step), ready, replace(step, _ctx=replace(step.ctx)))
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:

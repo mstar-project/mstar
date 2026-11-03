@@ -729,9 +729,6 @@ class KVManager(AttentionResource):
         # (rid, to_label) reservations a staged step made; clear_preplan
         # releases them. recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
-        # (rid, label) marked step_in_flight by a staged step, so an abandoned
-        # one does not leave its streams unevictable
-        self._preplan_marked: list[tuple[str, str]] = []
 
         # (rid, label) -> pages the live reservation freshly acquired, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
@@ -1945,10 +1942,8 @@ class KVManager(AttentionResource):
                 # clear below would leak them.
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
-            # plan and reserve for this step normally. The staged step's own
-            # span pages stay with its stream, where its re-admit finds them.
-            # Its reservation went with ``clear_preplan``, so the record of it is
-            # stale and the clear below is right for this path.
+            # plan and reserve for this step normally. A caller that throws a
+            # stage away unwinds its reservation first, as `StepRunner.clear_preplan` does.
             self.clear_preplan()
         if (step.pre_forks or step.post_forks) and len(self._groups) > 1:
             # A step declares its forks, so this is the first place to see them. Refused before
@@ -2019,7 +2014,6 @@ class KVManager(AttentionResource):
                 # these; reset anyway so a refused admit can't leave stale
                 # entries for the next clear_preplan to act on
                 self._preplan_new_labels = []
-                self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in self._forking_rids(step, ctx):
                     # checked before the reservation, which is what creates it
@@ -2094,10 +2088,6 @@ class KVManager(AttentionResource):
             # lock is held throughout, so the streams found above are current)
             for _, stream in marked:
                 stream.step_in_flight = True
-            if ctx.is_preplan:
-                self._preplan_marked.extend(
-                    (segment.request_id, segment.label) for segment, _ in marked
-                )
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
         # retention is applied at commit (see `_apply_retention`)
@@ -2200,9 +2190,10 @@ class KVManager(AttentionResource):
         """
         self._touch_plan_cache()
         with self._lock:
-            # No owner check: every rollback finishes before `commit_done` is
+            # No owner check: a refused admit unwinds before `commit_done` is
             # released, and the only pre-admit (`Worker._preplan_spec`) waits on
-            # it, so no other uncommitted step can hold marks on these streams.
+            # it and is unwound before another step admits, so no other
+            # uncommitted step can hold marks on these streams.
             # `.get` as in `admit`: a refusal can come before a stream exists
             for segment in step.segments:
                 stream = self._streams.get(
@@ -2904,7 +2895,6 @@ class KVManager(AttentionResource):
                 self._copy_image_ends()
 
                 self._preplan_new_labels = []
-                self._preplan_marked = []
                 # the promoted step runs; the plan cache still describes it
                 self.clear_preplan(promoted=True)
                 laps.lap("promote")
@@ -3039,9 +3029,9 @@ class KVManager(AttentionResource):
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
             self._touch_plan_cache()
-        # the staged step is not going to run, so undo what it did to live
-        # state. the pre-forks need no rewinding — staging only read them —
-        # but admit's reservations are real pages and real streams
+        # The staged step is not going to run. Staging only read the
+        # pre-forks, and the caller's `rollback_admit` gave back admit's pages,
+        # so what is left to undo is the streams admit created.
         with self._lock:
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
@@ -3052,11 +3042,6 @@ class KVManager(AttentionResource):
                     self._release(rid, stream, stream.pages())
                     self._recount(rid)
             self._preplan_new_labels = []
-            for rid, label in self._preplan_marked:
-                stream = self._streams.get(rid, {}).get(label)
-                if stream is not None:
-                    stream.step_in_flight = False
-            self._preplan_marked = []
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_key = None
@@ -4629,10 +4614,6 @@ class KVManager(AttentionResource):
         allotment = self._allotments[rid]
         allotment.pages = max(allotment.pages, self._held(rid)) + pages
         self._recount(rid)
-
-    @property
-    def counts(self) -> bool:
-        return self._counts
 
     def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""

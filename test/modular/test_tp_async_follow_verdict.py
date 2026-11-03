@@ -18,12 +18,10 @@ forward) and then hangs in the collective. So:
   ``ExecutingBatch``, written by the GPU thread before N's future resolves —
   turns a head into a step of moves alone without building it (the verdicts
   on which the leader clears its own speculation before threading), unless
-  the prefix cache is open or a pool counts reservations, where the leader
-  pre-planned the head and the follower builds it too;
+  the prefix cache is open, where the leader pre-planned the head and the
+  follower builds it too;
 * a step whose forward raised is closed (``_close_tp_follow_step``): a head from it,
-  queued or arriving later, becomes a step of moves alone. With the prefix cache open
-  or a pool that counts reservations, the follower first waits for the head and builds
-  it, and the error path drops its pre-plan as the leader's does.
+  queued or arriving later, becomes a step of moves alone.
 
 Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
@@ -31,7 +29,6 @@ uses. ``_try_follow_speculation`` is stubbed per test — its own build logic
 is exercised against the graph API elsewhere; here we pin the protocol.
 """
 
-import contextlib
 import sys
 import types
 from pathlib import Path
@@ -92,7 +89,7 @@ class _Communicator:
         self.inbox.extend(self.deliveries.pop(self.waits, []))
 
 
-def _stub(cache_open: bool = False, counts: bool = False):
+def _stub(cache_open: bool = False):
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
     stub.tp_async_sched = True
@@ -136,10 +133,6 @@ def _stub(cache_open: bool = False, counts: bool = False):
     )
     stub._step_voids_head = Worker._step_voids_head
     stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
-    # a pool on NODE that counts reservations, as a TP pool does once rank 0 decides for it
-    stub._kv_keys = {NODE: ["kv"]} if counts else {}
-    stub._kv_caches = {"kv": types.SimpleNamespace(cache=types.SimpleNamespace(counts=True))}
-    stub._builds_voided_head = lambda node: Worker._builds_voided_head(stub, node)
     return stub
 
 
@@ -175,19 +168,6 @@ def _future(stub, output, done_after=0):
     return types.SimpleNamespace(
         done=lambda: stub.communicator.waits >= done_after,
         result=lambda: output,
-        exception=lambda: None,
-    )
-
-
-def _raising_future(stub, done_after=0):
-    """N's future once its forward raised."""
-    err = RuntimeError("forward raised")
-
-    def result():
-        raise err
-
-    return types.SimpleNamespace(
-        done=lambda: stub.communicator.waits >= done_after, result=result, exception=lambda: err,
     )
 
 
@@ -545,48 +525,9 @@ def _head_with_moves(seq, from_seq):
     return head
 
 
-def test_on_a_pool_that_counts_reservations_a_follower_builds_a_head_a_failed_request_voids():
-    """With the cache off, rank 0 pre-planned the head and drops the pre-plan. Each continuing row keeps the next
-    page it took at the pre-admit. A follower on a pool that counts reservations builds the head too, so it holds
-    the same pages."""
-    s = _stub(cache_open=False, counts=True)
-    spec = object()
-    s.build_results = [spec]
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    armed = []
-    out = _output()
-    assert _await(s, _pending(4, _future(s, out), failed_requests=["r0"]), armed.append) == (out, spec)
-    assert armed == [spec], "rank 0 kept pages this rank never took"
-
-
-@pytest.mark.parametrize("pool", [{"cache_open": True}, {"counts": True}])
-def test_a_follower_that_builds_voided_heads_builds_the_head_of_a_step_whose_forward_raised(pool):
-    """N raised on every rank after rank 0 pre-planned the head built on N, and rank 0's error path drops that
-    pre-plan. The follower waits for the head, builds and arms it, and leaves N's error to the caller, whose error
-    path drops the pre-plan too."""
-    s = _stub(**pool)
-    spec = object()
-    s.build_results = [spec]
-    s.communicator.deliveries = {2: [_head(["r0"], seq=5, from_seq=4)]}
-    armed = []
-    assert _await(s, _pending(4, _raising_future(s)), armed.append) == (None, spec)
-    assert armed == [spec], "rank 0 kept pages this rank never took"
-
-
-def test_with_the_cache_off_and_no_pool_that_counts_reservations_a_forward_error_reaches_the_caller_at_once():
-    """The caller's error path then closes the step, which turns the head into a step of moves alone without
-    building it."""
-    s = _stub()
-    s.build_results = [object()]
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    with pytest.raises(RuntimeError, match="forward raised"):
-        _await(s, _pending(4, _raising_future(s)))
-    assert s.build_results, "the head was built"
-
-
 def test_a_head_a_follower_drops_unbuilt_counts_as_consumed_only_once_its_moves_land():
-    """With the cache off and no pool that counts reservations, a failed request voids the head, and the
-    follower drops the head without building it."""
+    """With the cache off, a failed request voids the head, and the follower drops the head without building
+    it."""
     s = _stub(cache_open=False)
     s.build_results = [object()]
     s.scheduler.register_tp_follow(_head_with_moves(seq=5, from_seq=4))
@@ -613,47 +554,3 @@ def test_with_the_prefix_cache_open_a_follower_takes_a_voided_heads_moves_before
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the build ran ahead of the head's moves"
     s.scheduler.pop_tp_follow_head()
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the pop applied the head's moves twice"
-
-
-class _SlowCommit:
-    """N's commit, which lands on the third wait, or never with ``never``."""
-
-    def __init__(self, never=False):
-        self.waits, self.never = 0, never
-
-    def wait(self, timeout=None):
-        self.waits += 1
-        assert self.waits < 5, "the plan thread waits for good"
-        return not self.never and self.waits == 3
-
-    def is_set(self):
-        return not self.never and self.waits >= 3
-
-
-def _plan_thread(commit, done):
-    engine = types.SimpleNamespace(
-        can_pre_plan=lambda node: True, reserve_replay_slot=lambda batch: object(),
-        pre_plan_for_batch=lambda batch: True,
-    )
-    w = types.SimpleNamespace(
-        worker_id="w1", parallel_nodes={NODE}, engine_manager=types.SimpleNamespace(get_engine=lambda node: engine),
-        _span=lambda name, cpu=None: contextlib.nullcontext(), _reset_skip_plan_flags=lambda batch: None,
-    )
-    pending = types.SimpleNamespace(
-        node_name=NODE, node_batch=types.SimpleNamespace(commit_done=commit),
-        future=types.SimpleNamespace(done=lambda: done),
-    )
-    spec = types.SimpleNamespace(node_batch=types.SimpleNamespace(node_name=NODE))
-    return Worker._preplan_spec(w, pending, spec)
-
-
-def test_a_tp_rank_waits_out_ns_commit_before_it_decides_to_pre_plan_the_head():
-    """A follower that builds the head after N finished pre-plans it at once. So rank 0, which armed the head during
-    N, pre-plans it however long N's commit takes."""
-    commit = _SlowCommit()
-    assert _plan_thread(commit, done=False) is True and commit.waits == 3, "a rank skipped the pre-plan on a timeout"
-
-
-def test_a_tp_rank_skips_the_pre_plan_once_ns_step_is_done_without_a_commit():
-    commit = _SlowCommit(never=True)
-    assert _plan_thread(commit, done=True) is False and commit.waits == 1
