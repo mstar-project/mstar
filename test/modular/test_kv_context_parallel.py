@@ -637,8 +637,7 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
     attention, and the sampler's rows are each row's last token of the whole step."""
     group = joint.sp_group
     ring = split == "ring"
-    shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if ring else None, device=device,
-                          eager_splits=ring)
+    shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if ring else None, device=device)
     case = _Case.build(PREFILL_ROWS, device, dtype)
 
     def placed_kv(placement):
@@ -868,7 +867,7 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
     case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
     for rank in range(world):
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world))
-        shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv", eager_splits=True)
+        shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
         attn, _ = _cp_attention(
             joint, CPU, torch.float32, shard=shard, exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
         )

@@ -184,8 +184,6 @@ class GDNManager(LinearAttnManager):
             run = wrapper.halves[2] if isinstance(wrapper, GDNMixedWrapper) else 0
             split = self._plan_split(label, [seg.span for seg in segments], addressing[label], ctx, run)
             if split is not None:
-                # a leased step plans copied where a linear layer splits (`captures_split_steps`)
-                assert ctx.slot_lease is None, "a leased step split for a linear attention"
                 self._split_rows[label] = split
         if ctx.is_preplan:
             self._preplanned = True

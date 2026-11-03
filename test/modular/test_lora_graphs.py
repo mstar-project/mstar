@@ -233,7 +233,7 @@ def test_every_bucket_is_captured_again_under_a_base_only_key_beside_the_nodes_o
 
     def specs(lora_keys):
         runner = object.__new__(AcceleratorGraphRunner)
-        runner._capture_configs, runner._num_slots = configs, 2
+        runner._capture_configs, runner._num_slots, runner._resources = configs, 2, {}
         runner._submodule = SimpleNamespace(lora_keys=lora_keys)
         return runner._get_slot_specs()
 

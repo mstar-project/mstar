@@ -185,12 +185,6 @@ class NodeResourceSpec(ABC):
             return "none"
         return self.split_exchange
 
-    def captures_split_steps(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
-        """Whether this resource runs a split step inside an accelerator graph. False for one whose
-        split exchange plans per rank or syncs the host; a node with any such resource plans every
-        leased step copied (``SeqShardSpec.eager_splits``). From raw fields, as ``resolve_exchange``."""
-        return True
-
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
     ) -> list[str]:

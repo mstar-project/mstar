@@ -124,10 +124,6 @@ class AttentionSpec(NodeResourceSpec):
         window = getattr(self.config, "sliding_window", None)
         return kv.storage == "by_position" and window is not None and window < kv.config.max_seq_len
 
-    def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
-        # the ring's partner plans and kv_gather's local plans differ by rank, so run eagerly
-        return self.resolve_exchange(specs) not in ("ring", "kv_gather")
-
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
     ) -> list[str]:

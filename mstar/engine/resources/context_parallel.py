@@ -227,8 +227,9 @@ class RingAttentionWrapper:
     masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager wrapper over this rank's slots per partner, all planned per step.
-    Eager only: a striped shard plans a leased step copied. Partner plans differ by rank, so a
-    backend with a plan check (``_plan_check``) would have to check every rank's before planning."""
+    Eager only: the node captures no bucket a step may split in (``captures_bucket``). Partner
+    plans differ by rank, so a backend with a plan check (``_plan_check``) would have to check
+    every rank's before planning."""
 
     # the step attends its own tokens from the pages, written first (`AttentionManager.reads_step_kv`)
     reads_step_kv = False

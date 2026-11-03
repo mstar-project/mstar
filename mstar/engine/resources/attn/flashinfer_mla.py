@@ -596,7 +596,7 @@ class FlashInferMLAManager(AttentionManager):
             # not on a pre-plan: the step in flight may still read its own
             self._step_qo.clear()
         for label, kv_out in plan_outputs.items():
-            # `kv_gather` plans this rank's own queries (eager only, `captures_split_steps`); the
+            # `kv_gather` plans this rank's own queries (eager only, `captures_bucket`); the
             # other exchanges attend a split step's every query, as a copied one
             r = None if shard_plan is None or self._split_exchange != "kv_gather" else shard_plan.ranges.get(label)
             if r is not None:

@@ -2420,7 +2420,9 @@ Splitting is declared in four places:
   ``sp_size`` tokens (a row, on axis 1). ``min_tokens`` (default 0) is a ``resources:`` override,
   a deployment's trade between the exchanges' cost and the split layers' saving, as is
   ``exchange`` (below), how a split step reaches the node's paged attentions. A captured step
-  decides from its bucket's size, not its prompt's, so capture and replay split alike. Declare
+  decides from its bucket's size, not its prompt's, so capture and replay split alike; where a
+  resource's split steps run eagerly only, the node doesn't capture the buckets a step could
+  split in (``Resource.captures_bucket``), so such a step runs eagerly. Declare
   the spec over every node of the attention resources that depend on it: a resource spanning
   nodes the shard doesn't cover is refused, as is a KV pool whose attentions depend on two specs.
 - **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
@@ -2464,9 +2466,10 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   (each rank runs its pieces, hands its state on in one fixed-size gather, and runs a row
   continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so ``ulysses``
   saves memory there, not time. ``state_passing`` and Mamba-2's split are tested on CPU only and no
-  in-tree model adopts them yet. Both exchanges run eagerly, so on a node with a recurrent layer a
-  step that leases a capture runs copied: only a step past the largest capture bucket (or any
-  step with capture off) splits. Prefix snapshots stay off above one rank.
+  in-tree model adopts them yet. Both exchanges run eagerly, so a node with a recurrent layer
+  doesn't capture the buckets a step could split in (``Resource.captures_bucket``): such a step
+  runs eagerly and splits, and every other step keeps its graph. Prefix snapshots stay off above
+  one rank.
 - An **MLA** pool is copied (its one latent serves every query head). Its attention gathers the
   step's latents (``kv_gather``), writes them on every rank, and attends each rank's own queries
   over each row's keys up to its piece. Copied steps attend on the TP heads with no collective.
@@ -2589,9 +2592,8 @@ over its own slots (stored context and the step's tokens together, one call, cau
 step declares), sends the partial back, and merges what it gets in fp32. Its hops are
 synchronous for now, and only the ``flashinfer`` backend plans it. Another is refused when the
 engine builds the attention, at any SP size like the storage checks, but after the validation that
-runs before a worker starts. A captured step
-runs copied on a ring node (ring is eager only), so prefill buckets above ``min_tokens`` that
-all-gather would split run copied there. A step that combines labels (batched CFG's) has no
+runs before a worker starts. Ring is eager only, so a ring node doesn't capture the buckets a
+step could split in: those steps split eagerly, and the rest keep their graphs. A step that combines labels (batched CFG's) has no
 stored positions to stripe by, so it fails at plan on a ring node. A step's peak memory is its resident tensors plus the
 larger of its attention and its MLP (or MoE) phase. All-gather's attention phase holds the
 whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone, and

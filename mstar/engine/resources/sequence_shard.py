@@ -97,12 +97,13 @@ class SeqShardSpec(NodeResourceSpec):
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
     SP rank it plans copied at no cost.
 
-    Three fields are derived from ``exchange`` and the resources on its nodes (``derive``), from
+    Two fields are derived from ``exchange`` and the resources on its nodes (``derive``), from
     their hooks alone: ``splits``, whether the node's steps may split (not where ``exchange``
-    resolves to ``none``, or where no resource there takes split steps); ``eager_splits``,
-    whether one of them runs split steps eagerly only (``captures_split_steps``), so a leased
-    step plans copied; and ``stripe_pool``, the pool a ring attention reads, by whose stored
-    positions each step is striped."""
+    resolves to ``none``, or where no resource there takes split steps); and ``stripe_pool``, the
+    pool a ring attention reads, by whose stored positions each step is striped. A resource
+    whose split steps run eagerly only leaves out the capture buckets a step may split in
+    (``Resource.captures_bucket`` over ``SequenceShard.may_split``), so such a step runs eagerly
+    and splits, and every other step keeps its graph."""
 
     labels: tuple[str, ...]
     axis: int
@@ -110,7 +111,6 @@ class SeqShardSpec(NodeResourceSpec):
     min_tokens: int = field(default=0, kw_only=True)
     exchange: SpExchange | Literal["auto"] = field(default="auto", kw_only=True)
     splits: bool = field(default=True, init=False, repr=False)
-    eager_splits: bool = field(default=False, init=False, repr=False)
     stripe_pool: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
@@ -160,7 +160,6 @@ class SeqShardSpec(NodeResourceSpec):
         by_position = any(spec.storage == "by_position" for spec in ours)
         exchanges = [(spec, spec.resolve_exchange(specs)) for spec in ours]
         self.splits = self.node_exchange(specs) != "none" and any(e != "none" for _, e in exchanges)
-        self.eager_splits = self.splits and not all(spec.captures_split_steps(specs) for spec in ours)
         pools = sorted({spec.config.kv_cache for spec, exchange in exchanges if exchange == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
         nodes = sorted(self.nodes)
@@ -294,7 +293,8 @@ class SequenceShard(Resource):
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
     (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's
     plan); it keeps ``can_capture`` True and ``force_double_buffer`` False (a leased step, the
-    only kind a pre-plan stages, never stripes: a ring attention runs split steps eagerly)."""
+    only kind a pre-plan stages, never stripes: a ring attention captures no bucket a step may
+    split in, ``Resource.captures_bucket``)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
@@ -303,7 +303,7 @@ class SequenceShard(Resource):
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
         group: CommGroup, splits: bool = True, stripe_pool: str | None = None,
-        device: torch.device = torch.device("cpu"), eager_splits: bool = False,
+        device: torch.device = torch.device("cpu"),
     ):
         self.labels = labels
         self.axis = axis
@@ -311,10 +311,8 @@ class SequenceShard(Resource):
         self.walks = walks
         self.min_tokens = min_tokens
         self.group = group
-        # `SeqShardSpec.stripe_pool`, `SeqShardSpec.eager_splits`: a ring runs split steps eagerly
-        assert stripe_pool is None or eager_splits, "a shard striping by a ring's pool runs its split steps eagerly"
+        # `SeqShardSpec.stripe_pool`
         self.stripe_pool = stripe_pool
-        self.eager_splits = eager_splits
         self._device = device
         # fixed at bind, so a compiled frame at one SP rank (or on a node whose attentions take no
         # split steps) traces the bracket straight through
@@ -334,7 +332,6 @@ class SequenceShard(Resource):
         walks = None if spec.walks is None else frozenset(spec.walks)
         return cls(
             spec.labels, spec.axis, walks, spec.min_tokens, group, spec.splits, spec.stripe_pool, info.device,
-            spec.eager_splits,
         )
 
     def depends_on(self) -> set[str]:
@@ -413,10 +410,6 @@ class SequenceShard(Resource):
         bucket = None if lease is None else lease.bucket
         if bucket is not None and not ctx.force_prefill and bucket.bs == bucket.num_tokens:
             # a batched decode replay, which declares its bucket: copied in O(1)
-            return COPIED
-        if bucket is not None and self.eager_splits:
-            # a resource here runs split steps eagerly only (a ring, say); the lease is the
-            # instance's capture decision, so every rank plans the step copied alike
             return COPIED
         sp = self.group.world_size
         segments = step.segments or ()
@@ -542,15 +535,19 @@ class SequenceShard(Resource):
             return xs[0] if len(xs) == 1 else xs
         return self._bracket(label, xs, dim, scatter=False)
 
-    def may_split(self, walk: str | None, tokens: int | None = None) -> bool:
+    def may_split(self, walk: str | None, tokens: int | None = None, rows: int | None = None) -> bool:
         """Whether a step of ``walk`` with ``tokens`` listed tokens may split (None: any walk, any
-        count), though ``_decide`` may still plan it copied. In O(1) from what is fixed at bind and
-        what every rank shares, so a compiled frame specializes on its walk and an admission bound
-        skips the steps that run copied."""
+        count), though ``_decide`` may still plan it copied. ``rows``, the rows of a step that
+        isn't packed: one token a row (``tokens == rows``) is a decode step, which never splits,
+        as ``_decide`` reads it. In O(1) from what is fixed at bind and what every rank shares, so
+        a compiled frame specializes on its walk, an admission bound skips the steps that run
+        copied, and a resource whose split steps run eagerly leaves out the capture buckets a step
+        may split in (``Resource.captures_bucket``)."""
         return (
             self.can_split
             and (walk is None or self.walks is None or walk in self.walks)
             and (tokens is None or tokens >= max(self.group.world_size, self.min_tokens))
+            and (rows is None or tokens != rows)
         )
 
     @torch.compiler.disable

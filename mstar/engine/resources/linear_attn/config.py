@@ -87,10 +87,6 @@ class LinearAttnSpec(NodeResourceSpec):
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> str:
         return self.own_exchange(specs)
 
-    def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
-        # both exchanges plan their halo and hand-off per rank on the host, eager only
-        return self.resolve_exchange(specs) == "none"
-
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
     ) -> list[str]:

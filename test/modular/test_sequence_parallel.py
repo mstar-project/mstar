@@ -505,20 +505,17 @@ def _kv_plan(*rows) -> KVPlanOutputs:
     return KVPlanOutputs({"main": KVPlanOutput(build_paged_indptrs(views, 16), views)})
 
 
-@pytest.mark.parametrize("world, rows, lease, counts", [
+@pytest.mark.parametrize("world, rows, counts", [
     # positions 1..4 and 0..2: rank 0 holds 2, 4, 0 and 2, step tokens 1, 3, 4 and 6
-    (2, ((1, 4), (0, 3)), None, (4, 3)),
+    (2, ((1, 4), (0, 3)), (4, 3)),
     # positions 1, 2, 5 and 6 over 4 ranks: ranks 0 and 3 would get none
-    (4, ((1, 2), (5, 2)), None, None),
-    # the ring runs eager: a leased step plans copied
-    (2, ((1, 4), (0, 3)), SlotLease(0, BucketKey("w", bs=2, num_tokens=8)), None),
-], ids=["split", "a-rank-gets-none", "leased"])
-def test_a_striped_shard_gives_each_rank_its_stored_positions(world, rows, lease, counts):
+    (4, ((1, 2), (5, 2)), None),
+], ids=["split", "a-rank-gets-none"])
+def test_a_striped_shard_gives_each_rank_its_stored_positions(world, rows, counts):
     shard = _shard(world=world)
-    # as a ring attention's shard derives them
-    shard.stripe_pool, shard.eager_splits = "kv", True
-    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False, slot_lease=lease,
-                      force_prefill=lease is not None)
+    # as a ring attention's shard derives it
+    shard.stripe_pool = "kv"
+    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
     ctx.plan_results["kv"] = _kv_plan(*rows)
     plan = shard.plan(SeqShardStep(segments=tuple(Segment(f"r{i}", "main", n) for i, (_, n) in enumerate(rows))), ctx)
     if counts is None:
@@ -798,15 +795,14 @@ def test_a_recurrent_layer_plans_after_its_nodes_shard_and_refuses_a_step_withou
 
 
 @pytest.mark.parametrize("placed, choice, want", [
-    (True, None, (False, False, None, "none")),
-    (True, "all_gather", (True, True, None, "ulysses")),
-    (True, "ring", (True, True, "kv", "ulysses")),
-    (False, None, (True, True, None, "ulysses")),
+    (True, None, (False, None, "none")),
+    (True, "all_gather", (True, None, "ulysses")),
+    (True, "ring", (True, "kv", "ulysses")),
+    (False, None, (True, None, "ulysses")),
 ], ids=["placed-unset", "placed-all-gather", "ring", "by-head"])
 def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed, choice, want):
     """The shard derives from the specs' hooks alone, so whichever spec derives first (the shard
-    first or last) it reads the same: whether the node splits, whether a leased step plans copied
-    (a recurrent layer and the ring run split steps eagerly), the striped pool; and an unset
+    first or last) it reads the same: whether the node splits, the striped pool; and an unset
     linear spec follows the node."""
     import itertools
 
@@ -827,7 +823,7 @@ def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed
         by_key = resolve_spec_dependencies(specs)
         shard = by_key["shard"]
         linear = by_key["linear"].resolve_exchange(by_key)
-        assert (shard.splits, shard.eager_splits, shard.stripe_pool, linear) == want, order
+        assert (shard.splits, shard.stripe_pool, linear) == want, order
         assert by_key["linear"].depends_on() == {"state", "shard"}
 
 

@@ -33,6 +33,7 @@ from mstar.engine.resources.sequence_shard import (
     ring,
     ulysses,
 )
+from mstar.engine.resources.step import BucketKey
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -91,6 +92,13 @@ class AttentionManager(AttentionResource):
         if self._shard_key is not None:
             keys.add(self._shard_key)
         return keys
+
+    def captures_bucket(self, bucket: BucketKey, packed: bool) -> bool:
+        # the ring's partner plans and kv_gather's own-query plans differ by rank: a step that may
+        # split runs eagerly. No shard where the node never splits (one SP rank, say)
+        return self._shard is None or self._split_exchange not in ("ring", "kv_gather") or not self._shard.may_split(
+            bucket.graph_walk, bucket.num_tokens, None if packed else bucket.bs,
+        )
 
     def bind_dependencies(self, resources) -> None:
         kv = resources[self._kv_cache_name]

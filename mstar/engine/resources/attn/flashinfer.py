@@ -360,7 +360,7 @@ class FlashInferManager(AttentionManager):
             r = None if shard_plan is None else shard_plan.ranges.get(label)
             if r is not None and self._split_exchange == "kv_gather":
                 # this rank's own queries over the whole step's keys, every rank storing the
-                # group whole (eager only, `captures_split_steps`)
+                # group whole (eager only, `captures_bucket`)
                 assert lease is None, "a leased step split under kv_gather"
                 own = own_queries(indptrs, r, self._group.page_size, step.causal)
                 wrapper = self._eager_wrapper(label, False, ctx.slot)
@@ -370,7 +370,7 @@ class FlashInferManager(AttentionManager):
                 plan_states[label] = wrapper
                 continue
             if r is not None and self._split_exchange == "ring":
-                assert lease is None, "a striped sequence shard plans a leased step copied"
+                assert lease is None, "a leased step split under ring"
                 wrapper = self._ring_wrapper(label, ctx.slot)
                 wrapper.plan(kv_out, r.counts, causal=step.causal)
                 plan_states[label] = wrapper
