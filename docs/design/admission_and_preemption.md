@@ -83,7 +83,7 @@ Rules:
 
 - **Ingest.** A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).
 - **Queue.** A request joins the runner's waiting list at its first readiness check, by its arrival number (§3.1), or behind every numbered request in the order it first asks when it has none. A request that is dropped or moves to the host asks again at once, at its arrival. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
-- **Passing.** While the first request of a pool's queue can't start, a request behind it is admitted if part of its prompt is cached on the GPU, running requests keep all of that part from eviction, and its own pages fit, output included. While the first request waits, no request behind it is admitted into the pages such a request frees. A recurrent pool lets a request pass when a slot is left for the first one.
+- **Passing.** While the first request of a pool's queue can't start, a request behind it is admitted if what its own admission would reserve, plus the growth that admission leaves out, fits. While the first request waits, no request behind it is admitted into the pages such a request frees. A recurrent pool lets a request pass when a slot is left for the first one.
 - **Size.** A preemptible request reserves its prompt. A guaranteed one, and one admitted past the first request, also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
@@ -102,12 +102,14 @@ What a cache hit costs:
 |---|---|
 | a page only the index holds | a fresh page, out of the room alone for a guaranteed request until it adopts its lease |
 | a page another request holds | nothing, lent |
+| a page past the newest recurrent snapshot under the hit | a fresh page, since the step runs from the snapshot |
 | a cached prefix copied from the host at readiness | a grant within the request's reservation |
 
 Why this shape:
 
 - **The rule lives in `_alloc`.** Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request's next grant would fail.
 - **The head is passed only while it doesn't fit.** The pages that passing requests free are kept for it, so it can't wait forever behind a stream of small ones (§5.5).
+- **A passer's hit comes off as the head's does.** A passer that runs short past its reservation is the newest request holding pages, so preemption takes it first, and the pages kept for the head are never lent to it.
 - **Evictable hits are charged as fresh.** Eviction could hand such a page to another request before the probe leases it.
 - **A guaranteed request is charged for no hit until it adopts its lease.** A cut lease leaves the walk to write the cut pages, and a cut page another request still holds frees no room, so its reservation keeps every page until then.
 

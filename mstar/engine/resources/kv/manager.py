@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -69,6 +69,9 @@ from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 logger = logging.getLogger(__name__)
 
@@ -682,12 +685,14 @@ class KVManager(AttentionResource):
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
         #   first `ask` or when a drop or a move takes them off the device.
+        # `_snapshots` holds the pools that restore a hit's recurrent state, which a prefill hit can't run past.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
         self._guaranteed: set[str] = set()
+        self._snapshots: list["RecurrentStatePool"] = []
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark, or None when the victim is the request that ran short.
@@ -1379,6 +1384,10 @@ class KVManager(AttentionResource):
     def keyed_label(self, rid: str, node_name: str, graph_walk: str) -> str | None:
         with self._lock:
             return self._keyed_label(rid, node_name, graph_walk)
+
+    def bind_snapshots(self, pool: "RecurrentStatePool") -> None:
+        """Count a prefill hit only as far as ``pool`` restores the recurrent state under it."""
+        self._snapshots.append(pool)
 
     def keyed_walks(self, label: str) -> frozenset[str]:
         """The walks whose writes under ``label`` the prefix cache keys."""
@@ -4372,8 +4381,7 @@ class KVManager(AttentionResource):
         """Allot ``rid`` its prompt, less the cache hits another request holds, or what it returns with
         from a drop or the host, or grow its allotment by the shortage it waits on.
 
-        A request ``passing`` the first one, while that one doesn't fit, is admitted when it has a hit, no page
-        of the hit is evictable, and its own pages fit, growth included.
+        A request ``passing`` the first one, while that one doesn't fit, is allotted its growth too (`_pass`).
         """
         if passing:
             return self._pass(rid, node_name, graph_walk, published)
@@ -4403,27 +4411,29 @@ class KVManager(AttentionResource):
     def _pass(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> RoomMark | None:
-        """Allot ``rid`` past a first request that doesn't fit, when it has a hit, no page of the hit is
-        evictable, and its own pages fit, growth included, in the room less the pages kept for that request."""
+        """Allot ``rid`` past a first request that doesn't fit, when what its own admission would take and the
+        growth that admission leaves to the room fit in the room less the pages kept for that request.
+
+        For a guaranteed request and one returning from a drop or the host, its admission already takes its
+        footprint, so passing costs it nothing more.
+        """
         with self._lock:
             wait, room = self._head_wait, self._room()
             refused = RoomMark(rid, node_name, graph_walk, published, room, 0, 0)
-            if wait is None or wait.pages <= room or room - wait.kept < 1:
+            if wait is None or wait.pages <= room or room - wait.kept < 1 or rid in self._allotments:
                 return refused
-            chains = [] if self._index is None else [
+            chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
             ]
         for prefix_chain in chains:
             self._root_chain(prefix_chain)
         with self._lock:
-            whole, charged = self._hit(rid, node_name, graph_walk, published)
-            if not whole or charged:
-                return refused
-            overrides = self._overrides[rid]
-            pages = overrides.pages(self._nodes, overrides.loop_caps, self.config) - whole
+            pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
             if not self._may_pass(pages):
                 return refused
+            # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
+            # request holding pages, so preemption takes it first.
             self._reserve(rid, pages, passed=True)
             return None
 
@@ -4498,9 +4508,11 @@ class KVManager(AttentionResource):
         return rid in self._dropped or self._on_host(rid)
 
     def _index_counts(self) -> tuple[int, int]:
-        """The pages the index has ever filed, and the pages requests have ever taken out of its
-        evictable set."""
-        return (0, 0) if self._index is None else (self._index.filed, self._index.taken)
+        """The pages the index has ever filed with the snapshots ever filed under its keys, and the pages
+        requests have ever taken out of its evictable set."""
+        if self._index is None:
+            return 0, 0
+        return self._index.filed + sum(pool.filed for pool in self._snapshots), self._index.taken
 
     def may_pass(self) -> bool:
         with self._lock:
@@ -4738,7 +4750,8 @@ class KVManager(AttentionResource):
     ) -> tuple[int, int]:
         """How many whole pages ``rid``'s streams will take from the index, and how many of the
         pages they take are evictable. A stream to be read in takes what `_take_local_match`
-        would match, and a stream to be prefilled what the probe would.
+        would match, and a stream to be prefilled what the probe would, up to the newest
+        recurrent snapshot under it.
 
         The engine doesn't probe a walk that writes two labels from one input, since a probe can cut
         only one label's input.
@@ -4764,6 +4777,8 @@ class KVManager(AttentionResource):
                 and self._keyed_label(rid, node_name, chain.spans[cursor.done].walk) == label
             ):
                 pages = self._index.pages_for(chain.rooted)[:len(chain.rooted) - 1]
+                for pool in self._snapshots:
+                    pages = pages[:pool.restorable(chain.rooted[:len(pages)])]
                 whole += len(pages)
                 total = sum(span.length for span in chain.spans)
                 image_end = self._image_end(chain.rooted_ends, len(pages) * page_size, total)

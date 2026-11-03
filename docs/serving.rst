@@ -450,9 +450,9 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache: true`` on it is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
-reservations already admitted. A request behind it starts first only if part of its prompt is
-cached on the GPU, running requests keep all of that part from eviction, and its own pages fit,
-output included. While the head waits, no request behind it starts in the pages such a request
+reservations already admitted. A request behind it starts first when its own pages fit, output
+included, less the cached part of its prompt that running requests keep from eviction and, on a
+node with recurrent state, that a snapshot can restore. While the head waits, no request behind it starts in the pages such a request
 frees. A cache hit on a page only the prefix index holds counts as a page the request takes. A request that can't fit in its
 pool at its full output length gets a 400 if it asked for that length, and otherwise has the
 model's default length cut until it fits. A request that can be rebuilt reserves only its

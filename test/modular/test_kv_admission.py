@@ -3,8 +3,9 @@
 "Not ready" is an answer the scheduler already retries, so the pool gives it until the
 prompt at the head of its queue fits beside what admitted requests have reserved. A cache hit on a
 page only the index holds counts as a page taken, since eviction could hand that page out.
-A request with a cache hit passes the head only when no page of the hit is evictable. The pages
-it frees are then kept for the head, or a stream of short requests would starve a long one.
+A request passes the head when its footprint fits, less the part of its hit no eviction can take
+and the recurrent state can restore. The pages it frees are then kept for the head, or a stream
+of short requests would starve a long one.
 """
 
 from __future__ import annotations
@@ -133,18 +134,24 @@ def test_a_page_filed_after_a_lost_race_keeps_the_winners_pages_evictable():
 
 
 def _queued(max_num_pages: int = 9):
-    """"a" fits in 8 pages, "long" doesn't fit beside it, and "short" would."""
+    """"a" fits in 8 pages, "long" doesn't fit beside it, and "short"'s prompt would but its output wouldn't."""
     kv = _manager(max_num_pages=max_num_pages)
-    for rid, n in (("a", 80), ("long", 64), ("short", 16)):
+    kv.local_loops = {"decode_loop"}
+    for rid, n in (("a", 80), ("long", 64)):
         _laid_out(kv, rid, list(range(n)))
+    kv.ingest_request("short", KVReqConfig(loop_caps={"decode_loop": 48}, kv_layout={
+        "main": StreamLayout((PrefixSpan(16, 16, WALK),), (("decode_loop", 1),), keyed_spans=1),
+    }))
     assert _ready(kv, "a") and not _ready(kv, "long")
     return kv
 
 
-def test_a_request_with_nothing_cached_never_passes_the_head():
+def test_a_request_with_nothing_cached_passes_the_head_only_when_its_footprint_fits():
     kv = _queued()
+    _laid_out(kv, "tiny", list(range(16)))
 
-    assert not _ready(kv, "short"), "a later request took the room the head waits for"
+    assert not _ready(kv, "short"), "a request passed the head with room for its prompt but not its output"
+    assert _ready(kv, "tiny"), "a request whose footprint fits waited behind the head because nothing of it is cached"
     _remove(kv, "a")
     assert _ready(kv, "long") and _ready(kv, "short"), "the queue didn't move once the head fit"
 
@@ -171,6 +178,7 @@ def _passing(free: int, head: int, kv=None):
     """"r" runs on ``HELD``, "fill" runs on tokens from 2000 and leaves ``free`` pages, and "head" waits."""
     kv = _manager(max_num_pages=16) if kv is None else kv
     kv._cpu_pool = host._HostPool(64)
+    kv.local_loops = {"decode_loop"}
     _prefill(kv, "r", HELD + list(range(1000, 1008)))
     _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - free) * PAGE_SIZE)))
     _laid_out(kv, "head", list(range(3000, 3000 + head * PAGE_SIZE)))
@@ -178,18 +186,85 @@ def _passing(free: int, head: int, kv=None):
     return kv
 
 
-def test_a_request_passes_the_head_only_when_no_page_of_its_hit_is_evictable_and_its_output_fits():
+def _short_chat(kv, rid: str, own: list[int], cap: int = 16) -> None:
+    """A request on ``HELD``, which "r" holds, plus ``own``, decoding up to ``cap`` tokens."""
+    tokens = HELD + own
+    kv.ingest_request(rid, KVReqConfig(
+        prefix_keys={"main": _keys(tokens)}, loop_caps={"decode_loop": cap},
+        kv_layout={"main": StreamLayout(
+            (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+        )},
+    ))
+
+
+def test_a_passer_pays_for_its_output_and_for_each_page_of_its_hit_eviction_can_take():
     kv = _passing(free=3, head=5)
+    # "w" passes and leaves its last page evictable, which the pool keeps for the head
     _prefill(kv, "w", HELD + list(range(100, 116)))
     kv.remove_request("w")
     _laid_out(kv, "partly", HELD + list(range(100, 124)), keyed=True)
-    for rid, cap in (("long", 32), ("short", 16)):
-        kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": _keys(HELD + [8] * 8)}, loop_caps={"decode_loop": cap},
-            kv_layout={"main": StreamLayout((PrefixSpan(56, 56, WALK),), (("decode_loop", 1),), keyed_spans=1)}))
+    _short_chat(kv, "long", [8] * 8, cap=32)
 
-    assert not _ready(kv, "partly"), "a request passed the head on a hit eviction can still take"
     assert not _ready(kv, "long"), "a request passed the head with room for its prompt but not its output"
-    assert _ready(kv, "short") and kv._allotments["short"].pages == 2, "a request whose hit and output fit waited"
+    assert _ready(kv, "partly"), "a request whose footprint fits beside its hit waited"
+    assert kv._allotments["partly"].pages == 2, "the passer's hit page eviction can take wasn't charged as fresh"
+
+
+def _with_snapshots(kv) -> RecurrentStatePool:
+    """A Qwen3.5-shaped node: ``kv`` beside a recurrent pool whose snapshots key off ``kv``'s chains."""
+    state = RecurrentStatePool(device=torch.device("cpu"), name="state", config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=8,
+        prefix_slots=4, kv_cache="kv",
+    ))
+    state.bind_kv(kv)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]}))
+    return state
+
+
+def _snapshot(state: RecurrentStatePool, kv, rid: str, pages: int) -> None:
+    """File a snapshot at ``rid``'s chain key ``pages`` pages in, as a prefill that kept that boundary would."""
+    assert state._index(state._reserve_snapshot(), kv.chain_key(rid, "main", pages))
+
+
+def test_a_passer_stays_inside_its_allotment_when_the_recurrent_pool_cuts_its_hit():
+    kv = _manager(max_num_pages=16)
+    _with_snapshots(kv)
+    kv = _passing(free=5, head=6, kv=kv)
+    _short_chat(kv, "p", list(range(4000, 4008)))
+    assert _ready(kv, "p")
+    room = kv._room()
+    # no snapshot under the hit, so the runner agrees on none and the prefill writes the KV hit again
+    inputs = ARNodeInputs(input_seq_len=len(HELD) + 8)
+    runner = _runner(kv)
+    runner.apply_cached_prefix("p", NODE, WALK, inputs, runner.resolve_cached_prefix("p", NODE, WALK, inputs))
+    _grow(kv, "p", len(HELD) + 8)
+
+    assert kv._room() == room, (
+        f"the passer wrote {room - kv._room()} pages past its allotment, out of the room kept for the head")
+
+
+def test_a_head_is_allotted_the_part_of_its_hit_past_its_newest_snapshot():
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _snapshot(state, kv, "r", 1)
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+
+    assert _ready(kv, "h")
+    assert kv._allotments["h"].pages == 3, "the head's allotment left out hit pages the recurrent pool can't restore"
+
+
+def test_a_snapshot_filed_under_a_waiting_heads_hit_retries_it():
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(5000, 5000 + (kv._room() - 2) * PAGE_SIZE)))
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+    assert not _ready(kv, "h")
+
+    _snapshot(state, kv, "r", 3)
+
+    assert _ready(kv, "h"), "a snapshot lowered what the head needs, and nothing its mark reads moved"
 
 
 @pytest.mark.parametrize("leave", [KVManager.remove_request, KVManager.offload], ids=["finishes", "is offloaded"])
@@ -777,12 +852,21 @@ def test_every_page_an_offload_frees_is_room():
 def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment():
     kv = host._manager(max_num_pages=20)
     host._on_the_host_only(kv)
-    # only the host holds "b"'s prefix, so "b" can't be admitted past "big"
     host._serve(kv, "c", list(range(900, 900 + 8 * host.PAGE_SIZE)))
     room = kv._room()
-    for rid, prompt in (("big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE))), ("b", host.A_PROMPT + [7, 8])):
-        host._ingest(kv, rid, prompt)
-        assert not _ready(kv, rid)
+    host._ingest(kv, "big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE)))
+    assert not _ready(kv, "big")
+    # only the host holds "b"'s prefix, and its output doesn't fit beside "c", so it can't pass "big"
+    kv.local_loops = {"decode_loop"}
+    tokens, page = host.A_PROMPT + [7, 8], host.PAGE_SIZE
+    kv.ingest_request("b", KVReqConfig(
+        prefix_keys={"main": chain([tokens[at:at + page] for at in range(0, len(tokens), page)])},
+        prefix_tail={"main": tokens[len(tokens) // page * page:]}, loop_caps={"decode_loop": room * page},
+        kv_layout={"main": StreamLayout(
+            (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+        )},
+    ))
+    assert not _ready(kv, "b")
     assert kv._host_copies == [], "a request still in the queue started a copy from the host"
 
     _remove(kv, "big")
