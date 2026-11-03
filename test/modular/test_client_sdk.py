@@ -24,6 +24,14 @@ def test_parse_ndjson_line():
         parse_ndjson_line('{"modality": "te')
 
 
+def test_a_single_modality_string_is_sent_whole():
+    c = MStarClient("http://x")
+    with mock.patch.object(c._session, "post") as post:
+        c.generate(text="hi", output_modalities="audio", input_modalities="text")
+    data = post.call_args.kwargs["data"]
+    assert (data["output_modalities"], data["input_modalities"]) == ("audio", "text")
+
+
 def test_parse_result_groups_modalities():
     pcm = np.array([0, 1000, -1000, 32767], dtype="<i2").tobytes()  # 4 int16 samples
     payload = {

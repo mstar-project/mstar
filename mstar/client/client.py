@@ -161,6 +161,12 @@ class MStarClient:
         iterator is first advanced. A failure after the stream has opened
         raises ``RuntimeError`` from the iterator.
         """
+        # A single modality may be given as a bare string; joining it would
+        # send its letters ("audio" -> "a,u,d,i,o").
+        if isinstance(output_modalities, str):
+            output_modalities = [output_modalities]
+        if isinstance(input_modalities, str):
+            input_modalities = [input_modalities]
         if "video_frame" in output_modalities and not stream:
             raise ValueError(
                 "output modality 'video_frame' requires stream=True; raw frame "
