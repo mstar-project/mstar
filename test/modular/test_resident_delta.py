@@ -1301,7 +1301,7 @@ def _counts(kv) -> tuple:
         kv._unused, {rid: (a.pages, a.remaining, a.prompt) for rid, a in kv._allotments.items()},
         {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
         sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
-        list(kv._arena.allocator.free_pages.queue),
+        kv._arena.free_pages(),
     )
 
 
