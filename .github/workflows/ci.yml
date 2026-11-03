@@ -32,7 +32,7 @@ jobs:
   cpu-tests:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +57,11 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -96,6 +101,14 @@ jobs:
           # Its metadata pins transformers==4.57.3 and packages mstar never
           # imports, so it goes in without them, after pip check.
           python -m pip install --no-deps "qwen-tts==0.1.1"
+      - name: Build and install the extension
+        env:
+          # maturin develop wants a virtualenv; setup-python's interpreter is
+          # the one the tests run on.
+          VIRTUAL_ENV: ${{ env.pythonLocation }}
+        run: |
+          python -m pip install maturin
+          maturin develop --release -m rust/Cargo.toml
       - name: Run CPU tests
         env:
           HF_HUB_OFFLINE: "1"

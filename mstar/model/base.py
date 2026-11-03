@@ -110,9 +110,8 @@ def _wrap_node_in_loop(
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
-        # where the two runtimes order the completion cascade differently
-        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
-        # rather than ship a shape only one runtime gets right.
+        # whose completion cascades into the parent's (rust/src/graph/state.rs).
+        # Chunking does not handle that, so refuse it.
         if node_name in section.section.get_nodes():
             raise ValueError(
                 f"node {node_name!r} is chunkable and already inside Loop "
@@ -174,6 +173,9 @@ class ClientChunk(NamedTuple):
 class Span(NamedTuple):
     """One write to a KV stream. A layout lists them in the order the walks write.
 
+    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
+    the span before it then writes it too, in the same row, as text around an attachment is.
+
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
     the tensor whose next entry an ids span keys, or the file of a digest span
@@ -190,6 +192,7 @@ class Span(NamedTuple):
     source: str | tuple[str, int]
     params: tuple = ()
     scratch: int = 0
+    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -214,8 +217,9 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
+        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
+        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
+        worker keys the span."""
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
@@ -226,7 +230,7 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
@@ -477,7 +481,7 @@ def _divide_into_worker_graphs(
         # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
         # matching over a streamed latent) inexpressible. Honouring it instead
         # means changing this, Loop._is_streamed_input, and the Rust held_mask
-        # together, or the two runtimes disagree.
+        # together.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams
