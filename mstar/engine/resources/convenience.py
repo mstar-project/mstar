@@ -51,7 +51,10 @@ class AttentionCallable:
         self.kv.set_default_layer_idx(layer_idx)
 
     @torch.compiler.disable
-    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def __call__(self, q: torch.Tensor | tuple[torch.Tensor, torch.Tensor], k: torch.Tensor,
+                 v: torch.Tensor | None) -> torch.Tensor:
+        """``q`` is one tensor, or MLA's query parts (``q_nope``, ``q_pe``) over its latent ``k``
+        with no ``v``."""
         return self._exchanged(q, k, v)
 
     @torch.compiler.disable
@@ -80,6 +83,9 @@ class AttentionCallable:
                 self.kv.write_kv(k, v, tokens=tokens)
         if q is None:
             return None
+        if isinstance(q, tuple):
+            q_nope, q_pe = q
+            return self.attn.run(q_nope, kv_cache_layer=self.kv.layer_view(), k=k, q_pe=q_pe)
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 
