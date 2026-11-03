@@ -328,22 +328,13 @@ class Allotment:
     ``prompt`` is the pages it asked for, which `unreserve` puts back in `_asks`. An allotment for a request
     on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload. ``passed`` is set for a request admitted past a head that doesn't fit,
-    and its allotment then covers its growth too."""
+    and its allotment then covers its growth too. ``kept`` is the count of `KVManager._kept` the allotment took,
+    which `unreserve` puts back."""
     pages: int
     remaining: int = 0
     prompt: int = 0
     returning: int | None = None
     passed: bool = False
-
-
-@dataclass(slots=True)
-class HeadWait:
-    """Set once ``rid``, the first request waiting for this pool, fails to fit, until it is admitted or
-    removed. ``pages`` is what it last asked for. ``kept`` counts the pages freed during the wait by
-    requests that passed this head or an earlier one. Those pages are kept for the head: no request
-    behind it may be admitted into them, though admitted requests can still take them."""
-    rid: str
-    pages: int
     kept: int = 0
 
 
@@ -686,6 +677,8 @@ class KVManager(AttentionResource):
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
         #   first `ask` or when a drop or a move takes them off the device.
         # `_snapshots` holds the pools that restore a hit's recurrent state, which a prefill hit can't run past.
+        # `_kept` counts the pages requests that passed the head freed while a request waited. No later passer is
+        #   admitted into them, though admitted requests can still take them, and the head's allotment takes them all.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -693,6 +686,7 @@ class KVManager(AttentionResource):
         self._unused = 0
         self._guaranteed: set[str] = set()
         self._snapshots: list["RecurrentStatePool"] = []
+        self._kept = 0
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark, or None when the victim is the request that ran short.
@@ -702,7 +696,6 @@ class KVManager(AttentionResource):
         self._victims: dict[str, Earmark | None] = {}
         self._hosted: set[str] = set()
         self._ran_short: dict[str, int] = {}
-        self._head_wait: HeadWait | None = None
         if _DEBUG_ASSERTS and tp_cache:
             self._arena.trail = (0, 0)
         self._device = device
@@ -4098,8 +4091,6 @@ class KVManager(AttentionResource):
         with self._lock:
             if _DEBUG_ASSERTS and rid in self._streams:
                 self._report_underuse(rid)
-            if self._head_wait is not None and self._head_wait.rid == rid:
-                self._head_wait = None
             room = self._room()
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
@@ -4399,13 +4390,10 @@ class KVManager(AttentionResource):
         with self._lock:
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room:
-                if self._head_wait is None or self._head_wait.rid != rid:
-                    self._head_wait = HeadWait(rid, pages)
-                self._head_wait.pages = pages
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
-            if self._head_wait is not None and self._head_wait.rid == rid:
-                self._head_wait = None
             self._reserve(rid, pages)
+            # only the head of the queue reserves without passing, so the pages kept for it are its own
+            self._allotments[rid].kept, self._kept = self._kept, 0
             return None
 
     def _pass(
@@ -4418,9 +4406,9 @@ class KVManager(AttentionResource):
         footprint, so passing costs it nothing more.
         """
         with self._lock:
-            wait, room = self._head_wait, self._room()
+            room = self._room()
             refused = RoomMark(rid, node_name, graph_walk, published, room, 0, 0)
-            if wait is None or wait.pages <= room or room - wait.kept < 1 or rid in self._allotments:
+            if not self._may_pass() or rid in self._allotments:
                 return refused
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
@@ -4457,6 +4445,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments.pop(rid)
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
+            self._kept += allotment.kept
             if self.journal is not None:
                 self.journal(MoveKind.UNRESERVE, rid, 0)
 
@@ -4519,16 +4508,15 @@ class KVManager(AttentionResource):
             return self._may_pass()
 
     def _may_pass(self, need: int = 1) -> bool:
-        """True while the head asks for more than the room, and ``need`` pages fit in the room less
-        the pages kept for the head. The default ``need`` is the fewest pages a request takes."""
-        wait, room = self._head_wait, self._room()
-        return wait is not None and wait.pages > room and need <= room - wait.kept
+        """Whether ``need`` pages fit in the room less the pages kept for the head. The default ``need`` is
+        the fewest pages a request takes."""
+        return need <= self._room() - self._kept
 
     def _keep_for_head(self, allotment: Allotment | None, room: int) -> None:
-        """When ``allotment`` belongs to a request that passed a head, keep for the waiting head the
-        pages freed since ``room`` was read."""
-        if self._head_wait is not None and allotment is not None and allotment.passed:
-            self._head_wait.kept += self._room() - room
+        """When ``allotment`` belongs to a request that passed a head, and a request waits, keep for the head
+        the pages freed since ``room`` was read."""
+        if allotment is not None and allotment.passed and self._asks:
+            self._kept += self._room() - room
 
     # Preemption
 

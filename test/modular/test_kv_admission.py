@@ -162,7 +162,6 @@ def test_removing_the_head_makes_the_next_request_the_head():
 
     _remove(kv, "long")
 
-    assert kv._head_wait is None, "the removed head's last ask would still decide who passes the next one"
     assert _ready(kv, "short"), "a request that left still heads the queue"
 
 
@@ -278,7 +277,7 @@ def test_the_pages_a_request_that_passed_frees_go_to_the_head(leave):
 
     assert not _ready(kv, "q"), "a request passed a head that the room now covers"
     assert _ready(kv, "head"), "the head waits though the room, the page kept for it included, covers it"
-    assert getattr(kv._head_wait, "rid", None) != "head", "the admitted head's wait would decide who passes next"
+    assert kv._kept == 0, "the pages kept for the head outlived its admission, so the next head's passers wait"
 
 
 @pytest.mark.parametrize("slots, passes", [(5, True), (4, False)], ids=["a slot left for the head", "none left"])
@@ -335,7 +334,61 @@ def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds
 
     assert not _ready(kv, "p"), "p passed though the other pool had no slot for it"
     assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
-    assert kv._head_wait.rid == "head", "a request held back while passing took the place of the head it passed"
+
+
+class _Gate(Resource):
+    """A pool every request asks, which refuses the requests in ``refused``."""
+
+    passes = True
+
+    def __init__(self):
+        self.refused, self.held, self.moved = set(), set(), 0
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def ask(self, rid, node_name, graph_walk):
+        return None if rid in self.held else ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published, passing=False):
+        if rid in self.refused:
+            return self.moved
+        self.held.add(rid)
+        return None
+
+    def unreserve(self, rid):
+        self.held.discard(rid)
+
+    def grew_since(self, mark):
+        return self.moved != mark
+
+
+def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
+    kv = _manager(max_num_pages=16)
+    gate = _Gate()
+    # named to sort after "kv", so the runner reserves the KV first and the gate refuses after it
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "zgate": gate}, node_resources={NODE: ["kv", "zgate"]}))
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "x", list(range(6000, 6064)))
+    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - 1) * PAGE_SIZE)))
+    _laid_out(kv, "head", list(range(3000, 3000 + 5 * PAGE_SIZE)))
+    assert not _ready(kv, "head")
+    # "p" passes into the one free page, writes it and finishes, so that page is kept for the head
+    _prefill(kv, "p", HELD + list(range(4000, 4008)))
+    kv.remove_request("p")
+    # "x" finishes, so the head fits in the KV, but the gate refuses it and the KV's allotment is undone
+    kv.remove_request("x")
+    gate.refused.add("head")
+    assert not _ready(kv, "head")
+    # "fill" grows into all but the kept page, and the gate lets the head through, which the KV now refuses
+    _grow(kv, "fill", 4 * PAGE_SIZE)
+    gate.refused.clear()
+    gate.moved += 1
+    assert not _ready(kv, "head")
+    _laid_out(kv, "q", HELD + list(range(5000, 5008)), keyed=True)
+
+    assert not _ready(kv, "q"), "a request passed into the page kept for the head, lost when the gate refused the head"
 
 
 def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
