@@ -57,6 +57,7 @@ def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_O
 
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
+    recompile_limit: int | None = None,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
@@ -67,16 +68,30 @@ def compile_transformer_forward(
     activation decompositions round differently: ``exact_ops`` keeps those modules eager
     (``exclude_from_compile``) and compiles the rest — ``True`` for all of them, or a list of the
     op classes to keep eager (``["norms"]``, ``["activations"]``), since each excluded module is a
-    graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%)."""
+    graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%).
+
+    ``recompile_limit`` replaces the process-wide limit for this forward only. Past the limit a frame silently
+    runs uncompiled, inside the captured graphs too."""
     types = exact_op_types(exact_ops)
     if types:
         excluded = exclude_from_compile(transformer, types)
         logger.info("compiled transformer keeps %d modules (%s) on the eager kernels", excluded,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
     transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False),
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False, recompile_limit=recompile_limit),
         eager_rounding=bool(eager_rounding),
     )
+
+
+def step_schedule_recompile_limit(step_dtypes) -> int | None:
+    """The recompile limit for transformers run under a step schedule (``StepDtypes``): one per dtype compiles the
+    same code objects, so Dynamo's entries per frame grow with the dtypes (3 capture sizes x 8 batch sizes is 48
+    entries, 96 with a bf16 twin, past the default 84). None without a schedule."""
+    if step_dtypes is None:
+        return None
+    from mstar.engine import recompile_limit
+
+    return len(step_dtypes.dtypes) * recompile_limit()
 
 
 def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
