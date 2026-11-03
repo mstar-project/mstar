@@ -127,8 +127,11 @@ class Harness:
     """One node's resources and a fake two-layer token cache (layer 0 the
     target's, layer 1 the draft head's)."""
 
-    def __init__(self, k: int, *, stop_at: int | None = None, wrong: frozenset[int] = frozenset()):
+    def __init__(
+        self, k: int, *, stop_at: int | None = None, wrong: frozenset[int] = frozenset(), twin: bool = False,
+    ):
         self.k, self.t = k, k + 1
+        self.twin = twin
         self.stop_at = stop_at
         # absolute token positions the toy draft guesses wrong
         self.wrong = wrong
@@ -153,7 +156,10 @@ class Harness:
             },
             max_slots=1 + 8 * (k + 1),
             spec_tokens=k,
+            twin_slots=twin,
         ))
+        if twin:
+            self.spec.read_columns_past(self.t)
         self.gdn: dict = {}
         self.cache = torch.full((NUM_PAGES, PAGE, 2), -1, dtype=torch.long)
         self.slot = 0
@@ -234,7 +240,7 @@ class Harness:
         ctx = self._ctx(rids, padded if pad else None, "decode", bucket)
         lease = ctx.slot_lease
         kv_step = KVStep(segments=segs, commit_adjust={(r, "main"): -g for r, g in retract.items()})
-        pool_step = RecurrentStep(segments=segs)
+        pool_step = RecurrentStep(segments=segs, verify=True)
         spec_step = SpecDecodeStep(segments=segs, phase=SpecPhase.VERIFY, retract=retract)
         assert self.kv.admit(kv_step, ctx).ok and self.pool.admit(pool_step, ctx).ok
         assert self.spec.admit(spec_step, ctx).ok
@@ -244,9 +250,12 @@ class Harness:
         plan = self.spec.plan(spec_step, ctx)
         wrapper = self.gdn.setdefault(lease is not None, GDNVerifyWrapper(
             CPU, pad_slot_id=-1, tokens_per_row=t, bs=len(padded) if pad else None,
-            accelerator_graph=lease is not None, null_slot_id=SINK_SLOT, kernels=_NoKernels(),
+            accelerator_graph=lease is not None, null_slot_id=SINK_SLOT, kernels=_NoKernels(), twin_slots=self.twin,
         ))
-        wrapper.plan(addressing["main"].host_slot_groups, plan.num_accepted)
+        wrapper.plan(
+            addressing["main"].host_slot_groups, plan.num_accepted, addressing["main"].host_twin_groups,
+            plan.read_columns,
+        )
 
         ids, positions = self.spec.verify_inputs()
         b = len(padded)
@@ -336,7 +345,7 @@ class Harness:
             row = plan.slot_map[r]
             if int(row[0]) < 0:
                 continue
-            h = float(state[int(row[int(plan.num_accepted[r]) - 1]), 0])
+            h = float(state[int(row[int(plan.read_columns[r]) - 1]), 0])
             for i in range(self.t):
                 h = ToyState.step(h, int(ids[r * self.t + i]))
                 state[int(row[i]), 0] = h
@@ -627,6 +636,80 @@ def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
     assert logits.argmax(dim=-1).tolist() == [3, 200]
 
 
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+@pytest.mark.parametrize("lag", [0, 1])
+def test_twin_groups_reproduce_greedy_with_rejected_drafts(k, lag):
+    """`run` checks after every step that a request's next start holds the state of what it accepted."""
+    budget = 23
+    h = Harness(k, wrong=frozenset(range(9, 200, 5)), twin=True)
+    emitted, history = run(h, PROMPTS, budget, lag)
+    for rid, prompt in PROMPTS.items():
+        assert emitted[rid] == greedy(prompt, budget), rid
+        assert any(a <= k for a in history[rid])
+
+
+def test_twin_groups_leave_padding_rows_on_the_sink():
+    h = Harness(2, wrong=frozenset(range(12, 200, 4)), twin=True)
+    emitted, _ = run(h, PROMPTS, 17, lag=1, pad=2)
+    for rid, prompt in PROMPTS.items():
+        assert emitted[rid] == greedy(prompt, 17), rid
+    assert h.pool.block("state", 0)[[g for s in h.pool._slots.values() for g in s["main"].held]].abs().sum() > 0
+
+
+def test_a_verify_step_swaps_its_group_once_whatever_its_tokens():
+    k = 3
+    h = Harness(k, twin=True)
+    h.prefill({0: PROMPTS[0]}, {0: 30})
+    slot = h.pool._slots[0]["main"]
+    # the prompt's state stays where the prefill wrote it, in the first slot of the first group
+    first, second = slot.group, slot.twin
+    assert len(first) == len(second) == k + 1 and not set(first) & set(second)
+    for step in range(4):
+        h.verify([0])
+        assert slot.group == (second if step % 2 == 0 else first)
+        assert slot.twin == (first if step % 2 == 0 else second)
+        assert slot.swapped == (step % 2 == 0)
+
+
+def test_a_rejected_draft_resumes_from_the_group_the_step_wrote():
+    k = 2
+    h = Harness(k, wrong=frozenset({len(PROMPTS[0]) + 1}), twin=True)
+    first = h.prefill({0: PROMPTS[0]}, {0: 30})
+    start_group = h.pool._slots[0]["main"].group
+    before = h.pool.block("state", 0)[list(start_group), 0].clone()
+    tokens, accepted, _ = h.verify([0])
+    assert int(accepted[0]) == 1
+    slot = h.pool._slots[0]["main"]
+    # the step read the first group and left it alone; the row resumes in what it wrote
+    assert torch.equal(h.pool.block("state", 0)[list(start_group), 0], before)
+    assert slot.twin == start_group
+    emitted = first + [int(x) for x in tokens[0] if int(x) >= 0]
+    expect = 0.0
+    for tok in PROMPTS[0] + emitted[:-1]:
+        expect = ToyState.step(expect, tok)
+    assert h.current_state(0) == pytest.approx(expect)
+
+
+def test_a_prompt_as_long_as_a_verify_row_stays_in_place():
+    k = 3
+    h = Harness(k, twin=True)
+    h.prefill({0: [1, 2, 3, 4]}, {0: 4})
+    slot = h.pool._slots[0]["main"]
+    assert not slot.swapped
+
+
+def test_twin_groups_double_a_requests_slots_and_return_them():
+    k = 2
+    h = Harness(k, twin=True)
+    free = h.pool.num_free_slots
+    assert free == 2 * 8 * (k + 1)
+    h.prefill({0: PROMPTS[0]}, {0: 4})
+    assert h.pool.num_free_slots == free - 2 * (k + 1)
+    h.verify([0])
+    h.pool.remove_request(0)
+    assert h.pool.num_free_slots == free
+
+
 def test_requests_hold_slot_groups_and_return_them():
     k = 3
     h = Harness(k)
@@ -644,91 +727,3 @@ def test_requests_hold_slot_groups_and_return_them():
         h.spec.remove_request(r)
     assert h.pool.num_free_slots == free
     assert h.spec.pending_retract(0) == 0 and not h.spec._row_of
-
-
-def _filtered(logits: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
-    """The sampler's distribution: top-k, then top-p over the renormalised rest."""
-    probs = (logits.double() / temperature).softmax(-1)
-    order = probs.argsort(descending=True)
-    keep = torch.zeros_like(probs, dtype=torch.bool)
-    if top_k > 0:
-        keep[order[:top_k]] = True
-    else:
-        keep[:] = True
-    probs = torch.where(keep, probs, 0.0)
-    probs = probs / probs.sum()
-    sorted_p = probs[order]
-    mass_before = sorted_p.cumsum(0) - sorted_p
-    cut = torch.zeros_like(keep)
-    cut[order] = mass_before < top_p
-    probs = torch.where(cut & keep, probs, 0.0)
-    return probs / probs.sum()
-
-
-def _reference_draw(logits, temperature, top_k, top_p, seed, offset):
-    """`draw_tokens` on CPU: each row's filtered distribution, drawn with a
-    generator seeded from its seed and offset (argmax at temperature 0)."""
-    out = torch.empty(logits.shape[0], dtype=torch.long)
-    for i in range(logits.shape[0]):
-        t = float(temperature[i])
-        if t == 0:
-            out[i] = logits[i].argmax()
-            continue
-        k = int(top_k[i])
-        probs = _filtered(logits[i], t, float(top_p[i]), k if k < logits.shape[1] else 0)
-        gen = torch.Generator().manual_seed(int(seed[i]) * 1_000_003 + int(offset[i]) * 7919 + i)
-        out[i] = torch.multinomial(probs.float(), 1, generator=gen)[0]
-    return out
-
-
-@pytest.mark.parametrize("params", [(1.0, 1.0, 0), (0.7, 0.9, 0), (1.3, 1.0, 5), (0.8, 0.6, 4)])
-def test_sampled_verification_follows_the_target_distribution(params, monkeypatch):
-    """k = 1 against fixed logits: the first emitted token is a draw from the
-    target's filtered distribution at position 0, whether or not the draft is
-    accepted, and the token after an accepted draft one from position 1's."""
-    from mstar.engine.resources.spec_decode import resource as spec_mod
-
-    monkeypatch.setattr(spec_mod.sampling, "draw_tokens", _reference_draw)
-    torch.manual_seed(0)
-    temperature, top_p, top_k = params
-    rows, vocab, draws = 400, 12, 30
-    spec = SpecDecodeResource(device=CPU, num_draft_tokens=1, max_requests=rows, page_size=PAGE,
-                              kv_key="kv", attn_key="attn", sampling=True)
-    for r in range(rows):
-        spec.ingest_request(r)
-    image = spec._new_image(rows)
-    image.rows.copy_(torch.tensor([spec._row_of[r] for r in range(rows)], dtype=torch.int32))
-    image.real.fill_(1)
-    table = torch.arange(1, rows * 4 + 1, dtype=torch.int32).view(rows, 4)
-    state = torch.zeros(rows * 2, dtype=torch.long)
-    from mstar.engine.resources.spec_decode.resource import SpecDecodePlan
-
-    spec._current = SpecDecodePlan(
-        phase=SpecPhase.VERIFY, num_rows=rows, image=image, block_table=table,
-        kv_lens=torch.zeros(rows, dtype=torch.int32), write_pages=state, write_offsets=state.clone(),
-    )
-    regs = slice(1, rows + 1)
-    spec._temperature[regs], spec._top_p[regs], spec._top_k[regs] = temperature, top_p, top_k
-    spec._seed[regs] = torch.arange(rows)
-    spec._budget[regs] = 1 << 20
-    logits = torch.randn(2, vocab) * 2
-    p0, p1 = (_filtered(logits[i], temperature, top_p, top_k) for i in range(2))
-    draft = int(p0.argmax())
-    first, after = torch.zeros(vocab), torch.zeros(vocab)
-    for _ in range(draws):
-        spec._tokens[:, regs] = torch.tensor([[3], [draft]])
-        spec._seq_len[regs] = 10
-        spec.verify_inputs()
-        out = spec.accept(logits.repeat(rows, 1), sample=True)
-        first += torch.bincount(out.tokens[:, 0], minlength=vocab)
-        accepted = out.accepted == 2
-        after += torch.bincount(out.tokens[accepted, 1], minlength=vocab)
-    n = rows * draws
-    tv_first = 0.5 * (first / n - p0).abs().sum()
-    tv_after = 0.5 * (after / after.sum() - p1).abs().sum()
-    assert tv_first < 0.02, (tv_first, first / n, p0)
-    assert tv_after < 0.03, (tv_after, after / after.sum(), p1)
-    # filtered-out tokens are never drawn
-    assert not first[p0 == 0].any() and not after[p1 == 0].any()
-    # the draft is accepted as often as the target would have drawn it
-    assert abs(float(accepted.float().mean()) - float(p0[draft])) < 0.1

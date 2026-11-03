@@ -285,8 +285,9 @@ class RecurrentStateConfig:
     # other and the two swap at commit. Writing what the same kernel just read
     # costs far more than the traffic (MI325X, 64 rows of 16 x 128 x 128 fp32:
     # 45 us a layer in place, 35 us out of place), and the values are the same.
-    # Needs a backend whose decode kernels take both slots; not with speculation,
-    # whose slots already hold a state per token.
+    # Needs a backend whose decode kernels take both slots. Under speculation a
+    # verify step reads one group of k + 1 slots and writes the other, one swap
+    # a step, so a rejected draft's state is simply never read.
     twin_slots: bool = False
 
     def __post_init__(self):
@@ -385,7 +386,11 @@ class RecurrentStep(ResourceStep):
 
     Forks mirror ``KVStep``'s: ``(from_label, to_label)`` pairs, reserved at
     admit and copied at plan (pre) or commit (post).
+
+    ``verify`` marks a speculative verify step, which spans alone can't tell from
+    a prompt of the same length.
     """
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    verify: bool = False

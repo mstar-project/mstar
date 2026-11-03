@@ -107,8 +107,10 @@ class GDNManager(LinearAttnManager):
                     f"{self._pool_key!r} declares twin_slots, but its GDN kernels "
                     f"({type(self._kernels).__name__}) update a slot in place"
                 )
-            # a split walk's decode kernel takes every row, on buffers of its own
-            self._pool.keep_in_place(frozenset(self._splits))
+            self._pool.split_walks(frozenset(self._splits))
+            spec = resources.get(self._spec_key)
+            if spec is not None:
+                spec.read_columns_past(self._pool.config.spec_tokens + 1)
 
     # Step lifecycle
 
@@ -192,8 +194,11 @@ class GDNManager(LinearAttnManager):
                 accelerator_graph=lease is not None,
                 null_slot_id=SINK_SLOT if self._has_sink else NO_SLOT,
                 kernels=self._kernels,
+                twin_slots=addressing.host_twin_groups is not None,
             )
-        wrapper.plan(groups[: addressing.num_rows], verify.num_accepted)
+        rows = addressing.num_rows
+        twins = addressing.host_twin_groups
+        wrapper.plan(groups[:rows], verify.num_accepted, None if twins is None else twins[:rows], verify.read_columns)
         return wrapper
 
     def _get_wrapper(
@@ -288,10 +293,12 @@ class GDNManager(LinearAttnManager):
             checkpoints = self._checkpoint_buffer(sum(max(span, 1) // every for span in spans))
         if split is not None and addressing.host_slot_indices is not None:
             wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=split)
+            writes = addressing.host_write_slots
             wrapper.plan(
                 spans, addressing.host_slot_indices[:num_rows],
                 addressing.host_has_state[:num_rows],
                 addressing.snapshots, every, checkpoints,
+                None if writes is None else writes[:num_rows],
             )
             return wrapper
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)

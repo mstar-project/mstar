@@ -61,6 +61,8 @@ MAX_SLOTS = 12
 # K = V = 128: Qwen3.5's head dims, and the HIP hidden-state stage's only shape
 GQA = DeltaNetGeometry(num_k_heads=4, num_v_heads=8, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
 MHA = DeltaNetGeometry(num_k_heads=4, num_v_heads=4, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
+# what one of two ranks holds of Qwen3.5's 16 x 16 heads
+TP2_SHARD = DeltaNetGeometry(num_k_heads=8, num_v_heads=8, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
 
 # bf16 activations against an fp32 reference
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
@@ -461,18 +463,18 @@ def test_captured_decode_replays_with_slot_reuse(flydsl):
 # --- twin slots: the same decode, read from one slot and written to another -------
 
 
-def _conv_weights(seed=2):
+def _conv_weights(seed=2, geometry=GQA):
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    dim = 2 * GQA.num_k_heads * GQA.head_k_dim + GQA.num_v_heads * GQA.head_v_dim
+    dim = geometry.conv_dim
     weight = (torch.randn(dim, 4, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
     bias = (torch.randn(dim, generator=gen, device=DEV) * 0.1).to(torch.bfloat16)
     return dim, weight, bias
 
 
-def _layer(manager, pool, x, w, conv):
+def _layer(manager, pool, x, w, conv, geometry=GQA):
     """A delta-net layer's two kernels on one step's rows: conv, then the rule."""
     dim, weight, bias = conv
-    hk, kd, hv, vd = GQA.num_k_heads, GQA.head_k_dim, GQA.num_v_heads, GQA.head_v_dim
+    hk, kd, hv, vd = geometry.num_k_heads, geometry.head_k_dim, geometry.num_v_heads, geometry.head_v_dim
     qkv = torch.cat((x["q"].flatten(1), x["k"].flatten(1), x["v"].flatten(1)), dim=1)
     qkv = manager.run_conv(qkv, conv_layer=pool.block("conv", 0), weight=weight, bias=bias)
     n = qkv.shape[0]
@@ -493,14 +495,15 @@ def _seed_state(pool, rid, seed):
     conv[slot.index] = torch.randn(conv[slot.index].shape, generator=gen, device=DEV).to(conv.dtype)
 
 
+@pytest.mark.parametrize("geometry", [GQA, TP2_SHARD], ids=["one-rank", "tp2-shard"])
 @pytest.mark.parametrize("rows", [1, 3, 8])
-def test_twin_slots_decode_what_in_place_decodes(rows):
+def test_twin_slots_decode_what_in_place_decodes(rows, geometry):
     """Eager, three steps: output, and the state and conv tail in whichever slot now holds them, bit-equal."""
-    plain_pool, plain = build()
-    twin_pool, twin = build(twin_slots=True)
+    plain_pool, plain = build(geometry)
+    twin_pool, twin = build(geometry, twin_slots=True)
     twin.bind_dependencies({POOL: twin_pool})
     rids = [f"r{i}" for i in range(rows)]
-    w, conv = weights(), _conv_weights()
+    w, conv = weights(geometry), _conv_weights(geometry=geometry)
     for step in range(3):
         rstep_p, ctx_p = plan_step(plain_pool, plain, [(r, 1) for r in rids], walk="decode")
         rstep_t, ctx_t = plan_step(twin_pool, twin, [(r, 1) for r in rids], walk="decode")
@@ -509,9 +512,9 @@ def test_twin_slots_decode_what_in_place_decodes(rows):
             for i, rid in enumerate(rids):
                 _seed_state(plain_pool, rid, 100 + i)
                 _seed_state(twin_pool, rid, 100 + i)
-        x = inputs(rows, seed=step)
-        qkv_p, out_p = _layer(plain, plain_pool, x, w, conv)
-        qkv_t, out_t = _layer(twin, twin_pool, x, w, conv)
+        x = inputs(rows, geometry, seed=step)
+        qkv_p, out_p = _layer(plain, plain_pool, x, w, conv, geometry)
+        qkv_t, out_t = _layer(twin, twin_pool, x, w, conv, geometry)
         torch.cuda.synchronize()
         assert torch.equal(qkv_p, qkv_t) and torch.equal(out_p, out_t)
         plain_pool.commit(rstep_p, ctx_p)
@@ -556,7 +559,7 @@ def test_twin_slots_replay_a_captured_decode_without_touching_other_slots():
         x = inputs(bs, seed=step)
         for name, t in static.items():
             t.copy_(x[name])
-        held = {pool._slots[r]["main"].index for r in rows} | {pool._slots[r]["main"].extra[0] for r in rows}
+        held = {pool._slots[r]["main"].index for r in rows} | {pool._slots[r]["main"].twin[0] for r in rows}
         before = pool.block("state", 0).clone()
         graphs[step % 2].replay()
         refs = _layer(plain, plain_pool, {k: v[: len(rows)] for k, v in x.items()}, w, conv)[1]
@@ -597,6 +600,58 @@ def test_a_conv_with_write_slots_leaves_the_read_slot_alone():
 
 
 # --- a combined walk's step: decode rows beside prompts ---------------------------
+
+
+@pytest.mark.parametrize("bucket", [False, True], ids=["eager", "bucket"])
+def test_twin_slots_take_a_mixed_step_as_in_place_does(bucket):
+    """Three steps of a split walk over both pools, a row turning from prompt to decode rows on the way: output, and
+    the state and conv tail in whichever slot now holds them, bit-equal. The kernels leave every slot that is neither
+    a decode row's two nor a prompt row's own, and a decode row's read slot, as they found them."""
+    split = CombinedSplit("mixed", prefill_walks=("prefill",))
+    plain_pool, plain = build(splits=(split,))
+    twin_pool, twin = build(splits=(split,), twin_slots=True)
+    twin.bind_dependencies({POOL: twin_pool})
+    w, conv = weights(), _conv_weights()
+    first = [("d0", 5), ("d1", 7)]
+    for pool, manager in ((plain_pool, plain), (twin_pool, twin)):
+        rstep, ctx = plan_step(pool, manager, first, walk="prefill")
+        _layer(manager, pool, inputs(12, seed=7), w, conv)
+        pool.commit(rstep, ctx)
+    torch.cuda.synchronize()
+
+    state, conv_block = twin_pool.block("state", 0), twin_pool.block("conv", 0)
+    script = [
+        [("d0", 1), ("p0", 23), ("d1", 1)],
+        [("d0", 1), ("p0", 1), ("p1", 9), ("d1", 1)],
+        [("d0", 1), ("p0", 1), ("p1", 1), ("d1", 1)],
+    ]
+    for i, rows in enumerate(script):
+        real = sum(s for _, s in rows)
+        lease, padding, width = None, (), real
+        if bucket:
+            lease = SlotLease(slot=0, bucket=BucketKey("mixed", bs=8, num_tokens=64))
+            padding, width = tuple(f"__cg_{j}" for j in range(8 - len(rows))), 64
+        x = inputs(real, seed=30 + i)
+        xin = {n: torch.cat((t, t.new_full((width - real, *t.shape[1:]), 1e4))) for n, t in x.items()}
+        rstep_p, ctx_p = plan_step(plain_pool, plain, rows, walk="mixed", lease=lease, padding=padding)
+        rstep_t, ctx_t = plan_step(twin_pool, twin, rows, walk="mixed", lease=lease, padding=padding)
+        assert isinstance(twin.current_plan(), GDNMixedWrapper)
+        reads = [
+            twin_pool._slots[r]["main"].index for r, s in rows
+            if s == 1 and twin_pool._slots[r]["main"].has_state
+        ]
+        before_state, before_conv = state[reads].clone(), conv_block[reads].clone()
+        qkv_p, out_p = _layer(plain, plain_pool, xin, w, conv)
+        qkv_t, out_t = _layer(twin, twin_pool, xin, w, conv)
+        torch.cuda.synchronize()
+        assert torch.equal(qkv_p[:real], qkv_t[:real]) and torch.equal(out_p[:real], out_t[:real])
+        assert torch.equal(state[reads], before_state) and torch.equal(conv_block[reads], before_conv)
+        plain_pool.commit(rstep_p, ctx_p)
+        twin_pool.commit(rstep_t, ctx_t)
+        for rid, _ in rows:
+            a, b = plain_pool._slots[rid]["main"], twin_pool._slots[rid]["main"]
+            for name in ("state", "conv"):
+                assert torch.equal(plain_pool.block(name, 0)[a.index], twin_pool.block(name, 0)[b.index]), (i, rid)
 
 
 @pytest.mark.parametrize("bucket", [False, True], ids=["eager", "bucket"])

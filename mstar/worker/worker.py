@@ -3689,7 +3689,8 @@ class Worker:
         ranks vote once per step: a row that failed after the forward on any rank
         fails on every rank. A step that raised, was admitted, or ran different
         rows on some ranks only has already mismatched their collectives, and
-        stops the instance with the reason rather than hang it.
+        stops the instance with the reason rather than hang it. So does one whose
+        ranks read different twin slots, which would otherwise go on silently.
         """
         # before the collective: if it raises, the error handler must not vote on
         # this step again
@@ -3697,12 +3698,14 @@ class Worker:
         node_batch = pending.node_batch
         refused = int(node_batch.admit_error is not None)
         rows = len(node_batch.request_ids)
+        parity = node_batch.step_context.slot_parity
         joint = self.parallel_groups.get_joint_group_for_node(pending.node_name)
         with self._span("worker.tp_step_vote"):
             (seq_hi, neg_seq_lo, any_raised, any_ran, any_refused, any_admitted,
-             rows_hi, neg_rows_lo, any_failed) = joint.agree(
+             rows_hi, neg_rows_lo, any_failed, parity_hi, neg_parity_lo) = joint.agree(
                 [pending.tp_seq, -pending.tp_seq, int(raised), int(not raised),
-                 refused, 1 - refused, rows, -rows, int(bool(node_batch.failed_requests))],
+                 refused, 1 - refused, rows, -rows, int(bool(node_batch.failed_requests)),
+                 parity, -parity],
                 ReduceOp.MAX,
             )
         if seq_hi != -neg_seq_lo:
@@ -3715,6 +3718,9 @@ class Worker:
             raise self._divergence(pending, "it was admitted on some ranks and refused on others")
         if rows_hi != -neg_rows_lo:
             raise self._divergence(pending, f"it ran {-neg_rows_lo} rows on one rank and {rows_hi} on another")
+        if parity_hi != -neg_parity_lo:
+            # no collective notices this: each rank's state shard would just stop matching the others'
+            raise self._divergence(pending, "its ranks read different twin slots of the recurrent state")
         if any_failed:
             self._agree_on_failed_rows(pending)
         pending.failed_on_a_rank = bool(any_failed)

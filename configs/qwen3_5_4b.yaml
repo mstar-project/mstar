@@ -5,6 +5,15 @@ node_groups:
   # encoder runs once per request, then idles.
   - node_names: [LLM, vision_encoder]
     ranks: [0]
+platform_overrides:
+  rocm:
+    # Twice the GDN state's memory, for a decode step that reads a request's state from one slot
+    # and writes it to the other. Same values.
+    resources:
+      gdn_state:
+        max_slots: 129
+        prefix_slots: 128
+        twin_slots: true
 resources:
   gdn_state:
     max_slots: 129

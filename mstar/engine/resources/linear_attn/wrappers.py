@@ -507,12 +507,12 @@ class GDNMixedWrapper(GDNWrapper):
     The chunked path over every row gathers and scatters each row's whole
     recurrent state (~1 MB a row at 16 heads x 128 x 128 fp32) and runs the
     chunked kernel on rows that need one recurrent update. Here the decode
-    kernel takes every row, updating the decode rows' state in place by slot
-    (the others point at the null slot, which it skips), and the prefill path
-    takes at most ``max_prefill_rows`` prompt rows, its tokens moved to the
-    front by a planned permutation. Both run over static shapes: the bucket's
-    rows and tokens, and ``max_prefill_rows`` sequences. Both halves run the
-    resource's ``GDNKernels``.
+    kernel takes every row, updating the decode rows' state by slot, in place or
+    into each row's twin (the others point at the null slot, which it skips), and
+    the prefill path takes at most ``max_prefill_rows`` prompt rows in place, its
+    tokens moved to the front by a planned permutation. Both run over static
+    shapes: the bucket's rows and tokens, and ``max_prefill_rows`` sequences. Both
+    halves run the resource's ``GDNKernels``.
 
     A one-token row without state (a one-token prompt) is a prompt row: the
     decode kernel reads the slot as it is, and a fresh slot is not cleared.
@@ -588,6 +588,7 @@ class GDNMixedWrapper(GDNWrapper):
         snapshots: Sequence[tuple[int, int, int]] = (),
         every: int = 0,
         checkpoints: torch.Tensor | None = None,
+        host_write_slots: Sequence[int] | None = None,
     ):
         null = self._null_slot_id
         span = np.asarray(spans, dtype=np.int64)
@@ -623,6 +624,11 @@ class GDNMixedWrapper(GDNWrapper):
         dec_dst[:rows] = np.where(decode, start, tokens)
         dec_slots[:rows] = np.where(decode, slot, null)
         pad = cap - len(prefill_rows)
+        dwrite_buf = None
+        if host_write_slots is not None:
+            dec_writes = np.full(bs, null, dtype=np.int64)
+            dec_writes[:rows] = np.where(decode, np.asarray(host_write_slots, dtype=np.int64), null)
+            dwrite_buf = self._buf("dec_writes", bs, torch.int32)
         pre_spans = span[prefill_rows].tolist() + [0] * pad
         pre_slots = np.concatenate([slot[prefill_rows], np.full(pad, null)])
         pre_has = np.concatenate([has[prefill_rows], np.zeros(pad, dtype=bool)])
@@ -638,6 +644,8 @@ class GDNMixedWrapper(GDNWrapper):
         self._stage.upload("dec_src", dec_src, src_buf)
         self._stage.upload("dec_dst", dec_dst, dst_buf)
         self._stage.upload("dec_slots", dec_slots, dslot_buf)
+        if dwrite_buf is not None:
+            self._stage.upload("dec_writes", dec_writes, dwrite_buf)
         self._stage.upload("pre_slots", pre_slots, pslot_buf)
         self._stage.upload("pre_has", pre_has, phas_buf)
         self._stage.end()
@@ -654,7 +662,7 @@ class GDNMixedWrapper(GDNWrapper):
         self._prefill.plan(
             pre_spans, pslot_buf[:cap], phas_buf[:cap], pre_snapshots, every, checkpoints,
         )
-        self._decode.plan([1] * bs, dslot_buf[:bs])
+        self._decode.plan([1] * bs, dslot_buf[:bs], None if dwrite_buf is None else dwrite_buf[:bs])
 
     def _split(self, x: torch.Tensor):
         """``x`` with its prompt tokens first, and each row's decode token."""
@@ -711,6 +719,10 @@ class GDNVerifyWrapper(GDNWrapper):
     window is one slot wide by k + width - 1 and slides by the accepted count
     the same way. Padding rows (a group on the pool's null slot) are skipped
     by both kernels.
+
+    With twin slots a request holds a second group: the row reads its start and
+    its conv window from one and writes everything to the other, so nothing is
+    written over what the step read, and the groups swap at commit.
     """
 
     def __init__(
@@ -722,6 +734,7 @@ class GDNVerifyWrapper(GDNWrapper):
         accelerator_graph: bool = False,
         null_slot_id: int = 0,
         kernels: GDNKernels | None = None,
+        twin_slots: bool = False,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id,
@@ -732,6 +745,10 @@ class GDNVerifyWrapper(GDNWrapper):
             raise ValueError("GDNVerifyWrapper needs the resource's GDNKernels")
         self._kernel: GDNPrefillKernel = kernels.verify()
         self._tokens = tokens_per_row
+        self._twin = twin_slots
+        # a row's columns of the image's slot map and conv slots
+        self._map_columns = tokens_per_row * (2 if twin_slots else 1)
+        self._conv_columns = 2 if twin_slots else 1
         self._stager = PinnedStager(torch.int32)
         self._mirror = H2DMirror() if accelerator_graph else None
         # [slot_map | conv_slots | cu_seqlens], one H2D a step, sized once to
@@ -739,18 +756,34 @@ class GDNVerifyWrapper(GDNWrapper):
         self._image: torch.Tensor | None = None
         self._rows_capacity = 0
         self._plan_state: GDNVerifyPlan | None = None
+        # which column of the conv slots a row reads, and which it writes
+        self._conv_read: torch.Tensor | None = None
+        self._conv_write: torch.Tensor | None = None
+
+    def _layout(self, cap: int) -> tuple[int, int, int]:
+        """Where the image's slot map and conv slots end, and its length."""
+        map_end = cap * self._map_columns
+        conv_end = map_end + cap * self._conv_columns
+        return map_end, conv_end, conv_end + cap + 1
 
     def _views(self, rows: int):
-        t = self._tokens
         cap = self._rows_capacity
         image = self._image
-        slot_map = image[: cap * t].view(cap, t)
-        conv = image[cap * t: cap * t + cap]
-        cu = image[cap * (t + 1): cap * (t + 1) + cap + 1]
+        map_end, conv_end, end = self._layout(cap)
+        slot_map = image[:map_end].view(cap, self._map_columns)
+        conv = image[map_end:conv_end]
+        if self._twin:
+            conv = conv.view(cap, self._conv_columns)
+        cu = image[conv_end:end]
         return slot_map[:rows], conv[:rows], cu[: rows + 1]
 
-    def plan(self, groups, num_accepted: torch.Tensor):
+    def plan(
+        self, groups, num_accepted: torch.Tensor, twins=None, read_columns: torch.Tensor | None = None,
+    ):
         rows, t = len(groups), self._tokens
+        assert self._twin == (twins is not None), (
+            "a verify wrapper's graph holds one layout; a twin pool's verify steps all write twins"
+        )
         need = max(rows, self._bs or 0) if self._accelerator_graph else rows
         if need > self._rows_capacity:
             if self._image is not None and self._accelerator_graph:
@@ -759,27 +792,37 @@ class GDNVerifyWrapper(GDNWrapper):
                     "its captured graph holds"
                 )
             self._rows_capacity = max(need, 1)
-            self._image = torch.zeros(
-                self._rows_capacity * (t + 2) + 1, dtype=torch.int32, device=self._device,
-            )
+            self._image = torch.zeros(self._layout(self._rows_capacity)[2], dtype=torch.int32, device=self._device)
+            if self._twin:
+                i32 = dict(dtype=torch.int32, device=self._device)
+                self._conv_read = torch.zeros(self._rows_capacity, **i32)
+                self._conv_write = torch.ones(self._rows_capacity, **i32)
             if self._mirror is not None:
                 self._mirror.invalidate()
         cap = self._rows_capacity
         null = self._null_slot_id
-        host = np.full(cap * (t + 2) + 1, -1, dtype=np.int32)
-        slot_map = host[: cap * t].reshape(cap, t)
-        conv = host[cap * t: cap * t + cap]
+        map_end, conv_end, end = self._layout(cap)
+        host = np.full(end, -1, dtype=np.int32)
+        slot_map = host[:map_end].reshape(cap, self._map_columns)
+        conv = host[map_end:conv_end].reshape(cap, self._conv_columns)
         conv[:] = null
         for i, group in enumerate(groups):
             if group[0] != null:
-                slot_map[i] = group
-                conv[i] = group[0]
-        host[cap * (t + 1): cap * (t + 1) + cap + 1] = np.arange(cap + 1, dtype=np.int32) * t
+                if twins is None:
+                    slot_map[i] = group
+                    conv[i] = group[0]
+                else:
+                    twin = twins[i]
+                    slot_map[i, :t] = twin
+                    slot_map[i, t:] = group
+                    conv[i] = group[0], twin[0]
+        host[conv_end:end] = np.arange(cap + 1, dtype=np.int32) * t
         self._stager.copy_(self._image, host, mirror=self._mirror)
         slot_map_d, conv_d, cu_d = self._views(rows)
         self._plan_state = GDNVerifyPlan(
             slot_map=slot_map_d, conv_slots=conv_d, cu_seqlens=cu_d,
             num_accepted=num_accepted[:rows], num_rows=rows, tokens_per_row=t,
+            read_columns=(num_accepted if read_columns is None else read_columns)[:rows],
         )
 
     def run_conv(
@@ -793,6 +836,13 @@ class GDNVerifyWrapper(GDNWrapper):
         from mstar.utils.causal_conv1d import causal_conv1d_update
 
         plan = self._plan_state
+        twin = {}
+        if self._twin:
+            # the update kernel reads its window and writes it through these columns of `conv_slots`
+            twin = dict(
+                initial_state_idx=self._conv_read[: plan.num_rows],
+                block_idx_last_scheduled_token=self._conv_write[: plan.num_rows],
+            )
         return causal_conv1d_update(
             x=x,
             conv_state=conv_layer,
@@ -804,6 +854,7 @@ class GDNVerifyWrapper(GDNWrapper):
             query_start_loc=plan.cu_seqlens,
             max_query_len=plan.tokens_per_row,
             null_block_id=self._null_slot_id,
+            **twin,
         )
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):

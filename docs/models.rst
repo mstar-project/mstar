@@ -382,10 +382,16 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
-On AMD GPUs the 0.8B, 2B and 9B configs also set ``gdn_state.twin_slots``: a request
-holds two slots, a decode step reads one and writes the other, and ``max_slots`` still
-counts requests. The state's memory doubles, and its traffic takes 22-48 % less time
-at 16-64 rows (0.8B, MI325X), with the same values.
+On AMD GPUs the 0.8B, 2B, 4B and 9B configs and 9B TP2 also set
+``gdn_state.twin_slots``: a request holds two slots, a decode step reads one and writes
+the other, and ``max_slots`` still counts what it counted (requests, or a speculative
+config's slots per token). The state's memory doubles, and its traffic takes 22-48 % less
+time at 16-64 rows (0.8B, MI325X), with the same values. A speculative verify step reads
+its start from one group of ``k + 1`` slots and writes every token's state to the other,
+but the MTP configs leave the key off: 9B showed no gain beyond run spread on MI325X for
+9-13 GiB more. A mixed step's decode rows write their twins while its prompt rows update
+in place; under TP each rank holds its shard's two slots, and the ranks compare which
+twin each row reads in their vote on the step.
 
 On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
 auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
@@ -407,12 +413,13 @@ tokens it accepts as one chunk. A request holds ``k + 1`` recurrent-state slots,
 so ``gdn_state.max_slots`` is ``1 + concurrency * (k + 1)`` (the configs: 64
 requests); the KV cache gains one layer for the head. The ``mtp3`` configs verify
 greedily and refuse ``temperature > 0``; the ``mtp2`` ones set ``spec_sampling:
-true`` and also sample (temperature, ``top_p``, ``top_k``; a second decode capture),
-seeded by the request but not reproducing the plain path's draws. Neither takes
-``repetition_penalty``. The configs set ``draft_head: fp8``: drafts read an fp8 copy
-of ``lm_head`` (one rank; ``draft_head: bf16`` keeps one head), which gives up about
-1 % of the accepted drafts for a step about 6 % cheaper at 9B c=1 on MI325X, and the
-verify always reads the full head. They need
+true`` and also sample (temperature, ``top_p``, ``top_k``; a second decode capture) by
+speculative sampling, so a request's tokens follow the plain sampler's distribution and
+repeat for its seed at the same batch position, without reproducing the plain path's
+draws. Neither takes ``repetition_penalty``. The configs set ``draft_head: fp8``: greedy
+drafts read an fp8 copy of ``lm_head`` (one rank; ``draft_head: bf16`` keeps one head),
+which gives up about 1 % of the accepted drafts for a step about 6 % cheaper at 9B c=1
+on MI325X. The verify and sampled drafts always read the full head. They need
 AITER's attention (device-side KV lengths) and are checked on text prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
