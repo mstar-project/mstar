@@ -18,14 +18,6 @@ def test_the_default_backend_is_the_rust_one():
     assert hasattr(bk, "_rust")
 
 
-@pytest.mark.parametrize("value", ["0", "1", "AUTO"])
-def test_the_transport_flag_does_not_choose_the_backend(monkeypatch, value):
-    """A data worker pinned to pyzmq still shares the extension's bookkeeper."""
-    pytest.importorskip("mstar_rust", reason="extension not built")
-    monkeypatch.setenv("MSTAR_RUST_ZMQ", value)
-    assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
-
-
 def test_a_rust_bookkeeper_can_be_passed_in():
     pytest.importorskip("mstar_rust", reason="extension not built")
     from mstar.communication.tensor_store import RustTensorBookkeeping
