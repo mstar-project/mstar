@@ -156,3 +156,18 @@ def test_the_mi325x_vf_picks_its_tuned_entries_per_batch(monkeypatch):
             assert up == want, (shape, m)
             assert down == {**want, **raw[entry].get("down", {}), "BLOCK_SIZE_M": want["BLOCK_SIZE_M"]}
             assert up != kernels.get_default_config(m, *shape, top_k=8)
+
+
+def test_the_mi325x_thinker_runs_the_default_tile_at_512_tokens(monkeypatch):
+    """The sweep's 512-token pick (32-row tiles, 8 warps), timed on uniform
+    routing, ran the Thinker's packed 512-token prefill steps at half the
+    default tile's speed when served, so that entry is the untuned launch."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "AMD Instinct MI325X VF")
+    monkeypatch.setattr(kernels, "current_platform", _Platform(True))
+    shape = (128, 1536, 2048)
+    untuned = {**kernels.get_default_config(512, *shape, top_k=8), "num_warps": 4, "num_stages": 2}
+    for m in (512, 400, 700):
+        assert kernels.get_config(M=m, E=shape[0], N=shape[1], K=shape[2], top_k=8) == (untuned, untuned), m
+    assert kernels.get_config(M=256, E=shape[0], N=shape[1], K=shape[2], top_k=8)[0] != untuned
+    assert kernels.get_config(M=1024, E=shape[0], N=shape[1], K=shape[2], top_k=8)[0] != untuned
