@@ -69,9 +69,12 @@ Once a deployment has reloaded its weights in place (``weight_version`` set by t
 update), every output chunk's ``metadata`` carries ``weight_version``, the version its
 request was admitted under, and so does a non-streaming response at the top level. A
 request never runs across a reload, so all of a request's chunks carry the same one.
-An error chunk carries it when the request was admitted; one for a request refused
-before admission (for example while generation is paused) has none. Before any
-reload the field is absent.
+An error chunk carries it when the engine answered for an admitted request, or, failing
+that, when the request had already sent a versioned chunk. It has none for a request
+refused before admission (for example while generation is paused), nor for an error the
+API server raises before any chunk arrived (the conductor exiting, a live call's append
+refused). On ``/generate/ws`` the error reply carries the error chunk's version the same
+way, and the ``finish`` message carries none. Before any reload the field is absent.
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
 arrive. A request that fails after its stream has started ends it with one chunk of
@@ -381,11 +384,17 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
-  ``/v1/images/edits`` for image output.
+  ``/v1/images/edits`` for image output, with ``output_format`` and ``output_compression``
+  as for FLUX.2 klein below.
 - **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
   klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
   ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
-  WebP quality) and ``png_compress_level`` (0-9, default 1) via ``extra_body``.
+  WebP quality, 0-100) and ``png_compress_level`` (0-9, default 1) via ``extra_body``; a
+  value of the chosen format's knob that is not a whole number in range (``90``, ``90.0``
+  and ``"90"`` are; ``true`` and ``50.9`` are not) is a 400, the other format's knob is
+  ignored, and ``null`` means the default. The PNG writer favours
+  speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL's
+  defaults; a higher ``png_compress_level`` shrinks them.
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.

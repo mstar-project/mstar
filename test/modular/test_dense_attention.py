@@ -69,11 +69,11 @@ def _manager(wrapper_class=DensePrefixedPrefillWrapper, **kwargs) -> DenseAttent
     )
 
 
-def _ctx(views: list[SequenceView], **kwargs) -> StepContext:
+def _ctx(views: list[SequenceView], slot: int = 0, **kwargs) -> StepContext:
     return StepContext(
         request_ids=tuple(dict.fromkeys(view.request_id for view in views)),
         graph_walk="gen",
-        slot=0,
+        slot=slot,
         capture=False,
         plan_results={
             "kv": {"main": KVPlanOutput(cpu_indptrs=None, cuda_indptrs=None, views=views)}

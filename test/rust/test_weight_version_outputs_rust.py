@@ -66,3 +66,34 @@ def test_no_version_leaves_the_metadata_empty(tmp_path, inline):
 def test_every_frame_carries_the_version_once_set(tmp_path, inline):
     frames = _frames(tmp_path, inline, "v7")
     assert [f.metadata for f in frames] == [{"weight_version": "v7"}] * 4
+
+
+def test_log_probs_and_the_version_share_the_metadata_on_both_runtimes(tmp_path):
+    """A tensor frame with a log-prob carries both keys, the log-prob first,
+    and both runtimes send the same frames; an inline frame keeps its
+    log-probs in their own column and the version in its metadata."""
+    from test_delivery_chunk_counts import python_runtime
+    from test_delivery_chunk_counts_rust import _frames as comparable
+    from test_delivery_chunk_counts_rust import _rust, _script
+
+    from mstar.communication.wire import encode
+
+    py_runtime, py_put, recorder = python_runtime(decode_steps=5)
+    py_runtime.set_weight_version("v9")
+    _script(py_runtime, py_put)
+    py_chunks = [decode(encode(m)).body for e, m in recorder.sent if e == "api_server"]
+
+    rs_runtime, rs_put, sent = _rust(5, tmp_path)
+    rs_runtime.set_weight_version("v9")
+    _script(rs_runtime, rs_put)
+    rs_chunks, _ = sent()
+
+    assert comparable(py_chunks) == comparable(rs_chunks)
+    for chunks in (py_chunks, rs_chunks):
+        assert all(c.metadata.get("weight_version") == "v9" for c in chunks)
+        with_lp = [c.metadata for c in chunks if not isinstance(c, ResultTokens) and "logprobs" in c.metadata]
+        assert len(with_lp) == 3
+        assert all(list(m) == ["logprobs", "weight_version"] for m in with_lp)
+        tokens = [c for c in chunks if isinstance(c, ResultTokens)]
+        assert tokens and all(c.metadata == {"weight_version": "v9"} for c in tokens)
+        assert any(c.logprobs for c in tokens)

@@ -25,7 +25,7 @@ sys.path.insert(0, ".")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.api_server.data_worker import InlineToken, PreprocessWorker
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import (
     APIServerMessage,
     RequestComplete,
@@ -95,16 +95,19 @@ def test_the_python_runtime_stamps_every_frame_once_set(inline):
 # -- the API server ------------------------------------------------------------
 
 
-def test_an_inline_token_carries_its_frames_metadata_to_the_chunk():
+def test_an_inline_frame_carries_its_metadata_to_every_chunk():
+    """One RESULT_TOKENS frame, one version: every request's chunk from the
+    batched postprocess gets it, and a frame without one stays bare."""
     from test_inline_tokens import _thread
 
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
-    facade.per_request_reading_tensors = {"r1": 0}
-    facade.received_chunk_counts = {"r1": {}}
+    facade._signal = lambda: None
+    facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
+    facade.received_chunk_counts = {"r1": {}, "r2": {}}
     frame = {"weight_version": "v4"}
-    facade.new_result_token("r1", 11, None, "new_token", "text", metadata=frame)
-    facade.new_result_token("r1", 12, None, "new_token", "text")
+    facade.new_result_tokens(["r1", "r2"], [11, 21], "new_token", "text", metadata=frame)
+    facade.new_result_tokens(["r1", "r2"], [12, 22], "new_token", "text")
     items = [facade.result_tensor_input_queue.get_nowait() for _ in range(2)]
     assert [i.metadata for i in items] == [frame, {}]
 
@@ -114,31 +117,33 @@ def test_an_inline_token_carries_its_frames_metadata_to_the_chunk():
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
-        chunks = [worker.out_queue.get(timeout=5) for _ in range(2)]
+        chunks = [worker.out_queue.get(timeout=5) for _ in range(4)]
     finally:
         stop.set()
         thread.join(timeout=5)
-    assert [c.metadata for c in chunks] == [frame, {}]
+    by_rid = {rid: [c.metadata for c in chunks if c.request_id == rid] for rid in ("r1", "r2")}
+    assert by_rid == {"r1": [frame, {}], "r2": [frame, {}]}
     chunks[0].metadata["sample_rate"] = 1
     assert frame == {"weight_version": "v4"}, "a chunk shares the frame's dict"
+    assert chunks[0].metadata is not chunks[1].metadata
 
 
 def test_an_error_chunk_carries_the_version_of_the_output_it_replaces():
     """A postprocess failure, and a read that never delivers, answer with an
     error chunk; it keeps the failed output's version."""
-    from test_inline_tokens import _thread
+    from test_inline_tokens import _Model, _thread
 
     from mstar.communication.tensors import FailedRead
     from mstar.graph.base import GraphEdge
 
-    class _Broken:
+    class _Broken(_Model):
         def postprocess(self, output, modality, request_kwargs=None):
             raise RuntimeError("bad bytes")
 
     worker, stop = _thread()
     worker.model = _Broken()
-    worker.result_tensor_queue.put(InlineToken("r1", 5, None, "text", {"weight_version": "v6"}))
-    worker.result_tensor_queue.put(InlineToken("r2", 5, None, "text"))
+    worker.result_tensor_queue.put(InlineTokens(["r1"], [5], "text", None, {"weight_version": "v6"}))
+    worker.result_tensor_queue.put(InlineTokens(["r2"], [5], "text"))
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
@@ -195,8 +200,9 @@ def test_the_message_loop_keeps_the_admitted_version():
     from mstar.api_server.request_types import ResultChunk
 
     worker = PreprocessWorker.__new__(PreprocessWorker)
-    worker.received_chunk_counts = {"ok": {}, "bad": {}, "live": {}}
-    worker.per_request_reading_tensors = {"ok": 0, "bad": 0, "live": 0}
+    worker.received_chunk_counts = {"ok": {}, "bad": {}, "live": {}, "tok": {}}
+    worker.per_request_reading_tensors = {"ok": 0, "bad": 0, "live": 0, "tok": 0}
+    worker.result_tensor_input_queue = queue.Queue()
     worker.output_queue = queue.Queue()
     # a live call streams a versioned output, then its input fails: no output
     # names the error, so it takes the version the request's chunks carried,
@@ -205,11 +211,13 @@ def test_the_message_loop_keeps_the_admitted_version():
     worker.profile_queue = queue.Queue()
     worker.reads_done_queue = queue.Queue()
     worker._signal = lambda: None
+    from mstar.communication.event import EventWakeup
+    worker.results_wakeup = EventWakeup()
     server.preprocess_worker = worker
     reqs = {
         rid: PendingRequest(streaming=False, input_modalities=["text"],
                             output_modalities=["text"], profile=RequestProfile(rid=rid))
-        for rid in ("ok", "bad", "live")
+        for rid in ("ok", "bad", "live", "tok")
     }
     server.pending_requests = dict(reqs)
     batches = [[
@@ -219,6 +227,10 @@ def test_the_message_loop_keeps_the_admitted_version():
         APIServerMessage("request_failed", RequestFailed(
             request_id="bad", error_message="generation was paused", status=503,
             weight_version="v5")),
+        # an inline frame: its metadata goes to the data worker with its values
+        APIServerMessage("result_tokens", ResultTokens(
+            request_ids=["tok"], values=[7], loop_indices=[None], signal="new_token",
+            modality="text", metadata={"weight_version": "v5"})),
     ], []]
     class _Comm(_ScriptedApiComm):
         def get_all_new_messages(self):
@@ -234,6 +246,8 @@ def test_the_message_loop_keeps_the_admitted_version():
     assert reqs["ok"].weight_version == "v5" and reqs["bad"].weight_version == "v5"
     assert reqs["bad"].error_status == 503
     assert [c.metadata for c in reqs["live"].chunks] == [{"status": 400, "weight_version": "v6"}]
+    queued = worker.result_tensor_input_queue.get_nowait()
+    assert (queued.request_ids, queued.metadata) == (["tok"], {"weight_version": "v5"})
 
 
 def test_a_request_with_no_answer_takes_the_version_its_chunks_carry():
@@ -315,6 +329,10 @@ class _World:
     # the communicator interface
     def send(self, entity, msg):
         self.sent.append((entity, msg))
+
+    def poll_for_messages(self, timeout_ms=20):
+        # every pass has work: the script answers on the next one
+        return True
 
     def get_all_new_messages(self):
         self.passes += 1

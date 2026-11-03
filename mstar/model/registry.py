@@ -17,6 +17,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosyvoice3": ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
@@ -43,6 +44,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "voxcpm2": ("mstar.model.voxcpm2.voxcpm2_model", "VoxCPM2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
@@ -93,6 +95,10 @@ HF_MODELS: dict[str, dict] = {
     # deployment as Super.
     "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
     "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
+    # Alibaba Fun-CosyVoice3: Qwen2-0.5B speech-token LM + DiT flow matching +
+    # causal HiFT, zero-shot voice cloning; the speech tokenizer and speaker
+    # encoder are Chatterbox's, loaded from the checkpoint's ONNX files.
+    "cosyvoice3": {"model_path_hf": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"},
     # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
@@ -165,6 +171,10 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # VoxCPM2 (OpenBMB, Apache-2.0): tokenizer-free diffusion-autoregressive
+    # TTS, 30 languages, voice design and cloning. MiniCPM-4 base + residual
+    # LMs drive a local DiT over AudioVAE V2 latents, decoded to 48 kHz.
+    "voxcpm2": {"model_path_hf": "openbmb/VoxCPM2"},
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},

@@ -17,9 +17,10 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker, _LazyPerRid
 
 NODE, WALK, STOP_TOKEN, LOOP = "producer", "decode", 9, "loop"
@@ -52,7 +53,7 @@ class _Producer(NodeSubmodule):
     def check_stop(self, request_id, request_info, outputs):
         return self._check(request_id, int(outputs["token"][0].item()))
 
-    def check_stop_batched(self, request_ids, request_infos, host_rows, step_walk=None):
+    def check_stop_batched(self, request_ids, request_infos, host_rows):
         if not self.batched:
             return None
         stops, withheld = {}, {}
@@ -145,8 +146,16 @@ class _Communicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
 
-class _RecordingRuntime:
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
+
+class _RecordingRuntime(PhasedPostprocess):
+    """Recording phase stubs under the reference begin / resume."""
+
     def __init__(self):
         self.routes = []
         self.stops = []
@@ -181,9 +190,9 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._walk_drivers = {}  # no producer-driven walk transitions here
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._graph_runtime = _RecordingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SharedMemoryCommunicationManager(
@@ -194,6 +203,8 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         check_stop_for_batch=engine.check_stop_for_batch,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
+        after_output_copy=lambda batch: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
     ))
     w.request_state = SimpleNamespace(
         per_request_info={},
@@ -201,6 +212,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         get_fwd_info=lambda rid, partition: None,
         get_pending_publish_info=lambda rid, partition: {},
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])  # no streams
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK, request_to_worker_graph={KEEP: 0, DROP: 0},

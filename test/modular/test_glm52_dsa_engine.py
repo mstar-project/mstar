@@ -49,22 +49,6 @@ from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
-
-
-def test_cleanup_request_drops_the_request_state():
-    """Retirement leaves NO per-request growth: the engine's request removal calls
-    cleanup_request on every managed submodule, which drops the prefill's stop (the index
-    keys are the DSA resource's, which remove_request drops)."""
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = Glm52ModelConfig.reduced()
-    sub.request_states = {}
-
-    sub.request_state("r0").add("ended_at_prefill", True)
-    sub.cleanup_request("r0")
-    assert sub.request_states == {}
-    sub.cleanup_request("r0")  # idempotent, like the base hook
-
 
 # ---------------------------------------------------------------------------
 # preprocess guard, both flag states
@@ -81,7 +65,6 @@ class _FakePositions:
 def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._index_stager = PinnedStager(torch.long)
     return sub
 
 

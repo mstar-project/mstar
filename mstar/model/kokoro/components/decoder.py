@@ -14,8 +14,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.masking import length_mask
 from mstar.model.kokoro.components.adain import AdaIN1d, AdainResBlk1d
-from mstar.model.kokoro.components.masking import length_mask, mask_channels
+from mstar.model.kokoro.components.masking import mask_channels
 from mstar.model.kokoro.components.stft import RealSTFT
 from mstar.model.kokoro.config import KokoroModelConfig
 
