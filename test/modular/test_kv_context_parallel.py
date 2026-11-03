@@ -1518,16 +1518,26 @@ def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refu
     (fm._FA_PLANNER_VERSION, 40, "causal tile-bound check can refuse a step at 20 query heads"),
     (fm._FA_PLANNER_VERSION, 128, None),
 ])
-def test_mla_attention_over_a_placed_pool_refuses_at_bind_a_flashinfer_or_head_count_its_fa_planner_may_refuse(
-    monkeypatch, version, heads, refused,
+@pytest.mark.parametrize("placed", [True, False], ids=["placed", "kv_gather"])
+def test_mla_attention_planning_per_rank_refuses_at_bind_a_flashinfer_or_head_count_its_fa_planner_may_refuse(
+    monkeypatch, version, heads, refused, placed,
 ):
+    """Over a placed pool, or gathering a pool stored by head on SP ranks (``kv_gather``: each rank
+    plans its own queries), with its heads over TP alone."""
     _fa_kernel(monkeypatch, version)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    if placed:
+        joint, attention = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), {}
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=_group(0, P))
+        attention = dict(placed=False, shard=SequenceShard(("main",), 0, None, 0, joint.sp_group))
+    build = lambda: _cp_attention(  # noqa: E731
+        joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2", **attention,
+    )
     if refused is None:
-        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
+        build()
         return
     with pytest.raises(ValueError, match=refused):
-        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
+        build()
 
 
 def test_the_fa_work_item_bound_holds_flashinfers_own_count():

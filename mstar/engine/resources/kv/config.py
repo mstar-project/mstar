@@ -706,7 +706,9 @@ class KVSpec(NodeResourceSpec):
             return "by_position"
         return "copied" if cfg.layout == KVLayout.MLA else "by_head"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         # stored by position, a split step's packed tokens are gathered or passed round; stored by
         # head, they trade for heads over every TP and SP rank (Ulysses)
         cfg = self.config

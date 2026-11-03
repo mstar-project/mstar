@@ -70,9 +70,6 @@ class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # the pool's config (`derive`), which the refusals read
-    _pool: "RecurrentStateConfig | None" = field(default=None, init=False, repr=False, compare=False)
-
     # a deployment's ``sp_exchange``, ulysses unset
     sp_exchanges = get_args(LinearSpExchange)
 
@@ -85,7 +82,6 @@ class LinearAttnSpec(NodeResourceSpec):
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        self._pool = specs[self.config.recurrent_state].config
         return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> str:
@@ -95,14 +91,17 @@ class LinearAttnSpec(NodeResourceSpec):
         # both exchanges plan their halo and hand-off per rank on the host, eager only
         return self.resolve_exchange(specs) == "none"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         # only a node whose shard splits gets here, so the choice is what its split steps take
         exchange = self.sp_exchange or self.sp_exchanges[0]
+        pool = specs[self.config.recurrent_state].config
         name = f"linear attention {self.resource_key!r}"
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
             return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]
-        heads = _unsharded_heads(self._pool, self.config.variant)
+        heads = _unsharded_heads(pool, self.config.variant)
         if exchange == "ulysses":
             # Mamba-2's B/C groups may also be fewer a TP rank than SP ranks: each SP rank's heads
             # then read one group, repeated to it
@@ -116,7 +115,7 @@ class LinearAttnSpec(NodeResourceSpec):
                     f"don't split {sp} ways per TP rank: set its sp_exchange to state_passing"
                 ]
         if exchange == "state_passing" and sp >= 3 and self.config.variant is not LinearAttnVariant.MAMBA2:
-            dk, dv = _unsharded_head_dims(self._pool)
+            dk, dv = _unsharded_head_dims(pool)
             if dk != dv:
                 return [
                     f"{name} hands state on over {sp} SP ranks (state_passing), whose middle pieces' transition "

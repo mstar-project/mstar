@@ -184,9 +184,11 @@ class NodeResourceSpec(ABC):
         leased step copied (``SeqShardSpec.eager_splits``). From raw fields, as ``resolve_exchange``."""
         return True
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP
-        ranks (``tp`` TP ranks each); each a sentence."""
+        ranks (``tp`` TP ranks each), among ``specs`` (every spec, by key); each a sentence."""
         return []
 
     @property

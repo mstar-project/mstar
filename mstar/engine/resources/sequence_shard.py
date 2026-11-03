@@ -804,7 +804,8 @@ def sequence_parallel_refusals(
     checks on built objects (``supports_split_steps``, ``check_captures``) are the engine's."""
     if sp == 1:
         return []
-    specs = [spec for spec in specs if node in spec.nodes]
+    by_key = {spec.resource_key: spec for spec in specs}
+    specs = [spec for spec in by_key.values() if node in spec.nodes]
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
     try:
         placed = any(position_pools(specs, node).values())
@@ -828,7 +829,7 @@ def sequence_parallel_refusals(
         ]
     refusals = []
     for spec in specs:
-        refusals += spec.split_step_refusals(node, shard, tp, sp)
+        refusals += spec.split_step_refusals(node, shard, tp, sp, by_key)
     if moe_parallel is not None and moe_parallel.parallel == "ep":
         refusals.append(f"node {node!r} splits tokens over SP ranks, which expert parallelism (ep_config) can't")
     return refusals

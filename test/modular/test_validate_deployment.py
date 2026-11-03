@@ -449,16 +449,6 @@ def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
 
 
-@pytest.mark.parametrize("q_heads, resources, pattern", [
-    # FlashInfer's FA planner may refuse a rank's own plan at a head count not dividing 64
-    (6, {}, r"node_groups\[0\]: attention 'attn' gathers its MLA latents \(kv_gather\) and plans each rank's own "
-            r"queries at 6 query heads a rank, which must divide 64"),
-], ids=["heads"])
-def test_an_mla_node_whose_sp_ranks_cant_split_its_steps_is_refused(q_heads, resources, pattern, tmp_path):
-    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
-    _refused(_mla_llm(q_heads), cfg, pattern)
-
-
 def test_an_mla_node_splits_its_steps_by_gathering_its_latents(tmp_path):
     """Over an MLA pool stored by head the attention gathers the latents (kv_gather), so the pool's
     one KV head doesn't refuse the split."""

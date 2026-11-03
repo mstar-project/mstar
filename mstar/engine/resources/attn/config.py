@@ -16,7 +16,6 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
-    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +89,6 @@ class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
-    # its pool's config (`derive`), which the refusals read
-    _pool: KVConfig | None = field(default=None, init=False, repr=False, compare=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
@@ -104,7 +101,6 @@ class AttentionSpec(NodeResourceSpec):
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        self._pool = specs[self.config.kv_cache].config
         return take_shard_edge(self, specs)
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
@@ -120,20 +116,6 @@ class AttentionSpec(NodeResourceSpec):
     def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
         # the ring's partner plans and kv_gather's local plans differ by rank, so run eagerly
         return self.resolve_exchange(specs) not in ("ring", "kv_gather")
-
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        if getattr(self._pool, "layout", None) != KVLayout.MLA or getattr(self._pool, "context_parallel", False):
-            return []
-        heads = self._pool._unsharded_qo_heads
-        if heads % (tp * sp) or 64 % (heads // tp):
-            # FlashInfer's FA planner refuses some causal plans at a head count not dividing its
-            # 64-query tile, which with plans differing by rank would come on one rank alone
-            return [
-                f"attention {self.resource_key!r} gathers its MLA latents (kv_gather) and plans each rank's own "
-                f"queries at {heads // tp} query heads a rank, which must divide 64 (and {heads} divide "
-                f"{tp * sp} ways)"
-            ]
-        return []
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits

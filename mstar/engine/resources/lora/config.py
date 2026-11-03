@@ -346,7 +346,9 @@ class LoraSpec(NodeResourceSpec):
 
         return LoraAdapterPool
 
-    def split_step_refusals(self, node: str, shard: SeqShardSpec, tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: SeqShardSpec, tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
         # only a node whose steps split gets here (`SeqShardSpec.splits`); one whose steps run
         # copied, e.g. over KV stored by position with its shard's exchange auto, runs every row on
         # every rank
