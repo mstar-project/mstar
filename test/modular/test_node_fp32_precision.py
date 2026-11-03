@@ -353,16 +353,16 @@ def test_no_setting_is_a_shared_no_op():
     assert fp32_precision_scope(None) is fp32_precision_scope(None)
 
 
-def _runtime_kwargs(communicator=None, bookkeeping=None):
+def _runtime_kwargs(communicator, bookkeeping):
     """``_make_graph_runtime``'s arguments for a one-node worker, as in
     test_graph_runtime_factory.py."""
-    from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
+    from mstar.communication.tensor_store import TensorStore
     from mstar.distributed.base import ShardingConfig
     from mstar.graph.base import GraphNode
     from mstar.model.base import WorkerGraph
 
     section = GraphNode(name="a", input_names={"x"}, outputs=[])
-    store = TensorStore(bookkeeping=bookkeeping or PythonTensorBookkeeping())
+    store = TensorStore(bookkeeping=bookkeeping)
     return dict(
         my_worker_id="worker0",
         my_worker_graphs=[WorkerGraph(
@@ -378,33 +378,20 @@ def _runtime_kwargs(communicator=None, bookkeeping=None):
     )
 
 
-@pytest.mark.parametrize("runtime", ["python", "rust"])
-def test_the_setting_holds_under_either_graph_runtime(runtime, monkeypatch):
-    """The setting lives on the submodule and is applied by the engine, which
-    the Python and Rust graph runtimes share; neither runtime sees it."""
+def test_the_setting_holds_under_the_graph_runtime(monkeypatch):
+    """The setting is on the submodule and the engine applies it; the graph
+    runtime never sees it."""
+    from mstar.communication.codec import WireCodec
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+    from mstar.communication.tensor_store import RustTensorBookkeeping
+    from mstar.graph.runtime.rust import RustGraphRuntime
     from mstar.worker.worker import _make_graph_runtime
 
-    _kwargs = _runtime_kwargs
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1" if runtime == "rust" else "0")
     monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
-    if runtime == "rust":
-        pytest.importorskip("mstar_rust")
-        from mstar.communication.codec import WireCodec
-        from mstar.communication.rust_communicator import RustZMQCommunicator
-        from mstar.communication.tensor_store import RustTensorBookkeeping
-        from mstar.graph.runtime.rust import RustGraphRuntime
-
-        comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
-        comm.codec = WireCodec
-        graph_runtime = _make_graph_runtime(**_kwargs(
-            communicator=comm, bookkeeping=RustTensorBookkeeping(),
-        ))
-        assert isinstance(graph_runtime, RustGraphRuntime)
-    else:
-        from mstar.graph.runtime.python import PythonGraphRuntime
-
-        graph_runtime = _make_graph_runtime(**_kwargs())
-        assert isinstance(graph_runtime, PythonGraphRuntime)
+    comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
+    comm.codec = WireCodec
+    graph_runtime = _make_graph_runtime(**_runtime_kwargs(comm, RustTensorBookkeeping()))
+    assert isinstance(graph_runtime, RustGraphRuntime)
 
     a, b = _Recorder(matmul="highest", cudnn=False), _Recorder()
     engine = _engine({"a": a, "b": b}, graph_runtime=graph_runtime)
