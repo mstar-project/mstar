@@ -4532,7 +4532,8 @@ class Worker:
                         new_list = []
                         for t in tensors:
                             if torch.is_tensor(t) and t.device.type == self.device.type:
-                                # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
+                                # by size class, not shape: a per-shape count gives
+                                # two shapes in one class the same buffer
                                 key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
                                 idx = buffer_indices[key]
                                 buffer_indices[key] += 1
