@@ -1888,9 +1888,10 @@ class KVManager(AttentionResource):
                 return label
             budget = self._arena.num_free
             if self._decides:
-                # the copy and the run's evictable pages come out of the allowance
+                # the copy and the run's evictable pages come out of the allowance, and the run is held whole
                 evictable = self._index.evictable()
-                budget = self._allowance(rid) - sum(page in evictable for page in run)
+                taken = sum(page in evictable for page in run)
+                budget = self._allowance(rid) - taken if taken <= self._hit_allowance(rid) else 0
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
                 self._note_looked_up(rid)
@@ -4610,6 +4611,12 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         return (0 if allotment is None else allotment.remaining) + self._room()
 
+    def _hit_allowance(self, rid: str) -> int:
+        """The pages ``rid``'s cache hits on evictable pages may take: `_allowance`, or the room alone for a
+        guaranteed request. Its allotment keeps every page the request's walks write until the request adopts its
+        lease, since a cut leaves the walk to write the cut pages again."""
+        return self._room() if rid in self._guaranteed else self._allowance(rid)
+
     def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.
 
@@ -4617,14 +4624,12 @@ class KVManager(AttentionResource):
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        A guaranteed request's allotment keeps every page the request's walks write until the request adopts its
-        lease, since a cut leaves the walk to write the cut pages again. So an evictable page comes out of the room
-        alone, and every page is lent.
+        A guaranteed request's evictable pages come out of `_hit_allowance`, and every page is lent.
         """
         if self._decides:
             evictable = self._index.evictable()
             guaranteed = rid in self._guaranteed
-            allowance = self._room() if guaranteed else self._allowance(rid)
+            allowance = self._hit_allowance(rid)
             for at, page in enumerate(pages):
                 if page in evictable:
                     if allowance <= 0:
