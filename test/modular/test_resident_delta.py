@@ -1313,9 +1313,9 @@ def _kept(node, rid):
     return len(_REBUILD.ids)
 
 
-def _both_short_then_drop(monkeypatch):
+def _both_short_then_drop(monkeypatch, kept=_kept):
     """r (arrival 1) grows past its allotment until its next token finds no room, on both ranks.
-    Rank 0 then chooses v (arrival 2) and drops it."""
+    Rank 0 then chooses v (arrival 2) and drops it, keeping ``kept`` ids of it."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
     _ingest((leader, follower), "r", 3, arrival=1)
     _ingest((leader, follower), "v", 5, arrival=2)
@@ -1326,8 +1326,22 @@ def _both_short_then_drop(monkeypatch):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
         assert _counts(leader) == _counts(follower)
     assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
-    lead.drop_request(NODE, "v", _kept(NODE, "v"))
+    lead.drop_request(NODE, "v", kept(NODE, "v"))
     return (leader, lead), (follower, follow)
+
+
+def test_a_follower_replays_the_drop_of_a_request_that_keeps_no_ids(monkeypatch):
+    """A request dropped mid-prefill can keep no ids, since its rebuild runs its prompt's chunks again. Rank 0
+    journals the drop with the ids it keeps, none, and a follower that keeps none either replays it."""
+    nothing_kept = Rebuilds({}, {})
+    (leader, lead), (follower, follow) = _both_short_then_drop(
+        monkeypatch, kept=lambda node, rid: nothing_kept.kept_count(rid, node),
+    )
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.rebuilds = Rebuilds({}, {})
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), scheduler._kept_count)
+    assert follower.residency("v") is Residency.DROPPED and _counts(leader) == _counts(follower)
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["voided head", "row dropped by prepare_inputs"])

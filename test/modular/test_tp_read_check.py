@@ -43,9 +43,10 @@ from mstar.engine.resources import Rebuild, Residency
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.model.submodule_base import chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.rebuild import Rebuilds
+from mstar.worker.rebuild import Prefilling, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Speculation, Worker
 
@@ -265,13 +266,14 @@ class _DroppedHere(_Engine):
 
 
 def _log(kept):
-    """A rebuild log keeping ids for ``kept``, which starts each rebuild once."""
+    """A rebuild log keeping ids for ``kept``, which starts each rebuild once, and from its prompt's chunks when
+    the request was mid-prefill."""
     cursors = {}
 
     def start(rid, node, prefilling):
         assert (node, rid) not in cursors, f"{rid}'s rebuild started twice"
-        cursors[(node, rid)] = None
-        return Rebuild(WALK, array("i", [1, 2]))
+        cursors[(node, rid)] = prefilling
+        return None if prefilling is not None else Rebuild(WALK, array("i", [1, 2]))
 
     return SimpleNamespace(
         kept=lambda rid, node: rid if rid in kept else None, start=start,
@@ -533,6 +535,23 @@ def test_a_follower_builds_rank_0s_rebuild_row_from_its_own_log():
 
     assert list(batch.request_to_worker_graph) == ["rb", "r0"], "the follower's step isn't rank 0's"
     assert batch.rebuild_rids == {"rb"} and sched.engine_manager.get_engine(NODE).started == ["rb"]
+
+
+def test_a_follower_rebuilds_a_request_dropped_mid_prefill_from_its_prompts_chunks():
+    """rb was dropped after 2 of its prompt's 4 chunks and keeps no ids. The follower knows rb's row from its own
+    KV and starts the rebuild from rb's chunk Loop, as rank 0 did, since the Loop runs in lockstep."""
+    sched, manager = _follower_scheduler(ready=["r0"], dropped=["rb"])
+    sched.rebuilds = _log(kept=())
+    sched.chunk_loop_walks = {NODE: frozenset({WALK})}
+    manager.loops[("rb", chunk_loop_name(NODE, WALK))] = [2, 4]
+    sched.register_tp_follow(_head(read_check=False, rids=("rb", "r0")))
+
+    batch = sched.get_next_batch(manager)
+
+    assert list(batch.request_to_worker_graph) == ["rb", "r0"] and batch.rebuild_rids == {"rb"}, (
+        "the follower took rb's row as one of its own"
+    )
+    assert dict(sched.rebuilds.cursors()) == {(NODE, "rb"): Prefilling(WALK, 2, 4)}, "rb's rebuild has another source"
 
 
 def test_rank_0_and_a_follower_vote_on_the_same_rows_when_a_step_has_a_rebuild_row(tmp_path):
