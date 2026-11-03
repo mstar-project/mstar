@@ -124,11 +124,21 @@ def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
-def test_eager_prefill_and_captured_decode_draw_independently(ingraph):
-    """Real FlashInfer draws and a real graph replay: with the same near-flat
-    logits on an eager step and the captured step after it, two independent
-    draws agree about 1/V of the time. Two draws at one offset always agree."""
+@pytest.mark.parametrize("first_step", ["eager", "captured"])
+def test_consecutive_draws_are_independent(ingraph, monkeypatch, first_step):
+    """Real draws and a real graph replay: with the same near-flat logits on a
+    request's step and the captured step after it, two independent draws agree
+    about 1/V of the time. Two draws at one offset always agree.
+
+    ``eager``: an eager FlashInfer step, then the captured one, with the
+    captured step on FlashInfer too (fused_sample's RNG never agrees with
+    FlashInfer's, so a shared offset would go unseen). ``captured``: two
+    captured steps on fused_sample, which this vocabulary takes."""
     pytest.importorskip("flashinfer")
+    if first_step == "eager":
+        monkeypatch.setattr(sampler_utils, "FUSED_SAMPLE_MAX_VOCAB", 0)
+    else:
+        assert V <= sampler_utils.FUSED_SAMPLE_MAX_VOCAB
     device = torch.device("cuda")
     res = _resource(device, ingraph)
     pad = -1
@@ -151,19 +161,26 @@ def test_eager_prefill_and_captured_decode_draw_independently(ingraph):
     res.commit(step, capture_ctx)
 
     logits = 0.1 * torch.randn(1, V, generator=torch.Generator().manual_seed(0)).to(device)
-    n, same = 64, 0
-    for i in range(n):
-        _ingest(res, i, seed=1000 + i)
-        ctx = _ctx(i, captured=False)
-        res.plan(step, ctx)
-        first = res.sample([i], logits)
-        res.commit(step, ctx)
-        ctx = _ctx(i, captured=True)
+
+    def captured(rid: int) -> int:
+        ctx = _ctx(rid, captured=True)
         res.plan(step, ctx)
         static_logits.copy_(logits)
         graph.replay()
         res.commit(step, ctx)
-        same += int(first.item() == static_out.item())
+        return static_out.item()
+
+    n, same = 64, 0
+    for i in range(n):
+        _ingest(res, i, seed=1000 + i)
+        if first_step == "eager":
+            ctx = _ctx(i, captured=False)
+            res.plan(step, ctx)
+            first = res.sample([i], logits).item()
+            res.commit(step, ctx)
+        else:
+            first = captured(i)
+        same += int(first == captured(i))
         res.remove_request(i)
     # independent: ~n/V = 1 expected; the shared offset gave n
-    assert same <= 8, f"{same}/{n} eager/captured token pairs equal"
+    assert same <= 8, f"{same}/{n} consecutive token pairs equal"
