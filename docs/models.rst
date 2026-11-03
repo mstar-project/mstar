@@ -748,7 +748,7 @@ Qwen3-TTS notes
   channels) through a direct kernel without tensor cores, about 100x slower
   on an H100. On a B300 the bf16 codec measured slower while those convs
   still ran dilated; measure there before switching. The decode is compiled
-  (Inductor), once per chunk width and batch bucket.
+  (Inductor) once per chunk width, its batch dimension dynamic.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
