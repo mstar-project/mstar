@@ -101,7 +101,7 @@ def _worker():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._kv_keys, w._kv_caches, w._dropped, w._preempted = {}, {}, {}, {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

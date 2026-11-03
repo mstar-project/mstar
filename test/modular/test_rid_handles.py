@@ -173,7 +173,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._rebuilds = Rebuilds({}, {})
     w._rebuilds._kept = {"n": {a: None, b: None}}
     w.scheduler.queue_rebuild(a, RebuildRow("n", "prefill", {}))
-    w._kv_keys, w._dropped, w._victims, w._preempted = {"n": ["kv"]}, {a: "n"}, {a: "kv"}, {a: None}
+    w._kv_keys, w._dropped, w._preempted = {"n": ["kv"]}, {a: "n"}, {a: None}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
@@ -191,8 +191,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
-    assert not (w.scheduler.rebuilds or w._dropped or w._victims or w._preempted), (
-        "the next request would run this one's rebuild row, or be taken for its victim"
+    assert not (w.scheduler.rebuilds or w._dropped or w._preempted), (
+        "the next request would run this one's rebuild row, or be counted as preempted"
     )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
@@ -266,7 +266,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w._draining_rids = set()
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._kv_keys, w._kv_caches, w._dropped, w._preempted = {}, {}, {}, {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -311,7 +311,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     )
     w._draining_rids, w._unprocessed_messages = set(), {}
     w._rebuilds = Rebuilds({}, {})
-    w._kv_keys, w._kv_caches, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}
+    w._kv_keys, w._kv_caches, w._dropped, w._preempted = {}, {}, {}, {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",

@@ -338,6 +338,12 @@ class Dropped(NamedTuple):
     held: int
 
 
+class Victims(NamedTuple):
+    """The requests `KVManager.preempt` chose to move off the device: to the host, or dropped."""
+    to_host: list[str]
+    to_drop: list[str]
+
+
 @dataclass(slots=True)
 class Earmark:
     """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``granted`` counts the pages
@@ -4386,14 +4392,14 @@ class KVManager(AttentionResource):
 
     # Preemption
 
-    def preempt(self, rid: str, pages_short: int, droppable: Callable[[str], bool]) -> list[str] | None:
+    def preempt(self, rid: str, pages_short: int, droppable: Callable[[str], bool]) -> Victims | None:
         """Choose newer requests to move off the device for ``rid``'s shortage of ``pages_short`` pages, newest
-        first, and earmark what they free for ``rid``. A victim the host can take whole moves there
-        (`moves_to_host`), and any other is dropped, once ``droppable`` says its launched steps allow it.
+        first, and earmark what they free for ``rid``. A victim the host can take whole moves there, and any
+        other is dropped, once ``droppable`` says its launched steps allow it.
 
-        Returns the victims, or ``[rid]`` when only moving ``rid`` itself frees pages, or ``[]`` while ``rid``
-        waits for room or for its earlier victims to move. None when the pool doesn't decide or ``rid`` has no
-        arrival number.
+        Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none while ``rid`` waits
+        for room or for its earlier victims to move. None when the pool doesn't decide or ``rid`` has no arrival
+        number.
         """
         if not self._decides:
             return None
@@ -4406,7 +4412,7 @@ class KVManager(AttentionResource):
             if then is not None:
                 pages_short -= max(0, room - then)
             if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
-                return []
+                return Victims([], [])
             newer = sorted(
                 (other for other, overrides in self._overrides.items()
                  if overrides.arrival is not None and overrides.arrival > arrival
@@ -4436,9 +4442,9 @@ class KVManager(AttentionResource):
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
-                    return [rid]
+                    return Victims([rid], []) if to_host else Victims([], [rid])
                 self._short[rid] = room
-                return []
+                return Victims([], [])
             freed = self._frees(victims)
             for victim in list(victims):
                 rest = [other for other in victims if other != victim]
@@ -4449,13 +4455,8 @@ class KVManager(AttentionResource):
                 self._victims[victim] = earmark
             self._hosted.update(hosted.intersection(victims))
             self._earmarks[rid] = earmark
-            return victims
-
-    def is_victim(self, rid: str) -> bool:
-        return rid in self._victims
-
-    def moves_to_host(self, rid: str) -> bool:
-        return rid in self._hosted
+            to_host = [victim for victim in victims if victim in hosted]
+            return Victims(to_host, [victim for victim in victims if victim not in hosted])
 
     def arrival(self, rid: str) -> int | None:
         overrides = self._overrides.get(rid)

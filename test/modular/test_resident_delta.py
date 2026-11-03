@@ -944,7 +944,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._rebuilds = Rebuilds({}, {})
-        self._kv_keys, self._kv_caches, self._dropped, self._victims, self._preempted = {}, {}, {}, {}, {}
+        self._kv_keys, self._kv_caches, self._dropped, self._preempted = {}, {}, {}, {}
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
