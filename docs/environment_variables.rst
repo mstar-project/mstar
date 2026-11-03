@@ -666,7 +666,8 @@ Worker scheduling
      - config's ``knobs: fused_decode``, else ``auto``
      - ``auto`` replays a fused forward in place of the compiled graph for the
        captured buckets a submodule declares (``NodeSubmodule.get_fused_decode_configs``;
-       Qwen3.5's decode at 1 and 2 rows, one persistent kernel per 4-layer block),
+       Qwen3.5's decode buckets named in ``model_kwargs.fused_decode_batch_sizes``, one
+       persistent kernel per 4-layer block),
        where the submodule's guard passes, the fused capture succeeds and its
        boot parity step agrees with the modules; the worker log says why a bucket
        or node keeps its graph. Lockstep (TP/SP) nodes always keep theirs.

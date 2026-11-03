@@ -490,6 +490,18 @@ decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok
 at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
 c=4 up it makes no difference.
 
+``model_kwargs: {fused_decode_batch_sizes: [1, 2]}`` runs those captured decode buckets on
+one persistent kernel per 4-layer block (``mstar/kernels/megakernel``, through
+``FusedDecodeConfig``) instead of the compiled graph; off by default. It needs a compute
+capability 10.x GPU and Qwen3.5's head sizes (the startup log says why a deployment keeps its
+graphs), and keeps the graph for a bucket whose boot parity step disagrees with the modules.
+On a B300 at 0.8B it cuts a one-row decode step's GPU time by a third (789 against 1156 µs,
+32 kernels against 273), but served decode there is host-bound, and c=1 and c=2 measured no
+faster. The kernels sum fp32 partials in no fixed order, so greedy output varies from run to
+run and differs from the graph's as much as it differs from itself, and
+``compile_deterministic`` turns it off. It costs about 200 MiB of weights (the down
+projections stored transposed) and about 400 MiB of scratch for the four captured slots.
+
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them

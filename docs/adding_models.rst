@@ -1679,8 +1679,8 @@ capture fails or the parity step disagrees: one step of the capture rows, planne
 rows with their own slots and pages, through both paths from one snapshot of their state
 (``Resource.row_state``), compared by relative L2 on the final hidden state and every state the
 rows hold after the step (``PARITY_REL_L2``, 2%). Lockstep (TP/SP) nodes and ``knobs:
-{fused_decode: off}`` keep their graphs. Qwen3.5's decode is the one user
-(``mstar/model/qwen3_5/fused_decode.py``).
+{fused_decode: off}`` keep their graphs. Qwen3.5 implements it for decode, declared only where a
+deployment names the batch sizes (``mstar/model/qwen3_5/fused_decode.py``, see :doc:`models`).
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:

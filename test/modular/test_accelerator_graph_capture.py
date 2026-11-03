@@ -63,9 +63,6 @@ class _FakeRunner:
     _register_slot = AcceleratorGraphRunner._register_slot
     _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
     _report_dropped = AcceleratorGraphRunner._report_dropped
-    _fused_config = AcceleratorGraphRunner._fused_config
-    # no fused decode declared (test_fused_decode.py covers it)
-    _fused: dict = {}
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
