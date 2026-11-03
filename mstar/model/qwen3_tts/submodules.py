@@ -929,7 +929,8 @@ class CodecSubmodule(ARNodeSubmodule):
     # stateless engine, stated directly now that the v1 engine reads these.
     disable_torch_compile = True
     disable_autocast = True
-    # Nothing in the Talker reads the audio, so its decode steps need not queue behind a window
+    # Nothing in the Talker reads the audio, so its decode steps need not queue
+    # behind a window; the serving config's ``side_stream`` turns it on
     side_stream_walks = frozenset({"codec_chunk"})
 
     # The conv stack decodes at most chunk + conv_context frames (35 for the
