@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.engine.resources.kv.plan import PagedIndptrs
 from mstar.engine.resources.resident import (
     CapturedResidentStep,
     ResidentPlan,
@@ -14,6 +15,8 @@ from mstar.engine.resources.resident import (
     advance_column,
     gather_column,
 )
+
+_NO_INDICES = torch.empty(0, dtype=torch.int32)
 
 
 @triton.jit
@@ -49,6 +52,7 @@ class KVResidentTables:
         self.kv_len = planner.length_table(key)
         self.host_len = np.zeros(planner.max_slots, dtype=np.int64)
         self.host_cols = np.zeros(planner.max_slots, dtype=np.int64)
+        self._qo_indptr: dict[int, torch.Tensor] = {}
 
     def row(self, stored_len: int, pages: list[int], slot: int, row: list[int], writes: ResidentWrites) -> None:
         """The cells of a stream about to append one token, or to be read. Its
@@ -105,6 +109,30 @@ class KVResidentTables:
             else:
                 plan.writes.put(self.block_table.cell(slot, last), stream_pages(rid)[last])
         plan.crossed[self.key] = (rows, need[rows])
+
+    def decode_indptrs(self, plan: ResidentPlan, bs: int) -> PagedIndptrs:
+        """The host half of a step whose graph builds the page arrays: each
+        row's page count and length, the step's token included, in its row
+        order. Padding rows read the trash row, one sink page of no stored
+        tokens, as the graph does. No page indices."""
+        stored = self.host_len[plan.slots]
+        n = stored.shape[0]
+        lens = np.ones(bs, dtype=np.int32)
+        lens[:n] = stored + 1
+        pages = np.ones(bs, dtype=np.int32)
+        pages[:n] = stored // self.page_size + 1
+        indptr = np.zeros(bs + 1, dtype=np.int32)
+        np.cumsum(pages, out=indptr[1:])
+        qo = self._qo_indptr.get(bs)
+        if qo is None:
+            qo = self._qo_indptr[bs] = torch.arange(bs + 1, dtype=torch.int32)
+        return PagedIndptrs(
+            qo_indptr=qo,
+            paged_kv_indptr=torch.from_numpy(indptr),
+            paged_kv_indices=_NO_INDICES,
+            paged_kv_last_page_len=torch.from_numpy(lens - (pages - 1) * self.page_size),
+            kv_lens=torch.from_numpy(lens),
+        )
 
     def advance(self, plan: ResidentPlan) -> None:
         if plan.writes.streams[self.key].reads:
