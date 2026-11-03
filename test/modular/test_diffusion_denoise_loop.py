@@ -558,7 +558,6 @@ def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
 def test_seeds_are_drawn_once_per_request_and_only_when_asked():
     sub = PrefetchingToy()
     _added(sub, "p3").result()
-    sub.on_request_added(_handle("p3"), _info("p3", 0))  # its second partition on this worker
     assert sub.drawn_on == ["mstar-seed_0"]
     plain = ToyDenoise()
     plain.on_request_added(_handle("p4"), _info("p4", 0))

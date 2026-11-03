@@ -1,10 +1,14 @@
 """``TopKRouter``'s fused softmax -> top-k -> renormalize (``mstar::moe_router_topk``)
 against the op sequence it replaces, and that the router keeps that sequence unless
-a model opts in."""
+a model opts in. A router that doesn't set the flag never reaches a fused route."""
 from __future__ import annotations
 
 import pytest
 import torch
+
+from mstar.model.command_a_plus.components.language_model import CommandAPlusRouter
+from mstar.model.components import moe
+from mstar.model.components.moe import NoAuxTcRouter, TopKRouter
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
@@ -65,3 +69,40 @@ def test_router_defaults_to_the_torch_ops():
         ref_w, ref_ids = torch.topk(probs, 8, dim=-1)
     assert torch.equal(ids, ref_ids)
     torch.testing.assert_close(w, ref_w / ref_w.sum(dim=-1, keepdim=True), rtol=0, atol=0)
+
+
+def _no_fused_route(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("a router that doesn't set the flag took a fused route")
+
+    monkeypatch.setattr(moe, "route_align", refuse, raising=False)
+    monkeypatch.setattr("mstar.utils.fused_moe.decode.router_topk", refuse, raising=False)
+
+
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=needs_cuda),
+])
+@pytest.mark.parametrize("make", [
+    pytest.param(lambda: TopKRouter(64, 128, 8), id="topk-default"),
+    pytest.param(lambda: NoAuxTcRouter(64, 128, 8, 2.5), id="glm-noaux"),
+    pytest.param(lambda: CommandAPlusRouter(64, 128, 8), id="command-a-plus"),
+])
+def test_a_router_without_the_flag_routes_as_it_always_did(monkeypatch, device, make):
+    pytest.importorskip("triton")
+    _no_fused_route(monkeypatch)
+    torch.manual_seed(3)
+    router = make().to(device).to(torch.bfloat16).requires_grad_(False)
+    torch.nn.init.normal_(router.weight)
+    x = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+    w1 = torch.zeros(128, 32, 64, device=device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        weights, experts, states, alignment = moe._route(router, x, w1, None)
+        ref_weights, ref_experts, _ = router(x)
+    assert alignment is None and states is None
+    assert torch.equal(experts, ref_experts) and torch.equal(weights, ref_weights)
+
+
+def test_only_a_flagged_topk_router_has_the_fused_route():
+    assert not TopKRouter(64, 128, 8).fused_softmax_topk
+    assert not hasattr(NoAuxTcRouter(64, 128, 8, 2.5), "fused_softmax_topk")
+    assert not hasattr(CommandAPlusRouter(64, 128, 8), "fused_softmax_topk")
