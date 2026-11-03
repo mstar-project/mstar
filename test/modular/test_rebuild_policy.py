@@ -87,9 +87,9 @@ def _rows(*rids: int) -> dict:
     return {rid: {"text_inputs": [torch.arange(rid, rid + 3)]} for rid in rids}
 
 
-def _rebuilds(pool_bytes: int = 1 << 10) -> Rebuilds:
+def _rebuilds(pool_bytes: int = 1 << 10, device: torch.device = torch.device("cpu")) -> Rebuilds:
     """`Rebuilds` with ``R``, ``A`` and ``B`` taken in as requests a drop on ``NODE`` can free."""
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(pool_bytes, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(pool_bytes, device))
     writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))}}
     layouts = {"kv": [StreamLayout(spans=(PrefixSpan(3, 3, PREFILL),), growth=(("decode_loop", 1),))]}
     for rid in (R, A, B):
@@ -104,9 +104,9 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
 
 
 def _kept(prompt, *sampled: int) -> KeptIds:
-    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", sampled))
+    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as the walk read it."""
+    view = torch.tensor(prompt, dtype=torch.long)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", sampled))
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -122,12 +122,14 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     assert kept[R].prompt.view.tolist() == [7, 8, 9] and kept[A].prompt.view.tolist() == [8, 9, 10], (
         "it kept another row's ids"
     )
-    assert kept[R].dtype == torch.long, "the rebuild row would read its ids in another dtype than the walk's"
+    assert kept[R].prompt.view.dtype == torch.long, (
+        "the rebuild row would read its ids in another dtype than the walk's"
+    )
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
 def test_a_full_pool_keeps_no_ids():
-    rebuilds = _rebuilds(16)
+    rebuilds = _rebuilds(32)
 
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
 
@@ -135,7 +137,7 @@ def test_a_full_pool_keeps_no_ids():
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = _rebuilds(16)
+    rebuilds = _rebuilds(32)
     rebuilds.keep_prompts(_ran(PREFILL, {R: {"text_inputs": [torch.arange(4)]}}))
 
     rebuilds.remove_request(R)
@@ -223,9 +225,9 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
 
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
-    prompt = torch.tensor([1, 2], dtype=torch.int32)
+    prompt = torch.tensor([1, 2], dtype=torch.long)
     copying = HostCopy(HostSlice(0, prompt.nbytes), prompt, SimpleNamespace(query=lambda: False))
-    rebuilds._kept[NODE][R] = KeptIds(copying, torch.long, array("i", [5]))
+    rebuilds._kept[NODE][R] = KeptIds(copying, array("i", [5]))
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"
@@ -269,3 +271,24 @@ def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declare
         kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
         assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts the device's allocations")
+def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy():
+    device = torch.device("cuda")
+    rebuilds = _rebuilds(1 << 12, device)
+    prompt = torch.arange(256, device=device)
+    step_done = torch.Event(device=device)
+    step_done.record()
+    step = _ran(PREFILL, {R: {"text_inputs": [prompt]}})
+    step.completion_event = step_done
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+
+    rebuilds.keep_prompts(step)
+    kept = rebuilds._kept[NODE][R]
+    kept.prompt.landed.synchronize()
+
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated, (
+        "a cast on the pool's stream made every later decode step 0.16 ms slower at Qwen3.5-9B TP2"
+    )
+    assert kept.prompt.view.tolist() == list(range(256)), "the rebuild would prefill other ids"

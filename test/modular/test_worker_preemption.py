@@ -66,8 +66,8 @@ class _Engine(SimpleNamespace):
 
 def _kept(tokens: int) -> KeptIds:
     """A request's prompt of ``tokens`` ids on the host, and one sample."""
-    view = torch.arange(tokens, dtype=torch.int32)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), torch.long, array("i", [0]))
+    view = torch.arange(tokens, dtype=torch.long)
+    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", [0]))
 
 
 def _worker(kv):

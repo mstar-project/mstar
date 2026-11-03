@@ -29,16 +29,16 @@ def test_a_slice_given_back_merges_with_its_free_neighbors():
 @requires_cuda
 def test_kept_ids_copy_after_the_steps_completion_event():
     device = torch.device("cuda")
-    pool = HostPool(1 << 10, device)
+    pool = HostPool(1 << 11, device)
     ids = torch.zeros(256, dtype=torch.long, device=device)
     torch.cuda._sleep(100_000_000)  # the step is still running when its ids are copied
     ids.fill_(7)
     step_done = torch.Event(device=device)
     step_done.record()
 
-    copy = pool.copy_out(ids, step_done, torch.int32)
+    copy = pool.copy_out(ids, step_done)
     copy.landed.synchronize()
 
-    assert copy.view.dtype == torch.int32 and copy.view.tolist() == [7] * 256, (
+    assert copy.view.tolist() == [7] * 256, (
         "the copy read the ids before the step wrote them"
     )
