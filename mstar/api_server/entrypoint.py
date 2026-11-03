@@ -3037,7 +3037,7 @@ def main(argv: list[str] | None = None):
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 find_server_binary(args.rust_frontend_bin), model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key)
+                args.port, bridge_dir, args.upload_dir, api_key=api_key, timeout=args.timeout)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

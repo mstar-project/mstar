@@ -336,7 +336,8 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend; on expiry the client gets
-       an error and the request is aborted in the backend.
+       an error and the request is aborted in the backend. ``mstar-serve
+       --rust-frontend`` sets it from ``--timeout`` unless it is exported.
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
      - Sample rate stamped on ``/v1/audio/speech`` WAV output.

@@ -217,3 +217,19 @@ def test_nemotron_realtime_server_checks_the_handshake():
         with client.websocket_connect("/v1/realtime"):
             pass
     assert info.value.code == 1008
+
+
+# inf and nan never time out on the Python frontend; the Rust one reads whole seconds
+@pytest.mark.parametrize(("timeout", "seconds"), [(1800.5, "1801"), (float("inf"), "1000000000"),
+                                                  (float("nan"), "1000000000"), (-5.0, "0"),
+                                                  (float("-inf"), "0")])
+def test_the_rust_frontend_gets_the_server_s_timeout(monkeypatch, timeout, seconds):
+    """``--rust-frontend`` used to cut every request at the frontend's own 600 s default."""
+    from types import SimpleNamespace
+
+    from mstar.api_server import rust_frontend
+
+    monkeypatch.delenv("MSTAR_REQUEST_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(rust_frontend.subprocess, "Popen", lambda argv, env: SimpleNamespace(pid=1, env=env))
+    proc = rust_frontend.launch_rust_server("mstar-server", "bagel", 1, "b", "u", timeout=timeout)
+    assert proc.env["MSTAR_REQUEST_TIMEOUT_S"] == seconds
