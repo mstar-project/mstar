@@ -35,8 +35,8 @@ def ingraph(request, monkeypatch) -> bool:
     return request.param
 
 
-def _resource(device: torch.device, ingraph: bool) -> SamplerResource:
-    res = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=device)
+def _resource(device: torch.device, ingraph: bool, **spec) -> SamplerResource:
+    res = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=device, **spec)
     res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=1, max_seq_len=1)
     assert res._cg_buffers.ingraph_scatter is ingraph
@@ -121,6 +121,24 @@ def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
         _run(res, RID + 1, first + "EC")
         assert [offset for _, offset in drawn] == [0, 1, 2]
         res.remove_request(RID + 1)
+
+
+@pytest.mark.parametrize("spec,fused", [({}, True), ({"enable_min_p": True}, False)], ids=["plain", "min_p"])
+def test_eager_and_captured_steps_pick_the_same_draw_kernel(monkeypatch, ingraph, spec, fused):
+    """The draw kernel is the node's: a node that enables min-p draws through
+    FlashInfer on an eager step too, though no row in its batch sets min-p."""
+    picked = []
+
+    def entry(logits, *args, fused=None, **kwargs):
+        picked.append(fused)
+        return torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+
+    monkeypatch.setattr(sampler_utils, "sample_tokens", entry)
+    monkeypatch.setattr(sampler_utils, "sample_accelerator_graphable_gpu", entry)
+    res = _resource(torch.device("cpu"), ingraph, **spec)
+    _ingest(res, RID, seed=1)
+    _run(res, RID, "EC")
+    assert picked == [fused, fused]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
