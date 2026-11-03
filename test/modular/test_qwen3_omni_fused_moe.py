@@ -181,12 +181,15 @@ def test_thinker_block_parity(num_tokens):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
+    # Both paths read the block's checkpoint-layout weights, which AITER (auto's
+    # pick for these sizes on MI325X) would re-tile.
     block = SparseMoeBlock(
         hidden_size=hidden,
         num_experts=num_experts,
         num_experts_per_tok=top_k,
         moe_intermediate_size=inter,
         norm_topk_prob=True,
+        moe_backend="triton",
     ).to(device=device, dtype=dtype)
     # Initialize expert and gate parameters to reasonable small values.
     with torch.no_grad():
