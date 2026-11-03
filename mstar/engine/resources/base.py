@@ -478,11 +478,11 @@ class Resource(ABC):
         return 0
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Take in what the dropped request's rebuild row writes, before the row is queued."""
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's rebuild row has run."""
+        """The dropped request's rebuild has run its last chunk."""
         return
 
     def reload(self, rid: str) -> bool:
