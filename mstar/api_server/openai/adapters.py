@@ -557,9 +557,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     Mode follows from what the caller sends, as it does in the reference:
     ``ref_audio`` + ``ref_text`` clones a voice, ``instruct`` designs one from a
-    description, and neither lets the model pick. ``voice`` is accepted as an
-    alias for ``instruct`` so an OpenAI client that only knows the standard
-    field can still reach voice design.
+    description (OpenAI's ``instructions``), and neither lets the model pick.
+    ``voice`` is accepted as an alias for ``instruct`` too.
 
     ``speed`` is a real OmniVoice knob (it scales the estimated duration), so
     unlike the other speech adapters it is forwarded rather than dropped. The
@@ -578,6 +577,10 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
+        # OpenAI's field is ``instructions``; the model reads ``instruct``.
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
         # is-not-None, so an empty voice reaches the model and is refused there
         if getattr(req, "voice", None) is not None and mk.get("instruct") is None:
             mk["instruct"] = req.voice

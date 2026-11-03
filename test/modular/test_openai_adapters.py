@@ -118,6 +118,12 @@ def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
     assert adapters.Qwen3TTSAdapter.speech_chunk_max_chars == 400
 
 
+def test_omnivoice_speech_maps_instructions_onto_instruct(tmp_path):
+    req = SpeechRequest(input="hello", instructions="a calm female voice")
+    mk = adapters.OmniVoiceAdapter().speech_to_request(req, tmp_path).model_kwargs
+    assert mk["instruct"] == "a calm female voice" and "instructions" not in mk
+
+
 def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path, monkeypatch):
     # the decode check itself runs on real clips in test_media_paths.py
     checked = []
