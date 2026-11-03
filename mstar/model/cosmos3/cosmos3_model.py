@@ -1442,6 +1442,8 @@ class Cosmos3Model(Model):
         gi = mk.get("guidance_interval")
         if gi is None and is_t2i:
             gi = (400.0, 1000.0)
+        if gi is None and action_mode is not None:
+            gi = self.config.guidance_interval_action
         if gi is not None:
             params["guidance_interval"] = (float(gi[0]), float(gi[1]))
         # Action requests must name their embodiment explicitly — the domain
