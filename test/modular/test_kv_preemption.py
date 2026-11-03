@@ -512,6 +512,29 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     assert _queue(kv) == ["b"], "b came back without room for its footprint"
 
 
+def test_a_request_back_from_the_host_waits_until_its_footprint_fits_and_is_never_moved_again():
+    """Kirill's Qwen3-Omni ITL p99 on #875. A request came back from the host once its pages and one more page fit.
+    Its next page found no room, and as the newest request holding pages it moved itself to the host again, a
+    copy of all its pages both ways for each page of decode."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "o", 5, arrival=0)
+    _running(kv, "z", 3, arrival=2)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok, "o grows into the room"
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["z"], [], [])
+    _offload(kv, "z")
+    _request(kv, "p", 6, arrival=1)
+    assert not _ready(kv, "p")
+    _remove(kv, "o")
+    assert _ready(kv, "p") and _step(kv, "p", 6 * PAGE_SIZE).ok
+
+    assert not _ready(kv, "z"), "z came back beside p with room for less than it grows into"
+    _remove(kv, "p")
+    assert _ready(kv, "z") and "z" in kv._guaranteed, "z came back preemptible, so a shortage could move it again"
+    for _ in range(4):
+        assert _step(kv, "z", PAGE_SIZE).ok, "z, back with room for what it grows into, ran short"
+
+
 @pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
 def test_an_offload_outside_preemption_reloads_as_before(decides):
     kv = _pool()
