@@ -216,6 +216,8 @@ class CapturedResidentStep:
     # host plan of the step. Nothing plans the bucket only if none needed one.
     reads_tables: bool = False
     host_planned: bool = False
+    # KV pools whose attention builds its page arrays in the graph: the host plans their lengths only
+    lengths_only: set[str] = field(default_factory=set)
 
 
 class ResidentPlanner:
@@ -254,6 +256,9 @@ class ResidentPlanner:
         self._streams: dict[BucketKey, dict[str, ResidentStream]] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
+        # (bucket, pool) whose attention reads its pages off the tables: the
+        # pool's KV plan hands it host lengths and no page indices
+        self.lengths_only: set[tuple[BucketKey, str]] = set()
 
         self._lock = threading.Lock()
         # rid -> slot. Handle-keyed: `release` purges it.
@@ -623,6 +628,7 @@ class ResidentPlanner:
             resource.resident_gather(step)
         if step.reads_tables and not step.host_planned:
             self.host_plan_free.add(step.bucket)
+        self.lengths_only.update((step.bucket, pool) for pool in step.lengths_only)
 
     def commit_in_graph(self, step: CapturedResidentStep) -> None:
         for resource in self._owners:

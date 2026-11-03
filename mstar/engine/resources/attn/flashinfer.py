@@ -117,8 +117,13 @@ class FlashInferManager(AttentionManager):
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
             step.reads_tables = True
-        else:
-            step.host_planned = True
+            return
+        step.host_planned = True
+        if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.schedules_alone and not stream.reads:
+            # the paged arrays come off the tables; the host plans the schedule alone
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.lengths_only.add(pool)
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -307,6 +312,11 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
+                wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+                laps.lap("schedule")
+                plan_states[label] = wrapper
+                continue
             kwargs = indptrs.to_kwargs_dict()
             laps.lap("wrapper")
             # TODO: cache the latest plan state

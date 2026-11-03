@@ -577,6 +577,65 @@ def test_the_captured_kernels_match_the_torch_ops():
     assert run(torch.device("cuda")) == run(CPU)
 
 
+
+def test_the_host_lengths_of_a_graph_indexed_step_match_the_host_plan():
+    """What the KV plan hands an attention that reads its pages off the tables:
+    the same indptr, lengths and last page lengths as the full host plan of the
+    step, padding rows included."""
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    rids = [1, 2, 3]
+    for t in range(12):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, run=False)
+        _promote(live, planner, a)
+        got = live["kv"]._resident.decode_indptrs(a.ctx.resident_plan, 4)
+        b = _captured_step(ref, None, rids, slot=t % 2, bs=4, run=False)
+        want = b.ctx.plan_results["kv"]["main"].cpu_indptrs
+        for field in ("qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "kv_lens"):
+            assert getattr(got, field).tolist() == getattr(want, field).tolist(), (t, field)
+        _replay(live, planner, a, promote=False)
+        _replay(ref, None, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel runs on CUDA")
+def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table():
+    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
+    from mstar.engine.resources.kv.resident import KVResidentTables
+
+    cuda = torch.device("cuda")
+    stride, block_col, page = 40, 2, 4
+    store = torch.zeros(6 * stride, dtype=torch.long, device=cuda)
+    lens = {1: 9, 3: 0, 4: 4, 5: 130}
+    for slot, n in lens.items():
+        store[slot * stride + 1] = n
+        cols = n // page + 1
+        store[slot * stride + block_col: slot * stride + block_col + cols] = torch.arange(
+            100 * slot, 100 * slot + cols,
+        )
+    order = [5, 1, 3, 4]
+    bs = 6  # two padding rows, at the trash row
+    slots = torch.tensor(order + [TRASH_SLOT] * (bs - len(order)), device=cuda)
+    kv_len = store[slots * stride + 1].clone()
+    capacity = 64
+    attn = SimpleNamespace(
+        _paged_kv_indptr_buf=torch.full((bs + 1,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_indices_buf=torch.full((capacity,), -1, dtype=torch.int32, device=cuda),
+        _paged_kv_last_page_len_buf=torch.full((bs,), -1, dtype=torch.int32, device=cuda),
+    )
+    FlashInferDecodeWrapper.gather_resident(
+        SimpleNamespace(attn_wrapper=attn, page_size=page), store, slots, kv_len, stride, block_col,
+    )
+
+    host_len = torch.zeros(6, dtype=torch.long).numpy()
+    for slot, n in lens.items():
+        host_len[slot] = n
+    tables = SimpleNamespace(host_len=host_len, page_size=page, _qo_indptr={})
+    want = KVResidentTables.decode_indptrs(tables, SimpleNamespace(slots=torch.tensor(order).numpy()), bs)
+    assert attn._paged_kv_indptr_buf.tolist() == want.paged_kv_indptr.tolist()
+    assert attn._paged_kv_last_page_len_buf.tolist() == want.paged_kv_last_page_len.tolist()
+    pages = [list(range(100 * s, 100 * s + lens[s] // page + 1)) for s in order] + [[SINK_PAGE]] * (bs - len(order))
+    end = int(want.paged_kv_indptr[-1])
+    assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
+
 # ---- slots ----
 
 def test_a_freed_slot_waits_for_the_last_step_that_read_it():
