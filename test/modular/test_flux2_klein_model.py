@@ -579,11 +579,15 @@ def test_the_recompile_limit_reaches_torch_compile_only_where_it_exists(monkeypa
     module = torch.nn.Linear(2, 2)
     compile_transformer_forward(module)
     assert calls[-1] == {"fullgraph": False, "dynamic": False}
-    monkeypatch.setattr(dynamo_config, "recompile_limit", 8)
-    compile_transformer_forward(module, recompile_limit=96)
-    assert dynamo_config.recompile_limit == 96
-    compile_transformer_forward(module, recompile_limit=10)
-    assert dynamo_config.recompile_limit == 96, "the process-wide limit never falls"
+    before = dynamo_config.recompile_limit
+    # torch's own patch() restores by assignment. pytest's monkeypatch restores a module entry that is not in
+    # __dict__ by deleting it, which torch's config module turns into a hidden key for the rest of the session.
+    with dynamo_config.patch(recompile_limit=8):
+        compile_transformer_forward(module, recompile_limit=96)
+        assert dynamo_config.recompile_limit == 96
+        compile_transformer_forward(module, recompile_limit=10)
+        assert dynamo_config.recompile_limit == 96, "the process-wide limit never falls"
+    assert dynamo_config.recompile_limit == before
 
     def new_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
                     disable=False, recompile_limit=None):
