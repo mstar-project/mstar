@@ -396,7 +396,7 @@ class ExecutingBatch:
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
-    # recorded once inputs copied to the device for this step have landed, which the step waits on
+    # events the step waits on, recorded once its inputs copied to the device have landed
     input_ready: tuple[torch.Event, ...] = ()
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None

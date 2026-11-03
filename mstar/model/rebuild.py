@@ -34,8 +34,8 @@ class RebuildPolicy:
 
     def check(self, node: str, graphs: Mapping[str, GraphSection]) -> dict[str, frozenset[str]]:
         """What ``node`` reads in each of ``walks`` besides ``ids_input``, which the worker copies. Raise unless
-        each walk runs ``node``, which reads ``ids_input`` and outputs ``sample_output`` there, and some walk runs
-        ``node`` inside ``loop``.
+        each walk runs ``node``, which reads ``ids_input`` and outputs ``sample_output`` there, ``copy_width`` names
+        each walk where ``node`` reads more than ``ids_input``, and some walk runs ``node`` inside ``loop``.
 
         The tick of ``node``'s chunk Loop in a walk is left out of what it reads, since the tick carries
         no tensor."""

@@ -31,8 +31,8 @@ if TYPE_CHECKING:
 # The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
 # at 4 B each.
 DEFAULT_REBUILD_HOST_MB = 64
-# The serving config's ``rebuild_media_host_mb`` unless it sets one, taken only where a node copies what a walk reads
-# besides the ids: a Qwen3.5-9B image of 1024 tokens is 8 MiB of encoder output.
+# The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
+# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.
 DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
@@ -214,7 +214,8 @@ class Rebuilds:
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
         """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
-        and the host copies for its spans other than ids, or None when the pool can't hold it."""
+        and the host copies for its spans other than ids. None when the pool can't hold it, or when the request has
+        spans other than ids and the node's dtype is unknown."""
         spans = [span for layout in layouts for span in layout.spans]
         ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
         others = [span for span in spans if span.kind != SpanKind.IDS]
@@ -468,11 +469,11 @@ class Rebuilds:
         """Give each rebuild row of ``rids`` its walk and its inputs, and return the events the step waits on before
         it reads them.
 
-        A rebuild of a prompt mid-prefill runs every chunk from the input the
-        engine keeps for the prompt, under the prompt's own step metadata. Any other runs under its prefill's
-        recorded metadata and reads the log: its kept ids, split as its prefill row read them with the ids sampled
-        since appended to the last tensor, and its host copies, both on the device when it runs its first chunk or
-        runs whole. A later chunk is cut from the input the engine prepared on the first."""
+        A rebuild of a prompt mid-prefill runs every chunk from the input the engine keeps for the prompt, under the
+        prompt's own step metadata. A rebuild from kept ids runs under its prefill's recorded metadata and reads the
+        log: its kept ids, split as its prefill row read them with the ids sampled since appended to the last
+        tensor, and its host copies, both on the device when it runs its first chunk or runs whole. A later chunk is
+        cut from the input the engine prepared on the first."""
         ids_input, ready = self._policies[node].ids_input, []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
