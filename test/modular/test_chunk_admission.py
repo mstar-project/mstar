@@ -219,7 +219,7 @@ def _declare(sub: "_Sub", other_walk_row: bool = False):
         inputs.append(ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10))
     batch = SimpleNamespace(
         node_name="LLM", graph_walk="prefill", per_request_info={},
-        chunk_ranges=chunk_ranges, step_context=ctx,
+        chunk_ranges=chunk_ranges, step_context=ctx, rebuild_rids=frozenset(),
     )
 
     outcome, _ = eng._declare_and_admit(
