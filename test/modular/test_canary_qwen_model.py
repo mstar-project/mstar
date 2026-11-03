@@ -232,8 +232,6 @@ def test_output_and_request_limits():
     assert model.get_max_output_tokens_limit() == limit
     assert model.get_max_output_tokens(max_output_tokens=None) == limit
     assert model.get_max_output_tokens(max_output_tokens=5) == 5
-    # the request's max_output_tokens caps the loop, not the graph's max_iters
-    assert model.get_loop_caps(max_output_tokens=5) == {"decode_loop": 5}
     # the shipped pool holds 64 requests at MAX_SEQ_LEN and the sink, no more
     model.validate_config_yaml({"max_concurrent_requests": 64}, "canary_qwen.yaml")
     with pytest.raises(ValueError, match=r"resources\.kv_cache"):
@@ -329,7 +327,8 @@ def test_llm_node_caps_captures_and_names():
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
     info = SimpleNamespace(
-        resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)}, dynamic_loop_iter_counts={}, max_tokens=100,
+        graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
+        dynamic_loop_iter_counts={}, max_tokens=100,
     )
     assert [node.check_stop("a", info, {"new_token": [torch.tensor([t])]}) for t in (11, 12, 3)] == [
         {"decode_loop"}, {"decode_loop"}, set(),

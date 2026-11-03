@@ -7,7 +7,8 @@ lookup. A hit re-stamps a page without pushing it again, so a leaf keeps one hea
 entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
-Every caller holds the manager's lock, so none of this takes one of its own.
+Every caller holds the manager's lock, or is the conductor's one thread, so none
+of this takes one of its own.
 """
 
 import copy
@@ -16,7 +17,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.arena import PageArena
 
 
 class PrefixIndex:
@@ -218,6 +219,15 @@ class PrefixIndex:
         for entry in passed_over + spared:
             heapq.heappush(self._leaves, entry)
         return dropped
+
+    def drop(self, entries: Sequence[tuple[bytes, int]]) -> None:
+        """Remove these ``(key, page)`` entries, last first, each only while the
+        key still names the page and it is a leaf the index alone holds: what the
+        routing mirror predicted a request would index, taken back once the
+        request ended without running."""
+        for key, page in reversed(entries):
+            if self._by_key.get(key) == page and not self._children[page] and self._arena.num_owners[page] == 1:
+                self._remove(page)
 
     def _pop_leaf(self) -> tuple[int, int] | None:
         while self._leaves:

@@ -491,7 +491,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         windows = torch.stack([F.pad(w, (0, 0, 0, max(lens) - w.shape[0])) for _, w, _ in mel_rows])
         # a strided conv reads a frame past a row's end, which alone is the conv's
         # zero padding: the subsampling masks each row past its own length
-        out = self.encoder.subsample(windows, to_device_nonblocking(torch.tensor(lens), windows.device))
+        out = self.encoder.subsample(windows, to_device_nonblocking(lens, windows.device))
         x = out.new_zeros(len(sts), max(n), out.shape[-1])
         for row, (i, _, (at, k)) in enumerate(mel_rows):
             x[i, :k] = out[row, at: at + k]
@@ -572,7 +572,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                                       request_ids=[rids[i] for i in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
-                y = self._blocks(x, to_device_nonblocking(torch.tensor(eager_n), device))
+                y = self._blocks(x, to_device_nonblocking(eager_n, device))
             for i in new:
                 states[i].frames += eager_n[i]
                 frames[i] = y[i][: eager_n[i]]

@@ -62,21 +62,6 @@ def test_qwen3_omni_tokenizer_and_processor_without_remote_code(qwen3_omni, monk
     assert [c["trust_remote_code"] for c in tok_calls + proc_calls] == [False, False]
 
 
-@pytest.mark.parametrize("loader", ["_create_audio_encoder_submodule", "_create_vision_encoder_submodule"])
-def test_qwen3_omni_encoder_config_without_remote_code(qwen3_omni, monkeypatch, tmp_path, loader):
-    from transformers import AutoConfig
-
-    calls = []
-    _patch_from_pretrained(monkeypatch, AutoConfig, calls, result=_StopLoadError)
-    model = qwen3_omni.Qwen3OmniModel.__new__(qwen3_omni.Qwen3OmniModel)
-    model.local_dir = str(tmp_path)
-
-    with pytest.raises(_StopLoadError):
-        getattr(model, loader)("cpu")
-
-    assert [c["trust_remote_code"] for c in calls] == [False]
-
-
 def test_omnivoice_checkpoint_config_without_remote_code(monkeypatch):
     from transformers import AutoConfig
 

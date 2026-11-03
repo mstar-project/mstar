@@ -1,4 +1,5 @@
-"""Ragged attention head-dimension padding checks that need no GPU."""
+"""Ragged attention checks that need no GPU: head-dimension padding and the
+custom op's manager registry."""
 
 import sys
 from types import SimpleNamespace
@@ -7,6 +8,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine.resources import AttentionStep, RaggedAttentionConfig, Segment, StepContext
+from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
+from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
     FlashInferRaggedPrefillWrapper,
@@ -120,3 +124,54 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
     assert decode.call_count == (0 if tensor_cores else 1)
     if tensor_cores:
         assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
+
+
+def test_a_dropped_manager_leaves_the_op_registry():
+    """The custom op finds a manager by key; the registry must not keep one
+    alive past the engine that built it, nor hand one engine's key to
+    another's manager over the same resource key."""
+    import gc
+
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.attn.ragged.base import _MANAGERS
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    spec = RaggedAttentionSpec(
+        resource_key="dropped", nodes={"encoder"},
+        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
+    )
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16)
+    mgr, other = build_resource(spec, info), build_resource(spec, info)
+    assert _MANAGERS[mgr._key] is mgr and _MANAGERS[other._key] is other
+    key = mgr._key
+    del mgr
+    gc.collect()
+    assert key not in _MANAGERS
+
+
+def test_a_ragged_wrapper_does_not_replan_an_unchanged_layout(monkeypatch):
+    """A denoise loop declares the same segments every step: the wrapper keeps
+    its last schedule, so only a changed layout, causal flag or another slot's
+    wrapper plans the kernel again."""
+    planned = []
+    real_plan = DenseRaggedPrefillWrapper._plan_kernel
+    monkeypatch.setattr(
+        DenseRaggedPrefillWrapper, "_plan_kernel", lambda self, *a: planned.append(self) or real_plan(self, *a),
+    )
+    manager = DenseRaggedManager(
+        torch.device("cpu"), torch.bfloat16, RaggedAttentionConfig(num_qo_heads=2, num_kv_heads=2, head_dim=64), "x",
+    )
+
+    def plan(*spans, causal=False, slot=0):
+        segments = tuple(Segment(request_id=f"r{i}", label="main", span=n) for i, n in enumerate(spans))
+        ctx = StepContext(request_ids=[s.request_id for s in segments], graph_walk="w", slot=slot, capture=False)
+        manager.plan(AttentionStep(segments=segments, causal=causal), ctx)
+
+    plan(64, 32)
+    plan(64, 32)
+    assert len(planned) == 1 and manager.num_segments() == 2
+    plan(64, 32, slot=1)
+    assert len(planned) == 2 and planned[1] is not planned[0]
+    plan(64, 32, causal=True)
+    plan(64, 33)
+    assert len(planned) == 4

@@ -32,6 +32,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVLayout, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 from mstar.engine.resources.kv.manager import KVManager
@@ -908,15 +909,15 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
     counting the refusals it stood for, keeps the log readable."""
     mgr = _make_manager(cpu_offload_pages=1)
     pool = mgr._cpu_pool
-    assert pool.place("held", "main", [1], [], stored_len=0, position=0)
+    assert pool.place("held", "main", (GroupPages([1]),), [], position=0)
     clock = [100.0]
     monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
 
     with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
         for _ in range(50):
-            assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
+            assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
         clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
-        assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
+        assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
 
     warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
     assert len(warnings) == 2
