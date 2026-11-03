@@ -12,8 +12,10 @@ import pytest
 import torch
 
 from mstar.model.base import ProcessPromptOutput
+from mstar.model.cosmos3.components.packing import action_start_frame_offset
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import ACTION_GEN_WALK, Cosmos3DiTSubmodule
+from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 
 STATE = [0.1, -0.2, 0.3, -2.0, 0.05, 1.9, 0.8, 1.0]  # 7 joints, 1 - gripper
 POLICY = {"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 8}
@@ -41,6 +43,7 @@ def _dit(model: Cosmos3Model) -> Cosmos3DiTSubmodule:
     dit.transformer = types.SimpleNamespace(
         proj_in=types.SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
         action_dim=model.config.max_action_dim,
+        _rotary=stand_in_rotary(model.config),
     )
     dit._new_scheduler = lambda *args, **kwargs: None
     return dit
@@ -121,10 +124,16 @@ def test_prefill_marks_the_state_row_clean() -> None:
     assert plain["cond"]["action_noisy_frame_indexes"][0].tolist() == list(range(32))
 
     # The state token sits at video frame 0's time, and the predicted rows keep
-    # the positions they have without a state row.
-    t_state = st["cond"]["action_mrope_ids"][0]
-    assert t_state[0] == st["cond"]["vision_mrope_ids"][0, 0]
-    assert torch.equal(t_state[1:], plain["cond"]["action_mrope_ids"][0])
+    # the positions they have without a state row (the prefill slims the
+    # position ids away, so build the statics again).
+    def static(chunk, rows):
+        offset = action_start_frame_offset(chunk, 33)
+        return dit._build_action_static([1, 2, 3], 64, 64, 33, chunk, "policy", 15.0, 15.0, offset, "cpu", rows)
+
+    with_state, without = static(33, 1), static(32, 0)
+    t_state = with_state["action_mrope_ids"][0]
+    assert t_state[0] == with_state["vision_mrope_ids"][0, 0]
+    assert torch.equal(t_state[1:], without["action_mrope_ids"][0])
 
 
 def test_reply_leaves_out_the_state_row() -> None:
@@ -160,10 +169,10 @@ def test_action_guidance_interval() -> None:
 
     dit._denoise_action = denoise
     dit.batched_cfg = False
-    dit._action_scheduler_step = lambda st, lat, act, v, a, t: (lat, act)
+    dit._action_scheduler_step = lambda st, lat, act, v, a, step, solver: (lat, act, solver)
     latents, action_latents = torch.zeros(1, 2), torch.zeros(1, 33, 64)
     for step, branches in ((0, 2), (1, 1), (3, 1)):
         labels.clear()
-        dit._forward_action_gen(None, st, latents, action_latents, torch.tensor([step]))
+        dit._forward_action_gen(None, st, step, latents, action_latents)
         assert len(labels) == branches, step
         assert dit._step_info(ACTION_GEN_WALK, st, step).cfg_active == (branches == 2)

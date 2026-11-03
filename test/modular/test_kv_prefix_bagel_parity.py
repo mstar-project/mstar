@@ -38,9 +38,9 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
@@ -187,11 +187,11 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-            prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+            kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
         )})
 
     def resolve(self, rid: str) -> int:
-        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].prefix_layout["main"][0].length)
+        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].kv_layout["main"].spans[0].length)
         prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
@@ -311,7 +311,7 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 @requires_cuda
 def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance():
     device = torch.device("cuda:0")
-    walks = {"main": (WALK, "decode", IMAGE_WALK)}
+    walks = {"main": KeyedWalks((WALK, IMAGE_WALK), ("decode",))}
     generator = torch.Generator().manual_seed(20260930)
     # at the scale `_initialise` gives the token embeddings
     image = (torch.randn(50, _small_config().hidden_size, generator=generator) * 0.02).to(

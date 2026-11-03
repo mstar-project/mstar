@@ -25,6 +25,9 @@ Triton-specific boilerplate out of the runner.
 
 from __future__ import annotations
 
+import functools
+import json
+from pathlib import Path
 from typing import Any, Dict
 
 import torch
@@ -617,6 +620,39 @@ def moe_sum_reduce_triton(
 # Block-size / warp-count configuration (shape-only; the fp8 runner overrides
 # BLOCK_SIZE_K and the decode tiles on top of it)
 # ---------------------------------------------------------------------------
+
+
+def config_path(E: int, N: int, K: int, device_name: str | None = None) -> Path:
+    """Where ``mstar.utils.fused_moe.tune`` writes configs for this shape and GPU."""
+    if device_name is None:
+        device_name = torch.cuda.get_device_name()
+    device_name = device_name.replace(" ", "_")
+    return Path(__file__).parent / "configs" / f"E={E},N={N},K={K},device_name={device_name}.json"
+
+
+@functools.lru_cache(maxsize=None)
+def _tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
+    path = config_path(E, N, K)
+    if not path.is_file():
+        return None
+    return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+
+
+def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Tile configs for the gate/up GEMM and the down GEMM.
+
+    Uses the tuned table for this shape and GPU when present, taking the entry
+    for the nearest tuned batch size, else :func:`get_default_config` for both.
+    The two GEMMs share ``BLOCK_SIZE_M`` because they share one alignment.
+    """
+    tuned = _tuned_configs(E, N, K)
+    if tuned is None:
+        config = get_default_config(M, E, N, K, top_k)
+        return config, config
+    up = dict(tuned[min(tuned, key=lambda m: abs(m - M))])
+    down_overrides = up.pop("down", {})
+    down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
+    return up, down
 
 
 def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:

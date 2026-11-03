@@ -211,6 +211,12 @@ def _video_parity(mode: str) -> None:
     dpipe, mpipe, snap = ctx["dpipe"], ctx["mpipe"], ctx["snap"]
     dev, dtype = ctx["device"], ctx["dtype"]
     is_i2v = mode == "i2v"
+    if is_i2v:
+        from diffusers.pipelines.cosmos import pipeline_cosmos3_omni
+
+        if not hasattr(pipeline_cosmos3_omni, "_preprocess_conditioning_image"):
+            print("  (skipped i2v parity: diffusers before 0.40 stretches the conditioning image, mstar crops it)")
+            return
     asset = os.path.join(snap, "assets", "example_i2v_prompt.json" if is_i2v else "example_t2v_prompt.json")
     with open(asset) as f:
         prompt = json.load(f)["temporal_caption"]
@@ -286,7 +292,7 @@ def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "torchcodec", _Broken())
     monkeypatch.setitem(sys.modules, "torchcodec.encoders", None)
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    video = torch.randint(0, 255, (1, 3, 9, 48, 64), dtype=torch.uint8)
+    video = torch.randint(0, 255, (9, 3, 48, 64), dtype=torch.uint8)
     data = model.postprocess(video, "video", {"fps": 12.0})
     assert data[4:8] == b"ftyp"
     with av.open(io.BytesIO(data)) as container:
@@ -295,3 +301,32 @@ def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
         codec, rate = stream.codec_context.name, float(stream.average_rate)
     assert len(frames) == 9 and (frames[0].width, frames[0].height) == (64, 48)
     assert codec == "h264" and rate == 12.0
+
+
+def test_video_postprocess_hands_torchcodec_the_decoders_frames(monkeypatch) -> None:
+    """The decoder emits [T, C, H, W] frames, torchcodec's layout, so the encoder
+    gets the tensor read off the transport with no host copy in between."""
+    import sys
+    import types
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    seen = []
+
+    class _Encoder:
+        def __init__(self, frames, *, frame_rate):
+            seen.append(frames)
+
+        def to_tensor(self, *args, **kwargs):
+            return torch.zeros(4, dtype=torch.uint8)
+
+    package = types.ModuleType("torchcodec")
+    encoders = types.ModuleType("torchcodec.encoders")
+    encoders.VideoEncoder = _Encoder
+    monkeypatch.setitem(sys.modules, "torchcodec", package)
+    monkeypatch.setitem(sys.modules, "torchcodec.encoders", encoders)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    video = torch.randint(0, 255, (9, 3, 48, 64), dtype=torch.uint8)
+    assert model.postprocess(video, "video", {"fps": 12.0}) == bytes(4)
+    (frames,) = seen
+    assert frames.data_ptr() == video.data_ptr() and frames.shape == video.shape

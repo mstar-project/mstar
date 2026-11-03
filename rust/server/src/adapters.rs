@@ -90,7 +90,9 @@ pub fn flatten_messages(
     allow_remote: bool,
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
     let mut parts: Vec<Part> = Vec::new();
-    let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // A refused chat is never submitted, so a refusal below drops `saved`
+    // unkept, which deletes the attachments saved before it.
+    let mut saved = crate::SavedUploads::new(upload_dir);
 
     for msg in messages {
         let role = match msg.role.as_str() {
@@ -132,7 +134,7 @@ pub fn flatten_messages(
                         let fallback = ptype.trim_end_matches("_url");
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut file_paths, m, p);
+                        add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }
                 "input_audio" => {
@@ -143,7 +145,7 @@ pub fn flatten_messages(
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut file_paths, m, p);
+                            add_file(&mut parts, &mut saved.paths, m, p);
                         }
                     }
                 }
@@ -155,7 +157,7 @@ pub fn flatten_messages(
     let texts: Vec<&str> = parts.iter().filter_map(|p| p.text.as_deref()).collect();
     let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
     let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
-    Ok((text, file_paths, input_modalities, parts))
+    Ok((text, saved.keep(), input_modalities, parts))
 }
 
 fn add_file(
@@ -216,10 +218,28 @@ fn set_default(mk: &mut Map<String, Value>, key: &str, value: Value) {
     }
 }
 
+/// OpenAI `size` ("WxH") onto the model's `width` / `height`, as the Python
+/// adapters' `_size_kwargs`.
+fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>) -> Result<(), String> {
+    let Some(size) = size.filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let parsed = size
+        .to_lowercase()
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.trim().parse::<i64>().ok()?, h.trim().parse::<i64>().ok()?)));
+    let Some((width, height)) = parsed else {
+        return Err(format!("size must be 'WxH' (e.g. '1024x1024'); got {size:?}"));
+    };
+    set_default(mk, "width", Value::from(width));
+    set_default(mk, "height", Value::from(height));
+    Ok(())
+}
+
 /// The OpenAI-standard sampling fields → a model's `model_kwargs` keys.
 struct Sampling<'a> {
-    temperature: Option<f64>,
-    top_p: Option<f64>,
+    temperature: Option<Value>,
+    top_p: Option<Value>,
     seed: Option<i64>,
     max_tokens: Option<i64>,
     temperature_key: &'a str,
@@ -230,10 +250,10 @@ struct Sampling<'a> {
 
 fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     if let Some(t) = s.temperature {
-        set_default(mk, s.temperature_key, json_num(t));
+        set_default(mk, s.temperature_key, t);
     }
     if let Some(p) = s.top_p {
-        set_default(mk, s.top_p_key, json_num(p));
+        set_default(mk, s.top_p_key, p);
     }
     if let Some(seed) = s.seed {
         set_default(mk, "seed", Value::from(seed));
@@ -318,10 +338,13 @@ impl Adapter {
             // max_output_tokens and seed are honored.
             Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
             Adapter::Cosmos3Edge => {
-                let mut args = text_chat(req, upload_dir, allow_remote)?;
                 // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
-                let template = args.model_kwargs.remove("chat_template_kwargs");
-                if let Some(on) = template_enable_thinking(template.as_ref())? {
+                // Read before the attachments are saved, since a malformed value
+                // refuses the request.
+                let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
+                let mut args = text_chat(req, upload_dir, allow_remote)?;
+                args.model_kwargs.remove("chat_template_kwargs");
+                if let Some(on) = thinking {
                     set_default(&mut args.model_kwargs, "enable_thinking", Value::Bool(on));
                 }
                 Ok(args)
@@ -344,8 +367,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: chat_max_tokens(req),
                         temperature_key: "thinker_temperature",
@@ -382,8 +405,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: None,
                         temperature_key: "talker_temperature",
@@ -409,8 +432,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: None,
                         temperature_key: "temperature",
@@ -438,6 +461,7 @@ impl Adapter {
         match self {
             Adapter::Bagel => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+                size_kwargs(&mut mk, req.size.as_deref())?;
                 if let Some(seed) = req.seed {
                     set_default(&mut mk, "seed", Value::from(seed));
                 }
@@ -556,6 +580,12 @@ impl Adapter {
     ) -> Result<SubmitArgs, String> {
         match self {
             Adapter::Bagel => {
+                let mut extra_kwargs = extra_kwargs;
+                // a form field that parsed as JSON (e.g. "512") is still the size text
+                let size = extra_kwargs
+                    .remove("size")
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+                size_kwargs(&mut extra_kwargs, size.as_deref())?;
                 let mut file_paths = BTreeMap::new();
                 file_paths.insert("image".to_string(), vec![image_path.to_string()]);
                 Ok(SubmitArgs {
@@ -573,10 +603,10 @@ impl Adapter {
     }
 }
 
-/// `max_completion_tokens or max_tokens`, as Python reads them: a 0 falls
-/// through to `max_tokens`.
+/// `max_completion_tokens`, else `max_tokens`, as Python reads them: an
+/// explicit 0 is kept, so validation refuses it.
 fn chat_max_tokens(req: &ChatCompletionRequest) -> Option<i64> {
-    req.max_completion_tokens.filter(|&n| n != 0).or(req.max_tokens)
+    req.max_completion_tokens.or(req.max_tokens)
 }
 
 /// Text out of a chat's messages, with the standard sampling fields
@@ -591,8 +621,8 @@ fn text_chat(
     apply_sampling(
         &mut mk,
         Sampling {
-            temperature: req.temperature,
-            top_p: req.top_p,
+            temperature: req.temperature.clone(),
+            top_p: req.top_p.clone(),
             seed: req.seed,
             max_tokens: chat_max_tokens(req),
             temperature_key: "temperature",

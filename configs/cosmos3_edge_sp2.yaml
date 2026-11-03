@@ -1,0 +1,40 @@
+model: "cosmos3_edge"
+# See cosmos3_edge.yaml for what each setting does; this file differs in
+# node_groups and enable_reasoner. Two GPUs, latency-oriented: the DiT runs
+# Ulysses sequence-parallel over both (see cosmos3_nano_sp2.yaml). The reasoner
+# is not sequence-parallel and shares the DiT's transformer, so this deployment
+# serves generation only; cosmos3_edge_dp2.yaml keeps chat.
+max_seq_len: 8192
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  enable_reasoner: false
+  accelerator_graph: true
+  graph_max_latent_area: 2000
+  gen_capture_video: []
+  image_size_default: [640, 640]
+  video_size_default: [832, 480]
+  num_frames_video: 121
+  num_inference_steps_video: 20
+  guidance_scale: 6.0
+  flow_shift_video: 12.0
+  conditioning_resize: aspect_crop
+  num_inference_steps_action: 30
+  guidance_scale_action: 1.0
+  flow_shift_action: 10.0
+  enable_windowed_video: true
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    sp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "vae_decoder_ar"]
+    ranks: [0]
+warmup_requests:
+  - text: warmup
+    output_modalities: [video]
+    model_kwargs: {num_frames: 121, num_inference_steps: 4}
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [video]
+    model_kwargs: {window_mode: chained, num_frames: 93, num_inference_steps: 4}

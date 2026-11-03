@@ -6,6 +6,10 @@ model: "qwen3_tts_1p7b"
 max_seq_len: 32768
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+# On B300 (sm_103) FA2 stays the decode backend too: trtllm-gen rebuilds its
+# block table on every plan, which a captured decode replay does not see
+# (wrong attention, then illegal memory accesses), and cudnn is faster up to
+# 16 rows but slower at 32 and costs more host time per plan.
 resources:
   talker_attn:
     flashinfer_backend: fa2

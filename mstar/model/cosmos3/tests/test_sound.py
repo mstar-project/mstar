@@ -20,10 +20,11 @@ import os
 import torch
 import torch.nn.functional as F  # noqa: F401 — keeps parity harness imports uniform
 
+from mstar.model.components.diffusion.unipc import initial_state
 from mstar.model.cosmos3.components.packing import build_static_inputs
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
-from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+from mstar.model.cosmos3.submodules import LATENT_DTYPE, sound_frames
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
@@ -70,18 +71,18 @@ def test_sound_segment_layout() -> None:
 
 
 def test_sound_frame_math() -> None:
-    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Config())
+    config = Cosmos3Config()
     # Video-duration default: 93 frames @ 16 fps = 5.8125 s -> 279000 samples
     # -> ceil(279000 / 1920) = 146 latent frames.
-    target, frames = dit._resolve_sound_frames({"num_frames": 93, "fps": 16.0})
+    target, frames = sound_frames({"num_frames": 93, "fps": 16.0}, config)
     assert (target, frames) == (279000, 146)
     # 17 frames @ 24 fps = 0.7083 s -> 34000 samples -> 18 latent frames.
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0}, config)
     assert (target, frames) == (34000, 18)
     # Explicit sound_duration wins; sub-frame durations clamp to one video frame.
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 2.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 2.0}, config)
     assert (target, frames) == (96000, 50)
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 0.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 0.0}, config)
     assert target == round(48000 / 24.0) and frames == 2
 
 
@@ -259,18 +260,19 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
-    time_index = torch.zeros(1, dtype=torch.long, device=device)
+    solver = initial_state(dit._packed(latents, sound_latents))
     fwd.graph_walk = VIDEO_SOUND_GEN_WALK
-    for _ in range(STEPS):
+    for k in range(STEPS):
+        fwd.dynamic_loop_iter_counts["video_sound_gen_loop"] = k
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
-            "latents": [latents], "sound_latents": [sound_latents], "time_index": [time_index],
+            "latents": [latents], "sound_latents": [sound_latents], **{n: [t] for n, t in solver.items()},
         })
         out = _forward_step(
             dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni],
         )
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
-        time_index = out["time_index"][0]
+        solver = {n: out[n][0] for n in solver}
     dit.cleanup_request(rid)
     return latents, sound_latents
 
@@ -290,16 +292,17 @@ def _sound_scenario():
         use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
     )
     lat_t = 1 + (FRAMES - 1) // mpipe.vae_scale_temporal
-    _, t_s = model.get_submodule("dit")._resolve_sound_frames({"num_frames": FRAMES, "fps": 24.0})
+    _, t_s = sound_frames({"num_frames": FRAMES, "fps": 24.0}, model.get_submodule("dit").config)
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    # the served loop state's dtype, so the engine path and the fused pipeline step the same latents
+    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     # The fused pipeline draws its sound noise from `generator` after the video
     # latents; with explicit `latents` that is the generator's first draw, so a
     # same-state generator here reproduces it for the engine loop.
     sgen = torch.Generator(device=device).manual_seed(SEED + 1)
     from diffusers.utils.torch_utils import randn_tensor
 
-    sound_init = randn_tensor((1, model.config.sound_dim, t_s), generator=sgen, device=device, dtype=dtype)
+    sound_init = randn_tensor((1, model.config.sound_dim, t_s), generator=sgen, device=device, dtype=LATENT_DTYPE)
     sgen2 = torch.Generator(device=device).manual_seed(SEED + 1)
     lat_fused, sound_fused = mpipe(
         prompt=PROMPT, negative_prompt="", num_frames=FRAMES, height=H, width=W,

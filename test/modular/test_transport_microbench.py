@@ -170,8 +170,9 @@ def test_smoke_both_roles_on_localhost(tmp_path, monkeypatch):
     assert {(c["a"], c["b"]) for c in saved["crossovers"]} == {
         (a, b) for i, a in enumerate(paths) for b in paths[i + 1:]
     }
-    # every SHM file was unlinked once its ack came back
-    assert not list(tmp_path.glob("mstar_*"))
+    # every SHM file was unlinked once its ack came back; the namespace lock
+    # is held for the life of the process
+    assert not [p for p in tmp_path.glob("mstar_*") if p.suffix != ".lock"]
 
 
 def test_interference_reports_extra_p99(monkeypatch):

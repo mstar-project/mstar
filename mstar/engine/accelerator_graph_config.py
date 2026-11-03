@@ -5,14 +5,21 @@ from typing import Any, Callable
 
 import torch
 
-from mstar.engine.resources import SubmoduleStep
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+
+# A compile mode of the engine's own rather than torch.compile's: Inductor's
+# defaults in its deterministic mode, which picks each kernel's config by rule
+# instead of timing candidates on the device, so every process compiles the
+# same kernels and one input gives one output from any server. See
+# ``accelerator_graph_runner.compile_kwargs``.
+DETERMINISTIC_COMPILE_MODE = "deterministic"
 
 
 def check_compile_mode(mode: str | None) -> str | None:
     """A capture config's ``compile_mode``, refused at build rather than at capture,
     where the per-capture fallback would serve the bucket eager."""
-    if mode is None or mode == "default":
+    if mode is None or mode in ("default", DETERMINISTIC_COMPILE_MODE):
         return mode
     if not mode:
         # torch.compile takes a falsy mode for "default"
@@ -49,8 +56,8 @@ class AcceleratorGraphConfig(ABC):
         # Must be hashable.
         additional_key_info: Any | None = None,
         compile: bool = True, # whether to run torch.compile before cuda graph capture
-        # torch.compile mode for the captured forward; None takes the runner's
-        # default, max-autotune-no-cudagraphs
+        # torch.compile mode for the captured forward; None takes the deployment's
+        # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
 
         # Per-config override for the set of batch sizes to capture
@@ -146,6 +153,17 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return [
             self.single_request_inputs.clone() for _  in range(bs)
         ]
+
+
+def geometric_batch_sizes(max_batch_size: int) -> list[int]:
+    """Powers of two below ``max_batch_size``, then ``max_batch_size`` itself.
+
+    Startup grows with ``log B`` rather than ``B``; a batch between two sizes
+    pads up to the next (or splits into these sizes), and a full batch fits one.
+    """
+    if max_batch_size < 1:
+        raise ValueError(f"max_batch_size must be at least 1, got {max_batch_size}")
+    return [1 << i for i in range((max_batch_size - 1).bit_length())] + [max_batch_size]
 
 
 def distribute_tokens(total_tokens: int, bs: int) -> list[int]:
@@ -292,6 +310,19 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # own work; the lease only tells the outer declaration which resources are
     # already spoken for, so it can leave them out.
     lease_before_step: bool = False
+    # For a `lease_before_step` region: whether this batch may take a slot at
+    # all, beyond fitting a captured bucket. For a limit the bucket key does
+    # not express, such as how many attention segments a replay's plan holds.
+    # A batch it rejects gets no lease, so its forward runs the region eagerly
+    # (`ModelInputsFromEngine.piecewise_leases` is what tells it so).
+    # None: every batch that fits a bucket.
+    can_lease: Callable[[list[NodeInputs]], bool] | None = None
+    # The region replays a whole step as ONE row, however many requests the
+    # step carries (a vision tower packing every request's images as segments
+    # of one ragged batch), so the runner leases, checks and replays it at batch
+    # size 1, under the step's first request. Only for a packed
+    # `lease_before_step` region captured at batch size 1 alone.
+    one_row_per_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets
@@ -299,12 +330,26 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
-    # torch.compile mode for the region; None takes the runner's default,
-    # max-autotune-no-cudagraphs
+    # torch.compile mode for the region; None takes the deployment's compile
+    # level (mstar serve -O), a mode opts the config out of it
     compile_mode: str | None = None
 
     def __post_init__(self):
         check_compile_mode(self.compile_mode)
+        if self.one_row_per_step and (
+            self.get_config_type() is not PiecewiseConfigType.PACKED
+            or not self.lease_before_step
+            or list(self.capture_batch_sizes or ()) != [1]
+        ):
+            raise ValueError(
+                "one_row_per_step needs a packed lease_before_step region "
+                "with capture_batch_sizes=[1]"
+            )
+
+    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+        """This region's step over the padded batch (``declare_step``); None
+        for a region that declares none."""
+        return None if self.declare_step is None else self.declare_step(request_ids, seq_lens)
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:
@@ -363,6 +408,30 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     replay.
     """
     total_tokens: list[int]  # token-count buckets to capture
+    # The attention resource of a region whose rows each attend within
+    # themselves. Set with `declare_step` left None, the region declares one
+    # non-causal "main" segment per row on it; a `one_row_per_step` region's
+    # lengths are all segments of its one row.
+    attn_key: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.attn_key is not None and self.declare_step is not None:
+            raise ValueError("attn_key declares the region's step; leave declare_step None")
+
+    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+        if self.attn_key is None:
+            return super().region_step(request_ids, seq_lens)
+        if self.one_row_per_step:
+            (rid,) = request_ids
+            request_ids = [rid] * len(seq_lens)
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=n)
+                for rid, n in zip(request_ids, seq_lens, strict=True)
+            ],
+            steps={self.attn_key: AttentionStep(causal=False)},
+        )
 
     def get_config_type(self) -> PiecewiseConfigType:
         return PiecewiseConfigType.PACKED

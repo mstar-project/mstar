@@ -10,8 +10,11 @@ Inverse dynamics still encodes the whole observed clip.
 
 from __future__ import annotations
 
+import pytest
 import torch
+import torch.nn.functional as F
 
+from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
 from mstar.model.cosmos3.submodules import Cosmos3VAEEncoderSubmodule
 from mstar.model.cosmos3.tests.test_edge import _tiny_edge_config
 from mstar.model.submodule_base import CurrentForwardPassInfo, ModelInputsFromEngine
@@ -35,16 +38,19 @@ class _StubVAE(torch.nn.Module):
         self.channels = channels
 
     def encode(self, x):
+        self.encoded_dtype = x.dtype
         b, c, t, h, w = x.shape
         lt = 1 if t == 1 else 1 + (t - 1) // 4
-        pooled = torch.nn.functional.avg_pool3d(x, kernel_size=(1, 16, 16))  # [1, 3, t, h/16, w/16]
+        # CPU avg_pool3d has no bf16 kernel
+        pooled = torch.nn.functional.avg_pool3d(x.float(), kernel_size=(1, 16, 16)).to(x.dtype)  # [1, 3, t, h/16, w/16]
         frames = [pooled[:, :, 0]] + [pooled[:, :, 1 + 4 * i] for i in range(lt - 1)]
         z = torch.stack(frames, dim=2).repeat(1, self.channels // 3 + 1, 1, 1, 1)[:, : self.channels]
         return type("out", (), {"latent_dist": _Dist(z)})()
 
 
-def _node(cfg):
-    return Cosmos3VAEEncoderSubmodule(vae=_StubVAE(cfg.latent_channel), config=cfg)
+def _node(cfg, dtype=torch.bfloat16):
+    # bf16 as Cosmos3Model._build_encode_vae builds it and the engine casts the node
+    return Cosmos3VAEEncoderSubmodule(vae=_StubVAE(cfg.latent_channel).to(dtype), config=cfg)
 
 
 def _run(enc, md, inputs):
@@ -78,8 +84,8 @@ def test_one_frame_encode_matches_frame0_of_the_repeated_clip():
     image = torch.rand(3, 64, 96)
     md = {"height": 32, "width": 48, "num_frames": 33, "action_mode": "policy", "action_chunk_size": 32}
     _, lat = _run(enc, md, {"image_inputs": [image]})
-    # What the reference pipelines encode: the frame repeated over the clip.
-    frame = enc._video_processor.preprocess(image, height=32, width=48).unsqueeze(2).float()
+    # What the reference pipelines encode: the frame repeated over the clip, in the VAE dtype.
+    frame = enc._video_processor.preprocess(image, height=32, width=48).unsqueeze(2).to(enc.vae.weight.dtype)
     repeated = enc.vae.encode(frame.expand(-1, -1, 33, -1, -1)).latent_dist.mode().to(lat.dtype)
     torch.testing.assert_close(lat[:, :, 0], repeated[:, :, 0])
 
@@ -96,3 +102,46 @@ def test_inverse_dynamics_and_i2v_keep_their_clips():
     ni, lat = _run(enc, {"height": 32, "width": 48, "num_frames": 33}, {"image_inputs": [torch.rand(3, 64, 96)]})
     assert ni.tensor_inputs["vision"].shape[2] == 1 and "condition_indexes" not in ni.kwargs
     assert tuple(lat.shape) == (1, cfg.latent_channel, 1, 2, 3)
+
+
+def test_i2v_follows_conditioning_resize():
+    image = torch.randint(0, 256, (3, 64, 96), generator=torch.Generator().manual_seed(0)).float() / 255.0
+    md = {"height": 32, "width": 32, "num_frames": 33}
+    for mode in ("aspect_crop", "stretch"):
+        ni, _ = _run(_node(_tiny_edge_config(conditioning_resize=mode)), md, {"image_inputs": [image]})
+        assert torch.equal(ni.tensor_inputs["vision"], prepare_conditioning_frames(image, 32, 32, mode)), mode
+    # diffusers' VideoProcessor resizes a tensor nearest-neighbour; the stretch must not.
+    nearest = F.interpolate(image.unsqueeze(0), size=(32, 32)) * 2 - 1
+    assert (ni.tensor_inputs["vision"][:, :, 0] - nearest).abs().mean() > 0.05
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_encode_runs_in_the_vaes_own_dtype(dtype):
+    """The node reads the encode dtype off its VAE and never casts the weights: the
+    instance may be shared with a chained window's head, which reads it too."""
+    cfg = _tiny_edge_config()
+    enc = _node(cfg, dtype)
+    md = {"height": 32, "width": 48, "num_frames": 33}
+    _, lat = _run(enc, md, {"image_inputs": [torch.rand(3, 64, 96)]})
+    assert enc.vae.encoded_dtype == dtype
+    assert enc.vae.weight.dtype == dtype
+    assert lat.dtype == torch.bfloat16  # what the DiT takes either way
+
+
+def test_encode_vae_is_built_in_bf16(tmp_path, monkeypatch):
+    """Cosmos3Model builds the encoder node's VAE in the checkpoint's bf16."""
+    diffusers = pytest.importorskip("diffusers")
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    vae = diffusers.AutoencoderKLWan(
+        base_dim=8, decoder_base_dim=16, z_dim=8, dim_mult=[1, 2, 2, 2], num_res_blocks=1, is_residual=True,
+        in_channels=12, out_channels=12, patch_size=2, scale_factor_spatial=16,
+        latents_mean=[0.0] * 8, latents_std=[1.0] * 8,
+    )
+    vae.to(torch.bfloat16).save_pretrained(tmp_path / "vae")
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    model.skip_weight_loading = False
+    monkeypatch.setattr(model, "_ensure_repo", lambda: tmp_path)
+    built = model._build_encode_vae("cpu")
+    assert {p.dtype for p in built.parameters()} == {torch.bfloat16}
+    assert all(torch.equal(a, b) for a, b in zip(built.state_dict().values(), vae.state_dict().values(), strict=True))

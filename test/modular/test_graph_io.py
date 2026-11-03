@@ -257,7 +257,7 @@ def test_cfg_branch_loop_io_artifacts():
     """A CFG-style loop — parallel denoise branches plus a combine node that
     feeds them back — derives no external inputs, classifies every branch
     feed as loop-back, and keeps the loop's declared output. This is BAGEL's
-    image_gen_cfg shape; these artifacts are identical before and after the
+    image_gen_cfg2 / image_gen_cfg3 shape; these artifacts are identical before and after the
     Parallel member-input fix (the branch feeds are produced by combine_cfg,
     so the enclosing Sequential reclassifies them as loop-back either way)."""
     from mstar.graph.base import Parallel

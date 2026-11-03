@@ -20,7 +20,7 @@ import types
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -35,9 +35,11 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
+from mstar.streaming.topology import PartitionTopology
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -47,6 +49,7 @@ class _DataWorker:
     reports each request's preprocess-finish time once asked to."""
 
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.inputs = []
         self.aborted = []
         self.chunks = queue.Queue()
@@ -100,10 +103,11 @@ class _DataWorker:
         pass
 
 
-class _Conductor:
+class _Conductor(StandInSocket):
     """The API server's socket to the conductor."""
 
     def __init__(self):
+        super().__init__()
         self.inbox = queue.Queue()
 
     def get_all_new_messages(self):
@@ -410,14 +414,14 @@ def _in_flight_id(served, client):
                          headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", content=_chunked(2**21),
                          headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
-    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 422, "/v1/chat/completions"),
+    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 400, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
     (_in_flight_id, 409, "/generate"),
     (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
     # The served model has no OpenAI adapter.
     (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
     (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
-], ids=["401", "401-unmatched", "413-declared", "413-chunked", "422", "400", "409", "404-unmatched",
+], ids=["401", "401-unmatched", "413-declared", "413-chunked", "400-schema", "400", "409", "404-unmatched",
         "404-no-adapter", "405"])
 def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
         served, refusing, send, status, route):
@@ -686,6 +690,9 @@ class _StubTensorManager:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def has_inflight_reads(self, request_id):
         return False
 
@@ -699,25 +706,32 @@ class _StubTensorManager:
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
     class _Model:
         def process_prompt(self, *args, **kwargs):
             return None
 
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["default"])
+
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
-    facade.profile_queue = queue.Queue()
+    facade.profile_queue = ResultQueue(EventWakeup())
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
-        communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                           send=lambda entity, msg: sent.append(msg)),
+        # codec / try_send_bytes: the thread's outbox sends through them
+        communicator=types.SimpleNamespace(
+            get_all_new_messages=lambda: [],
+            codec=types.SimpleNamespace(encode=lambda msg: msg),
+            try_send_bytes=lambda entity, msg: sent.append(msg) or True,
+        ),
         tensor_manager=_StubTensorManager(), model=_Model(),
         timing_requested=facade.timing_requested,
     )
@@ -1004,6 +1018,9 @@ class _MediaModel:
     def max_input_files(self):
         return {"image": 1}
 
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def load_image(self, filepath, device):
         from mstar.model.base import Model
 
@@ -1036,14 +1053,16 @@ class _RealDataWorker:
     stand-in transport and conductor, and the API server's message thread."""
 
     def __init__(self, tmp_path, *, metrics, enable_prof=False):
-        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 
         self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
         facade = self.facade = PreprocessWorker.__new__(PreprocessWorker)
         for name in ("request_input_queue", "result_tensor_input_queue", "cleanup_request_queue",
-                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
-                     "output_queue", "profile_queue"):
+                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
             setattr(facade, name, queue.Queue())
+        facade.results_wakeup = EventWakeup()
+        facade.output_queue = ResultQueue(facade.results_wakeup)
+        facade.profile_queue = ResultQueue(facade.results_wakeup)
         facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
         facade.worker_metrics_requested = threading.Event()
         facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
@@ -1055,8 +1074,12 @@ class _RealDataWorker:
             abort_request_queue=facade.abort_request_queue,
             reads_done_queue=facade.reads_done_queue,
             discard_tensor_queue=facade.discard_tensor_queue, stop_event=facade.stop_event,
-            communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                               send=lambda entity, msg: self.sent.append(msg)),
+            # codec / try_send_bytes: the thread's outbox sends through them
+            communicator=types.SimpleNamespace(
+                get_all_new_messages=lambda: [],
+                codec=types.SimpleNamespace(encode=lambda msg: msg),
+                try_send_bytes=lambda entity, msg: self.sent.append(msg) or True,
+            ),
             tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
             worker_metrics_requested=facade.worker_metrics_requested,
@@ -1286,6 +1309,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+    # sizing torch's pool would outlive the test in this process
+    monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     return str(cfg)
 
 
@@ -1311,6 +1336,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1349,7 +1375,9 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context",
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
@@ -1364,6 +1392,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1388,7 +1417,8 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "lora_adapter_digests": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 

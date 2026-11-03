@@ -314,6 +314,16 @@ def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
     return F.resize(image, (size, size), InterpolationMode.BICUBIC, antialias=True)
 
 
+def vllm_vae_size(h: int, w: int, stride: int, max_img_size: int, min_img_size: int = 256) -> tuple[int, int]:
+    """The ``(height, width)`` `vllm_vae_resize` resizes an ``h`` x ``w`` image to."""
+    scale = min(max_img_size / max(w, h), 1.0)
+    min_size = min(min_img_size, max_img_size)
+    scale = max(scale, min_size / min(w, h))
+    new_w = max(stride, int(round(w * scale / stride) * stride))
+    new_h = max(stride, int(round(h * scale / stride) * stride))
+    return min(new_h, max_img_size), min(new_w, max_img_size)
+
+
 def vllm_vae_resize(
     image: torch.Tensor,
     stride: int,
@@ -327,11 +337,5 @@ def vllm_vae_resize(
     normalization is applied separately by the caller.
     """
     _, h, w = image.shape
-    scale = min(max_img_size / max(w, h), 1.0)
-    min_size = min(min_img_size, max_img_size)
-    scale = max(scale, min_size / min(w, h))
-    new_w = max(stride, int(round(w * scale / stride) * stride))
-    new_h = max(stride, int(round(h * scale / stride) * stride))
-    new_w = min(new_w, max_img_size)
-    new_h = min(new_h, max_img_size)
-    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)
+    size = vllm_vae_size(h, w, stride, max_img_size, min_img_size)
+    return F.resize(image, size, InterpolationMode.BICUBIC, antialias=True)

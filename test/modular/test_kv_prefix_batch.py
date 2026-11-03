@@ -48,7 +48,7 @@ def _run(batched: bool, lazy_steps: int | None = None, flush: bool = False):
     rids = ["r0", "r1"]
     prompts = {"r0": list(range(100)), "r1": list(range(50, 50 + H.PAGE_SIZE + 10))}
     for rid in rids:
-        H._ingest(kv, rid, prompts[rid])
+        H._ingest(kv, rid, prompts[rid], decode=2 * H.PAGE_SIZE + 2)
     # the prefill of each, and the token it sampled
     for rid in rids:
         H._step(kv, rid, len(prompts[rid]))

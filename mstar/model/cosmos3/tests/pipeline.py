@@ -69,8 +69,8 @@ class Cosmos3Pipeline:
         self._latents_mean = torch.tensor(vae.config.latents_mean, dtype=vae.dtype, device=device)
         self._latents_inv_std = 1.0 / torch.tensor(vae.config.latents_std, dtype=vae.dtype, device=device)
 
-        # Conditioning-frame preprocessor (PIL / numpy / tensor -> [1,3,H,W] in
-        # [-1,1], resized) — the same one the diffusers pipeline uses, for parity.
+        # Video-conditioning frame preprocessor (PIL / numpy / tensor -> [1,3,H,W]
+        # in [-1,1], resized) — the same one the diffusers pipeline uses, for parity.
         from diffusers.video_processor import VideoProcessor
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_spatial, resample="bilinear")
@@ -100,9 +100,6 @@ class Cosmos3Pipeline:
     def _conditioning_frame(self, image, height: int, width: int) -> torch.Tensor:
         """The i2v conditioning frame as ``[1, 3, H, W]`` in [-1, 1], through
         the config's ``conditioning_resize`` recipe (the served node's choice)."""
-        mode = getattr(self.config, "conditioning_resize", "stretch")
-        if mode == "stretch":
-            return self.video_processor.preprocess(image, height=height, width=width)
         import numpy as np
 
         from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
@@ -110,7 +107,7 @@ class Cosmos3Pipeline:
         if not isinstance(image, torch.Tensor):
             arr = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
             image = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
-        return prepare_conditioning_frames(image, height, width, mode)[:, :, 0]
+        return prepare_conditioning_frames(image, height, width, self.config.conditioning_resize)[:, :, 0]
 
     def _encode_video(self, x: torch.Tensor) -> torch.Tensor:
         """[1,3,T,H,W] in [-1,1] -> normalized latents [1,C,T_lat,H/16,W/16].
@@ -232,8 +229,10 @@ class Cosmos3Pipeline:
             use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
         )
 
+        # The loop state is fp32 like the served path and the reference pipeline.
+        loop_dtype = torch.float32
         latents, has_image_condition = self._prepare_latents(
-            image, num_frames, height, width, generator, latents, device, dtype
+            image, num_frames, height, width, generator, latents, device, loop_dtype
         )
         latent_shape = tuple(latents.shape)
 
@@ -279,7 +278,7 @@ class Cosmos3Pipeline:
             hop = int(round(self.config.sound_sample_rate / self.config.sound_latent_fps))
             sound_frames = max(1, math.ceil(target / hop))
             sound_latents = randn_tensor(
-                (1, self.config.sound_dim, sound_frames), generator=generator, device=device, dtype=dtype
+                (1, self.config.sound_dim, sound_frames), generator=generator, device=device, dtype=loop_dtype
             )
 
         cond = build_static_inputs(
@@ -315,11 +314,15 @@ class Cosmos3Pipeline:
             cond_v, cond_s = _forward(cond_static, vision_tokens, vision_timesteps, t)
             if guidance_scale != 1.0:
                 uncond_v, uncond_s = _forward(uncond_static, vision_tokens, vision_timesteps, t)
+                cond_v, uncond_v = cond_v.to(loop_dtype), uncond_v.to(loop_dtype)
                 velocity = uncond_v + guidance_scale * (cond_v - uncond_v)
-                sound_v = (uncond_s + guidance_scale * (cond_s - uncond_s)) if generate_sound else None
+                sound_v = None
+                if generate_sound:
+                    cond_s, uncond_s = cond_s.to(loop_dtype), uncond_s.to(loop_dtype)
+                    sound_v = uncond_s + guidance_scale * (cond_s - uncond_s)
             else:
-                velocity = cond_v
-                sound_v = cond_s
+                velocity = cond_v.to(loop_dtype)
+                sound_v = cond_s.to(loop_dtype) if generate_sound else None
             if generate_sound:
                 # Joint [video | sound] scheduler step (one multistep history).
                 nv = velocity.numel()
@@ -414,7 +417,11 @@ class Cosmos3Pipeline:
         else:
             clean_action = torch.zeros((1, action_chunk_size, action_dim), device=device, dtype=dtype)
             action_clean_mask = torch.zeros((1, action_chunk_size, 1), device=device, dtype=dtype)
-        a_noise = randn_tensor((1, action_chunk_size, action_dim), generator=generator, device=device, dtype=dtype)
+        # The loop state is fp32 like the served path and the reference pipeline.
+        loop_dtype = torch.float32
+        a_noise = randn_tensor(
+            (1, action_chunk_size, action_dim), generator=generator, device=device, dtype=loop_dtype,
+        )
         a_noise[..., raw_action_dim:] = 0
         clean_action[..., raw_action_dim:] = 0
         action_latents = action_clean_mask * clean_action + (1.0 - action_clean_mask) * a_noise
@@ -433,7 +440,7 @@ class Cosmos3Pipeline:
         vmask = torch.zeros((1, 1, t_lat, 1, 1), device=device, dtype=dtype)
         for f in vis_clean:
             vmask[:, :, f] = 1.0
-        v_noise = randn_tensor(latent_shape, generator=generator, device=device, dtype=dtype)
+        v_noise = randn_tensor(latent_shape, generator=generator, device=device, dtype=loop_dtype)
         latents = vmask * cond_latent + (1.0 - vmask) * v_noise
         velocity_mask = 1.0 - vmask  # 1 where the video is predicted
 
@@ -466,10 +473,12 @@ class Cosmos3Pipeline:
             v_c, a_c, _ = self.transformer(**cond_static, **step_kwargs)
             if do_cfg:
                 v_u, a_u, _ = self.transformer(**uncond_static, **step_kwargs)
-                video_v = v_u[0] + guidance_scale * (v_c[0] - v_u[0])
+                v_c, v_u = v_c[0].to(loop_dtype), v_u[0].to(loop_dtype)
+                a_c, a_u = a_c.to(loop_dtype), a_u.to(loop_dtype)
+                video_v = v_u + guidance_scale * (v_c - v_u)
                 action_v = a_u + guidance_scale * (a_c - a_u)
             else:
-                video_v, action_v = v_c[0], a_c
+                video_v, action_v = v_c[0].to(loop_dtype), a_c.to(loop_dtype)
 
             video_v = video_v * velocity_mask
             action_v = action_v * action_velocity_mask

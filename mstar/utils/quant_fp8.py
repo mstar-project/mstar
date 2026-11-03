@@ -11,8 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-# e4m3; declared here so utils/ keeps no dependency on model/.
-FP8_DTYPE = torch.float8_e4m3fn
+from mstar.utils.fp8_block import FP8_DTYPE  # noqa: F401 - e4m3, re-exported for the kernels' importers
 
 # Groups quantized per program.  One program per group (sglang's shape) is
 # 393k programs for an 8k x 6144 prefill; 16 matches vLLM's CUDA quantizer.

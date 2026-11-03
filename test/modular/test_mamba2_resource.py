@@ -108,6 +108,19 @@ def test_build_dispatches_on_the_variant_and_reads_the_geometry():
     assert pool.block("ssm", 1).shape == (8, 4, 8, 16) and pool.block("conv", 0).shape == (8, GEOM.conv_dim, 3)
 
 
+def test_a_state_in_the_engine_dtype_reaches_the_manager_as_the_pool_stores_it():
+    spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
+        num_layers=NUM_LAYERS, blocks=GEOM.to_blocks(state_dtype=None), max_slots=8,
+    ))
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float16, dependencies={POOL: spec})
+    pool = RecurrentStatePool.build(spec, info)
+    manager = LinearAttnManager.build(
+        LinearAttnSpec(MAMBA, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.MAMBA2)),
+        info,
+    )
+    assert manager.state_dtype is pool.block("ssm", 0).dtype is torch.float16
+
+
 def test_plan_is_a_narrow_of_the_pools_addressing():
     pool, manager = build()
     _, c = plan(pool, manager, ["a", "b", "c"], [1, 1, 1])

@@ -1,7 +1,12 @@
 
-from collections.abc import KeysView, Mapping, Sequence
+from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, ClassVar, NamedTuple
+
+# The graph walk on a piecewise region's step context: the region declares, plans and
+# commits its own step inside the enclosing forward's (see accelerator_graph_runner).
+PIECEWISE_WALK = "__piecewise__"
 
 
 class Segment(NamedTuple):
@@ -47,6 +52,39 @@ class SlotLease:
     bucket: BucketKey | None # None -> eagre
 
 
+class SettingValue(Enum):
+    UNSET = 0
+    SET = 1
+    PARTIAL = 2
+
+
+class PerReqSetting(NamedTuple):
+    """A step's flag that may hold for only some of its rows."""
+    value: SettingValue
+    # the rows it holds for; set iff ``value`` is PARTIAL
+    set_rids: frozenset[int] | None = None
+
+    @classmethod
+    def over(
+        cls, rids: Collection[int], holds: Callable[[int], bool],
+    ) -> "PerReqSetting":
+        set_rids = frozenset(rid for rid in rids if holds(rid))
+        if len(set_rids) == len(rids):
+            return ALL_SET
+        if not set_rids:
+            return NONE_SET
+        return cls(SettingValue.PARTIAL, set_rids)
+
+    def holds_for(self, rid: int) -> bool:
+        if self.value is SettingValue.PARTIAL:
+            return rid in self.set_rids
+        return self.value is SettingValue.SET
+
+
+ALL_SET = PerReqSetting(SettingValue.SET)
+NONE_SET = PerReqSetting(SettingValue.UNSET)
+
+
 @dataclass
 class StepContext:
     # engine-only. mutable: the engine pads `request_ids` and fills the lease
@@ -58,6 +96,9 @@ class StepContext:
 
     # Preplan
     is_preplan: bool = False
+    # the prefix a resource's own plan laps record under, as the runner times
+    # the plan: res.pre_plan, res.plan (promoting a pre-plan) or res.plan_fresh
+    plan_phase: str = "res.plan"
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
@@ -80,6 +121,12 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # rid -> input tokens a chunked row runs after this step
+    chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
+    # the rows whose walk grows its state by those tokens, so a resource may
+    # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
+    # before reserving by ``chunk_tokens_after``.
+    reserve_whole_prefill: PerReqSetting = ALL_SET
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -168,6 +215,14 @@ class AllocationFailed(AdmitFailedReason):
     pages_short: int
     label: str
     request_id: str
+    # How many of the step's requests, in its order, the free pages held, and
+    # how many the pool would hold with nothing else resident, out of the
+    # ``rows_sized`` it counted; None when the resource does not say. The
+    # worker sizes the retry from them. A row the prefix cache served whole
+    # runs no step, so it is in the worker's batch but not in ``rows_sized``.
+    rows_fit: int | None = None
+    rows_fit_alone: int | None = None
+    rows_sized: int | None = None
 
 
 @dataclass
@@ -202,6 +257,8 @@ class AdmitOutcome(NamedTuple):
 # Every resource's admit returns this on the common path, several times a
 # step; nothing reads identity, so hand back one instance rather than build it.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
+# `Resource.ask`'s answer for a request that waits for the resource's capacity
+ASKS = AdmitOutcome(ok=True, ready=False)
 
 
 class FullAdmitOutcome(NamedTuple):
@@ -214,6 +271,8 @@ class FullAdmitOutcome(NamedTuple):
     """
     outcome: AdmitOutcome
     failed_resource: str | None = None
+    # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
+    queued: bool = False
 
     @property
     def ok(self) -> bool:
@@ -231,3 +290,4 @@ class FullAdmitOutcome(NamedTuple):
 FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
+FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)

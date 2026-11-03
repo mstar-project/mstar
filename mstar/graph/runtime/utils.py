@@ -10,18 +10,22 @@ class GraphRuntimeType(IntEnum):
     RUST = 1
 
 
-def resolve_graph_runtime_type(log: bool = True) -> GraphRuntimeType:
-    """``MSTAR_RUST_GRAPH``: ``0`` Python, ``1`` Rust, ``AUTO`` (default) Rust
-    where it can run.
-
-    Only those three spellings; a typo raises rather than falling back, so a
-    build that did not take cannot read as a deliberate ``0``.
-    """
+def requested_graph_runtime() -> str:
+    """``MSTAR_RUST_GRAPH`` as set. Only ``0``, ``1`` and ``AUTO``; a typo
+    raises rather than falling back, so a build that did not take cannot read
+    as a deliberate ``0``."""
     requested = os.getenv("MSTAR_RUST_GRAPH", "AUTO")
     if requested not in ("0", "1", "AUTO"):
         raise ValueError(
             f"MSTAR_RUST_GRAPH must be 0, 1, or AUTO; got {requested!r}"
         )
+    return requested
+
+
+def resolve_graph_runtime_type(log: bool = True) -> GraphRuntimeType:
+    """``MSTAR_RUST_GRAPH``: ``0`` Python, ``1`` Rust, ``AUTO`` (default) Rust
+    where it can run (see ``requested_graph_runtime``)."""
+    requested = requested_graph_runtime()
     choice = requested
     if choice == "AUTO":
         try:

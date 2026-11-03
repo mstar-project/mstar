@@ -205,6 +205,11 @@ class _ReadyTensorManager:
         self.dereferenced = []
         self.cleaned = []
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         ready, self.ready = self.ready, {}
         return {
@@ -397,8 +402,9 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.device = "cpu"
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
-    worker._prefix_streams = {}
+    worker._keyed_labels = {}
     worker._live_requests = {}
+    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(
@@ -641,6 +647,10 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
     assert interleaving_failure(log, ("rid-a", "rid-b")) is None
     assert harness["_execution_count_failure"](log, ("rid-a", "rid-b"), 2) is None
     assert harness["_cleaned_request_ids"](log) == {"rid-a", "rid-b"}
+    # the server logs the internal id: the client's plus a "#<n>" suffix
+    suffixed = log.replace("rid-a", "rid-a#0").replace("rid-b", "rid-b#0")
+    assert harness["_dit_schedule"](suffixed, {"rid-a", "rid-b"}) == harness["_dit_schedule"](log, {"rid-a", "rid-b"})
+    assert harness["_cleaned_request_ids"](suffixed) == {"rid-a", "rid-b"}
     serial = "\n".join(
         [
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",

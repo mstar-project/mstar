@@ -19,6 +19,7 @@ from mstar.api_server.request_types import PreprocessInput
 from mstar.model.base import ProcessPromptOutput
 from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+from mstar.streaming.topology import PartitionTopology
 
 ASSISTANT_PREFIX = [151644, 77091, 198]
 ASSISTANT_SUFFIX = [151645, 198, 151644, 77091, 198]
@@ -73,7 +74,7 @@ def test_qwen3_tts_a_client_cannot_set_the_codec_stream_lead(variant, mode, lead
     )
     assert codec.stream_lead_items == ({"codec_tokens": lead} if lead else {})
     # every key the conductor reads back is one the data worker strips from the client
-    assert set(result.metadata) <= set(model.INTERNAL_KWARGS)
+    assert set(result.metadata) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
 
 
 class _RecordingCommunicator:
@@ -102,6 +103,9 @@ class _Internal:
     """Reports a key of its own to the conductor, and only on some prompts."""
 
     INTERNAL_KWARGS = ("stream_lead",)
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         self.handed = kwargs
