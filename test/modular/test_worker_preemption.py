@@ -44,6 +44,7 @@ from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -397,11 +398,11 @@ def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_
     assert kv.residency("v") is Residency.DROPPED, "rank 0 left the victim for a later step"
 
     sent = []
-    w.maybe_send_zmq_to_tp_followers, w._make_executing_batch = sent.append, SimpleNamespace
+    w.maybe_send_zmq_to_tp_followers, w.streams = sent.append, StreamBufferManager(w.request_state, None, [])
     w._tp_followers = {NODE: ["rank1"]}
     w.engine_manager.get_engine(NODE).owes_moves = lambda: True
     Worker._flush_tp_moves(w)
-    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, [])], (
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], (
         "the drop waits for a step that never comes"
     )
 
@@ -415,12 +416,12 @@ def test_rank_0_sends_its_journal_unless_a_step_of_the_instance_waits_for_its_de
     w._lockstep_led, w._tp_followers = frozenset({NODE}), {NODE: ["rank1"]}
     w.engine_manager.get_engine(NODE).owes_moves = lambda: True
     sent = []
-    w.maybe_send_zmq_to_tp_followers, w._make_executing_batch = sent.append, SimpleNamespace
+    w.maybe_send_zmq_to_tp_followers, w.streams = sent.append, StreamBufferManager(w.request_state, None, [])
 
     Worker._flush_tp_moves(w, SimpleNamespace(node_name=NODE))
     assert not sent, "a step of moves alone went out ahead of the instance's speculation decision"
     Worker._flush_tp_moves(w, SimpleNamespace(node_name="SNAC"))
-    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, [])], "the journal waits out SNAC's chain"
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], "the journal waits out SNAC's chain"
 
 
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():

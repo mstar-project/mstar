@@ -2025,8 +2025,8 @@ class Worker:
             return
         node_name = next((node for node in self._lockstep_led if node in self._tp_followers), None)
         if node_name is not None and self._owes_tp_moves():
-            self.maybe_send_zmq_to_tp_followers(self._make_executing_batch(
-                node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
+            self.maybe_send_zmq_to_tp_followers(make_executing_batch(
+                self.streams, node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
                 per_request_info={},
             ))
 
