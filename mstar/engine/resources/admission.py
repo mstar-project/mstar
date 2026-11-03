@@ -42,7 +42,8 @@ class Admission:
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
         # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
         # against, until that request leaves the front of the queue.
-        # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried.
+        # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried, or a
+        # request waits to pass a first request whose resource has grown since it didn't fit.
         # `_admitted` holds the nodes each request was admitted on, with the walk each was admitted for.
         # `_started` holds, for a request admitted during one node's check, the other nodes waiting on
         # it, which `admit_waiting` reports so their parked checks resume.
@@ -251,6 +252,8 @@ class Admission:
             elif key in self._passes and first in blocked:
                 passing.append(key)
             else:
+                # a first request whose resource grew may fit now, and `admit_waiting` tries it before ``rid``
+                self._untried |= key in self._passes and key in self._short
                 return None
         return self._reserve(rid, published_of, passing) if passing else None
 

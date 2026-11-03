@@ -228,6 +228,17 @@ def test_a_filed_page_tries_no_request_whose_output_cant_fit_beside_the_head(mon
     assert not tried, f"one filed page tried {len(tried)} requests whose output doesn't fit whatever their hit"
 
 
+def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the_head_is_refused_again():
+    kv = _passing(free=3, head=5)
+    kv._index.filed += 1  # the head may fit now, so nothing passes it until it is measured again
+    _short_chat(kv, "p", [7000] * 8)
+    assert _runner(kv).admit_retrieve("p", NODE, WALK, None).queued
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "p") in started, "a request parked behind a head that still doesn't fit was never tried to pass"
+
+
 def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
     kv = _passing(free=3, head=5)
     # "p"'s output fits, but not beside its three own pages past what "r" holds
