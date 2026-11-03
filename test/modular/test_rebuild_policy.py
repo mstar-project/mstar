@@ -310,6 +310,30 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids_and_of_
     assert rebuilds._kept[NODE][A].copies.inputs is None, "a row of another walk would stand in for the prefill"
 
 
+def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_gives_back_what_they_didnt_use():
+    """Every image request pinned its encoder output in blocks of its own for its whole life, and nothing capped the
+    total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
+    pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
+    before it is admitted and stays out of the drops."""
+    pool = HostPool(160, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
+
+    # five ids at 4 B, aligned to 24, and the image's six slots at 8 B
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R].nbytes == 24 + 48
+    assert _ingest(rebuilds, A, IMAGE_CHAT)
+    assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
+    step = _vision_step((R,), {}, completion_event=None)
+    # the image's four rows, without its two sentinels
+    step.per_request_input_tensors[R] = {
+        "text_inputs": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], "embeds": [torch.ones(4, 2)],
+    }
+    rebuilds.keep_prompts(step)
+    rebuilds.keep_copies(step)
+
+    assert rebuilds._droppable[NODE][R].nbytes == 24 + 32, "the sentinels' room would stay taken for the request's life"
+    assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
+
+
 def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_metadata():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
     embeds, metadata = torch.ones(6, 2), {"prefill_order": ("text", "image", "text")}
