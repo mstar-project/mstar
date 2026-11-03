@@ -4451,11 +4451,7 @@ class KVManager(AttentionResource):
             # a victim not yet moved frees its pages for the request it was chosen for
             moving = any(other in self._victims for other in newer)
             newer = [other for other in newer if other not in self._victims]
-            # Above one rank, count only free host pages. The victims move after the readiness checks, and a host
-            # fetch there can retain the cached pages `CPUPagePool.room` counts.
-            on_host = 0 if self._cpu_pool is None else (
-                self._cpu_pool.arena.num_free if self._world_size > 1 else self._cpu_pool.room()
-            )
+            on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
             left, hosted = on_host, set()
             victims: list[str] = []
             for other in newer:

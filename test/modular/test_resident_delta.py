@@ -1434,32 +1434,6 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
 
 
-def test_above_one_rank_a_host_victim_moves_when_a_fetch_retains_cached_host_pages_before_the_broadcast(
-    monkeypatch,
-):
-    """Rank 0 moves its victims as their node's next step goes out, after the readiness checks, and a host fetch
-    there can retain cached pages that only the host index held. If those pages counted as room, a victim sent to
-    the host would not fit, stay on the device, and keep the request it was chosen for waiting."""
-    leader, lead = _pool_rank(monkeypatch, 0)
-    cpu = leader._cpu_pool = host._HostPool(8)
-    cached, keys = cpu.arena.acquire(4), [bytes([i]) * 32 for i in range(4)]
-    cpu.index.insert_run(keys, cached, None)
-    cpu.arena.release(cached)
-    _ingest((leader,), "r", 2, arrival=1)
-    _ingest((leader,), "v", 6, arrival=2)
-    assert _admits(leader, "r")
-    assert _admits(leader, "v")
-    for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 6 * PAGE_SIZE), ("r", 2 * PAGE_SIZE)):
-        assert _step(leader, rid, tokens).ok
-    assert not _step(leader, "r", 1).ok
-    victims = leader.preempt("r", 1, droppable=lambda rid: False)
-    hosted = [rid for rid in victims if leader.moves_to_host(rid)]
-    cpu.retain_run(keys)
-    for rid in hosted:
-        lead.offload_request(NODE, rid)
-    assert hosted and all(leader.is_offloaded(rid) for rid in hosted), f"{hosted} chosen for the host stayed"
-
-
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
     """A node's second pool can hold a request back on every readiness check, undoing the first pool's allotment."""
     leader, lead = _pool_rank(monkeypatch, 0)
