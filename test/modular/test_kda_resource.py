@@ -90,7 +90,8 @@ def build(device=CPU, **kwargs) -> tuple[RecurrentStatePool, KDAManager]:
 def plan(pool, kda, rids, spans, ctx, speculative=False):
     segments = tuple(Segment(rid, "main", n) for rid, n in zip(rids, spans, strict=True))
     for rid in rids:
-        pool.ingest_request(rid)
+        if rid not in pool._slots:  # once per request, as the worker does (#725)
+            pool.ingest_request(rid)
     pool_step = RecurrentStep(segments=segments)
     assert pool.admit(pool_step, ctx).ok
     ctx.plan_results[POOL] = pool.plan(pool_step, ctx)

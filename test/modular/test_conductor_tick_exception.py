@@ -99,6 +99,7 @@ def _conductor(*ticks, requests):
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
         get_all_new_messages=lambda: batches.pop(0) if batches else [],
+        poll_for_messages=lambda timeout_ms: bool(batches),
     )
     c.model = _Model()
     c.enable_nvtx = False
@@ -116,6 +117,8 @@ def _conductor(*ticks, requests):
     c._drain_ttl_s = 120.0
     c.worker_graphs = {0: SimpleNamespace(graph_walks={"decode"})}
     c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = set()
+    c._client_streams = {}
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}}
     c._wait_for_workers_ready = lambda: None
 
@@ -123,12 +126,12 @@ def _conductor(*ticks, requests):
         if not batches:
             raise _StopLoop
     c._poll_worker_liveness = _poll
+    c._next_liveness_check = 0.0
     return c
 
 
 @pytest.fixture(autouse=True)
-def _no_sleep_no_freeze(monkeypatch):
-    monkeypatch.setattr(conductor_mod.time, "sleep", lambda _s: None)
+def _no_freeze(monkeypatch):
     monkeypatch.setattr(conductor_mod, "freeze_after_setup", lambda _n: None)
 
 

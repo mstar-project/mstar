@@ -278,7 +278,7 @@ class ChatterboxModel(Model):
             return
         kv = next(s for s in self.get_node_resources() if s.resource_key == T3_KV).config
         overrides = (config.get("resources") or {}).get(T3_KV) or {}
-        page_size = int(overrides.get("page_size", kv.page_size))
+        page_size = int(overrides.get("page_size", kv.tokens_per_page))
         max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
         need = 1 + int(cap) * self._request_kv_pages(page_size)
         if need > max_num_pages:
@@ -428,7 +428,7 @@ class ChatterboxModel(Model):
         return self.resolve_generation_kwargs(model_kwargs)["max_new_tokens"]
 
     def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # The stop check counts the prefill's token, so it allows max_new_tokens - 1 iterations.
+        # The prefill samples the first token, so decode runs max_new_tokens - 1 iterations.
         return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

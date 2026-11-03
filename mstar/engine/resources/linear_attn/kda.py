@@ -288,7 +288,9 @@ class KDAManager(LinearAttnManager):
         previous replay on the stream that runs the step."""
         lease = ctx.slot_lease
         if lease is None:
-            return self._layout_stager.to_device(host, self._device)
+            out = torch.empty(len(host), dtype=torch.int32, device=self._device)
+            self._layout_stager.copy_(out, host)
+            return out
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_layout.get(key)
         if buf is None:

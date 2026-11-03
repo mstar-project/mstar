@@ -65,7 +65,8 @@ def _resources(cfg: KDAConfig):
 def _step(pool, kda, spans: dict[str, int], walk: str):
     segments = tuple(Segment(rid, "main", n) for rid, n in spans.items())
     for rid in spans:
-        pool.ingest_request(rid)
+        if rid not in pool._slots:  # once per request, as the worker does (#725)
+            pool.ingest_request(rid)
     ctx = StepContext(request_ids=tuple(spans), graph_walk=walk, slot=0, capture=False)
     pool_step = RecurrentStep(segments=segments)
     assert pool.admit(pool_step, ctx).ok

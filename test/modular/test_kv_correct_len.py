@@ -129,7 +129,7 @@ def test_a_rewind_across_a_sealed_page_drops_it():
     mgr.correct_len("r", "main", -8)  # back to 4, the end of page 0
 
     assert _stream(mgr).page_indices == pages[:1]
-    assert mgr._arena.num_owners[pages[1]] == 1, "the other owner keeps its page"
+    assert mgr._arena.owners(pages[1]) == 1, "the other owner keeps its page"
     assert mgr._arena.num_free == free + 1, "the unsealed page 2 is freed with it"
     view = _step(mgr, 1)
     assert view.page_idxs[0] == pages[0]
@@ -147,9 +147,9 @@ def test_a_rewind_ending_inside_a_sealed_page_keeps_a_copy():
     mgr.correct_len("r", "main", -2)  # back to 6, inside page 1
 
     copy = _stream(mgr).page_indices[1]
-    assert copy != pages[1] and not mgr._arena.sealed[copy]
+    assert copy != pages[1] and not mgr._arena.is_sealed(copy)
     assert mgr.layer_view(0)[copy].eq(7.0).all(), "the kept rows were not copied"
-    assert mgr._arena.num_owners[pages[1]] == 1
+    assert mgr._arena.owners(pages[1]) == 1
     assert _stream(mgr).stored_len == 6
 
 

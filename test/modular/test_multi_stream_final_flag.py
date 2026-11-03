@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import (  # noqa: E402
     StreamBuffer,
@@ -64,15 +63,12 @@ def _step(worker, node, final_edges):
         worker.streams, node_name=node, graph_walk="chunk", request_ids=list(final_edges),
         per_request_input_tensors={}, per_request_info={}, final_edges=final_edges,
     )
-    return batch.final_stream_rids, batch.stream_partition_done_rids
+    return batch.final_stream_rids, batch.partition_done_rids
 
 
 def _final_edge(name):
     return StreamingEdge(
-        GraphEdge(
-            next_node=TOPOLOGY[name][0], name=name, is_streaming=True,
-            _final_stream_chunk=True,
-        ),
+        name, TOPOLOGY[name][0], [],
         StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True),
     )
 
@@ -140,7 +136,7 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
         per_request_input_tensors={"r": {}}, per_request_info={"r": None},
         final_edges={"r": {"pitch"}},
     )
-    assert (batch.final_stream_rids, batch.stream_partition_done_rids) == ({"r"}, {"r"})
+    assert (batch.final_stream_rids, batch.partition_done_rids) == ({"r"}, {"r"})
     speculation = SimpleNamespace(
         node_batch=batch, continuing_rids={"r"}, consumed_edges=[("loop", None)],
         scheduled_batch=ScheduledBatch(node_name="n", graph_walk="w", request_to_worker_graph={"r": 0}),
@@ -159,7 +155,7 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     worker._settle_speculation(speculation, True, speculation.dropped)
 
     assert speculation.dropped == {"r"}
-    assert (batch.final_stream_rids, batch.stream_partition_done_rids) == (set(), set())
+    assert (batch.final_stream_rids, batch.partition_done_rids) == (set(), set())
     assert _step(worker, "vocoder", {"r": {"pitch"}}) == ({"r"}, {"r"})
 
 

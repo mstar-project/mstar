@@ -63,6 +63,7 @@ class Glm52Model(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -102,8 +103,9 @@ class Glm52Model(Model):
             self.config.kernels = kwargs["kernels"]
         if "graph_compile" in kwargs:
             self.config.graph_compile = bool(kwargs["graph_compile"])
-        for key in ("prefill_token_buckets", "prefill_batched_token_buckets",
-                    "prefill_capture_batch_sizes"):
+        if prefill_token_buckets is not None:
+            self.config.prefill_token_buckets = [int(n) for n in prefill_token_buckets]
+        for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
             if key in kwargs:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
         if "mtp_num_draft_tokens" in kwargs:
@@ -304,8 +306,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget lives in check_stop,
-            # which sees the request's real max_tokens. Sized to the most
+            # Runaway guard only: the per-request budget is the loop cap
+            # (get_loop_caps), set from the request's max_tokens. Sized to the most
             # decode steps any prompt can take before the context guard, not
             # to the default budget: at the default, every request asking for
             # more was cut short at 1025 tokens with no error.
