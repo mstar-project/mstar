@@ -51,8 +51,8 @@ def _graphs() -> dict:
 
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
+    view = torch.tensor(prompt, dtype=torch.long)
+    return KeptIds(HostCopy(view, None), PREFILL, array("i", sampled), {"is_prefill": True})
 
 
 def _cleanup(node, rids, wgs):

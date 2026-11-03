@@ -190,9 +190,9 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
 
 
 def _kept(prompt, *sampled: int) -> KeptIds:
-    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as int32."""
-    view = torch.tensor(prompt, dtype=torch.int32)
-    return KeptIds(HostCopy(view, None), PREFILL, torch.long, array("i", sampled), {"is_prefill": True})
+    """Ids kept as `Rebuilds.keep_prompts` keeps them, the prompt on the host as the walk read it."""
+    view = torch.tensor(prompt, dtype=torch.long)
+    return KeptIds(HostCopy(view, None), PREFILL, array("i", sampled), {"is_prefill": True})
 
 
 def test_a_prompt_rows_ids_are_kept_once_on_the_host():
@@ -208,12 +208,14 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
     assert kept[R].prompt.view.tolist() == [7, 8, 9] and kept[A].prompt.view.tolist() == [8, 9, 10], (
         "it kept another row's ids"
     )
-    assert kept[R].dtype == torch.long, "the rebuild row would read its ids in another dtype than the walk's"
+    assert kept[R].prompt.view.dtype == torch.long, (
+        "the rebuild row would read its ids in another dtype than the walk's"
+    )
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
 
     assert _ingest(rebuilds, A, (PrefixSpan(4, 4, PREFILL),)), "a request the pool holds would stay guaranteed"
     assert not _ingest(rebuilds, R, (PrefixSpan(2, 2, PREFILL),)), "two requests' ids would share host memory"
@@ -222,7 +224,7 @@ def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
 
 
 def test_removing_a_request_gives_its_slice_back():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu")))
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
     _ingest(rebuilds, R, (PrefixSpan(4, 4, PREFILL),))
 
     rebuilds.remove_request(R)
@@ -321,11 +323,11 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
     pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
     before it is admitted and stays out of the drops."""
-    pool = HostPool(160, torch.device("cpu"))
+    pool = HostPool(176, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, node_dtypes=DTYPES)
 
-    # five ids at 4 B, aligned to 24, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 24 + 48), 6)
+    # five ids at 8 B, and the image's six slots at two float32 values each
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 40 + 48), 6)
     assert _ingest(rebuilds, A, IMAGE_CHAT)
     assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
@@ -337,7 +339,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.keep_copies(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].piece.nbytes == 24 + 32, (
+    assert rebuilds._droppable[NODE][R].piece.nbytes == 40 + 32, (
         "the sentinels' room would stay taken for the request's life"
     )
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
@@ -512,7 +514,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     rows = 1 << 22
     # room for the prompt's one id and the copy
-    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), LogRoom(pool.take(aligned(4) + 4 * rows), 0)
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media([1], 5), LogRoom(pool.take(aligned(8) + 4 * rows), 0)
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
     with side:
@@ -607,9 +609,9 @@ def test_a_drop_is_refused_unless_the_kept_ids_cover_the_kv(why, node, walk, sam
 
 def test_a_drop_is_refused_until_the_kept_ids_reach_the_host():
     rebuilds = _rebuilds()
-    prompt = torch.tensor([1, 2], dtype=torch.int32)
+    prompt = torch.tensor([1, 2], dtype=torch.long)
     copying = HostCopy(prompt, SimpleNamespace(query=lambda: False))
-    rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, torch.long, array("i", [5]), {})
+    rebuilds._kept[NODE][R] = KeptIds(copying, PREFILL, array("i", [5]), {})
 
     assert "haven't reached the host" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
         "a rebuild would read ids the copy hasn't written yet"
@@ -653,3 +655,25 @@ def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declare
         kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
         assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="counts the device's allocations")
+def test_keeping_a_prompt_runs_nothing_on_the_device_but_its_copy():
+    device = torch.device("cuda")
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 12, device))
+    assert _ingest(rebuilds, R, (PrefixSpan(256, 256, PREFILL),))
+    prompt = torch.arange(256, device=device)
+    step_done = torch.Event(device=device)
+    step_done.record()
+    step = _ran(PREFILL, {R: {"text_inputs": [prompt]}})
+    step.completion_event = step_done
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+
+    rebuilds.keep_prompts(step)
+    kept = rebuilds._kept[NODE][R]
+    kept.prompt.landed.synchronize()
+
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated, (
+        "a cast on the pool's stream made every later decode step 0.16 ms slower at Qwen3.5-9B TP2"
+    )
+    assert kept.prompt.view.tolist() == list(range(256)), "the rebuild would prefill other ids"

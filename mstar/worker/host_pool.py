@@ -84,13 +84,10 @@ class HostPool:
         ready.record(self._stream)
         return copy, ready
 
-    def copy_out(
-        self, src: torch.Tensor, into: HostSlice, after: torch.Event | None, dtype: torch.dtype | None = None,
-    ) -> HostCopy:
-        """Copy ``src``, in ``dtype`` when given, to the start of ``into`` once ``after`` (the step that wrote it)
-        completes."""
-        dtype = src.dtype if dtype is None else dtype
-        view = self.view(into, dtype, src.shape)
+    def copy_out(self, src: torch.Tensor, into: HostSlice, after: torch.Event | None) -> HostCopy:
+        """Copy ``src`` as it is to the start of ``into`` once ``after`` (the step that wrote it) completes, running
+        nothing on the device but the copy."""
+        view = self.view(into, src.dtype, src.shape)
         if after is None:
             view.copy_(src)
             return HostCopy(view, None)
@@ -98,7 +95,7 @@ class HostPool:
             self._stream = torch.Stream(device=self.device)
         self._stream.wait_event(after)
         with self._stream:
-            view.copy_(src.to(dtype), non_blocking=True)
+            view.copy_(src, non_blocking=True)
         # the step's inputs may be freed before the copy reads them
         src.record_stream(self._stream)
         landed = torch.Event(device=self.device)

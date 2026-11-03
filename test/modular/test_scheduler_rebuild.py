@@ -96,10 +96,8 @@ def _rebuilding(sched, rid=R, total=20, done=0):
 
 def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
     sched, runtime, state, engine = _scheduler({"d0": DECODE}, dropped={"d0"})
-    prompt = torch.tensor([1, 2, 3], dtype=torch.int32)
-    sched.rebuilds._kept[NODE]["d0"] = KeptIds(
-        HostCopy(prompt, None), PREFILL, torch.int64, array("i", [4]), {},
-    )
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
+    sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(prompt, None), PREFILL, array("i", [4]), {})
 
     sched.get_next_batch(state)
     sched.get_next_batch(state)

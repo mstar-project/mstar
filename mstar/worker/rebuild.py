@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
 
-# The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
-# at 4 B each.
+# The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
+# at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
 # The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
 # what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.
@@ -53,13 +53,12 @@ class HostCopies:
 
 @dataclass(slots=True)
 class KeptIds:
-    """A request's ids on one node: its prompt copied to the host as int32, the ``walk`` it prefilled in and the
-    dtype that walk read it in, each id sampled since, and the prefill row's step metadata, which its rebuild row
-    runs under. ``lengths`` splits the prompt into the tensors the walk read, and is None for one tensor. A walk
-    that read more than the ids has its other inputs in ``copies``."""
+    """A request's ids on one node: its prompt copied to the host as its prefill ``walk`` read it, each id sampled
+    since, and the prefill row's step metadata, which its rebuild row runs under. ``lengths`` splits the prompt into
+    the tensors the walk read, and is None for one tensor. A walk that read more than the ids has its other inputs
+    in ``copies``."""
     prompt: HostCopy
     walk: str
-    dtype: torch.dtype
     sampled: array
     step_metadata: dict
     lengths: tuple[int, ...] | None = None
@@ -213,9 +212,12 @@ class Rebuilds:
         )
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
-        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
-        and the host copies for its spans other than ids. None when the pool can't hold it, or when the request has
-        spans other than ids and the node's dtype is unknown."""
+        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids and the host
+        copies for its spans other than ids. None when the pool can't hold it, or when the request has spans other
+        than ids and the node's dtype is unknown.
+
+        The ids' dtype isn't known until a step reads them, so each takes 8 B, as int64, the widest an embedding
+        reads. When the walk reads them in fewer bytes, the rest goes back to the pool once they are kept."""
         spans = [span for layout in layouts for span in layout.spans]
         ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
         others = [span for span in spans if span.kind != SpanKind.IDS]
@@ -223,7 +225,7 @@ class Rebuilds:
         if others and dtype is None:
             return None
         copies = sum(span.length * width[span.walk] for span in others) * (dtype.itemsize if others else 0)
-        piece = self._pool.take(aligned(4 * ids) + copies)
+        piece = self._pool.take(aligned(ids * torch.long.itemsize) + copies)
         return None if piece is None else LogRoom(piece, sum(span.length for span in others))
 
     def ingest_request(
@@ -283,10 +285,10 @@ class Rebuilds:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
             prompt = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event, torch.int32)
+            copy = self._pool.copy_out(prompt, droppable[rid].piece, node_batch.completion_event)
             copies = bool(self._copied[node_batch.node_name][row_walk])
             kept[rid] = KeptIds(
-                copy, row_walk, prompt.dtype, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
+                copy, row_walk, array("i"), dict(node_batch.per_request_info[rid].step_metadata),
                 tuple(map(len, tensors)) if len(tensors) > 1 else None,
                 HostCopies(droppable[rid].copied_slots) if copies else None,
             )
@@ -443,12 +445,12 @@ class Rebuilds:
             self._cursors[(node, rid)] = RebuildCursor(prefilling.walk, prefilling.done, prefilling.total)
             return None
         kept = self._kept[node][rid]
-        ids = array("i", kept.prompt.view.numpy().tobytes())
+        ids = array("i", kept.prompt.view.to(torch.int32).numpy().tobytes())
         ids.extend(kept.sampled)
         # the row writes every id but the last, and the slots its host copies fill
         slots = len(ids) - 1 + (0 if kept.copies is None else kept.copies.slots)
         cursor = RebuildCursor(
-            kept.walk, slots, slots, ids, kept.dtype, kept.lengths, kept.copies, kept.step_metadata,
+            kept.walk, slots, slots, ids, kept.prompt.view.dtype, kept.lengths, kept.copies, kept.step_metadata,
         )
         self._cursors[(node, rid)] = cursor
         return Rebuild(cursor.walk, ids)
