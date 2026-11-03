@@ -253,8 +253,10 @@ class Glm5NextModel(Model):
             k: model_kwargs.get(k, getattr(self.config, k))
             for k in keys
         }
-        if "top_k" in model_kwargs:
-            params["top_k"] = int(model_kwargs["top_k"])
+        # the sampler's own knobs with no config default
+        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
+            if k in model_kwargs:
+                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # MTP verifies greedily: a request that names no temperature gets 0, and an
             # explicit one > 0 is refused in process_prompt
