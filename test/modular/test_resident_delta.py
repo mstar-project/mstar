@@ -718,6 +718,31 @@ def test_the_broadcast_sends_the_rebuild_rows_apart_from_the_rows_the_follower_p
     assert (body.request_ids, body.rebuild_ids) == (["wire-r0"], ["wire-rb"]), "the follower can't pop a rebuild row"
 
 
+def _second_node(engine) -> _Resource:
+    """Give ``engine`` a node ``other`` in the same role as ``node``, with a resource of its own."""
+    resource = _Resource()
+    engine._resources["other_kv"] = resource
+    engine._submodules["other"] = SimpleNamespace(resources={"other_kv": resource})
+    for nodes in (engine._tp_leader_nodes, engine._tp_follower_nodes):
+        if "node" in nodes:
+            nodes.add("other")
+    return resource
+
+
+def test_a_step_of_one_node_carries_rank_0s_moves_on_another():
+    """A worker's lockstep nodes share one instance, so rank 0 journals their moves in one stream. A move on a node
+    with no step to send reaches the followers with another node's step, and each follower replays it on the node
+    it names."""
+    leader, follower = _Engine("leader"), _Engine("follower")
+    other = [_second_node(engine) for engine in (leader, follower)][1]
+    leader.offload_request("other", "a")
+    leader.offload_request("node", "b")
+
+    assert follower.apply_resident_delta(leader.take_resident_delta(), _no_rebuild)
+
+    assert other.offloaded == {"a"} and follower.resource.offloaded == {"b"}, "a move landed on another node"
+
+
 def test_the_journal_is_drained_by_the_broadcast():
     leader = _Leader(followers=("rank1",))
     leader.engine.offload_request("node", "victim")
