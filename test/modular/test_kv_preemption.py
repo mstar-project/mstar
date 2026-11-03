@@ -142,6 +142,22 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
 
 
+def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
+    kv = _pool()
+    # two pages stay free, so the room v2's drop frees would hold v2's return
+    _running(kv, "r", 3, arrival=1)
+    _running(kv, "v1", 3, arrival=2)
+    _running(kv, "v2", 2, arrival=3)
+    short = _step(kv, "r", 6 * PAGE_SIZE).reason.pages_short
+    assert kv.preempt("r", short, droppable=lambda rid: True) == ["v2", "v1"]
+
+    _drop(kv, "v2")
+    _admitted(kv, "v2")
+    _drop(kv, "v1")
+
+    assert kv._room() >= 0, f"the pool promises {kv._unused} pages, {-kv._room()} more than free and evictable"
+
+
 def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     kv = _pool()
     _running(kv, "r1", 3, arrival=1)
