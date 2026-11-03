@@ -458,6 +458,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -2608,6 +2609,20 @@ which is what the engine reads, and resources of one node must agree on a walk�
 <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>. The engine then orders that walk’s steps with the <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>
 rows last, so the kernels read the decode rows as the step’s first tokens, in place. Every
 other walk of the combined walk must be one token per row.</p>
+<p><strong>Steps beside the chain.</strong> A worker’s main loop runs one chain of steps, and any step on it
+costs a pass of the loop and holds the next one behind its kernels. A node that shares a
+worker with a heavier one can set <code class="docutils literal notranslate"><span class="pre">side_stream_walks</span></code> on its submodule to the walks that
+may run beside the chain instead, and a deployment turns that on with <code class="docutils literal notranslate"><span class="pre">side_stream:</span> <span class="pre">true</span></code>
+on the node’s group (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). Such a step neither takes a turn on the chain nor
+makes it yield, runs on a second stream, and the windows that come ready while it runs
+batch into the next one (see <code class="docutils literal notranslate"><span class="pre">mstar/worker/side_steps.py</span></code>). Its graphs capture on a stream
+of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
+walk that nothing on the chain reads, such as a codec. Where the config asks,
+<code class="docutils literal notranslate"><span class="pre">EngineManager.build</span></code> refuses what the lane can’t serve, since a side step is neither
+speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+alone on its worker, a device without streams, a node with chain walks or resources, and a
+side walk that is not the node’s alone, sits in a combined walk, or has output spans or a
+stop check. A config without the field keeps the node on the chain, whatever it declares.</p>
 <p><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> declares <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning <code class="docutils literal notranslate"><span class="pre">False</span></code> from <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> in those cases.</p>

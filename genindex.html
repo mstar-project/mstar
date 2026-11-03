@@ -812,6 +812,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -3674,10 +3675,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.voxcpm2.config.html#mstar.model.voxcpm2.config.VoxCPM2Config.encoder">(mstar.model.voxcpm2.config.VoxCPM2Config attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.encoder_attention_heads">encoder_attention_heads (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.voxcpm2.config.html#mstar.model.voxcpm2.config.AudioVAEConfig.encoder_dim">encoder_dim (mstar.model.voxcpm2.config.AudioVAEConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.encoder_ffn_dim">encoder_ffn_dim (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
@@ -3783,6 +3784,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.evictable">evictable() (mstar.engine.resources.kv.prefix_index.PrefixIndex method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.GenerationDefaults.exaggeration">exaggeration (mstar.model.chatterbox.config.GenerationDefaults attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.side_steps.html#mstar.worker.side_steps.SideStepLane.execute">execute() (mstar.worker.side_steps.SideStepLane method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.orphan.html#mstar.utils.orphan.exit_when_orphaned">exit_when_orphaned() (in module mstar.utils.orphan)</a>
 </li>
@@ -3976,6 +3979,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.fingerprint">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.side_steps.html#mstar.worker.side_steps.SideStepLane.finish">finish() (mstar.worker.side_steps.SideStepLane method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.audio_watermark.html#mstar.model.audio_watermark.WatermarkStream.finished">finished (mstar.model.audio_watermark.WatermarkStream attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.first_chunk_target_phonemes">first_chunk_target_phonemes (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
@@ -5972,6 +5977,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutputs.later_groups">later_groups (mstar.engine.resources.kv.plan.KVPlanOutputs attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.side_steps.html#mstar.worker.side_steps.SideStepLane.launch">launch() (mstar.worker.side_steps.SideStepLane method)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.launch_rust_server">launch_rust_server() (in module mstar.api_server.rust_frontend)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraModuleRef.layer">layer (mstar.engine.resources.lora.config.LoraModuleRef attribute)</a>
@@ -6116,14 +6123,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.CosyVoice3Config.llm_weights">llm_weights (mstar.model.cosyvoice3.config.CosyVoice3Config attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.CosyVoice3Config.lm">lm (mstar.model.cosyvoice3.config.CosyVoice3Config attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.model.voxcpm2.config.html#mstar.model.voxcpm2.config.VoxCPM2Config.lm">(mstar.model.voxcpm2.config.VoxCPM2Config attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.LMConfig">LMConfig (class in mstar.model.cosyvoice3.config)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoraAdapterStore.load">load() (mstar.engine.resources.lora.store.LoraAdapterStore method)</a>
@@ -7491,6 +7498,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils">mstar.worker.node_manager_utils</a>
 </li>
         <li><a href="_autosummary/mstar.worker.rid_table.html#module-mstar.worker.rid_table">mstar.worker.rid_table</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.side_steps.html#module-mstar.worker.side_steps">mstar.worker.side_steps</a>
 </li>
         <li><a href="_autosummary/mstar.worker.spec_rows.html#module-mstar.worker.spec_rows">mstar.worker.spec_rows</a>
 </li>
@@ -9313,6 +9322,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.worker.rid_table.html#module-mstar.worker.rid_table">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.worker.side_steps
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.side_steps.html#module-mstar.worker.side_steps">module</a>
 </li>
       </ul></li>
       <li>
@@ -13082,9 +13098,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncMooncakeReader.shutdown">shutdown() (mstar.communication.tensors.AsyncMooncakeReader method)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.side_stream_walks">side_stream_walks (mstar.model.submodule_base.NodeSubmodule attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.sidecar_default_alpha">sidecar_default_alpha() (in module mstar.engine.resources.lora.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.SidecarScaling">SidecarScaling (class in mstar.engine.resources.lora.checkpoint)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.side_steps.html#mstar.worker.side_steps.SideStepLane">SideStepLane (class in mstar.worker.side_steps)</a>
 </li>
       <li><a href="_autosummary/mstar.model.command_a_plus.components.vision.html#mstar.model.command_a_plus.components.vision.SiglipAttention">SiglipAttention (class in mstar.model.command_a_plus.components.vision)</a>
 </li>

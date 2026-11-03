@@ -459,6 +459,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -838,6 +839,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.resident_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.resident_walks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.side_stream_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.side_stream_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
@@ -2624,6 +2626,11 @@ The engine still refuses if a resource can’t.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.side_stream_walks">
+<span class="sig-name descname"><span class="pre">side_stream_walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.side_stream_walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.spanned_outputs">
 <span class="sig-name descname"><span class="pre">spanned_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.spanned_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs" title="Link to this definition">#</a></dt>
@@ -3463,6 +3470,7 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.resident_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.resident_walks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.side_stream_walks"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.side_stream_walks</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>

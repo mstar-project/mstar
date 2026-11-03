@@ -34,6 +34,7 @@
    micro_scheduler
    node_manager_utils
    rid_table
+   side_steps
    spec_rows
    speculation
    stream_buffers

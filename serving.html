@@ -459,6 +459,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1002,7 +1003,9 @@ Dynamo’s frontend or a gateway in front of it.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">node_groups</span></code></p></td>
 <td><p>List of placements. Each entry assigns <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>, optionally
 scoped to specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> and/or sharded with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. An
-<code class="docutils literal notranslate"><span class="pre">ep_config</span></code> block picks TP or EP for the group’s MoE experts.</p></td>
+<code class="docutils literal notranslate"><span class="pre">ep_config</span></code> block picks TP or EP for the group’s MoE experts. <code class="docutils literal notranslate"><span class="pre">side_stream:</span>
+<span class="pre">true</span></code> runs the group’s node beside the worker’s main chain of steps (see
+below).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">resources</span></code></p></td>
 <td><p><em>(optional)</em> Per-resource overrides, keyed by the model’s resource names (see
@@ -1366,6 +1369,23 @@ and quit the daemon at shutdown. The daemon uses a private pipe directory, so ot
 processes on the GPU are unaffected. <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span></code> (part of the NVIDIA
 driver) must be on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>. The <code class="docutils literal notranslate"><span class="pre">*_split.yaml</span></code> configs for Whisper, Qwen3-ASR, the three
 Chatterbox models and OmniVoice set it, and so does <code class="docutils literal notranslate"><span class="pre">qwen3tts_split.yaml</span></code> (the 0.6B).</p>
+<p><strong>A light node beside a heavy one, on one worker.</strong> <code class="docutils literal notranslate"><span class="pre">side_stream:</span> <span class="pre">true</span></code> on a node
+group runs that node’s steps on a lane of their own instead of the worker’s main chain:
+they take no turn on it, run on a second CUDA stream beside its steps, and whatever
+comes ready meanwhile batches into the next one. It applies to the walks the node’s
+submodule declares in <code class="docutils literal notranslate"><span class="pre">side_stream_walks</span></code> (Qwen3-TTS’s <code class="docutils literal notranslate"><span class="pre">Codec</span></code> declares
+<code class="docutils literal notranslate"><span class="pre">codec_chunk</span></code>, and its colocated configs set the field), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. Startup fails with a
+<code class="docutils literal notranslate"><span class="pre">ValueError</span></code> naming the field where the lane can’t apply: a TP or SP node, a node
+alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn’t the node’s alone, is part of a
+combined walk, or has output spans or a stop check. Without the field the node runs on
+the chain:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Talker</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">talker_prefill</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">talker_decode</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Codec</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">codec_chunk</span><span class="p p-Indicator">],</span><span class="nt"> side_stream</span><span class="p">:</span><span class="w"> </span><span class="nv">true</span><span class="p p-Indicator">}</span>
+</pre></div>
+</div>
 <p><strong>Disaggregation.</strong> The same node can live on different GPUs <em>per graph walk</em> — e.g.
 prefill, decode, and image generation on three GPUs:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>

@@ -812,6 +812,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1919,6 +1920,15 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># params to the autocast dtype nor wraps its forward (or capture) in</span>
     <span class="c1"># autocast, and explicitly disables any ambient one.</span>
     <span class="n">disable_autocast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Walks whose steps may run beside the worker's main chain, on a second</span>
+    <span class="c1"># stream (``mstar.worker.side_steps``); they do where the node's group in</span>
+    <span class="c1"># the serving config sets ``side_stream: true``. For a stream-fed walk that</span>
+    <span class="c1"># no chain step waits on. Where the config asks, ``EngineManager.build``</span>
+    <span class="c1"># (``_side_lane_keys``) refuses a TP or SP node, a node alone on its</span>
+    <span class="c1"># worker, a device without streams, a node that also has chain walks or</span>
+    <span class="c1"># holds resources, and a side walk that is not the node's alone, is part</span>
+    <span class="c1"># of a combined walk, or has output spans or a stop check.</span>
+    <span class="n">side_stream_walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
     <span class="c1"># Float32 math for this node's forward, where the process default (TF32</span>
     <span class="c1"># matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:</span>
