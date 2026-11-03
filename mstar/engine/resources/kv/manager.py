@@ -35,7 +35,6 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     RetentionPolicy,
     StreamLayout,
-    rebuild_refusal,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
@@ -320,8 +319,8 @@ class KVPageCounts(NamedTuple):
 @dataclass(slots=True)
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: the pages it asked for, less the
-    cache hits another request holds, and less what a window doesn't hold once its prompt is written. No
-    cache hit is taken off for a guaranteed request. ``remaining`` is its share of `KVManager._unused`, and
+    cache hits another request holds, and less what a window doesn't hold once its prompt is written. A
+    guaranteed request's hits come off when it adopts its lease. ``remaining`` is its share of `KVManager._unused`, and
     ``prompt`` is the pages it asked for, which `unreserve` puts back in `_asks`. An allotment for a request
     on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload."""
@@ -896,7 +895,7 @@ class KVManager(AttentionResource):
                 image_end = self._image_end(ends, held, total)
                 if image_end is not None:
                     end, key = image_end
-                    cached = self._retain_cached(rid, stream, self._index.lookup([key]), counted=False)
+                    cached = self._retain_cached(rid, stream, self._index.lookup([key]))
                     if cached:
                         # The lease isn't on the stream yet, so ``remaining`` still counts its pages as unused.
                         # Check this page against the whole allowance rather than ``remaining``.
@@ -1655,12 +1654,15 @@ class KVManager(AttentionResource):
             stream.chain.extend(col[i].tolist(), page_size)
 
     def _adopt(self, rid: str, stream: CacheStream, pages: list[int]) -> None:
-        """Make ``pages`` the whole of a stream that has written nothing yet.
+        """Make ``pages`` the whole of a stream that has written nothing yet. The lent ones come off a
+        guaranteed request's allotment, since no cut can release them now.
 
         Any pages the stream already holds are empty ones a refused admit left, so they are released.
         """
         empty, stream.page_indices = stream.page_indices, list(pages)
         self._release(rid, stream, empty)
+        if rid in self._guaranteed:
+            self._allotments[rid].pages -= len(stream.lent.intersection(pages))
         self._plan_epoch += 1
         stream.stored_len = len(pages) * self.config.tokens_per_page
 
@@ -3395,13 +3397,13 @@ class KVManager(AttentionResource):
         if self.in_step(rid):
             return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
         with self._lock:
-            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
-                return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
-            if rid in self._guaranteed:
-                return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
-            why = rebuild_refusal((self._overrides[rid].kv_layout or {}).values())
-            if why is not None:
-                return f"KV {self.name}: {rid} can't be dropped, since {why}"
+            if not self._movable(rid):
+                return (
+                    f"KV {self.name}: {rid} is guaranteed, waits on room set aside for it, or has a step or a read "
+                    "in flight on its pages"
+                )
+            if not self._overrides[rid].rebuildable:
+                return f"KV {self.name}: {rid} can't be rebuilt on this worker"
         return None
 
     def drop(self, rid: str) -> int:
@@ -3501,10 +3503,10 @@ class KVManager(AttentionResource):
         copied: a step admitted before the claim can still run its fork copy,
         and that copy reads one of these streams.
 
-        A victim `preempt` chose that doesn't move comes off its earmark with
-        nothing freed.
+        A guaranteed request never moves. A victim `preempt` chose that doesn't
+        move comes off its earmark with nothing freed.
         """
-        if self._cpu_pool is None or rid not in self._streams:
+        if self._cpu_pool is None or rid not in self._streams or rid in self._guaranteed:
             return 0
         claimed, read_futures = self._claim_for_offload(rid)
         if not claimed:
@@ -3832,26 +3834,13 @@ class KVManager(AttentionResource):
 
     def reclaimable(self, rid: str) -> int:
         """The device pages ``rid`` holds, or 0 when offloading it would free none
-        of them, when it is offloaded already, or when it is admitted but hasn't run.
-        Also 0 for a guaranteed request in a pool that decides, since a move to the host
-        preempts it too."""
+        of them, when it is offloaded already, or when it is admitted but hasn't run."""
         with self._lock:
-            if self._decides and self._streams.get(rid) and rid in self._guaranteed:
-                return 0
-            return self._freeable(rid)
-
-    def frees_on_remove(self, rid: str) -> int:
-        """`reclaimable` for any class of request, since a teardown frees a guaranteed request's pages too."""
-        with self._lock:
-            return self._freeable(rid)
-
-    def _freeable(self, rid: str) -> int:
-        """Under the lock: the device pages ``rid`` holds, or 0 when releasing them would free none."""
-        streams = self._streams.get(rid, {})
-        for stream in streams.values():
-            if any(self._reusable(page) for page in reversed(stream.page_indices)):
-                return sum(len(stream.pages()) for stream in streams.values())
-        return 0
+            streams = self._streams.get(rid, {})
+            for stream in streams.values():
+                if any(self._reusable(page) for page in reversed(stream.page_indices)):
+                    return sum(len(stream.pages()) for stream in streams.values())
+            return 0
 
     def get_offload_priority(self, rid: str) -> float:
         """What `reclaimable` counts, the most reclaimable first."""
@@ -4506,7 +4495,7 @@ class KVManager(AttentionResource):
             else:
                 pages = self._host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if not moving and (to_host or droppable(rid)) and self._frees([rid]) > 0:
+                if not moving and self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
                     self._victims[rid] = None
                     if to_host:
                         self._host(rid, [rid])
@@ -4555,9 +4544,9 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, and no step or
-        read is in flight on its pages."""
-        return rid not in self._earmarks and not any(
+        """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no room is set aside for
+        it, and no step or read is in flight on its pages."""
+        return rid not in self._guaranteed and rid not in self._earmarks and not any(
             stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
         )
 
@@ -4566,9 +4555,9 @@ class KVManager(AttentionResource):
 
     def _host_pages(self, rid: str) -> int | None:
         """The host pages that moving every stream of ``rid`` takes out of the host's room, past the pages the host
-        set aside for it, or None when ``rid`` can't move there: the pool has no host memory, ``rid`` is guaranteed,
-        isn't resident or holds no page, or a stream holds a cached image end `plan` hasn't copied."""
-        if self._cpu_pool is None or rid in self._guaranteed or not self.is_resident(rid) or self._unwritten(rid):
+        set aside for it, or None when ``rid`` can't move there: the pool has no host memory, ``rid`` isn't resident
+        or holds no page, or a stream holds a cached image end `plan` hasn't copied."""
+        if self._cpu_pool is None or not self.is_resident(rid) or self._unwritten(rid):
             return None
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):
@@ -4714,32 +4703,29 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         return (0 if allotment is None else allotment.remaining) + self._room()
 
-    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int], counted: bool = True) -> list[int]:
+    def _retain_cached(self, rid: str, stream: CacheStream, pages: list[int]) -> list[int]:
         """Retain the longest prefix of ``pages`` that ``rid`` can take, and return it.
 
         A page that isn't evictable is lent and takes no room. An evictable one comes out
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        ``counted`` is False for pages ``rid``'s allotment doesn't count, such as an image end. A
-        guaranteed request is charged for a page its allotment counts, even one another request holds,
-        and its allotment grows by each evictable page it doesn't count.
+        A guaranteed request's allotment keeps every page its walks write until its lease becomes its pages,
+        since a cut leaves the walk to write them again. So an evictable page comes out of the room alone,
+        and every page is lent.
         """
         if self._decides:
             evictable = self._index.evictable()
             guaranteed = rid in self._guaranteed
-            borrow = guaranteed and not counted
-            allowance = self._room() if borrow else self._allowance(rid)
+            allowance = self._room() if guaranteed else self._allowance(rid)
             for at, page in enumerate(pages):
-                if page not in evictable and not (guaranteed and counted):
-                    stream.lent.add(page)
-                elif allowance > 0:
+                if page in evictable:
+                    if allowance <= 0:
+                        pages = pages[:at]
+                        break
                     allowance -= 1
-                    if borrow:
-                        self._allotments[rid].pages += 1
-                else:
-                    pages = pages[:at]
-                    break
+                if guaranteed or page not in evictable:
+                    stream.lent.add(page)
         self._arena.retain(pages)
         return pages
 

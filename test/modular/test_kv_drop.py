@@ -108,11 +108,12 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["step", "read", "ranks", "host", "guaranteed"])
+@pytest.mark.parametrize("refusal", ["step", "read", "ranks", "host", "guaranteed", "not rebuildable"])
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE)
     kv._guaranteed.update({"r"} if refusal == "guaranteed" else ())
+    kv._overrides["r"].rebuildable = refusal != "not rebuildable"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
     kv._world_size, kv._counts = (2, False) if refusal == "ranks" else (kv._world_size, kv._counts)
@@ -122,25 +123,6 @@ def test_a_refused_drop_changes_nothing(refusal):
     with pytest.raises(RuntimeError):
         kv.drop("r")
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
-
-
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
-    kv = _manager()
-    config = _config(list(range(PAGE_SIZE)))
-    spans, growth = config.kv_layout["main"].spans, config.kv_layout["main"].growth
-    if layout == "two labels":
-        config.kv_layout["uncond"] = config.kv_layout["main"]
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        config.kv_layout["main"] = StreamLayout(spans=(*spans, PrefixSpan(4, 4, WALK)), growth=growth)
-    else:
-        config.kv_layout["main"] = StreamLayout(spans=spans, growth=(*growth, ("other_loop", 1)))
-        config.loop_caps["other_loop"] = 4
-    kv.ingest_request("r", config)
-
-    with pytest.raises(RuntimeError, match="one rebuild row"):
-        kv.drop("r")
-    assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
 
 
 class _Recording:

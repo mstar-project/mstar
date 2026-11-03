@@ -393,8 +393,8 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
 
 @pytest.mark.parametrize("guaranteed", [False, True])
 def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guaranteed):
-    """The follower lends the pages it adopts as rank 0 lent the pages it leased. Neither rank lends a page
-    to a guaranteed request."""
+    """The follower lends the pages it adopts as rank 0 lent the pages it leased, a guaranteed request's
+    included."""
     ranks = leader, follower = _manager(0), _manager(1)
     shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
     prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
@@ -406,7 +406,7 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
 
     assert _follow(follower, _send(leader, "b"))
 
-    assert bool(leader._streams["b"]["main"].lent) != guaranteed
+    assert leader._streams["b"]["main"].lent, "rank 0 lent nothing, so the test checks nothing"
     assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent
     assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
 

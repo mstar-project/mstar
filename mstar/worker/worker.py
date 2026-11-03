@@ -1888,18 +1888,21 @@ class Worker:
             return None
 
         # prefer evicting requests that aren't currently executing
-        external = [rid for rid in candidates if rid not in batch_ids]
-        victim_id = self._select_eviction_victim(node_name, graph_walk, external or candidates)
-        freed = engine.offload_request(node_name, victim_id)
-        if freed <= 0:
-            # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.place``) - different
-            # from having no candidate, and fixed by a larger
-            # ``cpu_offload_pages`` rather than by scheduling less.
+        untried = [rid for rid in candidates if rid not in batch_ids] or candidates
+        while untried:
+            victim_id = self._select_eviction_victim(node_name, graph_walk, untried)
+            freed = engine.offload_request(node_name, victim_id)
+            if freed > 0:
+                break
+            untried.remove(victim_id)
+        else:
+            # No candidate would move. The usual cause is the host pool being
+            # full (see ``CPUPagePool.place``) - different from having no
+            # candidate, and fixed by a larger ``cpu_offload_pages`` rather than
+            # by scheduling less. A pool also never moves a request it guarantees.
             logger.warning(
-                "Eviction victim %s on %s freed nothing — the host pool is "
-                "most likely full. Raise cpu_offload_pages for the resource "
-                "that ran out.", victim_id, node_name,
+                "No eviction candidate on %s moved, and the host pool is most likely "
+                "full. Raise cpu_offload_pages for the resource that ran out.", node_name,
             )
             return None
         logger.info(
