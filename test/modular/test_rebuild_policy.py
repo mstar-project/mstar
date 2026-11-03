@@ -75,6 +75,16 @@ def test_a_walk_whose_node_reads_more_than_the_ids_must_say_what_its_copies_take
         Rebuilds({NODE: POLICY}, graphs)
 
 
+def test_the_inputs_a_walk_copies_are_read_off_the_graph():
+    """The policy names the walks alone. A list of copied inputs beside the graph's own went stale when the LLM
+    stopped reading the image grids as an input, and every Qwen3.5 deployment failed its boot check."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs())
+
+    assert rebuilds._copied[NODE] == {PREFILL: frozenset(), VISION: frozenset({"embeds"})}, (
+        "the worker would copy other inputs than the ones the walk reads"
+    )
+
+
 def test_a_copied_walk_this_worker_doesnt_run_and_every_copied_walk_above_one_rank_is_left_out():
     policies = {NODE: MEDIA}
     walks = {(NODE, walk) for walk in (PREFILL, VISION, DECODE)}
