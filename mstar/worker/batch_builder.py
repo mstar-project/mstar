@@ -40,6 +40,8 @@ class BatchBuildRequest:
     pre_existing_walk: str | None = None
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
+    # Capture groups the step takes ahead of its first row's, in this order.
+    group_order: tuple = ()
 
 
 class BatchBuildResult(NamedTuple):
@@ -53,15 +55,22 @@ class BatchBuildResult(NamedTuple):
 def off_group_rids(
     batch: "ScheduledBatch", capture_group: Callable[[int], Any],
     exclude_rids: set[int] = frozenset(), anchor: int | None = None,
+    group_order: tuple = (),
 ) -> set[int]:
-    """The rids of ``batch`` outside ``anchor``'s capture group, or outside
-    the first eligible rid's when no anchor is given."""
+    """The rids of ``batch`` outside ``anchor``'s capture group. With no anchor,
+    outside the earliest group of ``group_order`` among the eligible rids, or
+    the first eligible rid's when none of them is in it."""
     rids = [
         rid for rid in batch.request_to_worker_graph
         if rid not in exclude_rids
     ]
     if not rids:
         return set()
+    if anchor is None and group_order:
+        groups = {rid: capture_group(rid) for rid in rids}
+        present = set(groups.values())
+        wanted = next((group for group in group_order if group in present), groups[rids[0]])
+        return {rid for rid, group in groups.items() if group != wanted}
     # `is not None`: handle 0 is a real rid
     wanted = capture_group(rids[0] if anchor is None else anchor)
     return {rid for rid in rids if capture_group(rid) != wanted}
@@ -156,6 +165,7 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         exclude = request.blocked_rids | off_group_rids(
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
+            group_order=request.group_order,
         )
         walk = _single_walk(batch, request)
         if walk is None:

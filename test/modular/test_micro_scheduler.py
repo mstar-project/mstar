@@ -232,6 +232,8 @@ class _Engine:
         self.checked = []
         # rid -> the input metadata capture_group was last handed
         self.metadata = {}
+        # capture groups the walk runs first, in order
+        self.group_order = ()
 
     def get_max_rows_in_combined(self, node_name, graph_walk):
         del node_name
@@ -251,6 +253,10 @@ class _Engine:
         del node_name, graph_walk, fwd_info
         self.metadata[rid] = input_metadata
         return self.groups.get(rid)
+
+    def capture_group_order(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self.group_order
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         del allow_reload, node_name, fwd_info
@@ -761,6 +767,61 @@ def test_an_unready_head_does_not_set_the_group():
     assert list(batch.request_to_worker_graph) == ["g0", "g1"]
 
 
+def _ordered_scheduler(*order, groups=_MIXED):
+    engine = _Engine(max_bs=16, groups=groups)
+    engine.group_order = order
+    return _scheduler(engine)
+
+
+def test_a_group_in_the_order_goes_ahead_of_an_older_backlog():
+    sched = _ordered_scheduler(True)
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "u1"])
+
+    batch = _next_batch(sched, _Manager(["g0", "g1"]))
+
+    assert list(batch.request_to_worker_graph) == ["g0", "g1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["u0", "u1"]
+
+
+def test_the_other_groups_run_once_no_ordered_row_waits():
+    sched = _ordered_scheduler(True)
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "u1"])
+    _next_batch(sched, _Manager(["g0", "g1"]))
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["u0", "u1"]
+    assert sched.backlog == {}
+
+
+def test_the_earliest_group_present_wins():
+    groups = {"a": "wide", "b": "second", "c": "first", "d": "second"}
+    sched = _ordered_scheduler("first", "second", groups=groups)
+    sched.backlog[(NODE, WALK)] = _batch(["a", "b", "d"])
+    assert list(_next_batch(sched, _Manager([])).request_to_worker_graph) == ["b", "d"]
+
+    sched = _ordered_scheduler("first", "second", groups=groups)
+    sched.backlog[(NODE, WALK)] = _batch(["a", "b", "c", "d"])
+    assert list(_next_batch(sched, _Manager([])).request_to_worker_graph) == ["c"]
+
+
+def test_an_order_with_no_row_present_leaves_the_first_rows_group():
+    sched = _ordered_scheduler("absent")
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "g0", "u1", "g1"])
+
+    assert list(_next_batch(sched, _Manager([])).request_to_worker_graph) == ["u0", "u1"]
+
+
+def test_a_merges_anchor_outranks_the_order():
+    """A speculation merge has to share its continuing rows' capture."""
+    sched = _ordered_scheduler(True)
+    sched.backlog[(NODE, WALK)] = _batch(["g0", "u0", "g1", "u1"])
+
+    batch = _next_batch(sched, _Manager([]), pre_existing_batch_size=1, capture_group_of="u0")
+
+    assert list(batch.request_to_worker_graph) == ["u0", "u1"]
+
+
 def test_without_capture_groups_nothing_is_split():
     sched = _scheduler(_Engine(max_bs=16))
 
@@ -946,6 +1007,10 @@ class _StreamKeyedSubmodule:
         del graph_walk
         return True
 
+    def capture_group_order(self, graph_walk):
+        del graph_walk
+        return ()
+
     def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None):
         del graph_walk
         ((rid, _),) = per_request_info.items()
@@ -962,6 +1027,7 @@ def _stream_engine():
         NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner),
     }
     engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
+    engine.capture_group_order = lambda node, walk: Engine.capture_group_order(engine, node, walk)
     engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)
     return engine
 
