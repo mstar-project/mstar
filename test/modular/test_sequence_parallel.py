@@ -22,6 +22,8 @@ from flashinfer_reference import reference_attention
 
 from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.context_parallel import gather_merge, merge, stripe_owners
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
@@ -386,19 +388,26 @@ def test_a_striped_shard_refuses_a_step_it_cant_stripe():
 def test_a_shard_that_never_splits_plans_every_step_copied():
     """Over KV stored by position the shard's exchange auto (a config from before such a pool could
     split runs as it did) or none: the shard derives that it splits nothing, so the node runs
-    copied (min_tokens 0 and all), as one without a shard; all_gather splits."""
+    copied (min_tokens 0 and all), as one without a shard; all_gather splits. A ragged Ulysses
+    attention there plans the heads the copied layer computes: over TP alone."""
     for choice, splits in ((None, False), ("none", False), ("all_gather", True)):
         specs = [
             KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
                                               num_qo_heads=1, context_parallel=True)),
             AttentionSpec("attn", {"n"}, AttentionConfig(kv_cache="kv")),
             SeqShardSpec("shard", {"n"}, ("main",), 0),
+            RaggedAttentionSpec("ragged", {"n"}, RaggedAttentionConfig(2, 2, 8), sp_exchange="ulysses"),
         ]
         apply_yaml_overrides(specs, {"resources": {} if choice is None else {"shard": {"exchange": choice}}})
-        spec = resolve_spec_dependencies(specs)["shard"]
+        by_key = resolve_spec_dependencies(specs)
+        spec = by_key["shard"]
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup(0, 0, [0, 1]))
         shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
         assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
+        ragged = RaggedAttnManager.build(by_key["ragged"], EngineResourceInfo(
+            device=torch.device("cpu"), joint_comm_group=joint, dependencies={"shard": spec},
+        ))
+        assert ragged._kwargs["num_qo_heads"] == (1 if splits else 2)
 
 
 @pytest.mark.parametrize("end", ["commit", "capture"])
