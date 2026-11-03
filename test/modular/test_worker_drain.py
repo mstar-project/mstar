@@ -79,7 +79,7 @@ def _worker(
         ),
     )
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._kv_writes = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
@@ -259,7 +259,8 @@ def test_draining_and_pending_removal_rids_are_not_published():
     w._pending_removes["pending"] = None
     w.scheduler.failed_rids.add("failed")
     batch = SimpleNamespace(
-        request_ids=["healthy", "draining", "pending", "failed"], rebuild_rids=frozenset(),
+        request_ids=["healthy", "draining", "pending", "failed"],
+        step_context=SimpleNamespace(rebuild_rids=frozenset()),
         per_request_info={
             rid: SimpleNamespace(request_id=rid)
             for rid in ("healthy", "draining", "pending", "failed")
@@ -496,7 +497,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._reads_done_sent = set()
     w._unprocessed_messages = {}
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._kv_writes = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0

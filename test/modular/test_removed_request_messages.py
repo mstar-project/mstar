@@ -112,7 +112,7 @@ def _worker(is_tp_follower=False) -> Worker:
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
     w._rebuilds = Rebuilds({}, {})
-    w._dropped, w._preemption = {}, SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
     w._kv_writes = {}
     w.enable_nvtx = False
     return w

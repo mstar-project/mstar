@@ -278,6 +278,8 @@ class LoraAdapterPool(Resource):
     # holds no per-token state, so a request whose prompt prefix was served from the cache
     # runs here exactly as one that computed it
     prefix_skip_safe = True
+    # a dropped request keeps its adapter and slot, and its rebuild runs under that adapter
+    supports_drop = True
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":

@@ -19,12 +19,15 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources.base import EngineResourceInfo, Rebuild
+from mstar.engine.engine import Engine
+from mstar.engine.resources.base import EngineResourceInfo, Rebuild, Residency, Resource
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.ring.manager import RingKVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import PublishedPositionInfo, RopeManager
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
@@ -32,9 +35,8 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
-from mstar.model.submodule_base import HostRows
 
 PAGE_SIZE = 16
 WALK = "prefill"
@@ -126,6 +128,17 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
+def test_a_second_drop_before_the_rebuild_lands_is_refused():
+    kv = _manager()
+    _prefill(kv, "r", PAGE_SIZE, kind="ids")
+    kv.drop("r")
+    held = kv._dropped["r"]
+
+    with pytest.raises(RuntimeError):
+        kv.drop("r")
+    assert kv._dropped["r"] == held, "a second drop would overwrite what the rebuild has to write again"
+
+
 class _Recording:
     """A resource that records the rebuild hooks it is called with."""
 
@@ -188,7 +201,9 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
 
     with pytest.raises(RuntimeError):
         engine.drop_request(NODE, "r")
-    assert kv.is_resident("r") and kv._streams["r"]["main"].page_indices, "one KV cache dropped and the other kept"
+    assert kv.residency("r") is Residency.RESIDENT and kv._streams["r"]["main"].page_indices, (
+        "one KV cache dropped and the other kept"
+    )
     assert rope._counters["r"] == {"main": PAGE_SIZE}, "the positions were reset for a request that keeps its KV"
 
 
@@ -229,24 +244,6 @@ def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
     )
 
 
-def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():
-    kv = _manager()
-    kv.ingest_request("r", _config(list(range(20)), cap=50))
-    kv.ingest_request("a", _config(list(range(50, 70)), cap=50))
-    _write(kv, "r", 20, 1)
-    kv.drop("r")
-    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(20), 100, 101])))
-    batch = ExecutingBatch(node_name=NODE, per_request_info={}, rebuild_rids=frozenset({"r"}),
-                           step_context=StepContext(request_ids=("r", "a"), graph_walk=WALK, slot=0, capture=False))
-
-    rows = HostRows(("r", "a"), {"text_inputs": torch.tensor([[7], [8]])})
-    Engine.extend_prefix_chains(SimpleNamespace(_runner=StepRunner({"kv": kv})), batch, {}, host_rows=rows)
-    kv.flush_chain_backlog()
-
-    assert kv._streams["r"]["main"].chain.unkeyed == [16, 17, 18, 19, 100, 101], "it would key a discarded sample"
-    assert kv._streams["a"]["main"].chain.covered_len == 21, "the other row's sample went unkeyed"
-
-
 def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pages():
     kv, rope = _manager(), RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)
     engine = _engine({"kv": kv, "rope": rope})
@@ -279,11 +276,70 @@ def test_removing_a_dropped_or_relaid_request_leaks_no_page():
         kv.drop(rid)
     kv.prepare_rebuild("relaid", Rebuild(WALK, array("i", range(21))))
     kv.land_rebuild("relaid")
-    assert kv.is_resident("relaid"), "a rebuilt request would never be ready again"
+    assert kv.residency("relaid") is Residency.RESIDENT, "a rebuilt request would never be ready again"
 
     for rid in ("dropped", "relaid"):
         kv.remove_request(rid)
     kv.assert_pages_conserved()
-    assert kv.is_resident("dropped"), "the next request given this handle would never be ready"
+    assert kv.residency("dropped") is Residency.RESIDENT, "the next request given this handle would never be ready"
     assert (counts := kv.page_counts()).used == counts.cached, "a page outlived its request outside the index"
 
+
+def test_a_dropped_request_reads_as_dropped_until_its_rebuild_lands():
+    kv = _manager()
+    engine = _engine({"kv": kv, "rope": RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)})
+    _prefill(kv, "r", 20)
+    kv.drop("r")
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(21))))
+
+    assert engine.residency(NODE, "r") is Residency.DROPPED, "the request would read as resident mid-rebuild"
+    kv.land_rebuild("r")
+    assert engine.residency(NODE, "r") is Residency.RESIDENT, "the rebuilt request would never be ready again"
+
+
+@pytest.mark.parametrize("allow_reload, outcome", [(True, FULL_ADMIT_REBUILD), (False, FULL_ADMIT_NOT_READY)],
+                         ids=["scheduler", "follower"])
+def test_readiness_answers_a_dropped_request_with_a_rebuild_and_a_follower_with_not_ready(allow_reload, outcome):
+    kv = _manager()
+    engine = _engine({"kv": kv, "rope": RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)})
+    _prefill(kv, "r", 20)
+    kv.drop("r")
+
+    info = SimpleNamespace(graph_walk=WALK, resource_publish_info={})
+    assert engine.check_ready(NODE, "r", info, allow_reload) == outcome, (
+        "the decode row would wait on a rebuild nothing starts, or a follower would start one rank 0 never ran"
+    )
+
+
+def _boot_engine(resources: dict, split: frozenset = frozenset()) -> Engine:
+    engine = Engine.__new__(Engine)
+    submodule = SimpleNamespace(split_batches_by_capture_key=lambda walk: walk in split)
+    engine._submodules = {NODE: SimpleNamespace(resources=resources, submodule=submodule)}
+    return engine
+
+
+def _model(combined: dict | None = None) -> SimpleNamespace:
+    """Declares a rebuild policy on ``NODE`` and, given ``combined``, batches its walks under a combined walk."""
+    policy = SimpleNamespace(walk=WALK, ids_input="text_inputs", sample_output="new_token", loop="decode_loop")
+    return SimpleNamespace(rebuild_policies=lambda: {NODE: policy}, combined_walk_of=lambda: combined or {})
+
+
+def test_a_resource_supports_no_drop_unless_it_opts_in():
+    supported = (KVManager, RecurrentStatePool, SamplerResource, RopeManager, LoraAdapterPool)
+
+    assert not Resource.supports_drop and not RingKVManager.supports_drop and not BoundedKVManager.supports_drop
+    assert all(cls.supports_drop for cls in supported), "a resource that discards what a rebuild writes refused"
+
+
+def test_a_rebuild_policy_on_a_node_with_a_resource_that_cant_drop_is_refused_at_load():
+    _boot_engine({"kv": _manager()})._check_rebuild_policies(_model())
+
+    with pytest.raises(ValueError, match=r"\['bounded'\] can't drop"):
+        engine = _boot_engine({"kv": _manager(), "bounded": SimpleNamespace(supports_drop=False)})
+        engine._check_rebuild_policies(_model())
+
+
+@pytest.mark.parametrize("split, combined", [({WALK}, None), ({"mixed"}, {(NODE, WALK): "mixed"})])
+def test_a_rebuild_policy_whose_steps_split_by_capture_key_is_refused_at_load(split, combined):
+    with pytest.raises(ValueError, match="capture key"):
+        _boot_engine({"kv": _manager()}, frozenset(split))._check_rebuild_policies(_model(combined))

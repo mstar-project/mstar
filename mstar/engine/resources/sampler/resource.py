@@ -31,6 +31,8 @@ from mstar.utils.profiler import PhaseLaps
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # a rebuild row's draw never commits, so a drop has nothing here to discard
+    supports_drop = True
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None
@@ -413,14 +415,15 @@ class SamplerResource(Resource):
 
     @staticmethod
     def _kept_rids_of(step: SamplerStep, ctx: StepContext) -> frozenset[int] | None:
-        """The rows whose draw commits: ``step.kept_rids`` less any row mid-prefill.
-        A non-final chunk's token is not a real sample, so it advances no RNG
-        offset and marks no token seen."""
-        mid_prefill = ctx.chunk_tokens_after
-        if not mid_prefill:
+        """The rows whose draw commits: ``step.kept_rids`` less any row mid-prefill
+        or rebuilding. A non-final chunk's token is not a real sample, so it
+        advances no RNG offset and marks no token seen, and a rebuild row's
+        request already has the token it draws."""
+        mid_prefill, rebuild = ctx.chunk_tokens_after, ctx.rebuild_rids
+        if not mid_prefill and not rebuild:
             return step.kept_rids
         kept = frozenset(ctx.request_ids) if step.kept_rids is None else step.kept_rids
-        return kept - mid_prefill.keys()
+        return kept - mid_prefill.keys() - rebuild
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)

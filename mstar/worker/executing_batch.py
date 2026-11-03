@@ -2,6 +2,8 @@
 worker's own batches and its speculative ones."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
@@ -10,6 +12,9 @@ from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import InputMetadata
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
+
+if TYPE_CHECKING:
+    from mstar.worker.rebuild import Rebuilds
 
 
 def input_metadata_and_fwd_info(
@@ -57,11 +62,14 @@ def make_executing_batch(
     request_walks: dict[int, str] | None = None,
     engine: Engine | None = None,
     chunk_ranges: dict[int, ChunkRange] | None = None,
+    rebuild_rids: frozenset[int] = frozenset(),
+    rebuilds: Rebuilds | None = None,
 ) -> ExecutingBatch:
     """One step's batch, with the step context the engine drives it through.
 
     ``final_edges`` maps a rid to the streams whose final chunk the step
     consumes. ``engine`` orders a split walk's rows (``Engine.order_split_rows``).
+    ``rebuilds`` gives the ``rebuild_rids`` rows their walk and inputs.
     The context starts unleased and eager; a slot is reserved later, once the
     real token count is known.
     """
@@ -72,6 +80,8 @@ def make_executing_batch(
         # Every path to a mixed step comes through here, a TP follower's too,
         # so each rank orders the leader's rows alike.
         request_ids = engine.order_split_rows(node_name, graph_walk, request_ids, request_walks)
+    if rebuild_rids:
+        rebuilds.fill(node_name, rebuild_rids, chunk_ranges or {}, per_request_input_tensors, per_request_info)
     return ExecutingBatch(
         node_name=node_name,
         per_request_info=per_request_info,
@@ -86,5 +96,6 @@ def make_executing_batch(
             slot=0,
             capture=False,
             request_walks=request_walks or {},
+            rebuild_rids=rebuild_rids,
         ),
     )

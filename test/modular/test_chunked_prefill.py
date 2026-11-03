@@ -240,7 +240,6 @@ def _batch():
         node_name="LLM", per_request_info_wrapped={0: None},
         per_request_input_tensors={}, final_stream_rids=set(),
         per_request_input_metadata={}, first_chunk_rids=set(), chunk_ranges={},
-        rebuild_rids=frozenset(),
     )
 
 

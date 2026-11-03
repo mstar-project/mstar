@@ -42,6 +42,8 @@ class XPUPagedPlan:
 class XPUPagedAttentionManager(AttentionManager):
     """Paged KV attention backed by ``vllm-xpu-kernels`` FlashAttention."""
 
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,

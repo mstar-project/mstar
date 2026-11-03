@@ -94,6 +94,7 @@ class _Scheduler:
     def __init__(self):
         self.room = None
         self.fresh: ScheduledBatch | None = None
+        self.rebuilds = Rebuilds({}, {})
 
     def backlog_splits_from(self, *a):
         return False
