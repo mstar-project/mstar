@@ -85,6 +85,7 @@ def _worker():
     worker.worker_id = "w0"
     worker.device = torch.device("cpu")
     worker._in_flight_rids = set()
+    worker._phase_period = 0
     worker._span = lambda *a, **k: contextlib.nullcontext()
     worker._wait_for_step = lambda step: log.append("wait for step")
     worker._clear_in_flight_flag = lambda batch: log.append("clear in flight")

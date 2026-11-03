@@ -243,12 +243,14 @@ def test_scrub_paths_cuts_absolute_paths_to_base_names(raw, scrubbed):
 def test_a_failed_kv_retrieve_reaches_the_client_without_its_path(caplog):
     from concurrent.futures import Future
 
+    from mstar.engine.resources.kv.arena import new_page_arena
     from mstar.engine.resources.kv.manager import CacheStream, KVManager
 
     snapshot = "/srv/private/alice/kv-worker-12345.pt"
     future = Future()
     future.set_exception(FileNotFoundError(2, "No such file or directory", snapshot))
-    manager = SimpleNamespace(_streams={"r1": {"main": CacheStream(read_pending=True, read_future=future)}})
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), read_pending=True, read_future=future)
+    manager = SimpleNamespace(_streams={"r1": {"main": stream}})
     with caplog.at_level("ERROR"):
         reasons = [KVManager._check_ready(manager, "r1", "main") for _ in range(2)]
     assert [ready for ready, _ in reasons] == [False, False]
