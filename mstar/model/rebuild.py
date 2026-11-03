@@ -14,8 +14,8 @@ class RebuildPolicy:
 
     ``ids_input`` is the input that carries the prompt's ids, and the row's ids go under it. Whatever else the node
     reads in a walk, such as the encoder's output for a prompt with images, the worker copies to the host when the
-    walk prefills a request, and the rebuild row reads it again. ``copy_bytes_per_slot`` gives, for each such walk,
-    what one KV slot of those copies takes in the dtype the node runs in.
+    walk prefills a request, and the rebuild row reads it again. ``copy_width`` gives, for each such walk, how many
+    values its copies hold per KV slot, each in the dtype the node runs in.
     ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of
     whose iterations samples one.
     """
@@ -23,7 +23,7 @@ class RebuildPolicy:
     ids_input: str
     sample_output: str
     loop: str
-    copy_bytes_per_slot: Mapping[str, int] = field(default_factory=dict)
+    copy_width: Mapping[str, int] = field(default_factory=dict)
 
     def loop_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
         """The walks in which ``loop`` runs ``node``: those a request can be dropped in."""
@@ -56,10 +56,10 @@ class RebuildPolicy:
                     f"in {walk!r}"
                 )
             copied[walk] = frozenset(reads - {self.ids_input})
-            if copied[walk] and walk not in self.copy_bytes_per_slot:
+            if copied[walk] and walk not in self.copy_width:
                 raise ValueError(
                     f"{node} reads {sorted(copied[walk])} besides its ids in {walk!r}, and its rebuild policy doesn't "
-                    "say what a slot of their host copies takes"
+                    "say how many values their host copies hold per slot"
                 )
         if not self.loop_walks(node, graphs):
             raise ValueError(f"{node}'s rebuild policy names loop {self.loop!r}, which runs {node} in no walk")

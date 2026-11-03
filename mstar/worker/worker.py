@@ -762,6 +762,7 @@ class Worker:
             policies, graphs,
             HostPool(host_mb << 20, self.device) if host_mb and policies else None,
             self.engine_manager.engine.host_allowance,
+            {node: dtype for node in policies if (dtype := self.engine_manager.engine.node_dtype(node)) is not None},
         )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,

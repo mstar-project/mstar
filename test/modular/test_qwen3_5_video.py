@@ -898,6 +898,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     w, eng = _worker()
     w._rebuilds = Rebuilds(
         model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 20, torch.device("cpu")),
+        node_dtypes={NODE: torch.float32},
     )
     inputs = {R: {"text_inputs": step.input_tensors["text_inputs"], **copied}}
     writes = {"kv": {NODE: NodeWrites(frozenset({"prefill_vision", "decode"}), frozenset({"decode_loop"}))}}

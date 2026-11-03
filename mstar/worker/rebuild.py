@@ -7,6 +7,7 @@ from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -169,10 +170,13 @@ class Rebuilds:
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
         pool: HostPool | None = None, allowance: StepAllowance | None = None,
+        node_dtypes: Mapping[str, torch.dtype] = MappingProxyType({}),
     ) -> None:
         # node -> walk -> what the node reads there besides the ids, which the worker copies to the host
         self._copied = {node: policy.check(node, graphs) for node, policy in policies.items()}
         self._policies = dict(policies)
+        # node -> the dtype it runs in, which its host copies take. A node missing here copies nothing.
+        self._node_dtypes = node_dtypes
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
         self._pool = pool
@@ -210,12 +214,15 @@ class Rebuilds:
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
         """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids as int32
-        and the host copies of what each other span's walk read, or None when the pool can't hold it."""
+        and the host copies for its spans other than ids, or None when the pool can't hold it."""
         spans = [span for layout in layouts for span in layout.spans]
         ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
-        per_slot = self._policies[node].copy_bytes_per_slot
         others = [span for span in spans if span.kind != SpanKind.IDS]
-        piece = self._pool.take(aligned(4 * ids) + sum(span.length * per_slot[span.walk] for span in others))
+        dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
+        if others and dtype is None:
+            return None
+        copies = sum(span.length * width[span.walk] for span in others) * (dtype.itemsize if others else 0)
+        piece = self._pool.take(aligned(4 * ids) + copies)
         return None if piece is None else LogRoom(piece, sum(span.length for span in others))
 
     def ingest_request(
@@ -287,8 +294,7 @@ class Rebuilds:
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
         """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
-        request's slice after the ids. A request whose copies don't fit its slice,
-        which the policy's ``copy_bytes_per_slot`` sized, keeps nothing, so it is never dropped."""
+        request's slice after the ids."""
         node = node_batch.node_name
         copied, kept_ids = self._copied.get(node, {}), self._kept.get(node)
         walks = {walk for walk, names in copied.items() if names}
@@ -311,9 +317,9 @@ class Rebuilds:
             piece, inputs = self._droppable[node][rid].piece, node_batch.per_request_input_tensors[rid]
             tensors = [(name, tensor) for name in sorted(copied[kept.walk]) for tensor in inputs[name]]
             used = aligned(kept.prompt.view.nbytes)
-            if used + sum(aligned(tensor.nbytes) for _, tensor in tensors) > piece.nbytes:
-                self._forget(node, rid)
-                continue
+            assert used + sum(aligned(tensor.nbytes) for _, tensor in tensors) <= piece.nbytes, (
+                f"{node} read more besides its ids in {kept.walk!r} than its rebuild policy's copy_width says"
+            )
             kept.copies.inputs = {name: [] for name in copied[kept.walk]}
             for name, tensor in tensors:
                 into = HostSlice(piece.offset + used, tensor.nbytes)

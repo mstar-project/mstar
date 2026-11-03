@@ -351,7 +351,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 1024)* MiB added to that pool on a worker where a node's rebuild policy
        copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
        with images or video, at one rank. A request takes room for its ids and copies together,
-       at the bytes per slot the policy declares, and gives back what its copies didn't use once
+       at the values per slot the policy declares in the node's dtype, and gives back what its copies didn't use once
        they are taken. A non-negative int, and 0 with ``rebuild_host_mb: 0`` keeps nothing.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it

@@ -725,6 +725,10 @@ class Engine:
                     "the decode walk while the request is rebuilt"
                 )
 
+    def node_dtype(self, node_name: str) -> torch.dtype | None:
+        """The dtype ``node_name`` was cast to and runs in, or None if it keeps its own (``disable_autocast``)."""
+        return resolve_node_dtype(self._submodules[node_name].submodule, self._autocast_dtype)
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager
