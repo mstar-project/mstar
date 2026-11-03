@@ -173,8 +173,8 @@ class PrefixIndex:
         """How many pages would join the evictable set if each page in ``released`` lost the number of
         owners it maps to.
         Replays `set_shared` and `_unpin_above` without changing anything."""
-        owners = self._arena.num_owners
-        left = {page: owners[page] - n for page, n in released.items()}
+        pages = list(released)
+        left = {page: owners - released[page] for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)}
         below: dict[int, int] = {}
         joined: set[int] = set()
         for page in released:
@@ -186,7 +186,7 @@ class PrefixIndex:
                 if parent is None:
                     break
                 below[parent] = below.get(parent, self._held_below[parent]) - 1
-                if below[parent] or left.get(parent, owners[parent]) > 1:
+                if below[parent] or (left[parent] if parent in left else self._arena.owners(parent)) > 1:
                     break
                 page = parent
         return len(joined)

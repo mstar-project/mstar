@@ -4752,8 +4752,8 @@ class KVManager(AttentionResource):
             for stream in self._streams[rid].values():
                 released.update(stream.pages())
                 released.update(stream.lease or ())
-        owners = self._arena.num_owners
-        pages = sum(1 for page, n in released.items() if owners[page] == n)
+        held = list(released)
+        pages = sum(owners == released[page] for page, owners in zip(held, self._arena.owners_of(held), strict=True))
         if self._index is not None:
             pages += self._index.evictable_after(released)
         return pages + sum(self._allotments[rid].remaining for rid in rids if rid in self._allotments)

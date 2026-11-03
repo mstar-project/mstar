@@ -287,5 +287,4 @@ class CPUPagePool:
     def takes(self, pages: int, keys: list[bytes]) -> int:
         """How many pages `place` takes out of `room` for a stream ``pages`` long, filed under ``keys``. A page
         another request holds under the same key costs nothing."""
-        owners = self.arena.num_owners
-        return pages - sum(owners[page] > 1 for page in self.index.pages_for(keys))
+        return pages - sum(owners > 1 for owners in self.arena.owners_of(self.index.pages_for(keys)))
