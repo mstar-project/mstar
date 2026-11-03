@@ -21,6 +21,7 @@ import torch
 from test_resident_delta import NODE, PAGE_SIZE, _both_short_then_drop, _counts, manager_mod
 from test_worker_rebuild import POLICY, _graphs, _kept
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
@@ -28,7 +29,7 @@ from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
-from mstar.worker.speculation import Speculation
+from mstar.worker.speculation import SpeculationBuilder, SpeculationContext
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -53,9 +54,8 @@ class _Rank:
         w._rebuilds, w.scheduler, w.enable_nvtx = self.rebuilds, self.scheduler, False
         w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
         w.request_state = SimpleNamespace(
-            get_partition_for_node=lambda node: "p", get_fwd_info=lambda rid, partition: SimpleNamespace(
-                graph_walk="decode",
-            ),
+            get_partition_for_node=lambda node: "p",
+            get_fwd_info=lambda rid, partition: CurrentForwardPassInfo(rid, "decode", 0, 0, 8),
         )
         w._wait_for_step = lambda batch_N: None
         w._preemption = SimpleNamespace(rebuilt=lambda rid, node, tokens: None)
@@ -63,11 +63,17 @@ class _Rank:
         tensors = SimpleNamespace(get_tensor=lambda uuid: None, get_tensors=lambda uuids: [])
         w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tensors, [])
         w._graph_runtime = SimpleNamespace(
-            get_spec_target=lambda *args: SimpleNamespace(),
+            get_spec_target=lambda *args: SimpleNamespace(
+                node_name=NODE, graph_walk=PREFILL, output_signals=[], is_new_loop_iter=False, loop_name=None,
+            ),
             prep_follow_spec_rids=lambda prep: SpeculationPrepOutput([], list(prep.rids), [0] * len(prep.rids),
                                                                       ColumnarEdgeSpecs.empty()),
+            get_consumed_edges=lambda node, spec_node, walk: frozenset(),
         )
-        w._spec_builder = SimpleNamespace(assemble=_assemble)
+        w._spec_builder = SpeculationBuilder(SpeculationContext(
+            graph_runtime=w._graph_runtime, tensor_manager=tensors, request_state=w.request_state,
+            scheduler=self.scheduler, streams=w.streams, engine_manager=w.engine_manager,
+        ))
 
     def post_process(self, batch: ScheduledBatch) -> None:
         rows = list(batch.request_to_worker_graph)
@@ -76,19 +82,6 @@ class _Rank:
         )
         pending = SimpleNamespace(batch=batch, node_batch=node_batch, node_name=NODE)
         Worker._finish_rebuild_rows(self.worker, pending, {})
-
-
-def _assemble(pending, info, rows, inputs, streamed, continuing, fresh_final, *, chunk_ranges=None,
-              incomplete_node_rids=None, rebuild_rids=frozenset(), **kwargs):
-    """The scheduled half of the speculation the follower built, as `SpeculationBuilder.assemble` carries it."""
-    return Speculation(
-        scheduled_batch=ScheduledBatch(
-            node_name=NODE, graph_walk=PREFILL, request_to_worker_graph=dict(rows), rebuild_rids=rebuild_rids,
-            chunk_ranges=dict(chunk_ranges or {}), incomplete_node_rids=set(incomplete_node_rids or ()),
-        ),
-        node_batch=None, consumed_edges=set(), continuing_rids=set(), partition="p", is_new_iter=False,
-        is_same_node=True,
-    )
 
 
 def _step(seq: int) -> ScheduledBatch:
@@ -134,7 +127,7 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
 
     if speculated:
         sched.register_tp_follow(_head(lead, 2, ["v"], speculative=True, spec_from_seq=1))
-        pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n,
+        pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n, partition="p",
                                   node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)))
         n_1 = Worker._try_follow_speculation(one.worker, pending).scheduled_batch
         zero.post_process(_step(1))
