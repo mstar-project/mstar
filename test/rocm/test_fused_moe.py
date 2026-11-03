@@ -201,6 +201,28 @@ def test_every_shipped_config_matches_reference():
             raise AssertionError(f"dims {dims} M={m} config {cfg}: {e}") from e
 
 
+def test_every_shipped_config_compiles_with_its_options():
+    """Served, the experts run inside compiled frames, where a launch's AMD
+    compiler options only reach the build through the kernel's config."""
+    from torch._inductor.utils import run_and_get_code
+
+    from mstar.utils.fused_moe.runner import fused_experts
+
+    entries = _shipped_tables()
+    if not entries:
+        pytest.skip(f"no tuned table for {torch.cuda.get_device_name()}")
+    for dims, m, cfg in entries:
+        x, w1, w2, weights, ids = _inputs(dims, m)
+        eager = fused_experts(x, w1, w2, weights, ids, config=cfg)
+        compiled = torch.compile(lambda *a, cfg=cfg: fused_experts(*a, config=cfg), fullgraph=True, dynamic=False)
+        out, code = run_and_get_code(compiled, x, w1, w2, weights, ids)
+        for c in cfg:
+            options = ", ".join(f"'{k}': {c[k]}" for k in ("waves_per_eu", "matrix_instr_nonkdim", "kpack") if k in c)
+            assert options in "".join(code), (dims, m, c)
+        _assert_matches(out, _reference(x, w1, w2, weights, ids))
+        assert torch.equal(out, eager), (dims, m)
+
+
 # ---------------------------------------------------------------------------
 # AITER backend
 # ---------------------------------------------------------------------------
