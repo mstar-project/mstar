@@ -39,7 +39,7 @@ source .venv/bin/activate
 uv pip install --torch-backend=auto -e .
 ```
 
-This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two console scripts, `mstar` and `mstar-serve`.
+This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two console scripts, `mstar` and `mstar-serve`. To serve from a checkout, also build the extension (see [Rust extension](/installation#rust-extension)).
 
 <Warning>
 
@@ -91,7 +91,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
 | `.[orpheus]` | Orpheus TTS runtime: `transformers`, `flashinfer-python`, `safetensors`, `einops`, `huggingface-hub`, `mooncake-transfer-engine`. |
 | `.[fish_s2_pro]` | Fish Audio S2-Pro runtime: `transformers`, `flashinfer-python`, `safetensors`, `soundfile` (reference-clip decoding), `huggingface-hub`, `mooncake-transfer-engine`. |
 | `.[omnivoice]` | OmniVoice TTS. The extra is empty on purpose: the runtime is the `omnivoice` package, installed separately from git — see [omnivoice (OmniVoice)](/installation#omnivoice-omnivoice). |
-| `.[pi05]` | Pi0.5 runtime: `transformers`, `flashinfer-python`, `safetensors`, `triton`, `huggingface-hub`, `mooncake-transfer-engine`. |
+| `.[pi05]` | Pi0.5 runtime: `transformers`, `flashinfer-python`, `safetensors`, `triton`, `huggingface-hub`, `mooncake-transfer-engine`. Its tokenizer comes from the gated `google/paligemma-3b-pt-224`: accept its license on Hugging Face and set `HF_TOKEN`, or the server refuses to start. |
 | `.[vjepa2]` / `.[vjepa2_ac]` | V-JEPA 2 runtime: `safetensors`, `torchcodec`, `huggingface-hub`, `mooncake-transfer-engine` (`vjepa2_ac` also adds `flashinfer-python`). |
 | `.[glm]` | GLM runtime: `transformers`, `flashinfer-python`, `safetensors`, `triton`, `huggingface-hub`, `mooncake-transfer-engine`, and `ninja` (speeds up the JIT build of the vendored MoE align kernel). |
 | `.[waypoint]` | Index-hosted Waypoint dependencies: `huggingface-hub`, `safetensors`, and `tensordict` for reference validation. The pinned TAEHV implementation must be installed separately as shown below; keeping its direct URL out of package metadata allows `m-star` to be published on PyPI. **Also needs** `flash-attn-4`, which is installed separately — see [flash-attn-4 (Waypoint, FA3 sm90 kernel)](/installation#flash-attn-4-waypoint-fa3-sm90-kernel). |
@@ -225,6 +225,8 @@ python -c "import flash_attn; print(flash_attn.__version__)"
 
 Waypoint's DiT attention runs torch flex-attention with the `FLASH` backend by default. That backend needs the **flash-attn-4** package, which provides `flash_attn.cute` — the CuTe DSL rewrite of flash-attn; on H100 it runs the FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
 
+Install it after `flash-attn` (FA2): the FA2 package ships an older `flash_attn/cute` that overwrites flash-attn-4's.
+
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the block-sparse block size, and capture fails with `Block sparse tensors ... require explicit sparse_block_size[0]`. Note this rules out the flash-attn prebuilt wheels above, which stop at `torch2.10`.
 
 Install it from the upstream repo's `flash_attn/cute` subdirectory, pinned to the revision this was tested against (with `nvidia-cutlass-dsl` 4.7.1 and torch 2.12.1):
@@ -274,23 +276,25 @@ mstar --help
 mstar-serve --help
 ```
 
-## Optional: Rust support {#optional-rust-support}
+<a id="optional-rust-support" />
 
-Parts of the runtime can run on Rust components (vendored in `rust/`), each optional and selectable per process — without the extension everything runs on the pure-Python paths as before. Migrated so far (see [Environment variables](/environment_variables) for the flags):
+## Rust extension {#rust-extension}
 
-- **ZeroMQ control mesh** — `MSTAR_RUST_ZMQ`: same endpoints, same wire format as pyzmq.
+Serving needs the `mstar_rust` extension (vendored in `rust/`): the graph runtime is Rust and every process sends on its ZeroMQ transport, so the conductor refuses to start without it. Importing `mstar` does not need it. The extension carries (see [Environment variables](/environment_variables) for the flags):
+
+- **Graph runtime**: graph state, scheduling, routing and speculation, and the frames a worker sends. It holds a share of the Rust transport and of the Rust tensor bookkeeper, and needs the msgpack codec.
+- **ZeroMQ control mesh**: the transport every process sends its control messages on. Each process logs it at startup (`control mesh transport: rust <version> from <path>`) and refuses an extension of another version than the one its `mstar` expects.
 - **SHM tensor arena** — `MSTAR_SHM_ARENA`: replaces the per-tensor file transport; requires the extension, interoperates on the same descriptor wire (and depends on the transport above only in the sense that both ship in the same extension).
 - **Message encoding** — `MSTAR_WIRE_CODEC`: typed msgpack rather than pickle, which is what lets one end of an edge be Rust. On by default, extension or not. The legacy `pickle` codec is no longer supported. Loosely typed metadata uses data-only extensions; upgrade all deployment processes together, since legacy pickle frames are rejected.
-- **Graph runtime** — `MSTAR_RUST_GRAPH`: graph state, scheduling, routing and speculation, and the frames a worker sends. Unlike the others this is not free-standing — it holds a share of the Rust transport and of the Rust tensor bookkeeper, so it runs only where `MSTAR_RUST_ZMQ` resolved to Rust and the msgpack codec is in use. `AUTO` takes it wherever that holds, so on a machine with the extension built, installing it is what moves a worker onto the Rust runtime.
 
-The Linux wheels of `mstar-ai` on PyPI (x86_64 and aarch64, CPython 3.12 to 3.14) carry the extension, so `pip install mstar-ai` there gets it; other platforms get the pure-Python wheel. The extension statically links libzmq 4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is the upstream [v4.3.4 release](https://github.com/zeromq/libzmq/releases/tag/v4.3.4). Elsewhere, or to build from a checkout, build the extension into your environment with [maturin](https://www.maturin.rs) (needs [rustup](https://rustup.rs), which installs the compiler version pinned in `rust-toolchain.toml`):
+There are two ways to get it. The Linux wheels of `mstar-ai` on PyPI (x86_64 and aarch64, CPython 3.12 to 3.14) carry the extension, so `pip install mstar-ai` there is all it takes; other platforms get a pure-Python wheel with no extension, which cannot serve. The extension statically links libzmq 4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is the upstream [v4.3.4 release](https://github.com/zeromq/libzmq/releases/tag/v4.3.4). Elsewhere, or from a checkout (`pip install -e .` does not compile it), build the extension into your environment with [maturin](https://www.maturin.rs) (needs [rustup](https://rustup.rs), which installs the compiler version pinned in `rust-toolchain.toml`):
 
 ```bash
 uv pip install maturin
 maturin develop --release -m rust/Cargo.toml
 ```
 
-Build with `--release` — an unoptimized debug build (maturin's default) costs real latency on the hot receive path. If `mstar-ai` came from a Linux wheel that carries the extension, this build (a separate `mstar-rust` distribution) takes precedence over the wheel's copy in the same environment; `pip uninstall mstar-rust` goes back to the wheel's, and neither uninstall removes the other's files. Verify with:
+The CPU test suites build a graph runtime too, so contributors need it as well, Mac contributors included: install `cargo` through rustup and run the same command. Build with `--release` — an unoptimized debug build (maturin's default) costs real latency on the hot receive path. If `mstar-ai` came from a Linux wheel that carries the extension, this build (a separate `mstar-rust` distribution) takes precedence over the wheel's copy in the same environment; `pip uninstall mstar-rust` goes back to the wheel's, and neither uninstall removes the other's files. Verify with:
 
 ```bash
 python -c "import mstar_rust; print('mstar_rust OK')"
