@@ -178,8 +178,8 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
     def _step_key(self, fwd_info: CurrentForwardPassInfo, key: KleinShape) -> KleinShape:
-        """A step's key: the request's, marked on the leading steps that run bf16. A request's own key stays shape
-        alone, since its schedule and seeds outlive any one step."""
+        """A step's key: the request's, marked on the leading steps that run bf16. A request's own key stays unmarked,
+        since its schedule and seeds outlive any one step."""
         return replace(key, bf16_step=True) if self.step_index(fwd_info) < self._bf16_steps else key
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs | None:

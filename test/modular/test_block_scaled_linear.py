@@ -180,7 +180,7 @@ def test_declared_linears_move_and_kept_ones_dont(precision):
     assert moved == ["fused", "plain"]
     assert isinstance(block.keep, nn.Linear)
     assert isinstance(block.fused, BlockScaledLinear) and isinstance(block.plain, BlockScaledLinear)
-    assert not list(block.fused.parameters()), "the bf16 weight goes with the module it lived on"
+    assert not list(block.fused.parameters()), "the bf16 weight goes with the module that held it"
 
     g = torch.Generator().manual_seed(1)
     x = torch.randn(2, 64, 128, generator=g).to(torch.bfloat16)
@@ -313,7 +313,7 @@ def test_bf16_steps_capture_each_bucket_twice_only_under_low_precision():
     assert len(_klein_model(linear_precision="mxfp8").capture_buckets()) == 1
 
 
-def test_a_steps_key_marks_the_leading_steps_and_the_requests_key_stays_shape_alone():
+def test_a_steps_key_marks_the_leading_steps_and_the_requests_key_stays_unmarked():
     sub = _step_submodule(bf16_steps=1)
     assert sub.cg_key_info("image_gen", {"r": _step_info(0)}).bf16_step is True
     assert sub.cg_key_info("image_gen", {"r": _step_info(1)}).bf16_step is False
