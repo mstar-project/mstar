@@ -172,10 +172,10 @@ ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
 
-# Image/video denoise state (initial noise, latents between steps, the guidance
-# combine and the scheduler step) is fp32, as diffusers' pipeline keeps it; only
-# the transformer input is bf16. Windowed rollouts keep their latents in the
-# model dtype.
+# Denoise state (initial noise, latents between steps, the guidance combine and
+# the scheduler step) is fp32 for image, video, sound and action requests, as
+# diffusers' pipeline keeps it; only the transformer input is bf16. Windowed
+# rollouts keep their latents in the model dtype.
 LATENT_DTYPE = torch.float32
 # The conditioning encode runs in the VAE checkpoint's dtype, as the reference does.
 ENCODE_DTYPE = torch.bfloat16
@@ -1389,8 +1389,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # First iteration: video noise first, then sound noise from the same
             # generator (the reference pipeline's RNG order), so the video band
             # of a sound request is bit-identical to the same-seed video-only
-            # request.
-            dtype = self.transformer.proj_in.weight.dtype
+            # request. Both in the fp32 loop dtype, as the video-only path draws.
+            dtype = LATENT_DTYPE
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             latents = torch.randn(st["latent_shape"], generator=gen, device=device, dtype=dtype)
             cond_latents = st.get("cond_latents")
@@ -1430,7 +1430,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # the video noise to match the fused pipeline's RNG order.
             from diffusers.utils.torch_utils import randn_tensor
 
-            dtype = self.transformer.proj_in.weight.dtype
+            dtype = LATENT_DTYPE
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
             chunk, adim, raw = st["action_chunk"], st["action_dim"], st["raw_action_dim"]
             a_noise = randn_tensor((1, chunk, adim), generator=gen, device=device, dtype=dtype)
@@ -1853,7 +1853,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         multistep history (the flow update is linear per element), then split
         back. Every sound frame is noisy, so no clean re-injection is needed on
         the sound band; the video band's i2v anchor stays clean because its
-        predicted velocity is zero (as in the video-only path)."""
+        predicted velocity is zero (as in the video-only path). The step runs in
+        the latents' dtype, like the reference's fp32 step."""
+        video_v, sound_v = video_v.to(latents.dtype), sound_v.to(sound_latents.dtype)
         nv = video_v.numel()
         packed_next, solver = st["scheduler"].step(
             self._packed(video_v, sound_v), self._packed(latents, sound_latents), step_index, solver,
@@ -1890,8 +1892,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["cond"]["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], sound_latents.dtype)
         else:
             cond_v, s_c = self.transformer.denoise_step(
                 latents, vts, st["cond"]["rotary"],
@@ -1905,8 +1907,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["uncond"]["mse_gen_indexes"], UNCOND_LABEL, attn,
                 **self._sound_kwargs(st["uncond"], sound_latents, sts),
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], sound_latents.dtype)
 
         new_latents, new_sound, solver = self._sound_scheduler_step(
             st, latents, sound_latents, velocity, sound_v, step_index, solver,
@@ -1942,10 +1944,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         scheduler over the packed [video | action] state, then re-inject the clean
         conditioning anchors (conditioning frames / action stay clean each step,
         their masked-in values invariant). Shared by the single-request and
-        cross-request batched action forwards."""
+        cross-request batched action forwards. The step runs in the latents'
+        dtype, like the reference's fp32 step."""
         raw, chunk, adim = st["raw_action_dim"], st["action_chunk"], st["action_dim"]
-        video_v = video_v * (1.0 - st["vmask"])
-        action_v = action_v * (1.0 - st["action_clean_mask"])
+        video_v = video_v.to(latents.dtype) * (1.0 - st["vmask"])
+        action_v = action_v.to(action_latents.dtype) * (1.0 - st["action_clean_mask"])
         action_v[..., raw:] = 0
         nv = video_v.numel()
         packed_next, solver = st["scheduler"].step(
@@ -1995,8 +1998,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 action_timesteps=ats,
                 action_domain_id=domain,
             )
-            video_v = v_u + st["gs"] * (video_v - v_u)
-            action_v = a_u + st["gs"] * (action_v - a_u)
+            video_v = _guided(video_v, v_u, st["gs"], latents.dtype)
+            action_v = _guided(action_v, a_u, st["gs"], action_latents.dtype)
         else:
             video_v, action_v = self._denoise_action(
                 attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
@@ -2004,8 +2007,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             v_u, a_u = self._denoise_action(
                 attn, st["uncond"], latents, action_latents, vts, ats, domain, UNCOND_LABEL
             )
-            video_v = v_u + st["gs"] * (video_v - v_u)
-            action_v = a_u + st["gs"] * (action_v - a_u)
+            video_v = _guided(video_v, v_u, st["gs"], latents.dtype)
+            action_v = _guided(action_v, a_u, st["gs"], action_latents.dtype)
 
         new_latents, new_action, solver = self._action_scheduler_step(
             st, latents, action_latents, video_v, action_v, step_index, solver,
@@ -2168,8 +2171,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, snd, k), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            sound_v = s_u + st["gs"] * (s_c - s_u)
+            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
             solver = {name: solvers[name][rid] for name in self._solver_state}
             new_latents, new_sound, solver = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, k, solver)
             if st.get("vmask") is not None:
@@ -2229,8 +2232,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             if with_cfg:
                 (cond_video, cond_action), (uncond_video, uncond_action) = branches
-                video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
-                action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
+                video_v = _guided(cond_video, uncond_video, st["gs"], lat.dtype)
+                action_v = _guided(cond_action, uncond_action, st["gs"], act.dtype)
             else:
                 (video_v, action_v), = branches
             solver = {name: solvers[name][rid] for name in self._solver_state}
