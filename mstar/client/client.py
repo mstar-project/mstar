@@ -410,9 +410,12 @@ class MStarClient:
             # Raw RGB frame events are multi-megabyte NDJSON lines. Requests'
             # 512-byte default repeatedly concatenates the growing partial
             # line and becomes quadratic at 720p, so read them in large slabs.
+            # Split on "\n" only: the default splitlines() also breaks a line
+            # at the U+2028 / U+2029 / U+0085 a JSON string may hold raw.
             lines = resp.iter_lines(
                 chunk_size=_STREAM_READ_CHUNK_SIZE,
                 decode_unicode=True,
+                delimiter="\n",
             )
             if self._nvtx is None:
                 for line in lines:
