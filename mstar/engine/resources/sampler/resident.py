@@ -122,6 +122,8 @@ class SamplerCells:
         self._tables = [planner.table() for _ in fields]
         self._encoders = [_encoder(f.dtype) for f in fields]
         self._defaults = [enc(f.default) for enc, f in zip(self._encoders, fields, strict=True)]
+        # for the torch path, made once: a capture can't copy one up
+        self._default_cells = torch.tensor(self._defaults, dtype=torch.long, device=planner.device)
         self._sizes = tuple(torch.empty((), dtype=f.dtype).element_size() for f in fields)
         # rid -> its cells, set on the thread that registers or updates it.
         # Handle-keyed: `drop` purges it.
@@ -225,15 +227,18 @@ class SamplerCells:
         if any(t.col != col + j for j, t in enumerate(tables)):
             raise RuntimeError(f"resident planning on {self.node}: the sampler's cells aren't side by side")
         row = self.scalar_row(step.bucket)
-        gather_cells(step.store, step.slots, tables[0].stride, col, row, self.fields, self._sizes, self._defaults)
+        gather_cells(
+            step.store, step.slots, tables[0].stride, col, row, self.fields, self._sizes,
+            self._defaults, self._default_cells,
+        )
 
 
 def gather_cells(
     store: torch.Tensor, slots: torch.Tensor, stride: int, col: int, row: _ScalarRow,
-    fields: tuple[ScalarField, ...], sizes: tuple[int, ...], defaults: list[int],
+    fields: tuple[ScalarField, ...], sizes: tuple[int, ...], defaults: list[int], default_cells: torch.Tensor,
 ) -> None:
     """Each field's cell of ``slots``' rows into its region of ``row``, the
-    trash row reading ``defaults``."""
+    trash row reading ``defaults`` (``default_cells`` on the device)."""
     n = slots.numel()
     if store.is_cuda:
         _gather_cells_kernel[(n,)](
@@ -242,6 +247,6 @@ def gather_cells(
         )
         return
     cells = store.view(-1, stride)[:, col: col + len(fields)].index_select(0, slots)
-    cells = torch.where((slots == TRASH_SLOT).unsqueeze(1), torch.tensor(defaults, device=store.device), cells)
+    cells = torch.where((slots == TRASH_SLOT).unsqueeze(1), default_cells, cells)
     for j, f in enumerate(fields):
         row.views[f.name][:n].copy_(_decode(cells[:, j], f.dtype))
