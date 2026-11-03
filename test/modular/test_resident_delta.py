@@ -1561,8 +1561,8 @@ def _follow_next(scheduler) -> None:
 
 def test_a_follower_lands_a_rebuild_between_the_steps_rank_0_landed_it_between(monkeypatch):
     """Rank 0 lands v's rebuild when post-processing the rebuild's step K, after sending the step it built during K
-    (a yield-away, under async scheduling). A follower post-processes K before it takes that step, so a follower that
-    landed v at that point would hold one dropped request fewer than rank 0's trail, and stop."""
+    (a yield-away, under async scheduling). A follower post-processes K before taking the step built during K, so a
+    follower that landed v then would hold one dropped request fewer than rank 0."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     scheduler = _follower_of(follow)
