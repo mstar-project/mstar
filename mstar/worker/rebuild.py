@@ -108,9 +108,9 @@ class Rebuilds:
     def rebuildable(
         self, writes: Mapping[str, Mapping[str, NodeWrites]], layouts: Mapping[str, Collection[StreamLayout]],
     ) -> dict[str, bool]:
-        """For each paged KV cache in ``writes``, whether a drop here can free a request's pages there: every
-        node that writes the request's ``layouts`` in it can write again all that the node writes. A node that
-        writes nothing for the request isn't asked.
+        """For each paged KV cache in ``writes``, whether a drop here can free a request's pages there: one
+        rebuild row can lay out its ``layouts`` there again, and every node that writes them can write again all
+        that the node writes. A node that writes nothing for the request isn't asked.
 
         A drop takes every cache of its node, so a node is judged by what it writes in all of them."""
         written: dict[str, list[StreamLayout]] = defaultdict(list)
@@ -122,7 +122,9 @@ class Rebuilds:
                     written[node] += laid_out
                     writers[key].append(node)
         refused = {node for node, laid_out in written.items() if not self.can_rebuild(node, laid_out)}
-        return {key: refused.isdisjoint(writers[key]) for key in writes}
+        return {
+            key: refused.isdisjoint(writers[key]) and rebuild_refusal(layouts.get(key, ())) is None for key in writes
+        }
 
     def keep_prompts(
         self, node: str, graph_walk: str, request_walks: Mapping[int, str],

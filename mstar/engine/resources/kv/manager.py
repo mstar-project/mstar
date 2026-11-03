@@ -33,7 +33,6 @@ from mstar.engine.resources.kv.config import (
     PrefixSpan,
     RetentionPolicy,
     StreamLayout,
-    rebuild_refusal,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
@@ -3382,13 +3381,13 @@ class KVManager(AttentionResource):
         if self.is_offloaded(rid):
             return f"KV {self.name}: {rid} has a host copy, which a drop would leave behind"
         with self._lock:
-            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
-                return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
-            if rid in self._guaranteed:
-                return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
-            why = rebuild_refusal((self._overrides[rid].kv_layout or {}).values())
-            if why is not None:
-                return f"KV {self.name}: {rid} can't be dropped, since {why}"
+            if not self._movable(rid):
+                return (
+                    f"KV {self.name}: {rid} is guaranteed, waits on room set aside for it, or has a step or a read "
+                    "in flight on its pages"
+                )
+            if not self._overrides[rid].rebuildable:
+                return f"KV {self.name}: {rid} can't be rebuilt on this worker"
         return None
 
     def drop(self, rid: str) -> int:
@@ -3488,10 +3487,10 @@ class KVManager(AttentionResource):
         copied: a step admitted before the claim can still run its fork copy,
         and that copy reads one of these streams.
 
-        A victim `preempt` chose that doesn't move comes off its earmark with
-        nothing freed.
+        A guaranteed request never moves. A victim `preempt` chose that doesn't
+        move comes off its earmark with nothing freed.
         """
-        if self._cpu_pool is None or rid not in self._streams:
+        if self._cpu_pool is None or rid not in self._streams or rid in self._guaranteed:
             return 0
         claimed, read_futures = self._claim_for_offload(rid)
         if not claimed:
@@ -3819,26 +3818,13 @@ class KVManager(AttentionResource):
 
     def reclaimable(self, rid: str) -> int:
         """The device pages ``rid`` holds, or 0 when offloading it would free none
-        of them, when it is offloaded already, or when it is admitted but hasn't run.
-        Also 0 for a guaranteed request in a pool that decides, since a move to the host
-        preempts it too."""
+        of them, when it is offloaded already, or when it is admitted but hasn't run."""
         with self._lock:
-            if self._decides and self._streams.get(rid) and rid in self._guaranteed:
-                return 0
-            return self._freeable(rid)
-
-    def frees_on_remove(self, rid: str) -> int:
-        """`reclaimable` for any class of request, since a teardown frees a guaranteed request's pages too."""
-        with self._lock:
-            return self._freeable(rid)
-
-    def _freeable(self, rid: str) -> int:
-        """Under the lock: the device pages ``rid`` holds, or 0 when releasing them would free none."""
-        streams = self._streams.get(rid, {})
-        for stream in streams.values():
-            if any(self._reusable(page) for page in reversed(stream.page_indices)):
-                return sum(len(stream.pages()) for stream in streams.values())
-        return 0
+            streams = self._streams.get(rid, {})
+            for stream in streams.values():
+                if any(self._reusable(page) for page in reversed(stream.page_indices)):
+                    return sum(len(stream.pages()) for stream in streams.values())
+            return 0
 
     def get_offload_priority(self, rid: str) -> float:
         """What `reclaimable` counts, the most reclaimable first."""
@@ -4478,7 +4464,7 @@ class KVManager(AttentionResource):
             else:
                 pages = self._host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if not moving and (to_host or droppable(rid)) and self._frees([rid]) > 0:
+                if not moving and self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
@@ -4511,9 +4497,9 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, and no step or
-        read is in flight on its pages."""
-        return rid not in self._earmarks and not any(
+        """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no room is set aside for
+        it, and no step or read is in flight on its pages."""
+        return rid not in self._guaranteed and rid not in self._earmarks and not any(
             stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
         )
 
@@ -4522,9 +4508,9 @@ class KVManager(AttentionResource):
 
     def _host_pages(self, rid: str) -> int | None:
         """The host pages that moving every stream of ``rid`` takes out of the host's room, past the pages the host
-        set aside for it, or None when ``rid`` can't move there: the pool has no host memory, ``rid`` is guaranteed,
-        isn't resident or holds no page, or a stream holds a cached image end `plan` hasn't copied."""
-        if self._cpu_pool is None or rid in self._guaranteed or not self.is_resident(rid) or self._unwritten(rid):
+        set aside for it, or None when ``rid`` can't move there: the pool has no host memory, ``rid`` isn't resident
+        or holds no page, or a stream holds a cached image end `plan` hasn't copied."""
+        if self._cpu_pool is None or not self.is_resident(rid) or self._unwritten(rid):
             return None
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):

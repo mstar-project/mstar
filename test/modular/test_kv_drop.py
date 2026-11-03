@@ -124,25 +124,6 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
-    kv = _manager()
-    config = _config(list(range(PAGE_SIZE)))
-    spans, growth = config.kv_layout["main"].spans, config.kv_layout["main"].growth
-    if layout == "two labels":
-        config.kv_layout["uncond"] = config.kv_layout["main"]
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        config.kv_layout["main"] = StreamLayout(spans=(*spans, PrefixSpan(4, 4, WALK)), growth=growth)
-    else:
-        config.kv_layout["main"] = StreamLayout(spans=spans, growth=(*growth, ("other_loop", 1)))
-        config.loop_caps["other_loop"] = 4
-    kv.ingest_request("r", config)
-
-    with pytest.raises(RuntimeError, match="one rebuild row"):
-        kv.drop("r")
-    assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
-
-
 class _Recording:
     """A resource that records the rebuild hooks it is called with."""
 

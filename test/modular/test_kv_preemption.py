@@ -389,18 +389,6 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
 
 
-@pytest.mark.parametrize("decides", [True, False])
-def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decides):
-    kv = _pool()
-    _running(kv, "p", 2, arrival=0)
-    _running(kv, "g", 2, arrival=1, guaranteed=True)
-    kv._decides = decides
-    # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
-    # Any other pool frees room only through the offload, which has to be able to take any request.
-    assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"
-    assert kv.frees_on_remove("g"), "a guaranteed request's teardown would lift no caps"
-
-
 def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     """A host fetch holds a run of cached pages that starts below the root, and eviction takes leaves only, so the
     pages above that run stay. Counting those pages as room would send a victim to a host that can't take
