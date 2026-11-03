@@ -98,7 +98,7 @@ class Workspace:
         except torch.cuda.OutOfMemoryError as oom:
             why = f"the GPU has no room to grow it: {oom}"
             try:
-                # what it held, so the wrappers on it keep a workspace their plans fitted
+                # back to what it held, which every plan made on it so far fitted
                 self.tensor.data = torch.empty(have, dtype=torch.uint8, device=device)
             except torch.cuda.OutOfMemoryError:
                 why += f"; nor to take back the {have} bytes it held"
