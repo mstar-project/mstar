@@ -3118,7 +3118,15 @@ class Engine:
             resource.prepare_rebuild(request_id, rebuild)
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild row has run."""
+        """Make the dropped request resident again, once its rebuild row has run. On a TP follower the rebuild lands
+        when the follower replays rank 0's LAND move, so every rank lands it between the same two of rank 0's steps."""
+        if node_name in self._tp_follower_nodes:
+            return
+        self._land_rebuild(node_name, request_id)
+        if node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.LAND, request_id, node=node_name)
+
+    def _land_rebuild(self, node_name: str, request_id: int) -> None:
         for resource in self._submodules[node_name].resources.values():
             resource.land_rebuild(request_id)
 
@@ -3237,12 +3245,13 @@ class Engine:
         return bool(self._resident_delta)
 
     def apply_resident_delta(
-        self, delta: OffloadDelta, kept_count: Callable[[str, int], int],
+        self, delta: OffloadDelta, kept_count: Callable[[int, str], int], rebuilding: Callable[[int, str], bool],
     ) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``kept_count(node, rid)`` is how many ids this rank keeps of a request on a node.
+        ``kept_count(rid, node)`` is how many ids this rank keeps of a request on a node, and ``rebuilding(rid,
+        node)`` whether this rank's rebuild of it is still running.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3271,7 +3280,7 @@ class Engine:
                              wire_rid, kind.name, node_name, len(delta))
                 return False
             elif kind == MoveKind.DROP:
-                kept = kept_count(node_name, rid)
+                kept = kept_count(rid, node_name)
                 if kept != move.count:
                     raise RuntimeError(
                         f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps {kept}"
@@ -3279,6 +3288,13 @@ class Engine:
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
+            elif kind == MoveKind.LAND:
+                if rebuilding(rid, node_name):
+                    raise RuntimeError(
+                        f"rank 0 landed {wire_rid}'s rebuild on {node_name}, and this rank's is still running"
+                    )
+                self._land_rebuild(node_name, rid)
+                logger.debug("Replayed rank 0's LAND of request %s on %s", wire_rid, node_name)
             elif kind == MoveKind.OFFLOAD:
                 hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.residency(node_name, rid) is Residency.ON_HOST:

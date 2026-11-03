@@ -256,7 +256,10 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     engine._runner, engine.residency = _runner(kv), lambda node, rid: kv.residency(rid)
     engine.prepare_rebuild = lambda node, rid, rebuild: None
     engine.check_ready = lambda node, rid, info, allow_reload=True: Engine.check_ready(engine, node, rid, info)
-    scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={})
+    scheduler = SimpleNamespace(
+        parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={},
+        parallel_leader_nodes=None,
+    )
     for name in ("_check_ready", "_start_rebuild", "_unpark", "prefilling"):
         setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
     info = w.request_state.get_fwd_info("v", "p")

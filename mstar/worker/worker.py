@@ -3368,10 +3368,11 @@ class Worker:
         # rows whose input read failed here: built without, as on the serial path
         unread = self.scheduler.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
-        in_batch = batch_N.request_to_worker_graph
-        # rebuild rows, which the graph runtime holds no node of, so they are never popped
+        in_batch, held = batch_N.request_to_worker_graph, batch_N.incomplete_node_rids
+        # rebuild rows, which the graph runtime holds no node of, so they are never popped. A rebuild whose chunk ran
+        # in N is one of N's rows mid-prefill, which rank 0 stamps a rebuild row from its log too.
         rebuild = self.scheduler.follow_rebuilds(
-            self.request_state, head.node_name, [r for r in head_rids if r not in in_batch],
+            self.request_state, head.node_name, [r for r in head_rids if r not in in_batch or r in held],
         )
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
@@ -3379,7 +3380,6 @@ class Worker:
         # N's rows mid-prefill loop back on nothing of N's: as on the leader,
         # their next chunk is cut from the input held since their first. N's
         # chunks came from the leader, so every rank splits these out alike.
-        held = batch_N.incomplete_node_rids
         mid_prefill = {r for r in in_n if r in held} if held else set()
         continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
         fresh = [r for r in head_rids if r not in in_batch and r not in unread and r not in rebuild]

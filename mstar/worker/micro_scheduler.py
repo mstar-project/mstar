@@ -837,10 +837,9 @@ class MicroScheduler:
         if not len(delta):
             return True
 
-        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self._kept_count)
-
-    def _kept_count(self, node_name: str, rid: int) -> int:
-        return self.rebuilds.kept_count(rid, node_name)
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(
+            delta, self.rebuilds.kept_count, self.rebuilds.rebuilding,
+        )
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
         new_delta = None
@@ -2237,7 +2236,12 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            self._start_rebuild(node_name, rid, fwd_info.graph_walk)
+            # A follower starts a rebuild only at its first row in rank 0's step, in `follow_rebuilds`. The request
+            # stays dropped here from the rebuild's last chunk until this rank replays the rebuild landing on rank 0,
+            # and starting a rebuild then would run it a second time on this rank alone.
+            leads = self.parallel_leader_nodes
+            if leads is None or node_name in leads:
+                self._start_rebuild(node_name, rid, fwd_info.graph_walk)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
