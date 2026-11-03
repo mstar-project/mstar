@@ -241,9 +241,8 @@ class Resource(ABC):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
-        """Must be idempotent: the conductor sends one NewRequest per partition,
-        so a worker serving several partitions of a request ingests it once
-        for each, possibly after a node has already run a step for it."""
+        """Open the request's state. The worker calls this once per request, on
+        its first NewRequest, though one comes per partition it serves."""
         return
 
     def ingest_capture_row(self, rid: str):
