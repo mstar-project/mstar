@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -736,7 +738,6 @@
 <ul class="simple">
 <li><p><strong>Per-peer order.</strong> Messages from one peer are handled in arrival order, and a parked message replays before later ones for the same request.</p></li>
 <li><p><strong>Lockstep</strong> (invariant 11). A follower handles control messages in rank 0’s order; anything the inbox decides must be derived from replicated state or replayed, never from per-rank timing.</p></li>
-<li><p><strong>Both runtimes</strong> (invariant 5). The Python runtime gets the same begin / resume API over today’s handlers, and parity tests drive both with the same message streams, as <code class="docutils literal notranslate"><span class="pre">test_stream_completion_order.py</span></code> does for EDGE_ITEMS.</p></li>
 <li><p><strong>Handles stay local</strong> (invariant 14). Translation happens inside the inbox; nothing it returns carries another worker’s handle.</p></li>
 </ul>
 </section>

@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1064,11 +1066,10 @@ sends with this and retries later (see <code class="docutils literal notranslate
 <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension; see <code class="docutils literal notranslate"><span class="pre">communication/rust_communicator.py</span></code>) when
 the extension imports successfully, pyzmq otherwise.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">1</span></code> — the Rust communicator; raises if the extension is missing.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">0</span></code> — always the pyzmq <code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">0</span></code> — always the pyzmq <code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code>. A worker refuses this: the
+graph runtime holds a share of the Rust transport.</p></li>
 </ul>
-<p>The two are wire-compatible (same endpoints, same codec), so the
-flag can be set per-process — one entity at a time — while the rest of
-the mesh stays on pyzmq.</p>
+<p>The two are wire-compatible (same endpoints, same codec).</p>
 <p><code class="docutils literal notranslate"><span class="pre">nonblocking_send</span></code> is for a communicator <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code> wraps,
 which needs <code class="docutils literal notranslate"><span class="pre">try_send_bytes</span></code>: an extension built before
 <code class="docutils literal notranslate"><span class="pre">ZmqCommunicator.try_send</span></code> falls back to pyzmq under <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> and

@@ -13,7 +13,6 @@ mstar.communication.edge\_items
 
    .. autosummary::
    
-      edge_items_eligible
       frame_dtypes
       row_infos
       row_input_signals

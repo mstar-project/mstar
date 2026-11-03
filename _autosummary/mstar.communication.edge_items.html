@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -701,7 +703,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.StreamRow.start"><code class="docutils literal notranslate"><span class="pre">StreamRow.start</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.edge_items_eligible"><code class="docutils literal notranslate"><span class="pre">edge_items_eligible()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.frame_dtypes"><code class="docutils literal notranslate"><span class="pre">frame_dtypes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_infos"><code class="docutils literal notranslate"><span class="pre">row_infos()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_input_signals"><code class="docutils literal notranslate"><span class="pre">row_input_signals()</span></code></a></li>
@@ -720,28 +721,26 @@
   <section id="module-mstar.communication.edge_items">
 <span id="mstar-communication-edge-items"></span><h1>mstar.communication.edge_items<a class="headerlink" href="#module-mstar.communication.edge_items" title="Link to this heading">#</a></h1>
 <p>EDGE_ITEMS: a step’s streamed tensors to one peer worker, as columns.</p>
-<p>The sender side (<code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder</span></code>) mirrors the Rust runtime’s
-<code class="docutils literal notranslate"><span class="pre">frames::EdgeItems</span></code>: both runtimes send a step’s plain streamed edges this
-way, so a receiver decodes, reads and routes them once per step instead of
-once per (request, worker) INPUT_SIGNALS. The reader side turns a frame back
+<p>The graph runtime sends a step’s plain streamed edges this way
+(<code class="docutils literal notranslate"><span class="pre">frames::EdgeItems</span></code> in Rust), so a receiver decodes, reads and routes them
+once per step instead of once per (request, worker) INPUT_SIGNALS.
+<code class="docutils literal notranslate"><span class="pre">EdgeItemsBuilder</span></code> is a Python encoder of the same frame, which tests build
+frames with and check Rust’s against. The reader side turns a frame back
 into rows, and a row back into what INPUT_SIGNALS carried, for the paths that
 still want that (a request not known yet, a transport without a batched read).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.edge_items_eligible" title="mstar.communication.edge_items.edge_items_eligible"><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_items_eligible</span></code></a>(edge)</p></td>
-<td><p>Whether a streamed edge can ride EDGE_ITEMS: unsharded, one producer, with items.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.frame_dtypes" title="mstar.communication.edge_items.frame_dtypes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">frame_dtypes</span></code></a>(frame)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.frame_dtypes" title="mstar.communication.edge_items.frame_dtypes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">frame_dtypes</span></code></a>(frame)</p></td>
 <td><p>The frame's dtypes, by <code class="docutils literal notranslate"><span class="pre">dtype_idx</span></code>: once per frame, for <code class="docutils literal notranslate"><span class="pre">row_infos</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_infos" title="mstar.communication.edge_items.row_infos"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_infos</span></code></a>(frame, row[, dtypes])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_infos" title="mstar.communication.edge_items.row_infos"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_infos</span></code></a>(frame, row[, dtypes])</p></td>
 <td><p>The row's tensor descriptors, as INPUT_SIGNALS carried them (<code class="docutils literal notranslate"><span class="pre">dtypes</span></code> from <code class="docutils literal notranslate"><span class="pre">frame_dtypes</span></code>, or computed here).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_input_signals" title="mstar.communication.edge_items.row_input_signals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_input_signals</span></code></a>(frame, row)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.row_input_signals" title="mstar.communication.edge_items.row_input_signals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_input_signals</span></code></a>(frame, row)</p></td>
 <td><p>The row as the INPUT_SIGNALS that carried it before EDGE_ITEMS.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.edge_items.rows" title="mstar.communication.edge_items.rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rows</span></code></a>(frame)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.edge_items.rows" title="mstar.communication.edge_items.rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rows</span></code></a>(frame)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -861,21 +860,6 @@ column), and their dims and strides <code class="docutils literal notranslate"><
 <dd><p>Alias for field number 4</p>
 </dd></dl>
 
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.communication.edge_items.edge_items_eligible">
-<span class="sig-prename descclassname"><span class="pre">mstar.communication.edge_items.</span></span><span class="sig-name descname"><span class="pre">edge_items_eligible</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">edge</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/edge_items.html#edge_items_eligible"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.edge_items.edge_items_eligible" title="Link to this definition">#</a></dt>
-<dd><p>Whether a streamed edge can ride EDGE_ITEMS: unsharded, one
-producer, with items.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>edge</strong> (<a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
-</dd>
-</dl>
 </dd></dl>
 
 <dl class="py function">
@@ -1005,7 +989,6 @@ producer, with items.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.StreamRow.start"><code class="docutils literal notranslate"><span class="pre">StreamRow.start</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.edge_items_eligible"><code class="docutils literal notranslate"><span class="pre">edge_items_eligible()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.frame_dtypes"><code class="docutils literal notranslate"><span class="pre">frame_dtypes()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_infos"><code class="docutils literal notranslate"><span class="pre">row_infos()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.edge_items.row_input_signals"><code class="docutils literal notranslate"><span class="pre">row_input_signals()</span></code></a></li>

@@ -811,8 +811,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -979,10 +981,11 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.communication.edge_items</h1><div class="highlight"><pre>
 <span></span><span class="sd">"""EDGE_ITEMS: a step's streamed tensors to one peer worker, as columns.</span>
 
-<span class="sd">The sender side (``EdgeItemsBuilder``) mirrors the Rust runtime's</span>
-<span class="sd">``frames::EdgeItems``: both runtimes send a step's plain streamed edges this</span>
-<span class="sd">way, so a receiver decodes, reads and routes them once per step instead of</span>
-<span class="sd">once per (request, worker) INPUT_SIGNALS. The reader side turns a frame back</span>
+<span class="sd">The graph runtime sends a step's plain streamed edges this way</span>
+<span class="sd">(``frames::EdgeItems`` in Rust), so a receiver decodes, reads and routes them</span>
+<span class="sd">once per step instead of once per (request, worker) INPUT_SIGNALS.</span>
+<span class="sd">``EdgeItemsBuilder`` is a Python encoder of the same frame, which tests build</span>
+<span class="sd">frames with and check Rust's against. The reader side turns a frame back</span>
 <span class="sd">into rows, and a row back into what INPUT_SIGNALS carried, for the paths that</span>
 <span class="sd">still want that (a request not known yet, a transport without a batched read).</span>
 <span class="sd">"""</span>
@@ -994,15 +997,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.wire</span><span class="w"> </span><span class="kn">import</span> <span class="n">_dtype_from_name</span><span class="p">,</span> <span class="n">_dtype_name</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.ipc_format</span><span class="w"> </span><span class="kn">import</span> <span class="n">EdgeItems</span><span class="p">,</span> <span class="n">InputSignals</span>
-
-
-<div class="viewcode-block" id="edge_items_eligible">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.edge_items.html#mstar.communication.edge_items.edge_items_eligible">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">edge_items_eligible</span><span class="p">(</span><span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Whether a streamed edge can ride EDGE_ITEMS: unsharded, one</span>
-<span class="sd">    producer, with items."""</span>
-    <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span> <span class="ow">and</span> <span class="n">edge</span><span class="o">.</span><span class="n">_shard_dim</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">edge</span><span class="o">.</span><span class="n">_total_fanin</span> <span class="o">==</span> <span class="mi">1</span></div>
-
 
 
 <div class="viewcode-block" id="EdgeItemsBuilder">

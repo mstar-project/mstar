@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -701,7 +703,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-extension">Rust extension</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
@@ -768,7 +770,8 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 </pre></div>
 </div>
 <p>This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
-console scripts, <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>.</p>
+console scripts, <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>. To serve from a checkout, also build the
+extension (see <a class="reference internal" href="#rust-extension">Rust extension</a>).</p>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
 <p><strong>For CUDA installs, always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors
@@ -1162,13 +1165,16 @@ mstar-serve<span class="w"> </span>--help
 </pre></div>
 </div>
 </section>
-<section id="optional-rust-support">
-<h2>Optional: Rust support<a class="headerlink" href="#optional-rust-support" title="Link to this heading">#</a></h2>
-<p>Parts of the runtime can run on Rust components (vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code>),
-each optional and selectable per process — without the extension everything
-runs on the pure-Python paths as before. Migrated so far (see
-<a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> for the flags):</p>
+<section id="rust-extension">
+<h2>Rust extension<a class="headerlink" href="#rust-extension" title="Link to this heading">#</a></h2>
+<p>Serving needs the <code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension (vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code>): the graph
+runtime is Rust, and the conductor refuses to start without it. Importing <code class="docutils literal notranslate"><span class="pre">mstar</span></code>
+does not need it. The extension carries (see <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a> for
+the flags):</p>
 <ul class="simple">
+<li><p><strong>Graph runtime</strong>: graph state, scheduling, routing and speculation, and the
+frames a worker sends. It holds a share of the Rust transport and of the Rust
+tensor bookkeeper, and needs the msgpack codec.</p></li>
 <li><p><strong>ZeroMQ control mesh</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>: same endpoints, same wire
 format as pyzmq.</p></li>
 <li><p><strong>SHM tensor arena</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>: replaces the per-tensor file
@@ -1180,28 +1186,25 @@ pickle, which is what lets one end of an edge be Rust. On by default,
 extension or not. The legacy <code class="docutils literal notranslate"><span class="pre">pickle</span></code> codec is no longer supported.
 Loosely typed metadata uses data-only extensions; upgrade all deployment
 processes together, since legacy pickle frames are rejected.</p></li>
-<li><p><strong>Graph runtime</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code>: graph state, scheduling,
-routing and speculation, and the frames a worker sends. Unlike the others
-this is not free-standing — it holds a share of the Rust transport and of
-the Rust tensor bookkeeper, so it runs only where <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>
-resolved to Rust and the msgpack codec is in use. <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> takes it
-wherever that holds, so on a machine with the extension built, installing
-it is what moves a worker onto the Rust runtime.</p></li>
 </ul>
-<p>The Linux wheels of <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> on PyPI (x86_64 and aarch64, CPython 3.12 to
-3.14) carry the extension, so <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">mstar-ai</span></code> there gets it; other
-platforms get the pure-Python wheel. The extension statically links libzmq
+<p>There are two ways to get it. The Linux wheels of <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> on PyPI (x86_64
+and aarch64, CPython 3.12 to 3.14) carry the extension, so <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span>
+<span class="pre">mstar-ai</span></code> there is all it takes; other platforms get a pure-Python wheel with
+no extension, which cannot serve. The extension statically links libzmq
 4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
 the upstream <a class="reference external" href="https://github.com/zeromq/libzmq/releases/tag/v4.3.4">v4.3.4 release</a>.
-Elsewhere, or to build from a checkout, build the extension into your
-environment with <a class="reference external" href="https://www.maturin.rs">maturin</a> (needs <a class="reference external" href="https://rustup.rs">rustup</a>, which installs the compiler version pinned in
-<code class="docutils literal notranslate"><span class="pre">rust-toolchain.toml</span></code>):</p>
+Elsewhere, or from a checkout (<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">.</span></code> does not compile it), build
+the extension into your environment with <a class="reference external" href="https://www.maturin.rs">maturin</a>
+(needs <a class="reference external" href="https://rustup.rs">rustup</a>, which installs the compiler version pinned
+in <code class="docutils literal notranslate"><span class="pre">rust-toolchain.toml</span></code>):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>maturin
 maturin<span class="w"> </span>develop<span class="w"> </span>--release<span class="w"> </span>-m<span class="w"> </span>rust/Cargo.toml
 </pre></div>
 </div>
-<p>Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s default)
-costs real latency on the hot receive path. If <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> came from a Linux
+<p>The CPU test suites build a graph runtime too, so contributors need it as well,
+Mac contributors included: install <code class="docutils literal notranslate"><span class="pre">cargo</span></code> through rustup and run the same
+command. Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s
+default) costs real latency on the hot receive path. If <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> came from a Linux
 wheel that carries the extension, this build (a separate <code class="docutils literal notranslate"><span class="pre">mstar-rust</span></code>
 distribution) takes precedence over the wheel’s copy in the same environment;
 <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">uninstall</span> <span class="pre">mstar-rust</span></code> goes back to the wheel’s, and neither uninstall
@@ -1360,7 +1363,7 @@ Repeat the swap afterwards.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-extension">Rust extension</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>

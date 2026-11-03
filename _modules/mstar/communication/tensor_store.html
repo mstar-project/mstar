@@ -811,8 +811,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1002,7 +1004,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorPointerInfo</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphRuntimeType</span><span class="p">,</span> <span class="n">resolve_graph_runtime_type</span>
 
 <span class="n">NameToTensorList</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span>
 
@@ -1685,23 +1686,26 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_tensor_bookkeeping</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">TensorBookkeeping</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Gated on ``MSTAR_RUST_GRAPH``, which is what actually needs it: the</span>
-<span class="sd">    Rust graph runtime holds a SHARE of this object, so the two have to be the</span>
-<span class="sd">    same implementation.</span>
+<span class="w">    </span><span class="sd">"""The Rust bookkeeper wherever the extension imports: the graph runtime</span>
+<span class="sd">    holds a SHARE of this object, so the two have to be the same</span>
+<span class="sd">    implementation. The Python one is for the api server's data worker, which</span>
+<span class="sd">    may run without the extension.</span>
 
-<span class="sd">    Not worth taking on its own. A descriptor is copied into Rust on the way</span>
-<span class="sd">    in and rebuilt on the way out, which the Python runtime pays for and gets</span>
-<span class="sd">    nothing back -- the saving is in the crossings the Rust runtime avoids.</span>
-
-<span class="sd">    Deliberately NOT gated on being in a worker, so the api server's data</span>
-<span class="sd">    worker takes it too and pays that copy with no Rust runtime behind it.</span>
-<span class="sd">    Small next to its per-request work, and the api server is a candidate for</span>
-<span class="sd">    Rust itself; ``TensorStore(bookkeeping=...)`` is the override if that</span>
-<span class="sd">    stops being true.</span>
+<span class="sd">    Deliberately NOT gated on being in a worker, so the data worker takes the</span>
+<span class="sd">    Rust one too where it can, and pays the copy of each descriptor into Rust</span>
+<span class="sd">    with no graph runtime behind it. Small next to its per-request work, and</span>
+<span class="sd">    the api server is a candidate for Rust itself;</span>
+<span class="sd">    ``TensorStore(bookkeeping=...)`` is the override if that stops being true.</span>
 <span class="sd">    """</span>
-    <span class="k">if</span> <span class="n">resolve_graph_runtime_type</span><span class="p">(</span><span class="n">log</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">==</span> <span class="n">GraphRuntimeType</span><span class="o">.</span><span class="n">RUST</span><span class="p">:</span>
+    <span class="k">try</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">RustTensorBookkeeping</span><span class="p">()</span>
-    <span class="k">return</span> <span class="n">PythonTensorBookkeeping</span><span class="p">()</span>
+    <span class="k">except</span> <span class="ne">ModuleNotFoundError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="c1"># Only a missing extension falls back. One that imports but lacks</span>
+        <span class="c1"># TensorBookkeeping is a stale build, which should fail here rather</span>
+        <span class="c1"># than as the worker's "needs the Rust TensorBookkeeping" guard.</span>
+        <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">name</span> <span class="o">!=</span> <span class="s2">"mstar_rust"</span><span class="p">:</span>
+            <span class="k">raise</span>
+        <span class="k">return</span> <span class="n">PythonTensorBookkeeping</span><span class="p">()</span>
 
 
 <div class="viewcode-block" id="TensorStore">

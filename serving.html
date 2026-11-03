@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1724,9 +1726,8 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 <code class="docutils literal notranslate"><span class="pre">api_server</span></code> stands for the request’s inputs (as <code class="docutils literal notranslate"><span class="pre">src</span></code>) and its results (as <code class="docutils literal notranslate"><span class="pre">dst</span></code>),
 which the API server’s data worker sends and reads. <code class="docutils literal notranslate"><span class="pre">transport</span></code> is the protocol:
-<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. The
-Python and Rust runtimes and communicators (<code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code>, <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>)
-report the same series. A tensor already on the reader (one it made, or one it read once
+<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers

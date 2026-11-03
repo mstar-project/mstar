@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1052,7 +1054,7 @@
 <p>The data worker already reads the prompt’s ids on the host to key the prefix cache, so it sends them with the request’s first frame. They are the ids after templating. The worker keeps them per node and per handle, and lists them in <code class="docutils literal notranslate"><span class="pre">rid_table.py</span></code>. It keeps them only where one prefill row can rebuild the node’s KV. Elsewhere the request is guaranteed (§1).</p>
 <p>Why this shape:</p>
 <ul class="simple">
-<li><p><strong>The graph runtime never sees the row.</strong> Switching the request’s runtime walk for one step would touch both runtimes, the output edges, <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code> and the loop-back.</p></li>
+<li><p><strong>The graph runtime never sees the row.</strong> Switching the request’s runtime walk for one step would touch the runtime, the output edges, <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code> and the loop-back.</p></li>
 <li><p><strong>The prefill walk.</strong> Each model’s decode walk breaks a multi-token row in its own way. Bagel’s declares a span of 1, the Qwen3-Omni Thinker’s embeds every id at one position, and Qwen3.5’s with device loop-back reads one token off the sampler.</p></li>
 <li><p><strong>The prompt’s ids from the data worker.</strong> A drop can come at any token, after the prompt tensor is freed. Keeping the ids any other way means a device-to-host copy of every prefill’s input.</p></li>
 <li><p><strong>Not a remove and re-ingest.</strong> The sampler’s RNG offset and repetition mask would be lost.</p></li>
