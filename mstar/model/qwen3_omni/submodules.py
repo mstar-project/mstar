@@ -79,6 +79,7 @@ from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -771,10 +772,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             "sin_3d": sin_3d,
             "mrope_section": self.MROPE_SECTION,
             "seq_lens": seq_lens,
-            "masks_for_talker": {
-                rid: inp.tensor_inputs.get("masks_for_talker") \
-                    for (rid, inp) in zip(engine_inputs.request_ids, inputs, strict=True)
-            },
             **extra_inputs
         }
 
@@ -844,7 +841,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
         mrope_section: list[int] | None = None,
-        masks_for_talker: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """Run Thinker transformer, produce logits (decode) and thinker_states.
@@ -853,7 +849,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         (checked via ``request_info.step_metadata["audio_output"]``). This
         saves cross-partition bandwidth for text-only requests. Defaults to
         ``True`` for backwards compatibility with callers that do not set
-        the flag (e.g. unit tests).
+        the flag (e.g. unit tests). ``unpack_packed_outputs`` adds the talker
+        mask.
 
         ``deepstack`` (used by prefill_vision) is reassembled from per-layer
         ``deepstack_<i>`` kwargs — see ``_collect_deepstack_kwargs``.
@@ -899,8 +896,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     [layer_0_embed, layer_0_embed], dim=-1,
                 )
             result["thinker_states"] = [thinker_states]
-            result["thinker_mask"] = [next(iter(masks_for_talker.values()))] \
-                if masks_for_talker else []
         return result
 
     # ---- batching ----
@@ -1031,16 +1026,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
         mrope_section: list[int] | None = None,
-        masks_for_talker: dict[str, torch.Tensor] | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Batched Thinker forward shared between ``thinker_decode`` and the prefill walks.
 
+        Returns batch tensors, row i for request i, and never reads a request
+        id: dynamo guards a compiled frame on any id it reads, so one bucket's
+        two slots and every new batch would each recompile the frame, and past
+        the recompile limit the frame runs eager. The engine maps rows to ids.
+
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
-        Always packs ``thinker_states`` + ``thinker_mask`` in every per-rid
-        output dict so the captured CUDA graph has a static output shape
-        regardless of request metadata. Per-rid filtering happens in
-        ``unpack_packed_output``.
+        Always emits ``thinker_states`` so the captured CUDA graph has a static
+        output shape regardless of request metadata. Per-rid filtering happens
+        in ``filter_batched_output``, and ``unpack_packed_outputs`` adds the
+        talker masks.
         """
 
         is_prefill = graph_walk != "thinker_decode"
@@ -1061,7 +1060,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
-        request_ids = engine_inputs.request_ids
         sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
 
         if is_prefill:
@@ -1080,15 +1078,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     [layer_0_embed, layer_0_embed], dim=-1,
                 )
 
-            return {
-                "__batched_thinker_states__": thinker_states,
-                **{
-                    rid: {
-                        "new_token": [new_tokens[i:i + 1]],
-                        "first_token_embed": [first_embeds[i:i + 1]],
-                    } for i, rid in enumerate(request_ids)
-                }
-            }
+            return BatchedModelOutput(
+                row_outputs={"new_token": new_tokens, "first_token_embed": first_embeds},
+                packed_outputs={"__batched_thinker_states__": thinker_states},
+            )
 
         # thinker_decode (existing behavior)
         logits = self.model.lm_head(hidden)  # (batch, vocab)
@@ -1103,17 +1096,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 [layer_0_embed, layer_0_embed], dim=-1,
             )
 
-        outputs: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(request_ids):
-            req_out: NameToTensorList = {
-                "thinker_states": [thinker_states[i : i + 1]],
-                "new_token": [new_tokens[i:i+1]]
-            }
-            if masks_for_talker is not None and rid in masks_for_talker:
-                req_out["thinker_mask"] = [masks_for_talker[rid]]
-            outputs[rid] = req_out
-
-        return outputs
+        return BatchedModelOutput(
+            row_outputs={"thinker_states": thinker_states, "new_token": new_tokens},
+        )
 
     def unpack_packed_outputs(
         self,
@@ -1123,19 +1108,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
         per_request_info: dict[str, "CurrentForwardPassInfo"],
     ) -> dict[str, dict[str, list[torch.Tensor]]]:
-        """Slice the packed ``__batched_thinker_states__`` per real seq_len.
+        """Attach the per-request talker masks, and slice a prefill's packed
+        ``__batched_thinker_states__`` per real seq_len.
 
-        Captured forward emits the full ``(total_tokens, 2*hidden)`` packed
-        tensor; here we cut it at the real per-request token boundaries and
-        reattach the per-request talker masks, which live on the original
-        ARNodeInputs (the captured graph never saw them — masks vary in
-        shape with text content). Drops per-rid emission for requests with
-        ``audio_output=False``, mirroring ``filter_batched_output``'s gating
-        for the decode path.
+        The masks live on the original ARNodeInputs: no forward sees them, as
+        they vary in shape with text content. A captured prefill emits the
+        full ``(total_tokens, 2*hidden)`` packed tensor, cut here at the real
+        per-request token boundaries; decode's states are row outputs. Drops
+        per-rid emission for requests with ``audio_output=False``, mirroring
+        ``filter_batched_output``'s gating of the row outputs.
         """
         packed_states = static_output.get("__batched_thinker_states__")
-        if packed_states is None:
-            return {}
 
         out: dict[str, dict[str, list[torch.Tensor]]] = {}
         cum = 0
@@ -1148,10 +1131,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             if info is not None and not info.step_metadata.get("audio_output", True):
                 continue
 
-            ts_slice = packed_states[slice_start:slice_end].clone()
-            rid_out: dict[str, list[torch.Tensor]] = {
-                "thinker_states": [ts_slice],
-            }
+            rid_out: dict[str, list[torch.Tensor]] = {}
+            if packed_states is not None:
+                rid_out["thinker_states"] = [packed_states[slice_start:slice_end].clone()]
             mask = inputs[i].tensor_inputs.get("masks_for_talker")
             if mask is not None:
                 rid_out["thinker_mask"] = [mask]
