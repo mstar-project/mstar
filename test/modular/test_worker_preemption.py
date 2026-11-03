@@ -320,7 +320,7 @@ def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
     layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
     configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64})}
 
-    w._set_rebuildable(configs)
+    w._set_rebuildable(1, configs)
 
     assert configs["kv"].rebuildable, "a node that writes nothing for the request made it guaranteed"
 
@@ -343,7 +343,7 @@ def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(l
         layouts["main"] = StreamLayout(spans=(span,), growth=(*growth, ("other_loop", 1)))
     configs = {"kv": KVReqConfig(kv_layout=layouts, loop_caps={"decode": 64, "cfg_loop": 4, "other_loop": 4})}
 
-    w._set_rebuildable(configs)
+    w._set_rebuildable(1, configs)
 
     assert not configs["kv"].rebuildable, "a request its rebuild couldn't bring back could be dropped"
 

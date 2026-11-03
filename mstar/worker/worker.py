@@ -954,7 +954,7 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
         laps.lap("worker_state")
-        self._set_rebuildable(body.request_info.resource_configs)
+        self._set_rebuildable(request_id, body.request_info.resource_configs)
         try:
             self.engine_manager.add_request(
                 request_id, body.request_info.resource_configs, body.request_info,
@@ -1142,11 +1142,11 @@ class Worker:
             self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
             kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
 
-    def _set_rebuildable(self, configs: dict[str, ResourceReqConfig]) -> None:
-        layouts = {
-            key: (config.kv_layout or {}).values() for key, config in configs.items() if isinstance(config, KVReqConfig)
-        }
-        for key, rebuildable in self._rebuilds.rebuildable(self._kv_writes, layouts).items():
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
+        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        unpausable = any(config.unpausable for config in kv_configs.values())
+        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:
                 configs[key].rebuildable = rebuildable
 
