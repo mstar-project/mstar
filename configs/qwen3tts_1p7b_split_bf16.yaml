@@ -8,6 +8,14 @@ model: "qwen3_tts_1p7b"
 max_seq_len: 32768
 model_kwargs:
   codec_dtype: bfloat16
+platform_overrides:
+  rocm:
+    # 64 rows in one step instead of two half-batches taking turns at c=64
+    model_kwargs:
+      codec_dtype: bfloat16
+      talker_max_batch: 64
+      # a padded row costs the conv stack what a real one does
+      codec_capture_batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32]
 resources:
   talker_attn:
     flashinfer_backend: fa2

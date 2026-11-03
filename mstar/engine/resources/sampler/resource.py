@@ -47,7 +47,12 @@ class SamplerResource(Resource):
         max_repetition_window: int = 0,
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
+        fused_draw: bool = False,
     ):
+        if fused_draw and (enable_repetion_penalty or enable_min_p or max_repetition_window or min_tokens_stop_ids
+                           or enable_top_p_first):
+            raise ValueError("fused_draw covers top-k and top-p only: a node with it can enable nothing else")
+        self._fused_draw = fused_draw
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
@@ -164,7 +169,14 @@ class SamplerResource(Resource):
             max_repetition_window=spec.max_repetition_window,
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
+            fused_draw=spec.fused_draw,
         )
+
+    @staticmethod
+    def _fused_draw_available() -> bool:
+        from mstar.engine.resources.sampler.filtered import available
+
+        return available()
 
     def build_accelerator_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
@@ -196,6 +208,8 @@ class SamplerResource(Resource):
             ) if self._device.type == "cuda" else {}),
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
             loopback_state=self._loopback_state,
+            # the fused draw keeps no token: a node that reads them samples in full
+            fused_draw=self._fused_draw and not self._keep_last_token and self._fused_draw_available(),
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):

@@ -94,6 +94,10 @@ class SamplerSpec(NodeResourceSpec):
     min_tokens_stop_ids: tuple[int, ...] = ()
     # Allows ``top_p_first`` / ``top_p_min_keep``.
     enable_top_p_first: bool = False
+    # A captured step's draw in one kernel (``sampler.filtered``), where the
+    # platform has one; the same distribution, not the same draw. Top-k and
+    # top-p only, so it excludes the capabilities above.
+    fused_draw: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":

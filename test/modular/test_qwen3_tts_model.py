@@ -14,6 +14,7 @@ import yaml
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
+from mstar.engine.resources.attn import prologue
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
@@ -32,6 +33,7 @@ from mstar.model.qwen3_tts.config import (
     REF_CLIP_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
+    TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
@@ -41,7 +43,15 @@ from mstar.model.qwen3_tts.config import (
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, clip_digest
 from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine, StopCheck
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    BatchedModelOutput,
+    HostRows,
+    InputMetadata,
+    ModelInputsFromEngine,
+    StopCheck,
+)
+from mstar.platforms.depth_decoder_ops import _norm_rope
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -839,7 +849,8 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"talker_input_embeds": [torch.zeros(1, 16)]},
     )
-    assert torch.equal(prepared.input_embeds[0], state["tts_pad_embed"])
+    assert torch.equal(prepared.input_embeds[0], torch.zeros(16))
+    assert prepared.kwargs["text_condition"] is state["tts_pad_embed"]
 
 
 def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
@@ -940,12 +951,12 @@ def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
     # (all a window can use as context) ahead of the first generated frame.
     reference = torch.arange(12).view(3, 4)
     submodule.request_state("clone").add("reference_frames", reference)
-    frame = torch.tensor([9, 9, 9, 9])
+    frame = torch.tensor([[9, 9, 9, 9]])
     items = submodule._codec_stream_items("talker_prefill_clone", "clone", frame)
-    assert [item.tolist() for item in items] == [[4, 5, 6, 7], [8, 9, 10, 11], [9, 9, 9, 9]]
+    assert [item.tolist() for item in items] == [[[4, 5, 6, 7]], [[8, 9, 10, 11]], [[9, 9, 9, 9]]]
     submodule.request_state("short").add("reference_frames", reference[:1])
     assert [item.tolist() for item in submodule._codec_stream_items("talker_prefill_clone", "short", frame)] == [
-        [0, 1, 2, 3], [9, 9, 9, 9],
+        [[0, 1, 2, 3]], [[9, 9, 9, 9]],
     ]
     # Only the clone prefill leads with the reference; decode never does.
     assert submodule._codec_stream_items("talker_decode", "clone", frame) == [frame]
@@ -1221,7 +1232,9 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     packed = submodule.preprocess("talker_decode", engine_inputs, rows)
     _assert_same_tensor(packed["suppress_eos"], _old_flags(flags))
     _assert_same_tensor(packed["last_token_indices"], torch.arange(len(rows)))
-    _assert_same_tensor(packed["input_embeds"], torch.cat([row.input_embeds for row in rows]))
+    _assert_same_tensor(
+        packed["input_embeds"], torch.cat([row.input_embeds + row.kwargs["text_condition"] for row in rows]),
+    )
 
     def prefill_row(rid, walk, text_ids, layout, speaker_id, language_id, **inputs) -> ARNodeInputs:
         metadata = {PROMPT_LAYOUT_KEY: layout, SPEAKER_ID_KEY: speaker_id, LANGUAGE_ID_KEY: language_id}
@@ -2245,6 +2258,239 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     assert encoder.calls == 3 and len(submodule._conditioning) == 2
     encode("a4", clip_a, 7)   # evicted, so encoded again
     assert encoder.calls == 4
+
+
+def _talker_with_frame(config, rows):
+    """A Talker whose frame step returns recognizable rows, with no model run."""
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    frame = {
+        "talker_input_embeds": torch.arange(rows * 2, dtype=torch.float32).view(rows, 2),
+        "codec_tokens": torch.arange(rows * 4).view(rows, 4),
+        "new_token": torch.arange(rows),
+    }
+    submodule._run_frame = lambda *args: frame
+    return submodule, frame
+
+
+def test_talker_steps_hand_back_rows_and_one_stop_buffer():
+    config = _tiny_model_config()
+    submodule, frame = _talker_with_frame(config, 3)
+    engine_inputs = SimpleNamespace(request_ids=["a", "b", "c"])
+    for walk in ("talker_decode", "talker_prefill"):
+        out = submodule.forward_batched(
+            walk, engine_inputs, input_embeds=None, last_token_indices=None, suppress_eos=None,
+        )
+        assert isinstance(out, BatchedModelOutput) and not out.per_rid_outputs
+        assert set(out.row_outputs) == {"talker_input_embeds", "codec_tokens", "new_token"}
+        assert out.check_stop_buffers["new_token"] is frame["new_token"]
+
+
+def test_talker_clone_prefill_keeps_its_per_request_stream():
+    config = _tiny_model_config()
+    submodule, _ = _talker_with_frame(config, 2)
+    submodule.request_state("a").add("reference_frames", torch.arange(8).view(2, 4))
+    out = submodule.forward_batched(
+        "talker_prefill_clone", SimpleNamespace(request_ids=["a", "b"]),
+        input_embeds=None, last_token_indices=None, suppress_eos=None,
+    )
+    # both reference frames, then the frame of a's row; one frame for the request without any
+    assert [item.tolist() for item in out["a"]["codec_tokens"]] == [[[0, 1, 2, 3]], [[4, 5, 6, 7]], [[0, 1, 2, 3]]]
+    assert [item.tolist() for item in out["b"]["codec_tokens"]] == [[[4, 5, 6, 7]]]
+
+
+def test_talker_batched_stop_check_matches_the_per_request_one():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    eos = config.talker.codec_eos_token_id
+    infos = {
+        "eos": SimpleNamespace(max_tokens=50, resource_configs={}),
+        "ignored": SimpleNamespace(max_tokens=50, resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=True)}),
+        "limit": SimpleNamespace(max_tokens=2, resource_configs={}),
+        "running": SimpleNamespace(max_tokens=50, resource_configs={}),
+    }
+    tokens = {"eos": eos, "ignored": eos, "limit": 3, "running": 4}
+    for rid in infos:
+        submodule.request_state(rid).add("generated_frames", 2)
+    rids = list(infos)
+    rows = HostRows(tuple(rids), {"new_token": torch.tensor([tokens[rid] for rid in rids])})
+    batched = submodule.check_stop_batched(rids, infos, rows)
+    for rid in rids:
+        single = submodule.check_stop(rid, infos[rid], {"layer0_codes": [torch.tensor(tokens[rid])]})
+        stops, withheld = (single.stops, single.withheld) if isinstance(single, StopCheck) else (single, ())
+        assert batched.stops.get(rid, set()) == stops
+        assert batched.withheld.get(rid, ()) == withheld
+    # no stop buffer: the engine falls back to the per-request check
+    assert submodule.check_stop_batched(rids, infos, HostRows(tuple(rids), {})) is None
+
+
+def test_codec_reads_a_window_of_collated_row_items():
+    config = _tiny_model_config()
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
+    groups = config.num_code_groups
+    fwd = SimpleNamespace(request_id="r", rid_handle="r")
+    chunk = StreamChunkInfo(0, 0, 3, False)
+    rows = torch.arange(3 * groups).view(3, 1, groups)  # three [1, groups] items, stacked
+    meta = InputMetadata(stream_chunks={"codec_tokens": chunk})
+    from_rows = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows]}, input_metadata=meta)
+    flat = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows.view(3, groups)]}, input_metadata=meta)
+    assert torch.equal(from_rows.tensor_inputs["codec_tokens"], flat.tensor_inputs["codec_tokens"])
+
+
+def test_talker_adds_text_conditions_once_per_batch():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    hidden = config.talker.hidden_size
+    embeds = torch.randn(3, hidden)
+    pad = torch.randn(hidden)
+
+    def row(i, condition):
+        kwargs = {"suppress_eos": False, **({"text_condition": condition} if condition is not None else {})}
+        return ARNodeInputs(input_embeds=embeds[i:i + 1], input_seq_len=1, kwargs=kwargs)
+
+    def packed(*conditions):
+        rows = [row(i, c) for i, c in enumerate(conditions)]
+        return submodule._add_text_conditions(torch.cat([r.input_embeds for r in rows]), rows)
+
+    # one PAD tensor for the batch, and a padding row beside it reads whatever is there
+    assert torch.equal(packed(pad, pad)[:2], embeds[:2] + pad)
+    assert torch.equal(packed(pad, pad, None)[:2], embeds[:2] + pad)
+    # a streamed prompt's rows differ; a padding row beside them adds nothing
+    streamed = torch.randn(hidden)
+    mixed = packed(pad, streamed, None)
+    assert torch.equal(mixed, torch.stack([embeds[0] + pad, embeds[1] + streamed, embeds[2]]))
+    # a capture's template rows carry none
+    assert packed(None, None) is not None and torch.equal(packed(None, None), embeds[:2])
+    # a row's own condition is not written back into the previous step's output
+    single = [row(0, pad)]
+    before = single[0].input_embeds.clone()
+    submodule._add_text_conditions(single[0].input_embeds, single)
+    assert torch.equal(single[0].input_embeds, before)
+
+
+def test_talker_prefill_projects_special_embeds_once():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    first = submodule._special_text_embeds(torch.float32)
+    assert all(a is b for a, b in zip(first, submodule._special_text_embeds(torch.float32), strict=True))
+    assert submodule._special_text_embeds(torch.float64)[0].dtype == torch.float64
+
+
+def test_codec_captures_the_sizes_a_deployment_asks_for():
+    config = _tiny_model_config()
+    assert CodecSubmodule(_FakeCodecDecoder(4), config).CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32]
+    sizes = [1, 2, 4, 8, 12, 16, 24, 32]
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config, capture_batch_sizes=list(reversed(sizes)))
+    configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
+    assert configs and all(c.capture_batch_sizes == sizes for c in configs)
+
+
+def _talker_language_model(comm_world_size=1):
+    config = _tiny_model_config()
+    model = Qwen3TTSTalkerModel(config).model
+    if comm_world_size != 1:
+        model.comm_group = SimpleNamespace(world_size=comm_world_size)
+    for layer in model.layers:
+        layer.self_attn.attend = SimpleNamespace(enable=lambda: True)
+    return config, model
+
+
+def test_the_talker_takes_the_packed_prologue_on_one_rank_with_the_kernel():
+    assert _talker_language_model()[1].packed_prologue
+    assert not _talker_language_model(comm_world_size=2)[1].packed_prologue
+    _, model = _talker_language_model()
+    model.layers[0].self_attn.attend = SimpleNamespace(enable=lambda: False)
+    assert not model.packed_prologue
+
+
+@pytest.mark.parametrize("walk, leased, packed, expect", [
+    ("talker_decode", True, True, True),
+    ("talker_prefill", True, True, False),  # flat write slots are staged for decode only
+    ("talker_decode", False, True, False),  # an eager step
+    ("talker_decode", True, False, False),  # a platform or rank layout without the kernel
+])
+def test_which_steps_take_the_packed_prologue(walk, leased, packed, expect):
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule.model.model._packed = packed
+    pos = torch.arange(8)
+    engine_inputs = SimpleNamespace(
+        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object() if leased else None)),
+        resources={TALKER_POS: SimpleNamespace(pos_ids=lambda label: pos)},
+    )
+    positions = submodule._packed_positions(walk, engine_inputs, torch.zeros(3, 16))
+    assert (positions is not None) == expect
+    if expect:
+        assert positions.tolist() == [0, 1, 2]
+
+
+def test_a_packed_prologue_does_what_a_layers_unfused_attention_does():
+    """Through the prologue's torch reference: norm, rotation from the tables, and the cache write."""
+    config = _tiny_model_config()
+    talker = config.talker
+    model = Qwen3TTSTalkerModel(config).model
+    attn = model.layers[0].self_attn
+    with torch.no_grad():
+        for norm in (attn.q_norm, attn.k_norm):
+            torch.nn.init.normal_(norm.weight, 1.0, 0.1)
+    cos, sin = model.rope_tables()
+    tokens, heads, kv_heads, dim = 3, attn.num_heads, attn.num_kv_heads, attn.head_dim
+    assert cos.shape == (talker.max_position_embeddings, dim // 2) and cos.dtype == torch.float32
+    qkv = torch.randn(tokens, (heads + 2 * kv_heads) * dim, generator=torch.Generator().manual_seed(0))
+    positions = torch.tensor([0, 5, 1000])
+    q_gamma, k_gamma = attn.prologue_gammas()
+    assert torch.allclose(q_gamma + 1.0, attn.q_norm.weight.float())
+    pages = torch.zeros(4, 2, 8, kv_heads, dim)
+    slots = torch.tensor([0, 9, 17])
+    eps = attn.q_norm.variance_epsilon
+    q, _, k, v = prologue._reference(
+        qkv, q_gamma, k_gamma, cos, sin, positions, pages[:, 0], pages[:, 1], slots, heads, kv_heads, dim, eps, False,
+    )
+    want_q, want_k, want_v = qkv.split([heads * dim, kv_heads * dim, kv_heads * dim], dim=-1)
+
+    def norm_rope(x, shape, weight):
+        rows = [
+            _norm_rope(row, weight, eps, int(p), float(attn.rope_theta))
+            for row, p in zip(x.reshape(shape).detach(), positions, strict=True)
+        ]
+        return torch.stack(rows)
+
+    want_q = norm_rope(want_q, (tokens, heads, dim), attn.q_norm.weight.detach())
+    want_k = norm_rope(want_k, (tokens, kv_heads, dim), attn.k_norm.weight.detach())
+    assert torch.allclose(q, want_q, rtol=2e-3, atol=2e-3)
+    assert torch.allclose(k, want_k, rtol=2e-3, atol=2e-3)
+    assert torch.equal(v, want_v.reshape(tokens, kv_heads, dim))
+    assert torch.equal(pages[1, 0, 1], k[1]) and torch.equal(pages[1, 1, 1], v[1]) and torch.equal(pages[2, 0, 1], k[2])
+
+
+def test_only_the_code_predictor_sampler_takes_the_fused_draw():
+    specs = {spec.resource_key: spec for spec in _make_model().get_node_resources()}
+    assert specs[CODE_PRED_SAMPLER].fused_draw
+    assert not specs[TALKER_SAMPLER].fused_draw
+
+
+def test_talker_cap_sets_its_capture_sizes():
+    config = _tiny_model_config()
+    talker, predictor = Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config)
+    default = TalkerSubmodule(talker, predictor, config)
+    assert default.max_batch_size("talker_decode") == 32
+    assert default.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32]
+
+    raised = TalkerSubmodule(talker, predictor, config, max_batch_size=64)
+    assert raised.max_batch_size("talker_decode") == 64
+    assert raised.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32, 64]
+    batch = SimpleNamespace(graph_walk="talker_decode")
+    assert raised.can_batch(batch, [object()] * 64) and not raised.can_batch(batch, [object()] * 65)
+    assert not default.can_batch(batch, [object()] * 33)
+
+
+def test_only_the_amd_split_config_raises_the_talker_cap():
+    from mstar.platforms.serving_config import apply_platform_overrides
+
+    config = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_1p7b_split_bf16.yaml").read_text(encoding="utf-8"))
+    assert apply_platform_overrides(config, "cuda")["model_kwargs"] == {"codec_dtype": "bfloat16"}
+    rocm = apply_platform_overrides(config, "rocm")["model_kwargs"]
+    assert rocm["codec_dtype"] == "bfloat16" and rocm["talker_max_batch"] == 64
+    assert 12 in rocm["codec_capture_batch_sizes"] and 24 in rocm["codec_capture_batch_sizes"]
 
 
 def test_qwen3_tts_codec_dtype_option():

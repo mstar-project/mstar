@@ -403,6 +403,13 @@ class Qwen3TTSModel(Model):
         # bit for bit. bfloat16 is not faster on B300: cuDNN's heuristics run
         # several of its convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
+        # Server-init knob: the most rows a Talker step runs, the largest decode
+        # capture (default ``TalkerSubmodule.MAX_BATCH_SIZE``). Raising it costs
+        # one more pair of graphs per capture.
+        self.talker_max_batch = kwargs.get("talker_max_batch")
+        # Server-init knob: the codec's capture batch sizes (default
+        # ``CodecSubmodule.CAPTURE_BATCH_SIZES``); see ``CodecSubmodule.__init__``.
+        self.codec_capture_batch_sizes = kwargs.get("codec_capture_batch_sizes")
         # Server-init knob: opt-in AudioSeal watermark on the codec's output
         # (``mstar.model.audio_watermark``). Checked here so a missing package
         # fails the server at startup, not at the first request.
@@ -479,6 +486,7 @@ class Qwen3TTSModel(Model):
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
                 enable_repetion_penalty=False,
+                fused_draw=True,
             ),
         ]
 
@@ -1223,7 +1231,7 @@ class Qwen3TTSModel(Model):
         # consolidate after the individual checkpoint heads are loaded.
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
-        return TalkerSubmodule(talker, code_predictor, self.config)
+        return TalkerSubmodule(talker, code_predictor, self.config, max_batch_size=self.talker_max_batch)
 
     def _create_codec_submodule(self, device: str) -> NodeSubmodule:
         """Build the official speech-tokenizer decoder from its sub-checkpoint."""
@@ -1262,7 +1270,9 @@ class Qwen3TTSModel(Model):
             decoder.to(dtype=self.codec_dtype)
         watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
         watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
-        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
+        return CodecSubmodule(
+            decoder, self.config, watermarker=watermarker, capture_batch_sizes=self.codec_capture_batch_sizes,
+        )
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
