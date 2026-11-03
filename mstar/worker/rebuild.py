@@ -459,30 +459,33 @@ class Rebuilds:
         self, node: str, rids: Collection[int], chunk_ranges: Mapping[int, ChunkRange],
         inputs: MutableMapping[int, NameToTensorList], infos: MutableMapping[int, CurrentForwardPassInfo],
     ) -> list[torch.Event]:
-        """Give each rebuild row of ``rids`` its walk, a row from kept ids its prefill's step metadata, and its kept
-        ids and host copies on the device when it runs its first chunk or runs whole, and return the events the step
-        waits on before it reads the copies. The ids
-        are split as its prefill row read them, with the ids sampled since appended to the last tensor. A later
-        chunk is cut from the input the engine prepared on the first, and every chunk of a prompt's rebuild from
-        the input the engine keeps for the prompt."""
+        """Give each rebuild row of ``rids`` its walk and its inputs, and return the events the step waits on before
+        it reads them.
+
+        A row reads what its source holds. A rebuild of a prompt mid-prefill runs every chunk from the input the
+        engine keeps for the prompt, under the prompt's own step metadata. Any other runs under its prefill's
+        recorded metadata and reads the log: its kept ids, split as its prefill row read them with the ids sampled
+        since appended to the last tensor, and its host copies, both on the device when it runs its first chunk or
+        runs whole. A later chunk is cut from the input the engine prepared on the first."""
         ids_input, ready = self._policies[node].ids_input, []
         for rid in rids:
             cursor = self._cursors[(node, rid)]
-            copies = cursor.copies
-            infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
-            if cursor.ids is not None:
-                infos[rid] = replace(infos[rid], step_metadata=cursor.step_metadata)
+            if cursor.ids is None:
+                infos[rid] = replace(infos[rid], graph_walk=cursor.walk)
+                continue
+            infos[rid] = replace(infos[rid], graph_walk=cursor.walk, step_metadata=cursor.step_metadata)
             chunk = chunk_ranges.get(rid)
-            if cursor.ids is not None and (chunk is None or chunk.is_first):
-                ids = to_device_nonblocking(_row_ids(cursor).to(cursor.dtype), self._pool.device)
-                head = cursor.lengths[:-1] if cursor.lengths else ()
-                inputs[rid] = {ids_input: list(ids.split([*head, len(ids) - sum(head)]))}
-                for name, views in (copies.inputs if copies is not None else {}).items():
-                    inputs[rid][name] = []
-                    for view in views:
-                        tensor, landed = self._pool.copy_in(view)
-                        inputs[rid][name].append(tensor)
-                        ready += [landed] if landed is not None else []
+            if chunk is not None and not chunk.is_first:
+                continue
+            ids = to_device_nonblocking(_row_ids(cursor).to(cursor.dtype), self._pool.device)
+            head = cursor.lengths[:-1] if cursor.lengths else ()
+            inputs[rid] = {ids_input: list(ids.split([*head, len(ids) - sum(head)]))}
+            for name, views in (cursor.copies.inputs if cursor.copies is not None else {}).items():
+                inputs[rid][name] = []
+                for view in views:
+                    tensor, landed = self._pool.copy_in(view)
+                    inputs[rid][name].append(tensor)
+                    ready += [landed] if landed is not None else []
         return ready
 
     def land_chunk(self, rid: int, node: str, chunk: ChunkRange | None) -> RebuildCursor | None:
