@@ -54,10 +54,12 @@ def test_a_submodule_declares_no_fused_decode_by_default():
     assert "no fused forward" in base.prepare_fused_decode({})
 
 
-def test_qwen35_declares_decode_at_one_and_two_rows_where_it_captures_them():
+def test_qwen35_declares_only_the_decode_buckets_a_deployment_asks_for_and_captures():
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     llm = LLMSubmodule.__new__(LLMSubmodule)
+    assert llm.get_fused_decode_configs(_CUDA) == [], "nothing by default"
+    llm.FUSED_DECODE_BATCH_SIZES = (1, 2)
     assert llm.get_fused_decode_configs(_CUDA) == [FusedDecodeConfig(walk="decode", batch_sizes=(1, 2))]
     llm.DECODE_CAPTURE_BATCH_SIZES = [2, 4, 8]
     assert llm.get_fused_decode_configs(_CUDA) == [FusedDecodeConfig(walk="decode", batch_sizes=(2,))]

@@ -171,12 +171,15 @@ class Qwen3_5DenseModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         prefill_token_buckets: list[int] | None = None,
+        fused_decode_batch_sizes: list[int] | None = None,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # the captured text-prefill ladder (`LLMSubmodule.PREFILL_TOKEN_BUCKETS`)
         self.prefill_token_buckets = prefill_token_buckets
+        # decode buckets on the fused kernels (`LLMSubmodule.FUSED_DECODE_BATCH_SIZES`)
+        self.fused_decode_batch_sizes = fused_decode_batch_sizes
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
@@ -984,6 +987,7 @@ class Qwen3_5DenseModel(Model):
         return LLMSubmodule(
             model, self.config, self.vision_config,
             prefill_token_buckets=self.prefill_token_buckets,
+            fused_decode_batch_sizes=self.fused_decode_batch_sizes,
         )
 
     @staticmethod

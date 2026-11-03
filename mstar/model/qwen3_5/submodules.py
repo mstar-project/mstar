@@ -153,9 +153,12 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     # Decode buckets that replay one persistent kernel per 4-layer block instead
-    # of the compiled graph (`fused_decode.py`): measured faster at 1-2 rows, and
-    # slower from 4, where the kernels' GEMVs still reduce one row at a time.
-    FUSED_DECODE_BATCH_SIZES = (1, 2)
+    # of the compiled graph (`fused_decode.py`), from a deployment's
+    # `model_kwargs.fused_decode_batch_sizes`; none by default. The kernels
+    # shorten the GPU step at 1-2 rows (0.8B on B300: 789 against 1156 us) and
+    # lose from 4, but served decode there is host-bound, so the shorter step
+    # bought no throughput.
+    FUSED_DECODE_BATCH_SIZES: tuple[int, ...] = ()
 
     def __init__(
         self,
@@ -163,8 +166,11 @@ class LLMSubmodule(ARNodeSubmodule):
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
         prefill_token_buckets: list[int] | None = None,
+        fused_decode_batch_sizes: list[int] | None = None,
     ):
         super().__init__(prefill_token_buckets)
+        if fused_decode_batch_sizes:
+            self.FUSED_DECODE_BATCH_SIZES = tuple(fused_decode_batch_sizes)
         if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
             logger.warning(
                 "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
