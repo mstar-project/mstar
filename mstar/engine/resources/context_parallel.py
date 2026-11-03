@@ -4,7 +4,9 @@ that would otherwise hold the same KV heads.
 Page ids stay logical and are the same on every rank, so allocation, prefix keys,
 offload and admission need nothing new. Within a page, logical slot ``s`` belongs to
 partner ``s % P`` and sits at its physical slot ``s // P``, so each rank stores
-``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement.
+``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement. A pool that keeps
+a sliding window places its first group of layers alone; the window's stay whole on every partner
+(``PagedKVConfig.placed_groups``).
 
 Attention over such a pool runs on each rank over its own slots and returns the partial with
 its log-sum-exp; the partners exchange partials and ``merge`` them, exactly.

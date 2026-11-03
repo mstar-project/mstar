@@ -451,19 +451,23 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
-On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``). With
-its KV pool stored by position (``kv_cache: {context_parallel: true}``) and the
-shard's default ``exchange``, every step runs copied, each rank attending its share of the
-stored context (more KV capacity, no faster prefill). With ``llm_shard:
-{exchange: all_gather}`` a prefill of at least ``llm_shard.min_tokens``
-tokens splits over the SP ranks: each runs the layers on its part of the
-prompt, attention gathers the step's queries, keys and values, and the gated
-DeltaNet layers trade tokens for heads (``ulysses``; ``linear_attn:
-{sp_exchange: state_passing}`` where their heads per TP rank don't divide by
-``sp_size``). The recurrent state is held whole on every SP rank, so decode is
-unchanged. No shipped config splits yet: a TP2 x SP2 9B config lands with its
-GPU parity run. Prefix caching stays on at one rank as before; above one rank
-it is off.
+On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``, its
+prefill and mixed walks; decode never splits, and its compiled frame keeps the
+bracket out). With its KV pool stored by position (``kv_cache:
+{context_parallel: true}``) and the shard's default ``exchange``, every step
+runs copied, each rank attending its share of the stored context (more KV
+capacity, no faster prefill). With ``llm_shard: {exchange: all_gather}`` a
+step of at least ``llm_shard.min_tokens`` tokens that runs eagerly splits over
+the SP ranks: each runs the layers on its part of the prompt, attention gathers
+the step's queries, keys and values, and the gated DeltaNet layers trade tokens
+for heads (``ulysses``; ``linear_attn: {sp_exchange: state_passing}`` where
+their heads per TP rank don't divide by ``sp_size``). The DeltaNet split runs
+eagerly only, so a step that fits a capture bucket (by default text prefills up
+to 8704 tokens, vision ones up to 4096) runs copied whatever ``min_tokens`` says; a
+longer prompt, which chunked prefill (off on SP ranks) leaves whole, splits.
+The recurrent state is held whole on every SP rank, so decode is unchanged. No
+shipped config splits yet: a TP2 x SP2 9B config lands with its GPU parity run.
+Prefix caching stays on at one rank as before; above one rank it is off.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay

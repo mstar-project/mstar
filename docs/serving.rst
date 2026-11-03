@@ -443,8 +443,11 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 
 A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
 declares a sequence shard (``SeqShardSpec``: LTX-2.5's and Cosmos3's DiTs, Qwen3-Omni's Thinker,
-Qwen3.5's LLM) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
-step that can split does). A captured step decides from its bucket's size, not its prompt's.
+Qwen3.5's LLM) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on
+every rank instead (default 0: every step that can split does). A captured step decides from its
+bucket's size, not its prompt's, and on a node with a resource whose split steps run eagerly only
+(a ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) a captured step runs copied: there
+only a step past the largest capture bucket, or any step with capture off, splits.
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
 head: each request's positions split over the ranks that would otherwise hold the same KV
 heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose
@@ -456,11 +459,14 @@ from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV 
 and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
 position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
 this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
-never splits. An MLA pool stored by head, whose one latent every rank holds whole, takes
-``kv_gather`` wherever the node splits. A recurrent layer's resource (``linear_attn``) takes
-``ulysses`` wherever the node splits, or its own ``sp_exchange: state_passing``. A value the
-node's storage can't take fails at load, at any SP size, and so does ``ring`` over an attention
-backend other than ``flashinfer`` (when the engine builds it):
+never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
+an MLA pool's attention, and a sliding-window attention over KV stored by position (whose window
+layers stay whole on each rank, so its decode needs no collective), gather the step's keys
+(``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses``, or its own
+``sp_exchange: state_passing`` (CPU-tested only, as Mamba-2's split is). A value the node's
+storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
+other than ``flashinfer`` (when the engine builds it), or beside a ``kv_gather`` attention or a
+recurrent layer:
 
 .. code-block:: yaml
 

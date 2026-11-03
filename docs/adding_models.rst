@@ -687,7 +687,8 @@ The spec types are:
        every layer at the declared ``page_size``, or at 128 tokens when it is unset, so
        the pool's bytes don't move with the derived page. Such a cache doesn't prefix
        cache yet, so its ``prefix_cache`` goes off (logged at info), and a serving config's
-       ``prefix_cache: true`` is refused. It doesn't fork, serve a node on another instance
+       ``prefix_cache: true`` is refused. With ``context_parallel`` the window's layers stay
+       whole on every partner (Context parallelism, below). It doesn't fork, serve a node on another instance
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
@@ -2442,46 +2443,57 @@ Splitting is declared in four places:
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
   on a node with no ``SeqShardSpec``, so one declaration serves every deployment shape.
 
-**Recurrent and MLA layers.** They take split steps through their own resources too, and the
-model writes nothing more than the bracket:
+**Recurrent, MLA and sliding-window layers.** They take split steps through their own resources
+too, and the model writes nothing more than the bracket. Each resource's state is stored one of
+three ways over the SP ranks (``NodeResourceSpec.storage``): by head, by position
+(``context_parallel``), or copied (heads over TP alone, every SP rank holding all of it). A copied
+resource takes its own exchange wherever the node's shard splits, whatever the shard's
+``exchange``:
 
-- A **recurrent pool** (GDN, Mamba-2) shards heads over TP alone, so every SP rank holds every
-  slot's whole state, and a split step leaves the same bytes in every replica. Decode reads it with
-  no collective. On a split step the conv runs on each rank's tokens from the earlier ranks'
-  last inputs (``conv_halo``, one all-gather a layer), and every row's final window is written on
-  every rank. A combined walk's leading decode rows run copied. The prompt rows take the linear
-  resource's ``sp_exchange`` (a ``resources:`` override): ``ulysses`` (the default where another
-  resource on the node splits; one all-to-all to a block of heads, the chunked kernel over that
+- A **recurrent pool** (GDN, Mamba-2) is copied, so decode reads it with no collective, and a split
+  step leaves the same bytes in every replica. On a split step the conv runs on each rank's tokens
+  from the earlier ranks' last inputs (``conv_halo``, one all-gather a layer), and every row's final
+  window is written on every rank. A combined walk's leading decode rows run copied. The prompt
+  rows take the linear resource's ``sp_exchange`` (a ``resources:`` override, the one per-resource
+  choice): ``ulysses`` by default (one all-to-all to a block of heads, the chunked kernel over that
   block of the state, the block's final states gathered, one all-to-all back) or ``state_passing``
   (each rank runs its pieces, hands its state on in one fixed-size gather, and runs a row
-  continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so
-  ``ulysses`` saves memory there, not time. Both run eagerly: a captured step runs copied on a node
-  with a recurrent layer. Prefix snapshots stay off above one rank.
-- An **MLA** pool stored by head holds its one latent whole on every rank. Its attention's
-  default, ``kv_gather``, gathers the step's latents, writes them on every rank, and attends each
-  rank's own queries over each row's keys up to its piece. Copied steps attend on the TP heads
-  with no collective. Over a pool stored by position it takes ``all_gather`` (both query parts
-  gathered), as GQA does. It runs eagerly too.
+  continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so ``ulysses``
+  saves memory there, not time. ``state_passing`` and Mamba-2's split are tested on CPU only and no
+  in-tree model adopts them yet. Both exchanges run eagerly, so on a node with a recurrent layer a
+  step that leases a capture runs copied: only a step past the largest capture bucket (or any
+  step with capture off) splits. Prefix snapshots stay off above one rank.
+- An **MLA** pool is copied (its one latent serves every query head). Its attention gathers the
+  step's latents (``kv_gather``), writes them on every rank, and attends each rank's own queries
+  over each row's keys up to its piece. Copied steps attend on the TP heads with no collective.
+  Over a pool stored by position it takes the shard's ``all_gather`` (both query parts gathered),
+  as GQA does. Split steps run eagerly.
+- A **sliding-window** attention over a pool stored by position keeps its window layers whole on
+  every SP rank (``PagedKVConfig.placed_groups``) while the full layers' slots stripe: its copied
+  steps (decode included) attend as on one rank, with no collective, and its split steps gather
+  the step's keys (``kv_gather``), eagerly. Its pages hold ``1/sp_size`` the tokens they would
+  unplaced, so each window page must split ``sp_size`` ways.
 
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
 the KV pool, paged FlashInfer, MLA and dense attention, ragged self and cross attention,
 positions, the sampler, the recurrent pool and its GDN and Mamba-2 resources); DSA, flex and XPU
 attention don't, so a splitting node can't own them. The engine and the conductor
 also refuse, before a worker starts: a node on SP ranks that neither splits its steps (a
-``SeqShardSpec`` whose ``exchange`` isn't ``none``, with an attention that takes split steps)
-nor places its pools by position; a shard on axis 1 over a pool stored by position; a
-head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged
-``sp_exchange`` whose heads don't divide by ``tp * sp``, or beside a ring; a
-ragged cross-attention under a shard on axis 0 (a packed split can leave a rank none of a row);
-a linear ``ulysses`` whose key or value heads (Mamba-2's heads, or B/C groups neither dividing
-nor divided by ``sp_size``) per TP rank don't divide by ``sp_size`` (use ``state_passing``); a
-``state_passing`` with unequal key and value head dims at ``sp_size`` 3 or more; a linear layer
-under a shard on axis 1 or a ring's; a linear ``sp_exchange: none`` beside resources that split;
-``kv_gather`` over a pool other than MLA's stored by head, or at query heads per TP rank not
-dividing 64; ``ulysses`` or ``ring`` over MLA; expert parallelism; piecewise captures; a capture replayed
-under listed and unlisted walks; and a packed capture of a listed walk unless the shard lists
-one label on axis 0 (its padding joins that label). Each attention resource of a splitting node
-logs at load how it takes split steps.
+``SeqShardSpec`` whose ``exchange`` isn't ``none``, with a resource that takes split steps) nor
+places its pools by position; a shard on axis 1 over a pool stored by position; a head-stored pool
+whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged ``sp_exchange`` whose
+heads don't divide by ``tp * sp``, or beside a ring; a ragged cross-attention under a shard on
+axis 0 (a packed split can leave a rank none of a row); a linear ``ulysses`` whose key or value
+heads (Mamba-2's heads, or B/C groups neither dividing nor divided by ``sp_size``) per TP rank
+don't divide by ``sp_size`` (use ``state_passing``); a ``state_passing`` with unequal key and value
+head dims at ``sp_size`` 3 or more; a linear layer under a shard on axis 1 or a ring's; a
+``kv_gather`` attention under a ring's (it plans contiguous pieces); a window page that doesn't
+split ``sp_size`` ways; expert parallelism; piecewise captures; a capture replayed under listed
+and unlisted walks; and a packed capture of a listed walk unless the shard lists one label on axis
+0 (its padding joins that label). When the engine builds an MLA attention that plans each rank's
+own lengths (a placed pool, or ``kv_gather``) on FlashInfer's FA planner, it also refuses query
+heads per TP rank that don't divide 64. Each attention resource of a splitting node logs at load
+how it takes split steps.
 
 **Choosing the exchange.** ``exchange`` on the node's ``SeqShardSpec`` ``resources:`` block picks
 how its split steps' tokens reach its paged attentions, from where their KV is stored. ``auto``
@@ -2489,8 +2501,9 @@ how its split steps' tokens reach its paged attentions, from where their KV is s
 steps copied, so a node whose pools store KV by position splits its steps only where the
 deployment opts in with ``all_gather`` or ``ring``. A value the node's storage can't take fails at
 load, at any SP size. It only picks the split exchange: copied steps keep the storage's own path.
-A ragged attention's exchange is the model's ``sp_exchange`` (above), on a shard that splits.
-Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` above 1:
+A ragged attention's exchange is the model's ``sp_exchange`` (above), and a copied resource's its
+own (the list above), on a shard that splits. Each row assumes the node declares a
+``SeqShardSpec`` and runs on ``sp_size`` above 1:
 
 .. list-table::
    :header-rows: 1
@@ -2523,17 +2536,40 @@ Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` ab
      - striped pass-Q ring, eager only
      - partials merged
      - attention is the step's peak memory: past a per-model crossover (below, estimated and
-       unmeasured)
+       unmeasured); not beside a recurrent layer or a ``kv_gather`` attention
    * - ``none``
      - by head
      - refused at load: the SP ranks would only share heads
      - n/a
      - never; use TP
-   * - ``auto`` / ``ulysses``
-     - MLA, by head (whole on every rank)
-     - gather the latents (``kv_gather``), attend own queries, eager only
+
+And for the copied resources, under any ``exchange`` that splits:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 30 22 30
+
+   * - Resource
+     - Split steps
+     - Copied steps
+     - Pick it when
+   * - MLA attention (pool copied)
+     - ``kv_gather``: gather the latents, attend own queries, eager only
      - TP heads, no collective
-     - MLA attention, whose one latent can't split by head
+     - always (its one latent can't split by head)
+   * - sliding-window attention over KV stored by position
+     - ``kv_gather``, eager only
+     - as on one rank, no collective
+     - always; its window pages must split ``sp_size`` ways
+   * - recurrent layer, ``sp_exchange: ulysses`` (the default)
+     - conv halo; all-to-all to heads; eager only
+     - as on one rank
+     - heads (and Mamba-2's B/C groups) per TP rank divide by ``sp_size`` (Qwen3.5)
+   * - recurrent layer, ``sp_exchange: state_passing``
+     - conv halo; one state hand-off; eager only
+     - as on one rank
+     - heads that don't divide; a hand-off's bytes don't grow with the prompt (at ``P = 2`` it
+       waits on the previous rank, so it isn't faster). CPU-tested only
 
 ``ulysses`` over KV stored by position, and ``all_gather`` or ``ring`` over KV stored by head, are
 refused. A shard that never splits (``none``, or ``auto`` over KV stored by position) makes the
@@ -2587,8 +2623,10 @@ rank). Every resource over the pool must support it, or loading fails naming the
 FlashInfer attention (``flashinfer``, ``flashinfer_mla``) with ``flashinfer_backend`` ``auto``,
 ``fa2`` or ``fa3`` (``auto`` runs as ``fa2`` from SM100 on ``flashinfer``), RoPE positions and
 the recurrent state pool (GDN, KDA; the same state on every SP partner) do; dense, flex and XPU
-attention, cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't
-set the key. A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool.
+attention, cross-attention and DSA don't, and a ring or bounded KV pool can't set the key. A
+``sliding_window`` kept in its own group of layers stays whole on every partner, in pages of
+``1/P`` its unplaced tokens (which must be whole), while the full layers stripe; a window at
+least ``max_seq_len`` reads the placed layers and is refused there. A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool.
 
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
