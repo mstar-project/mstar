@@ -281,14 +281,12 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
     assert new_request.request_info.max_tokens == 29
 
 
-@pytest.mark.parametrize("streaming, outputs, kinds, guaranteed", [
-    (True, ["text", "audio"], ("ids", "ids"), True), (False, ["text", "audio"], ("ids", "ids"), False),
-    (True, ["text"], ("ids", "ids"), False), (False, ["text"], ("digest", "ids"), True),
-    (False, ["text"], ("ids", "rows"), True),
+@pytest.mark.parametrize("streaming, outputs, guaranteed", [
+    (True, ["text", "audio"], True), (False, ["text", "audio"], False), (True, ["text"], False),
 ])
-def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, kinds, guaranteed):
-    configs = {key: KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(PS, PS, "prefill", kind=kind),))})
-               for key, kind in zip(("kv", "talk"), kinds, strict=True)}
+def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, guaranteed):
+    configs = {key: KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(PS, PS, "prefill"),))})
+               for key in ("kv", "talk")}
     mark_guaranteed(configs, streaming, outputs)
     assert [config.guaranteed for config in configs.values()] == [guaranteed] * 2, "a pool got another class"
 

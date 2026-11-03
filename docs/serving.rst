@@ -448,11 +448,11 @@ its pages, and is otherwise dropped if it can be rebuilt from its token ids. The
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
 request on the host waits at its place in the queue until its pages and one more page fit, and
 its pages are then copied back. A dropped request waits until its history and one more page
-fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
-made from media or another node's outputs, reserves its whole footprint in every pool, with
-every cache hit counted, and is never dropped or moved to the host. So does a request in the
-pools of a node that keeps no token ids to rebuild it. Voice requests then queue when the pool
-is short and are never preempted mid-stream.
+fit, then recomputes its KV in one prefill row. A request that streams audio out reserves its
+whole footprint in every pool, with every cache hit counted, and is never dropped or moved to
+the host. A request that holds KV made from media or another node's outputs does so in the pools
+of the node that writes it, and so does a request in the pools of a node that keeps no token ids
+to rebuild it. Voice requests then queue when the pool is short and are never preempted mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
 until they time out. At one rank, a request that runs short and can neither move to the host

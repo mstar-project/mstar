@@ -556,15 +556,12 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
 def mark_guaranteed(
     configs: Mapping[str, ResourceReqConfig], streaming: bool, output_modalities: Collection[str],
 ) -> None:
-    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause is a gap in
-    playback, or when any of them lays out KV that a rebuild from token ids can't recompute."""
-    kv_configs = [config for config in configs.values() if isinstance(config, KVReqConfig)]
-    guaranteed = (streaming and "audio" in output_modalities) or any(
-        span.kind != "ids"
-        for config in kv_configs for layout in (config.kv_layout or {}).values() for span in layout.spans
-    )
-    for config in kv_configs:
-        config.guaranteed = guaranteed
+    """A request is guaranteed in all of ``configs`` when it streams audio out, since a pause in any pool is a
+    gap in playback."""
+    guaranteed = streaming and "audio" in output_modalities
+    for config in configs.values():
+        if isinstance(config, KVReqConfig):
+            config.guaranteed = guaranteed
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:

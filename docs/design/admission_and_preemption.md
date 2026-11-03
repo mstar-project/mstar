@@ -40,13 +40,13 @@ The model declares the footprint as KV spans (#832). A span's kind says what its
 - `digest`: an encoder's output
 - `rows`: another node's outputs
 
-The conductor sets the class once, at ingest, and the same class holds in every pool.
+The conductor marks a request that streams audio once, at ingest, and that class holds in every pool. Rows 2 to 4 hold in the pools of the node that writes the span.
 
 | # | A request with | Class | Why |
 |---|---|---|---|
 | 1 | Audio it streams out | guaranteed | a pause is a gap in playback |
-| 2 | A `rows` span | guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
-| 3 | A `digest` span | guaranteed | its KV comes from an encoder's output, freed after prefill |
+| 2 | A `rows` span | guaranteed there | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
+| 3 | A `digest` span | guaranteed there | its KV comes from an encoder's output, freed after prefill |
 | 4 | No rebuild policy on its node | guaranteed there | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
@@ -57,7 +57,7 @@ On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTF
 Why this shape:
 
 - **The class comes from the request.** A priority or a per-request flag would be one more input to tune, when the footprint and the output can be used to make the decision.
-- **The conductor sets it.** It is the one place that sees every resource's layout. A Qwen3-Omni request with audio out has `rows` only on the Talker's worker, so a class each worker set from its own pools would let the Thinker's worker drop a request whose Talker is speaking.
+- **Streamed audio holds in every pool.** A Qwen3-Omni request with streamed audio out must not be dropped by the Thinker's worker while its Talker is speaking, so the conductor marks it. A span no rebuild can write again holds only in its node's pools: for an unstreamed reply, a Thinker rebuild only delays the Talker's rows.
 - **Only streamed audio.** A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.
 - **Not the worst case for every request.** With 32 Bagel text chats beside 16 image chats on 64 pages, chat TTFT p50 was 559 ms with every request guaranteed and 69.7 ms with two classes.
 - **Seeded requests stay preemptible.** Guaranteeing them would charge the worst case to every request that sets a seed. A rebuilt seeded request may not repeat its output (§5.4).
