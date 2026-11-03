@@ -62,8 +62,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -190,11 +191,13 @@ class LoraLayerDelta:
             self._pool._current is None or self._pool._plan_thread != threading.get_ident()
         ):
             raise RuntimeError(
-                "a LoRA delta was called outside its node's planned step (e.g. from "
-                "prepare_inputs, which the async worker runs while the GPU thread's step "
-                "is planned, or on an output cached from an earlier step): there is no "
-                "addressing for its rows. Call the module's base computation there and "
-                "add the delta in preprocess or the forward"
+                "a LoRA delta was called with no planned step addressing its rows: the "
+                "step running it (the node's, or a piecewise region's) is None or declares "
+                "no segments to lay its LoRA rows out from; or the call is "
+                "outside the planned step (prepare_inputs, which the async worker runs "
+                "while the GPU thread's step is planned, or an output cached from an "
+                "earlier step), where the module's base computation runs and the delta "
+                "belongs in preprocess or the forward"
             )
         if not self._pool.active:
             # a base-only step: no row names an adapter, so nothing is launched
@@ -454,10 +457,23 @@ class LoraAdapterPool(Resource):
         for a backend to run against."""
         if self._current is None:
             raise RuntimeError(
-                "the LoRA pool has no plan for this step; the step declaration must carry "
-                "a LoraStep under this resource's key"
+                "the LoRA pool has no plan for this step: the step running the adapted "
+                "module (the node's, or a piecewise region's) is None or declares no "
+                "segments to lay its LoRA rows out from"
             )
         return self._current[grouping]
+
+    @contextmanager
+    def base_only(self) -> Iterator[None]:
+        """A forward outside any step (a compile's warm-up) on this thread, as a base-only
+        step: its deltas add nothing. A compile traced here takes the base-only branch,
+        so the first step with an adapter row compiles its own."""
+        saved = self._current, self._plan_thread, self.active
+        self._current, self._plan_thread, self.active = {}, threading.get_ident(), False
+        try:
+            yield
+        finally:
+            self._current, self._plan_thread, self.active = saved
 
     def slot_state(self, index: int) -> SlotState:
         return self._slots[index]
@@ -478,9 +494,6 @@ class LoraAdapterPool(Resource):
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
         adapter = overrides.adapter if isinstance(overrides, LoraReqConfig) else None
         with self._lock:
-            # idempotent: one NewRequest per partition
-            if rid in self._adapter_of:
-                return
             if adapter is not None and adapter not in self._serving:
                 raise ValueError(
                     f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
@@ -751,7 +764,7 @@ class LoraAdapterPool(Resource):
         in its now-unheld slot, as a cache."""
         del step
         if ctx.graph_walk != PIECEWISE_WALK:
-            self._current = None
+            self._unplanned()
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
@@ -769,18 +782,24 @@ class LoraAdapterPool(Resource):
 
     def commit(self, step: LoraStep, ctx: StepContext) -> None:
         del step
-        if ctx.graph_walk != PIECEWISE_WALK:
-            # nothing reads the addressing past the step's forward: a delta called
-            # before the next plan refuses rather than add these rows' adapters
-            self._current = None
-        elif self._enclosing is not None:
+        if ctx.graph_walk == PIECEWISE_WALK and self._enclosing is not None:
             # the region is done; the eager code after it reads the enclosing plan
             (self._current, self.active), self._enclosing = self._enclosing, None
+        else:
+            # nothing reads the addressing past the step's (or a region capture's)
+            # forward: a delta called before the next plan refuses rather than add
+            # these rows' adapters
+            self._unplanned()
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
                 del self._admit_taken[rid]
+
+    def _unplanned(self) -> None:
+        """No step's addressing: a delta refuses until the next plan, eagerly in its own
+        check, compiled in ``addressing`` (which it reaches with ``active`` set)."""
+        self._current, self.active = None, True
 
     def _take(self, rid, slot: int) -> None:
         """Caller holds the lock."""

@@ -18,6 +18,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import KVSpec  # noqa: E402
+from mstar.engine.resources.step import Segment  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.components.audio_features import (  # noqa: E402
     LogMelSpectrogram,
@@ -980,7 +981,10 @@ def test_decoder_align_walk_emits_the_alignment_and_postprocess_times_the_words(
         "encoder_states": [enc],
     })
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
-    assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
+    # one segment over the rows the projections see, which a LoRA pool lays its rows out from
+    step = sub.declare_step(ALIGN_WALK, ["r"], [row])
+    assert step.segments == [Segment("r", "main", row.input_ids.shape[0])] and not step.steps
+    assert sub.max_batch_size(ALIGN_WALK) == 1
     batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
     with torch.no_grad():
         out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)

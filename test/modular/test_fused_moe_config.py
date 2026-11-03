@@ -43,6 +43,47 @@ def test_get_config_uses_nearest_batch_and_down_overrides(tuned_table):
     assert kernels.get_config(M=50, E=8, N=64, K=32, top_k=2)[0]["BLOCK_SIZE_M"] == 64
 
 
+def test_a_traced_launch_drops_the_tuned_warps_and_stages():
+    """The table lookup graph-breaks, so under a dynamic compile the config
+    reaches the launch with symbolic ints, which Triton takes only as constants."""
+    tile = {"BLOCK_SIZE_M": 16, "num_warps": 4, "num_stages": 3}
+
+    def lookup():
+        torch._dynamo.graph_break()
+        return dict(tile)
+
+    torch._dynamo.reset()
+    launch = torch.compile(lambda x: x + len(kernels._launch_options(lookup())), dynamic=True, backend="eager")
+    assert launch(torch.zeros(4)).tolist() == [1.0] * 4
+    assert kernels._launch_options(dict(tile)) == tile
+
+
+@CUDA
+@pytest.mark.parametrize(
+    "table", sorted((kernels.config_path(1, 1, 1, "x").parent).glob("*.json")), ids=lambda p: p.name,
+)
+def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(table, monkeypatch):
+    """An uncaptured step compiles fused_experts with a dynamic batch size, and
+    every entry of a shipped table must trace that way (launch options included)."""
+    import re
+
+    from mstar.utils.fused_moe import fused_experts
+
+    experts, two_inter, hidden = (int(v) for v in re.match(r"E=(\d+),N=(\d+),K=(\d+)", table.name).groups())
+    monkeypatch.setattr(kernels, "config_path", lambda E, N, K: table)
+    kernels._tuned_configs.cache_clear()
+    torch._dynamo.reset()
+    w1 = torch.randn(experts, two_inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    w2 = torch.randn(experts, hidden, two_inter // 2, device="cuda", dtype=torch.bfloat16) * 0.02
+    run = torch.compile(lambda x, w, i: fused_experts(x, w1, w2, w, i), dynamic=True)
+    # every tuned batch size; 0 and 1 are specialized, never symbolic
+    for num_tokens in sorted({max(int(m), 2) for m in json.loads(table.read_text())}):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        weights, ids = torch.rand(num_tokens, experts, device="cuda").topk(8, dim=-1)
+        run(x, weights.to(torch.bfloat16), ids)
+    kernels._tuned_configs.cache_clear()
+
+
 @CUDA
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64])
 def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):

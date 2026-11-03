@@ -121,6 +121,11 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class BagelVisionEmbeddings(nn.Module):
+    lora_unservable = {
+        "patch_embedding": "converted at load to a linear over (kh, kw, C) patches "
+        "(convert_conv2d_to_linear), where a conv adapter's factors are (C, kh, kw)",
+    }
+
     def __init__(self, config: BagelViTConfig):
         super().__init__()
         self.config = config

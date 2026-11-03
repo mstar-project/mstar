@@ -13,7 +13,7 @@ Accepted checkpoint layouts (``.safetensors``):
 
 ``<module>`` is a reference-library module path; the model's checkpoint remap (the same one the
 weight loader uses) and its stacked-shard rules turn it into the native parameter and, for
-fused projections, the shard it lands on (a ``LoraSpec``'s ``module_map``, and the static
+fused projections, the shard it lands on (the model side's ``ModuleLoraMap``, and the static
 merge's ``resolve_lora_module``).
 """
 

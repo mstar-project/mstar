@@ -14,33 +14,6 @@ Communication
    * - Variable
      - Default
      - Meaning
-   * - ``MSTAR_RUST_ZMQ``
-     - ``AUTO``
-     - Transport selection for the ZeroMQ control mesh (see
-       :func:`mstar.communication.communicator.make_communicator`).
-       ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
-       ``rust/`` extension imports successfully, pyzmq otherwise.
-       ``1``: the Rust communicator, raising if the extension is missing.
-       ``0``: always pyzmq. The two transports are wire-compatible, so
-       this can be set per-process while the rest of the mesh stays on
-       pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
-       worker's graph runtime on Python -- the Rust one cannot share a
-       pyzmq transport. An extension built before 0.1.1 has no
-       non-blocking ``try_send``, which the API server's preprocess thread
-       sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
-       warning and ``1`` raises, asking for a rebuild. The conductor, the
-       workers and the rest of the API server keep the Rust transport.
-   * - ``MSTAR_RUST_GRAPH``
-     - ``AUTO``
-     - Which graph runtime a worker builds (see
-       :func:`mstar.graph.runtime.utils.resolve_graph_runtime_type`).
-       ``AUTO``: Rust where the vendored ``rust/`` extension imports *and*
-       the Rust transport is in use, Python otherwise. ``1``: the Rust
-       runtime, failing at startup if the transport or the tensor bookkeeper
-       is a Python one -- it holds a share of both, so there is no degraded
-       mode to fall back to. ``0``: always the Python runtime. Resolved once
-       per process, because it also selects the tensor bookkeeper the
-       runtime and the tensor store must share.
    * - ``MSTAR_WIRE_CODEC``
      - ``msgpack``
      - How messages are encoded on every communicator edge (see
@@ -593,15 +566,6 @@ Worker scheduling
        ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
        worker starts and ``5`` is used; a negative value is raised to ``0``
        with a warning.
-   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
-     - ``32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704``
-     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
-       graph (one per bucket and batch size). A prompt past the top bucket
-       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
-       spends 78 ms of wall time on 36 ms of kernels. 2176, 4352 and 8704 add
-       1/16 of slack above the powers of two from 2048 up, for a mixed step's
-       decode rows and for batches a few tokens over. Narrow it to save graph
-       memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
      - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
@@ -614,6 +578,16 @@ Worker scheduling
        page unindexed. The default ``1`` extends on every step: ``16``
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
+   * - ``MSTAR_WORKSPACE_BUFFER_MB``
+     - ``512``
+     - The size each FlashInfer attention workspace starts at, per (plan label, slot), read
+       by ``workspace_bytes`` (``mstar/engine/resources/attn/workspace.py``). A floor: a plan
+       at startup that asks for more grows that workspace to what it asked for. Raise it for
+       an eager step that wants more than startup's plans left it, which raises with the bytes
+       it asked for, since a captured graph holds the workspace's address by then. A ragged
+       resource that declares ``workspace_mb`` starts there instead, and this doesn't reach
+       it: LTX-2.5's twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
+       ``512`` and 24 GiB at ``2048`` if this applied.
    * - ``MSTAR_KV_PINNED_INDPTRS``
      - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,

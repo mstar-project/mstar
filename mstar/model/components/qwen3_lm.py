@@ -31,10 +31,11 @@ from mstar.model.components.norm import RMSNorm
 
 class Qwen3Attention(ParallelAttention):
     """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
-    the step's KV write in one Triton kernel (``qk_norm_rope_kv_write``). At
-    decode width a step is a few small kernels per layer, and the separate
-    norm, RoPE and KV-write kernels were a sizeable share of it. Falls back to
-    the unfused path off CUDA or without planned positions."""
+    the step's KV write in one Triton kernel, through
+    ``AttentionCallable.norm_rope_attend``. At decode width a step is a few
+    small kernels per layer, and the separate norm, RoPE and KV-write kernels
+    were a sizeable share of it. Falls back to the unfused path off CUDA or
+    without planned positions."""
 
     _fuse_qk = False
 
@@ -53,28 +54,9 @@ class Qwen3Attention(ParallelAttention):
             return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
-        attn_output = self._norm_rope_attend(q, k, v, pos_ids)
+        attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
-
-    @torch.compiler.disable
-    def _norm_rope_attend(self, q, k, v, pos_ids) -> torch.Tensor:
-        """q/k norm and RoPE, the step's KV write and attention. For a backend
-        that reads K/V from the paged cache, the write rides in the norm/RoPE
-        kernel (``qk_norm_rope_kv_write``) rather than a launch of its own."""
-        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
-
-        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), self._rope_theta)
-        attend = self.attend
-        if not attend.attn.requires_kv_write:
-            qk_norm_rope_inplace(q, k, self.q_norm.weight, self.k_norm.weight, pos_ids, *eps)
-            return attend(q, k, v)
-        layer, page_idx, slot_idx, n = attend.kv.write_target()
-        qk_norm_rope_kv_write(
-            q, k, v, self.q_norm.weight, self.k_norm.weight, pos_ids,
-            layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
-        )
-        return attend.attn.run(q, kv_cache_layer=attend.kv.layer_view())
 
 
 @dataclass

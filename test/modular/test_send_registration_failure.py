@@ -11,14 +11,15 @@ import torch
 
 sys.path.insert(0, ".")
 
+from rust_runtime import Inboxes
 from test_graph_runtime import (
     _build_on_real_manager,
     _complete,
     _fwd_info,
     _ingest,
-    _RecordingCommunicator,
 )
 
+from mstar.communication import tensor_store
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     AsyncMooncakeReader,
@@ -153,14 +154,13 @@ def test_the_worker_fails_only_the_refused_request():
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_the_python_runtime_sends_nothing_for_a_failed_rid(tmp_path, failed):
+def test_the_runtime_sends_nothing_for_a_failed_rid(tmp_path, failed):
     section = GraphNode(
         name="gen", input_names={"tok"},
         outputs=[GraphEdge(name="out", next_node=EMIT_TO_CLIENT)],
     )
-    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path)
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
+    comm = Inboxes("worker_0", tmp_path)
+    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path, inboxes=comm)
     _ingest(runtime, rid, [GraphEdge(name="tok", next_node="gen")])
     _, out = _complete(tm, runtime, rid, "gen", {"out": [torch.ones(1)]}, ["out"])
 
@@ -423,11 +423,13 @@ def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
 
 
 def _real_manager(monkeypatch, rust):
-    """Mooncake over TCP, with the bookkeeper the given graph runtime uses."""
+    """Mooncake over TCP, with the given bookkeeper: the Rust one a worker
+    uses, or the Python one a data worker falls back to."""
     pytest.importorskip("mooncake.engine")
     if rust:
         pytest.importorskip("mstar_rust")
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1" if rust else "0")
+    else:
+        monkeypatch.setattr(tensor_store, "_build_tensor_bookkeeping", tensor_store.PythonTensorBookkeeping)
     from mstar.communication.tensors import create_tensor_communication_manager
 
     mgr = create_tensor_communication_manager(

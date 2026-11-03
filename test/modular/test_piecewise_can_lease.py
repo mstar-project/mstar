@@ -20,7 +20,7 @@ class _Runner:
         self.lease_before_step = lease_before_step
         self._accepts = accepts
 
-    def can_lease(self, inputs):
+    def can_lease(self, inputs, request_ids):
         return self._accepts
 
     def lease_slot(self, bs, total_tokens):
@@ -28,6 +28,7 @@ class _Runner:
 
 
 class _Ctx:
+    request_ids = ()
     slot_lease = None
     piecewise_leases = None
 
@@ -54,10 +55,10 @@ def test_nothing_leased_leaves_the_context_alone():
 
 def test_runner_defers_to_the_configs_predicate():
     def runner(predicate):
-        return SimpleNamespace(_config=SimpleNamespace(can_lease=predicate))
+        return SimpleNamespace(_config=SimpleNamespace(can_lease=predicate, one_row_per_step=False))
 
-    assert PiecewiseAcceleratorGraphRunner.can_lease(runner(None), [])
-    assert not PiecewiseAcceleratorGraphRunner.can_lease(runner(lambda inputs: len(inputs) < 2), [1, 2])
+    assert PiecewiseAcceleratorGraphRunner.can_lease(runner(None), [], ())
+    assert not PiecewiseAcceleratorGraphRunner.can_lease(runner(lambda inputs: len(inputs) < 2), [1, 2], ())
 
 
 def _packed_runner(one_row):
@@ -72,6 +73,7 @@ def _packed_runner(one_row):
         replay_seq_lens=lambda shape, seq_lens, real_bs: list(seq_lens),
     )
     runner._label, runner._current_slot, runner._capture_batch_sizes = "region", 0, sizes
+    runner._lora_keys = ()
     runner._graphs = {
         PiecewiseGraphKey(bs=bs, seq_len=256, slot=0): SimpleNamespace(
             bucket=(bs, 256), shape=SimpleNamespace(bs=bs), dummy_rids=list(range(bs)),
@@ -122,27 +124,6 @@ def test_one_row_per_step_is_refused_where_it_means_nothing(batched, overrides):
             PiecewiseBatchedConfig(**kwargs, seq_len=8)
         else:
             PiecewisePackedConfig(**{**kwargs, **overrides}, total_tokens=[8])
-
-
-def test_a_one_row_per_step_region_refuses_a_lora_step():
-    """Its replay names the step's first request alone, so a LoRA pool planned in it
-    would give every request's tokens that request's adapter."""
-    from mstar.engine.accelerator_graph_config import PiecewiseCaptureShape
-    from mstar.engine.resources.lora import LoraStep
-    from mstar.engine.resources.step import SubmoduleStep
-
-    runner = PiecewiseAcceleratorGraphRunner.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._config = SimpleNamespace(
-        one_row_per_step=True,
-        get_capture_shapes=lambda sizes: [PiecewiseCaptureShape(bs=1, seq_lens=[8], total_tokens=8)],
-        region_step=lambda rids, seq_lens: SubmoduleStep(steps={"lora": LoraStep()}),
-    )
-    runner._label, runner._node_name, runner._prepared_shapes = "region", "vision", None
-    runner._capture_batch_sizes = [1]
-    runner._dummy_rows = SimpleNamespace(handles=lambda key, n: list(range(n)))
-    runner._dummy_key = lambda shape, slot: "k"
-    with pytest.raises(ValueError, match="one_row_per_step"):
-        runner.prepare_for_capture()
 
 
 @pytest.mark.parametrize("one_row, request_ids, seq_lens, rows", [

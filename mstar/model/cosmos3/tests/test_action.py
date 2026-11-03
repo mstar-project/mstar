@@ -329,8 +329,11 @@ def test_action_engine_matches_fused() -> None:
         video_latents=cond_latent, num_frames=nf, height=h, width=w, fps=fps, action_fps=fps,
         num_inference_steps=steps, guidance_scale=1.0, flow_shift=fshift, generator=gen)
 
+    from mstar.model.cosmos3.submodules import LATENT_DTYPE
+
+    # the served loop state's dtype, as the fused pipeline draws it
     gen2 = torch.Generator(device=device).manual_seed(0)
-    a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=dtype)
+    a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=LATENT_DTYPE)
     a_noise[..., raw:] = 0
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -347,7 +350,7 @@ def test_action_engine_matches_fused() -> None:
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
-    latents, action_latents = cond_latent.clone(), a_noise.clone()
+    latents, action_latents = cond_latent.to(LATENT_DTYPE), a_noise.clone()
     solver = initial_state(dit._packed(latents, action_latents))
     for k in range(steps):
         fwd.dynamic_loop_iter_counts["action_gen_loop"] = k

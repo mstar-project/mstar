@@ -17,6 +17,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.lora import LoraReqConfig, LoraSpec, LoraStep
 from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import lora_rows
 
 DTYPE = torch.float64
 
@@ -129,13 +130,14 @@ def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
 
 
 def admit_declared(lora_pool, step, rows, walk: str = "prefill") -> None:
-    """Admit and plan a node's own declared ``step`` (its LoraStep under the pool's key)
-    for ``rows`` ((rid, adapter, span))."""
+    """Admit and plan a node's declared ``step`` for ``rows`` ((rid, adapter, span)), with
+    the LoraStep the engine adds to it (``lora_rows``)."""
     for rid, adapter, _ in rows:
         lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
     ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False)
-    lora_step = step.get(lora_pool.spec.resource_key)
-    assert lora_step is not None, "the node's declare_step carries no LoraStep"
+    key = lora_pool.spec.resource_key
+    lora_step = lora_rows(step, (key,)).get(key)
+    assert lora_step is not None, "the node's step declares no segments to lay its LoRA rows out from"
     assert lora_pool.admit(lora_step, ctx).ok
     lora_pool.plan(lora_step, ctx)
 

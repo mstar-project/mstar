@@ -215,8 +215,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if not self.PREFETCH_SEEDS:
             return
         state = self.request_state(request_id)
-        if "seed_draw" in state:
-            return  # a request arrives once per partition this worker serves
         # a copy: the worker updates the request's info as its walks advance
         info = copy.copy(request_info)
         bucket_key = self.bucket_key_for(info)

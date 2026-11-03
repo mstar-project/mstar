@@ -112,7 +112,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     Loop state is the fp32 latent ``[16, H/8, W/8]`` (the reference keeps latents fp32 and
     casts to bf16 only for the transformer). Per-shape layout: image-token pad mask and the
-    complex rotary tables for the image and caption spans.
+    rotary tables (``ZImageRoPE``) for the image and caption spans.
     """
 
     # the noise is a function of the latent grid and the seed alone

@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
@@ -69,6 +69,7 @@ from mstar.model.submodule_base import (
     StepOrder,
     StopCheck,
     StopPolicy,
+    engine_step,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -126,6 +127,16 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
         yield
     finally:
         torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
+@contextmanager
+def _outside_steps(submodule_mgmt) -> Iterator[None]:
+    """A node's forwards run outside any step (compile warm-ups), with each of its LoRA
+    pools as in a base-only step (``LoraAdapterPool.base_only``)."""
+    with ExitStack() as stack:
+        for pool in submodule_mgmt.lora_pools:
+            stack.enter_context(pool.base_only())
+        yield
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -781,7 +792,7 @@ class Engine:
                 setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
                 with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
                     self._autocast_dtype_for(node_name), self._device.type, node_name,
-                ):
+                ), _outside_steps(submodule_mgmt):
                     for args in examples:
                         getattr(owner, name)(*args)
                 logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
@@ -826,6 +837,8 @@ class Engine:
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
         plan = self._plan_captures(ag_runners, piecewise)
+        for resource in self._resources.values():
+            resource.seal_capture_buffers()
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
@@ -873,7 +886,7 @@ class Engine:
         # graph runner compiles internally
         self._compile_submodules()
         for submodule_mgmt in self._submodules.values():
-            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+            with fp32_precision_scope(submodule_mgmt.fp32_precision), _outside_steps(submodule_mgmt):
                 submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
@@ -1016,6 +1029,7 @@ class Engine:
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
+                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner
         return runners
@@ -1361,7 +1375,7 @@ class Engine:
         self.extend_prefix_chains(batch, outputs, host_rows=host_rows, skip_rids=skip_rids)
 
     def extend_prefix_chains(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
         skip_rids: Collection[int] = (),
     ) -> None:
@@ -1392,7 +1406,7 @@ class Engine:
             return
         for rid in rids:
             per_rid = outputs.get(rid)
-            if isinstance(per_rid, dict):
+            if isinstance(per_rid, Mapping):
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
@@ -1694,11 +1708,14 @@ class Engine:
     def _exec_per_request(
         self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
-        """Full step cycle per request, eager (no lease), outputs merged.
+        """Full step cycle per request, without a whole-forward lease, outputs merged.
 
-        The unbatchable fallback: no capture applies (a lease would have set
-        ``running_batched``), so each request declares/admits/plans/commits on
-        its own, keeping the plan matched to its single-request forward.
+        The unbatchable fallback: no whole-forward capture applies (a lease
+        would have set ``running_batched``), so each request declares/admits/
+        plans/commits on its own, keeping the plan matched to its
+        single-request forward. Each request still takes its own
+        piecewise-region leases in ``_declare_and_admit``, so a captured inner
+        loop can replay per request.
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
@@ -1835,7 +1852,8 @@ class Engine:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
-                step = submodule.declare_step(
+                step = engine_step(
+                    submodule,
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
@@ -1909,7 +1927,7 @@ class Engine:
         leases = {}
         for label, runner in runners.items():
             # a batch the region refuses runs it eagerly, with no slot
-            if not runner.lease_before_step or not runner.can_lease(inputs):
+            if not runner.lease_before_step or not runner.can_lease(inputs, ctx.request_ids):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
@@ -2183,7 +2201,7 @@ class Engine:
         return None if mgmt is None else mgmt.submodule.get_stop_policies(graph_walk)
 
     def check_stop_for_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
@@ -2896,7 +2914,8 @@ class Engine:
         )
         laps.lap("pad")
         t0 = phase_start()
-        step = submodule_mgmt.submodule.declare_step(
+        step = engine_step(
+            submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,

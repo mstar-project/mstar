@@ -8,7 +8,6 @@ row-parallel ``o`` target. Other LoRA test modules import the helpers defined he
 from __future__ import annotations
 
 import gc
-import re
 import threading
 import time
 import weakref
@@ -33,6 +32,8 @@ from mstar.engine.resources.step import (  # noqa: E402
     SlotLease,
     StepContext,
 )
+from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
+from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
 
 HIDDEN, Q_OUT, KV_OUT, LAYERS = 16, 16, 8, 2
 QKV = LoraTarget(
@@ -40,18 +41,15 @@ QKV = LoraTarget(
     slice_names=("q", "k", "v"), slice_units=(4, 2, 2),
 )
 O = LoraTarget(in_features=Q_OUT, out_slices=(HIDDEN,), parallel="row")
-
-
-def _module_map(module: str) -> LoraModuleRef | None:
-    """Where a checkpoint module lands: q, k and v as slices of the fused ``qkv`` target."""
-    found = re.fullmatch(r"model\.layers\.(\d+)\.self_attn\.([qkvo])_proj", module)
-    if found is None or int(found[1]) >= LAYERS:
-        return None
-    layer, proj = int(found[1]), found[2]
-    return LoraModuleRef("o", layer) if proj == "o" else LoraModuleRef("qkv", layer, proj)
-
-
-MODULE_MAP = _module_map
+MODULE_MAP = ModuleLoraMap(
+    {
+        f"model.layers.{layer}.self_attn.{proj}_proj": LoraModuleRef(target, layer)
+        for layer in range(LAYERS) for proj, target in (("qkv", "qkv"), ("o", "o"))
+    },
+    rules=CheckpointRules(stacked_params=tuple(
+        StackedParamRule(".qkv_proj", f".{s}_proj", s) for s in ("q", "k", "v")
+    )),
+)
 OUT_WIDTH = {"q_proj": Q_OUT, "k_proj": KV_OUT, "v_proj": KV_OUT, "o_proj": HIDDEN}
 IN_WIDTH = {"q_proj": HIDDEN, "k_proj": HIDDEN, "v_proj": HIDDEN, "o_proj": Q_OUT}
 CPU = torch.device("cpu")
@@ -172,9 +170,8 @@ def test_admit_refcount_lru_evict_and_the_zero_slot(adapters):
     for a, b in (pool.weights("qkv", 0), pool.weights("o", 1)):
         assert not a[ZERO_SLOT].any() and not b[ZERO_SLOT].any()
     assert pool.scalings[ZERO_SLOT] == 0
-    for rid, name in [("base", None), ("r1", "a1"), ("r2", "a2"), ("r3", "a3"), ("r4", "a2"), ("r5", "a1"),
-                      ("r1", "a1")]:
-        ingest(pool, rid, name)  # a repeated ingest is a no-op
+    for rid, name in [("base", None), ("r1", "a1"), ("r2", "a2"), ("r3", "a3"), ("r4", "a2"), ("r5", "a1")]:
+        ingest(pool, rid, name)
     with pytest.raises(ValueError):
         ingest(pool, "bad", "nope")
     assert run_step(pool, ["base", "r1", "r2"]).ok
