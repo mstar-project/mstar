@@ -1969,6 +1969,11 @@ class TensorCommunicationManager(ABC):
             return tensor
         return self._undo_leading_shard_dim(shard_dim, tensor)
 
+    def clone_received(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Copies of tensors this manager read in, for a caller that keeps them
+        after handing the reads back (a stream buffer's items)."""
+        return [tensor.clone() for tensor in tensors]
+
     def drop_host_copies(self) -> None:
         """Forget the host copies stored with a step's outputs once that step's
         sends are done. They are views of buffers the producer reuses on its
@@ -2603,6 +2608,45 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # The send is a host write, so a host copy the producer already made
         # saves the device-to-host copy here.
         return True
+
+    def clone_received(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Copy on the stream the reads ran on, behind their copies, then
+        order the current stream after it once.
+
+        A read on another stream can see a received tensor's memory as it was
+        before its host-to-device copy, though the copy's event has fired and
+        that stream waited on it (seen on MI325X with ROCm 7.2); work on the
+        copy stream reads the copied bytes. Tensors of one shape and dtype are
+        stacked into one block and handed out as its rows: one kernel and one
+        block per shape, not one per tensor. Each block is marked as used by
+        the current stream, so the copy stream's pool cannot give it to the
+        next read while that stream still reads it.
+        """
+        stream = self._h2d_stream
+        if stream is None or not any(tensor.is_cuda for tensor in tensors):
+            return super().clone_received(tensors)
+        consumer = torch.cuda.current_stream(self.device)
+        groups: dict[tuple, list[int]] = {}
+        for i, tensor in enumerate(tensors):
+            groups.setdefault((tensor.device, tensor.dtype, tuple(tensor.shape)), []).append(i)
+        copies: list[torch.Tensor] = [None] * len(tensors)
+        blocks = []
+        with torch.cuda.stream(stream):
+            for (device, _, _), index in groups.items():
+                if device.type != "cuda" or len(index) == 1:
+                    for i in index:
+                        copies[i] = tensors[i].clone()
+                        blocks.append(copies[i])
+                    continue
+                block = torch.stack([tensors[i] for i in index])
+                blocks.append(block)
+                for row, i in enumerate(index):
+                    copies[i] = block[row]
+        consumer.wait_stream(stream)
+        for block in blocks:
+            if block.is_cuda:
+                block.record_stream(consumer)
+        return copies
 
     def _send_source(self, uuid: int) -> torch.Tensor:
         """What to serialize for ``uuid``: the stored host copy if there is
