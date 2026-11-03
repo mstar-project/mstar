@@ -177,8 +177,6 @@ SAMPLER = "sampler"
 # diffusers' pipeline keeps it; only the transformer input is bf16. Windowed
 # rollouts keep their latents in the model dtype.
 LATENT_DTYPE = torch.float32
-# The conditioning encode runs in the VAE checkpoint's dtype, as the reference does.
-ENCODE_DTYPE = torch.bfloat16
 
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
@@ -2592,9 +2590,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
     def __init__(self, vae, config):
         super().__init__()
         # Dedicated instance (not shared with the decoder node): the encode
-        # runs in ENCODE_DTYPE while the decode dtype is cuDNN-gated, and
-        # sharing would re-cast the full VAE weights every encode/decode
-        # interleave.
+        # runs in this VAE's own dtype (bf16, see Cosmos3Model._build_encode_vae)
+        # while the decode dtype is cuDNN-gated, and sharing would re-cast the
+        # full VAE weights every encode/decode interleave.
         self.vae = vae
         self.config = config
         self._video_processor = None
@@ -2693,15 +2691,15 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
         vae = self.vae
-        # bf16 like the reference pipeline's encode and latent normalization (the
-        # checkpoint is bf16, so the cast is lossless). An fp32 encode moves the
-        # anchor latent enough to move the whole i2v trajectory.
-        if next(vae.parameters()).dtype != ENCODE_DTYPE:
-            vae.to(ENCODE_DTYPE)
+        # In the VAE's own dtype, like the reference pipeline's encode and latent
+        # normalization: bf16 as built and as the engine casts this node. An
+        # fp32 encode moves the anchor latent enough to move the whole i2v
+        # trajectory.
+        dtype = next(vae.parameters()).dtype
         device = vision.device
-        mean, inv_std = _latent_affine(vae, ENCODE_DTYPE, device)
+        mean, inv_std = _latent_affine(vae, dtype, device)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision.to(ENCODE_DTYPE)).latent_dist.mode()
+            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
@@ -2789,10 +2787,11 @@ class ChainedWindowHead:
     decode the ``vae_decoder`` node runs (compiled, channels-last, the
     cuDNN-gated dtype, the frames quantized as served), behind
     ``chained_head_context_latents`` latents of the same window so the causal
-    decoder is warm at the kept frames; the encode runs fp32 like the encoder
-    node's. Both VAEs are the model's shared copies when the nodes share a
-    process. Held outside the module tree, so the engine's casts of the DiT
-    never reach them.
+    decoder is warm at the kept frames; the encode runs in the encode VAE's
+    own dtype (bf16), as the encoder node's and the reference's
+    video-to-video encode do. Both VAEs are the model's shared copies when
+    the nodes share a process. Held outside the module tree, so the engine's
+    casts of the DiT never reach them.
     """
 
     def __init__(self, decode_vae, encode_vae, config):
@@ -2807,11 +2806,11 @@ class ChainedWindowHead:
         frames = 1 + (units - 1) * self.config.vae.scale_factor_temporal
         pixels = self.decoder._decode_pixels(z)[:, :, -frames:]
         vae = self.encode_vae
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
-        mean, inv_std = _latent_affine(vae, torch.float32, z.device)
+        # read, never re-cast: the instance is the encoder node's when they share a process
+        dtype = next(vae.parameters()).dtype
+        mean, inv_std = _latent_affine(vae, dtype, z.device)
         with torch.autocast(device_type=z.device.type, enabled=False):
-            raw_mu = vae.encode(pixels.to(torch.float32) / 127.5 - 1).latent_dist.mode()
+            raw_mu = vae.encode((pixels.to(torch.float32) / 127.5 - 1).to(dtype)).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(window_latents.dtype)
 
 
