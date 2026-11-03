@@ -336,7 +336,9 @@ def _postprocess(config, walk, *, iteration=0, audio_output=True, first=True):
         graph_walk=walk, step_metadata={"audio_output": audio_output},
         dynamic_loop_iter_counts={"thinker_decode_loop": iteration} if iteration else {},
     )
-    thinker.postprocess(0, info, outputs)
+    # the row's inputs, as the engine passes them: what the Talker keeps is known on the host
+    inputs = SimpleNamespace(tensor_inputs={"masks_for_talker": mask, "talker_keep": mask[0] | mask[1]})
+    thinker.postprocess(0, info, outputs, inputs=inputs)
     return outputs
 
 
