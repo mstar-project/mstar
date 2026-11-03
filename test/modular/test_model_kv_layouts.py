@@ -262,6 +262,34 @@ def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, m
     assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
 
 
+def _first_token_at_prefill(model_name):
+    """(model, decode loop) for a model whose prefill samples the reply's first token."""
+    if model_name == "higgs_audio":
+        return _higgs(), "decode_loop"
+    if model_name == "whisper":
+        return _whisper(), "decode_loop"
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    cls, loop = {
+        "orpheus": (OrpheusModel, "decode_loop"),
+        "qwen3_5": (Qwen3_5DenseModel, "decode_loop"),
+        "qwen3_omni": (Qwen3OmniModel, "thinker_decode_loop"),
+    }[model_name]
+    return object.__new__(cls), loop
+
+
+@pytest.mark.parametrize("max_tokens", [2, 3, 64])
+@pytest.mark.parametrize("model_name", ["higgs_audio", "orpheus", "qwen3_5", "qwen3_omni", "whisper"])
+def test_the_prefills_token_and_the_decode_cap_add_up_to_max_output_tokens(model_name, max_tokens):
+    """The decode loop's cap alone ends it (``TokenStop``), one token a step,
+    after the prefill's."""
+    model, loop = _first_token_at_prefill(model_name)
+
+    assert 1 + model.get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
+
+
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(variant):
     from mstar.model.chatterbox.components.audio_frontend import resample, trim_reference
@@ -446,9 +474,8 @@ def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
-@pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
+@pytest.mark.parametrize("talker_max_tokens", [0, 1, 2, 64])
 def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
-    pytest.importorskip("flashinfer")
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
 
@@ -459,6 +486,9 @@ def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_
         2048, {"layer0_codes": [torch.tensor([NOT_EOS])]}, max_tokens=2048,
         step_metadata={"talker_max_tokens": talker_max_tokens},
     ), "the cap and the stop check end decode on different iterations"
+    if talker_max_tokens > 1:
+        # talker_last_prefill streams the first frame to Code2Wav
+        assert 1 + cap["talker_decode_loop"] == talker_max_tokens
 
 
 def _tiny_qwen3_tts_talker():
