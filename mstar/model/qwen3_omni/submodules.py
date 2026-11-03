@@ -1718,8 +1718,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         is_eos = eos_token_id is not None and eos_token_id == token
         stops = set()
+        # talker_last_prefill streamed the first frame, so decode step k streams frame k + 2
         if is_eos or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 2 >= max_tokens):
             stops = {"talker_decode_loop"}
         return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
 
