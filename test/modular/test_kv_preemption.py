@@ -389,6 +389,30 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
 
 
+def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_the_offload_leaves_it():
+    """`reclaimable` answered 0 for a guaranteed request on the rank that decides only, so a follower's replay read
+    another number, and a teardown needed a second hook to count its pages."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "g", 2, arrival=0, guaranteed=True)
+
+    assert kv.reclaimable("g") == len(kv._streams["g"]["main"].pages()), "reclaimable answered by class"
+    assert kv.offload("g") == 0 and kv.is_resident("g"), "a guaranteed request was moved to the host"
+
+
+def test_a_guaranteed_request_that_wrote_nothing_keeps_its_allotment_when_an_older_one_runs_short():
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _request(kv, "g", 2, arrival=1, guaranteed=True)
+    assert _ready(kv, "g")
+    short = _step(kv, "o", 2 * PAGE_SIZE).reason.pages_short
+
+    assert _preempt(kv, "o", short, droppable=lambda rid: False) == Victims([], [], [], waits=True), (
+        "a guaranteed request gave back its allotment for an older request's shortage"
+    )
+    assert "g" in kv._allotments
+
+
 def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     """A host fetch holds a run of cached pages that starts below the root, and eviction takes leaves only, so the
     pages above that run stay. Counting those pages as room would send a victim to a host that can't take

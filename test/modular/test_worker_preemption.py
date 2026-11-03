@@ -311,6 +311,29 @@ def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
     assert configs["kv"].rebuildable, "a node that writes nothing for the request made it guaranteed"
 
 
+@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
+def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
+    """A drop lays the pool's one label out again as one span of the policy's walk. The second label is written
+    in a walk and a loop this worker doesn't run, so only the pool's own layout refuses it."""
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    span, growth = PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"), (("decode", 1),)
+    layouts = {"main": StreamLayout(spans=(span,), growth=growth)}
+    if layout == "two labels":
+        layouts["uncond"] = StreamLayout(spans=(PrefixSpan(4, 4, "cfg_text"),), growth=(("cfg_loop", 1),))
+    elif layout == "two spans":  # as a prompt prefilled over two rows
+        layouts["main"] = StreamLayout(spans=(span, PrefixSpan(4, 4, "prefill")), growth=growth)
+    else:
+        layouts["main"] = StreamLayout(spans=(span,), growth=(*growth, ("other_loop", 1)))
+    configs = {"kv": KVReqConfig(kv_layout=layouts, loop_caps={"decode": 64, "cfg_loop": 4, "other_loop": 4})}
+
+    w._set_rebuildable(configs)
+
+    assert not configs["kv"].rebuildable, "a request its rebuild couldn't bring back could be dropped"
+
+
 def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
     kv = _pool()
     _running(kv, "r", 5, arrival=1)

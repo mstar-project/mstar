@@ -108,11 +108,12 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["step", "read", "ranks", "host", "guaranteed"])
+@pytest.mark.parametrize("refusal", ["step", "read", "ranks", "host", "guaranteed", "not rebuildable"])
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE)
     kv._guaranteed.update({"r"} if refusal == "guaranteed" else ())
+    kv._overrides["r"].rebuildable = refusal != "not rebuildable"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
     kv._world_size = 2 if refusal == "ranks" else kv._world_size

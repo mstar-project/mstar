@@ -624,6 +624,20 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
 
 
+def test_a_candidate_that_wont_move_gives_way_to_the_next_in_line():
+    """A pool never moves a request it guarantees, so its offload frees nothing. Giving up at the first
+    candidate that didn't move left the refused step without room that the next one would have made."""
+    worker = _EvictingWorker(["r0", "r1", "g"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    engine = worker.engine_manager.get_engine(SCHED_NODE)
+    offload = engine.offload_request
+    engine.offload_request = lambda node, rid, affected_resources=None: 0 if rid == "g" else offload(node, rid)
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "r1", (
+        "the offload gave up after a candidate that didn't move"
+    )
+    assert worker.offloaded == ["r1"]
+
+
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
     """A mixed batch limited to one row: every step under it holds one walk
     and carries that walk's label. The first of them to admit has to lift
