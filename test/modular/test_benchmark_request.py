@@ -1,6 +1,7 @@
 """benchmark/request.py and runner.py: what the client sends and how a run's figures are counted (CPU)."""
 
 import asyncio
+import base64
 import json
 import random
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
-from benchmark import runner  # noqa: E402
+from benchmark import asr_eval, runner  # noqa: E402
 from benchmark.base import Model, Orpheus, RequestType  # noqa: E402
 from benchmark.request import (  # noqa: E402
     OursOpenAI,
@@ -19,6 +20,7 @@ from benchmark.request import (  # noqa: E402
     _record_vllm_omni_chunk,
     aggregate_metrics,
 )
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: E402
 
 
 class _TextModel(Model):
@@ -147,3 +149,11 @@ def test_an_offline_run_stamps_each_request_its_own_length_and_fills_its_last_wa
     asyncio.run(bench.run())
     rng = random.Random(cfg.output_len_seed)
     assert [r.model_kwargs["max_tokens"] for r in sent] == [rng.randint(1, 1000) for _ in range(8)]
+
+
+def test_qwen3_asr_is_scored_without_its_language_prefix():
+    """/generate returns "language English<asr_text>..."; the prefix is not transcript (#1027)."""
+    text = base64.b64encode(f"language English{ASR_TEXT_TAG}hi there".encode()).decode()
+    session = _Session([json.dumps({"modality": "text", "data": text}).encode()])
+    req = RequestInput(req_type=RequestType.A2T, prompt="")
+    assert asyncio.run(asr_eval._transcribe(session, req, "http://x", 0, _TextModel())) == (0, "hi there", None)
