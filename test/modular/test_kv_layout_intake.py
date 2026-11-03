@@ -291,6 +291,17 @@ def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs,
     assert [config.guaranteed for config in configs.values()] == [guaranteed] * 2, "a pool got another class"
 
 
+def test_the_conductor_leaves_a_rows_span_to_the_pools_that_hold_it(tmp_path, monkeypatch):
+    """An unstreamed Qwen3-Omni chat with audio out lays out rows only in the Talker's pool, since the Talker reads
+    the Thinker's hidden states. Guaranteed in every pool, it would reserve the Thinker's whole decode cap, though
+    a rebuild writes the Thinker's ids again."""
+    model = _Model()
+    new_request = _ingest(model, _preprocess(model, {}), tmp_path, monkeypatch, outputs=["text", "audio"])
+    assert not new_request.request_info.resource_configs["kv"].guaranteed, (
+        "a rows span made the request guaranteed in every pool"
+    )
+
+
 def test_the_conductor_marks_a_request_that_streams_audio_guaranteed(tmp_path, monkeypatch):
     model = _Model({"kv": {"main": LAYOUT["kv"]["main"], "uncond": LabelLayout()}})
     kwargs = _preprocess(model, {})
