@@ -435,7 +435,7 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
         register_request=lambda rid, sharding: None,
         start_read_tensors=lambda *a, **kw: pytest.fail("a drained request started a read"),
     )
-    w._keep_ids = w._guarantee = lambda rid, configs: None
+    w._rebuilds, w._kv_writes = Rebuilds({}, {}), {}
     w.scheduler = SimpleNamespace(fail_rids=stopped.extend, note_arrival=lambda rid: None)
     w._process_message_list = processed.extend
     body = SimpleNamespace(
