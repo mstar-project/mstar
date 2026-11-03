@@ -324,6 +324,36 @@ def test_vjepa2_ac_decodes_only_the_frames_its_walk_encodes(monkeypatch, tmp_pat
     assert out["video_inputs"] == []
 
 
+def _vjepa2_prompt(monkeypatch, tmp_path, **kwargs):
+    """V-JEPA 2's masked-predictor process_prompt on a 1000-frame upload."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    _fake_torchcodec(monkeypatch, [], _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    model._preprocess_frames = lambda frames: frames.float()  # no HF processor without weights
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    return model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]}, **kwargs,
+    ).new_input_tensors
+
+
+@pytest.mark.parametrize("masks", [
+    {"target_mask": [[0, 1]]},  # alone, it was replaced by the full-coverage default
+    {"context_mask": [[0, 1]]},
+    {"context_mask": [[0, 1]], "target_mask": [[256]]},  # 2 frames are 256 tokens; the gather device-asserted
+    {"context_mask": [[0, 1]], "target_mask": [["abc"]]},  # a TypeError: a 500
+    {"context_mask": [[0.9, 1]], "target_mask": [[1]]},  # silently truncated to [[0, 1]]
+])
+def test_vjepa2_masks_come_together_and_index_the_clips_tokens(monkeypatch, tmp_path, masks):
+    with pytest.raises(ValueError, match="mask"):
+        _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, **masks)
+    out = _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, context_mask=[[0, 255]], target_mask=[[1]])
+    assert out["target_mask"][0].tolist() == [[1]]
+
+
 @pytest.mark.parametrize("key_frames, decoders", [
     (torch.tensor([0, 10, 20, 30, 40]), 3),  # one per group of GOPs; the index's decoder decodes the first
     ([0, 10, 20, 30, 40], 3),  # the list torchcodec's annotation promises
