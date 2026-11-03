@@ -409,12 +409,22 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
 # ── the worker's side ───────────────────────────────────────────────────
 
 
-def _worker(chain: ChainPick, prep, taken=None) -> SimpleNamespace:
+def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
+    asked = {} if asked is None else asked
+
+    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None):
+        asked["pick"] = next_iter_of
+        return chain
+
+    def backlog_splits_from(state, target, rid, next_iter_of=None):
+        asked["yield"] = next_iter_of
+        return False
+
     worker = SimpleNamespace(
         worker_id="w0",
         scheduler=SimpleNamespace(
-            backlog_splits_from=lambda *a: False,
-            pick_chain_step=lambda state, target, continuing, mid_prefill=(): chain,
+            backlog_splits_from=backlog_splits_from,
+            pick_chain_step=pick_chain_step,
             take_chain_step=lambda state, chain, *_: taken,
         ),
         _spec_preparer=SimpleNamespace(prepare=prep),
@@ -452,10 +462,13 @@ def test_prep_gets_the_chains_rows_in_line_and_the_room():
         return SimpleNamespace(ready_rids=[])
 
     pick = StepPick(taken=[2, 9], continuing=[2, 3, 1], room=1, held_back=set(), ordered=True)
-    worker = _worker(ChainPick(KEY, pick, []), prep)
+    asked = {}
+    worker = _worker(ChainPick(KEY, pick, []), prep, asked=asked)
 
     assert worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3])) is None
     assert seen == {"rids": [2, 3, 1], "room": 1}
+    # the chain's rows run the step one iteration on, and the scheduler groups them there
+    assert asked == {"pick": "denoise", "yield": "denoise"}
 
 
 def test_a_chain_that_gives_its_whole_step_away_runs_the_waiting_rows():

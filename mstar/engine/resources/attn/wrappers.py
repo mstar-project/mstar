@@ -19,7 +19,10 @@ import logging
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
@@ -100,16 +103,30 @@ def _prefill_plan_is_direct(w) -> bool:
     )
 
 
-def _decode_plan_is_direct(w) -> bool:
-    """Whether FlashInfer decode wrapper ``w``'s plan resolved to the one
-    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2
-    tensor-core decode under a graph, one query token per row, no window."""
-    return (
-        _direct_plan_supported()
-        and w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
+# The two FlashInfer decode planners ``_plan_direct`` reproduces: the batch
+# prefill module's (tensor-core decode) and the batch decode module's (CUDA-core
+# decode, which an MHA model such as Whisper takes: the tensor-core kernel pads
+# one query head per KV head to a tile).
+_TENSOR_CORE_DECODE, _CUDA_CORE_DECODE = "tensor_cores", "cuda_cores"
+
+
+def _decode_direct_variant(w) -> str | None:
+    """Which planner FlashInfer decode wrapper ``w``'s plan resolved to, when
+    ``_plan_direct`` reproduces it on a checked FlashInfer version: fa2
+    tensor-core or generic CUDA-core decode, under a graph, one query token per
+    row, no window, no soft cap. None otherwise. CUDA-core decode takes the
+    generic module under "auto" (unless it resolved to cuDNN) and "fa2" alike."""
+    if not (
+        _direct_plan_supported() and w.is_cuda_graph_enabled
         and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
         and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
-    )
+    ):
+        return None
+    if w.use_tensor_cores:
+        return _TENSOR_CORE_DECODE if w._backend == "fa2" else None
+    if w._backend in ("auto", "fa2") and not w._logits_soft_cap:
+        return _CUDA_CORE_DECODE
+    return None
 
 
 class FlashInferPrefillWrapper:
@@ -119,7 +136,7 @@ class FlashInferPrefillWrapper:
     CUDA graph mode using static buffers. KV writes are the KVManager's job.
 
     Args:
-        workspace_buffer: FlashInfer workspace (256MB+ recommended)
+        workspace_buffer: the `Workspace` it plans through, which grows to what a plan asks for
         num_qo_heads: number of query/output heads
         num_kv_heads: number of key/value heads
         head_dim: dimension per head
@@ -133,7 +150,7 @@ class FlashInferPrefillWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -157,6 +174,7 @@ class FlashInferPrefillWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -181,7 +199,7 @@ class FlashInferPrefillWrapper:
             )
 
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer,
+                self._workspace.tensor,
                 "NHD",
                 use_cuda_graph=True,
                 qo_indptr_buf=self._qo_indptr_buf,
@@ -200,7 +218,7 @@ class FlashInferPrefillWrapper:
             )
         else:
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD", backend=backend
+                self._workspace.tensor, "NHD", backend=backend
             )
             self.token_to_page = None
             self.token_to_cache = None
@@ -294,7 +312,8 @@ class FlashInferPrefillWrapper:
                 self._pinned_done.record()
             return
         self.dtype = dtype
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
@@ -333,7 +352,8 @@ class FlashInferPrefillWrapper:
             )
             return
         self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=self._paged_kv_indices_buf[:n],
@@ -439,7 +459,7 @@ class FlashInferDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -462,8 +482,11 @@ class FlashInferDecodeWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
-        # set by the first plan when ``_plan_direct`` may take the later ones
+        # set by the first plan when ``_plan_direct`` may take the later ones,
+        # with where in them the per-step indptr and lengths go
         self._planner_args: list | None = None
+        self._planner_slots: tuple[int, int | None] = (4, 5)
+        self._workspace = workspace_buffer
 
         import flashinfer
 
@@ -484,7 +507,7 @@ class FlashInferDecodeWrapper:
             )
 
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer,
+                self._workspace.tensor,
                 "NHD",
                 use_cuda_graph=True,
                 use_tensor_cores=use_tensor_cores,
@@ -495,7 +518,7 @@ class FlashInferDecodeWrapper:
             )
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD",
+                self._workspace.tensor, "NHD",
                 use_tensor_cores=use_tensor_cores,
                 backend=backend,
             )
@@ -547,7 +570,8 @@ class FlashInferDecodeWrapper:
 
             range_push("flashinfer.decode.plan_inner", synchronize=False)
         try:
-            self.attn_wrapper.plan(
+            self._workspace.plan(
+                self.attn_wrapper.plan,
                 indptr=paged_kv_indptr,
                 indices=paged_kv_indices,
                 last_page_len=paged_kv_last_page_len,
@@ -571,17 +595,32 @@ class FlashInferDecodeWrapper:
 
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
-        indptr and lengths, when its plan resolved to the one path
-        ``_plan_direct`` reproduces (``_decode_plan_is_direct``); else None.
-        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
-        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
+        indptr (and, for tensor-core decode, the lengths), when its plan
+        resolved to a path ``_plan_direct`` reproduces
+        (``_decode_direct_variant``); else None. Restating them is what vLLM
+        and SGLang do too, on a pinned FlashInfer (see
+        ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
         ``fast_decode_plan``, the direct path sets no per-step state but the
         plan."""
         w = self.attn_wrapper
-        if not _decode_plan_is_direct(w):
+        variant = _decode_direct_variant(w)
+        if variant is None:
             return None
+        if variant == _CUDA_CORE_DECODE:
+            self._planner_slots = (3, None)
+            return [
+                w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+                None,  # indptr
+                n_req, self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+                -1,  # window_left
+                0.0,  # logits_soft_cap
+                self.head_dim, self.head_dim,
+                torch.empty(0, dtype=w._cached_q_data_type),
+                torch.empty(0, dtype=w._cached_kv_data_type),
+            ]
         from flashinfer.utils import _get_range_buf
 
+        self._planner_slots = (4, 5)
         return [
             w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
             _get_range_buf(n_req + 1, "cpu"), None, None,
@@ -609,8 +648,10 @@ class FlashInferDecodeWrapper:
         if indices.data_ptr() != dst.data_ptr():
             dst.copy_(indices, non_blocking=indices.device == dst.device)
         args = self._planner_args
-        args[4] = indptr
-        args[5] = kv_lens
+        at_indptr, at_lens = self._planner_slots
+        args[at_indptr] = indptr
+        if at_lens is not None:
+            args[at_lens] = kv_lens
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
@@ -626,6 +667,23 @@ class FlashInferDecodeWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
+@triton.jit
+def _gather_block_rows_kernel(
+    slots_ptr, kv_len_ptr, store_ptr, table_ptr, lens_ptr,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, WIDTH: tl.constexpr,
+):
+    i = tl.program_id(0)
+    n = tl.load(kv_len_ptr + i) + 1
+    tl.store(lens_ptr + i, n.to(tl.int32))
+    row = tl.load(slots_ptr + i) * STRIDE + BLOCK
+    pages = (n + PAGE - 1) // PAGE
+    for start in tl.range(0, pages, 32):
+        cols = start + tl.arange(0, 32)
+        keep = cols < pages
+        values = tl.load(store_ptr + row + cols, mask=keep, other=0)
+        tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=keep)
+
+
 class FmhaDecodeWrapper:
     """Captured decode attention on FlashInfer's trtllm-gen fmha kernel.
 
@@ -637,7 +695,7 @@ class FmhaDecodeWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -654,7 +712,7 @@ class FmhaDecodeWrapper:
         check_flashinfer_head_dim(head_dim, device)
         self.batch_size = batch_size
         self.dtype = torch.bfloat16
-        self._workspace = workspace_buffer
+        self._workspace = workspace_buffer.tensor
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._scale = head_dim ** -0.5
@@ -711,6 +769,17 @@ class FmhaDecodeWrapper:
         self._planned = True
         self.dtype = dtype
         self._window_left = window_left
+
+    def gather_resident(
+        self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+    ) -> None:
+        """Inside a resident step's capture: this step's rows off the tables,
+        into the table and lengths the kernel holds the addresses of. Only the
+        columns a row reads; the rest of the table is never looked at."""
+        _gather_block_rows_kernel[(self.batch_size,)](
+            slots, kv_len, store, self._table, self._lens,
+            STRIDE=stride, BLOCK=block_col, PAGE=self._page_size, WIDTH=self._table.shape[1], num_warps=1,
+        )
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -789,8 +858,8 @@ class FlashInferMixedWrapper:
 
     def __init__(
         self,
-        decode_workspace: torch.Tensor,
-        prefill_workspace: torch.Tensor,
+        decode_workspace: Workspace,
+        prefill_workspace: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,

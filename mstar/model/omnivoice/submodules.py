@@ -38,13 +38,8 @@ from mstar.model.omnivoice.components.backbone import (
 from mstar.model.omnivoice.components.codec import (
     decode_canvas,
     encode_reference,
-    post_process,
 )
-from mstar.model.omnivoice.components.unmask import (
-    apply_reveal,
-    build_reveal_schedule,
-    predict_tokens_with_scoring,
-)
+from mstar.model.omnivoice.components.unmask import build_reveal_schedule, unmask_step
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -273,7 +268,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 "audio_tokens": tokens,
                 "step_index": step_index,
             },
-            # the iteration, for postprocess: at iteration 0 the loop counter
+            # the iteration, for forward_batched: at iteration 0 the loop counter
             # is not there yet, and reading the step edge would sync
             kwargs={"item": item, "step": k},
             # The row's packed contribution: its conditional document plus,
@@ -389,6 +384,9 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         return {
             "items": items,
             "canvas": build_packed_canvas(items, device),
+            "steps": [row.kwargs["step"] for row in inputs],
+            "step_index": torch.cat([row.tensor_inputs["step_index"] for row in inputs])
+            if len(inputs) > 1 else inputs[0].tensor_inputs["step_index"],
         }
 
     def max_batch_size(self, graph_walk: str):
@@ -401,17 +399,14 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         plus a head GEMM over ``2 * sum(target_len)``; eight 30-second requests
         and eight 2-second ones are two very different steps. Row count alone
         would let the first case allocate a logits tensor several hundred MB
-        wide.
-
-        The cap is deliberately conservative and has room now that the
-        float32 upcast is per request rather than over the whole batch, but
-        raising it is a measurement, not a guess, so it stays where it was.
+        wide, and the unmask step scores those logits in float32, a few copies
+        at a time.
         """
         packed = sum(inp.input_seq_len for inp in model_inputs)
         if packed > self.config.max_packed_tokens:
             logger.debug(
                 "OmniVoice backbone: %d packed tokens over the %d cap; "
-                "the scheduler will split this batch",
+                "the engine runs each request as its own forward",
                 packed, self.config.max_packed_tokens,
             )
             return False
@@ -425,99 +420,55 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         items: list[CanvasItem] | None = None,
         canvas: PackedCanvas | None = None,
+        steps: list[int] | None = None,
+        step_index: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """One packed forward over the whole batch.
+        """One unmask iteration for the whole batch: the packed backbone
+        forward, then every request's scoring and reveal in one batched pass
+        (``unmask_step``), so a step launches the same kernels for 1 request
+        as for 16.
 
-        Nothing request-shaped happens here: the canvas arrives built from
-        ``preprocess`` and the CFG branches leave as a per-request pair of
-        logit blocks, so the body is a single backbone call.
-
-        The float32 upcast happens per slice rather than on the whole packed
-        tensor. Scoring needs float32, but casting first materialises a
-        float32 copy of every request's logits at once, and that peak is what
-        ``max_packed_tokens`` has to be set low enough to survive. Casting
-        after the slice keeps the peak at one batch in the backbone's dtype
-        plus one request in float32.
+        Each request keeps its own reveal schedule, knobs and seeded RNG. The
+        iteration index is the one ``prepare_inputs`` took from the loop
+        counter (see ``_loop_step``); the knobs come from step metadata.
         """
-        assert items is not None and canvas is not None, (
+        assert items is not None and canvas is not None and steps is not None and step_index is not None, (
             "OmniVoice backbone requires preprocess output"
         )
         logits = self._logits(engine_inputs, canvas)
-        outputs: dict[str, NameToTensorList] = {}
-        # keyed by the engine's row ids (worker-local handles), never by the
-        # request id prepare_inputs saw on the wire
-        for rid, item in zip(engine_inputs.request_ids, items, strict=True):
-            c_logits, u_logits = canvas.slice_logits(logits, item)
-            row: NameToTensorList = {"c_logits": [c_logits[0].to(torch.float32)]}
-            # An item with CFG off has no unconditional document. Echo the
-            # conditional block so the edge keeps one shape for every request;
-            # scoring ignores it at guidance_scale 0.
-            row["u_logits"] = (
-                [u_logits[0].to(torch.float32)]
-                if u_logits is not None
-                else row["c_logits"]
+        infos = [engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids]
+        metas = [info.step_metadata for info in infos]
+        counts = []
+        for item, meta, k in zip(items, metas, steps, strict=True):
+            schedule = build_reveal_schedule(
+                target_len=item.target_len,
+                num_codebook=self.config.num_audio_codebook,
+                num_step=int(meta["num_step"]),
+                t_shift=float(meta["t_shift"]),
             )
-            outputs[rid] = row
-        return outputs
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        inputs: NodeInputs | None = None,
-        **kwargs,
-    ):
-        """Turn this request's logits into its next canvas.
-
-        Scoring, the reveal schedule and the in-place write are per-request and
-        data-dependent, which is what keeps them out of ``forward_batched``.
-        The iteration index is the one ``prepare_inputs`` took from the loop
-        counter (see ``_loop_step``); everything else comes from step metadata.
-        """
-        assert inputs is not None, "OmniVoice backbone postprocess needs its inputs"
-        meta = request_info.step_metadata
-        k = inputs.kwargs["step"]
-
-        # Cloned because apply_reveal writes in place and this tensor is the
-        # edge the engine routed in from the previous iteration; mutating it
-        # would edit state the engine still owns.
-        tokens = inputs.tensor_inputs["audio_tokens"].clone().unsqueeze(0)
-        schedule = build_reveal_schedule(
-            target_len=tokens.shape[-1],
-            num_codebook=self.config.num_audio_codebook,
-            num_step=int(meta["num_step"]),
-            t_shift=float(meta["t_shift"]),
-        )
-        # Reseeded per step from the request's seed plus the iteration, so a
-        # replay matches step for step; one generator for the whole request
-        # would only match if every step ran in the same order, which async
-        # scheduling does not promise.
-        generator = self._step_generator(request_info, k, tokens.device)
-        pred_tokens, scores = predict_tokens_with_scoring(
-            c_logits=outputs["c_logits"][0].unsqueeze(0),
-            u_logits=outputs["u_logits"][0].unsqueeze(0),
+            counts.append(schedule[k] if k < len(schedule) else 0)
+        tokens = unmask_step(
+            logits,
+            canvases=[item.tokens[0] for item in items],
+            uncond_rows=canvas.uncond_rows(),
+            counts=counts,
+            generators=[self._step_generator(info, k, logits.device) for info, k in zip(infos, steps, strict=True)],
+            guidance_scale=[item.guidance_scale for item in items],
+            class_temperature=[float(meta["class_temperature"]) for meta in metas],
+            layer_penalty_factor=[float(meta["layer_penalty_factor"]) for meta in metas],
+            position_temperature=[float(meta["position_temperature"]) for meta in metas],
             audio_mask_id=self.config.audio_mask_id,
-            guidance_scale=float(meta["guidance_scale"]),
-            class_temperature=float(meta["class_temperature"]),
-            generator=generator,
         )
-        tokens = apply_reveal(
-            tokens=tokens,
-            pred_tokens=pred_tokens,
-            scores=scores,
-            reveal_count=schedule[k] if k < len(schedule) else 0,
-            audio_mask_id=self.config.audio_mask_id,
-            layer_penalty_factor=float(meta["layer_penalty_factor"]),
-            position_temperature=float(meta["position_temperature"]),
-            generator=generator,
-        )
-
-        outputs.pop("c_logits", None)
-        outputs.pop("u_logits", None)
-        outputs["audio_tokens"] = [tokens[0]]
-        outputs["step_index"] = [inputs.tensor_inputs["step_index"] + 1]
+        next_index = step_index + 1
+        # keyed by the engine's ids for the rows (the worker's handles), not the wire ids
+        return {
+            rid: {
+                "audio_tokens": [tokens[:, item.flat_start:item.flat_start + item.target_len]],
+                "step_index": [next_index[i:i + 1]],
+            }
+            for i, (rid, item) in enumerate(zip(engine_inputs.request_ids, items, strict=True))
+        }
 
     @staticmethod
     def _step_generator(
@@ -525,9 +476,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     ) -> torch.Generator | None:
         """The request's RNG for iteration ``k``.
 
-        The conductor derives a seed per request, so this is normally always
-        set and the fallback is only for a caller that drives the submodule
-        without one.
+        Reseeded per step from the request's seed plus the iteration, so a
+        replay matches step for step; one generator for the whole request
+        would only match if every step ran in the same order, which async
+        scheduling does not promise. The conductor derives a seed per request,
+        so this is normally always set and the fallback is only for a caller
+        that drives the submodule without one.
         """
         seed = getattr(request_info, "random_seed", None)
         if seed is None:
@@ -572,15 +526,20 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
 
 class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
-    """Decode the finished canvas and apply the reference's output shaping.
+    """Decode the finished canvas to the codec's float waveform.
 
-    Emits ``audio_output``, 1-D **int16 PCM** at the codec's sample rate: the
-    speech handler concatenates node output straight into a WAV container, so
-    the conversion belongs here, as it does for orpheus and qwen3_tts.
+    Emits ``audio_output``, 1-D float32 at the codec's sample rate, and nothing
+    else happens here: the reference's output shaping (silence trim, level,
+    fade, pad) and the PCM16 conversion run in ``OmniVoiceModel.postprocess``
+    on the API side. Done in this step they synced the host and held up the
+    unmask loop of every other request.
 
     A canvas that still holds a MASK cell means the loop ended early, which
-    would decode to noise — that is a fault, not a degraded result, so it
-    raises rather than emitting.
+    would decode to noise -- a fault, not a degraded result. The MASK id is
+    outside the codebooks, so the decode reads code 0 there (an out-of-range
+    index on the GPU is a device-side assert that kills the worker), and the
+    step poisons the waveform with NaN (no host sync here) for
+    ``postprocess`` to refuse.
     """
 
     disable_torch_compile = True
@@ -591,6 +550,27 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         self.codec = codec
         self.config = config
 
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        """The codec's acoustic decoder, compiled for dynamic canvas lengths:
+        Inductor fuses each Snake activation and residual add between its convs,
+        which eagerly are ~300 of a decode's ~430 kernels. Dynamo builds one
+        graph per range of canvas lengths, split where the conv backend choice
+        depends on size: on CPU, MKLDNN's numel heuristic splits at 3, 6, 21
+        and 81 frames, and the warm-up runs one canvas per range. The CUDA
+        ranges (conv backend choice and Inductor's own guards) are unmeasured;
+        probably one. Canvases of one and two frames (80 ms at most) get
+        graphs of their own, so they are warmed too: six graphs, under
+        dynamo's recompile limit of 8 if the CUDA ranges add none. The inputs
+        are made as the codec's ``decode`` makes them (``fc2``, then a
+        transpose): a tensor of other strides or view base
+        fails the guards."""
+        fc2 = self.codec.fc2
+        latents = [
+            torch.zeros(1, frames, fc2.in_features, dtype=fc2.weight.dtype, device=fc2.weight.device)
+            for frames in (1, 2, 3, 10, 40, 160)
+        ]
+        return {"codec.acoustic_decoder": [(fc2(x).transpose(1, 2),) for x in latents]}
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -598,43 +578,16 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        tensor_inputs = {"audio_tokens": inputs["audio_tokens"][0]}
-        ref_rms = inputs.get("ref_rms")
-        if ref_rms:
-            tensor_inputs["ref_rms"] = ref_rms[0]
-        return NodeInputs(tensor_inputs=tensor_inputs)
+        return NodeInputs(tensor_inputs={"audio_tokens": inputs["audio_tokens"][0]})
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         audio_tokens: torch.Tensor,
-        ref_rms: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        info = engine_inputs.single_request_info
-        meta = info.step_metadata
-
-        remaining = int((audio_tokens == self.config.audio_mask_id).sum().item())
-        if remaining:
-            raise RuntimeError(
-                f"OmniVoice canvas for request {info.request_id} still holds "
-                f"{remaining} masked cells at decode; the unmask loop ended early."
-            )
-
-        waveform = decode_canvas(self.codec, audio_tokens)
-        waveform = post_process(
-            waveform,
-            config=self.config,
-            # None means "no reference to match" and selects peak
-            # normalisation instead; that is a different code path, not a
-            # default value, so it must stay None rather than become 0.
-            ref_rms=None if ref_rms is None else float(ref_rms.reshape(-1)[0]),
-            pad_duration=float(meta.get("pad_duration", 0.1)),
-            fade_duration=float(meta.get("fade_duration", 0.1)),
-            enabled=bool(meta.get("postprocess_output", True)),
-        )
-        pcm16 = (
-            torch.from_numpy(waveform).float().clamp(-1, 1).mul(32767).to(torch.int16)
-        )
-        return {"audio_output": [pcm16]}
+        masked = audio_tokens == self.config.audio_mask_id
+        waveform = decode_canvas(self.codec, audio_tokens.masked_fill(masked, 0))
+        waveform = waveform.masked_fill(masked.any(), float("nan"))
+        return {"audio_output": [waveform]}
