@@ -246,7 +246,7 @@ class ResidentPlanner:
         self._seal()
         # the largest flush up front, plus a cells row: growing the stager waits
         # out its copies, which on the GPU thread would be a sync in the step path
-        self._stager = PinnedStager(torch.long, numel=max_bs * self._tables[0].stride + 4 * max_bs)
+        self._stager = PinnedStager(torch.long, numel=max_bs * self._stride + 4 * max_bs)
 
     # Tables
 
@@ -265,7 +265,7 @@ class ResidentPlanner:
             raise ValueError("a resident row holds one wide table")
         narrow = [t for t in self._tables if t.width == 1]
         self.narrow_cols = len(narrow)
-        stride = sum(t.width for t in self._tables)
+        stride = self._stride = sum(t.width for t in self._tables)
         # int64: what the KV write addressing and the positions are, and index ops take
         self._store = torch.zeros(self.max_slots * stride, dtype=torch.long, device=self.device)
         rows = self._store.view(self.max_slots, stride)
@@ -403,10 +403,16 @@ class ResidentPlanner:
             self._restore(staged)
 
     def _restore(self, plan: ResidentPlan) -> None:
-        """Hand back the rows of a plan that won't run: it wrote nothing."""
+        """Hand back the rows of a plan that won't run: it wrote nothing but its
+        staging. The next plan stages its row again, even an equal one: this
+        one's copy is on the plan stream, and the replacing step waits on no
+        event for it."""
         with self._lock:
             self._stale |= {rid for rid in plan.taken if rid in self._slot_of}
             self._moved |= {rid for rid in plan.moved if rid in self._slot_of}
+        buffers = self._buffers.get(plan.key[1:])
+        if buffers is not None:
+            buffers.staged = None
 
     def _build(self, rids: tuple[int, ...], key: tuple, label: str, ctx) -> ResidentPlan:
         lease = ctx.slot_lease
@@ -485,7 +491,7 @@ class ResidentPlanner:
         rows = plan.writes.rows
         if not rows:
             return
-        stride = self._tables[0].stride
+        stride = self._stride
         dsts = [self._store[slot * stride: slot * stride + len(row)] for slot, row in rows]
         self._stager.copy_runs_(dsts, np.fromiter(chain.from_iterable(r for _, r in rows), dtype=np.int64))
 
@@ -537,7 +543,8 @@ class ResidentPlanner:
                     name for name in ("pre_forks", "post_forks", "retention", "sink", "advance", "pos_ids", "fork_rids")
                     if getattr(resource_step, name, None)
                 ),
-                None,
+                # a step that keeps no tokens: the table's commit would advance past its stream
+                "commit=False" if getattr(resource_step, "commit", True) is False else None,
             )
             if refusal is not None:
                 raise ValueError(

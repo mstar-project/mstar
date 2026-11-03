@@ -526,6 +526,28 @@ def test_a_new_row_abandoned_before_its_first_step_is_still_written():
     _assert_row(planner, live, 1)
 
 
+def test_an_abandoned_stage_of_a_steady_batch_is_staged_again(monkeypatch):
+    """Its slot row went out on the plan stream, and the step replacing it waits on no
+    event for that, so an equal row is no reason to skip the copy on its own stream."""
+    live, ref, planner = _setup({1: 3, 2: 5})
+    del ref
+    _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    _captured_step(live, planner, [1, 2], slot=0, bs=2, preplan=True, run=False)
+    for key in ("kv", "pool", "rope"):
+        live[key].clear_preplan()
+    buffers = planner.buffers(BucketKey(WALK, 2, 2), 0)
+    copies = []
+    real = planner._stager.copy_
+    monkeypatch.setattr(planner._stager, "copy_", lambda dst, *a, **k: (copies.append(dst), real(dst, *a, **k))[1])
+    s = _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    assert any(dst is buffers.slots for dst in copies)
+    _assert_step_read_its_streams(live, s, [1, 2])
+    # and a steady step after it still copies nothing
+    copies.clear()
+    _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    assert not any(dst is buffers.slots for dst in copies)
+
+
 def test_a_promoted_preplan_reuses_its_stage():
     live, ref, planner = _setup({1: 3})
     del ref
@@ -1238,6 +1260,11 @@ def _build(resources, nodes=None, walks=(WALK,), max_bs=4):
     return build_planner("n", walks, resources, nodes or {}, CPU, max_bs)
 
 
+def test_a_node_with_no_table_owner_still_builds():
+    planner = ResidentPlanner("n", {WALK}, {}, CPU, max_bs=2)
+    assert planner.max_slots == 5
+
+
 def test_every_resident_resource_passes():
     res = _resources()
     planner, why = _build({k: res[k] for k in ("kv", "pool", "rope")})
@@ -1342,7 +1369,7 @@ def test_flashinfer_refuses_a_sliding_window():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("pre_forks", (("a", "b"),)), ("post_forks", (("a", "b"),)), ("sink", frozenset({(1, "main")})),
+    ("pre_forks", (("a", "b"),)), ("post_forks", (("a", "b"),)), ("sink", frozenset({(1, "main")})), ("commit", False),
 ])
 def test_a_resident_walk_can_not_declare_forks_or_a_sink(field, value):
     _, _, planner = _setup({})
