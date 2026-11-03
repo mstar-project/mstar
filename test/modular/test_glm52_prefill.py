@@ -215,13 +215,11 @@ def test_batched_prefill_buckets_get_their_own_capture():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton top-k kernel on CUDA")
 @pytest.mark.parametrize("tokens", [1, 65, 1100])
 def test_router_kernel_matches_the_torch_top_k(tokens):
-    from mstar.utils.fused_moe import decode as moe_decode
-
     gate = _gate(hidden=6144, experts=256, device="cuda")
     x = torch.randn(tokens, 6144, dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():  # as the engine runs it
         w_ref, ids_ref, _ = gate(x)
-        gate._topk_op = moe_decode.router_topk
+        gate.finalize_weights(topk_kernel=True)
         w, ids, _ = torch.compile(gate, fullgraph=True)(x)  # an opaque op: no graph break
     _, _, gap = _fp32_reference(gate, x)
     clear = gap > 1e-5

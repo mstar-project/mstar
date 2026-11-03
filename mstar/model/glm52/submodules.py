@@ -50,7 +50,6 @@ from mstar.utils.h2d import PinnedStager
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
-_VERDICT_TIMEOUT_S = 120.0
 
 
 class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
@@ -75,8 +74,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # an MTP decode step is one captured graph; the uncaptured fallback runs eager
-        self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
+        # what get_accelerator_graph_configs fits to its captures
+        self._recompile_limit: int | None = None
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -242,8 +241,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     @property
     def disable_torch_compile(self) -> bool:
-        # graph_compile covers the uncaptured steps too, which the engine compiles
-        return getattr(self, "_mtp_uncompiled", False) or not self.config.graph_compile
+        # graph_compile covers the uncaptured steps too, which the engine compiles. An MTP
+        # decode step is one captured graph, and its uncaptured fallback runs eager.
+        return self.config.mtp_num_draft_tokens > 0 or not self.config.graph_compile
 
     def to(self, *args, **kwargs):
         """Honor device moves; refuse post-load dtype casts (per-param dtypes
@@ -331,7 +331,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._recompile_limit = need
 
     def dynamo_recompile_limit(self) -> int | None:
-        return getattr(self, "_recompile_limit", None)
+        return self._recompile_limit
 
     # ── per-step contract ──
 
@@ -714,16 +714,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        deadline = time.monotonic() + _VERDICT_TIMEOUT_S
+        # No timeout, as with a collective: every read follows the step's launch (a pre-plan
+        # waits on its commit), so only a hung device or peer delays the verdict, and a rank
+        # giving up alone would leave the others in the next all-reduce.
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                raise RuntimeError(
+                # a broken invariant, not a request's failure: failing this rank's batch alone
+                # would leave the other ranks in its collective
+                raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it was read")
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"MTP verdict of step {seq} never arrived")
             time.sleep(0)
         table = verdicts[: max(p[2] for p in pending) + 1].tolist()
         block = self.mtp_block

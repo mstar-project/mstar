@@ -487,6 +487,11 @@ class RopeManager(PositionManager):
         larger fusion; None without ``rope_table_dtype``."""
         return self._rope_table
 
+    @property
+    def interleave(self) -> bool:
+        """Whether RoPE turns adjacent pairs ``(2i, 2i + 1)`` (GPT-J), else the halves (NeoX)."""
+        return self._config.interleave
+
     def _check_rope_table_args(
         self,
         rotary_dim: int,
