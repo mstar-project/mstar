@@ -2252,7 +2252,7 @@ class Worker:
         """
         devices = local_worker_devices or [str(self.device)]
         slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
-        plan = cpus.devices_plan(knobs.step_thread_core(), devices)
+        plan = cpus.devices_plan(knobs.step_thread_core(), devices, knobs.idle_hold())
         cpus.install(plan)
         self._process_cpus = plan.mask
         self._step_cpus = plan.workers[slot] if plan.workers else None

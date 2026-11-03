@@ -2768,7 +2768,7 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Placing by rank (``auto``, ``always``) also takes the GPUs' locks, and a
+    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and a
     server that finds one held pins nothing, here or in its workers. A bad knob value is left for the
     conductor's deployment check to report; a CPU number the mask can't honour
     raises ``CpuPlanError``."""
@@ -2780,7 +2780,7 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     if setting == "off":
         return cpus.deployment_plan(setting, [])
     devices = deployment_workers(config, accelerator_type()).devices
-    plan = cpus.devices_plan(setting, devices)
+    plan = cpus.devices_plan(setting, devices, knobs.idle_hold())
     if setting not in cpus.PLACED or not plan.pinned:
         return plan
     refused = cpus.claim_gpus(cpus.device_addresses(devices))

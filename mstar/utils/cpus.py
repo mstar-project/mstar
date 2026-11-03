@@ -12,25 +12,29 @@ taken from the CPUs left after those. The API server and every worker build it
 with ``deployment_plan`` from the same inputs (the knob, the mask, the
 deployment's devices), so they agree on it without talking.
 
-Placement under ``auto`` and ``always`` is by the device's rank among the
+Placement under ``always`` and ``siblings`` is by the device's rank among the
 host's GPUs on its NUMA node, as sysfs lists them (every GPU of the host, not
 only the ones this process was given), so servers on different GPUs pick
-different CPUs without knowing about each other. A worker takes the core at its
-device's rank from the bottom of the node's allowed CPUs, the API server the
-core at its first device's rank from the top, so the cores a GPU picks from must
-hold two per GPU. A mask too small for that across the host may still do for the
+different CPUs without knowing about each other. The API server takes the core
+at its first device's rank from the top of the node's allowed CPUs, and a worker
+the step unit at its device's rank from the bottom of the cores below the API
+servers'. Under ``always`` a unit is ``STEP_CORES`` cores, one hardware thread
+of each, so the cores a GPU picks from must hold four per GPU, and no two pinned
+threads share a core; ``siblings`` (``_siblings``) puts a worker on one core's
+hardware threads instead. A mask too small across the host may still do for the
 GPUs this container can open, which are the only ones that can share it, so those
 rank instead; failing that, nothing is pinned. Servers on one GPU can't be told
 apart by rank, so the first holds a lock on it (``claim_gpus``) and the next
 pins nothing.
 
-Pinning pays where a thread woken on an idle core waits for that core to leave
-a deep idle state. Without one it costs throughput, since the threads only queue
-on their CPUs, so ``auto`` reads the idle states sysfs lists for the mask's CPUs
-and pins nothing unless one reaches ``DEEP_IDLE_US`` (``deepest_idle``). It also
-refuses to give a worker a single CPU, where the step threads queue behind each
-other, and pins only on the CPU vendors in ``AUTO_VENDORS``, the ones its
-placement was measured on. ``always`` skips all three checks.
+Pinning can pay where a thread woken on an idle core waits for that core to
+leave a deep idle state, and costs throughput where it doesn't, since the
+threads only queue on their CPUs. Which layout pays depends on the host: on a
+deep-idle Xeon one core's hardware threads beat no pin and separate cores lost
+to it, while one core's hardware threads lost on two H200 hosts. So ``auto``
+pins nothing and logs why (``_auto_declines``): the reason names the idle hold,
+a CPU vendor other than Intel, idle states under ``DEEP_IDLE_US``
+(``deepest_idle``), or what the separate cores measured.
 """
 from __future__ import annotations
 
@@ -60,11 +64,15 @@ PINNABLE = hasattr(os, "sched_setaffinity")
 # the C6 class well above.
 DEEP_IDLE_US = 100
 # settings that place by the GPU's rank
-PLACED = ("auto", "always")
+PLACED = ("always", "siblings")
+# Physical cores one worker's main, GPU and plan threads share under ``always``,
+# one hardware thread of each: a woken step thread finds a CPU of its own, and
+# none of them shares a core's execution units with another.
+STEP_CORES = 3
 # CPU latency the idle hold asks for: admits C1 and C1E, refuses the C6 class
 IDLE_HOLD_US = 10
-# ``/proc/cpuinfo`` vendors ``auto`` pins on: its placement is measured on Xeon
-# 6767P and 6740E hosts, and the same placement lost on an AMD EPYC
+# ``/proc/cpuinfo`` vendors ``auto``'s measurements come from (Xeon 6767P and
+# 6740E hosts); elsewhere its reason says so rather than quote them
 AUTO_VENDORS = ("GenuineIntel",)
 
 
@@ -142,8 +150,8 @@ def usable_cpus() -> int:
 # ── the plan ────────────────────────────────────────────────────────────────
 
 class StepCpus(NamedTuple):
-    """The CPUs one worker's main, GPU and plan threads share (one core's
-    hardware threads in the mask), and how they were chosen, for the log."""
+    """The CPUs one worker's main, GPU and plan threads share, and how they
+    were chosen, for the log."""
     cpus: frozenset[int]
     why: str
 
@@ -300,12 +308,30 @@ def _cores(cpus: Collection[int], siblings: Callable[[int], frozenset[int]]) -> 
     return sorted(cores)
 
 
+class _Unit(NamedTuple):
+    """The CPUs one worker's step threads share, and the physical cores they
+    come from."""
+    cpus: tuple[int, ...]
+    cores: tuple[tuple[int, ...], ...]
+
+
+class _Layout(NamedTuple):
+    """How a placing setting cuts a pool's cores into workers' step units, and
+    what each GPU needs, for the log."""
+    units: Callable[[list[tuple[int, ...]]], list[_Unit]]
+    need: str
+
+
+def _spread(cores: list[tuple[int, ...]]) -> list[_Unit]:
+    """``cores`` taken ``STEP_CORES`` at a time, in order, one hardware thread
+    of each: a worker's step threads under ``always``."""
+    groups = (cores[i:i + STEP_CORES] for i in range(0, len(cores) - STEP_CORES + 1, STEP_CORES))
+    return [_Unit(tuple(core[0] for core in group), tuple(group)) for group in groups]
+
+
 def _paired(cores: list[tuple[int, ...]], cluster: Callable[[int], frozenset[int]]) -> list[tuple[int, ...]]:
     """``cores`` with each run of one-CPU cores of an L2 cluster taken two at a
-    time, in the same order. Where a core brings no second hardware thread (no
-    SMT, or the sibling is outside the mask) two cores of a cluster stand in
-    for it: the step threads don't queue on one CPU, and a wake inside an awake
-    cluster costs a fraction of one that wakes the cluster."""
+    time, in the same order."""
     alone: dict[frozenset[int], list[tuple[int, ...]]] = {}
     for core in cores:
         if len(core) == 1:
@@ -319,12 +345,27 @@ def _paired(cores: list[tuple[int, ...]], cluster: Callable[[int], frozenset[int
     return [core for core in placed if core is not None]
 
 
+def _siblings(cores: list[tuple[int, ...]], cluster: Callable[[int], frozenset[int]]) -> list[_Unit]:
+    """``step_thread_core: siblings``: a worker's step threads on all hardware
+    threads of one core, or on two cores of an L2 cluster where a core has one
+    CPU in the mask. The core (or cluster) stays awake while any of the three
+    runs, so a handoff rarely waits for it to leave a deep idle state, but the
+    three share its execution units.
+
+    Qwen3.5-0.8B tok/s at c=1 / c=8 on 8 cores of the server's mask: Xeon
+    6767P (SMT, an L2 per core, C6 at 170 µs) 808 / 5670 against 548 / 3939
+    with no pin and 526 / 3851 on three cores of their own; Xeon 6740E (no SMT,
+    four cores to an L2 cluster) 527 / 3635 against 371 / 2688. With a
+    ``SCHED_IDLE`` spinner holding the 6767P's cores awake it lost at c=1, 753
+    against 906 with no pin. On two H200 hosts with SMT it lost to no pin: c=1
+    506 against 634 on a 2-socket AMD EPYC (C2 at 800 µs), 13-26% at c=1-32 on
+    the other. So ``auto`` never takes it."""
+    return [_Unit(unit, tuple(core for core in cores if core[0] in unit)) for unit in _paired(cores, cluster)]
+
+
 def _step_cpus(core: tuple[int, ...], why: str) -> StepCpus:
-    """A worker's step threads on all of ``core``'s CPUs. On one CPU the three
-    queue behind each other (a Qwen3-TTS worker's main thread alone keeps about
-    0.6 of a CPU busy at c=1); on a core's two hardware threads, or two cores
-    of a cluster (``_paired``), there is room, and a woken thread still finds
-    the core or the cluster awake."""
+    """A worker's step threads on all of ``core``'s CPUs: what a
+    ``step_thread_core`` number gives each worker."""
     return StepCpus(frozenset(core), why)
 
 
@@ -410,21 +451,20 @@ def deployment_plan(
     cpu_root: Path = _CPU_ROOT,
     reachable: Collection[str] = (),
     cpuinfo: Path | None = None,
+    idle_hold: str = "off",
 ) -> CpuPlan:
     """The plan for a deployment whose workers' devices sit at PCI
     ``addresses``, in the conductor's worker order (None for a device sysfs
-    doesn't place, such as a CPU worker; only ``auto`` and ``always`` read
-    them), and ``reachable`` the GPUs this container can open.
+    doesn't place, such as a CPU worker; only ``always`` and ``siblings``
+    read them), and ``reachable`` the GPUs this container can open.
 
-    ``off`` pins nothing. A CPU number is the first worker's CPU; the next
-    workers take the next cores above it, and the API server the last core of
-    the mask; a number outside the mask, or too near its top for every worker,
-    raises ``CpuPlanError``. ``always`` places by device rank (module
-    docstring), and pins nothing, saying why in ``CpuPlan.why``, when the mask
-    is too small. ``auto`` does the same on a CPU vendor in ``AUTO_VENDORS``
-    where the mask's CPUs have a deep idle state and every worker gets two
-    CPUs, and otherwise pins nothing, saying so.
-    Either way at least one CPU of the mask stays unpinned.
+    ``off`` pins nothing, and ``auto`` pins nothing and says why. A CPU number
+    is the first worker's core; the next workers take the next cores above it,
+    and the API server the last core of the mask; a number outside the mask,
+    or too near its top for every worker, raises ``CpuPlanError``. ``always``
+    and ``siblings`` place by device rank (module docstring), and pin nothing,
+    saying why in ``CpuPlan.why``, when the mask is too small. At least one CPU
+    of the mask stays unpinned.
     """
     mask = frozenset(process_mask() if mask is None else mask)
     usable = usable_cpus() if usable is None else usable
@@ -433,23 +473,27 @@ def deployment_plan(
     if not PINNABLE:
         return CpuPlan(mask, usable, why="not pinned: no sched_setaffinity here")
     if setting == "auto":
-        declined = _auto_declines(cpu_vendor(cpuinfo), mask, cpu_root)
-        if declined is not None:
-            return CpuPlan(mask, usable, why=f"not pinned: {declined}", declined=True)
+        declined = _auto_declines(idle_hold, cpu_vendor(cpuinfo), mask, cpu_root)
+        return CpuPlan(mask, usable, why=f"not pinned: {declined}", declined=True)
     cores = _cores(mask, siblings)
     if setting in PLACED:
         def cores_of(cpus: Collection[int]) -> list[tuple[int, ...]]:
-            return _paired(_cores(cpus, siblings), cluster)
+            return _cores(cpus, siblings)
 
-        placed = _auto(setting, addresses, mask, cores_of, pci_root, reachable)
+        if setting == "siblings":
+            layout = _Layout(lambda cores: _siblings(cores, cluster),
+                             "2, one for its worker's step threads and one for its API server (3 where a core has "
+                             "one CPU in the mask)")
+        else:
+            layout = _Layout(_spread, f"{STEP_CORES + 1} ({STEP_CORES} for its worker's step threads, 1 for its API "
+                                      "server)")
+        placed = _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable)
         if isinstance(placed, str):
             return CpuPlan(mask, usable, why=f"not pinned: {placed}")
         workers, result, why = placed
     else:
         workers, result, why = _explicit(int(setting), len(addresses), mask, cores)
     out = CpuPlan(mask, usable, tuple(workers), result, why)
-    if setting == "auto" and any(len(step.cpus) < 2 for step in workers):
-        return CpuPlan(mask, usable, why=f"not pinned: {_one_cpu_worker(workers, mask, siblings)}")
     if len(out.pinned) >= len(mask):
         reason = (f"{len(addresses)} worker(s) and the API server would pin all {len(mask)} CPU(s) "
                   f"of the process mask {format_cpu_list(mask)}, leaving none for the rest")
@@ -459,13 +503,23 @@ def deployment_plan(
     return out
 
 
-def _auto_declines(vendor: str | None, mask: frozenset[int], cpu_root: Path) -> str | None:
-    """Why ``auto`` leaves this host's threads alone; None when it pins."""
+def _auto_declines(idle_hold: str, vendor: str | None, mask: frozenset[int], cpu_root: Path) -> str:
+    """Why ``auto`` leaves this host's threads alone. No host it can tell
+    apart has a measurement in which its layout beats no pin yet, so the
+    answer is never None; the reason names what the host has."""
+    anyway = "step_thread_core always pins anyway"
+    if idle_hold != "off":
+        return (f"idle_hold {idle_hold} keeps the cores out of deep idle, where pinning measured no faster than none "
+                f"({anyway})")
     if vendor not in AUTO_VENDORS:
         this = f"this host's is {vendor}" if vendor else "/proc/cpuinfo names no vendor here"
-        return (f"auto is measured on Intel hosts only and {this} "
-                "(step_thread_core always pins anyway)")
-    return _no_deep_idle(mask, cpu_root)
+        return f"auto is measured on Intel hosts only and {this} ({anyway})"
+    shallow = _no_deep_idle(mask, cpu_root)
+    if shallow is not None:
+        return shallow
+    return (f"on an Intel host whose cores sleep deep, the step threads on {STEP_CORES} cores of their own measured "
+            f"no faster than no pin; step_thread_core siblings, one core's hardware threads, measured faster there "
+            f"but lost on other hosts ({anyway})")
 
 
 def _no_deep_idle(mask: frozenset[int], cpu_root: Path) -> str | None:
@@ -477,17 +531,8 @@ def _no_deep_idle(mask: frozenset[int], cpu_root: Path) -> str | None:
         where = f"the deepest idle state is {deepest.name} at {deepest.latency_us} µs"
     else:
         return None
-    return (f"{where} on CPUs {format_cpu_list(mask)}, under the {DEEP_IDLE_US} µs that pays for pinning "
+    return (f"{where} on CPUs {format_cpu_list(mask)}, under the {DEEP_IDLE_US} µs from which pinning could pay "
             "(step_thread_core always pins anyway)")
-
-
-def _one_cpu_worker(workers: Sequence[StepCpus], mask: frozenset[int], siblings) -> str:
-    """Why ``auto`` refuses a worker a single CPU, and the mask that would do."""
-    wider = mask.union(*(siblings(cpu) for step in workers for cpu in step.cpus))
-    needs = (f"try {format_cpu_list(wider)}, which adds their hardware threads" if len(wider) > len(mask)
-             else "give it two cores of one L2 cluster")
-    return (f"the mask {format_cpu_list(mask)} leaves a worker's main, GPU and plan threads one CPU to queue on, "
-            f"which costs a host-bound step more than the pin saves; {needs} (step_thread_core always pins anyway)")
 
 
 def _explicit(first: int, n: int, mask: frozenset[int], cores: list[tuple[int, ...]]):
@@ -507,16 +552,19 @@ def _explicit(first: int, n: int, mask: frozenset[int], cores: list[tuple[int, .
 
 
 class _Pool(NamedTuple):
-    """The cores some GPUs pick from. A GPU's worker takes the core at ``rank``
-    from the bottom and its API server the one at ``rank`` from the top, so
-    they need two cores per GPU to stay apart."""
+    """The physical cores some GPUs pick from. The top ``gpus`` cores are their
+    API servers', by ``rank`` from the top; a GPU's worker takes the step
+    units of the cores below at ``rank`` from the bottom."""
     cores: list[tuple[int, ...]]
     rank: int
     gpus: int
     why: str
 
+    def units(self, layout: _Layout) -> list[_Unit]:
+        return layout.units(self.cores[:len(self.cores) - self.gpus])
 
-def _gpu_pools(gpus, mask, cores_of) -> dict[str, _Pool]:
+
+def _gpu_pools(gpus, mask, cores_of, layout) -> dict[str, _Pool]:
     """Each host GPU's pool. A GPU with allowed CPUs on its node picks among
     those by its rank on the node; the GPUs with none pick, by their rank among
     themselves, from the cores those ranks leave."""
@@ -533,8 +581,10 @@ def _gpu_pools(gpus, mask, cores_of) -> dict[str, _Pool]:
         for rank, gpu in enumerate(members):
             pools[gpu.address] = _Pool(
                 local, rank, count, f"GPU {rank + 1} of {count} on its NUMA node, over its allowed CPUs {where}")
-        if len(local) >= 2 * count:
-            claimed.update(local[:count] + local[-count:])
+        units = pools[members[0].address].units(layout)
+        if len(units) >= count:
+            claimed.update(core for unit in units[:count] for core in unit.cores)
+            claimed.update(local[len(local) - count:])
     spare = [core for core in cores_of(mask) if core not in claimed]
     elsewhere = [gpu for gpu in gpus if gpu.address not in pools]
     for rank, gpu in enumerate(elsewhere):
@@ -545,7 +595,7 @@ def _gpu_pools(gpus, mask, cores_of) -> dict[str, _Pool]:
     return pools
 
 
-def _auto(setting, addresses, mask, cores_of, pci_root, reachable):
+def _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable):
     """``(workers, result, why)``, or why nothing can be pinned."""
     cores = cores_of(mask)
     if not cores or not addresses:
@@ -554,32 +604,31 @@ def _auto(setting, addresses, mask, cores_of, pci_root, reachable):
     unplaced = _Pool(cores, 0, 1, "no sysfs entry for its device, so over the process mask")
 
     def short_of_cores(group):
-        pools = _gpu_pools(group, mask, cores_of)
+        pools = _gpu_pools(group, mask, cores_of, layout)
         homes = [pools.get(a, unplaced) for a in addresses]
-        return homes, next((home for home in homes if len(home.cores) < 2 * home.gpus), None)
+        return homes, next((home for home in homes if len(home.units(layout)) < home.gpus), None)
 
     homes, short = short_of_cores(gpus)
     within = [gpu for gpu in gpus if gpu.address in reachable]
     if short is not None and within and len(within) < len(gpus):
         homes, short = short_of_cores(within)
     if short is not None:
-        return (f"{short.why}: {len(short.cores)} core(s) there for {short.gpus} GPU(s), and each needs two; "
-                "widen the mask or name a CPU")
+        return (f"{short.why}: {len(short.cores)} core(s) there for {short.gpus} GPU(s), and each needs "
+                f"{layout.need}; widen the mask or name a CPU")
     first = homes[0]
     result_core = first.cores[len(first.cores) - 1 - first.rank]
     taken = {result_core}
     workers = []
     for i, home in enumerate(homes):
         # workers of this deployment on one device (a split config) step by the
-        # pool's GPU count, so each GPU's first worker keeps its core; the top
-        # ``gpus`` cores are those GPUs' API servers'
+        # pool's GPU count, so each GPU's first worker keeps its cores
         nth = sum(a == addresses[i] for a in addresses[:i])
-        steps = home.cores[home.rank + nth * home.gpus:len(home.cores) - home.gpus]
-        core = next((c for c in steps if c not in taken), None)
-        if core is None:
+        units = home.units(layout)[home.rank + nth * home.gpus:]
+        unit = next((u for u in units if not taken.intersection(u.cores)), None)
+        if unit is None:
             return f"{len(addresses)} worker(s) and the API server need more cores than the mask has"
-        taken.add(core)
-        workers.append(_step_cpus(core, f"{setting}: {home.why}"))
+        taken.update(unit.cores)
+        workers.append(StepCpus(frozenset(unit.cpus), f"{setting}: {home.why}"))
     return workers, result_core[0], f"{setting}: {first.why} (the first worker's device), from the top"
 
 
@@ -595,15 +644,16 @@ def device_addresses(devices: Sequence[str]) -> list[str | None]:
     return addresses
 
 
-def devices_plan(setting: str | int, devices: Sequence[str]) -> CpuPlan:
+def devices_plan(setting: str | int, devices: Sequence[str], idle_hold: str = "off") -> CpuPlan:
     """``deployment_plan`` for the workers' device strings, in the conductor's
     worker order: the same call in the API server and in every worker."""
-    # a host auto leaves alone never asks torch about its devices
-    if setting not in PLACED or (setting == "auto" and _auto_declines(cpu_vendor(), process_mask(), _CPU_ROOT)):
-        return deployment_plan(setting, [None] * len(devices))
+    # auto, which pins nothing, never asks torch about the devices
+    if setting not in PLACED:
+        return deployment_plan(setting, [None] * len(devices), idle_hold=idle_hold)
     from mstar.platforms import current_platform
 
-    return deployment_plan(setting, device_addresses(devices), reachable=current_platform.reachable_pci_addresses())
+    return deployment_plan(setting, device_addresses(devices), idle_hold=idle_hold,
+                           reachable=current_platform.reachable_pci_addresses())
 
 
 # ── one server per GPU ──────────────────────────────────────────────────────

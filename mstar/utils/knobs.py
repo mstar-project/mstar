@@ -65,10 +65,10 @@ def _step_thread_core_value(value: object) -> str:
         return "auto" if value else "off"
     if isinstance(value, int) and value >= 0:
         return str(value)
-    if isinstance(value, str) and value.strip().lower() in ("auto", "always", "off"):
+    if isinstance(value, str) and value.strip().lower() in ("auto", "always", "siblings", "off"):
         return value.strip().lower()
     raise ValueError(
-        f"`knobs: step_thread_core` must be auto, always, off or a CPU number, got {value!r}"
+        f"`knobs: step_thread_core` must be auto, always, siblings, off or a CPU number, got {value!r}"
     )
 
 
@@ -205,17 +205,18 @@ def pre_plan_enabled() -> bool:
 def step_thread_core() -> str | int:
     """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):
     pin each worker's main, GPU and plan threads, and the API server's result
-    threads, to CPUs of their own. ``auto`` pins where the host's idle states
-    are deep enough to pay for it and places them by the GPU's rank on its
-    NUMA node, ``always`` places them the same way on any host, a number is
-    the first worker's CPU (see ``mstar.utils.cpus``)."""
+    threads, to CPUs of their own. ``always`` places them by the GPU's rank on
+    its NUMA node, a worker's three on three cores of their own;
+    ``siblings`` places them the same way with a worker's three on one core's
+    hardware threads; a number is the first worker's core. ``auto`` pins
+    nothing and logs why for this host (see ``mstar.utils.cpus``)."""
     value = _setting("step_thread_core", "off").strip().lower()
-    if value in ("auto", "always", "off"):
+    if value in ("auto", "always", "siblings", "off"):
         return value
     if value.isdigit():
         return int(value)
     raise ValueError(
-        f"MSTAR_STEP_THREAD_CORE must be auto, always, off or a CPU number, got {value!r}"
+        f"MSTAR_STEP_THREAD_CORE must be auto, always, siblings, off or a CPU number, got {value!r}"
     )
 
 
