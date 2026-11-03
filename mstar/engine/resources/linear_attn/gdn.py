@@ -42,8 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Run compiled: eager, the normalize is four full-size passes per tensor (fp32
 # copy, norm, divide, cast); compiled, one. Not dynamic=True: a symbolic head dim
-# made the reduction ~3x slower; the token count goes dynamic on its own at the
-# second size.
+# made the reduction ~3x slower; the caller marks the token count dynamic.
 def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Both in one compiled call, so a layer pays one guard check, not two."""
     def norm(t):
@@ -373,6 +372,10 @@ class GDNManager(LinearAttnManager):
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
+            # inside a captured forward this call inherits the runner's
+            # dynamic=False, which would compile it once per bucket
+            torch._dynamo.maybe_mark_dynamic(q, 0)
+            torch._dynamo.maybe_mark_dynamic(k, 0)
             q, k = compiled(_l2norm_qk)(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
