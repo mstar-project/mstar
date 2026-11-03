@@ -142,7 +142,7 @@ class Admission:
         that lets requests pass has a first request that can't start, each later waiting request is
         tried, in arrival order, to pass it, but only once a queue has a new first request or a
         resource that refused a passing request has grown since. Otherwise only the requests in
-        `_unpassed` and the first requests of the queues that grew are tried.
+        `_unpassed` and the first requests of the queues whose resource grew are tried.
         """
         started = []
         if self._started:
@@ -256,8 +256,8 @@ class Admission:
     ) -> dict[str, str] | None:
         """Admit ``rid`` past the first request of each queue it waits behind, when that request is in
         ``blocked`` and the queue's resource lets requests pass, and ``rid`` is first wherever else it
-        waits. Return the nodes waiting on it, or None, adding ``rid`` to ``blocked`` when a queue it is
-        first in just refused it."""
+        waits. Return the nodes waiting on it, or None. Add ``rid`` to ``blocked`` when it is first in a
+        queue whose resource just refused it."""
         passing = []
         for key in self._waiting[rid].asked:
             first = self._queues[key][0]
