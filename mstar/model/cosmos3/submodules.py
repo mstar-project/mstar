@@ -1562,11 +1562,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
-            # batched forward always applies guidance when the branch exists,
-            # so the interval does not narrow the batched declaration.
-            labels = (
-                (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
-            )
+            # image and sound batched forwards apply guidance whenever the
+            # branch exists. The action one runs the conditional branch alone
+            # when no row is inside its guidance interval, as a single request
+            # does (rows outside it in a guided batch drop the other branch).
+            cfg = infos[0].cfg and (graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos))
+            labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return self._gen_step(
                 request_ids, spans, labels, combined=True, attn_key=attn_key,
             )
@@ -2200,11 +2201,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step."""
+        branches (when present) and apply its own joint scheduler step. When no
+        row is inside its guidance interval the batch runs the conditional
+        branch alone, as ``declare_step`` planned it."""
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
-        with_cfg = states[rids[0]]["uncond"] is not None
+        with_cfg = states[rids[0]]["uncond"] is not None and any(
+            self._cfg_active(states[rid], _loop_step(engine_inputs.per_request_info[rid], graph_walk))
+            for rid in rids
+        )
         reqs, meta = [], []
         for rid in rids:
             st = states[rid]
