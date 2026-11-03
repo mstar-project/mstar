@@ -1333,6 +1333,34 @@ def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkey
     assert _counts(leader)[:-1] == _counts(follower)[:-1] and leader._arena.num_free == follower._arena.num_free
 
 
+def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_0_stops(monkeypatch):
+    """Under MSTAR_KV_DEBUG_ASSERTS rank 0 sends its counts with each step's page trail. Here the step that carried
+    s's reservation never reached the follower, which would then refuse a grant rank 0 makes and leave rank 0 alone
+    in the step's collective. So the follower stops before it builds the next step."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "s", 3, arrival=2)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+
+    def send(seq):
+        scheduler.register_tp_follow(ScheduleTPNode(
+            NODE, "decode", [], spec_seq=seq, resident_delta=lead.take_resident_delta(NODE),
+            page_trails=lead.page_trails(NODE),
+        ))
+
+    assert _admits(leader, "r")
+    send(0)
+    assert scheduler.settle_tp_follow_delta(caught_up=True), "the follower stopped on counts that agree"
+    scheduler.pop_tp_follow_head()
+    assert _admits(leader, "s")
+    lead.take_resident_delta(NODE)
+    send(1)
+
+    with pytest.raises(SystemExit, match="TP ranks diverged"):
+        scheduler.settle_tp_follow_delta(caught_up=True)
+
+
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
 

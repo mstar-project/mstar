@@ -411,6 +411,30 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
 
 
+def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts():
+    """Owner counts can differ between ranks, since above one rank a page is filed under a parent only its
+    stream holds. A follower that worked out the lent pages from its own evictable set would then count other room
+    than rank 0 and could refuse a grant rank 0 makes. Here a cached page has one more owner on the follower."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
+    _cache(ranks, "a", shared)
+    first = _pages(follower, "a")[0]
+    for kv in ranks:
+        kv.remove_request("a")
+        kv.ingest_request("b", _config([prompt]))
+    follower._arena.retain([first])
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
+
+    assert _follow(follower, _send(leader, "b"))
+
+    assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent == set(), (
+        "the follower lent a page rank 0 charged to b's allotment"
+    )
+    assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_a_commit_above_one_rank_keeps_the_room_when_it_files_under_a_page_only_the_index_holds(rank):
     """z prefills beside x, so it finds nothing cached and loses x's keys at commit. Its next page goes in with no
