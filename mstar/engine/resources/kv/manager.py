@@ -4215,6 +4215,7 @@ class KVManager(AttentionResource):
         pool = self._cpu_pool
         host = pool.arena
         owned = self._owned_pages(host, "host")
+        pool.index.assert_evictable()
         refs = Counter(pool.index.pages())
         for streams in pool.offloaded.values():
             for state in streams.values():
