@@ -22,6 +22,7 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
+from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
@@ -388,6 +389,35 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     leased = len(kv._streams["g"]["main"].lease or ())
     assert _step(kv, "g", PAGE_SIZE).ok
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
+
+
+@pytest.mark.parametrize("hit", ["held", "evictable"])
+def test_a_guaranteed_request_whose_lease_is_cut_writes_the_cut_pages_within_its_reservation(hit):
+    """Qwen3.5's recurrent snapshots cut a hit to what they cover, and the walk writes the cut pages itself. A
+    guaranteed request was charged for its hits at the probe, which gave their room to the pool, and a cut page
+    that another request still held came off its allotment. So it ran short later and could neither move nor be
+    dropped."""
+    kv, tokens = _pool(), list(range(3 * PAGE_SIZE))
+    _running(kv, "h", 3, arrival=0, keyed=tokens)
+    if hit == "evictable":
+        _remove(kv, "h")
+    _request(kv, "g", 3, arrival=1, keyed=tokens, guaranteed=True)
+    assert _ready(kv, "g")
+    inputs = ARNodeInputs(input_seq_len=3 * PAGE_SIZE)
+    kv.resolve_cached_prefix("g", NODE, WALK, inputs)
+    if hit == "evictable":
+        # "b" leases the pages "g" leased, so they stay held once "g" lets go of them
+        _request(kv, "b", 3, arrival=2, keyed=tokens)
+        assert _ready(kv, "b") and kv.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == 2 * PAGE_SIZE
+    # "x" is admitted into whatever room the probe left
+    _request(kv, "x", 2, arrival=3)
+    _ready(kv, "x")
+
+    kv.apply_cached_prefix("g", NODE, WALK, inputs, CachedPrefix("main", PAGE_SIZE, PAGE_SIZE))
+
+    assert _step(kv, "g", 2 * PAGE_SIZE).ok
+    for _ in range(4):
+        assert _step(kv, "g", PAGE_SIZE).ok, "g ran short of the pages its reservation held for the cut ones"
 
 
 def test_a_guaranteed_request_counts_its_pages_as_reclaimable_and_the_offload_leaves_it():
