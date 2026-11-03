@@ -43,7 +43,7 @@ LLM serving stacks assume inference is a single autoregressive loop. Composite m
 
 **Fast** — per-component fast paths, matched to each component's bottleneck:
 - Paged attention (FlashInfer) and continuous batching for autoregressive backbones
-- CUDA-graph capture for encoders and decode
+- Accelerator graph capture for encoders and decode
 - Classifier-free-guidance parallelism for diffusion / flow
 - Tensor parallelism and Ulysses sequence parallelism, composable as a TP × SP mesh per component
 - Sliding-window chunk streaming for audio codecs

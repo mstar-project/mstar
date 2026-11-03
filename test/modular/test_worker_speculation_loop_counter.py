@@ -85,12 +85,11 @@ def test_a_continuing_rid_runs_one_iteration_past_the_in_flight_one():
     view = spec.node_batch.per_request_info_wrapped[1]
     assert view.dynamic_loop_iter_counts == {LOOP: 3}
     assert spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts == {LOOP: 3}
-    # the shared info is untouched: the in-flight batch's stop check reads 2
+    # Building the successor leaves the shared info at the current iteration.
     assert shared[1].dynamic_loop_iter_counts == {LOOP: 2}
-    # the speculative batch still carries the shared info itself, so what an
-    # engine records on it is seen by later steps
     assert spec.node_batch.per_request_info[1] is shared[1]
     assert view is not shared[1]
+    # what an engine records on the view is seen by later steps
     assert view.step_metadata is shared[1].step_metadata
     assert view.resource_publish_info is shared[1].resource_publish_info
     assert view.resource_configs is shared[1].resource_configs
@@ -100,8 +99,7 @@ def test_a_continuing_rid_runs_one_iteration_past_the_in_flight_one():
 
 
 def test_a_fresh_rid_runs_at_its_loops_current_index():
-    # 2's last step was iteration 0; routing it advanced the loop to 1 and refreshed
-    # the shared counter, so a fresh rid is not incremented: it is already there
+    # 2's last step routed and updated its shared counter to 1.
     shared = {1: _info(1, 2), 2: _info(2, 1)}
     ctx = _context(shared)
     spec = _assemble(ctx, _target(is_new_loop_iter=True), [1, 2], [1])

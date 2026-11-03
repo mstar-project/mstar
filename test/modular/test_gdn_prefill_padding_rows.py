@@ -3,7 +3,7 @@
 The GDN prefill kernel is warp-specialised: a row covering no tokens leaves its
 consumers waiting on a barrier its producer never reaches, so the launch never
 retires and every rank of a TP instance wedges behind it — no error, no log.
-A replay's padding rows arrive with span 0 (`PackedCudaGraphConfig` pads with
+A replay's padding rows arrive with span 0 (`PackedAcceleratorGraphConfig` pads with
 `distribute_tokens(0, n)`), which is exactly that shape.
 
 CPU-only: nothing here launches a kernel.

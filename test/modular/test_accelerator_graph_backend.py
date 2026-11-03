@@ -43,6 +43,7 @@ def test_backend_dispatches_without_initializing_hardware(
 ):
     runtime = getattr(torch, device_type)
     graph = object()
+    # CPU-only PyTorch wheels may omit the XPU graph class entirely.
     monkeypatch.setattr(runtime, graph_type, lambda keep_graph=False: graph, raising=False)
     monkeypatch.setattr(runtime, "is_available", lambda: False)
 

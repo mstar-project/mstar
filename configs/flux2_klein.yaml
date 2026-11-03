@@ -6,7 +6,7 @@ max_seq_len: 512
 
 # FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
 # Flux2KleinModel.__init__): attention_backend flashinfer|sdpa, torch.compile of the
-# transformer per shape, CUDA-graph capture of the denoise step for the listed
+# transformer per shape, accelerator graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
   # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the

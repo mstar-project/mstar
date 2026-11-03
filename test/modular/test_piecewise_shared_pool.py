@@ -13,7 +13,7 @@ def test_runner_accepts_a_shared_pool_and_keeps_it():
     assert "memory_pool" in inspect.signature(PiecewiseAcceleratorGraphRunner.__init__).parameters
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
     runner._memory_pool = None
-    # a runner built without a pool allocates its own at capture time (CUDA only)
+    # a runner built without a pool allocates its own at capture time
     src = inspect.getsource(PiecewiseAcceleratorGraphRunner.warmup_and_capture)
     assert "if self._memory_pool is None" in src
 

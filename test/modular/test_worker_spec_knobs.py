@@ -2,7 +2,7 @@
 when it is built.
 
 ``Worker.run`` used to parse both after it had sent SETUP_DONE, so a value
-such as ``5ms`` raised only once weight load, warmup and CUDA-graph capture
+such as ``5ms`` raised only once weight load, warmup and accelerator graph capture
 were done and the conductor had counted the worker ready, and then the worker
 died. Now a bad value is reported, with a warning, before anything loads and
 the default is used, as ``MSTAR_PY_SWITCH_INTERVAL_SEC`` already does.

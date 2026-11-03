@@ -8,7 +8,7 @@ ATTN = "attn"
 SAMPLER = "sampler"
 ROPE = "rope"
 
-# SNAC captures one CUDA graph per window size at every capture batch size,
+# SNAC captures one accelerator graph per window size at every capture batch size,
 # and every size from 1 frame up to the widest window occurs (final flushes),
 # so the widest window (left + right context + largest chunk) bounds startup
 # and graph memory.

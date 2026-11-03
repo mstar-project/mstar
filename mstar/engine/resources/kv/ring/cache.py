@@ -25,7 +25,7 @@ def ring_scatter(
     ``index_fill_`` and not ``written[dst] = True``, which is what this was.
     The subscript form lowers to ``index_put_`` with the Python ``True``
     materialized as a CPU scalar tensor and copied to the device, and an H2D
-    copy from pageable host memory invalidates CUDA graph capture.
+    copy from pageable host memory invalidates accelerator graph capture.
     """
     cache.index_copy_(3, dst, kv)
     if mark:

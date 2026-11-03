@@ -440,6 +440,7 @@ def test_build_accelerator_graph_buffers_is_scoped_to_the_capturing_node():
 
 @pytest.mark.parametrize("variant", ["gdn", "mamba2"])
 def test_graph_buffer_sizing_reaches_recurrent_and_linear_attention(variant):
+    """Real resources must override the runner's hook after API renames."""
     import torch
 
     from mstar.engine.resources.base import EngineResourceInfo

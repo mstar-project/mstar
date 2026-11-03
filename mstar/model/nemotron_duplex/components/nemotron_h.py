@@ -25,7 +25,7 @@ Design notes:
     are slots in the engine's recurrent-state pool (``MAMBA_STATE``), stepped
     by the ``MAMBA`` resource: the mixer binds a ``Mamba2Callable`` and calls
     ``mix.conv`` then ``mix(...)`` per layer, like the attention layers call
-    ``attend``. Fixed-address, so the decode step captures as a CUDA graph.
+    ``attend``. Fixed-address, so the decode step captures as an accelerator graph.
 
 The Mamba-2 forward is a pure-PyTorch reference scan (no ``mamba_ssm`` kernel
 dependency) — correct but not fast; the kernel fast path is a later swap.

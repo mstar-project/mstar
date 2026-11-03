@@ -1,5 +1,5 @@
 """The Kokoro synthesis node: one sentence chunk per loop iteration, batched
-across requests, with CUDA graphs per length bucket.
+across requests, with accelerator graphs per length bucket.
 
 ``process_prompt`` hands every request all of its chunks at once (padded
 ``[n_chunks, T]`` phoneme ids, lengths, one style row per chunk, speed). Each
@@ -8,7 +8,7 @@ the batch and emits its PCM to the client; ``check_stop`` ends a request's
 loop after its last chunk.
 
 The forward has one host read, the frame count, between two static halves.
-Each half is captured as a piecewise CUDA graph per padded length bucket:
+Each half is captured as a piecewise accelerator graph per padded length bucket:
 
 * ``text_T<n>``: phonemes -> prosody states, text features, durations;
 * ``frames_F<n>``: frame-aligned features -> waveform.

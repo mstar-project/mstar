@@ -8,7 +8,7 @@ recurrence is ``mamba2_kernels``: an in-place slot-indexed Triton step for
 decode and the sequential scan for prefill.
 
 Decode is the hot path of a full-duplex model (one token per session per tick,
-every layer, every 80 ms) and is CUDA-graph safe: the step kernel reads the
+every layer, every 80 ms) and is accelerator graph safe: the step kernel reads the
 pool through the plan's slot buffer and writes it back in place. Prefill is a
 system prompt, short and rare, and runs eagerly on gathered state.
 """

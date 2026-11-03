@@ -1,4 +1,4 @@
-"""Signature-conformance test for ``get_piecewise_cuda_graph_configs`` overrides.
+"""Signature-conformance test for ``get_piecewise_accelerator_graph_configs`` overrides.
 
 ``build_piecewise_runners`` calls this method OUTSIDE the per-label try/except,
 so an override whose signature drifts from the base raises ``TypeError`` at

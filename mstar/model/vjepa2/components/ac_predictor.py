@@ -115,8 +115,8 @@ class ACRoPEAttention(nn.Module):
         """Compute RoPE position tensors for one cached frame step.
 
         Separated from forward_cached so callers can hoist this computation
-        out of CUDA-graph-captured regions.  The returned tensors are ordinary
-        (non-static) GPU tensors; the CUDA-graph path instead pre-allocates
+        out of accelerator graph-captured regions.  The returned tensors are ordinary
+        (non-static) GPU tensors; the accelerator graph path instead pre-allocates
         static GPU buffers and updates them with .copy_() before each replay.
         """
         spatial_ids = torch.arange(t_0 * h * w, (t_0 + 1) * h * w, device=device)
@@ -224,8 +224,8 @@ class ACRoPEAttention(nn.Module):
 
         Callers build ``rope`` with ``rope_tables`` from positions computed via
         _compute_positions (or the model-level _compute_rope_positions), which they
-        may hold in static GPU buffers updated via .copy_() so the surrounding CUDA
-        graph sees the new values.
+        may hold in static GPU buffers updated via .copy_() so the surrounding
+        accelerator graph sees the new values.
 
         Parity with the regular forward was partially validated in
         test/modular/vjepa2/test_ac_rope_parity.py and more thoroughly in
@@ -434,7 +434,7 @@ class VisionTransformerPredictorAC(nn.Module):
         Delegates to ACRoPEAttention._compute_positions using the first block's
         grid_size, which is constant across all blocks for a given config.
         Called once before the block loop so the computation is hoisted out of
-        any CUDA-graph-captured region.
+        any accelerator graph-captured region.
         """
         return self.predictor_blocks[0].attn._compute_positions(
             t_0, h, w, action_tokens, device, dtype
@@ -490,7 +490,7 @@ class VisionTransformerPredictorAC(nn.Module):
         static_pos_bufs: dict,          # {"d_pos": Tensor, "h_pos": Tensor, ...}
         cond_tokens: int,
     ):
-        """Return a closure capturing the block loop for PiecewiseCudaGraphRunner.
+        """Return a closure capturing the block loop for PiecewiseAcceleratorGraphRunner.
 
         The returned ``fn(x) -> x`` reads position tensors from
         ``static_pos_bufs`` (which the runner updates via ``.copy_()`` before
@@ -558,7 +558,7 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             attn_mask = None
             # Compute positions and their sin/cos once before the block loop so this
-            # work stays outside any CUDA-graph-captured region (see PiecewiseCudaGraphRunner).
+            # work stays outside any accelerator graph-captured region (see PiecewiseAcceleratorGraphRunner).
             positions = self._compute_rope_positions(
                 t_0, self.grid_height, self.grid_width, cond_tokens, x.device, x.dtype
             )

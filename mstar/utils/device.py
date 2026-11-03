@@ -1,3 +1,4 @@
+"""Device capabilities shared by workers, graph runners, and staging utilities."""
 
 from __future__ import annotations
 

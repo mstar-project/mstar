@@ -1,7 +1,7 @@
 """Static LoRA merging for the DiT scaffold.
 
 Serving-time LoRA here means folding the adapter into the base weights once at load
-(``W += scale * alpha / r * B @ A``): zero cost per step, CUDA graphs and compiled kernels
+(``W += scale * alpha / r * B @ A``): zero cost per step, accelerator graphs and compiled kernels
 see plain Linear weights, and the merged model behaves exactly like the reference pipeline
 after ``load_lora_weights`` + ``fuse_lora``. Per-request adapter switching is out of scope.
 

@@ -264,7 +264,7 @@ def ports(reference):
     sigma LUT is a fp32 GEMM whose result depends on
     ``float32_matmul_precision``, and the reference fixture is what sets it.
     """
-    # compile_dit=False: compilation and CUDA graph selection have separate
+    # compile_dit=False: compilation and accelerator graph selection have separate
     # execution-mode gates, so keeping the port eager here isolates numerical
     # compatibility.
     default = replace(waypoint_1_5_1b_720p(), compile_dit=False)

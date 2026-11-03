@@ -101,6 +101,7 @@ class TimestepEmbedder(nn.Module):
         )
 
     def _apply(self, fn, recurse=True):
+        # Module dtype conversion must not quantize the sinusoidal frequencies.
         self._buffers.pop("timestep_freqs")
         result = super()._apply(fn, recurse=recurse)
         device = self.mlp[0].weight.device

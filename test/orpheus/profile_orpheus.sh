@@ -2,7 +2,7 @@
 #
 # Profile Orpheus model execution with nsys + NVTX markers.
 # Launches the server under nsys, waits for full readiness (including model
-# loading and CUDA graph warmup), sends a warmup request, then fires
+# loading and accelerator graph warmup), sends a warmup request, then fires
 # concurrent requests for profiling.
 #
 # Usage:
@@ -81,7 +81,7 @@ if ! curl -sf "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
     exit 1
 fi
 
-# Wait for model loading + warmup (CUDA graphs, torch.compile)
+# Wait for model loading + warmup (accelerator graphs, torch.compile)
 echo "  Waiting for model loading and warmup..."
 for i in $(seq 1 300); do
     if grep -q "Worker worker_0: engine runs" "$SERVER_LOG" 2>/dev/null; then

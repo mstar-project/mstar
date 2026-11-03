@@ -1,5 +1,5 @@
 """Time the Kokoro network on one device, eager, per batch size and phoneme
-length, to size the CUDA-graph buckets and see the compute ceiling.
+length, to size the accelerator graph buckets and see the compute ceiling.
 
     python test/kokoro/bench_synth.py --device cuda --batch-sizes 1 8 32 --phonemes 40 120 300
 

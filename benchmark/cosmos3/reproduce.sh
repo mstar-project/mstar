@@ -14,7 +14,7 @@
 set -eu
 
 # --------------------------------------------------------------------------
-# Serve M* (this repo). torch.compile + CUDA graphs are on by default.
+# Serve M* (this repo). torch.compile + accelerator graphs are on by default.
 # COSMOS3_GEN_CAPTURE_RES bakes a denoise graph per benchmarked resolution;
 # COSMOS3_GEN_CAPTURE_BS additionally captures batched (concurrent) denoise
 # steps, which the throughput sweep needs to scale past one request.

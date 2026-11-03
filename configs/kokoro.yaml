@@ -11,7 +11,7 @@ node_groups:
 #   espeak_fallback: false  # skip espeak-ng for out-of-dictionary English words even if installed
 #   default_voice: af_bella
 #   chunk_target_phonemes: 200          # sentence packing (first_chunk_target_phonemes bounds TTFA)
-#   frame_buckets: [64, 128, 256, 512, 1024]   # fewer CUDA graphs on a smaller GPU
+#   frame_buckets: [64, 128, 256, 512, 1024]   # fewer accelerator graphs on a smaller GPU
 #   max_batch_frames: 8192              # batch x frames cap per captured decoder graph
 #   compile_decoder: false              # skip torch.compile of the vocoder: start-up in seconds, about half the throughput
 #   decoder_dtype: "bfloat16"           # bf16 vocoder trunk (+13% audio-s/s at concurrency 32 on an H100; fp32 is parity-tested)

@@ -1,4 +1,4 @@
-"""CPU checks for the video / windowed denoise CUDA-graph capture: one graph
+"""CPU checks for the video / windowed denoise Accelerator graph capture: one graph
 per latent shape built with every frame declared noisy, the request's
 clean/noisy layout carried as a per-token mask input. Covers the bucket
 declaration, the capture key (video, chained windows; never kv windows),

@@ -85,7 +85,7 @@ class GDNManager(LinearAttnManager):
         self._check_state_dtype(state_dtype, geometry, has_sink)
         self._stage_prefill = gdn_stage_applies(device, geometry)
 
-        # See `build_cuda_graph_buffers`.
+        # See `build_accelerator_graph_buffers`.
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}

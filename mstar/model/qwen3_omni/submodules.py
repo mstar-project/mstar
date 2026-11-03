@@ -776,7 +776,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ]
 
         # Compute cos/sin for 3D MRoPE.  Returned as separate tensor keys
-        # (not a tuple) so the CUDA graph runner can detect them as static
+        # (not a tuple) so the accelerator graph runner can detect them as static
         # inputs and copy them into the captured buffers at replay.
         inv_freq = self._get_inv_freq(device)
         cos_3d, sin_3d = compute_3d_cos_sin(
@@ -1082,7 +1082,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
         always emits ``thinker_states`` and ``thinker_mask`` as row outputs so
-        the captured CUDA graph's outputs are fixed whatever the request
+        the captured accelerator graph's outputs are fixed whatever the request
         metadata; ``postprocess`` drops them for a text-only request.
         Prefill packs ``thinker_states`` for ``unpack_packed_outputs``.
         """
