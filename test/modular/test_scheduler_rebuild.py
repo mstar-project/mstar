@@ -157,6 +157,28 @@ def test_a_rebuild_starts_past_its_cached_prefix():
     assert batch.chunk_ranges[R] == ChunkRange(8, 16, 20, 16), "the rebuild would recompute what the cache holds"
 
 
+class _Prefilling(_Runtime):
+    """Every prompt stands 4 tokens into its 10 on its chunk Loop."""
+
+    def loop_progress(self, node_name, rids, graph_walks, loop_names):
+        return [4] * len(rids), [10] * len(rids)
+
+
+def test_a_prompt_dropped_mid_prefill_runs_its_chunks_again_up_to_where_its_loop_stands():
+    sched, _, _, engine = _scheduler({}, budget=8, dropped={R})
+    sched.runtime = runtime = _Prefilling({R: PREFILL})
+    sched.chunk_loop_walks = {NODE: frozenset({PREFILL})}
+    state = _State(runtime)
+
+    rebuild = sched.get_next_batch(state)
+
+    assert R in sched.parked[NODE] and not engine.prepared, "the KV would lay the prompt out again over unkept ids"
+    assert rebuild.rebuild_rids == {R} and rebuild.chunk_ranges[R] == ChunkRange(0, 4, 4, 4), (
+        "the rebuild would run past where the prompt stood, or whole, with no input of its own"
+    )
+    assert (R, NODE) in sched.chunk_started, "the prompt's next chunk would lose its place ahead of newer prompts"
+
+
 def test_a_chunk_in_flight_is_offered_only_as_its_steps_continuation():
     sched, _, state, _ = _scheduler({}, budget=8)
     _rebuilding(sched, total=20, done=8)

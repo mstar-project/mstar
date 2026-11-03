@@ -25,7 +25,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import KeptIds, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker
 
@@ -158,6 +158,22 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
 
     assert not (eng.landed or eng.released or w.rebuilt), "the request would decode over KV the rebuild hasn't written"
     assert w._rebuilds._cursors[(NODE, R)].done == 2, "the next chunk would start over"
+
+
+def test_a_prompts_rebuild_lands_and_leaves_the_prompts_input_to_its_last_chunk():
+    w, eng = _worker()
+    w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE, Prefilling(PREFILL, 4, 10))
+    batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+    batch.chunk_ranges[R] = ChunkRange(0, 4, 4, 4)
+    node_batch = w._build_executing_batch(batch)
+
+    w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+
+    assert eng.landed == [R] and w.rebuilt == [R], "the prompt's next chunk would wait for good"
+    assert not eng.released, "the prompt's next chunk would find no input to be cut from"
+    assert w._preemption.counts[NODE].rebuild_tokens == 4
 
 
 @pytest.mark.parametrize(

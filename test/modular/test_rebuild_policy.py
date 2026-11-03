@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.graph.base import GraphEdge, GraphNode, Loop
@@ -25,7 +26,7 @@ from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import HostRows, chunk_loop_name
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
-from mstar.worker.rebuild import KeptIds, Rebuilds
+from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds
 from mstar.worker.worker import _LazyHostOutputs
 
 NODE, PREFILL, DECODE, MIXED = "LLM", "prefill", "decode", "mixed"
@@ -219,6 +220,23 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     assert infos[R].graph_walk == PREFILL and list(inputs[R]) == ["text_inputs"]
     [tokens] = inputs[R]["text_inputs"]
     assert tokens.tolist() == [1, 2, 3, 4] and tokens.dtype == torch.long, "decode would read the last id twice"
+
+
+def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its_prompt_stood():
+    rebuilds = _rebuilds()
+    prefilling = Prefilling(PREFILL, 4, 10)
+
+    why = rebuilds.refusal(R, NODE, PREFILL, {}, prefilling)
+    rebuild = rebuilds.start(R, NODE, prefilling)
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)}
+    rebuilds.fill(NODE, {R}, {R: ChunkRange(0, 4, 4, 4)}, inputs, infos)
+
+    assert why is None, "the newest request would keep its pages while an older one drops itself"
+    assert rebuild is None and inputs == {R: {}}, "the rebuild would lay out and read ids the request never kept"
+    cursor = rebuilds.cursor(R, NODE)
+    assert (cursor.walk, cursor.total, cursor.length, cursor.resumes_prefill) == (PREFILL, 4, 10, True), (
+        "the rebuild would run past where the prompt stood, or release the input the prompt's next chunk reads"
+    )
 
 
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():

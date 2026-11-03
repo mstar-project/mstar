@@ -42,7 +42,7 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, Rebuilds, policies_run_here
+from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -220,6 +220,28 @@ def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_o
 
     assert kv.residency("r") is Residency.RESIDENT and "n" not in kv._allotments, (
         "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
+
+
+def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_not_itself():
+    """A newer request between two chunks of its prompt keeps no ids from a sample yet. It was refused as a victim,
+    so the older decode dropped itself and paid a rebuild of its whole history, where the newer one reruns only
+    the chunks it ran."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    del w._rebuilds._kept[NODE]["v"]
+    w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
+        rid == "v") else None
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.DROPPED and kv.residency("r") is Residency.RESIDENT, (
+        "the older decode dropped itself while the newest request kept its pages")
+    assert _step(kv, "r", 1).ok
 
 
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
