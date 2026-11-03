@@ -56,7 +56,8 @@ The router returns these outputs:
 * ``routing_weights`` is the tensor of expert weights. The shape is
   ``(tokens, top_k)``.
 * ``selected_experts`` is the tensor of expert indices. The shape is
-  ``(tokens, top_k)``. The type is int64.
+  ``(tokens, top_k)``. The type is int64, or int32 (what the fused MoE
+  reads) from ``TopKRouter`` on AMD GPUs.
 * ``router_states_next`` is the state for the next call. A stateless router
   returns ``None``.
 
@@ -91,10 +92,12 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe.backend import MoEProblem, make_moe_backend
+    from mstar.utils.fused_moe.topk_softmax import route_topk_softmax
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
     make_moe_backend = None
+    route_topk_softmax = None
     _HAS_FUSED = False
     logger.warning(f"Could not load fused MoE kernel: {e}")
 
@@ -135,6 +138,8 @@ class TopKRouter(nn.Module):
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
+        # Picked here, not in forward: the pick takes a lock dynamo can't trace.
+        self._route = route_topk_softmax.resolve() if route_topk_softmax is not None else None
 
     def forward(
         self,
@@ -150,11 +155,15 @@ class TopKRouter(nn.Module):
         Returns:
             routing_weights: ``(tokens, top_k)`` top-k probabilities
                 (optionally renormalized).
-            selected_experts: ``(tokens, top_k)`` int64 indices.
+            selected_experts: ``(tokens, top_k)`` indices, int64 (int32
+                from the fused kernel on AMD GPUs).
             router_states_next: always ``None`` (stateless).
         """
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
+        if self._route is not None:
+            routing_weights, router_indices = self._route(router_logits, self.top_k, self.norm_topk_prob)
+            return routing_weights, router_indices, None
         router_logits = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
@@ -250,7 +259,7 @@ def dispatch_experts_fused(
         hidden_states: ``(tokens, hidden_size)``.
         gate_up_proj: ``(num_experts, 2 * moe_intermediate_size, hidden_size)``.
         down_proj: ``(num_experts, hidden_size, moe_intermediate_size)``.
-        selected_experts: ``(tokens, top_k)`` int64.
+        selected_experts: ``(tokens, top_k)`` integer indices.
         routing_weights: ``(tokens, top_k)`` float.
         skip_invalid: set when ``selected_experts`` may hold the EP
             sentinel ``num_experts``; those slots contribute nothing.
@@ -260,7 +269,7 @@ def dispatch_experts_fused(
     with torch.no_grad():
         # one-hot mask over expert dim: (num_experts, top_k, tokens)
         num_classes = num_experts + 1 if skip_invalid else num_experts
-        expert_mask = F.one_hot(selected_experts, num_classes=num_classes)
+        expert_mask = F.one_hot(selected_experts.long(), num_classes=num_classes)
         # Drop the sentinel column so skipped slots never reach an expert.
         expert_mask = expert_mask[..., :num_experts].permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()

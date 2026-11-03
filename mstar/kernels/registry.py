@@ -54,6 +54,7 @@ DECLARING_MODULES = (
     "mstar.engine.resources.spec_decode.kernels",
     "mstar.kernels.fp8_gemm",
     "mstar.platforms.rocm_gemm",
+    "mstar.utils.fused_moe.topk_softmax",
 )
 
 _OPS: dict[str, KernelOp] = {}
