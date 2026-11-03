@@ -11,6 +11,7 @@ So the oldest request always gets its page and finishes.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -21,6 +22,7 @@ from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
+from mstar.engine.resources import Residency
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
@@ -529,6 +531,47 @@ def test_a_request_back_from_the_host_waits_until_its_footprint_fits_and_is_neve
     assert _ready(kv, "z") and "z" in kv._guaranteed, "z came back preemptible, so a shortage could move it again"
     for _ in range(4):
         assert _step(kv, "z", PAGE_SIZE).ok, "z, back with room for what it grows into, ran short"
+
+
+def test_a_request_back_from_a_drop_is_never_chosen_again():
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "v", 2, arrival=2)
+    assert _step(kv, "o", 5 * PAGE_SIZE).ok
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    _request(kv, "a", 2, arrival=1)
+    _remove(kv, "o")
+    assert _ready(kv, "a") and _admitted(kv, "v")
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
+
+    assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v was preempted a second time"
+
+
+def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():
+    """`Engine.reload_request` undoes a partial reload by offloading what it reloaded. The KV's offload refused a
+    request that came back guaranteed, so a failed reload left it resident in one pool and on the host in another."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "o", 5, arrival=0)
+    _running(kv, "z", 3, arrival=1)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["z"], [], [])
+    _offload(kv, "z")
+    _remove(kv, "o")
+    assert _admitted(kv, "z") and "z" in kv._guaranteed
+    refusing = SimpleNamespace(
+        supports_eviction=True, residency=lambda rid: Residency.ON_HOST, can_reload=lambda rid: True,
+        reload=lambda rid: False,
+    )
+    engine = Engine.__new__(Engine)
+    engine._tp_follower_nodes, engine._submodules = set(), {NODE: SimpleNamespace(resources={"kv": kv, "x": refusing})}
+
+    assert not engine.reload_request(NODE, "z")
+    assert kv.residency("z") is Residency.ON_HOST, "z stayed resident in one pool and on the host in the other"
 
 
 @pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
