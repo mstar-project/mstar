@@ -1037,3 +1037,48 @@ def test_realtime_refused_format_is_not_applied(tmp_path, fmt):
     assert out[1]["session"]["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
     with wave.open(server.submitted[0]["file_paths"]["audio"][0], "rb") as wf:
         assert wf.getframerate() == 24000 and wf.readframes(wf.getnframes()) == PCM
+
+
+def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_path):
+    """Without it a Dynamo worker had no prefix-cache keys, LoRA adapters or request limits."""
+    import yaml
+
+    from mstar.api_server import entrypoint
+    from mstar.integrations.dynamo import worker
+
+    config = {"model": "whisper_large", "preprocess_torch_threads": None, "max_call_input_mb": 1}
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump(config))
+    seen = {}
+    monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: SimpleNamespace())
+    monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
+    monkeypatch.setattr(worker.cpus, "install", lambda plan: None)
+    monkeypatch.setattr(entrypoint, "APIServer", lambda **kw: seen.setdefault(
+        "server", SimpleNamespace(lora_adapter_digests={"style": b"\x01"}, **kw)))
+    monkeypatch.setattr(worker.mp, "get_context", lambda method: SimpleNamespace(Process=lambda **kw: seen.setdefault(
+        "conductor", SimpleNamespace(start=lambda: None, pid=1, **kw))))
+    worker.build_server(SimpleNamespace(
+        config=str(path), cache_dir=None, socket_path_prefix="p", upload_dir="u", timeout=1,
+        tensor_comm_protocol="TCP", log_level="INFO"))
+    assert seen["server"].model_config == config
+    assert seen["conductor"].kwargs == {"lora_adapter_digests": {"style": "01"}}
+
+
+def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
+    """Without them the first Dynamo request of a shape paid its compile."""
+    from mstar.api_server import entrypoint
+    from mstar.integrations.dynamo import worker
+
+    events = []
+    server = SimpleNamespace(
+        _model_config={"model": "whisper_large", "warmup_requests": [{"text": "hi"}]}, model=None,
+        fatal_error=None, cleanup=lambda: None, finalize_setup=lambda: events.append("setup"))
+    monkeypatch.setattr(worker, "build_server", lambda args: (server, None, "whisper_large"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append(("warmup", specs, kw)))
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+    monkeypatch.setattr(worker, "serve", lambda server, name, args: events.append("serve"))
+    worker._serve_until_shutdown(SimpleNamespace(config="c.yaml", cache_dir="/models"))
+    assert events == ["setup", ("warmup", [{"text": "hi"}], {}), "serve"]
