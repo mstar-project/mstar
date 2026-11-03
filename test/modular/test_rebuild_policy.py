@@ -656,3 +656,146 @@ def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declare
         kept = SamplerResource._kept_rids_of(SamplerStep(kept_rids=kept_rids), ctx)
 
         assert kept == {A}, "the rebuild row's sample would overwrite decode's next input"
+
+
+# A Bagel image chat: text in its own step, then the image and the text after it in the image's walk, as a Qwen3-Omni
+# prompt with audio lays out each attachment's step.
+TWO_STEPS = (PrefixSpan(3, 3, PREFILL), *IMAGE_CHAT[1:])
+TEXT_STEP = {"text_inputs": [torch.tensor([1, 2, 3])]}
+IMAGE_STEP = {"text_inputs": [torch.tensor([4, 5])], "embeds": [torch.ones(4, 2)]}
+
+
+def _two_steps(*sampled: int) -> Rebuilds:
+    """`Rebuilds` whose ``R`` ran both steps of ``TWO_STEPS``, each under its own metadata, and sampled ``sampled``."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), _CountingPool())
+    assert _ingest(rebuilds, R, TWO_STEPS)
+    for walk, inputs, order in ((PREFILL, TEXT_STEP, "text"), (VISION, IMAGE_STEP, "image")):
+        step = _ran(walk, {R: inputs})
+        step.per_request_info[R].step_metadata = {"prefill_order": (order,)}
+        rebuilds.record(step)
+    rebuilds.flush()
+    rebuilds._kept[NODE][R].sampled.extend(sampled)
+    return rebuilds
+
+
+def _fill(rebuilds: Rebuilds) -> tuple[dict, CurrentForwardPassInfo]:
+    inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
+    rebuilds.fill(NODE, {R}, {}, inputs, infos)
+    return inputs[R], infos[R]
+
+
+def test_a_prompt_of_two_steps_is_rebuilt_a_row_per_step_from_its_layout():
+    """The rebuild replayed the steps it had watched go by, so a chunked prompt, recorded once per chunk, rebuilt
+    other rows than its layout lays out. The rows are the layout's steps, and the last one carries the samples."""
+    rebuilds = _two_steps(6, 7)
+
+    rebuild = rebuilds.start(R, NODE, None)
+    cursor = rebuilds.cursor(R, NODE)
+
+    assert [(row.walk, row.total) for row in cursor.rows] == [(PREFILL, 3), (VISION, 9)], (
+        "the rows would write other slots than the prompt's steps, or leave out the sample decode wrote"
+    )
+    assert rebuild == Rebuild(array("i", [6, 7]))
+
+
+def test_every_rebuild_row_runs_under_its_own_prefill_steps_metadata_and_reads_only_its_own_copies():
+    rebuilds = _two_steps(6, 7)
+    rebuilds.start(R, NODE, None)
+
+    text, text_info = _fill(rebuilds)
+    assert text_info.step_metadata == {"prefill_order": ("text",)}, "the text row would run under decode's metadata"
+    assert rebuilds._pool.copied_in == 0 and list(text) == ["text_inputs"], (
+        "handing out the text row would copy the image back to the device, outside the KV pool"
+    )
+    rebuilds.land_chunk(R, NODE, None)
+    image, image_info = _fill(rebuilds)
+
+    assert image_info.graph_walk == VISION and image_info.step_metadata == {"prefill_order": ("image",)}
+    assert rebuilds._pool.copied_in == 1 and image["text_inputs"][0].tolist() == [4, 5, 6], (
+        "the samples would follow another step's text, or the image would stay on the host"
+    )
+
+
+def test_a_rebuild_stays_open_until_its_last_row_lands():
+    """A request partway through a rebuild of several rows could be picked again and start over. Its rebuild stays
+    open, and its KV dropped, from the first row to the last."""
+    rebuilds = _two_steps(6)
+    rebuilds.start(R, NODE, None)
+
+    first = rebuilds.land_chunk(R, NODE, None)
+
+    assert first.row.walk == PREFILL and rebuilds.rebuilding(R, NODE), "the rebuild would land after its first row"
+    assert rebuilds.land_chunk(R, NODE, None).ran == 8 and not rebuilds.rebuilding(R, NODE)
+
+
+def test_only_the_last_prefill_steps_sample_is_kept():
+    """A prefill step before the last draws a token the model throws away, so keeping it would refuse every drop."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    assert _ingest(rebuilds, R, TWO_STEPS)
+
+    for walk, inputs, token in ((PREFILL, TEXT_STEP, 40), (VISION, IMAGE_STEP, 41)):
+        rebuilds.record(_ran(walk, {R: inputs}))
+        rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [torch.tensor([token])]}}, None)
+
+    assert list(rebuilds._kept[NODE][R].sampled) == [41], "the first step's draw would be kept as a sample"
+    assert R not in rebuilds._prefilling[NODE], "decode steps would look for the request's prefill steps"
+
+
+class _Unread(dict):
+    """A step's rows that fail the test when read."""
+
+    def items(self):
+        raise AssertionError("a decode step's rows were read")
+
+
+def test_a_step_with_no_request_still_prefilling_reads_no_row():
+    rebuilds = _two_steps(6)
+
+    rebuilds.record(_ran(DECODE, _Unread({R: {}})))
+
+
+@pytest.mark.parametrize("step", ["another walk", "another length"])
+def test_a_step_other_than_its_layouts_next_leaves_the_request_never_dropped(step):
+    """A rebuild from a layout its prefill didn't follow would write other slots."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    assert _ingest(rebuilds, R, TWO_STEPS)
+    first = _ran(VISION if step == "another walk" else PREFILL, {R: TEXT_STEP})
+    first.chunk_ranges = {} if step == "another walk" else {R: ChunkRange(0, 2, 5, 2)}
+
+    rebuilds.record(first)
+
+    assert "keeps no log" in rebuilds.refusal(R, NODE, DECODE, {}, None), "a rebuild would write other slots"
+
+
+def test_a_chunked_steps_first_chunk_records_it_and_its_later_chunks_record_nothing():
+    """A chunk after the first carries no inputs, since it is cut from what the first prepared, and recording it as
+    a step of its own raised for a copied walk."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    assert _ingest(rebuilds, R, IMAGE_CHAT)
+
+    chunks = [(ChunkRange(0, 4, 11, 4), IMAGE_STEP), (ChunkRange(4, 8, 11, 4), {}), (ChunkRange(8, 11, 11, 3), {})]
+    for chunk, inputs in chunks:
+        step = _ran(VISION, {R: inputs})
+        step.chunk_ranges = {R: chunk}
+        rebuilds.record(step)
+
+    assert len(rebuilds._kept[NODE][R].records) == 1 and R not in rebuilds._prefilling[NODE], (
+        "one step run in chunks would be recorded as several, or not at all"
+    )
+
+
+def test_a_request_dropped_in_a_later_prompt_step_reruns_the_steps_before_it_then_its_own_chunks():
+    """A request mid-prefill in its second step holds the first step's KV too. Its rebuild reruns the first from the
+    log and the second from the input the engine keeps for it, up to where it stood."""
+    rebuilds = _two_steps()
+    prefilling = Prefilling(VISION, 4, 11)
+
+    why = rebuilds.refusal(R, NODE, VISION, {}, prefilling)
+    rebuild = rebuilds.start(R, NODE, prefilling)
+    cursor = rebuilds.cursor(R, NODE)
+
+    assert why is None and rebuild is None, "the request's layout already says what its rebuild writes"
+    assert [(row.walk, row.total, row.length, row.record is None) for row in cursor.rows] == [
+        (PREFILL, 3, 3, False), (VISION, 4, 11, True),
+    ], "the rebuild would write the second step's chunks where the first step's KV was"
+    assert not cursor.resumes_prefill, "the first row would be cut from the second step's input"

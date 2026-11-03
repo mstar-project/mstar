@@ -308,6 +308,36 @@ def test_a_rebuild_rows_ids_go_to_the_device_on_its_first_chunk_only(chunk):
         assert not inputs, "a later chunk is cut from the input the engine prepared on the first"
 
 
+def test_a_request_dropped_in_its_second_prompt_step_reruns_both_and_its_prompt_goes_on_from_its_own_input():
+    """The first row prepares its own input from the log, where the engine keeps the prompt's, so the prompt's input
+    waits aside until the row that resumes it, and the rebuild lands only after that row."""
+    w, eng = _worker()
+    eng.restored = []
+    eng.restore_chunk_inputs = lambda rid, node: eng.restored.append(rid)
+    w.infos[R] = CurrentForwardPassInfo(str(R), PREFILL, 0, 0, 8)
+    rows = (LayoutRow(PREFILL, 3), LayoutRow(PREFILL, 5))
+    w._rebuilds._kept[NODE][R] = KeptIds(rows, [_record(), _record((4, 5, 6, 7, 8))])
+    eng.dropped.append(R)
+    w._rebuilds.start(R, NODE, Prefilling(PREFILL, 2, 5))
+
+    def run(chunk=None):
+        batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
+        if chunk is not None:
+            batch.chunk_ranges[R] = chunk
+        node_batch = w._build_executing_batch(batch)
+        w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+        return node_batch.per_request_input_tensors.get(R, {})
+
+    first = run()
+    assert first["text_inputs"][0].tolist() == [1, 2, 3], "the first row would read the prompt step's input"
+    assert eng.released == eng.restored == [R] and not eng.landed, (
+        "the first row's input would stay on the device, or the prompt's next chunk would find none"
+    )
+    assert not run(ChunkRange(0, 2, 2, 2)), "the prompt's row would prepare an input the engine already keeps"
+
+    assert eng.landed == [R] and eng.released == [R], "the prompt's next chunk would find no input to be cut from"
+
+
 def test_a_skipped_rebuild_row_fails_its_request():
     w, eng, batch, node_batch = _rebuilding()
     # as the engine leaves a row whose prepare_inputs returned None

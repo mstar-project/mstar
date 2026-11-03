@@ -10,6 +10,7 @@ import logging
 import sys
 from array import array
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -361,6 +362,25 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
     w._set_rebuildable(1, configs)
 
     assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+
+
+@pytest.mark.parametrize("prefix_cache", [True, False])
+def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
+    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
+    the way of a rebuild."""
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    text = PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill")
+    layout = StreamLayout(spans=(text, replace(text, opens_step=False)), growth=(("decode", 1),), keyed_spans=1)
+    configs = {"kv": KVReqConfig(
+        kv_layout={"main": layout}, loop_caps={"decode": 64}, prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache,
+    )}
+
+    w._set_rebuildable(1, configs)
+
+    assert configs["kv"].rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
 
 
 @pytest.mark.parametrize("layout", ["two labels", "two loops"])
