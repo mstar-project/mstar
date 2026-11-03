@@ -25,7 +25,7 @@ sys.path.insert(0, ".")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
+from mstar.api_server.data_worker import EncodedOutput, InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import (
     APIServerMessage,
     RequestComplete,
@@ -142,7 +142,8 @@ def test_an_error_chunk_carries_the_version_of_the_output_it_replaces():
     state = object()
     worker.request_output_state["r4"] = state
     worker.tensor_manager = SimpleNamespace(dereference=lambda uuid: None)
-    worker._encoded = collections.deque([(failed, "r4", state, None, "image", {"weight_version": "v6"}, 41)])
+    worker._encoded = collections.deque([
+        EncodedOutput(failed, "r4", state, None, "image", {"weight_version": "v6"}, 41, None)])
     worker._release_encoded()
     assert worker.out_queue.get_nowait().metadata == {"status": 400, "weight_version": "v6"}
 
