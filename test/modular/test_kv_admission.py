@@ -239,6 +239,22 @@ def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the
     assert (NODE, "p") in started, "a request parked behind a head that still doesn't fit was never tried to pass"
 
 
+def test_a_passer_finishing_tries_no_request_behind_the_head_again(monkeypatch):
+    kv = _passing(free=3, head=5)
+    _short_chat(kv, "p", [6000] * 8)
+    assert _ready(kv, "p")
+    for n in range(4):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv.remove_request("p")
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, "the pages a passer freed for the head made the runner try requests that can't use them"
+
+
 def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
     kv = _passing(free=3, head=5)
     # "p"'s output fits, but not beside its three own pages past what "r" holds

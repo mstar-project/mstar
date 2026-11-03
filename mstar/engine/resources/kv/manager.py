@@ -95,8 +95,9 @@ class RoomMark(NamedTuple):
 
 
 class PassMark(NamedTuple):
-    """What `reserve_past` refused a request against: the room, and the index counts when the refusal read
-    the index. A refusal on the request's growth alone reads none, so a filed page doesn't retry it."""
+    """What `reserve_past` refused a request against: the room less `KVManager._kept`, and the index counts
+    when the refusal read the index. A refusal on the request's growth alone reads none, so a filed page
+    doesn't retry it."""
     room: int
     filed: int | None
     taken: int | None
@@ -4426,7 +4427,7 @@ class KVManager(AttentionResource):
         with self._lock:
             room = self._room()
             if rid in self._allotments or self._footprint(rid) - self._asks[rid] > room - self._kept:
-                return PassMark(room, None, None)
+                return PassMark(room - self._kept, None, None)
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
@@ -4437,7 +4438,7 @@ class KVManager(AttentionResource):
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
             room = self._room()
             if pages > room - self._kept:
-                return PassMark(room, *self._index_counts())
+                return PassMark(room - self._kept, *self._index_counts())
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
             self._reserve(rid, pages, passed=True)
@@ -4486,7 +4487,9 @@ class KVManager(AttentionResource):
             return grew
 
     def _grew_since(self, mark: RoomMark | PassMark) -> bool:
-        if self._room() > mark.room:
+        # pages freed into `_kept` are no room for a passer
+        room = self._room() - self._kept if isinstance(mark, PassMark) else self._room()
+        if room > mark.room:
             return True
         return mark.filed is not None and (mark.filed, mark.taken) != self._index_counts()
 
