@@ -234,7 +234,9 @@ Notes
   ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
-  On AMD GPUs the sweep tunes Triton's HIP compiler options too.
+  On AMD GPUs the sweep tunes Triton's HIP compiler options too. An AMD GPU passed
+  to a VM through SR-IOV reports its name with " VF" appended and reads the bare
+  GPU's table.
 - To add a new family, see :doc:`adding_models`.
 - For AMD GPUs, see `Running on AMD GPUs`_.
 
@@ -770,6 +772,13 @@ Qwen3-Omni notes
   ``ramp4g`` schedule below. On MI325X, at 32 text requests: 168 audio-s/s against
   135, the same at one request. Other platforms serve one worker and the default
   schedule, and ``configs/qwen3omni_2gpu_stock.yaml`` keeps those everywhere.
+- On AMD GPUs the Thinker's decode step runs three registry kernels per layer in place
+  of several each: the router's softmax, top-k and renormalization
+  (``mstar::moe_topk_softmax``), the q/k norms with the multimodal rotation
+  (``mstar::qk_norm_rope``), and each residual add inside the next norm
+  (``mstar::fused_add_rms_norm``). On one MI325X that is 806 kernels a step at one
+  request against 1239, and the Thinker's device time 4.8 against 6.7 ms (16.3 against
+  19.2 ms at 32 requests). Other platforms run the unfused layer.
 - On AMD GPUs ``configs/qwen3omni_colocated.yaml`` runs the Thinker with the encoders,
   the Talker and Code2Wav as three workers on one GPU, the layout of
   ``configs/qwen3omni_colocated_split3.yaml``. On one MI325X (a quiet node, one run per
