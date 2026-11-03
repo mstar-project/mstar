@@ -474,12 +474,13 @@ and is never dropped or moved to the host. Voice requests then queue when the po
 are never preempted mid-stream. A request with images, video or audio can be dropped at one rank
 when its node's rebuild policy names the walks its prompt runs in: the worker keeps a host copy of
 what each prefill step read, the encoder's output included, and rebuilds the request by running
-those steps again in order, such as a Qwen3.5 chat with images or a video, or a Higgs Audio
-transcription. A request no drop can free, because it holds KV made from another node's outputs
-or from media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only
-to the host: when it is admitted the host pool sets room for its whole footprint aside, and it
-reserves only its prompt. Bagel and Qwen3-Omni requests with media, whose nodes' policies name only
-the text walk, and requests with media above one rank are such requests. When the host pool can't set the room aside, the
+those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image chat, a
+Qwen3-Omni request with audio, images or video in and text out, or a Higgs Audio transcription. A
+request no drop can free, because it holds KV made from another node's outputs or from media it
+keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
+it is admitted the host pool sets room for its whole footprint aside, and it reserves only its
+prompt. Bagel generations, which write a label per guidance, and requests with media above one rank
+are such requests. When the host pool can't set the room aside, the
 request reserves its whole footprint in that pool, as a voice request does. So
 ``cpu_offload_pages`` also sets how many such requests run at once with only their prompt reserved.
 

@@ -185,6 +185,8 @@ class Rebuilds:
     ) -> None:
         # node -> walk -> what the node reads there besides the ids, which the worker copies to the host
         self._copied = {node: policy.check(node, graphs) for node, policy in policies.items()}
+        # node -> the walks that read the ids, the only ones an ids span is written in
+        self._ids_walks = {node: policy.ids_walks(node, graphs) for node, policy in policies.items()}
         self._policies = dict(policies)
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
@@ -218,7 +220,8 @@ class Rebuilds:
             policy is not None and rebuild_refusal(layouts) is None
             and all(loop == policy.loop for layout in layouts for loop, _ in layout.growth)
             and all(
-                span.walk in policy.walks and (span.kind == SpanKind.IDS or self._copied[node][span.walk])
+                span.walk in policy.walks
+                and (span.walk in self._ids_walks[node] if span.kind == SpanKind.IDS else self._copied[node][span.walk])
                 for layout in layouts for span in layout.spans
             )
         )
@@ -302,7 +305,7 @@ class Rebuilds:
                 continue
             kept, piece = self._kept[node][rid], self._droppable[node][rid]
             row = kept.rows[len(kept.records)]
-            names = sorted({ids_input, *self._copied[node][walk]})
+            names = sorted({*([ids_input] if walk in self._ids_walks[node] else ()), *self._copied[node][walk]})
             tensors = [
                 (name, tensor.reshape(-1) if name == ids_input else tensor)
                 for name in names for tensor in inputs.get(name, ())

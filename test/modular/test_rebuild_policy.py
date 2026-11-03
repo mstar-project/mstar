@@ -64,7 +64,7 @@ def _graphs() -> dict:
 
 @pytest.mark.parametrize("field, value, why", [
     ("walks", frozenset({"audio"}), "doesn't run"),
-    ("ids_input", "embeds", "carries"),
+    ("ids_input", "pixels", "carries"),
     ("sample_output", "codes", "doesn't output"),
     ("loop", "talker_loop", "in no walk"),
     ("copy_bytes_per_slot", {}, "doesn't say"),
@@ -147,10 +147,13 @@ def test_a_video_on_a_walk_whose_inputs_are_copied_can_be_rebuilt():
     }),
     (OrpheusModel, {"config": SimpleNamespace(max_position_embeddings=4096)}),
     (BagelModel, {
-        "config": SimpleNamespace(max_position_embeddings=4096, num_timesteps=50),
+        "config": SimpleNamespace(max_position_embeddings=4096, num_timesteps=50, hidden_size=64),
         "_has_cfg_parallel": False, "_image_gen_remote_handoff": False,
     }),
-    (Qwen3OmniModel, {"config": SimpleNamespace(thinker_text=SimpleNamespace(max_position_embeddings=4096))}),
+    (Qwen3OmniModel, {"config": SimpleNamespace(
+        thinker_text=SimpleNamespace(max_position_embeddings=4096, hidden_size=64),
+        vision=SimpleNamespace(out_hidden_size=64, deepstack_visual_indexes=(8, 16)),
+    )}),
 ], ids=["qwen3_5", "orpheus", "bagel", "qwen3_omni"])
 def test_a_policy_passes_its_check_on_a_walk_that_chunks(model_class, attrs):
     """A chunkable node runs its walk inside a chunk Loop, which adds the Loop's tick to the node's inputs."""

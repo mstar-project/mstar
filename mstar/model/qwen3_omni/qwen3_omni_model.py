@@ -440,10 +440,16 @@ class Qwen3OmniModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # the Talker's KV is built from the Thinker's states, which no ids recompute
+        # Audio, images and video are rebuilt from host copies of the encoders' outputs, one bf16 embedding per slot,
+        # and for vision one more per deepstack layer. The Talker's KV is built from the Thinker's states, which no
+        # rebuild recomputes.
+        vision = self.config.vision
         return {"Thinker": RebuildPolicy(
-            walks=frozenset({"prefill_text"}), ids_input="text_inputs", sample_output="new_token",
-            loop="thinker_decode_loop",
+            walks=frozenset({"prefill_text", "prefill_audio", "prefill_vision"}), ids_input="text_inputs",
+            sample_output="new_token", loop="thinker_decode_loop", copy_bytes_per_slot={
+                "prefill_audio": 2 * self.config.thinker_text.hidden_size,
+                "prefill_vision": 2 * vision.out_hidden_size * (1 + len(vision.deepstack_visual_indexes)),
+            },
         )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:

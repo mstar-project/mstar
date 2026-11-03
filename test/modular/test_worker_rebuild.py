@@ -191,7 +191,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
-    w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
+    w._rebuilds._copied, w._rebuilds._ids_walks = {node: {walk: frozenset({"embeds"})}}, {node: frozenset({walk})}
     w._rebuilds._kept = {node: {1: KeptIds((LayoutRow(walk, 4),))}}
     w._rebuilds._prefilling = {node: {1}}
     w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
