@@ -1404,6 +1404,22 @@ def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_
         scheduler.settle_tp_follow_delta(caught_up=True)
 
 
+def test_a_follower_replays_a_request_that_passed_the_head_into_rank_0s_counts(monkeypatch):
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "head", 8, arrival=2)
+    _ingest((leader, follower), "p", 1, arrival=3)
+    assert _admits(leader, "r") and not _admits(leader, "head") and _admits(leader, "p")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept)
+    assert _counts(leader) == _counts(follower), "the follower allotted the request that passed another way"
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("p", PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    for engine in (lead, follow):
+        engine.remove_request("p")
+
+    assert _counts(leader) == _counts(follower), "the pages the request that passed freed went elsewhere on one rank"
+
+
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
 
