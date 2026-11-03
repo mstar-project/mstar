@@ -81,7 +81,9 @@ def test_real_checkpoint_loads_all_components(model, talker, codec):
     assert model.get_submodule("Codec", device="cuda:0") is codec
     assert sum(p.numel() for p in talker.model.parameters()) == 764_218_368
     assert sum(p.numel() for p in talker.code_predictor.parameters()) == 141_570_304
-    assert sum(p.numel() for p in codec.decoder.parameters()) == 114_323_137
+    # the checkpoint's 114,323,137 less the SnakeBeta alpha/beta (23,232), which
+    # load into FusedSnakeBeta's buffers
+    assert sum(p.numel() for p in codec.decoder.parameters()) == 114_299_905
     assert next(talker.model.parameters()).dtype == torch.bfloat16
     assert next(codec.decoder.parameters()).dtype == torch.float32
 
