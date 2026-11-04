@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from mstar_sim import clock
+from mstar_sim.device import gpu_error
 
 from ._paged import PagedAttention, _not_supported, check_layout, element_size, table_features
 
@@ -75,7 +76,7 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
         if window_right != 0:
             _not_supported("decode window_right")
         if q_len_per_req < 1:
-            raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
+            raise gpu_error(ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}"))
         if data_type is not None:
             q_data_type = kv_data_type = data_type
         if self._use_tensor_cores and self._backend == "auto":

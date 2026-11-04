@@ -274,10 +274,10 @@ def _allocate(index: int, nbytes: int) -> Pool:
             if reserved(index) + grow > limit:
                 held = ", ".join(f"{'default' if p.handle == DEFAULT_POOL else p.handle}: {p.reserved / 2**20:.0f}"
                                  for p in POOLS.values() if p.device == index and p.reserved)
-                raise torch.cuda.OutOfMemoryError(
+                raise gpu_error(torch.cuda.OutOfMemoryError(
                     f"CUDA out of memory. Tried to allocate {nbytes / 2**20:.2f} MiB. GPU {index} has a total "
                     f"capacity of {limit / 2**30:.2f} GiB, of which {(limit - reserved(index)) / 2**20:.2f} MiB "
-                    f"is free (mstar_sim: MiB reserved per pool: {held})")
+                    f"is free (mstar_sim: MiB reserved per pool: {held})"))
         into.reserved += grow
         RESERVED_PEAK[index] = max(RESERVED_PEAK.get(index, 0), reserved(index))
     return into
@@ -405,21 +405,29 @@ def _rewrap(raw, inputs, index):
     return tree_map(one, raw)
 
 
+def gpu_error(error: BaseException) -> BaseException:
+    """``error``, which the emulator raises where the GPU stack would (CUDA, the caching
+    allocator, a kernel library's own check): tagged, so it reads as mstar's, not as a gap
+    in the emulator (``mstar_sim.pytest_plugin``)."""
+    error._mstar_sim_gpu = True
+    return error
+
+
 def host_wait() -> None:
     """A host read of device data: wait for the current stream, refuse under capture
     (and, under ``torch.cuda.set_sync_debug_mode``, warn or refuse as CUDA does)."""
     if SYNC_DEBUG[0]:
         message = "called a synchronizing CUDA operation (mstar_sim: a host read of a cuda tensor)"
         if SYNC_DEBUG[0] >= 2:
-            raise RuntimeError(message)
+            raise gpu_error(RuntimeError(message))
         import warnings
 
         warnings.warn(message, stacklevel=3)
     if clock.capturing() is not None:
-        raise RuntimeError(
+        raise gpu_error(RuntimeError(
             "CUDA error: operation not permitted when stream is capturing "
             "(mstar_sim: a host read of a cuda tensor during graph capture)"
-        )
+        ))
     clock.wait_until(clock.current_timeline().free_at)
 
 
@@ -437,11 +445,11 @@ def _check_devices(func, args, kwargs, flat=None) -> int:
             f"{'cuda' if isinstance(x, SimTensor) else x.device.type}{tuple(x.shape)}"
             for x in tree_flatten((args, kwargs))[0] if isinstance(x, torch.Tensor)
         ]
-        raise RuntimeError(
+        raise gpu_error(RuntimeError(
             "Expected all tensors to be on the same device, but found at least two "
             f"devices, cuda:{index} and cpu! (mstar_sim: {getattr(func, '__name__', func)} "
             f"over {', '.join(where)})"
-        )
+        ))
     return index or 0
 
 
@@ -529,7 +537,7 @@ def _assert_in_bounds(name: str, pairs) -> None:
         bad = (ix < low) | (ix >= size)
         if bool(bad.any()):
             FAULT[0] = f"{name}: index {int(ix[bad][0])} is out of bounds for size {size}"
-            raise RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})")
+            raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})"))
 
 
 # torch functions with an index operand, priced per aten op when an index holds values
@@ -860,7 +868,7 @@ def _custom_impl(func):
 
 def _function(func, args, kwargs):
     if FAULT[0] and func not in _METADATA:
-        raise RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: earlier, {FAULT[0]})")
+        raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: earlier, {FAULT[0]})"))
     if clock.FAST:
         return _function_body(func, args, kwargs)
     # the interposer's own time is not the host's: the device stamps exclude it

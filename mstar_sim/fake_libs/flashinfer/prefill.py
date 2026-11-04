@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from mstar_sim.device import gpu_error
+
 from ._paged import (
     PagedAttention,
     _copy,
@@ -48,7 +50,7 @@ class BatchPrefillWithPagedKVCacheWrapper(PagedAttention):
         if jit_args is not None:
             _not_supported("BatchPrefillWithPagedKVCacheWrapper(jit_args=...)")
         if use_cuda_graph and not torch.is_tensor(qo_indptr_buf):
-            raise ValueError("qo_indptr_buf should be a torch.Tensor in cuda graph mode")
+            raise gpu_error(ValueError("qo_indptr_buf should be a torch.Tensor in cuda graph mode"))
         super().__init__(
             float_workspace_buffer, kv_layout, use_cuda_graph, qo_indptr_buf,
             paged_kv_indptr_buf, paged_kv_indices_buf, paged_kv_last_page_len_buf, backend,
@@ -137,12 +139,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf) or not torch.is_tensor(kv_indptr_buf):
-                raise ValueError(
+                raise gpu_error(ValueError(
                     "qo_indptr_buf and kv_indptr_buf should be torch.Tensors in cuda graph mode"
-                )
+                ))
             self._fixed_batch_size = len(qo_indptr_buf) - 1
             if len(kv_indptr_buf) != self._fixed_batch_size + 1:
-                raise ValueError("The length of kv_indptr_buf should be batch_size + 1.")
+                raise gpu_error(ValueError("The length of kv_indptr_buf should be batch_size + 1."))
         else:
             self._fixed_batch_size = 0
         self._qo_indptr_buf = qo_indptr_buf
@@ -191,29 +193,29 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             max_item_len_ptr=max_item_len_ptr,
         )
         if num_qo_heads % num_kv_heads:
-            raise ValueError(
+            raise gpu_error(ValueError(
                 f"num_qo_heads {num_qo_heads} must be a multiple of num_kv_heads {num_kv_heads}"
-            )
+            ))
         qo_host = [int(x) for x in qo_indptr.tolist()]
         kv_host = [int(x) for x in kv_indptr.tolist()]
         if len(qo_host) != len(kv_host):
-            raise ValueError("qo_indptr and kv_indptr must have the same length")
+            raise gpu_error(ValueError("qo_indptr and kv_indptr must have the same length"))
         batch = len(qo_host) - 1
         total_rows = qo_host[-1]
         if self._use_cuda_graph:
             if self._max_total_num_rows is None:
                 self._max_total_num_rows = total_rows
             elif total_rows > self._max_total_num_rows:
-                raise ValueError(
+                raise gpu_error(ValueError(
                     f"The total number of rows in qo_indptr {total_rows} in cuda graph mode cannot "
                     f"exceed the number of rows set during initialization {self._max_total_num_rows}."
-                )
+                ))
             if batch != self._fixed_batch_size:
-                raise ValueError(
+                raise gpu_error(ValueError(
                     "The batch size should be fixed in cudagraph mode, the runtime batch size "
                     f"{batch}  mismatches the batch size set during initialization "
                     f"{self._fixed_batch_size}."
-                )
+                ))
             self._qo_indptr_buf.copy_(qo_indptr)
             self._kv_indptr_buf.copy_(kv_indptr)
         else:
@@ -259,7 +261,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_cache_sf=None, lse_base: str = "log2", **kwargs,
     ):
         if not self._planned:
-            raise RuntimeError("plan() must be called before run()")
+            raise gpu_error(RuntimeError("plan() must be called before run()"))
         if args:
             _not_supported("custom-kernel run(*args)")
         if kv_cache_sf is not None:

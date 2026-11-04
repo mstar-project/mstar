@@ -263,7 +263,9 @@ class Stream:
         # as torch's THPStream_enter: the saved context lives on the stream object,
         # so a second enter (nested, or from another thread) raises
         if getattr(self, "_ctx", None) is not None:
-            raise RuntimeError("Stream's context should not be initialized.")
+            from mstar_sim.device import gpu_error
+
+            raise gpu_error(RuntimeError("Stream's context should not be initialized."))
         self._ctx = stream(self)
         return self._ctx.__enter__()
 

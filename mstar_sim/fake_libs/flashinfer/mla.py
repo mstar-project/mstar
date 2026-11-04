@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from mstar_sim.device import gpu_error
+
 from ._paged import _copy, _not_supported, attention_kernel, canonical_dtype, element_size, visible_keys
 
 
@@ -32,7 +34,7 @@ class BatchMLAPagedAttentionWrapper:
             for name, buf in (("qo_indptr", qo_indptr), ("kv_indptr", kv_indptr),
                               ("kv_indices", kv_indices), ("kv_len_arr", kv_len_arr)):
                 if not torch.is_tensor(buf):
-                    raise ValueError(f"{name} should be a torch.Tensor in cuda graph mode")
+                    raise gpu_error(ValueError(f"{name} should be a torch.Tensor in cuda graph mode"))
         self._qo_indptr_buf = qo_indptr
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
@@ -61,12 +63,12 @@ class BatchMLAPagedAttentionWrapper:
         batch = len(qo_host) - 1
         if self._use_cuda_graph:
             if batch + 1 != len(self._qo_indptr_buf):
-                raise ValueError(
+                raise gpu_error(ValueError(
                     f"The batch size should be fixed in cudagraph mode: {batch} rows planned, "
                     f"{len(self._qo_indptr_buf) - 1} captured"
-                )
+                ))
             if len(kv_indices) > len(self._kv_indices_buf):
-                raise ValueError("The length of kv_indices exceeds the allocated buffer size.")
+                raise gpu_error(ValueError("The length of kv_indices exceeds the allocated buffer size."))
             self._qo_indptr_buf.copy_(qo_indptr)
             self._kv_indptr_buf.copy_(kv_indptr)
             self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices)
@@ -107,7 +109,7 @@ class BatchMLAPagedAttentionWrapper:
         o_scale: float | None = None, *, ckv_scale=None, ckv_scale_arr=None, kpe_scale=None,
     ):
         if not self._planned:
-            raise RuntimeError("plan() must be called before run()")
+            raise gpu_error(RuntimeError("plan() must be called before run()"))
         if kv_len is not None or page_table is not None:
             _not_supported("mla run(kv_len=, page_table=) (the trtllm-gen path)")
         if ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None:

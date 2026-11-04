@@ -29,13 +29,11 @@ from __future__ import annotations
 import ast
 import functools
 import inspect
-import pathlib
 import re
 import sys
 import textwrap
 
 import pytest
-import torch
 
 from mstar_sim import device
 
@@ -59,40 +57,38 @@ def _needs_the_hub(excinfo) -> bool:
 
 
 def _missing_from_stand_in(excinfo) -> str | None:
-    """A name a stand-in library (``mstar_sim/fake_libs``) doesn't provide yet: the
-    real library has it, so the gap is the emulator's."""
-    if not excinfo.errisinstance((AttributeError, ImportError)):
+    """A name an emulated object (a ``torch.cuda`` stand-in, a ``fake_libs`` library)
+    doesn't provide yet: the real one has it, so the gap is the emulator's."""
+    error = excinfo.value
+    if isinstance(error, AttributeError):
+        owner = getattr(error, "obj", None)  # what lacked the attribute
+        module = owner if inspect.ismodule(owner) else sys.modules.get(
+            getattr(owner if isinstance(owner, type) else type(owner), "__module__", None) or "")
+    elif isinstance(error, ImportError):
+        module = sys.modules.get((error.name or "").split(".")[0])  # what it was imported from
+    else:
         return None
-    text = excinfo.exconly()
-    owner = getattr(excinfo.value, "obj", None)  # what lacked the attribute
-    if owner is not None:
-        source = getattr(owner if isinstance(owner, type) or inspect.ismodule(owner) else type(owner),
-                         "__module__", None) or getattr(owner, "__name__", "")
-        module = sys.modules.get(source) if isinstance(source, str) else None
-        if "fake_libs" in str(getattr(module, "__file__", "") or getattr(owner, "__file__", "") or ""):
-            return f"fake_libs: {text[:160]}"
-    stand_ins = {path.name for path in _FAKE_LIBS.iterdir()} if _FAKE_LIBS.is_dir() else set()
-    if any(re.search(rf"\b{re.escape(name)}\b", text) for name in stand_ins) or "fake_libs" in text:
-        return f"fake_libs: {text[:160]}"
+    if _EMULATOR in str(getattr(module, "__file__", "") or ""):
+        return f"{module.__name__}: {excinfo.exconly()[:160]}"
     return None
 
 
-_FAKE_LIBS = pathlib.Path(__file__).resolve().parent / "fake_libs"
+_EMULATOR = "/mstar_sim/"
 
 
 def _raised_in_emulator(excinfo) -> str | None:
     """Where the exception started, when that is the emulator's own code: a gap in
-    the emulator, not a fault of mstar's. CUDA's own errors, which the emulator
-    raises as a GPU would (out of memory, a device-side assert), are mstar's."""
-    if excinfo.errisinstance(torch.cuda.OutOfMemoryError) or "device-side assert triggered" in str(excinfo.value):
+    the emulator, not a fault of mstar's. What the emulator raises as the GPU stack
+    would (out of memory, a device-side assert, a capture refusal) is mstar's."""
+    if getattr(excinfo.value, "_mstar_sim_gpu", False):
         return None
     # the innermost frame of this tree (not torch, triton or the stdlib under it) decides
     for entry in reversed(excinfo.traceback):
         path = str(entry.path)
         if "site-packages" in path or "/lib/python" in path or "<" in path:
             continue
-        if "/mstar_sim/" in path and "/mstar_sim/tests/" not in path:
-            return f"{path.rsplit('/mstar_sim/', maxsplit=1)[-1]}:{entry.lineno + 1}"
+        if _EMULATOR in path and "/mstar_sim/tests/" not in path:
+            return f"{path.rsplit(_EMULATOR, maxsplit=1)[-1]}:{entry.lineno + 1}"
         return None
     return None
 

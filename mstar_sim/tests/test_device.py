@@ -316,6 +316,39 @@ def test_fast_mode_skips_device_time_but_keeps_host_semantics():
     assert out.strip() == "ok"
 
 
+def run_pytest(cwd, *args, emulated: bool = False, **env: str) -> str:
+    """pytest's output for ``args`` in ``cwd``, on the emulated GPU when ``emulated``."""
+    if emulated:
+        env = dict(env, MSTAR_SIM="1", PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT]))
+    env = dict(os.environ, **{"PYTHONPATH": ROOT, **env})
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=cwd, env=env,
+                          capture_output=True, text=True, timeout=300, check=False)
+    return proc.stdout
+
+
+def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps(tmp_path):
+    """What the emulator raises as CUDA would (a host read during capture) is mstar's
+    failure; a name an emulated object lacks is the emulator's gap; mstar's own error
+    stays its own, whatever library it names."""
+    (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
+        import torch
+        def test_host_read_in_capture():
+            pos = torch.arange(4, device="cuda")
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                pos.sum().item()
+        def test_stand_in_lacks_a_name():
+            torch.cuda.Stream().no_such_method()
+        def test_own_error_names_a_library():
+            raise AttributeError("the flashinfer wrapper has no plan")
+    """))
+    out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfx", "test_cases.py", emulated=True,
+                     MSTAR_SIM_FAST="1")
+    outcomes = {line.split()[1].split("::")[1]: line.split()[0] for line in out.splitlines()
+                if line.startswith(("FAILED", "XFAIL"))}
+    assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
+                        "test_own_error_names_a_library": "FAILED"}, out
+
+
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
     """``--skipped-in``: the tests a plain CPU run's junit report skipped, in a class or in
     a module skipped at collection, and those whose own skipif checks for a GPU; none
@@ -341,14 +374,9 @@ def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
         def test_one(): pass
     """))
 
-    def pytest_run(*args, **env):
-        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp_path,
-                              env=dict(os.environ, PYTHONPATH=ROOT, **env), capture_output=True, text=True,
-                              check=False)
-        return proc.stdout
-
-    pytest_run("--junitxml=plain.xml", "test", PLAIN="1")
-    out = pytest_run("-p", "mstar_sim.pytest_plugin", "--skipped-in=plain.xml", "--collect-only", "-q", "test")
+    run_pytest(tmp_path, "--junitxml=plain.xml", "test", PLAIN="1")
+    out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "--skipped-in=plain.xml", "--collect-only", "-q",
+                     "test")
     selected = {line for line in out.splitlines() if "::" in line}
     assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_classes.py::test_checks_for_a_gpu",
                         "test/a/test_module.py::test_one"}, out

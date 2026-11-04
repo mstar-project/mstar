@@ -22,6 +22,7 @@ from __future__ import annotations
 import torch
 
 from mstar_sim import clock
+from mstar_sim.device import gpu_error
 
 
 def canonical_dtype(dtype) -> torch.dtype:
@@ -32,7 +33,7 @@ def canonical_dtype(dtype) -> torch.dtype:
 
 def check_layout(kv_layout: str) -> str:
     if kv_layout not in ("NHD", "HND"):
-        raise KeyError(f"Invalid kv_layout {kv_layout}")
+        raise gpu_error(KeyError(f"Invalid kv_layout {kv_layout}"))
     return kv_layout
 
 
@@ -149,14 +150,14 @@ class PagedAttention:
                 ("paged_kv_last_page_len_buf", paged_kv_last_page_len_buf),
             ):
                 if not torch.is_tensor(buf):
-                    raise ValueError(f"{name} should be a torch.Tensor in cuda graph mode")
+                    raise gpu_error(ValueError(f"{name} should be a torch.Tensor in cuda graph mode"))
             self._fixed_batch_size = len(paged_kv_last_page_len_buf)
             if len(paged_kv_indptr_buf) != self._fixed_batch_size + 1:
-                raise ValueError(
+                raise gpu_error(ValueError(
                     "The length of paged_kv_indptr_buf should be batch_size + 1."
-                )
+                ))
             if qo_indptr_buf is not None and len(qo_indptr_buf) != self._fixed_batch_size + 1:
-                raise ValueError("The length of qo_indptr_buf should be batch_size + 1.")
+                raise gpu_error(ValueError("The length of qo_indptr_buf should be batch_size + 1."))
         else:
             self._fixed_batch_size = 0
         self._qo_indptr_buf = qo_indptr_buf
@@ -191,18 +192,18 @@ class PagedAttention:
     ) -> None:
         """Store the plan. ``qo_indptr`` None means ``q_len_per_req`` queries a row (decode)."""
         if num_qo_heads % num_kv_heads:
-            raise ValueError(
+            raise gpu_error(ValueError(
                 f"num_qo_heads {num_qo_heads} must be a multiple of num_kv_heads {num_kv_heads}"
-            )
+            ))
         batch = len(last_page_len)
         if len(indptr) != batch + 1:
-            raise ValueError(f"indptr has {len(indptr)} entries for a batch of {batch}")
+            raise gpu_error(ValueError(f"indptr has {len(indptr)} entries for a batch of {batch}"))
         qo_host = (
             [i * q_len_per_req for i in range(batch + 1)] if qo_indptr is None
             else [int(x) for x in qo_indptr.tolist()]
         )
         if len(qo_host) != batch + 1:
-            raise ValueError(f"qo_indptr has {len(qo_host)} entries for a batch of {batch}")
+            raise gpu_error(ValueError(f"qo_indptr has {len(qo_host)} entries for a batch of {batch}"))
         kv_host = [int(x) for x in indptr.tolist()]
         last_host = [int(x) for x in last_page_len.tolist()]
         total_rows = qo_host[-1]
@@ -211,18 +212,18 @@ class PagedAttention:
             if self._max_total_num_rows is None:
                 self._max_total_num_rows = total_rows
             elif total_rows > self._max_total_num_rows:
-                raise ValueError(
+                raise gpu_error(ValueError(
                     f"The total number of rows in qo_indptr {total_rows} in cuda graph mode cannot "
                     f"exceed the number of rows set during initialization {self._max_total_num_rows}."
-                )
+                ))
             if batch != self._fixed_batch_size:
-                raise ValueError(
+                raise gpu_error(ValueError(
                     "The batch size should be fixed during the lifecycle of the wrapper in "
                     f"cuda graph mode, the runtime batch size {batch} mismatches the batch size "
                     f"{self._fixed_batch_size}  set during initialization."
-                )
+                ))
             if len(indices) > len(self._paged_kv_indices_buf):
-                raise ValueError("The length of paged_kv_indices exceeds the allocated buffer size.")
+                raise gpu_error(ValueError("The length of paged_kv_indices exceeds the allocated buffer size."))
             if qo_indptr is not None:
                 self._qo_indptr_buf.copy_(qo_indptr)
             self._paged_kv_indptr_buf.copy_(indptr)
@@ -307,7 +308,7 @@ class PagedAttention:
         lse_base: str = "log2", **kwargs,
     ):
         if not self._planned:
-            raise RuntimeError("plan() must be called before run()")
+            raise gpu_error(RuntimeError("plan() must be called before run()"))
         if args:
             _not_supported("custom-kernel run(*args)")
         if sinks is not None:
