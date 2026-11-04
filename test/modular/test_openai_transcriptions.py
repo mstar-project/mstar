@@ -387,13 +387,13 @@ def test_plan_windows_cuts_only_bounded_models(tmp_path):
     assert len(short) == 1
 
 
-def test_higgs_audio_windows_an_upload_its_transcript_cap_would_cut(tmp_path):
+def test_higgs_audio_windows_a_long_upload(tmp_path):
     """Higgs-Audio drops or repeats text on long audio; a long upload was sent whole, with a 200."""
     sf = pytest.importorskip("soundfile")
     import numpy as np
 
     path = tmp_path / "long.wav"
-    sf.write(path, np.zeros(16_000 * 150, dtype="float32"), 16_000)
+    sf.write(path, np.zeros(16_000 * 45, dtype="float32"), 16_000)
     assert len(serving_transcriptions.planner_for(adapters.HiggsAudioAdapter(), str(path), tmp_path).fixed()) > 1
 
 
