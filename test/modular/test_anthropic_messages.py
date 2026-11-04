@@ -14,6 +14,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 
 class _Chunk:
@@ -32,9 +33,11 @@ class _StubAPI:
     in batches; a reader that stops early aborts the request."""
 
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name):
         self.model_name = model_name
+        self.served_models = ServedModels.of(model_name, None)
         self.model = types.SimpleNamespace()
         self.upload_dir = "/nonexistent"
         self.last_submit = None
@@ -296,6 +299,19 @@ def test_a_model_without_the_api_is_an_anthropic_404(client_and_stub):
     stub.model_name = "bagel"
     r = client.post("/v1/messages", json=_body())
     assert r.status_code == 404 and r.json()["error"]["type"] == "not_found_error"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.served_models = ServedModels(base=["glm52"], adapters=["sql"])
+    stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
+    r = client.post("/v1/messages", json=_body(model="sql", stream=stream))
+    assert stub.last_submit["model_kwargs"]["lora_adapter"] == "sql"
+    message = _events(r.text)[0]["message"] if stream else r.json()
+    assert message["model"] == "sql"
+    r = client.post("/v1/messages", json=_body(model="nope"))
+    assert r.status_code == 400 and "unknown LoRA adapter" in r.json()["error"]["message"]
 
 
 def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):

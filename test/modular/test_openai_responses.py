@@ -220,6 +220,21 @@ def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
     assert stub.aborted == []
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream):
+    from mstar.api_server.served_models import ServedModels
+
+    client, stub = client_and_stub
+    stub.served_models = ServedModels(base=["glm5_next"], adapters=["sql"])
+    stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
+    r = client.post("/v1/responses", json=_codex(model="sql", stream=stream))
+    assert stub.last_submit["model_kwargs"]["lora_adapter"] == "sql"
+    response = _events(r.text)[-1]["response"] if stream else r.json()
+    assert response["model"] == "sql"
+    r = client.post("/v1/responses", json=_codex(model="nope"))
+    assert r.status_code == 400 and "unknown LoRA adapter" in r.json()["error"]["message"]
+
+
 def test_a_model_without_the_api_is_a_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
