@@ -52,3 +52,18 @@ def test_a_negative_draft_count_is_refused(k):
     # -1 would size the cache at zero rows and fail building the graph; -3 would serve unnoticed
     with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
         Glm5NextModel("x", tokenizer_mode="byte", mtp_num_draft_tokens=k)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
+    {"prefill_capture_batch_sizes": []}, {"prefill_token_buckets": [0, 256]},
+    {"prefill_token_buckets": [256, 256]}, {"prefill_token_buckets": [128.5]},
+    {"prefill_graphs": "false"}, {"mtp_num_draft_tokens": True}, {"mtp_num_draft_tokens": 2.5},
+    {"mtp_num_draft_tokens": 1023},
+])
+def test_a_bad_serving_knob_is_refused_at_load(kwargs):
+    """As GLM-5.2 refuses them. Each loaded before: bad ladder entries went into capture and an
+    empty ladder meant the default, ``"false"`` captured the prefill, True and 2.5 drafted 1
+    and 2, and k=1023 left no room for a prompt."""
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        Glm5NextModel("x", tokenizer_mode="byte", **kwargs)
