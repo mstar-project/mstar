@@ -24,8 +24,9 @@ resources:
   tts_kv:
     max_num_pages: 256
   # The vocoder holds a slot in each of these per spoken reply, ~0.4 GiB in all
-  # (t2w_state has one more, its sink). A reply waits for slots before its first
-  # audio, so they cap concurrent spoken replies.
+  # (t2w_state has one more, its sink; startup refuses counts that disagree). A
+  # reply waits for slots before its first audio, so they cap concurrent spoken
+  # replies.
   t2w_state:
     max_slots: 33
   t2w_enc1_kv:

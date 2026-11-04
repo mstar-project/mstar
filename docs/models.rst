@@ -541,7 +541,8 @@ false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 ``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
 it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
 reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
-``max_slots`` cap concurrent spoken replies. The ``minicpm_o`` extra installs ``onnx``, used
+``max_slots`` cap concurrent spoken replies. ``t2w_state`` has one more than each of the
+three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The ``minicpm_o`` extra installs ``onnx``, used
 only to read the voice encoders' weights.
 Command A+ (``command_a_plus``)
 -------------------------------

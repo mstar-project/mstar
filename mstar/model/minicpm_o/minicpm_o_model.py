@@ -227,6 +227,23 @@ class MiniCPMOModel(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._voices: dict[str, np.ndarray] = {}
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """A spoken reply holds a slot of each ``t2w_*`` resource, so one count sizes
+        them all: ``t2w_state`` has one more (its sink). Set apart, the smallest caps
+        concurrent spoken replies and the rest strand ~0.4 GiB a slot."""
+        resources = config.get("resources") or {}
+
+        def slots(key: str, default: int) -> int:
+            return int((resources.get(key) or {}).get("max_slots", default))
+
+        state = slots(T2W_STATE, T2W_DEFAULT_SLOTS)
+        kv = {key: slots(key, T2W_DEFAULT_SLOTS - 1) for key in T2W_KV.values()}
+        if any(n != state - 1 for n in kv.values()):
+            raise ValueError(
+                f"{config_path}: resources.{T2W_STATE}.max_slots ({state}) must be one more than "
+                f"each of {', '.join(f'{k}.max_slots ({n})' for k, n in kv.items())}"
+            )
+
     def checkpoint_path(self) -> str | None:
         return self.local_dir
 

@@ -434,3 +434,21 @@ def test_audio_block_loop_leases_within_the_resources_segment_limit():
 
     assert region.can_lease(request(2))
     assert not region.can_lease(request(3))
+
+
+def test_vocoder_slot_counts_must_agree():
+    """A spoken reply holds a slot of each t2w resource, so one count sizes all four:
+    t2w_state has one more (its sink). A YAML that sets them apart is refused."""
+    from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
+
+    model = a_bare_model()
+
+    def yaml(state, kv):
+        return {"resources": {T2W_STATE: {"max_slots": state}, **{key: {"max_slots": kv} for key in T2W_KV.values()}}}
+
+    model.validate_config_yaml(yaml(33, 32), "minicpm_o.yaml")
+    model.validate_config_yaml({}, "minicpm_o.yaml")
+    with pytest.raises(ValueError, match="t2w_state"):
+        model.validate_config_yaml(yaml(33, 33), "minicpm_o.yaml")
+    with pytest.raises(ValueError, match="t2w_state"):
+        model.validate_config_yaml({"resources": {T2W_STATE: {"max_slots": 33}}}, "minicpm_o.yaml")
