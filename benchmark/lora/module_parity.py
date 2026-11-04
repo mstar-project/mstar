@@ -579,8 +579,8 @@ def _row(rows, adapter, j) -> str:
 
 
 def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rope=None):
-    """Every (adapter, prompt) in one mixed step through the generic path, inside the
-    step's compute scope."""
+    """Every (adapter, prompt) in one mixed step through the generic path, run between
+    the step's plan and its commit, as the engine runs a forward."""
     import torch
 
     from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig
@@ -600,16 +600,14 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
     for rid, adapter, _ in rows:
         pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
     ctx = StepContext(request_ids=rids, graph_walk="prefill", slot=0, capture=False)
-    assert pool.admit(step.get(LORA_RESOURCE_KEY), ctx).ok
-    pool.plan(step.get(LORA_RESOURCE_KEY), ctx)
+    lora_step = step.get(LORA_RESOURCE_KEY)
+    assert pool.admit(lora_step, ctx).ok
+    pool.plan(lora_step, ctx)
     lengths = [len(i) for _, _, i in rows]
     _set_positions(lengths)
-    pool.enter_compute()
-    try:
-        with torch.no_grad():
-            logits = spec_.run(sub, torch.cat([i for _, _, i in rows]).cuda(), lengths, rope)
-    finally:
-        pool.exit_compute()
+    with torch.no_grad():
+        logits = spec_.run(sub, torch.cat([i for _, _, i in rows]).cuda(), lengths, rope)
+    pool.commit(lora_step, ctx)
     return {rid: logits[k] for k, rid in enumerate(rids)}, rows
 
 

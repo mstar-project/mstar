@@ -147,7 +147,8 @@ def capture(fn):
 
 
 def bucket_step(pool, rows, lease, capturing=False):
-    """A step of (rid, tokens) rows padded to the bucket as the graph runner pads a replay."""
+    """Admit and plan a step of (rid, tokens) rows padded to the bucket as the graph runner pads
+    a replay; the caller commits it after the forward, as the engine does."""
     pad = [-(i + 1) for i in range(len(rows), BUCKET_BS)]
     rids = [rid for rid, _ in rows]
     step = LoraStep(segments=tuple([Segment(r, "main", n) for r, n in rows] + [Segment(r, "main", 0) for r in pad]))
@@ -156,7 +157,7 @@ def bucket_step(pool, rows, lease, capturing=False):
     ctx.set_padded_rids([*rids, *pad])
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
-    pool.commit(step, ctx)
+    return step, ctx
 
 
 def slot_layout(token_slots, slots):
@@ -245,7 +246,8 @@ def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
     lease = SlotLease(slot=0, bucket=BucketKey("prefill_text", BUCKET_BS, BUCKET_TOKENS))
     for i in range(BUCKET_BS):
         pool.ingest_capture_row(-(i + 1))
-    bucket_step(pool, [(-(i + 1), BUCKET_TOKENS // BUCKET_BS) for i in range(BUCKET_BS)], lease, capturing=True)
+    step, ctx = bucket_step(pool, [(-(i + 1), BUCKET_TOKENS // BUCKET_BS) for i in range(BUCKET_BS)], lease,
+                            capturing=True)
     rows = BUCKET_BS if head else BUCKET_TOKENS
     io = [(pool.layer_delta(t, layer), t, layer, torch.zeros(rows, pool.targets[t].in_features, **BF16),
            torch.zeros(rows, pool.targets[t].out_features, **BF16))
@@ -256,6 +258,7 @@ def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
 
     fn = torch.compile(forward, mode="max-autotune-no-cudagraphs", fullgraph=True) if "compiled" in case else forward
     graph, outs = capture(fn)
+    pool.commit(step, ctx)
     a, b, c = ("h16", "h4", "h16") if head else ("r16", "r8", "r4")
     mixes = [
         [("m0", a, 9), ("m1", None, 1), ("m2", b, 20)],
@@ -267,7 +270,7 @@ def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
     for mix in mixes:
         for rid, name, _ in mix:
             pool.ingest_request(rid, LoraReqConfig(adapter=name))
-        bucket_step(pool, [(rid, n) for rid, _, n in mix], lease)
+        step, ctx = bucket_step(pool, [(rid, n) for rid, _, n in mix], lease)
         spans = [1 if head else n for *_, n in mix]
         real = sum(spans)
         for *_, x, y in io:
@@ -275,6 +278,7 @@ def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
             y.copy_(torch.randn(y.shape, generator=g, device="cuda").to(torch.bfloat16))
         graph.replay()
         torch.cuda.synchronize()
+        pool.commit(step, ctx)
         step, ctx = eager_step(pool, mix, ingest=False)
         eager = [delta(x[:real], y[:real].clone()) for delta, _, _, x, y in io]
         pool.commit(step, ctx)

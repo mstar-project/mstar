@@ -1,7 +1,8 @@
 """Adapter-keyed prefix caching, served: hits only within an adapter's namespace.
 
-GPU only; nothing here runs in CI. Needs a model that both declares a prefix-cache
-stream (``prefix_key_streams``) and serves LoRA adapters (``get_lora_specs``). Orpheus
+GPU only; nothing here runs in CI. Needs a model that both keys a KV label for prefix
+reuse (``KVLabel.keys`` in its ``kv_labels``) and serves LoRA adapters
+(``get_lora_specs``). Orpheus
 does both (speech out, through ``/generate`` with the adapter in ``model_kwargs``); a
 text model, Qwen3.5 among them (it keys ``prefill_text``), goes through the chat
 endpoint (``--endpoint chat``).
@@ -50,18 +51,20 @@ PROMPT = " ".join(
 
 
 def _preflight(model: str) -> None:
-    from mstar.model.base import Model
+    from mstar.model.base import Model, keyed_labels
     from mstar.model.registry import get_model_class
 
     cls = get_model_class(model)
-    missing = [
-        name for name in ("prefix_key_streams", "get_lora_specs")
-        if getattr(cls, name) is getattr(Model, name)
-    ]
+    missing = []
+    # the models that key a label declare it without their config or checkpoint
+    if not keyed_labels(object.__new__(cls)):
+        missing.append("a keyed KV label (KVLabel.keys in kv_labels)")
+    if cls.get_lora_specs is Model.get_lora_specs:
+        missing.append("get_lora_specs")
     if missing:
         raise SystemExit(
-            f"{model}: {cls.__name__} does not override {missing}; this check needs a model "
-            "that keys a prefix-cache stream and serves LoRA adapters"
+            f"{model}: {cls.__name__} lacks {' and '.join(missing)}; this check needs "
+            "a model that keys a prefix-cache label and serves LoRA adapters"
         )
 
 
