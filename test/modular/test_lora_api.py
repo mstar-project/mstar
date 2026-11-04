@@ -257,7 +257,10 @@ def test_startup_refuses_every_bad_configured_adapter(tmp_path):
     LoraAdapterPool(make_spec({"good": good, "wide": wide}, cpu_capacity=1), "cpu")
     # the conductor runs the check when the API server did not
     conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
+    conductor.model = SimpleNamespace(
+        declare_state=list, kernel_settings=dict,
+        get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})],
+    )
     conductor.model_config = {"resources": {"lora": {"adapters": {"good": good, "wide": wide}}}}
     with pytest.raises(ValueError, match="'wide'"):
         conductor._settle_lora_adapters(None)

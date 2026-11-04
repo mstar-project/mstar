@@ -133,7 +133,7 @@ def test_each_worker_counts_only_the_labels_its_nodes_open():
     }, loop_caps={})
     pool = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=17, page_size=16)
     conductor = Conductor.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [
+    conductor.model = SimpleNamespace(declare_state=list, kernel_settings=dict, get_node_resources=lambda: [
         KVSpec(resource_key="kv", nodes={"llm", "talker"}, config=pool),
     ])
     conductor.model_config = {}

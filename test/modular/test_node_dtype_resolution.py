@@ -48,6 +48,12 @@ class _Model:
     def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
         return _NODES[node_name]()
 
+    def declare_state(self):
+        return []
+
+    def kernel_settings(self):
+        return {}
+
     def get_node_resources(self):
         return []
 

@@ -512,7 +512,10 @@ def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
     from mstar.model.base import serving_resources
 
     _, paths = adapters
-    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
+    model = SimpleNamespace(
+        declare_state=list, kernel_settings=dict,
+        get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})],
+    )
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
     conductor = Conductor.__new__(Conductor)
     conductor.model, conductor.model_config = model, config
@@ -540,7 +543,10 @@ def test_a_lora_deployment_still_has_its_kv_pools_checked_against_its_cap(adapte
     kv = KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
     ))
-    model = SimpleNamespace(get_node_resources=lambda: [kv], get_lora_specs=lambda: [make_spec({})])
+    model = SimpleNamespace(
+        declare_state=list, kernel_settings=dict,
+        get_node_resources=lambda: [kv], get_lora_specs=lambda: [make_spec({})],
+    )
     config = {"max_concurrent_requests": 8, "resources": {"lora": {"adapters": {"a3": paths["a3"]}}}}
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__))
@@ -556,7 +562,10 @@ def test_a_bad_key_in_the_lora_block_is_a_config_error_on_every_lora_spec():
     from mstar.model.base import serving_resources
 
     vit = replace(make_spec({}), resource_key="lora_vit", nodes={"ViT"})
-    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({}), vit])
+    model = SimpleNamespace(
+        declare_state=list, kernel_settings=dict,
+        get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({}), vit],
+    )
     with pytest.raises(ValueError, match="resources.lora"):
         serving_resources(model, {"resources": {"lora": {"max_slot": 2}}})
 
