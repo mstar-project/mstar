@@ -11,6 +11,7 @@ MB of disk.
 CLI::
 
     python -m mstar_sim.checkpoint Qwen/Qwen3.5-27B /path/out
+    python -m mstar_sim.checkpoint Qwen/Qwen3.5-27B --hf-home ~/sim-hf   # as the HF cache
 """
 
 from __future__ import annotations
@@ -149,13 +150,33 @@ def synthesize(repo_or_dir: str, out_dir: str | os.PathLike) -> dict:
     return manifest
 
 
+def into_hf_cache(repo: str, hf_home: str | os.PathLike) -> dict:
+    """Write a shapes-only copy of Hub repo ``repo`` into the Hugging Face cache
+    at ``hf_home`` (``hub/models--org--name/snapshots/<rev>``, ``refs/main``), so
+    code that loads it by name (``from_pretrained``, ``snapshot_download``,
+    ``hf_hub_download``) finds it with ``HF_HOME=<hf_home> HF_HUB_OFFLINE=1``."""
+    from huggingface_hub import HfApi
+
+    revision = HfApi().model_info(repo).sha
+    repo_dir = Path(hf_home) / "hub" / f"models--{repo.replace('/', '--')}"
+    manifest = synthesize(repo, repo_dir / "snapshots" / revision)
+    (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "refs" / "main").write_text(revision)
+    return manifest
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m mstar_sim.checkpoint", description=__doc__.split("\n\n")[0])
     ap.add_argument("source", help="HF repo id or local checkpoint directory")
-    ap.add_argument("out_dir")
+    ap.add_argument("out_dir", nargs="?", help="where the copy goes (or --hf-home)")
+    ap.add_argument("--hf-home", help="write into this Hugging Face cache instead, for code that loads "
+                                      "the model by name (then run with HF_HOME=<dir> HF_HUB_OFFLINE=1)")
     a = ap.parse_args(argv)
+    if bool(a.out_dir) == bool(a.hf_home):
+        ap.error("give either out_dir or --hf-home")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    json.dump(synthesize(a.source, a.out_dir), sys.stdout, indent=2)
+    manifest = into_hf_cache(a.source, a.hf_home) if a.hf_home else synthesize(a.source, a.out_dir)
+    json.dump(manifest, sys.stdout, indent=2)
     print()
 
 

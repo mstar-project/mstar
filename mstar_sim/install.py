@@ -52,10 +52,11 @@ def install() -> None:
 
 
 def thread_dumps() -> None:
-    """``kill -USR1 <pid>`` prints every thread's Python stack to stderr: for a
-    hung repro. A thread of its own waits for the signal (blocked everywhere
-    else, and inherited blocked by every thread started after), so the dump runs
-    even while the main thread sits in a C call."""
+    """``kill -USR1 <pid>`` prints every thread's Python stack to stderr and passes
+    the signal on to the process's children, so one signal to the server dumps
+    its workers too: for a hung repro. A thread of its own waits for the signal
+    (blocked everywhere else, and inherited blocked by every thread started
+    after), so the dump runs even while the main thread sits in a C call."""
     import signal
     import threading
     import traceback
@@ -73,8 +74,26 @@ def thread_dumps() -> None:
                 lines.extend(traceback.format_stack(frame))
             sys.stderr.write("".join(lines))
             sys.stderr.flush()
+            for child in _children(os.getpid()):
+                try:
+                    os.kill(child, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
 
     threading.Thread(target=wait, name="mstar_sim-thread-dump", daemon=True).start()
+
+
+def _children(pid: int) -> list[int]:
+    out = []
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    if int(f.read().rsplit(")", 1)[1].split()[1]) == pid:
+                        out.append(int(entry))
+            except (OSError, IndexError, ValueError):
+                pass
+    return out
 
 
 def _no_compile(torch) -> None:

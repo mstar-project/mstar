@@ -47,6 +47,17 @@ attention features), Maya (one interposed process per device, symmetric collecti
 
 Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-capture-tokens N` drops large token buckets. `--max-capture-batch N` does the same for batch buckets, but it also caps the served batch at N (mstar caps eager batches at the largest captured one).
 
+## Repro tips
+
+- **Models by name, no weights.** `python -m mstar_sim.checkpoint <repo> --hf-home <dir>` writes a shapes-only copy into a Hugging Face cache (headers over sparse files, about 20 MB for 27B). Run with `HF_HOME=<dir> HF_HUB_OFFLINE=1`, and `from_pretrained`, `snapshot_download` and `hf_hub_download` find it.
+- **GPU-only tests.** `python -m mstar_sim --fast -- -m pytest -p mstar_sim.pytest_plugin --gpu-only <paths>` runs the tests a CPU box skips for want of a GPU. It reports value checks the emulator can't answer as expected failures, and lists its own gaps at the end.
+- **Timing-shaped bugs** (queues that fill while the GPU is busy): drop `--fast`, and slow the GPU with `--time-scale K`.
+- **Hangs.** `kill -USR1 <server pid>` prints every thread's stack in that process and in all its children (the workers).
+- **Your own probes** (a `sitecustomize.py` on `PYTHONPATH`):
+  - They also run in the `python -m mstar_sim` process itself, where the tree isn't on `sys.path` yet. Guard their mstar imports, or put the tree first on `PYTHONPATH`.
+  - They run after the emulator installs, by which time mstar modules are already imported. Patch what's in `sys.modules` as well as hooking imports.
+- **Small pools.** A config with a small cross-attention or KV pool can fail capture planning, because each bucket's plan needs room for its whole batch. Cap the buckets (`--max-capture-batch 8`) rather than shrinking the pool below that.
+
 ## Measured kernel times
 
 By default GEMMs, attention, GDN and causal-conv kernels cost the latencies NVIDIA

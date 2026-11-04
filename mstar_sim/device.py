@@ -737,6 +737,7 @@ def _to(self, *args, **kwargs):
             raw = self._data.to(**opts)
             return self if raw is self._data else SimTensor(raw, self.device.index)
         if device.type == "cpu":
+            _d2h(self)
             if not non_blocking:
                 host_wait()
             value = host_value(self._data)
@@ -754,12 +755,18 @@ def _to(self, *args, **kwargs):
         return T.to(self, *args, copy=copy, **kwargs)
 
 
+def _d2h(src) -> None:
+    """A device-to-host copy runs on the current stream, after what is queued there."""
+    clock.charge(_copy_seconds(src.numel() * src.element_size(), "d2h"))
+
+
 def _cuda(self, device=None, non_blocking=False, memory_format=torch.preserve_format):
     target = torch.device("cuda", _index(device if device is not None else "cuda"))
     return _to(self, target, non_blocking=non_blocking)
 
 
 def _cpu(self, memory_format=torch.preserve_format):
+    _d2h(self)
     host_wait()
     return host_value(self._data).clone(memory_format=memory_format)
 
@@ -789,6 +796,7 @@ def _copy_(self, src, non_blocking=False):
             return self
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
+    _d2h(src)
     if not non_blocking:
         host_wait()
     if not _is_meta(self):
