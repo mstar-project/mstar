@@ -1350,28 +1350,42 @@ ABSENT_MODULES = {
 
 def _swap_or_assign() -> None:
     """Moving a module swaps its parameters in place (so tied weights stay tied), but a
-    swap refuses a tensor something else holds (weight_norm's hooks): that module's move
-    or load then assigns fresh parameters instead, as torch does without the swap."""
+    swap refuses a tensor something else holds (weight_norm's hooks): that module alone
+    is then moved or loaded by assignment, as torch does without the swap, on its thread
+    alone (the swap setting reads per thread)."""
     from torch import nn
 
-    apply, load = nn.Module._apply, nn.Module.load_state_dict
+    future, assigning = torch.__future__, threading.local()
+    swaps = future.get_swap_module_params_on_conversion
+    future.get_swap_module_params_on_conversion = lambda: swaps() and not getattr(assigning, "on", False)
 
-    def without_swap(call, failed: str):
-        def retry(self, *args, **kwargs):
-            try:
-                return call(self, *args, **kwargs)
-            except RuntimeError as e:
-                if failed not in str(e):
-                    raise
-                torch.__future__.set_swap_module_params_on_conversion(False)
-                try:
-                    return call(self, *args, **kwargs)
-                finally:
-                    torch.__future__.set_swap_module_params_on_conversion(True)
-        return retry
+    def by_assignment(call, *args):
+        assigning.on = True
+        try:
+            return call(*args)
+        finally:
+            assigning.on = False
 
-    nn.Module._apply = without_swap(apply, "Couldn't swap")
-    nn.Module.load_state_dict = without_swap(load, "While swapping")
+    apply, load = nn.Module._apply, nn.Module._load_from_state_dict
+
+    def apply_one(self, fn, recurse=True):
+        try:
+            return apply(self, fn, recurse)
+        except RuntimeError as e:  # its own parameters (a child retries its own)
+            if not str(e).startswith("_apply(): Couldn't swap"):
+                raise
+            return by_assignment(apply, self, fn, False)
+
+    def load_one(self, state_dict, prefix, metadata, strict, missing, unexpected, errors):
+        marks = len(missing), len(unexpected), len(errors)
+        load(self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
+        if any(e.startswith("While swapping") for e in errors[marks[2]:]):
+            for found, mark in zip((missing, unexpected, errors), marks, strict=True):
+                del found[mark:]
+            by_assignment(load, self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
+
+    nn.Module._apply = apply_one
+    nn.Module._load_from_state_dict = load_one
 
 
 def _relax_blockwise_scaled_mm_meta() -> None:
