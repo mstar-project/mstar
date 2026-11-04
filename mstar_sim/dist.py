@@ -62,11 +62,17 @@ def _collective(name: str, op: str, group_pos: int | None):
         nbytes = max(t.numel() * t.element_size() for t in tensors)
         if not clock.FAST:
             clock.charge(cost.collective_seconds(op, n, nbytes, graph=clock.capturing() is not None))
-        if clock.capturing() is None and all(t._data.device.type != "meta" for t in tensors):
+        work = _Done() if kwargs.get("async_op") else None
+        moved = clock.capturing() is None and all(t._data.device.type != "meta" for t in tensors)
+        if moved:
             # every tensor holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
-            return real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
-        return _Done() if kwargs.get("async_op") else None
+            work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
+        # what it wrote is computed if all it had here was (the fact doesn't cross ranks)
+        never = not moved or any(device.never_computed(t._data) for t in tensors)
+        for t in tensors:
+            device.set_never_computed(t._data, never)
+        return work
 
     return call
 
