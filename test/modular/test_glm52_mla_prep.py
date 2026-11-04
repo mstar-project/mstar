@@ -156,6 +156,26 @@ def test_fused_prep_needs_the_absorbed_path_and_supported_widths():
     assert not Glm52MLAAttention(cfg).mla_fused_prep
 
 
+def test_fused_prep_rotates_only_interleaved_pairs_from_a_table():
+    """The kernels turn (2i, 2i + 1) from the cos/sin table: a NeoX checkpoint, or a position
+    resource without a table, keeps the ops."""
+    from dataclasses import replace
+
+    from mstar.engine.resources.position.manager import RopeManager
+    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, POS_RESOURCE
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = True
+    cfg.q_lora_rank, cfg.kv_lora_rank, cfg.qk_rope_head_dim = 256, 256, 8
+    pos = cfg.position_config()
+    for pos_cfg, fused in ((pos, True), (replace(pos, interleave=False), False),
+                           (replace(pos, rope_table_dtype=None), False)):
+        layer = Glm52MLAAttention(cfg)
+        layer.bind_resources({KV_RESOURCE: object(), ATTN_RESOURCE: object(),
+                              POS_RESOURCE: RopeManager(pos_cfg, torch.device("cpu"), max_seq_len=64)})
+        assert layer.mla_fused_prep is fused, pos_cfg
+
+
 def _gpu_resources(cfg, num_pages):
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
     from mstar.engine.resources.kv import manager as manager_mod

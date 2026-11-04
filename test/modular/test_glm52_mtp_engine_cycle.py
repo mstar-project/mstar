@@ -485,16 +485,25 @@ def test_the_forward_allocates_no_pages():
     cfg = _cfg(k, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     driver = _Driver(sub, cfg, ["r0"])
-    arena = driver.resources[KV_RESOURCE]._arena
+    kv = driver.resources[KV_RESOURCE]
+    arena = kv._arena
     forward = sub.forward_batched
 
+    class _NoPages:
+        """The arena, refusing every allocation (main's is a Rust object, read-only)."""
+
+        def acquire(self, n):
+            return None
+
+        def __getattr__(self, name):
+            return getattr(arena, name)
+
     def no_pages_inside(*args, **kwargs):
-        acquire = arena.acquire
-        arena.acquire = lambda n: None
+        kv._arena = _NoPages()
         try:
             return forward(*args, **kwargs)
         finally:
-            arena.acquire = acquire
+            kv._arena = arena
 
     sub.forward_batched = no_pages_inside
     spec = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 16, True))

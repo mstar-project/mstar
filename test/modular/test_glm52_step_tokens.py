@@ -42,8 +42,8 @@ def test_longctx_config_window_fits_its_pages(name):
 def _kv(pages, page_size):
     import types
 
-    return types.SimpleNamespace(config=types.SimpleNamespace(max_num_pages=pages,
-                                                              page_size=page_size))
+    return types.SimpleNamespace(config=types.SimpleNamespace(
+        max_num_pages=pages, page_size=page_size, tokens_per_page=page_size))
 
 
 @pytest.mark.parametrize("change, resources, match", [

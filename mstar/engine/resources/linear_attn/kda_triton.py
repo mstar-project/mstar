@@ -172,6 +172,12 @@ def supported(head_dim: int) -> bool:
     return head_dim >= 32 and head_dim & (head_dim - 1) == 0
 
 
+def bound_fits(lower_bound: float, row_block: int = CONFIG.row_block) -> bool:
+    """Whether the prefill's decay blocks hold the forget-gate bound: exp(|bound| *
+    row_block / 2) must fit fp32."""
+    return abs(lower_bound) * (row_block // 2) <= 80.0
+
+
 @dataclass
 class KdaVarlen:
     """Where each span's tokens and state live, and the (span, chunk) table, on device."""
@@ -517,7 +523,7 @@ def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state
     br = min(cfg.row_block, C)
     assert C % br == 0 and C & (C - 1) == 0 and D >= 16
     # The in-block decay factors reach exp(|lb| * br / 2); fp32 tops out at exp(88.7).
-    assert abs(lower_bound) * (br // 2) <= 80.0, (lower_bound, br)
+    assert bound_fits(lower_bound, br), (lower_bound, br)
     dev, dt = proj.device, cfg.scratch_dtype
     out = torch.empty(T, P, dtype=proj.dtype, device=dev)
     if T == 0:

@@ -94,7 +94,7 @@ def test_dispatch_fused_matches_clamped_reference(num_tokens):
     block = _build_fp8_block(seed=0, swiglu_limit=0.5)
     x = (torch.randn(num_tokens, block.hidden_size, device=DEVICE) * 0.6).to(torch.bfloat16)
 
-    topk_weights, topk_ids = block.gate(x)
+    topk_weights, topk_ids, _ = block.gate(x)
     assert topk_weights.dtype == torch.float32
 
     ref = block._dispatch_clamped(x, topk_weights, topk_ids)

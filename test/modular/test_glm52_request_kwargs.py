@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.conductor.conductor import Conductor
-from mstar.engine.resources import SamplerSpec
+from mstar.engine.resources import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sampler.config import BOOL_KNOBS, INT_KNOB_RULES, REAL_KNOB_RULES
 from mstar.model.glm52.config import SAMPLER_RESOURCE
 from mstar.model.glm52.glm52_model import Glm52Model
 
@@ -53,6 +54,19 @@ def test_a_null_kwarg_is_unset(kwargs):
     assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
 
 
+@pytest.mark.parametrize("knob", [*REAL_KNOB_RULES, *INT_KNOB_RULES, *BOOL_KNOBS])
+def test_a_sampler_knob_is_honored_or_refused(knob):
+    """A knob the API accepts reaches the sampler, or intake refuses it: never dropped."""
+    value = (not getattr(SamplingReqConfig(), knob) if knob in BOOL_KNOBS
+             else 5 if knob in INT_KNOB_RULES else 0.5)
+    m = _model()
+    try:
+        _intake(m, {knob: value})
+    except ValueError:
+        return
+    assert getattr(m.get_request_resource_configs({}, {knob: value})[SAMPLER_RESOURCE], knob) == value
+
+
 @pytest.mark.parametrize("kwargs", [
     {"top_k": "many"}, {"temperature": "hot"}, {"top_p": [0.9]}, {"repetition_penalty": float("nan")},
     {"max_output_tokens": "100x"}, {"max_output_tokens": 1.5}, {"seed": "abc"},
@@ -74,6 +88,13 @@ def test_strings_that_are_not_the_knobs_type_are_refused(kwargs):
     # one meaning per knob on every model (mstar/utils/generation_kwargs.py)
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _intake(_model(), kwargs)
+
+
+def test_return_logprobs_is_refused_where_the_sampler_never_sees_it():
+    # GLM-5.2 builds its sampler config from its own keys, which leave it out
+    with pytest.raises(ValueError, match="does not report logprobs"):
+        _intake(_model(), {"return_logprobs": True})
+    _intake(_model(), {"return_logprobs": False})
 
 
 def test_min_p_is_refused_at_intake():

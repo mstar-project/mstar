@@ -71,6 +71,12 @@ class _DeploymentCommunicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 def _namespace_files(shm_dir, prefix) -> list[str]:
     ns = _deployment_namespace(_DeploymentCommunicator(prefix))
