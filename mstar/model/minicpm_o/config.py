@@ -39,6 +39,9 @@ PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "pr
 # tensor, they would wait on the device)
 IMAGE_TGT_SIZES = "image_tgt_sizes"
 AUDIO_FEATURE_LENS = "audio_feature_lens"
+# a spoken reply's text cap (``get_max_output_tokens``), a default rather than a
+# length kwarg, so admission still fits it to the prompt
+SPEECH_TEXT_TOKENS = "speech_text_tokens"
 
 # ragged span labels
 PATCHES = "patches"

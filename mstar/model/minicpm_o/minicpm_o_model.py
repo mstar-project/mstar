@@ -58,7 +58,6 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
-    MAX_OUTPUT_TOKENS,
     ForwardPassArgs,
     KVLabel,
     LabelLayout,
@@ -88,6 +87,7 @@ from mstar.model.minicpm_o.config import (
     LLM_POS,
     LLM_SAMPLER,
     RESAMPLER_ATTN,
+    SPEECH_TEXT_TOKENS,
     T2W_KV,
     T2W_STATE,
     TTS_ATTN,
@@ -197,8 +197,8 @@ class MiniCPMOModel(Model):
     # Preprocessing is a few small ops per request, which a thread per core
     # only slows (Qwen3.5 measured its image preprocessing at 4 threads).
     PREPROCESS_TORCH_THREADS = 4
-    # the encoders' segment sizes, which process_prompt settles
-    INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS)
+    # the encoders' segment sizes and a spoken reply's text cap, which process_prompt settles
+    INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS, SPEECH_TEXT_TOKENS)
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None, max_seq_len: int | None = None, **kwargs: Any,
@@ -644,8 +644,7 @@ class MiniCPMOModel(Model):
             requested = kwargs.get("max_output_tokens")
             if requested is not None and int(requested) > limit:
                 raise ValueError(f"a spoken reply holds at most {limit} text tokens; got max_output_tokens={requested}")
-            if requested is None:
-                metadata["max_output_tokens"] = min(MAX_OUTPUT_TOKENS, limit)
+            metadata[SPEECH_TEXT_TOKENS] = limit
         # the LLM's prefill writes every prompt row, placeholders included, then a row per decode step
         rows = int(input_ids.numel())
         llm = LabelLayout(
@@ -661,6 +660,10 @@ class MiniCPMOModel(Model):
         ) if speech else LabelLayout()
         metadata["kv_layout"] = {LLM_KV: {"main": llm}, TTS_KV: {"main": tts}}
         return ProcessPromptOutput(result, metadata)
+
+    def get_max_output_tokens(self, **model_kwargs) -> int:
+        cap = super().get_max_output_tokens(**model_kwargs)
+        return min(cap, model_kwargs.get(SPEECH_TEXT_TOKENS, cap))
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill samples the first of max_output_tokens, so the loop runs one fewer
@@ -774,7 +777,7 @@ class MiniCPMOModel(Model):
             unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
             step_metadata={
                 **self._step_metadata(metadata),
-                **{k: model_kwargs[k] for k in self.INTERNAL_KWARGS if k in model_kwargs},
+                **{k: model_kwargs[k] for k in (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS) if k in model_kwargs},
             },
         )
 

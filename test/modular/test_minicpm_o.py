@@ -252,21 +252,22 @@ def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
 @needs_ckpt
 def test_spoken_reply_text_fits_the_tts(model):
     """The TTS speaks the whole reply within its positions: a spoken reply's text
-    budget defaults under that, and asking for more is refused (a 400)."""
+    budget defaults under that, and asking for more is refused (a 400). The default
+    sets no length kwarg, so admission still fits the budget to a long prompt."""
     from mstar.model.multimodal import PromptPart
 
     parts = [PromptPart("text", "Say hello.")]
     limit = model.speech_max_text_tokens
     assert limit + 2 + 2047 == model.tts_config.max_position_embeddings
     out = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
-    assert out.metadata["max_output_tokens"] == min(2048, limit)
-    assert "max_output_tokens" not in model.process_prompt(
-        None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit).metadata
+    assert not any(k in out.metadata for k in model.LENGTH_KWARGS)
+    assert model.get_max_output_tokens(**out.metadata) == min(2048, limit)
+    assert model.get_loop_caps(**out.metadata) == {DECODE_LOOP: min(2048, limit) - 1}
     with pytest.raises(ValueError, match="spoken reply"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit + 1)
     # text replies are not capped
-    assert "max_output_tokens" not in model.process_prompt(
-        None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192).metadata
+    text = model.process_prompt(None, ["text"], ["text"], prompt_parts=parts).metadata
+    assert model.get_max_output_tokens(**text, max_output_tokens=8192) == 8192
 
 
 @needs_ckpt
