@@ -1605,6 +1605,22 @@ def test_a_follower_holds_the_class_and_allotment_rank_0_gave_a_request_as_its_s
     assert _counts(follower) == _counts(leader), "r grows into pages here that rank 0 never allotted it"
 
 
+def test_a_flip_to_guaranteed_is_counted_and_logged_on_rank_0_alone(monkeypatch, caplog):
+    """A follower replays the flip, and counting it there too logged the same line once per rank."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(1)
+    _ingest((leader, follower), "b", 1, arrival=1, rebuildable=False)
+    _ingest((leader, follower), "x", 1, arrival=2, rebuildable=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert _admits(leader, "b") and _admits(leader, "x")
+        assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert "x" in follower._guaranteed and (leader._cpu_pool.guaranteed, follower._cpu_pool.guaranteed) == (1, 0)
+    assert caplog.text.count("no room to set aside for x's move") == 1, "every rank logged rank 0's flip"
+
+
 def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch):
     """r's grant needs three pages past its allotment where the room has two, so rank 0 allots r those two and
     drops v for the third. The follower replayed the earmark and the drop, and r's allotment there was two pages
