@@ -369,6 +369,8 @@ A layout has six fields:
   node's outputs. A request whose spans are not all ``"ids"`` can be rebuilt at one rank when the
   node's ``RebuildPolicy`` names their walk in ``walks``, whatever their kind: the worker keeps
   host copies of what the node reads there besides the ids, and the rebuild row reads them again.
+  The policy's ``copy_width`` gives, for each walk where the node reads more than the ids, how many
+  values those copies hold per KV slot, in the node's dtype, and startup raises without it.
   One step of that walk must write every span of the label, the last must be an ``"ids"`` span,
   and the label must key none of them for the prefix cache. Otherwise, in a pool that decides
   admission, the request can only move to the host, into room set aside at its first ask, and

@@ -345,10 +345,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        chunked walk. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
-       which a request dropped from the KV cache is rebuilt from. A request takes its room when it
-       arrives, and one the pool can't hold then is never dropped on that node, though it can
-       still move to the host with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, which a
+       request dropped from the KV cache is rebuilt from. A request takes its room when it
+       arrives, 8 B a token, and gives back what its ids don't use once its prompt is kept. One
+       the pool can't hold then is never dropped on that node, though it can still move to the
+       host with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
    * - ``rebuild_media_host_mb``
      - *(optional, default 1024)* MiB added to that pool on a worker where a node's rebuild policy
        copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
