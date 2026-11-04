@@ -287,6 +287,8 @@ class MLPFusion(nn.Module):
     loader's concat into ``mlp.fc1``.
     """
 
+    lora_unservable = dict.fromkeys(("mlp.fc1", "mlp.fc2"), "run as F.linear over its weight, never its own forward")
+
     def __init__(self, config: WaypointConfig):
         super().__init__()
         self.mlp = MLP(2 * config.d_model, config.d_model, config.d_model)

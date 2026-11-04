@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -25,6 +24,7 @@ from mstar.model.omnilingual_asr.config import (
     HUB_TOKENIZER,
     Artifact,
 )
+from mstar.utils.cache_home import user_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,7 @@ POS_CONV = "encoder_frontend.pos_encoder.conv."
 
 
 def default_cache_dir() -> Path:
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return cache_home / "mstar" / "omnilingual_asr"
+    return user_cache_dir() / "mstar" / "omnilingual_asr"
 
 
 def sha256_of(path: str | Path, chunk: int = 1 << 24) -> str:

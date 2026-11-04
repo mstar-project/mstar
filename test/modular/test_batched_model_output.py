@@ -83,6 +83,19 @@ def test_clone_detaches_and_keeps_non_tensors():
     assert cloned["nested"]["flag"] == "keep", "non-tensors must survive"
 
 
+def test_a_stop_buffer_under_two_names_is_cloned_once():
+    """Qwen3.5 hands the stop check its sampled tokens as `new_token` and `text_inputs`, one
+    tensor that is also its row output, so each step cloned them twice."""
+    tokens = torch.tensor([0, 1, 2])
+    out = BatchedModelOutput(
+        row_outputs={"new_token": tokens},
+        check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
+    )
+    rows = out.clone_row_outputs(3)
+    cloned = out.clone_check_stop_buffers(reuse=rows)
+    assert cloned["text_inputs"] is cloned["new_token"] is rows["new_token"], "one tensor was cloned twice"
+
+
 def test_check_stop_falls_back_to_per_rid():
     per_rid = {"r0": {"new_token": [torch.tensor([5])]}}
     out = BatchedModelOutput(per_rid_outputs=per_rid)
@@ -139,6 +152,16 @@ def test_batched_prematerialize_keeps_row_to_request_order(accelerator_device):
     for i, rid in enumerate(rids):
         assert got[rid]["new_token"][0].item() == 100 + i
         assert got[rid]["new_token"][0].device.type == "cpu", "must land on the host"
+
+
+def test_the_side_stream_copy_lands_a_tensor_under_two_names_once(accelerator_device):
+    tokens = torch.arange(3, device=accelerator_device)
+    worker = _StubWorker(accelerator_device)
+    runtime = getattr(torch, accelerator_device.type)
+    side = runtime.Stream(device=accelerator_device)
+    side.wait_stream(runtime.current_stream(accelerator_device))
+    host = worker._d2h_batched({"new_token": tokens, "text_inputs": tokens}, side)
+    assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"
 
 
 def test_batched_matches_what_the_per_rid_walk_would_give(accelerator_device):
@@ -225,6 +248,7 @@ class _StagingWorker(_StubWorker):
     _host_rows_slot = 0
     _d2h_stream = None
     _stage_host_rows = Worker._stage_host_rows
+    _copy_to_pinned = Worker._copy_to_pinned
     _prematerialize_for_check_stop = Worker._prematerialize_for_check_stop
 
     def __init__(self, device=torch.device("cpu")):
@@ -277,3 +301,14 @@ def test_staged_rows_land_behind_the_stream_and_rotate_buffers(accelerator_devic
         assert buf.tolist() == list(range(100 * step, 100 * step + 6))
         seen.add(buf.data_ptr())
     assert len(seen) == 3, "consecutive steps use different pinned buffers"
+
+
+def test_staged_rows_land_a_tensor_under_two_names_once(accelerator_device):
+    tokens = torch.arange(3, device=accelerator_device)
+    out = BatchedModelOutput(
+        check_stop_buffers={"new_token": tokens, "text_inputs": tokens}, row_request_ids=("a", "b", "c"),
+    )
+    worker = _StagingWorker(accelerator_device)
+    worker._stage_host_rows(out)
+    host = out.host_rows.buffers
+    assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"

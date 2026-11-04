@@ -72,6 +72,9 @@ class CommandAPlusTextConfig:
             raise ValueError("rope_parameters must be default RoPE with the same rope_theta")
         if not set(data["layer_types"]) <= {"sliding_attention", "full_attention"}:
             raise ValueError(f"Unsupported layer_types: {sorted(set(data['layer_types']))}")
+        for kind in ("sliding_attention", "full_attention"):
+            if kind not in data["layer_types"]:
+                raise ValueError(f"layer_types must include {kind} layers; Command A+ interleaves both")
         return cls(**{name: data[name] for name in cls.__dataclass_fields__})
 
 

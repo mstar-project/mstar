@@ -23,8 +23,21 @@ mod flex {
     use serde::{de::Error, Deserialize, Deserializer};
     use serde_json::Value;
 
+    /// `f` as an i64 when integral and in range; `as` alone would saturate `1e20` to `i64::MAX`.
     fn float_to_i64(f: f64) -> Option<i64> {
-        (f.is_finite() && f.fract() == 0.0).then_some(f as i64)
+        const BOUND: f64 = 9_223_372_036_854_775_808.0; // 2^63
+        (f.is_finite() && f.fract() == 0.0 && (-BOUND..BOUND).contains(&f)).then_some(f as i64)
+    }
+
+    /// An integer literal with an optional zero fraction (`"5"`, `"-3"`, `"5.0"`);
+    /// no exponent, as pydantic.
+    fn parse_integral(t: &str) -> Option<i64> {
+        let (int, frac) = t.split_once('.').unwrap_or((t, ""));
+        if frac.bytes().all(|b| b == b'0') {
+            int.parse::<i64>().ok()
+        } else {
+            None
+        }
     }
 
     pub fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
@@ -36,10 +49,7 @@ mod flex {
                 .map(Some)
                 .ok_or_else(|| Error::custom(format!("expected an integer, got {n}"))),
             Some(Value::String(s)) => {
-                let t = s.trim();
-                t.parse::<i64>()
-                    .ok()
-                    .or_else(|| t.parse::<f64>().ok().and_then(float_to_i64))
+                parse_integral(s.trim())
                     .map(Some)
                     .ok_or_else(|| Error::custom(format!("expected an integer, got {s:?}")))
             }
@@ -60,6 +70,12 @@ mod flex {
                 .map_err(|_| Error::custom(format!("expected a number, got {s:?}"))),
             Some(other) => Err(Error::custom(format!("expected a number, got {other}"))),
         }
+    }
+
+    /// [`opt_f64`] for a field whose presence matters: serde calls this only
+    /// for a field the request sent, so an absent one stays `None` (the default).
+    pub fn sent_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+        opt_f64(d).map(Some)
     }
 
     pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
@@ -107,10 +123,11 @@ pub struct ChatCompletionRequest {
     #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub top_p: Option<f64>,
+    /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
+    #[serde(default)]
+    pub temperature: Option<Value>,
+    #[serde(default)]
+    pub top_p: Option<Value>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub max_tokens: Option<i64>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -153,19 +170,20 @@ pub struct SpeechRequest {
     pub voice: Option<String>,
     #[serde(default = "default_wav")]
     pub response_format: String,
-    /// Accepted for OpenAI compatibility (kept out of `extra`); playback-rate
-    /// adjustment is not applied, as in mstar.
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub speed: Option<f64>,
+    /// Kept out of `extra`. `None` when the request did not send it,
+    /// `Some(None)` for an explicit `null`: an adapter forwards a sent speed
+    /// (pydantic's `model_fields_set`) and leaves an unsent one out.
+    #[serde(default, deserialize_with = "flex::sent_f64")]
+    pub speed: Option<Option<f64>>,
     /// `bool | None` in Python (default False); accept an explicit `null`
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub stream: Option<bool>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub top_p: Option<f64>,
+    /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
+    #[serde(default)]
+    pub temperature: Option<Value>,
+    #[serde(default)]
+    pub top_p: Option<Value>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub seed: Option<i64>,
 
@@ -183,7 +201,6 @@ pub struct ImageGenerationRequest {
     /// OpenAI `n`: number of images to generate (submitted as n engine requests).
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub size: Option<String>,
     #[allow(dead_code)]
@@ -274,6 +291,7 @@ impl ModelList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn chat(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
@@ -289,8 +307,8 @@ mod tests {
                 "max_tokens":"16","n":"2","seed":"7"}"#,
         );
         assert_eq!(r.stream, Some(true));
-        assert_eq!(r.temperature, Some(0.5));
-        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.temperature, Some(json!("0.5")));
+        assert_eq!(r.top_p, Some(json!("0.9")));
         assert_eq!(r.max_tokens, Some(16));
         assert_eq!(r.n, Some(2));
         assert_eq!(r.seed, Some(7));
@@ -305,7 +323,7 @@ mod tests {
                 "seed":null}"#,
         );
         assert_eq!(r.stream, Some(true));
-        assert_eq!(r.temperature, Some(0.5));
+        assert_eq!(r.temperature, Some(json!(0.5)));
         assert_eq!(r.max_tokens, Some(16));
         assert_eq!(r.seed, None); // explicit null
         let r = chat(r#"{"messages":[]}"#);
@@ -315,10 +333,6 @@ mod tests {
 
     #[test]
     fn rejects_genuinely_invalid_scalars() {
-        assert!(serde_json::from_str::<ChatCompletionRequest>(
-            r#"{"messages":[],"temperature":"abc"}"#
-        )
-        .is_err());
         // A non-integral value for an int field is still an error.
         assert!(serde_json::from_str::<ChatCompletionRequest>(
             r#"{"messages":[],"max_tokens":"1.5"}"#
@@ -328,6 +342,36 @@ mod tests {
             r#"{"messages":[],"stream":"maybe"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn int_fields_refuse_what_python_refuses() {
+        let max_tokens = |v: &str| {
+            let body = format!(r#"{{"messages":[],"max_tokens":{v}}}"#);
+            serde_json::from_str::<ChatCompletionRequest>(&body).map(|r| r.max_tokens)
+        };
+        assert_eq!(max_tokens(r#"" -3 ""#).unwrap(), Some(-3));
+        assert_eq!(max_tokens(r#""5.000""#).unwrap(), Some(5));
+        assert_eq!(max_tokens(r#""9007199254740993.0""#).unwrap(), Some(9007199254740993));
+        // an exponent string, as pydantic refuses it
+        assert!(max_tokens(r#""5e0""#).is_err());
+        assert!(max_tokens(r#""1e20""#).is_err());
+        // out of i64: refused, not saturated to i64::MAX
+        assert!(max_tokens("1e20").is_err());
+        assert!(max_tokens("-1e20").is_err());
+        assert!(max_tokens("9223372036854775808.0").is_err());
+        assert_eq!(max_tokens("-9223372036854775808.0").unwrap(), Some(i64::MIN));
+        let seed = r#"{"messages":[],"seed":1e20}"#;
+        assert!(serde_json::from_str::<ChatCompletionRequest>(seed).is_err());
+    }
+
+    #[test]
+    fn speech_speed_tells_unsent_from_null() {
+        let speed = |body: &str| serde_json::from_str::<SpeechRequest>(body).unwrap().speed;
+        assert_eq!(speed(r#"{"input":"x"}"#), None);
+        assert_eq!(speed(r#"{"input":"x","speed":null}"#), Some(None));
+        assert_eq!(speed(r#"{"input":"x","speed":"1.5"}"#), Some(Some(1.5)));
+        assert!(serde_json::from_str::<SpeechRequest>(r#"{"input":"x","speed":"fast"}"#).is_err());
     }
 
     #[test]

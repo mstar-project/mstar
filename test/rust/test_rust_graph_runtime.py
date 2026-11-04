@@ -186,11 +186,11 @@ def test_removing_twice_is_idempotent(runtime):
 
 # --- per-request state -------------------------------------------------------
 
-def test_set_walk_and_stream_done_reach_the_request(runtime):
+def test_set_walk_and_partition_done_reach_the_request(runtime):
     rid = _admit(runtime)
     runtime.set_walk(rid, "default", "other_walk")
-    runtime.mark_stream_partition_done(rid, "default")
-    # No getter for stream-done on the ABC; not raising is the assertion, and
+    runtime.mark_partition_done(rid, "default")
+    # No getter for partition_done on the ABC; not raising is the assertion, and
     # the walk change is observable.
     assert runtime is not None
 
@@ -539,7 +539,7 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
 def test_pop_of_an_unknown_node_raises(runtime):
     """Not None: nothing in the deployment runs this pair, and returning None
     would have the scheduler read a structural error as "not ready yet" and
-    retry the row forever. PythonGraphRuntime has always raised here."""
+    retry the row forever."""
     with pytest.raises(RuntimeError):
         runtime.pop_rids("nope", WALK, [])
 
@@ -868,10 +868,9 @@ def test_a_peer_stop_applies_only_when_newer(runtime):
     kept = runtime._loop_stop_times(rid)["ar_loop"]
     assert kept.wg_fwd_pass_idx == 3
 
-    # An older observation is recorded but must not re-stop a loop that has
-    # since restarted.
+    # An older observation is dropped, not recorded over the newer one.
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
-    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 1
+    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 3
 
 
 def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):

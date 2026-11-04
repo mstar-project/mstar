@@ -23,6 +23,7 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai import adapters  # noqa: E402
 from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
 
@@ -63,6 +64,13 @@ def test_cjk_terminators_and_paragraph_breaks_split():
 
     paragraphs = split_sentences("First paragraph no period\n\nsecond paragraph no period", max_chars=30, min_chars=1)
     assert paragraphs == ["First paragraph no period", "second paragraph no period"]
+
+
+def test_cjk_sentences_in_one_chunk_are_joined_without_a_space():
+    text = "今天天气很好。我们去公园散步吧！你觉得怎么样？" * 2
+    chunks = split_sentences(text, max_chars=30, min_chars=1)
+    assert "".join(chunks) == text and all(" " not in c for c in chunks)
+    assert split_sentences("Hi there. 你好。Bye now.", max_chars=12, min_chars=1) == ["Hi there.", "你好。Bye now."]
 
 
 def test_quotes_after_terminators_stay_with_their_sentence():
@@ -116,6 +124,8 @@ def _pcm(*vals):
 
 class _RecordingAPI:
     """Each submitted request returns PCM that encodes its submission index."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self):
         self.model_name = "orpheus"
@@ -303,9 +313,8 @@ def _stream(stub, num_chunks):
         from mstar.api_server.openai import serving_speech
 
         pending = [submit(0), submit(1)]
-        first_iter = stub.iter_result_chunks(pending[0])
-        first = await anext(first_iter)
-        return serving_speech._stream_pcm(stub, submit, num_chunks, pending, first_iter, first, 24000)
+        first_iter = await stub.open_result_stream(pending[0])
+        return serving_speech._stream_pcm(stub, submit, num_chunks, pending, first_iter, 24000)
 
     return ids, start
 
@@ -408,7 +417,8 @@ def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
 
     assert [_chunk_kwargs({"seed": 7}, i)["seed"] for i in range(3)] == [7, 8, 9]
     top = 2**63 - 1
-    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, 0, 1]
+    # a signed int64 wrap, as the Rust frontend's
+    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, -(2**63), 1 - 2**63]
     # the first piece keeps the client's value
     assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
     assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)

@@ -63,13 +63,13 @@ class _RecordingBuffers:
     def stage_seen_token_masks(self, request_ids, seen_masks):
         self.staged += 1
 
-    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True):
+    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True, kept=None):
         self.gathered_seen.append(gather_seen_tokens)
 
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0, keep=None):
+    def scatter_offset(self, cg_slot=0, keep=None, index=None):
         self.offset_scatters += 1
 
     def keep_mask(self, keep):

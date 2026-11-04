@@ -1,9 +1,12 @@
 """``compile_mode`` on a capture config: checked when the config is built, and
-turned into ``torch.compile``'s arguments by ``accelerator_graph_runner.compile_kwargs``."""
+turned into ``torch.compile``'s arguments by ``accelerator_graph_runner.compile_kwargs``;
+and how many cache entries a forward compiled with them takes per bucket."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, ".")
 
@@ -13,6 +16,9 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseBatchedConfig,
 )
 from mstar.engine.accelerator_graph_runner import compile_kwargs
+from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+from mstar.engine.resources.attn.xpu import XPUPagedAttentionManager
 from mstar.model.submodule_base import NodeInputs
 
 
@@ -62,3 +68,68 @@ def test_configs_carry_the_field():
     assert packed.compile_mode == "default"
     assert _piecewise("default").compile_mode == "default"
     assert _piecewise(None).compile_mode is None
+
+
+@pytest.fixture
+def fresh_deterministic_check():
+    from mstar.engine import accelerator_graph_runner
+
+    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+    yield
+    accelerator_graph_runner._has_deterministic_mode.cache_clear()
+
+
+@pytest.mark.parametrize("build", [_batched, _piecewise])
+def test_the_deterministic_mode_is_the_engines_own(build, fresh_deterministic_check):
+    """Not a torch.compile mode: it turns into Inductor's deterministic option."""
+    import torch._inductor.config as inductor_config
+
+    assert build("deterministic").compile_mode == "deterministic"
+    kwargs = compile_kwargs("deterministic")
+    assert kwargs["fullgraph"] is False and kwargs["dynamic"] is False and "mode" not in kwargs
+    if hasattr(inductor_config, "deterministic"):
+        assert kwargs["options"] == {"deterministic": True}
+
+
+def test_a_torch_without_the_deterministic_mode_says_so(monkeypatch, caplog, fresh_deterministic_check):
+    import logging
+
+    import torch._inductor.config as inductor_config
+
+    from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+    if hasattr(inductor_config, "deterministic"):
+        monkeypatch.delattr(inductor_config, "deterministic")
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.accelerator_graph_runner"):
+        assert deterministic_inductor_options() == {}
+        assert compile_kwargs("deterministic") == {"fullgraph": False, "dynamic": False}
+    assert caplog.text.count("has no Inductor deterministic mode") == 1
+
+
+@pytest.mark.parametrize("manager_cls, plans_attr, plan", [
+    (FlashInferManager, "_current_plan_states", lambda qo: SimpleNamespace(_qo_indptr_buf=qo)),
+    (FlashInferMLAManager, "_current_plan_states", lambda qo: SimpleNamespace(_qo_indptr_buf=qo)),
+    (XPUPagedAttentionManager, "_current_plans", lambda qo: SimpleNamespace(cu_q=qo)),
+])
+def test_select_last_hidden_compiles_no_frame_per_prefill_bucket(manager_cls, plans_attr, plan):
+    """Captured forwards compile with static shapes, so a frame holding both a
+    bucket's token count and its row count takes one cache entry per pair.
+    Three token counts by three row counts must fit in three entries per frame."""
+    manager = manager_cls.__new__(manager_cls)
+    head = torch.nn.Linear(8, 4)
+
+    def forward(hidden):
+        return head(manager.select_last_hidden(hidden))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(forward, backend="eager", **compile_kwargs("default"))
+    try:
+        with torch._dynamo.config.patch(recompile_limit=3, fail_on_recompile_limit_hit=True), torch.no_grad():
+            for tokens in (16, 32, 64):
+                for rows in (1, 2, 4):
+                    qo = torch.arange(rows + 1, dtype=torch.int32) * (tokens // rows)
+                    setattr(manager, plans_attr, {"main": plan(qo)})
+                    hidden = torch.randn(tokens, 8)
+                    assert torch.equal(compiled(hidden), head(hidden[qo[1:].long() - 1]))
+    finally:
+        torch._dynamo.reset()

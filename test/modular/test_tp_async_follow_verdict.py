@@ -192,7 +192,7 @@ def test_env_parses_master_switch_and_node_list():
 
 
 @pytest.mark.parametrize("env, config, want", [
-    (None, None, (False, None)),
+    (None, None, (True, None)),  # on by default
     (None, True, (True, None)),
     (None, False, (False, None)),
     (None, ["thinker", "talker"], (True, frozenset({"thinker", "talker"}))),

@@ -29,6 +29,7 @@ from mstar.engine.resources.attn.ragged.config import (
     cross_label,
 )
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVConfig,
     KVLayout,
@@ -90,6 +91,9 @@ __all__ = [
     "CGSlotSpec",
     "CrossAttentionConfig",
     "CrossAttentionSpec",
+    "DSAConfig",
+    "DSASpec",
+    "DSAStep",
     "KVConfig",
     "KVLayout",
     "KVReqConfig",

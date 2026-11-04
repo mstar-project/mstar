@@ -8,6 +8,7 @@ and runs only when they are already in AudioSeal's cache.
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import sys
 from hashlib import sha1
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 
 import pytest
 import torch
+from packaging.version import Version
 
 from mstar.engine.engine import Engine
 from mstar.model.audio_watermark import (
@@ -220,15 +222,21 @@ def test_an_utterance_ending_mid_frame_differs_from_the_library_in_its_last_fram
     torch.testing.assert_close(streamed[:whole], _library_offline(wmk, audio)[:whole], atol=1e-6, rtol=0)
 
 
-def test_library_streaming_context_does_not_carry_history():
-    """Why the module keeps the state itself (upstream issue #105)."""
+def test_library_streaming_context_carries_history_from_0_2_1():
+    """AudioSeal 0.2.0's ``streaming()`` drops the history between chunks
+    (upstream issue #105), why the module first kept the state itself. 0.2.1
+    fixed it, and its stream matches the offline watermark like ours does."""
     wmk = _watermarker()
     audio = _speechlike(2560, seed=2)
     message = torch.tensor([wmk.config.message_bits()])
     with torch.no_grad(), wmk._no_compile(), wmk.generator.streaming(1):
         parts = [wmk.generator(audio[i:i + 640].view(1, 1, -1), message=message) for i in range(0, 2560, 640)]
     naive = torch.cat([p.view(-1) for p in parts])
-    assert (naive - _library_offline(wmk, audio)).abs().max() > 1e-4
+    offline = _library_offline(wmk, audio)
+    if Version(importlib.metadata.version("audioseal")) < Version("0.2.1"):
+        assert (naive - offline).abs().max() > 1e-4
+    else:
+        torch.testing.assert_close(naive, offline, atol=1e-6, rtol=0)
 
 
 def test_streams_batch_without_mixing():
@@ -477,7 +485,7 @@ def test_pcm16_round_trip_matches_offline_within_one_step():
     assert (marked.int() - expected.int()).abs().max() <= 1
 
 
-def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monkeypatch):
+def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monkeypatch, torch_flag):
     """cuDNN on H100 picks a far slower conv with TF32 off; matmuls, which the
     engine turns to TF32, stay fp32."""
     wmk = _watermarker()
@@ -490,18 +498,18 @@ def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monke
         return forward(x)
 
     monkeypatch.setattr(first_conv, "forward", conv)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cuda.matmul, "allow_tf32", True)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
     wmk.apply([torch.zeros(320)], [WatermarkStream()])
     assert seen == [(False, True)]
     assert torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32
 
 
-def test_precision_getters_answer_while_the_watermark_runs(monkeypatch):
+def test_precision_getters_answer_while_the_watermark_runs(torch_flag):
     """Flipping ``cuda.matmul.allow_tf32`` alone made
     ``get_float32_matmul_precision()`` raise (a mix of the legacy and new
     APIs) for every thread until the window closed."""
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
     previous = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:

@@ -19,11 +19,14 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from mstar.model.components.linear_attn import (
+    GATE_ALIGN,
+    SPLIT_BLOCK_NAMES,
     SPLIT_SHARD_BLOCKS,
     GatedDeltaNet,
     GDNProjLayout,
@@ -49,12 +52,46 @@ class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
 
     ``shard_map`` names the blocks each checkpoint tensor covers (``[q|k|v]``
     is one tensor), so loader names match the checkpoint's.
+
+    ``block_names`` names each block as a LoRA slice (None for a pad block the
+    loader never fills), and ``pad_align`` is the multiple a pad rounds the
+    block before it up to on each rank.
     """
 
-    def __init__(self, *, shard_map: dict[str, tuple[int, ...]], **kwargs):
+    def __init__(
+        self, *, shard_map: dict[str, tuple[int, ...]],
+        block_names: tuple[str | None, ...], pad_align: int = 1, **kwargs,
+    ):
         # before super(), which attaches the bound loader below
         self._shard_map = shard_map
+        self._block_names = block_names
+        self._pad_align = pad_align
         super().__init__(**kwargs)
+
+    def lora_target(self) -> LoraTarget:
+        """A slice per named block; a checkpoint tensor spanning several blocks
+        (``[q|k|v]``) is a pack of their slices, and a pad block is its
+        predecessor's per-rank alignment."""
+        names = self._block_names
+        slices, align = [], []
+        for block, name in enumerate(names):
+            if name is None:
+                align[-1] = self._pad_align
+                continue
+            slices.append((name, self.output_sizes[block]))
+            align.append(1)
+        packs = {
+            shard: tuple(names[b] for b in blocks)
+            for shard, blocks in self._shard_map.items() if len(blocks) > 1
+        }
+        return LoraTarget(
+            in_features=self.input_size_per_partition,
+            out_slices=tuple(size for _, size in slices),
+            parallel="column",
+            slice_names=tuple(name for name, _ in slices),
+            slice_packs=packs or None,
+            slice_align=tuple(align) if any(a > 1 for a in align) else None,
+        )
 
     def weight_loader(
         self,
@@ -146,6 +183,7 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
                     num_v_heads, gate_pad(self.num_v_heads) * tp, num_v_heads,
                 ],
                 bias=proj_bias, shard_map=SPLIT_SHARD_BLOCKS,
+                block_names=SPLIT_BLOCK_NAMES, pad_align=GATE_ALIGN,
             )
         self.out_proj = RowParallelLinear(
             comm_group=comm_group, input_size=self.total_value_dim,

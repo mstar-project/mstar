@@ -660,6 +660,11 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
     return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
 
 
+def _task_strings(tasks_df) -> dict[int, str]:
+    """task_index -> instruction from a lerobot v3.0 meta/tasks.parquet, which keeps the strings in the index."""
+    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=True))
+
+
 def _decode_frames_to_png_and_video(
     video_path: str,
     frame_indices: list[int],
@@ -701,7 +706,11 @@ class DROIDDataset(BaseDataset):
 
     For vjepa2_ac the downloaded mp4 is passed directly to the server — no
     re-encoding.  For pi05 only the first frame of each camera video is
-    decoded to a PNG.
+    decoded to a PNG, and a request carries what openpi's pi05_droid policy
+    takes (configs/pi05_droid.yaml): the exterior_image_1_left and
+    wrist_image_left frames and the recorded state, unpadded. droid_100 records
+    the end-effector pose and gripper rather than joint positions, so the state
+    has the right width for a DROID request but not the right meaning.
 
     Args:
         local_file_dir:  directory for extracted PNGs (created if absent).
@@ -709,7 +718,7 @@ class DROIDDataset(BaseDataset):
         num_requests:    number of episodes to use.
         task:            ``"pi05"`` or ``"vjepa2_ac"``.
         rollout_horizon: H for vjepa2_ac; actions/states shape is [H, dim].
-        action_dim:      target dim; defaults to 32 (pi05) or 7 (vjepa2_ac).
+        action_dim:      vjepa2_ac's action/state width (default 7).
         cache_dir:       HuggingFace cache root (None → HF default).
     """
 
@@ -736,7 +745,7 @@ class DROIDDataset(BaseDataset):
         self.local_file_dir  = local_file_dir
         self.task            = task
         self._num_requests   = num_requests
-        self.action_dim      = action_dim if action_dim is not None else (32 if task == "pi05" else 7)
+        self.action_dim      = action_dim if action_dim is not None else 7
         self.rollout_horizon = rollout_horizon
         self.cache_dir       = cache_dir
         # Number of video frames to extract per vjepa2_ac request. Default 8
@@ -774,9 +783,7 @@ class DROIDDataset(BaseDataset):
         tasks: dict[int, str] = {}
         try:
             import pandas as _pd
-            tasks_df = _pd.read_parquet(_dl("meta/tasks.parquet"))
-            tasks = dict(zip(tasks_df["task_index"].astype(int),
-                             tasks_df["task"].astype(str), strict=False))
+            tasks = _task_strings(_pd.read_parquet(_dl("meta/tasks.parquet")))
             print(f"  tasks loaded: {len(tasks)}")
         except Exception as e:
             print(f"  [warn] could not load tasks.parquet: {e}")
@@ -855,8 +862,11 @@ class DROIDDataset(BaseDataset):
         local_indices = self._local_frame_indices(frames)
         first_local   = local_indices[0]
 
+        # openpi's DroidInputs: the first exterior camera, then the wrist camera.
+        exterior = next((k for k in camera_keys if "exterior_image_1" in k), camera_keys[0])
+        wrist = next((k for k in camera_keys if "wrist" in k), camera_keys[-1])
         image_paths: list[str] = []
-        for cam_key in camera_keys[:3]:
+        for cam_key in (exterior, wrist):
             chunk_video = download_fn(self._chunk_video_path(ep_id, cam_key, chunks_size))
             png_path    = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
             _decode_frames_to_png_and_video(
@@ -864,14 +874,10 @@ class DROIDDataset(BaseDataset):
             )
             image_paths.append(png_path)
 
-        if not image_paths:
-            raise ValueError("no camera videos found")
-        while len(image_paths) < 3:
-            image_paths.append(image_paths[0])
-
-        state = _to_float_list(
-            frames[0].get(state_col) if state_col else None, self.action_dim
-        )
+        raw_state = frames[0].get(state_col) if state_col else None
+        if raw_state is None:
+            raise ValueError("no state column")
+        state = [float(v) for v in raw_state]
         return RequestInput(
             req_type=RequestType.VLA,
             prompt=language or "manipulate the object",

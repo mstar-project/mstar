@@ -27,6 +27,7 @@ from mstar.distributed.communication import (
     GlobalParallelConfig,
     WorkerParallelGroups,
 )
+from mstar.model.base import WorkerGraph
 
 _REAL_BACKENDS = dict(ar.SYMM_BACKENDS)
 
@@ -77,7 +78,7 @@ class _CudaTensor:
 def _one_process(monkeypatch):
     monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_FakeSymm))
     # one process: every rank is this one
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: flag)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: list(values))
     _FakeSymm.instances.clear()
 
 
@@ -138,7 +139,7 @@ def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, c
 def test_a_peer_that_failed_takes_every_rank_to_nccl(monkeypatch, fake_cuda, caplog):
     """One rank on NCCL while its peers wait in the symmetric kernel for its signal
     deadlocked the first all-reduce."""
-    monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: False)
+    monkeypatch.setattr(CommGroup, "agree", lambda self, values, op=None: [0] * len(values))
     with caplog.at_level(logging.WARNING, logger=ar.__name__):
         backend = AllReduce.new(_group(), "symm_multimem")
     assert type(backend) is AllReduce
@@ -221,10 +222,9 @@ def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
 
 @pytest.mark.parametrize("tp_allreduce", [None, "symm_multimem"])
 def test_global_config_hands_it_to_every_worker(tp_allreduce):
-    wg = SimpleNamespace(
-        tp_size=2, sp_size=1, _tp_ranks=[[0, 1]], _sp_ranks=[[0], [1]],
-        ranks=[0, 1], _tp_comm_size=2, _instance_ranks=[[0, 1]],
+    wg = WorkerGraph(
         section=SimpleNamespace(get_nodes=lambda: {"llm": None}),
+        graph_walks=set(), ranks=[0, 1], tp_size=2,
     )
     cfg = GlobalParallelConfig(
         {"wg": wg}, ["worker_0", "worker_1"], tp_allreduce=tp_allreduce
@@ -561,9 +561,9 @@ def flashinfer(monkeypatch, fake_cuda):
 
     built, routed = [], []
 
-    def create_workspace(rank, world_size, cpu_group, max_tokens, hidden, dtype):
+    def create_workspace(group, max_tokens, hidden, dtype):
         nbytes = max_tokens * hidden * dtype.itemsize
-        built.append((cpu_group, nbytes))
+        built.append((group.cpu_group, nbytes))
         ar_fusion._WORKSPACES.append(_Workspace(nbytes))
         return len(ar_fusion._WORKSPACES) - 1
 

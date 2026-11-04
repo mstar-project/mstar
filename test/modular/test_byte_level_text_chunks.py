@@ -222,10 +222,10 @@ class _BatchAPI:
 
 
 def _sse_content(chunks):
-    from mstar.api_server.openai.serving_chat import _stream
+    from mstar.api_server.openai.serving_chat import _stream_events
 
     async def run():
-        return [f async for f in _stream(_BatchAPI(chunks), "m", "r", 24000)]
+        return [f async for f in _stream_events(_BatchAPI(chunks).iter_result_chunk_batches("r"), "m", "r", 24000)]
 
     content = ""
     for frame in asyncio.run(run()):
@@ -257,6 +257,19 @@ def test_ignore_eos_keeps_each_end_token_as_its_own_chunk(name, kind, request):
     chunks = [c.data for c in _chunks(_model(name, tok), ids, {"ignore_eos": True})]
     assert all(chunks)
     assert b"".join(chunks).decode() == tok.decode(ids) == "猫<|im_end|><|im_end|>"
+
+
+@pytest.mark.parametrize(("name", "kind"), MODELS)
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_inline_tokens_get_the_same_chunks_as_postprocess(name, kind, ignore_eos, request):
+    """Both paths come from the model's ``text_output``; the inline one maps ids without a tensor."""
+    tok = request.getfixturevalue(f"{kind}_tokenizer")
+    model = _model(name, tok)
+    ids = _ids(tok, REPLY + "<|im_end|>") * 2  # the second pass reads the memo
+    kw = {"ignore_eos": True} if ignore_eos else None
+    inline = model.postprocess_inline(ids, "text", [kw] * len(ids))
+    assert inline == [c.data for c in _chunks(model, ids, kw)]
+    assert inline[-1] == (b"<|im_end|>" if ignore_eos else b"")
 
 
 # ----------------------------------------------------------------------

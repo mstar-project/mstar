@@ -1,0 +1,24 @@
+model: "cosyvoice3"
+# sos + prompt text and text (<= 512) + task_id + reference speech (<= 750)
+# + speech tokens (<= 2048) per request
+max_seq_len: 3312
+# 32 requests at the full length hold 32 x 52 pages; with the sink page that
+# fits in 1792 (checked at startup). A full pool would stall decode.
+max_concurrent_requests: 32
+resources:
+  lm_kv:
+    # 24 layers x 2 kv heads x 64 dims x bf16 = 12 KB per token
+    page_size: 64
+    max_num_pages: 1792
+node_groups:
+  - node_names: [speaker_encoder, llm]
+    ranks: [0]
+    graph_walks: [prefill, prefill_voice, decode]
+  - node_names: [flow, hift]
+    ranks: [0]
+    graph_walks: [token2wav]
+# model_kwargs:
+#   voices_dir: /path/to/presets      # voice="<name>" loads <name>.wav (+ <name>.txt transcript)
+#   stream_hop_tokens: 0               # decode once at the end, full attention (reference stream=False)
+#   llm_weights: llm.rl.pt             # the checkpoint's RL-tuned LM
+#   flow_estimator_dtype: float32      # the reference's flow precision (default bfloat16: more throughput)
