@@ -192,9 +192,9 @@ HF_MODELS: dict[str, dict] = {
     # ASR-benchmark checkpoint. ``whisper_large_v3_turbo`` is the 4-decoder-
     # layer distillation that serves the same encoder several times faster.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
     # MiniCPM-o 4.5: Qwen3-8B over SigLIP image slices and Whisper audio, half-duplex chat.
     "minicpm_o": {"model_path_hf": "openbmb/MiniCPM-o-4_5"},
-    "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
     # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
     # FLUX.1 VAE), text-to-image only. Apache-2.0.
     "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},

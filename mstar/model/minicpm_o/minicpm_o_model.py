@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoProcessor
+from transformers import Qwen2TokenizerFast, WhisperFeatureExtractor
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -66,7 +66,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
 )
-from mstar.model.minicpm_o import weight_loader
+from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
     CACHE_FAMILIES,
@@ -81,7 +81,9 @@ from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    AUDIO_FEATURE_LENS,
     DECODE_LOOP,
+    IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -106,8 +108,9 @@ from mstar.model.minicpm_o.submodules import (
     TTSSubmodule,
     VisionEncoderSubmodule,
 )
-from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
+from mstar.model.multimodal import TEXT, PromptPart, check_attachments, messages_from_parts, parts_from_modalities
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import TextOutput
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -157,30 +160,30 @@ DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalt
 _WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
     "prefill_text": {LLM: ("text_inputs",)},
     "prefill_image": {
-        VISION: ("pixel_values", "image_tgt_sizes"),
+        VISION: ("pixel_values",),
         LLM: ("text_inputs", "image_positions"),
     },
     "prefill_audio": {
-        AUDIO: ("audio_features", "audio_feature_lens"),
+        AUDIO: ("audio_features",),
         LLM: ("text_inputs", "audio_positions"),
     },
     "prefill_omni": {
-        VISION: ("pixel_values", "image_tgt_sizes"),
-        AUDIO: ("audio_features", "audio_feature_lens"),
+        VISION: ("pixel_values",),
+        AUDIO: ("audio_features",),
         LLM: ("text_inputs", "image_positions", "audio_positions"),
     },
 }
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
-    """Config, tokenizer and processor files only; workers fetch weights."""
+    """Config and tokenizer files only; workers fetch weights."""
     if Path(repo_id).is_dir():
         return repo_id
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
         repo_id=repo_id, cache_dir=cache_dir,
-        allow_patterns=["*.json", "*.py", "*.txt", "assets/*.wav"],
+        allow_patterns=["*.json", "*.txt", "assets/*.wav"],
     )
 
 
@@ -197,18 +200,16 @@ def _as_pil(image: torch.Tensor):
     return Image.fromarray(image.permute(1, 2, 0).cpu().contiguous().numpy(), mode="RGB")
 
 
-def _bound_positions(bounds: torch.Tensor) -> torch.Tensor:
-    """Concatenated ``[start, end)`` ranges of ``[n, 2]`` placeholder bounds."""
-    if bounds.numel() == 0:
-        return torch.zeros(0, dtype=torch.long)
-    return torch.cat([torch.arange(int(a), int(b)) for a, b in bounds.reshape(-1, 2).tolist()])
-
-
 class MiniCPMOModel(Model):
+    # Preprocessing is a few small ops per request, which a thread per core
+    # only slows (Qwen3.5 measured its image preprocessing at 4 threads).
     PREPROCESS_TORCH_THREADS = 4
+    # the encoders' segment sizes, which process_prompt settles
+    INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS)
 
     def __init__(
-        self, model_path_hf: str, cache_dir: str | None = None, custom_voices: int = 0, **kwargs: Any,
+        self, model_path_hf: str, cache_dir: str | None = None, max_seq_len: int | None = None,
+        custom_voices: int = 0, **kwargs: Any,
     ):
         """``custom_voices``: how many custom voices the vocoder holds at once (a pool it
         allocates only for requests that bring one); 0 keeps to the bundled voices."""
@@ -217,10 +218,16 @@ class MiniCPMOModel(Model):
         self.cache_dir = cache_dir
         self.local_dir = _resolve_metadata(model_path_hf, cache_dir)
         self.config = MiniCPMOConfig.from_hf(self.local_dir)
+        limit = self.config.llm.max_position_embeddings
+        self.max_seq_len = limit if max_seq_len is None else max_seq_len
+        if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= limit:
+            raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
+        # upstream's tokenizer class is Qwen2's with token-name attributes added
         self.tts_config = TTSConfig.from_hf(self.config.tts_config)
-        self._processor = None
-        tokenizer = self.processor.tokenizer
+        tokenizer = Qwen2TokenizerFast.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
+        # upstream's mel: Whisper's, as its own audio processor configures it
+        self._mel = WhisperFeatureExtractor(feature_size=self.config.audio.num_mel_bins)
         # A reply ends on <|im_end|> (the tokenizer's eos; config.json names
         # only that) or <|endoftext|>, as upstream's `chat` terminators; and
         # a spoken reply's text closes with <|tts_eos|> just before <|im_end|>,
@@ -230,16 +237,6 @@ class MiniCPMOModel(Model):
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._voices: dict[str, np.ndarray] = {}
-
-    @property
-    def processor(self):
-        """Upstream's processor: image slicing, the Whisper-style mel and the
-        placeholder layout, run in the API server's preprocessing."""
-        if self._processor is None:
-            self._processor = AutoProcessor.from_pretrained(
-                self.local_dir, cache_dir=self.cache_dir, trust_remote_code=True,
-            )
-        return self._processor
 
     def checkpoint_path(self) -> str | None:
         return self.local_dir
@@ -259,7 +256,7 @@ class MiniCPMOModel(Model):
                     num_layers=llm.num_hidden_layers,
                     num_kv_heads=llm.num_key_value_heads,
                     head_dim=llm.head_dim,
-                    max_seq_len=llm.max_position_embeddings,
+                    max_seq_len=self.max_seq_len,
                     num_qo_heads=llm.num_attention_heads,
                 ),
             ),
@@ -405,13 +402,15 @@ class MiniCPMOModel(Model):
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        knobs = {**DEFAULT_SAMPLING, **{
-            k: model_kwargs[k] for k in ("temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos")
-            if k in model_kwargs
-        }}
+        keys = (
+            "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
+            "return_logprobs", "logprobs_mode",
+        )
+        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in keys if k in model_kwargs}}
         tts = TTS_SAMPLING
         return {
-            LLM_SAMPLER: SamplingReqConfig(**knobs),
+            # upstream generates from embeddings, so its penalty sees only generated tokens
+            LLM_SAMPLER: SamplingReqConfig(**knobs, penalize_prompt=False),
             TTS_SAMPLER: SamplingReqConfig(
                 temperature=tts.temperature, top_p=tts.top_p, top_k=tts.top_k,
                 repetition_penalty=tts.repetition_penalty, repetition_window=tts.penalty_window,
@@ -434,11 +433,11 @@ class MiniCPMOModel(Model):
             )
 
         vision = GraphNode(
-            name=VISION, input_names=["pixel_values", "image_tgt_sizes"],
+            name=VISION, input_names=["pixel_values"],
             outputs=[GraphEdge(next_node=LLM, name="vision_embeds")],
         )
         audio = GraphNode(
-            name=AUDIO, input_names=["audio_features", "audio_feature_lens"],
+            name=AUDIO, input_names=["audio_features"],
             outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
         )
         decode = Loop(
@@ -455,8 +454,8 @@ class MiniCPMOModel(Model):
                     GraphEdge(next_node=EMPTY_DESTINATION, name="tts_hidden"),
                 ],
             ),
-            # a safety bound; the per-request budget is `check_stop`'s
-            max_iters=self.config.llm.max_position_embeddings,
+            # a safety bound; the per-request budget is `get_loop_caps`'
+            max_iters=self.max_seq_len,
             outputs=[],
             # the reply's TTS condition, handed over whole when it ends
             accumulated_outputs=[
@@ -531,50 +530,38 @@ class MiniCPMOModel(Model):
     def _render(
         self,
         parts: list[PromptPart],
-        images: list,
-        audios: list[np.ndarray],
+        has_audio: bool,
         enable_thinking: bool,
         system_prompt: str | None,
         voice_audio: np.ndarray | None,
         speech: bool,
-    ) -> tuple[str, list[int]]:
-        """The chat string as upstream's `chat` renders it, and a part id per
-        audio. Each clip gets its own: the processor encodes clips that share an
-        id as one, but sizes their placeholders clip by clip, and the two round
-        differently (upstream's own `chat` fails on such prompts).
+    ) -> str:
+        """The chat string as upstream's `chat` renders it: a message per turn,
+        its items joined by newlines, with a tag per attachment.
 
         A spoken reply's system message is upstream's voice prompt around the
-        voice's reference clip (``voice_audio``, then the first of ``audios``);
-        without it, the request's ``system_prompt``."""
-        msgs: list[dict] = []
-        audio_parts: list[int] = []
+        voice's reference clip (``voice_audio``, the first audio the prompt
+        holds); without it, the request's ``system_prompt``."""
+        tags = {"image": processor.IMAGE_TAG, "audio": processor.AUDIO_TAG}
+        msgs = [
+            {"role": m["role"], "content": m["content"] if isinstance(m["content"], str) else "\n".join(
+                item["text"] if item["type"] == TEXT else tags[item["type"]] for item in m["content"]
+            )}
+            for m in messages_from_parts(parts, default_system=system_prompt or None)
+        ]
         if voice_audio is not None:
-            msgs.append({"role": "system", "content": "\n".join(
-                [VOICE_PROMPT_PREFIX, "<audio>./</audio>", VOICE_PROMPT_SUFFIX]
-            )})
-            audio_parts.append(0)
-        elif system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        user: list[str] = []
-        for part in parts:
-            if part.modality == TEXT:
-                user.append(part.text or "")
-            elif part.modality == "image":
-                user.append("<image>./</image>")
-            elif part.modality == "audio":
-                user.append("<audio>./</audio>")
-                audio_parts.append(len(audio_parts))
-        msgs.append({"role": "user", "content": "\n".join(user)})
-        text = self.tokenizer.apply_chat_template(
+            msgs = [{"role": "system", "content": "\n".join(
+                [VOICE_PROMPT_PREFIX, processor.AUDIO_TAG, VOICE_PROMPT_SUFFIX]
+            )}] + [m for m in msgs if m["role"] != "system"]
+        return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
             add_generation_prompt=True,
             # upstream turns the speech template on whenever audio is anywhere
             # in the request, and a spoken reply needs it
-            use_tts_template=bool(audios) or speech,
+            use_tts_template=has_audio or speech,
             enable_thinking=enable_thinking,
         )
-        return text, audio_parts
 
     def process_prompt(
         self,
@@ -589,10 +576,21 @@ class MiniCPMOModel(Model):
         if unsupported:
             raise ValueError(f"MiniCPM-o outputs text and audio; got {sorted(unsupported)}")
         speech = "audio" in output_modalities
+        enable_thinking = kwargs.get("enable_thinking", False)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be true or false, got {enable_thinking!r}")
+        max_slice_nums = kwargs.get("max_slice_nums")
+        max_slice_nums = processor.MAX_SLICE_NUMS if max_slice_nums is None else max_slice_nums
+        # the checkpoint's own setting is the most: each slice is up to 1024 patches
+        if type(max_slice_nums) is not int or not 1 <= max_slice_nums <= processor.MAX_SLICE_NUMS:
+            raise ValueError(
+                f"max_slice_nums must be an integer in 1..{processor.MAX_SLICE_NUMS}, got {max_slice_nums!r}"
+            )
         tensors = tensors or {}
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+            roles=[p.role for p in prompt_parts] if prompt_parts is not None else None,
         )
         bad = {p.modality for p in parts} - {TEXT, "image", "audio"}
         if bad:
@@ -603,7 +601,6 @@ class MiniCPMOModel(Model):
         if not any(p.text for p in parts if p.modality == TEXT) and not raw_images and not raw_audios:
             raise ValueError("MiniCPM-o got a request with no text and no attachments")
 
-        images = [_as_pil(img) for img in raw_images]
         audios = [a.reshape(-1).float().cpu().numpy() for a in raw_audios]
         # `voice_prompt=False` leaves the voice clip out of the system message
         # (the reply is still spoken in the voice): what vllm-omni's examples
@@ -613,61 +610,63 @@ class MiniCPMOModel(Model):
             voice_audio = None
         if voice_audio is not None:
             audios = [voice_audio] + audios
-        text, audio_parts = self._render(
-            parts, images, audios,
-            enable_thinking=bool(kwargs.get("enable_thinking", False)),
+        text = self._render(
+            parts, bool(audios),
+            enable_thinking=enable_thinking,
             system_prompt=kwargs.get("system_prompt"),
             voice_audio=voice_audio,
             speech=speech,
         )
-        out = self.processor(
-            [text], [images], [audios], [audio_parts],
-            max_slice_nums=kwargs.get("max_slice_nums"),
-            return_tensors="pt",
+        p, queries = self.config.vision.patch_size, self.config.resampler.num_queries
+        sliced = [processor.slice_image(_as_pil(img), max_slice_nums, p) for img in raw_images]
+        text = processor.expand_tags(
+            text,
+            [processor.image_placeholder(i, grid, queries) for i, (_, grid) in enumerate(sliced)],
+            [processor.audio_placeholder(len(a), self.config.audio) for a in audios],
         )
-        input_ids = out["input_ids"][0].long()
+        input_ids, image_positions, audio_positions = processor.prompt_ids(self.tokenizer, text)
         result: NameToTensorList = {"text_inputs": [input_ids]}
+        metadata: dict[str, Any] = {}
 
-        if images:
-            strips = out["pixel_values"][0]
-            # [3, p, n * p] strips -> [n, 3, p, p] patches; bf16 is what the
-            # tower casts them to before its patch conv, so the cast is exact
-            p = self.config.vision.patch_size
-            patches = torch.cat([
-                s.view(3, p, s.shape[-1] // p, p).permute(2, 0, 1, 3) for s in strips
-            ]).to(torch.bfloat16)
-            positions = _bound_positions(out["image_bound"][0])
-            if positions.numel() != len(strips) * self.config.resampler.num_queries:
+        if sliced:
+            patches, tgt_sizes = zip(
+                *(processor.slice_patches(s, p) for slices, _ in sliced for s in slices), strict=True,
+            )
+            if image_positions.numel() != len(tgt_sizes) * queries:
                 raise ValueError(
-                    f"image placeholders ({positions.numel()}) do not match "
-                    f"{len(strips)} slices x {self.config.resampler.num_queries} queries"
+                    f"image placeholders ({image_positions.numel()}) do not match "
+                    f"{len(tgt_sizes)} slices x {queries} queries"
                 )
-            result["pixel_values"] = [patches]
-            result["image_tgt_sizes"] = [out["tgt_sizes"][0].int()]
-            result["image_positions"] = [positions]
+            # bf16 is what the tower casts them to before its patch conv, so the cast is exact
+            result["pixel_values"] = [torch.cat(patches).to(torch.bfloat16)]
+            metadata[IMAGE_TGT_SIZES] = list(tgt_sizes)
+            result["image_positions"] = [image_positions]
 
         if audios:
-            lens = out["audio_feature_lens"][0].reshape(-1).long()
-            feats = out["audio_features"]
+            mel = self._mel(
+                [piece for a in audios for piece in processor.audio_pieces(a)],
+                sampling_rate=processor.SAMPLE_RATE, padding="max_length",
+                return_attention_mask=True, return_tensors="pt",
+            )
             # a piece shorter than one pooling step (a clip under ~0.1 s, or what
             # is left of a long one past its last 30 s cut) pools to no tokens
-            keep = [i for i, n in enumerate(lens.tolist()) if self.config.audio.pooled_tokens(n) > 0]
-            lens = lens[keep]
-            pieces = [feats[i, :, :n] for i, n in zip(keep, lens.tolist(), strict=True)]
-            positions = _bound_positions(out["audio_bounds"][0])
-            tokens = sum(self.config.audio.pooled_tokens(n) for n in lens.tolist())
-            if positions.numel() != tokens:
+            lens = [
+                (i, n) for i, n in enumerate(mel["attention_mask"].sum(dim=1).tolist())
+                if self.config.audio.pooled_tokens(n) > 0
+            ]
+            pieces = [mel["input_features"][i, :, :n] for i, n in lens]
+            tokens = sum(self.config.audio.pooled_tokens(n) for _, n in lens)
+            if audio_positions.numel() != tokens:
                 # upstream sizes the placeholder off the whole clip but encodes
                 # 30 s pieces, which disagree for some long clips
                 raise ValueError(
-                    f"audio placeholders ({positions.numel()}) do not match the "
+                    f"audio placeholders ({audio_positions.numel()}) do not match the "
                     f"{tokens} tokens its {len(pieces)} piece(s) encode to"
                 )
             if pieces:  # else the clips are all too short to encode, and the prompt is text only
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
-                result["audio_feature_lens"] = [lens]
-                result["audio_positions"] = [positions]
-        metadata: dict = {}
+                metadata[AUDIO_FEATURE_LENS] = [n for _, n in lens]
+                result["audio_positions"] = [audio_positions]
         if speech:
             # The TTS reads the whole reply and then speaks it, all within its
             # positions; a longer reply would run past them, so speech caps the text.
@@ -694,7 +693,8 @@ class MiniCPMOModel(Model):
         return ProcessPromptOutput(result, metadata)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first of max_output_tokens, so the loop runs one fewer
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {
@@ -730,10 +730,12 @@ class MiniCPMOModel(Model):
             cached = self._voices[name] = audio
         return cached
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == TEXT:
-            ids = [t for t in output.reshape(-1).tolist() if t not in self.config.stop_token_ids]
-            return self.tokenizer.decode(ids).encode("utf-8")
+            return super().postprocess(output, modality, request_kwargs)
         if modality == "audio":
             pcm = (output.reshape(-1).float().clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
             return pcm.cpu().numpy().tobytes()
@@ -803,11 +805,15 @@ class MiniCPMOModel(Model):
             kwargs={"audio_output": "audio" in output_modalities},
         )
         inputs = self._walk_inputs(walk, input_signals)
+        model_kwargs = model_kwargs or {}
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata=self._step_metadata(metadata),
+            step_metadata={
+                **self._step_metadata(metadata),
+                **{k: model_kwargs[k] for k in self.INTERNAL_KWARGS if k in model_kwargs},
+            },
         )
 
     @staticmethod
@@ -863,6 +869,7 @@ class MiniCPMOModel(Model):
             metadata.graph_walk = TTS_DECODE
             inputs = self._carry(TTS, ("tts_code",), persist_signals)
         else:
+            # the decode loop has stopped; back here, the reply is done
             return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
         return ForwardPassArgs(
             full_metadata=metadata,
@@ -893,7 +900,10 @@ class MiniCPMOModel(Model):
             return self.model_path_hf
         from huggingface_hub import snapshot_download
 
-        return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
+        return snapshot_download(
+            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
+            allow_patterns=["*.safetensors", "*.json", "assets/token2wav/*.pt", "assets/token2wav/*.onnx"],
+        )
 
     def _create_token2wav(self, weights: str, device: str) -> NodeSubmodule:
         t2w = load_token2wav(str(Path(weights) / "assets" / "token2wav"), device=device)
@@ -909,13 +919,12 @@ class MiniCPMOModel(Model):
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under ``dtype`` so no fp32 copy of the weights is
-        allocated; fp32-only buffers restore themselves in ``_apply``."""
-        torch.set_default_dtype(dtype)
-        try:
-            return make().to(device)
-        finally:
-            torch.set_default_dtype(torch.float32)
+        """Construct on ``meta``, then give it uninitialized ``dtype`` storage on
+        ``device`` for the loader to fill (it raises on any parameter left
+        unfilled); fp32-only buffers restore themselves in ``_apply``."""
+        with torch.device("meta"):
+            module = make()
+        return module.to(dtype).to_empty(device=device)
 
     def _create_submodule(self, node_name: str, device: str, tp_group, dtype: torch.dtype) -> NodeSubmodule | None:
 

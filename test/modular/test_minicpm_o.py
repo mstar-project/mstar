@@ -2,20 +2,30 @@
 
 The resampler's sincos keys and the navit position buckets are checked
 against upstream's own formulas on the CPU. Everything else needs the
-checkpoint's tokenizer and processor (not its weights), so it skips unless
+checkpoint's config and tokenizer (not its weights), so it skips unless
 MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot.
 """
 
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from mstar.model.components.qwen3_lm import Qwen3LMConfig
 from mstar.model.minicpm_o.components.vision import Resampler, navit_position_ids, slice_layout
-from mstar.model.minicpm_o.config import ResamplerConfig, VisionConfig
+from mstar.model.minicpm_o.config import (
+    DECODE_LOOP,
+    LLM_SAMPLER,
+    PREFILL_WALKS,
+    AudioConfig,
+    MiniCPMOConfig,
+    ResamplerConfig,
+    VisionConfig,
+)
 
 CKPT = os.environ.get("MINICPM_O_CKPT")
 needs_ckpt = pytest.mark.skipif(not CKPT, reason="set MINICPM_O_CKPT to a MiniCPM-o 4.5 snapshot")
@@ -71,7 +81,57 @@ def test_slice_layout_concatenates_slices_in_order():
     assert layout.grid_coords.tolist()[6:] == [[0, 0], [0, 1]]
 
 
-# --- with the checkpoint's tokenizer and processor -------------------------
+def a_config(**kwargs) -> MiniCPMOConfig:
+    return MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(), **kwargs,
+    )
+
+
+def a_bare_model(**attrs):
+    """A MiniCPMOModel without its checkpoint: what reads only ``config``."""
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    model = object.__new__(MiniCPMOModel)
+    model.config = a_config()
+    for name, value in attrs.items():
+        setattr(model, name, value)
+    return model
+
+
+@pytest.mark.parametrize("walk", sorted(PREFILL_WALKS))
+def test_prefill_token_counts_toward_the_budget(walk):
+    """The prefill samples the reply's first token: a stop id there, or a
+    one-token budget, ends the reply, and decode runs one step fewer."""
+    from mstar.model.minicpm_o.submodules import LLMSubmodule
+    from mstar.model.submodule_base import END_PARTITION
+
+    llm = LLMSubmodule(torch.nn.Identity(), a_config(stop_token_ids=(7,)))
+
+    def stop(token, max_tokens):
+        info = SimpleNamespace(
+            graph_walk=walk, max_tokens=max_tokens, step_metadata={}, dynamic_loop_iter_counts={},
+            resource_configs={LLM_SAMPLER: SimpleNamespace(ignore_eos=False)},
+        )
+        return llm.check_stop("r", info, {"new_token": [torch.tensor([token])]})
+
+    assert stop(7, 8) == {END_PARTITION}
+    assert stop(3, 1) == {END_PARTITION}
+    assert stop(3, 8) == set()
+    model = a_bare_model()
+    assert model.get_loop_caps(max_output_tokens=8) == {DECODE_LOOP: 7}
+    assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
+
+
+@pytest.mark.parametrize("knob, value", [
+    ("max_slice_nums", "9"), ("max_slice_nums", 0), ("max_slice_nums", 1000), ("max_slice_nums", True),
+    ("enable_thinking", "false"),
+])
+def test_bad_request_knobs_are_refused(knob, value):
+    with pytest.raises(ValueError, match=knob):
+        a_bare_model().process_prompt("Hi.", ["text"], ["text"], **{knob: value})
+
+
+# --- with the checkpoint's config and tokenizer ---------------------------
 
 @pytest.fixture(scope="module")
 def model():
@@ -81,13 +141,11 @@ def model():
 
 
 def an_image(h=448, w=640):
-    torch.manual_seed(0)
-    return torch.rand(3, h, w)
+    return torch.rand(3, h, w, generator=torch.Generator().manual_seed(0))
 
 
 def a_clip(seconds=3.0):
-    torch.manual_seed(1)
-    return 0.1 * torch.randn(int(16000 * seconds))
+    return 0.1 * torch.randn(int(16000 * seconds), generator=torch.Generator().manual_seed(1))
 
 
 @needs_ckpt
@@ -95,15 +153,16 @@ def a_clip(seconds=3.0):
 def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
     from mstar.model.multimodal import PromptPart
 
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["image", "text"], ["text"],
         tensors={"image_inputs": [an_image()]},
         prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
         max_slice_nums=max_slice_nums,
-    ).new_input_tensors
+    )
+    out = prompt.new_input_tensors
     ids = out["text_inputs"][0]
     positions = out["image_positions"][0]
-    tgt = out["image_tgt_sizes"][0]
+    tgt = torch.tensor(prompt.metadata["image_tgt_sizes"])
     assert positions.numel() == tgt.shape[0] * model.config.resampler.num_queries
     unk = model.tokenizer.convert_tokens_to_ids("<unk>")
     assert (ids[positions] == unk).all()
@@ -111,15 +170,32 @@ def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
 
 
 @needs_ckpt
+def test_chat_turns_keep_their_roles(model):
+    """A multi-turn chat renders as upstream's template renders its messages."""
+    from mstar.model.multimodal import PromptPart
+
+    turns = [("system", "Be brief."), ("user", "Hi."), ("assistant", "Hello."), ("user", "Name a colour.")]
+    out = model.process_prompt(
+        None, ["text"] * len(turns), ["text"], prompt_parts=[PromptPart("text", t, role=r) for r, t in turns],
+    ).new_input_tensors
+    want = model.tokenizer.apply_chat_template(
+        [{"role": r, "content": t} for r, t in turns], tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    assert out["text_inputs"][0].tolist() == model.tokenizer.encode(want)
+
+
+@needs_ckpt
 def test_audio_placeholders_line_up_with_pooled_tokens(model):
     from mstar.model.multimodal import PromptPart
 
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["text", "audio"], ["text"],
         tensors={"audio_inputs": [a_clip()]},
         prompt_parts=[PromptPart("text", "Transcribe."), PromptPart("audio")],
-    ).new_input_tensors
-    lens = out["audio_feature_lens"][0].tolist()
+    )
+    out = prompt.new_input_tensors
+    lens = prompt.metadata["audio_feature_lens"]
     assert out["audio_positions"][0].numel() == sum(model.config.audio.pooled_tokens(n) for n in lens)
     # audio anywhere turns upstream's speech template on: the prompt ends on <|tts_bos|>
     assert out["text_inputs"][0][-1].item() == model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
@@ -134,16 +210,17 @@ def test_audio_placeholders_line_up_for_any_clips(model, seconds):
     from mstar.model.multimodal import PromptPart
 
     clips = [a_clip(s) for s in seconds]
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["text"] + ["audio"] * len(clips), ["text"],
         tensors={"audio_inputs": clips},
         prompt_parts=[PromptPart("text", "Transcribe.")] + [PromptPart("audio")] * len(clips),
-    ).new_input_tensors
+    )
+    out = prompt.new_input_tensors
     audio = model.config.audio
-    if "audio_feature_lens" not in out:  # nothing long enough to encode
+    if "audio_feature_lens" not in prompt.metadata:  # nothing long enough to encode
         assert seconds == (0.06,)
         return
-    lens = out["audio_feature_lens"][0].tolist()
+    lens = prompt.metadata["audio_feature_lens"]
     assert min(audio.pooled_tokens(n) for n in lens) > 0
     assert out["audio_positions"][0].numel() == sum(audio.pooled_tokens(n) for n in lens)
     assert out["audio_features"][0].shape[-1] == sum(lens)
@@ -190,11 +267,41 @@ def test_spoken_reply_text_fits_the_tts(model):
     # text replies are not capped
     assert "max_output_tokens" not in model.process_prompt(
         None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192).metadata
+
+
+@needs_ckpt
+def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
+    """The slice grids and mel lengths reach the encoders as step metadata,
+    and their segments cover the patches and frames the prompt carries."""
+    from mstar.model.minicpm_o.submodules import AudioEncoderSubmodule, VisionEncoderSubmodule
+    from mstar.model.multimodal import PromptPart
+
+    prompt = model.process_prompt(
+        None, ["image", "audio", "text"], ["text"],
+        tensors={"image_inputs": [an_image()], "audio_inputs": [a_clip()]},
+        prompt_parts=[PromptPart("image"), PromptPart("audio"), PromptPart("text", "What is this?")],
+    )
+    out = prompt.new_input_tensors
+    signals = {name: [None] for name in out}
+    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, model_kwargs=prompt.metadata)
+    assert args.full_metadata.graph_walk == "prefill_omni"
+    info = SimpleNamespace(step_metadata=args.step_metadata)
+    vision = VisionEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"pixel_values": out["pixel_values"]},
+    )
+    assert sum(vision.kwargs["seq_lengths"]) == vision.input_seq_len == out["pixel_values"][0].shape[0]
+    audio = AudioEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"audio_features": out["audio_features"]},
+    )
+    assert sum(audio.kwargs["mel_lens"]) == out["audio_features"][0].shape[-1]
+
+
+@needs_ckpt
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     """The LLM's layout: one span over every prompt row (placeholders included),
     written by the prefill walk the request takes, then a row per decode step."""
     from mstar.model.base import LabelLayout
-    from mstar.model.minicpm_o.config import DECODE_LOOP, LLM_KV, TTS_KV
+    from mstar.model.minicpm_o.config import LLM_KV, TTS_KV
     from mstar.model.multimodal import PromptPart
 
     out = model.process_prompt(
@@ -206,7 +313,6 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     rows = out.new_input_tensors["text_inputs"][0].numel()
     assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
     assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
-    assert model.get_loop_caps(max_output_tokens=7) == {DECODE_LOOP: 7}
     assert set(model.kv_labels()) == {LLM_KV, TTS_KV}
     # a text reply opens the TTS's pool with nothing in it; a spoken one prefills its
     # condition (two rows and a row per LLM step) and then writes a row per code
@@ -218,14 +324,27 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
 
 
 @needs_ckpt
+def test_max_seq_len_sizes_the_kv_and_the_decode_loop():
+    from mstar.engine.resources import KVSpec
+    from mstar.model.minicpm_o.config import LLM_KV
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    model = MiniCPMOModel(CKPT, max_seq_len=4096)
+    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
+    assert kv.config.max_seq_len == 4096
+    assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
+    with pytest.raises(ValueError, match="max_seq_len"):
+        MiniCPMOModel(CKPT, max_seq_len=model.config.llm.max_position_embeddings + 1)
+
+
+@needs_ckpt
 @pytest.mark.parametrize(
     "tensors, walk",
     [
         ({"text_inputs"}, "prefill_text"),
-        ({"text_inputs", "pixel_values", "image_tgt_sizes", "image_positions"}, "prefill_image"),
-        ({"text_inputs", "audio_features", "audio_feature_lens", "audio_positions"}, "prefill_audio"),
-        ({"text_inputs", "pixel_values", "image_tgt_sizes", "image_positions",
-          "audio_features", "audio_feature_lens", "audio_positions"}, "prefill_omni"),
+        ({"text_inputs", "pixel_values", "image_positions"}, "prefill_image"),
+        ({"text_inputs", "audio_features", "audio_positions"}, "prefill_audio"),
+        ({"text_inputs", "pixel_values", "image_positions", "audio_features", "audio_positions"}, "prefill_omni"),
     ],
 )
 def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
@@ -241,9 +360,14 @@ def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
 
 
 @needs_ckpt
-def test_postprocess_drops_stop_tokens(model):
-    ids = model.tokenizer.encode("Paris.", add_special_tokens=False) + list(model.config.stop_token_ids)
-    assert model.postprocess(torch.tensor(ids), "text") == b"Paris."
+def test_text_streamed_a_token_at_a_time_reassembles(model):
+    """Each decode step's token reaches the client alone: a character split
+    across tokens must join back whole, and the stop tokens are dropped."""
+    text = "Paris 🐱猫."
+    ids = model.tokenizer.encode(text, add_special_tokens=False) + list(model.config.stop_token_ids)
+    chunks = model.postprocess_inline(ids, "text", [None] * len(ids))
+    assert b"".join(chunks).decode("utf-8") == text
+    assert model.postprocess(torch.tensor(ids), "text") == text.encode("utf-8")
 
 
 @needs_ckpt

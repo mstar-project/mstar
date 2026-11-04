@@ -61,12 +61,15 @@ from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    AUDIO_FEATURE_LENS,
     DECODE_LOOP,
+    IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
     LLM_SAMPLER,
     PATCHES,
+    PREFILL_WALKS,
     QUERIES,
     RESAMPLER_ATTN,
     T2W_KV,
@@ -84,11 +87,14 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
     pass
@@ -105,11 +111,26 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # off, as on the other Qwen3DenseLM nodes: compiled, Canary-Qwen's
+    # throughput was 7-15% lower (its H100 A/B)
+    disable_torch_compile = True
 
     def __init__(self, model: Qwen3DenseLM, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
         self.config = config
+        # A prefill samples the reply's first token, so a stop id there (or a
+        # one-token budget) ends the partition; decode's stop ids are checked
+        # by the graph runtime, and its budget is the loop's cap.
+        self.token_stop = TokenStop(
+            loop=DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
+            sampler=LLM_SAMPLER, walk=DECODE, prefill_walks=PREFILL_WALKS, runtime_check=True,
+        )
+        # decode reads its last token off the sampler's slot masters, and its
+        # client token rides inline
+        self.device_loopback = DeviceLoopback(
+            walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -161,8 +182,13 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty here
+            return row
         ids = inputs["text_inputs"][0]
         if graph_walk == DECODE or not any(name in inputs for name in _MM_FILLS):
             return ARNodeInputs(input_seq_len=ids.shape[0], input_ids=ids)
@@ -176,6 +202,15 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
+        if graph_walk == DECODE:
+            # A spoken reply's TTS reads each row's input token, so the ids
+            # ride to the forward. With device loop-back every row is its
+            # request's last sampled token, read by slot.
+            if any(inp.input_ids is None for inp in inputs):
+                ids = self.loopback_inputs(engine_inputs, inputs)["input_ids"]
+            else:
+                ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
+            return {"input_embeds": self.model.embed(ids), "input_ids": ids}
         if all(inp.input_ids is not None for inp in inputs):
             ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
             return {"input_embeds": self.model.embed(ids)}
@@ -202,8 +237,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 LLM_KV: KVStep(),
                 LLM_ATTN: AttentionStep(causal=True),
                 LLM_POS: PositionStep(),
-                # The prompt is not tracked: upstream generates from embeddings,
-                # so its penalty sees only generated tokens.
                 LLM_SAMPLER: SamplerStep(apply_penalty=True),
             },
         )
@@ -214,14 +247,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """``new_token``, and on decode ``tts_hidden``: the post-norm hidden of
-        each row's input token, which a spoken reply's TTS reads."""
+        """``new_token``, and on decode the (``tts_ids``, ``tts_hidden``) pair:
+        each row's input token and its post-norm hidden, which a spoken
+        reply's TTS reads."""
         attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
         sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
         hidden = self.model(input_embeds, label="main")
         out = {}
         if graph_walk == DECODE:
+            out["tts_ids"] = input_ids
             out["tts_hidden"] = hidden
         else:
             hidden = attn.select_last_hidden(hidden)
@@ -229,17 +265,19 @@ class LLMSubmodule(ARNodeSubmodule):
         return out
 
     def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+        input_ids: torch.Tensor | None = None, **kwargs,
     ) -> NameToTensorList:
-        return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, input_embeds).items()}
+        return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, input_embeds, input_ids).items()}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
 
     def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+        input_ids: torch.Tensor | None = None, **kwargs,
     ) -> BatchedModelOutput:
-        out = self._forward(graph_walk, engine_inputs, input_embeds)
+        out = self._forward(graph_walk, engine_inputs, input_embeds, input_ids)
         return BatchedModelOutput(
             row_outputs=out,
             check_stop_buffers={"new_token": out["new_token"]},
@@ -254,59 +292,16 @@ class LLMSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-        inputs: NodeInputs | None = None,
         **kwargs,
     ):
-        # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
-        # tested in `check_stop`, off the GPU thread.
+        # Rebind, not copy: the decode loop routes on `text_inputs`.
         if "new_token" in outputs:
             outputs["text_inputs"] = outputs["new_token"]
         if "tts_hidden" not in outputs:
             return
-        if request_info.step_metadata.get("audio_output", False):
-            # the decode loop accumulates (input token, its hidden) pairs: the
-            # reply's TTS condition, available whole when the loop ends
-            outputs["tts_ids"] = [inputs.input_ids]
-        else:
+        if not request_info.step_metadata.get("audio_output", False):
+            outputs.pop("tts_ids")
             outputs.pop("tts_hidden")
-
-    def _stops(self, token: int, info: CurrentForwardPassInfo) -> bool:
-        hit_eos = (
-            not info.resource_configs[LLM_SAMPLER].ignore_eos
-            and token in self.config.stop_token_ids
-        )
-        out_of_budget = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1 >= info.max_tokens
-        return hit_eos or out_of_budget
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        return {DECODE_LOOP} if self._stops(outputs["new_token"][0].item(), request_info) else set()
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-    ) -> dict[str, set[str]] | None:
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue
-            if self._stops(values[i], request_infos[rid]):
-                stops[rid] = {DECODE_LOOP}
-        return stops
 
 
 class VisionEncoderSubmodule(NodeSubmodule):
@@ -330,10 +325,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        tgt_sizes = [
-            (int(h), int(w)) for t in inputs["image_tgt_sizes"] for h, w in t.reshape(-1, 2).tolist()
-        ]
-        layout = slice_layout(tgt_sizes, self.config.vision)
+        layout = slice_layout([tuple(hw) for hw in fwd_info.step_metadata[IMAGE_TGT_SIZES]], self.config.vision)
         patches = torch.cat(inputs["pixel_values"])
         return NodeInputs(
             input_seq_len=patches.shape[0],
@@ -375,12 +367,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
         device = self.get_device()
 
         def cat(name):
-            return torch.cat([inp.tensor_inputs[name] for inp in inputs]).to(device)
+            return torch.cat([inp.tensor_inputs[name] for inp in inputs])
 
         return {
-            "patches": cat("patches"),
-            "position_ids": cat("position_ids"),
-            "grid_coords": cat("grid_coords"),
+            "patches": cat("patches").to(device),
+            # built on the host: a pageable copy would wait out the running step
+            "position_ids": to_device_nonblocking(cat("position_ids"), device),
+            "grid_coords": to_device_nonblocking(cat("grid_coords"), device),
             "slices_per_request": [len(inp.kwargs["seq_lengths"]) for inp in inputs],
         }
 
@@ -432,6 +425,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
     # for; the captured block loop is what makes it fast.
     disable_torch_compile = True
 
+    # Every clip has its own length, which a compiled forward would recompile
+    # for; it runs once a request.
+    disable_torch_compile = True
+
     def __init__(self, model: MiniCPMOAudio, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
@@ -444,7 +441,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        mel_lens = [int(n) for t in inputs["audio_feature_lens"] for n in t.reshape(-1).tolist()]
+        mel_lens = list(fwd_info.step_metadata[AUDIO_FEATURE_LENS])
         features = torch.cat(inputs["audio_features"], dim=-1)
         frames = [self.config.audio.conv_frames(n) for n in mel_lens]
         return NodeInputs(

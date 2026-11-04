@@ -35,6 +35,14 @@ T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
 # the LLM's decode loop, which the KV layout and loop caps name
 DECODE_LOOP = "decode_loop"
+# the walks that prefill the prompt and sample the reply's first token
+PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "prefill_omni"})
+
+# step_metadata keys: each image slice's patch grid and each audio piece's mel
+# frames, which the encoders lay their segments out by (read off a routed
+# tensor, they would wait on the device)
+IMAGE_TGT_SIZES = "image_tgt_sizes"
+AUDIO_FEATURE_LENS = "audio_feature_lens"
 
 # ragged span labels
 PATCHES = "patches"
