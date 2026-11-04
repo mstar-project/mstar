@@ -670,7 +670,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
     w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq, w._tp_followers = 0, {}
+    w._tp_broadcast_seq, w._tp_followers = 0, dict.fromkeys(nodes, FOLLOWERS[1:])
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),

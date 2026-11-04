@@ -651,17 +651,10 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
-        self._tp_followers = {}
-        group = SimpleNamespace(_workers=["rank0", *followers])
-        # The runtime owns both the sharding config and the handle table now.
-        # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
+        self._tp_followers = {"node": list(followers)}
+        # The runtime owns the handle table. Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
         # broadcast that shipped local handles instead of wire ids is visible.
-        self._graph_runtime = SimpleNamespace(
-            get_sharding_config=lambda rid: SimpleNamespace(
-                get_sharding_group=lambda n, w: group
-            ),
-            get_rid_string=_Rids().get_rid_string,
-        )
+        self._graph_runtime = SimpleNamespace(get_rid_string=_Rids().get_rid_string)
         # Live requests moved off the worker-graph manager onto here; the
         # broadcast reads it to say what its page state should add up to.
         self.request_state = SimpleNamespace(per_request_info={"r0": object()})
