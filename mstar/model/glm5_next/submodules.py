@@ -44,6 +44,7 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -54,6 +55,9 @@ from mstar.model.submodule_base import (
 from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
+
+# How long a read waits for a verify step's verdict before the process exits
+_VERDICT_DEADLINE_S = 300.0
 
 # Captured prefill shapes when the config names none. They start above the MoE decode path's
 # 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
@@ -709,25 +713,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         states = [self.request_state(rid) for rid in request_ids]
         pending = [st.get("mtp_pending") for st in states]
         seq, key, _ = pending[0]
-        assert all(p[:2] == (seq, key) for p in pending), pending
+        if any(p[:2] != (seq, key) for p in pending):
+            raise SystemExit(f"one MTP verdict read spans several steps: {pending}")
         # read once, then kept: a later step may reuse the mailbox before a second read
         cached = [st.get("mtp_verdict") for st in states]
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        # No timeout, as with a collective: every read follows the step's launch (a pre-plan
-        # waits on its commit), so only a hung device or peer delays the verdict, and a rank
-        # giving up alone would leave the others in the next all-reduce.
+        # A step that failed after it was numbered never stages its verdict. Failing this rank's
+        # batch alone would leave the other ranks in its collective, so a missed deadline exits
+        # the process: the instance goes down where everyone sees it, rather than hanging.
+        deadline = time.monotonic() + _VERDICT_DEADLINE_S
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                # a broken invariant, not a request's failure: failing this rank's batch alone
-                # would leave the other ranks in its collective
                 raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it "
                     "was read")
+            if time.monotonic() > deadline:
+                raise SystemExit(
+                    f"MTP step {seq} never staged its verdict in {_VERDICT_DEADLINE_S:.0f} s")
             time.sleep(0)
         table = verdicts[:max(p[2] for p in pending) + 1].tolist()
         k1 = self.mtp_block
@@ -786,19 +793,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs.setdefault("text_inputs", outputs["new_token"])
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         if self.mtp_k > 0:
@@ -830,25 +830,24 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         """The loops a plain step's emitted ``token`` stops."""
         state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            return {"decode_loop"}
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                self.request_state(request_id).add("ended_at_prefill", True)
-            return set()
+            # no decode_loop on this walk to stop: a stop token ends the partition before any
+            # decode step runs, and the conductor ends a max_tokens of 1 here
+            return {END_PARTITION} if not ignore_eos and is_eos else set()
         # Total generated = 1 prefill-emitted token + (decode iters + 1):
         # max_tokens counts the token the prefill emits, so the decode loop
         # runs one fewer.
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        # The next step takes the context to prompt + generated, and it may
-        # already be scheduled when this stop lands, so stop while it still
-        # fits: past the context limit prepare_inputs refuses it.
+        # The next step takes the context to prompt + generated and may already
+        # be scheduled when this stop lands, so stop while it still fits, before
+        # a step past the context limit (which prepare_inputs refuses) is scheduled. A
+        # next step that emits the reply's last token ends the loop at its cap
+        # with nothing after it, so it may fill the window.
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
-        full = prompt_len + generated >= self.config.context_limit
+        full = (prompt_len + generated >= self.config.context_limit
+                and generated + 1 < request_info.max_tokens)
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()
@@ -870,10 +869,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         is_eos = not ignore_eos and any(
             t in self.config.eos_token_ids for t in new_token.tolist())
         if request_info.graph_walk == "prefill":
-            # as in check_stop: the prefill walk has no decode_loop to stop
-            if is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
+            # as in _stops: the prefill walk has no decode_loop to stop
+            return {END_PARTITION} if is_eos else set()
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
