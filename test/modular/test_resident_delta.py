@@ -1355,6 +1355,17 @@ def test_a_follower_replays_the_drop_of_a_request_that_keeps_no_ids(monkeypatch)
     assert follower.residency("v") is Residency.DROPPED and _counts(leader) == _counts(follower)
 
 
+def test_a_follower_whose_kv_holds_other_than_rank_0s_drop_counted_refuses_the_drop(monkeypatch):
+    """A follower drops with the tokens rank 0's rebuild writes, which its own KV refuses unless it holds as many.
+    Dropped anyway, the follower would rebuild other KV than it held."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    follower._streams["v"]["main"].stored_len -= 1
+
+    with pytest.raises(RuntimeError, match="would write 80 tokens, but its label holds 79"):
+        follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert follower.residency("v") is Residency.RESIDENT, "the follower dropped what rank 0's rebuild doesn't write"
+
+
 @pytest.mark.parametrize("dropped", [False, True], ids=["voided head", "row dropped by prepare_inputs"])
 def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkeypatch, dropped):
     """Rank 0 pre-plans the next decode step of r and s, whose tokens each need a fourth page, and throws the stage
