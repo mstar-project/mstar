@@ -1,8 +1,11 @@
 """GLM-5.3-Flash's output budget, decode loop cap and chat-template call. check_stop
 enforces a request's ``max_tokens``; the loop's ``max_iters`` is only the runaway guard."""
 
+import pytest
 import torch
+from jinja2 import TemplateError
 
+from mstar.api_server.openai.adapters import flatten_messages
 from mstar.graph.base import Loop
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 
@@ -46,3 +49,40 @@ def test_chat_template_returns_the_bare_ids():
     m._tokenizer = ChatTokenizer()
     ids = m.process_prompt("hi", ["text"], ["text"]).new_input_tensors["text_inputs"][0]
     assert ids.tolist() == [7, 8, 9]
+
+
+class _RecordingTokenizer:
+    chat_template = "{{ messages }}"
+
+    def __init__(self, refuse: bool = False):
+        self.messages, self.refuse = None, refuse
+
+    def apply_chat_template(self, messages, **kwargs):
+        if self.refuse:
+            raise TemplateError("roles must alternate")
+        self.messages = messages
+        return torch.tensor([[7, 8, 9]])
+
+
+def test_a_chat_keeps_its_turns_in_their_roles(tmp_path):
+    chat = [
+        {"role": "system", "content": "Answer in French."},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "bonjour"},
+        {"role": "user", "content": "how are you?"},
+    ]
+    text, _, _, parts = flatten_messages(chat, tmp_path)
+    m = Glm5NextModel("x")
+    m._tokenizer = tok = _RecordingTokenizer()
+    m.process_prompt(text, ["text"], ["text"], prompt_parts=parts)
+    assert tok.messages == [
+        {"role": "system", "content": "Answer in French."}, {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "bonjour"}, {"role": "user", "content": "how are you?"},
+    ]
+
+
+def test_a_chat_the_template_refuses_is_a_400():
+    m = Glm5NextModel("x")
+    m._tokenizer = _RecordingTokenizer(refuse=True)
+    with pytest.raises(ValueError, match="refused the chat"):
+        m.process_prompt("hi", ["text"], ["text"])
