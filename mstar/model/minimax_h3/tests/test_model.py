@@ -697,6 +697,16 @@ def test_padding_rows_stay_finite_and_never_reach_the_request():
         assert torch.equal(a, b)
 
 
+def test_an_sp_size_the_heads_do_not_divide_is_refused_at_load():
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.minimax_h3.components.transformer import H3DiT
+
+    with torch.device("meta"):
+        H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2, 3]))
+        with pytest.raises(ValueError, match="8 heads don't split over sp_size 3"):
+            H3DiT(_sp_cfg(), sp_group=CommGroup(0, 0, [0, 1, 2]))
+
+
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):
     import builtins
 

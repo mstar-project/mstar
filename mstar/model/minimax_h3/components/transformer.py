@@ -322,6 +322,11 @@ class H3DiT(nn.Module):
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
         self.sp_group = sp_group or CommGroup.trivial()
+        heads = cfg.num_attention_heads // comm_group.world_size
+        if heads % self.sp_group.world_size:
+            # Ulysses gives each rank whole heads; under SDPA nothing else would refuse this
+            # before the first request
+            raise ValueError(f"MiniMax-H3's {heads} heads don't split over sp_size {self.sp_group.world_size}")
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
         self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size)
         self.time_embedder = H3TimeEmbedder(cfg)
