@@ -86,6 +86,8 @@ the roofline.
   whose emulation outlasts its device time reads host-bound. A different CPU or a loaded box moves
   host-bound results; device time is unaffected (the report's `device_busy_s` against `wall_s`
   says which bound a run was).
+- `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
+  room, so admission paths that depend on it only run with graphs on.
 - A value that was never computed reads as zeros: data-dependent control flow on device values
   (beyond small integer tensors) takes the zero branch.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against

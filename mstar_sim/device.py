@@ -553,7 +553,10 @@ def _function_body(func, args, kwargs):
     if _is_custom_op(func):
         impl = _custom_impl(func)
         if impl is not None:
-            return impl(*args, **kwargs)
+            # the body runs inside SimMode's handler, where the mode is off: its factory calls
+            # (``torch.empty(..., device=x.device)``) need the mode back
+            with SimMode():
+                return impl(*args, **kwargs)
     flat = tree_flatten((args, kwargs))[0]
     index = _check_devices(func, args, kwargs, flat)
     return _run(func, args, kwargs, index, flat)
@@ -681,8 +684,9 @@ _METHODS = {
     torch._has_compatible_shallow_copy_type: lambda a, b: type(a) is type(b),
 }
 _HOST_READS = {torch.equal}
+# copies, indexing, and load_state_dict(assign=True) into a module built on the CPU
 _MIXED_OK = {T.copy_, torch.Tensor.__getitem__, torch.Tensor.__setitem__, T.index_put_,
-             torch.index_put, T.to, T.__getitem__}
+             torch.index_put, T.to, T.__getitem__, T.module_load}
 
 
 def _rebuild(data, index):
@@ -743,6 +747,8 @@ class SimMode(TorchFunctionMode):
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **(kwargs or {}))
         kwargs = kwargs or {}
+        if func is torch.device and len(args) == 1 and type(args[0]) is int and not kwargs:
+            return torch.device("cuda", args[0])  # a bare index names the accelerator: the emulated GPU
         if kwargs.get("pin_memory"):  # no pinned allocator without a real accelerator
             kwargs = dict(kwargs, pin_memory=False)
         device = kwargs.get("device")

@@ -461,3 +461,6 @@ def install() -> None:
         setattr(acc, name, value)
     torch.Stream = Stream
     torch.Event = Event
+    # the C++ binding refuses an emulated stream before any override sees it, and the
+    # caching allocator's cross-stream lifetime has nothing to defer here
+    torch.Tensor.record_stream = lambda self, stream: None
