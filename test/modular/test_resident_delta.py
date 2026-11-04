@@ -1039,9 +1039,9 @@ def test_the_speculation_is_cleared_before_the_recovery_runs():
     import inspect
 
     src = inspect.getsource(worker_mod.Worker.run)
-    block = src[src.index("if pending.node_batch.admit_error is not None:"):]
+    block = src[src.index("refused = pending.node_batch.admit_error is not None"):]
     clear = block.index("_maybe_clear_spec()")
-    recover = block.index("_handle_admit_failure(")
+    recover = block.index("_settle_step_rows(")
     assert clear < recover, (
         "recovery runs before the speculation is cleared, so it evicts to make "
         "room the pre-plan was about to give back"

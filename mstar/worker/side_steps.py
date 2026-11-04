@@ -131,12 +131,8 @@ class SideStepLane:
             worker._wait_for_step(step)
             worker._clear_in_flight_flag(step.batch)
             worker._count_turn(step)
-            if step.node_batch.admit_error is not None:
-                worker._handle_admit_failure(step.batch, step.node_batch)
-                return
-            if step.node_batch.failed_requests:
-                worker._fail_step_rows(step, outputs)
-            worker._finish_step(step, outputs)
+            if not worker._settle_step_rows(step, outputs):
+                worker._finish_step(step, outputs)
         except Exception as exc:
             self._fail(step.batch, exc)
         finally:

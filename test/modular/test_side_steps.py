@@ -338,20 +338,24 @@ def test_failed_rows_are_reported_before_the_step_routes():
 
 def test_a_step_its_pool_refused_goes_back_to_wait_and_routes_nothing():
     """It ran no forward: its rows return to the scheduler as a refused
-    chain step's do (``Worker._handle_admit_failure``), and leave the lane."""
+    chain step's do (``Worker._settle_step_rows``), a row that failed
+    preparing fails, and all of them leave the lane."""
     worker = _worker()
     refused = []
-    worker._handle_admit_failure = lambda batch, node_batch: refused.append(sorted(batch.request_to_worker_graph))
+    worker._handle_admit_failure = lambda batch, node_batch, referenced_rids: refused.append(
+        sorted(batch.request_to_worker_graph),
+    )
     lane = SideStepLane(worker)
-    step = lane.pending = _step([1, 2])
+    step = lane.pending = _step([1, 2, 3], failed={3: "boom"})
     step.node_batch.admit_error = AllocationFailed(message="full", pages_short=1, label="main", request_id=2)
-    worker._hold_rows(SIDE_LANE, {1, 2})
+    worker._hold_rows(SIDE_LANE, {1, 2, 3})
+    worker._hold_rows(CHAIN_LANE, {9})
 
     lane.finish()
 
-    assert refused == [[1, 2]]
-    assert worker.log == ["wait for step", "clear in flight"]
-    assert lane.pending is None and worker._in_flight_rids == set()
+    assert refused == [[1, 2, 3]]
+    assert worker.log == ["wait for step", "clear in flight", ("drop", [3]), ("fail", [3])]
+    assert lane.pending is None and worker._in_flight_rids == {9}
 
 
 # ----- the chain's postprocess order ----------------------------------------

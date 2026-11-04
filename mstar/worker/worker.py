@@ -2617,6 +2617,23 @@ class Worker:
         self._drop_failed_rids(step, outputs, failed)
         self._fail_requests(failed)
 
+    def _settle_step_rows(
+        self, step: PendingBatch, outputs: BatchedModelOutput, speculation: Speculation | None = None,
+    ) -> bool:
+        """The tail every lane runs on a step that came back: a step its admit
+        refused ran nothing, so its rows go back to wait for room
+        (``_handle_admit_failure``, which leaves the rows the chain's
+        ``speculation`` will run alone), and the rows a per-rid stage blamed
+        fail. True when the step was refused."""
+        refused = step.node_batch.admit_error is not None
+        if refused:
+            self._handle_admit_failure(
+                step.batch, step.node_batch, referenced_rids=self._speculated_rids(speculation),
+            )
+        if step.node_batch.failed_requests:
+            self._fail_step_rows(step, outputs)
+        return refused
+
     def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
@@ -5346,27 +5363,19 @@ class Worker:
                                 )
                                 speculation = None
 
-                    if pending.node_batch.admit_error is not None:
-                        # Admit refused pending, so no forward ran.
-                        # ``_handle_admit_failure`` pushes the nodes back and on
-                        # KV-cache OOM offloads or holds. Clearing the speculation
-                        # first drops its pre-plan, releasing pages the eviction
-                        # would otherwise go looking for. Nothing is speculated on
-                        # a refusal, so in practice there is nothing to clear.
+                    refused = pending.node_batch.admit_error is not None
+                    if refused or pending.node_batch.failed_requests:
+                        # Drop the speculation. On a refusal that drops its
+                        # pre-plan, releasing pages the eviction would otherwise
+                        # go looking for (nothing is speculated on a refusal, so
+                        # in practice there is nothing to clear). On failed rows
+                        # it was built from pending's rids and may thread outputs
+                        # that the failed rids never produced.
+                        _maybe_clear_spec()
+                    if refused:
                         self._clear_in_flight_flag(pending.batch)
-                        _maybe_clear_spec()
                         self._drop_rows_whose_loop_stopped(pending)
-                        self._handle_admit_failure(
-                            pending.batch, pending.node_batch,
-                            referenced_rids=self._speculated_rids(speculation),
-                        )
-
-                    if pending.node_batch.failed_requests:
-                        # Drop the speculation: it was built from pending's
-                        # rids and may thread outputs that the failed rids
-                        # never produced.
-                        _maybe_clear_spec()
-                        self._fail_step_rows(pending, outputs)
+                    self._settle_step_rows(pending, outputs, speculation)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
