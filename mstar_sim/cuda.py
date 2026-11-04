@@ -115,28 +115,29 @@ def get_device_properties(device=None):
 # ------------------------------------------------------------------ memory
 
 
-def memory_allocated(device=None) -> int:
-    """Bytes of the simulated device's live tensors (their storages)."""
+def _used(device) -> list[int]:
+    """``[current, peak]`` bytes of a simulated device's live tensors (their storages)."""
     from mstar_sim import device as dev
 
-    return dev.ALLOCATED[0]
+    return dev.ALLOCATED.setdefault(_as_index(device), [0, 0])
+
+
+def memory_allocated(device=None) -> int:
+    return _used(device)[0]
 
 
 def max_memory_allocated(device=None) -> int:
-    from mstar_sim import device as dev
-
-    return dev.ALLOCATED[1]
+    return _used(device)[1]
 
 
 def reset_peak_memory_stats(device=None) -> None:
-    from mstar_sim import device as dev
-
-    dev.ALLOCATED[1] = dev.ALLOCATED[0]
+    used = _used(device)
+    used[1] = used[0]
 
 
 def mem_get_info(device=None) -> tuple[int, int]:
     total = spec().total
-    return max(0, total - memory_allocated()), total
+    return max(0, total - memory_allocated(device)), total
 
 
 _fraction = 1.0
@@ -152,9 +153,9 @@ def get_per_process_memory_fraction(device=None) -> float:
 
 
 def memory_stats(device=None) -> dict:
-    used = memory_allocated()
+    used = memory_allocated(device)
     return {"allocated_bytes.all.current": used, "reserved_bytes.all.current": used,
-            "allocated_bytes.all.peak": max_memory_allocated()}
+            "allocated_bytes.all.peak": max_memory_allocated(device)}
 
 
 # ------------------------------------------------------------ streams, events
@@ -482,10 +483,6 @@ def install() -> None:
         "init": _noop,
         "_lazy_init": _noop,
         "is_initialized": lambda: True,
-        "manual_seed": _noop,
-        "manual_seed_all": _noop,
-        "seed": _noop,
-        "seed_all": _noop,
         "ipc_collect": _noop,
         "get_arch_list": lambda: ["sm_90", "sm_100"],
     }.items():
@@ -528,6 +525,10 @@ def install() -> None:
     torch.Stream = Stream
     torch.Event = Event
     torch.Generator = Generator
+    # torch.cuda's seeding and RNG-state functions (and dynamo's RNG save) use these
+    tc.default_generators = tuple(Generator(f"cuda:{i}") for i in range(device_count()))
+    for name in ("_lazy_init", "current_device", "device_count", "is_initialized"):
+        setattr(tc.random, name, getattr(tc, name))  # bound there at its import
     # the C++ binding refuses an emulated stream before any override sees it, and the
     # caching allocator's cross-stream lifetime has nothing to defer here
     torch.Tensor.record_stream = lambda self, stream: None

@@ -5,7 +5,10 @@
 ``--gpu-only`` keeps the tests a CPU box skips for want of a GPU: everything in
 ``test/integration``, and any test whose skip (a ``skipif`` marker, a
 module-level ``pytest.skip``, or one in its body) names CUDA, a GPU, Triton or
-FlashInfer. The rest already run in CPU Core.
+FlashInfer, or that checks for one itself (``torch.cuda.is_available()`` in its
+body or its skipif). The rest already run in CPU Core. ``--skipped-in`` keeps
+those a plain run skipped, plus the ones that check for a GPU in their body
+(on a CPU they ``print`` and ``return``, and pass).
 
 Nothing is computed on the emulated GPU, so a test that checks values (parity,
 an error bound) can't pass. A test is reported as an expected failure when it
@@ -129,8 +132,25 @@ def pytest_addoption(parser):
                      help="mstar_sim: run only the tests this plain CPU run's junit report skipped")
 
 
+# a GPU check whose CPU branch passes (``print(...); return``) or a skipif whose reason names no GPU
+_CHECKS_GPU = re.compile(r"cuda\.(?:is_available|device_count)\(")
+_SKIPIF_GPU = re.compile(r"skipif\(\s*[^,)]*cuda\.(?:is_available|device_count)\(")
+
+
+def _checks_gpu(item) -> bool:
+    try:
+        if _CHECKS_GPU.search(inspect.getsource(item.function)):
+            return True
+    except (OSError, TypeError):
+        pass
+    if any(item.iter_markers("skipif")) and getattr(item.module, "__file__", None):
+        with open(item.module.__file__) as f:
+            return bool(_SKIPIF_GPU.search(f.read()))
+    return False
+
+
 def _needs_gpu(item) -> bool:
-    if "test/integration/" in item.nodeid:
+    if "test/integration/" in item.nodeid or _checks_gpu(item):
         return True
     for mark in item.iter_markers("skipif"):
         if _NEEDS_GPU.search(str(mark.kwargs.get("reason", ""))):
@@ -167,7 +187,7 @@ def pytest_collection_modifyitems(config, items):
     skipped_in = config.getoption("--skipped-in")
     if skipped_in:
         names = _skipped_in(skipped_in)
-        kept = [item for item in items if item.nodeid in names]
+        kept = [item for item in items if item.nodeid in names or _checks_gpu(item)]
     elif config.getoption("--gpu-only"):
         kept = [item for item in items if _needs_gpu(item)]
     else:

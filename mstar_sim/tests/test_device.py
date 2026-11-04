@@ -58,6 +58,13 @@ def test_cuda_semantics():
         assert x[torch.tensor([0, 2])].shape == (2, 8)  # so is a CPU index
         with torch.autocast("cuda", dtype=torch.bfloat16):
             assert m(x).dtype == torch.bfloat16
+        # small host floats keep their values; beside a never-computed operand they join it
+        v, g = torch.empty(512, 256, 3, device="cuda"), torch.randn(512, 1, 1).cuda()
+        assert torch._weight_norm(v, g, 0).shape == v.shape  # a composite's same-device check
+        assert torch.stack([x.sum(), torch.ones((), device="cuda")]).shape == (2,)
+        torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
+        assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
+        torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)
         print("ok")
     """)
     assert out.strip() == "ok"
@@ -167,6 +174,10 @@ def test_timing_only_holds_shapes_not_values():
         before = torch.cuda.mem_get_info()[0]
         del big
         assert torch.cuda.mem_get_info()[0] - before == 40 * 2**30
+        on0 = torch.cuda.memory_allocated(0)
+        other = torch.empty(2**20, device="cuda:1")  # each device counts its own
+        assert torch.cuda.memory_allocated(1) == 4 * 2**20 and torch.cuda.memory_allocated(0) == on0
+        assert torch.cuda.mem_get_info(1)[0] == total - 4 * 2**20
         print("ok")
     """)
     assert out.strip() == "ok"

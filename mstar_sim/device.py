@@ -194,9 +194,9 @@ class SimTensor(torch.Tensor):
         return _run(func, args, kwargs or {}, index)
 
 
-# simulated device memory: bytes of the distinct storages SimTensors hold
+# simulated device memory: bytes of the distinct storages SimTensors hold, per device
 _STORAGES: dict[int, list[int]] = {}
-ALLOCATED = [0, 0]  # current, peak
+ALLOCATED: dict[int, list[int]] = {}  # device index: [current, peak]
 # reentrant: a finalizer can run (garbage collection) while this thread holds it
 _track_lock = threading.RLock()
 
@@ -208,7 +208,7 @@ def _release(key: int) -> None:
             entry[1] -= 1
             if entry[1] == 0:
                 del _STORAGES[key]
-                ALLOCATED[0] -= entry[0]
+                ALLOCATED[entry[3]][0] -= entry[0]
 
 
 def _track(wrapper, data: torch.Tensor) -> None:
@@ -222,9 +222,11 @@ def _track(wrapper, data: torch.Tensor) -> None:
     with _track_lock:
         entry = _STORAGES.get(key)
         if entry is None:
-            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes())]
-            ALLOCATED[0] += entry[0]
-            ALLOCATED[1] = max(ALLOCATED[1], ALLOCATED[0])
+            index = wrapper.device.index
+            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes()), index]
+            used = ALLOCATED.setdefault(index, [0, 0])
+            used[0] += entry[0]
+            used[1] = max(used[1], used[0])
         entry[1] += 1
     weakref.finalize(data, _release, key)
 
@@ -521,9 +523,21 @@ def _autocast(func, args, kwargs, low: torch.dtype):
 
 
 def _as_meta(x):
-    if isinstance(x, torch.Tensor) and x.device.type == "cpu" and x.dim() > 0:
+    """A kept value beside a value-less operand: the result has no value either.
+    0-dim integer and bool tensors stay (a size, a count or a mask a shape
+    depends on), as do integer index operands at a composite call (their bounds
+    are checked at the aten op)."""
+    if isinstance(x, torch.Tensor) and x.device.type == "cpu" and (x.dim() > 0 or _floating(x)):
         return x.to(META)
     return x
+
+
+def _floats_as_meta(x):
+    return x.to(META) if isinstance(x, torch.Tensor) and x.device.type == "cpu" and _floating(x) else x
+
+
+def _floating(x) -> bool:
+    return x.dtype.is_floating_point or x.dtype.is_complex
 
 
 _FREE = {
@@ -709,6 +723,11 @@ def _run(func, args, kwargs, index, flat=None):
             and not (func in _INDEXING and _real_index(flat))):
         return _fast(func, args, kwargs, flat, index)
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
+    shallow = list(_shallow(uargs, ukwargs))
+    if any(t.device.type == "meta" for t in shallow) and any(t.device.type == "cpu" for t in shallow):
+        # a composite checks its operands share a device before it decomposes
+        # (stft's window, weight_norm's g): kept floats beside a value-less one join it
+        uargs, ukwargs = tree_map(_floats_as_meta, (uargs, ukwargs))
     standin = _COMPOSITE_STAND_INS.get(func)
     if standin is not None and any(_is_meta(t) for t in tree_flatten((uargs, ukwargs))[0]):
         return _rewrap(standin(*uargs, **ukwargs), [x for x in flat if isinstance(x, torch.Tensor)], index)
