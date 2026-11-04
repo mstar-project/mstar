@@ -1113,13 +1113,15 @@ class KVManager(AttentionResource):
                 self._recount(rid)
 
     def page_trail(self) -> tuple[int, ...] | None:
-        """The arena's trail when it keeps one, then, when it carries the counts, the pages allotted and not yet
-        used, the pages earmarked and the requests dropped, which every rank admits a step from."""
+        """The arena's trail when it keeps one, then, when it carries the counts, the requests holding an allotment,
+        the pages earmarked and the requests dropped, which every rank admits a step from. A step's admit and commit
+        move none of the counts, so a follower that reads them at another point of a step in flight than rank 0 reads
+        the same."""
         with self._lock:
             if not self._trails_counts:
                 return self._arena.trail
             earmarked = sum(earmark.pages for earmark in self._earmarks.values())
-            return (*(self._arena.trail or ()), self._unused, earmarked, len(self._dropped))
+            return (*(self._arena.trail or ()), len(self._allotments), earmarked, len(self._dropped))
 
     def _check_positions(
         self, step: tuple[PrefixSpan, ...], span: PrefixSpan, graph_walk: str, inputs,
