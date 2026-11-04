@@ -306,7 +306,7 @@ Ripple-65B (``ripple_65b``)
   ``max_tokens`` stops at 2048 tokens, which a long reasoning reply can reach inside
   ``<think>``. Set ``max_tokens`` for hard problems.
 - Text in, text out, on ``/generate`` and ``/v1/chat/completions``. A reply's reasoning stays
-  inline as ``<think>...</think>``, and a chat with ``tools`` is refused.
+  inline as ``<think>...</think>``, and a chat that asks for tool calls is refused.
 - Not supported yet: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window
   doesn't prefix cache) and DP replicas (a window pool can't span instances).
 

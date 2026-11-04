@@ -124,7 +124,7 @@ def test_the_text_stack_matches_the_reference_layer(model_dir):
     torch.manual_seed(0)
     cfg = RippleConfig.from_dict(RAW)
     model = RippleForCausalLM(cfg).double()
-    # the stand-ins take what the model declares, so a miswired resource fails against the reference
+    # the stand-ins take the window and theta the model declares, so a wrong one fails against the reference
     ripple = get_model_class("ripple_65b")(str(model_dir))
     specs = {spec.resource_key: spec for spec in ripple.get_node_resources()}
     for p in model.parameters():
