@@ -739,7 +739,8 @@ class Token2WavSubmodule(NodeSubmodule):
         return voice, self.bank.prompt_tokens[voice]
 
     def _voice_ids(self, rids: list[str], device: torch.device) -> torch.Tensor:
-        return torch.tensor([self._voice_of(r)[0] for r in rids], device=device)
+        # pinned and queued: a pageable copy would wait out the running step
+        return to_device_nonblocking([self._voice_of(r)[0] for r in rids], device, torch.long)
 
     def _cache_steps(
         self, request_ids: list[str], num_tokens: list[int], lasts: list[bool],

@@ -135,11 +135,10 @@ class MiniCPMTTS(nn.Module):
         projected = self.projector_semantic(hidden.to(self.emb_text.weight.dtype))
         if self.config.normalize_projected_hidden:
             projected = F.normalize(projected, p=2, dim=-1)
-        tail = torch.tensor(
-            [self.config.text_eos_token_id, self.config.audio_bos_token_id],
-            dtype=torch.long, device=ids.device,
-        )
-        return torch.cat([self.emb_text(ids) + projected, self.emb_text(tail)])
+        # rows of the table by Python index: views, with no host-to-device copy
+        table = self.emb_text.weight
+        tail = [table[self.config.text_eos_token_id], table[self.config.audio_bos_token_id]]
+        return torch.cat([self.emb_text(ids) + projected, torch.stack(tail)])
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         # upstream computes the head into a float32 buffer
