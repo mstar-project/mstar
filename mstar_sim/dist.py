@@ -13,6 +13,7 @@ Maya assume.
 from __future__ import annotations
 
 import functools
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -50,8 +51,15 @@ def _group_size(kwargs, args, position: int | None) -> int:
     return dist.get_world_size(group) if dist.is_initialized() else 1
 
 
+# each collective writes its first argument, but for these
+_ONLY_READS = {"send", "isend"}
+# and all but these leave nothing of what was there
+_READS_WHAT_IT_WRITES = {"all_reduce", "reduce", "broadcast"}
+
+
 def _collective(name: str, op: str, group_pos: int | None):
     real = getattr(dist, name)
+    first = next(iter(inspect.signature(real).parameters))
 
     @functools.wraps(real)
     def call(*args, **kwargs):
@@ -68,10 +76,20 @@ def _collective(name: str, op: str, group_pos: int | None):
             # every tensor holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
             work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
-        # what it wrote is computed if all it had here was (the fact doesn't cross ranks)
-        never = not moved or any(device.never_computed(t._data) for t in tensors)
-        for t in tensors:
-            device.set_never_computed(t._data, never)
+        written = [] if name in _ONLY_READS else _sim_tensors((args[0] if args else kwargs[first],), {})
+        covered = [] if name in _READS_WHAT_IT_WRITES else [t for t in written if device._covers(t._data)]
+        # what it wrote is computed if all it read here was (the fact doesn't cross ranks); what
+        # didn't move, or a captured one at each replay, wasn't
+        never = not moved or any(device.never_computed(t._data) for t in tensors
+                                 if not any(t is c for c in covered))
+        kept = [t._data for t in written if t._data.device.type != "meta"]
+
+        def flag():
+            for t in kept:
+                device.set_never_computed(t, never)
+
+        flag()
+        clock.on_replay(flag)
         return work
 
     return call

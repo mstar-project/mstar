@@ -586,6 +586,23 @@ def test_tensor_parallel_collectives_are_timed_not_sent():
             gathered = torch.zeros(4, 4, device="cuda")
             dist.all_gather_into_tensor(gathered, flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1))
             assert never_computed(gathered._data)
+            # it reads its source and writes its destination: a whole write of computed values
+            # ends the fact there, and what didn't move leaves a source computed
+            src = torch.arange(4, device="cuda").float()
+            dist.all_gather_into_tensor(gathered.view(-1)[:8], src)  # part of it: the rest is as it was
+            assert never_computed(gathered._data) and not never_computed(src._data)
+            stale = flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
+            dist.all_gather_into_tensor(stale.view(-1), src)
+            assert not never_computed(stale._data) and stale.view(-1).tolist() == [0, 1, 2, 3] * 2
+            dist.all_gather_into_tensor(torch.empty(1 << 14, device="cuda")[:8], src)
+            assert not never_computed(src._data)
+            # captured, nothing moves, at each replay
+            y, graph = torch.zeros(4, device="cuda"), torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                y.copy_(src * 2)
+                dist.all_reduce(y)
+            graph.replay()
+            assert never_computed(y._data)
             dist.destroy_process_group()
 
         if __name__ == "__main__":
