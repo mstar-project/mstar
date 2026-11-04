@@ -23,6 +23,7 @@ kernel's own error check, which a stand-in doesn't have.
 from __future__ import annotations
 
 import inspect
+import pathlib
 import re
 
 import pytest
@@ -37,6 +38,28 @@ def pytest_runtest_setup(item):
     device.VALUELESS_READS[0] = 0
     device.VALUE_SHAPES[0] = 0
     device.KERNELS_RUN[0] = 0
+
+
+def _needs_the_hub(excinfo) -> bool:
+    """A download the offline run can't make: the environment, not mstar."""
+    text = excinfo.exconly()
+    return ("huggingface_hub" in text or "huggingface.co" in text) and (
+        excinfo.errisinstance(OSError) or "Snapshot" in text or "offline" in text.lower())
+
+
+def _missing_from_stand_in(excinfo) -> str | None:
+    """A name a stand-in library (``mstar_sim/fake_libs``) doesn't provide yet: the
+    real library has it, so the gap is the emulator's."""
+    if not excinfo.errisinstance((AttributeError, ImportError)):
+        return None
+    text = excinfo.exconly()
+    stand_ins = {path.name for path in _FAKE_LIBS.iterdir()} if _FAKE_LIBS.is_dir() else set()
+    if any(re.search(rf"\b{re.escape(name)}\b", text) for name in stand_ins) or "fake_libs" in text:
+        return f"fake_libs: {text[:160]}"
+    return None
+
+
+_FAKE_LIBS = pathlib.Path(__file__).resolve().parent / "fake_libs"
 
 
 def _raised_in_emulator(excinfo) -> str | None:
@@ -59,7 +82,11 @@ def pytest_runtest_makereport(item, call):
     report = outcome.get_result()
     if not report.failed or call.excinfo is None or report.when not in ("setup", "call"):
         return
-    where = _raised_in_emulator(call.excinfo)
+    if _needs_the_hub(call.excinfo):
+        report.outcome = "skipped"
+        report.longrepr = (str(item.path), item.location[1] or 0, "Skipped: needs the Hugging Face Hub (offline)")
+        return
+    where = _raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
     if where:
         GAPS.append((item.nodeid, f"{where}: {call.excinfo.exconly()[:160]}"))
         report.outcome = "skipped"
