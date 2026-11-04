@@ -128,9 +128,11 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             lens2.copy_(staged, non_blocking=True)
             step += 1
             mailbox.copy_(lens2 + step, non_blocking=True)
+            cast = lens2.to(torch.int32)
         assert step.item() == 0 and mailbox.tolist() == [0]
         staged.fill_(10); g2.replay(); g2.replay(); torch.cuda.synchronize()
         assert step.item() == 2 and mailbox.tolist() == [12], (step.item(), mailbox.tolist())
+        assert cast.tolist() == [10], cast.tolist()
         # the emulator's own work at a replay (re-running ops on kept values) is not host time
         import time
         g5 = torch.cuda.CUDAGraph()

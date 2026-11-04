@@ -1031,8 +1031,7 @@ def _to(self, *args, **kwargs):
         opts["memory_format"] = memory_format
     if isinstance(self, SimTensor):
         if device is None or device.type == "cuda":
-            raw = self._data.to(**opts)
-            return self if raw is self._data else SimTensor(raw, self.device.index)
+            return _run(T.to, (self,), opts, self.device.index)  # a cast is a kernel, captured as one
         if device.type == "cpu":
             _d2h(self)
             if not non_blocking:
