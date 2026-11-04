@@ -474,7 +474,7 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
 
 @requires_audio_duration
 def test_sequential_long_form_keeps_higgs_audios_instruction(client_and_stub):
-    """Higgs-Audio takes no previous text: the transcript so far replaced its instruction."""
+    """Higgs-Audio takes no previous text, so every window keeps the client's instruction."""
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 
     client, stub = client_and_stub
