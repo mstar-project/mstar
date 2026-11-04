@@ -822,6 +822,12 @@ Qwen3-TTS notes
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.
+- The Talker's decode rows run on FlashInfer's CUDA-core decode kernel. Every
+  checkpoint has 16 query heads over 8 KV heads, and the tensor-core kernel pads
+  the 2 query heads per KV head out to a tile. On an H200 the 1.7B serves 1.01x
+  to 1.03x the audio from c1 to c128 with the same WER. It's unmeasured on the
+  0.6B and on B300. ``talker_attn: decode_tensor_cores: true`` in a deployment's
+  YAML selects the tensor-core kernel.
 - The codec decoder runs in float32 by default: a stream's audio is the
   reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs:
   {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay
