@@ -138,9 +138,9 @@ Say request R's grant is short by `pages_short` pages, one for a decode row. A r
 
 Then:
 
-1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
+1. If the victims free enough, the worker earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
 2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
-3. Otherwise, R keeps its reservation and asks the pool for its shortage. It waits in the queue at its arrival, parked as a new prompt is, until the room covers the shortage.
+3. Otherwise, R keeps its reservation and asks the pool for every page its grant needed past it. It waits in the queue at its arrival, parked as a new prompt is, until the room covers them.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
@@ -162,11 +162,11 @@ Why this shape:
 @dataclass
 class Earmark:
     rid: str            # R, the request whose grant failed
-    pages: int          # what R was short
-    victims: set[str]   # the victims whose moves cover it
+    pages: int          # what R's grant needed past its reservation
+    victims: set[str]   # the victims whose moves cover the rest
 ```
 
-As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+The room R's grant counted joins R's reservation at once. As each victim's move lands, what it frees joins too, up to what the grant needed past the reservation, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
 Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
