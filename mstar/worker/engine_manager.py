@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -20,6 +20,24 @@ from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
+
+
+def _prefill_token_buckets(model_config: dict) -> Mapping:
+    """The serving config's ``prefill_token_buckets``: node -> capture walk ->
+    ladder, which each node's captures take at warmup (`apply_token_ladders`)."""
+    if "prefill_token_buckets" in (model_config.get("model_kwargs") or {}):
+        raise ValueError(
+            "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
+            "per node and capture walk: prefill_token_buckets: {<node>: {<capture walk>: [...]}}"
+        )
+    ladders = model_config.get("prefill_token_buckets")
+    if ladders is None:
+        return {}
+    if not isinstance(ladders, Mapping) or not all(isinstance(v, Mapping) for v in ladders.values()):
+        raise ValueError(
+            f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
+        )
+    return ladders
 
 
 def _unchunkable_nodes(
@@ -269,6 +287,18 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        # the per-node settings read only the config: refuse a bad one before any weights load
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        ladders = _prefill_token_buckets(model_config)
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (
+            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
+            ("prefill_token_buckets", ladders),
+        ):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
@@ -331,14 +361,8 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            token_ladders=ladders,
         )
-        budgets = model_config.get("max_batch_tokens") or {}
-        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
-            unknown = sorted(set(setting) - known)
-            if unknown:
-                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
         engine.set_chunking_policies(model.chunking_policy_of())

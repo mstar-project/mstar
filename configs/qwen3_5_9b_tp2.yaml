@@ -4,12 +4,12 @@ max_seq_len: 32768
 # collects almost every step and runs a full collection every few hundred.
 knobs:
   gc_gen0_threshold: 50000
-# Captured text-prefill ladder (see docs/models.rst): the powers of two to
-# 2048, and 2176 for a mixed step's decode rows beside four prompts. The LLM's
-# 2048-token step budget caps prefill and mixed steps, so no bucket past 2176
-# is reached.
-model_kwargs:
-  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176]
+# Captured text-prefill and mixed-step ladders (see docs/serving.rst): the
+# powers of two to 2048, which the LLM's 2048-token step budget caps both at.
+prefill_token_buckets:
+  LLM:
+    prefill_text: [32, 64, 128, 256, 512, 1024, 2048]
+    mixed: [32, 64, 128, 256, 512, 1024, 2048]
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

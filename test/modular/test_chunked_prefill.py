@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.chunking import ChunkRange
@@ -706,6 +707,113 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
 
     assert engine._chunking._overruns == {("LLM", "mixed"): 1}
     assert "over its budget of 1024" in caplog.records[0].getMessage()
+
+
+# ── engine: the serving config's prefill_token_buckets ─────────────────
+
+
+def _captured_buckets(submodule, walk, ladders, engine) -> list[int]:
+    """The token counts the engine's runner captures ``submodule``'s ``walk``
+    at (batch size 1), given the serving config's ladders and ``engine``'s budgets."""
+    import functools
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=submodule, resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1,
+        token_ladders=ladders, step_budget=functools.partial(engine._chunking.step_budget, "LLM"),
+    )
+    return sorted({
+        spec.bucket.num_tokens for spec in runner._get_slot_specs()
+        if spec.bucket.graph_walk == walk and spec.bucket.bs == 1
+    })
+
+
+def _orpheus_prefill_buckets(ladders) -> list[int]:
+    """Orpheus's ``prefill`` capture, which its ``prefill`` and ``mixed`` steps replay."""
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+    engine = _mixed_engine()
+    engine.set_token_budgets({}, WALKS, COMBINED)
+    # its capture configs read no weights
+    return _captured_buckets(object.__new__(OrpheusLLMSubmodule), "prefill", ladders, engine)
+
+
+def test_a_ladder_reaches_the_capture_of_a_model_that_plumbs_none():
+    assert _orpheus_prefill_buckets({"prefill": [48, 16]}) == [16, 48]
+
+
+def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
+    """Qwen3.5's ``prefill_text`` capture replays only ``prefill_text`` steps,
+    which run inside ``mixed`` and are scheduled under its budget (4096 here),
+    not the walk's own 2048. With chunking off nothing is dropped."""
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    walks, combined = {"prefill_text", "decode"}, {("LLM", "prefill_text"): "mixed", ("LLM", "decode"): "mixed"}
+    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
+    ladder = {"prefill_text": [1024, 2048, 3000, 4096, 8192]}
+
+    def buckets(budgets):
+        engine = _budgeted_engine()
+        engine.set_chunking_policies({
+            ("LLM", "prefill_text"): ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=2048),
+            ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=2048),
+        })
+        engine.set_token_budgets(budgets, walks, combined)
+        return _captured_buckets(llm, "prefill_text", ladder, engine)
+
+    assert buckets({"LLM": {"mixed": 4096}}) == [1024, 2048, 3000, 4096]
+    assert buckets({"LLM": {"mixed": 2500}}) == [1024, 2048, 3000]
+    assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
+
+
+@pytest.mark.parametrize("ladders, match", [
+    # ``mixed`` replays the ``prefill`` capture but has none of its own
+    ({"mixed": [64]}, "no packed capture"),
+    ([64, 128], "capture walk -> ladder"),
+    ({"prefill": []}, "distinct positive"),
+    ({"prefill": [64, 64]}, "distinct positive"),
+    ({"prefill": [0, 64]}, "distinct positive"),
+    ({"prefill": 2048}, "distinct positive"),
+])
+def test_a_ladder_that_cannot_apply_is_refused(ladders, match):
+    with pytest.raises(ValueError, match=match):
+        _orpheus_prefill_buckets(ladders)
+
+
+@pytest.mark.parametrize("model_config, match", [
+    # the key's place before it moved, which every model's `**kwargs` would swallow
+    ({"model_kwargs": {"prefill_token_buckets": [32, 64]}}, "moved to the top level"),
+    ({"prefill_token_buckets": [32, 64]}, "node -> capture walk -> ladder"),
+    ({"prefill_token_buckets": {"LLM": []}}, "node -> capture walk -> ladder"),
+])
+def test_a_serving_config_ladder_in_the_wrong_shape_or_place_is_refused_before_loading(model_config, match):
+    """EngineManager.build refuses it from the config alone, before any node's weights load."""
+    import types
+
+    import torch
+
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.worker.engine_manager import EngineManager
+
+    class Unloadable:
+        def get_submodule(self, *args, **kwargs):
+            raise AssertionError("loaded weights before checking the config")
+
+        def __getattr__(self, name):
+            raise AssertionError(f"read the model ({name}) before checking the config")
+
+    with pytest.raises(ValueError, match=match):
+        EngineManager.build(
+            node_names={"LLM"}, device=torch.device("cpu"),
+            model_config={"node_groups": [{"node_names": ["LLM"], "ranks": [0]}], **model_config},
+            parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+            transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
+            model=Unloadable(), graph_runtime=types.SimpleNamespace(),
+        )
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────

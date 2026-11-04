@@ -24,6 +24,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
+    apply_token_ladders,
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
@@ -699,7 +700,12 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        token_ladders: Mapping[str, Any] | None = None,
+        step_budget: Callable[[str], int | None] = lambda walk: None,
     ):
+        """``token_ladders``: the serving config's ``prefill_token_buckets``
+        for this node, applied to its packed captures under ``step_budget``
+        (walk -> the token budget its steps run under; `apply_token_ladders`)."""
         self._submodule_name = submodule_name
         self._capture_stream = capture_stream
         self._submodule = submodule
@@ -711,6 +717,8 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
+        if token_ladders:
+            apply_token_ladders(submodule_name, self._capture_configs, token_ladders, step_budget)
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
