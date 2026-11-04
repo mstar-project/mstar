@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import Qwen2TokenizerFast
+from transformers import Qwen2Tokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
@@ -139,7 +139,7 @@ class MiniCPMOModel(Model):
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= limit:
             raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
         # upstream's tokenizer class is Qwen2's with token-name attributes added
-        tokenizer = Qwen2TokenizerFast.from_pretrained(self.local_dir)
+        tokenizer = Qwen2Tokenizer.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
         # upstream's mel: Whisper's, as its own audio processor configures it
         self.log_mel = LogMelSpectrogram(num_mel_bins=self.config.audio.num_mel_bins)

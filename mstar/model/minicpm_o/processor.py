@@ -1,10 +1,10 @@
-"""MiniCPM-o 4.5's prompt preprocessing: image slicing, the audio mel and the
+"""MiniCPM-o 4.5's prompt preprocessing: image slicing, audio pieces and the
 placeholder layout, ported from the checkpoint's ``processing_minicpmo.py`` so
 no Python from the checkpoint repo runs (#509).
 
 The rendered chat marks each attachment with a tag; ``expand_tags`` swaps each
-for its run of ``<unk>`` placeholder tokens, and ``placeholder_positions``
-finds the runs in the tokenized prompt, as upstream's ``_convert`` does.
+for its run of ``<unk>`` placeholder tokens, and ``prompt_ids`` finds the runs
+in the tokenized prompt, as upstream's ``_convert`` does.
 """
 from __future__ import annotations
 
@@ -115,7 +115,10 @@ def slice_patches(image: Image.Image, patch_size: int) -> tuple[torch.Tensor, tu
 
 
 def audio_pieces(audio: torch.Tensor) -> list[torch.Tensor]:
-    """A clip cut into the pieces upstream encodes one by one."""
+    """A clip cut into the pieces upstream encodes one by one. Each clip is
+    its own: upstream merges the clips of one message into one, but sizes
+    their placeholders clip by clip, and the two round differently (upstream's
+    own `chat` fails on such prompts)."""
     step = MAX_AUDIO_SECONDS * SAMPLE_RATE
     return [audio[i:i + step] for i in range(0, len(audio), step)] or [audio]
 
