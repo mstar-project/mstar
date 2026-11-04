@@ -264,6 +264,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         super().__init__(loop_name=loop_name, max_batch_size=1, attn_resource_key=attn_resource_key)
         self.transformer = transformer
         self.config = config
+        self.compiled = bool(compile_blocks)
         if compile_blocks and transformer is not None:
             # around the attention and the exchanges, static per row count: each new count
             # compiles once (~8 s), and a step then runs the same kernels, at static speed, whatever
@@ -350,8 +351,10 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             # here and carried unchanged after
             t = torch.full((), KEYFRAME_NOISE_AUG, dtype=torch.float32, device=latents.device)
             latents = torch.cat([t * cond_latents + (1.0 - t) * latents[:, :n], latents[:, n:]], dim=1)
-        if first and not n:
-            # video and audio both at t = 0: one timestep, as the reference embeds it
+        if first and not n and not self.compiled:
+            # video and audio both at t = 0: one timestep, as the reference embeds it. Compiled
+            # (not bit-exact anyway) step 0 keeps the three-entry table, the same values, so a
+            # row count compiles one graph rather than a second for step 0
             timesteps = timestep.view(-1, 1).float()
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()

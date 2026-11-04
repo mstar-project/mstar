@@ -7,6 +7,7 @@ import torch
 
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.minimax_h3.components.layout import (
     T_AUDIO,
     T_COND,
@@ -563,6 +564,7 @@ class _StubDiT:
     generated row where it was."""
 
     dtype = torch.float32
+    blocks = ()  # nothing to compile
 
     def __init__(self):
         self.calls = []
@@ -570,6 +572,63 @@ class _StubDiT:
     def __call__(self, inputs, layout, attend):
         self.calls.append(inputs)
         return torch.zeros_like(inputs.video), torch.zeros_like(inputs.audio)
+
+
+def _step(node, layout, first, latents=None, cond=None):
+    """One ``denoise`` call at sigma == sigma_next, where a zero velocity leaves the rows in place."""
+    from mstar.model.minimax_h3.config import KEYFRAME_NOISE_AUG
+
+    cfg = H3Config().transformer
+    rows = layout.num_condition_rows + layout.num_video_rows
+    latents = torch.zeros(1, rows, cfg.patch_dim) if latents is None else latents
+
+    def scalar(value):
+        return torch.tensor([value])
+
+    return node.denoise(
+        None, layout, latents, scalar(0.9), scalar(0.8), scalar(0.8),
+        torch.zeros(1, layout.num_audio_rows, cfg.audio_latents_dim), scalar(0.9), scalar(0.8), scalar(0.8),
+        scalar(KEYFRAME_NOISE_AUG), torch.zeros(1, 3, cfg.hidden_size), torch.tensor(first), cond_latents=cond,
+    )
+
+
+def test_a_compiled_dit_sees_one_timestep_table_shape():
+    """Eager step 0 without keyframes embeds one timestep, as the reference; compiled, it
+    keeps the three-entry table, so a row count compiles one graph, not two."""
+    layout = H3Layout(text_len=3, latent_frames=2, latent_height=4, latent_width=4, audio_latents=2)
+    for compiled, step0 in ((False, (1, 1)), (True, (1, 3))):
+        stub = _StubDiT()
+        node = H3DenoiseSubmodule(stub, H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None,
+                                  compile_blocks=compiled)
+        for first in (True, False):
+            _step(node, layout, first)
+        assert [tuple(call.timesteps.shape) for call in stub.calls] == [step0, (1, 3)]
+
+
+def test_step_0_gives_the_same_velocity_on_one_timestep_or_three():
+    from dataclasses import replace
+
+    from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
+    from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG
+
+    torch.manual_seed(0)
+    dit = H3DiT(CFG).eval()
+    with torch.no_grad():
+        for param in dit.parameters():
+            param.normal_(0, 0.2)
+    node = H3DenoiseSubmodule(dit, replace(H3Config(), transformer=CFG), loop_name=DENOISE_LOOP,
+                              attn_resource_key=None)
+    layout = H3Layout(text_len=5, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4)
+    step_layout = node.build_layout(layout, "cpu")
+    g = torch.Generator().manual_seed(1)
+    video = torch.randn(1, layout.num_video_rows, CFG.patch_dim, generator=g)
+    audio = torch.randn(1, layout.num_audio_rows, CFG.audio_latents_dim, generator=g)
+    text = torch.randn(1, layout.text_len, CFG.hidden_size, generator=g)
+    with torch.no_grad():
+        one, three = (dit(H3Inputs(video=video, audio=audio, text=text, timesteps=t), step_layout, sdpa_attention)
+                      for t in (torch.zeros(1, 1), torch.tensor([[0.0, 0.0, 0.999]])))
+    for got, want in zip(three, one, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
 def test_denoise_noises_keyframe_rows_at_step_0_and_carries_them():
