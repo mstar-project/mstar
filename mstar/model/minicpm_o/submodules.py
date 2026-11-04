@@ -308,7 +308,7 @@ class LLMSubmodule(ARNodeSubmodule):
             outputs["text_inputs"] = outputs["new_token"]
         if "tts_hidden" not in outputs:
             return
-        if not request_info.step_metadata.get("audio_output", False):
+        if request_info.graph_walk != DECODE_SPOKEN:  # the row's own walk, in a mixed step too
             outputs.pop("tts_ids")
             outputs.pop("tts_hidden")
             return

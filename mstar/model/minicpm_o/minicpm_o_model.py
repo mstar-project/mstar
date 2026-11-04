@@ -815,17 +815,8 @@ class MiniCPMOModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata={
-                **self._step_metadata(metadata),
-                **{k: model_kwargs[k] for k in (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS) if k in model_kwargs},
-            },
+            step_metadata={k: model_kwargs[k] for k in (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS) if k in model_kwargs},
         )
-
-    @staticmethod
-    def _step_metadata(metadata: CurrentForwardConductorMetadata) -> dict:
-        # every walk carries it: the LLM's decode keeps the TTS condition only
-        # for a spoken reply
-        return {"audio_output": metadata.kwargs["audio_output"]}
 
     @staticmethod
     def _carry(
@@ -878,7 +869,6 @@ class MiniCPMOModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
-            step_metadata=self._step_metadata(metadata),
         )
 
     # ------------------------------------------------------------------
