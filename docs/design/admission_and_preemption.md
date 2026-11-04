@@ -201,8 +201,7 @@ class KVManager:
 A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
 
 - a guaranteed request
-- one with no kept ids
-- one not yet decoding
+- one that keeps no ids, unless it is between two chunks of its prompt, which its rebuild runs again
 - one with a host copy
 - one with a step, a KV read or a sample in flight, until that lands
 - one whose rebuild would write other than the tokens its KV holds
