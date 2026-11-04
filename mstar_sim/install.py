@@ -49,6 +49,8 @@ def install() -> None:
 
     patches.install()
     thread_dumps()
+    if os.environ.get("MSTAR_SIM_SHM_MB"):
+        _small_dev_shm(int(os.environ["MSTAR_SIM_SHM_MB"]))
 
 
 def thread_dumps() -> None:
@@ -81,6 +83,45 @@ def thread_dumps() -> None:
                     pass
 
     threading.Thread(target=wait, name="mstar_sim-thread-dump", daemon=True).start()
+
+
+def _small_dev_shm(mib: int) -> None:
+    """``--shm-mb N``: ``statvfs("/dev/shm")`` answers as an N MiB tmpfs, its free
+    space N MiB less what every ``mstar_*`` file in it really holds (a dead run's
+    leftovers included; other mstar runs on the box count too). Only what mstar
+    reads to size its arena and files changes: writes past N still succeed."""
+    real = os.statvfs
+    total = mib << 20
+
+    class _Result:
+        f_bsize = f_frsize = 4096
+        f_blocks = total // 4096
+        f_files = f_ffree = f_favail = 1 << 20
+        f_flag = 0
+        f_namemax = 255
+
+        def __init__(self, used: int):
+            self.f_bfree = self.f_bavail = max(0, total - used) // 4096
+
+    def used() -> int:
+        held = 0
+        try:
+            for entry in os.scandir("/dev/shm"):
+                if entry.name.startswith("mstar_"):
+                    try:
+                        held += entry.stat(follow_symlinks=False).st_blocks * 512
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return held
+
+    def statvfs(path, *args, **kwargs):
+        if os.fspath(path).rstrip("/") == "/dev/shm":
+            return _Result(used())
+        return real(path, *args, **kwargs)
+
+    os.statvfs = statvfs
 
 
 def _children(pid: int) -> list[int]:

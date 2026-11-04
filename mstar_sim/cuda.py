@@ -259,11 +259,16 @@ class Event:
             enable_timing, device = device, None
         self.enable_timing = enable_timing
         self.t: float | None = None
+        self.stamp: float | None = None
         self.device = torch.device("cuda", current_device())
 
     def record(self, stream: Stream | None = None) -> None:
         s = stream if stream is not None else current_stream()
-        self.t = max(clock.vnow(), s.timeline.free_at)
+        # complete once the stream drains past it: on an idle stream that is now, for
+        # every thread (the recording thread's own virtual time would skew a waiter on
+        # another); the timestamp, for elapsed_time, is when the GPU reaches it
+        self.t = s.timeline.free_at
+        self.stamp = max(clock.vnow(), self.t)
 
     def wait(self, stream: Stream | None = None) -> None:
         (stream if stream is not None else current_stream()).wait_event(self)
@@ -276,7 +281,7 @@ class Event:
             clock.wait_until(self.t)
 
     def elapsed_time(self, end: Event) -> float:
-        return (end.t - self.t) * 1000.0
+        return (end.stamp - self.stamp) * 1000.0
 
 
 def synchronize(device=None) -> None:
