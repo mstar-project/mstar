@@ -580,9 +580,9 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
     """What the emulator raises as CUDA would (a host read during capture) is mstar's
     failure; a name an emulated object lacks is the emulator's gap; mstar's own error
     stays its own, whatever library it names. An assert is a value check, the one failure
-    the plugin expects, only once a never-computed value has been read: not for making a
+    the plugin expects, only once the test has read a never-computed value: not for making a
     scratch buffer, or exporting a storage. A pass isn't reported for a test whose own code
-    read a never-computed value: that check can't have failed."""
+    read a never-computed value: that check can't answer."""
     (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
         import torch
         def test_host_read_in_capture():
@@ -618,6 +618,11 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             tokens = flashinfer.sampling_from_probs(torch.empty(2, 512, device="cuda"))
             helper = eval(compile("lambda t: t.tolist()", "/mstar/worker.py", "eval"))
             assert len(helper(tokens)) == 2
+        def test_lifecycle_assert_after_mstar_reads_a_sampled_token():
+            import flashinfer
+            tokens = flashinfer.sampling_from_probs(torch.empty(2, 512, device="cuda"))
+            eval(compile("lambda t: t.tolist()", "/mstar/worker.py", "eval"))(tokens)
+            assert len([]) == 1
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
     """))
@@ -631,6 +636,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL",
                         "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
                         "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
+                        "test_lifecycle_assert_after_mstar_reads_a_sampled_token": "FAILED",
                         "test_passing_value_check": "PASSED"}, out
 
 

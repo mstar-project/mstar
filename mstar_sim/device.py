@@ -105,13 +105,8 @@ def _is_meta(x) -> bool:
     return isinstance(x, torch.Tensor) and x.device.type == "meta"
 
 
-# host reads of a never-computed value so far: an assert after one is a check the emulator
-# can't answer (``mstar_sim.pytest_plugin``)
-VALUELESS_READS = [0]
-
-
 def uncomputed() -> None:
-    VALUELESS_READS[0] += 1
+    """A host read of a never-computed value: ``mstar_sim.pytest_plugin`` asks who read it."""
 
 
 def never_computed(t: torch.Tensor) -> bool:

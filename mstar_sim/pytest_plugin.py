@@ -14,19 +14,18 @@ the ones that check for a GPU in their body
 Nothing is computed on the emulated GPU, so a test that checks values (parity,
 an error bound) can't be answered. A test is reported as an expected failure when:
 
-- it fails an ``assert`` after a host read of a never-computed value, or fails in
-  any way after an op whose output shape depends on never-computed values
-  (``nonzero`` of a mask, run on zeros);
-- it passes, but its own code (directly, or through ``torch.testing``) read a
-  never-computed value: such a check saw zeros, and can't have failed.
+- its own code (directly, or through ``torch.testing``) read a never-computed value,
+  and it then passes or fails an ``assert``: such a check can't answer;
+- it fails in any way after an op whose output shape depends on never-computed values
+  (``nonzero`` of a mask, run on zeros).
 
 A value is never computed when no kernel computed it (``device.never_computed``):
 a large tensor's, one a stand-in wrote, an allocation not written yet, and what kept
 ops derive from those. So a pass means every value the test itself read was computed,
 as far as the emulator can tell: it can't tell of a host value mstar read from one
-and handed on (a sampled token in a list), of a value a real write made over part
-of such a tensor, or whether a real value could show what the test is for (a race,
-when values land at launch).
+and handed on (a sampled token in a list, whose check then passes on zeros or fails
+as mstar's), of a value a real write made over part of such a tensor, or whether a
+real value could show what the test is for (a race, when values land at launch).
 
 Every other failure stays a failure: an exception from mstar's own code (a lifecycle
 or planning error, an API that moved, a crash), or an assertion made before any such
@@ -53,11 +52,9 @@ from mstar_sim import device
 GAPS: list[tuple[str, str]] = []
 # host reads of never-computed values by the test's own code
 TEST_READS = [0]
-_host_read = device.uncomputed
 
 
 def _uncomputed() -> None:
-    _host_read()
     frame = sys._getframe(1)
     while frame is not None:  # the reader: the innermost frame that isn't torch's or the emulator's
         path = frame.f_code.co_filename
@@ -80,7 +77,6 @@ def _test_code(path: str) -> bool:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    device.VALUELESS_READS[0] = 0
     TEST_READS[0] = 0
     device.VALUE_SHAPES[0] = 0
     device.KERNELS_RUN[0] = 0
@@ -165,10 +161,9 @@ def pytest_runtest_makereport(item, call):
         report.outcome = "skipped"
         report.wasxfail = (f"mstar_sim: failed after {device.VALUE_SHAPES[0]} op(s) whose output shape "
                            "depends on never-computed values")
-    elif call.excinfo.errisinstance(AssertionError) and device.VALUELESS_READS[0]:
+    elif call.excinfo.errisinstance(AssertionError) and TEST_READS[0]:
         report.outcome = "skipped"
-        report.wasxfail = (f"mstar_sim: a value check after {device.VALUELESS_READS[0]} read(s) "
-                           "of never-computed values")
+        report.wasxfail = f"mstar_sim: a value check after it read {TEST_READS[0]} never-computed value(s)"
 
 
 _NEEDS_GPU = re.compile(r"cuda|gpu|triton|flashinfer|nvidia|sm_?\d\d|blackwell|hopper", re.I)
