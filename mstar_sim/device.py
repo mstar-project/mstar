@@ -1126,6 +1126,7 @@ def _cpu(self, memory_format=torch.preserve_format):
 
 def _host_read(name):
     def read(self, *args, **kwargs):
+        _d2h(self)
         host_wait()
         return getattr(host_value(self._data), name)(*args, **kwargs)
 

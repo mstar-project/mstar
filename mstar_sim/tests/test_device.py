@@ -216,6 +216,16 @@ def test_device_time_follows_the_cost_model_not_the_host(gpu):
         print(start.elapsed_time(end) / 1000, launched)
     """, gpu)
     device_s, _ = map(float, out.split())
+    # a host read is a D2H copy: it takes device time even on an idle stream (slowed down
+    # 1000x to stand clear of the host's own time between the events)
+    out = run_sim("""
+        import torch
+        from mstar_sim import cost
+        small, start, end = torch.ones(1, device="cuda"), torch.cuda.Event(True), torch.cuda.Event(True)
+        torch.cuda.synchronize()
+        start.record(); small.item(); end.record(); end.synchronize()
+        assert start.elapsed_time(end) / 1000 > 1000 * cost.copy_seconds(4, "d2h"), start.elapsed_time(end)
+    """, gpu, MSTAR_SIM_TIME_SCALE="1000")
     flops = 20 * 2 * 4096**3
     # the device time is the roofline estimate's order of magnitude for this card
     peak = {"h100": 989e12, "b200": 2250e12}[gpu]
