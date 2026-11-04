@@ -841,7 +841,7 @@ def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.qwen3_lm import Qwen3LMConfig
     from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
-    return _bare(MiniCPMOModel, config=MiniCPMOConfig(
+    return _bare(MiniCPMOModel, max_seq_len=64, config=MiniCPMOConfig(
         llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
     ))
 

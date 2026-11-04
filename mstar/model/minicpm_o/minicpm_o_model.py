@@ -126,11 +126,17 @@ def _bound_positions(bounds: torch.Tensor) -> torch.Tensor:
 class MiniCPMOModel(Model):
     PREPROCESS_TORCH_THREADS = 4
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None, max_seq_len: int | None = None, **kwargs: Any,
+    ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.local_dir = _resolve_metadata(model_path_hf, cache_dir)
         self.config = MiniCPMOConfig.from_hf(self.local_dir)
+        limit = self.config.llm.max_position_embeddings
+        self.max_seq_len = limit if max_seq_len is None else max_seq_len
+        if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= limit:
+            raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
         self._processor = None
         tokenizer = self.processor.tokenizer
         self.tokenizer = tokenizer
@@ -171,7 +177,7 @@ class MiniCPMOModel(Model):
                     num_layers=llm.num_hidden_layers,
                     num_kv_heads=llm.num_key_value_heads,
                     head_dim=llm.head_dim,
-                    max_seq_len=llm.max_position_embeddings,
+                    max_seq_len=self.max_seq_len,
                     num_qo_heads=llm.num_attention_heads,
                 ),
             ),
@@ -254,7 +260,7 @@ class MiniCPMOModel(Model):
                 ],
             ),
             # a safety bound; the per-request budget is `get_loop_caps`'
-            max_iters=self.config.llm.max_position_embeddings,
+            max_iters=self.max_seq_len,
             outputs=[],
         )
         return {

@@ -220,6 +220,20 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
 
 
 @needs_ckpt
+def test_max_seq_len_sizes_the_kv_and_the_decode_loop():
+    from mstar.engine.resources import KVSpec
+    from mstar.model.minicpm_o.config import LLM_KV
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    model = MiniCPMOModel(CKPT, max_seq_len=4096)
+    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
+    assert kv.config.max_seq_len == 4096
+    assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
+    with pytest.raises(ValueError, match="max_seq_len"):
+        MiniCPMOModel(CKPT, max_seq_len=model.config.llm.max_position_embeddings + 1)
+
+
+@needs_ckpt
 @pytest.mark.parametrize(
     "tensors, walk",
     [
