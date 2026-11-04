@@ -32,8 +32,9 @@ if TYPE_CHECKING:
 # at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
 # The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
-# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.
-DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
+# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output. With
+# ``rebuild_host_mb``'s default that makes the pool 1 GiB, a power of two, so it isn't rounded up to 2 GiB.
+DEFAULT_REBUILD_MEDIA_HOST_MB = 960
 
 
 class LayoutRow(NamedTuple):
@@ -349,6 +350,9 @@ class Rebuilds:
                     record.landed = copy.landed
                 else:
                     record.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
+                    if not tensor.nbytes:
+                        # an empty copy spends no allowance, so `flush` would never take it off the queue
+                        continue
                     self._queued.append(QueuedCopy(
                         tensor.reshape(-1).view(torch.uint8), into, node_batch.completion_event, record,
                     ))

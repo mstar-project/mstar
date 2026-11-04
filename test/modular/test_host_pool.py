@@ -26,6 +26,14 @@ def test_a_slice_given_back_merges_with_its_free_neighbors():
     assert pool.take(64) == HostSlice(0, 64), "the pool stayed in pieces, so a long prompt would find no room"
 
 
+def test_the_pool_hands_out_all_the_pinned_allocator_takes():
+    """The pinned allocator rounds an allocation up to a power of two, so a 1088 MiB pool pinned 2 GiB and never
+    handed out the other 960 MiB."""
+    pool = HostPool(96, torch.device("cpu"))
+
+    assert pool.take(128) == HostSlice(0, 128), "the pool would pin memory it never hands out"
+
+
 @requires_cuda
 def test_kept_ids_copy_after_the_steps_completion_event():
     device = torch.device("cuda")
@@ -42,3 +50,22 @@ def test_kept_ids_copy_after_the_steps_completion_event():
     assert copy.view.tolist() == [7] * 256, (
         "the copy read the ids before the step wrote them"
     )
+
+
+@requires_cuda
+def test_a_copy_back_to_the_device_doesnt_wait_behind_copies_to_the_host():
+    """The copy back shared a stream with the copies to the host, so a rebuild row's inputs waited behind every
+    copy to the host queued before them."""
+    device = torch.device("cuda")
+    pool = HostPool(1 << 12, device)
+    busy = torch.cuda.Stream()
+    with busy:
+        torch.cuda._sleep(1 << 30)  # the step a copy to the host waits for is still running
+    step_done = torch.Event(device=device)
+    step_done.record(busy)
+    out = pool.copy_out(torch.ones(256, device=device), pool.take(1 << 10), step_done)
+
+    _, ready = pool.copy_in(pool.view(pool.take(1 << 10), torch.float32, torch.Size([256])))
+    ready.synchronize()
+
+    assert not out.landed.query(), "the copy back waited for a copy to the host it doesn't read"
