@@ -5152,7 +5152,10 @@ class KVManager(AttentionResource):
                     available = self._allowance(request_id)
                     pages_short = short or num_new_pages - available
                     if self._decides:
-                        self._ran_short[request_id] = ShortGrant(self._room(), num_new_pages - within)
+                        # The grant needed the room and `pages_short` past the allotment, which for a guarantee
+                        # `_cover_move` found short is every page the request grows into.
+                        room = self._room()
+                        self._ran_short[request_id] = ShortGrant(room, room + pages_short)
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(
