@@ -65,6 +65,13 @@ def test_cuda_semantics():
         torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
         assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
         torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)
+        from torch._dynamo.testing import CompileCounter
+        counter = CompileCounter()  # a test's own backend compiles for real, without tracing the emulator
+        for layer in [torch.nn.Linear(4, 4) for _ in range(3)]:
+            layer.forward = torch.compile(lambda x, f=layer.forward: f(x).float().to(x.dtype),
+                                          backend=counter, dynamic=True)
+            layer(torch.randn(2, 4))
+        assert counter.frame_count == 1, counter.frame_count
         print("ok")
     """)
     assert out.strip() == "ok"

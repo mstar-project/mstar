@@ -147,11 +147,34 @@ def _no_compile(torch) -> None:
 
     real = torch.compile
 
+    def outside_the_mode(fn):
+        """Calls ``fn`` with the emulator's torch-function mode off: Dynamo would
+        trace the mode too, and recompile on its state."""
+        import functools
+
+        from mstar_sim import device
+
+        @functools.wraps(fn)
+        def call(*args, **kw):
+            stack = torch.overrides._get_current_function_mode_stack()
+            if not stack or type(stack[-1]) is not device.SimMode:
+                return fn(*args, **kw)
+            with torch.overrides._pop_mode_temporarily():
+                return fn(*args, **kw)
+
+        return call
+
     def compile(model=None, **kwargs):  # noqa: A001
         signature.bind(model, **kwargs)
         if callable(kwargs.get("backend")):
             # a test's own backend (a frame counter, over CPU tensors) compiles for real
-            return real(model, **kwargs) if model is not None else real(**kwargs)
+            if model is None:
+                return lambda fn: compile(fn, **kwargs)
+            compiled = real(model, **kwargs)
+            if isinstance(compiled, torch.nn.Module):
+                compiled.forward = outside_the_mode(compiled.forward)
+                return compiled
+            return outside_the_mode(compiled)
         if model is None:
             return lambda fn: fn
         return model
