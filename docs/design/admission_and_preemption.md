@@ -186,7 +186,7 @@ class KVManager:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
         evictable pages. Needs no host pool. tokens is what rid's rebuild
-        writes from its kept ids."""
+        writes: its kept ids but the last, or the chunks its prompt ran."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
