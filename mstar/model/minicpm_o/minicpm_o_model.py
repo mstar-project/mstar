@@ -502,13 +502,12 @@ class MiniCPMOModel(Model):
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under ``dtype`` so no fp32 copy of the weights is
-        allocated; fp32-only buffers restore themselves in ``_apply``."""
-        torch.set_default_dtype(dtype)
-        try:
-            return make().to(device)
-        finally:
-            torch.set_default_dtype(torch.float32)
+        """Construct on ``meta``, then give it uninitialized ``dtype`` storage on
+        ``device`` for the loader to fill (it raises on any parameter left
+        unfilled); fp32-only buffers restore themselves in ``_apply``."""
+        with torch.device("meta"):
+            module = make()
+        return module.to(dtype).to_empty(device=device)
 
     def _create_submodule(self, node_name: str, device: str, tp_group, dtype: torch.dtype) -> NodeSubmodule | None:
         from mstar.model.minicpm_o import submodules, weight_loader
