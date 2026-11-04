@@ -248,6 +248,30 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     assert _step(kv, "r", 1).ok
 
 
+@pytest.mark.parametrize("why", ["kept ids", "mid-prefill"])
+def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why):
+    """v's KV holds 5 pages, but its kept ids, or the chunks its prompt ran, rebuild a token less. Chosen anyway,
+    v either fails its drop in the move or comes back one token short."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    if why == "kept ids":
+        w._rebuilds._kept[NODE]["v"] = _kept(5 * PAGE_SIZE - 1)
+    else:
+        del w._rebuilds._kept[NODE]["v"]
+        w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE - 1, 8 * PAGE_SIZE) if (
+            rid == "v") else None
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.RESIDENT, "v was chosen though its rebuild doesn't write what its KV holds"
+    assert kv.residency("r") is Residency.DROPPED, "r neither dropped itself nor left v alone"
+
+
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     """A dropped request asks again at its drop, so its next readiness check parks it in the queue. Once the pool
     admits it, the check starts its rebuild, and the rebuild's landing lets it run. A second path that readmitted

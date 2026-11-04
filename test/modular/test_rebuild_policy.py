@@ -255,6 +255,17 @@ def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its
     )
 
 
+@pytest.mark.parametrize("prefilling", [None, Prefilling(PREFILL, 4, 10)], ids=["kept ids", "mid-prefill"])
+def test_a_drop_is_checked_against_the_tokens_its_rebuild_writes(prefilling):
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    rebuilds.start(R, NODE, prefilling)
+
+    assert tokens == rebuilds.cursor(R, NODE).total, "the drop would check one count and the rebuild write another"
+
+
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():
     ctx = StepContext(request_ids=(R, A), graph_walk=PREFILL, slot=0, capture=False, rebuild_rids=frozenset({R}))
     for kept_rids in (None, frozenset({R, A})):
