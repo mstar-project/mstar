@@ -6,6 +6,9 @@ log offers the rebuild's next chunk
 the way the scheduler offers a speculation's chunk in flight, so the walk's caps, token budget and pick treat it
 as a prompt mid-prefill. Nothing popped it, so nothing pushes it back or parks it in a backlog, and a chunk in
 flight is offered again only as its step's continuation.
+
+A rebuild the request's resources refuse opens nothing in the log, and fails that request without the step
+around it.
 """
 
 from __future__ import annotations
@@ -24,7 +27,13 @@ from test_scheduler_room import _Engine as _RoomEngine
 from test_scheduler_room import _Runtime as _RoomRuntime
 
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
+from mstar.engine.resources.step import (
+    FULL_ADMIT_OK,
+    FULL_ADMIT_REBUILD,
+    AdmitOutcome,
+    AdmitRuntimeError,
+    FullAdmitOutcome,
+)
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, MidPrefillRow
@@ -46,11 +55,13 @@ class _Runtime(_RoomRuntime):
 
 
 class _Engine(_RoomEngine):
-    """Readiness that answers ``dropped`` with a rebuild, a token budget, and lengths read off the row's ids."""
+    """Readiness that answers ``dropped`` with a rebuild, which the KV refuses for ``refused``, a token budget, and
+    lengths read off the row's ids."""
 
-    def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=()):
+    def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=(), refused=()):
         super().__init__(max_bs)
         self.budget, self.chunkable, self.cached, self.dropped = budget, chunkable, cached, set(dropped)
+        self.refused = set(refused)
         self.asked, self.prepared = [], []
 
     def get_max_batch_tokens(self, node_name, graph_walk):
@@ -75,6 +86,8 @@ class _Engine(_RoomEngine):
 
     def prepare_rebuild(self, node_name, rid, rebuild):
         self.prepared.append((rid, list(rebuild.ids)))
+        if rid in self.refused:
+            return FullAdmitOutcome(AdmitOutcome(ok=False, reason=AdmitRuntimeError("its label held 2")), "kv")
         return FULL_ADMIT_OK
 
     def admit_waiting(self, published_of):
@@ -108,6 +121,17 @@ def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
     assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
     assert engine.asked.count("d0") == 1, "a waiting decode row asks the engine on every pass"
+
+
+def test_a_rebuild_the_kv_refuses_fails_its_request_alone_and_never_opens():
+    sched, _, state, _ = _scheduler({"d0": DECODE, "d1": DECODE}, dropped={"d0"}, refused={"d0"})
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
+    sched.rebuilds._kept[NODE]["d0"] = KeptIds(HostCopy(HostSlice(0, 24), prompt, None), array("i", [4]))
+
+    batch = sched.get_next_batch(state)
+
+    assert _rids(batch) == ["d1"] and "d0" in sched.take_admit_errors(), "one refused rebuild would fail the step"
+    assert not sched.rebuilds.rebuilding("d0", NODE), "the rebuild would run over KV the check refused"
 
 
 def test_a_decode_row_runs_once_its_rebuild_lands():
