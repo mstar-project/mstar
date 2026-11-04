@@ -70,6 +70,23 @@ def test_cuda_semantics():
         v, g = torch.empty(512, 256, 3, device="cuda"), torch.randn(512, 1, 1).cuda()
         assert torch._weight_norm(v, g, 0).shape == v.shape  # a composite's same-device check
         assert torch.stack([x.sum(), torch.ones((), device="cuda")]).shape == (2,)
+        # a block-scaled fp8 GEMM takes a partial last 128-block of N; no other bad scale
+        F, fp8 = torch.nn.functional, torch.float8_e4m3fn
+        a, w = torch.empty(128, 256, dtype=fp8, device="cuda"), torch.empty(208, 256, dtype=fp8, device="cuda").t()
+        rows, blocks = F.ScalingType.BlockWise1x128.value, F.ScalingType.BlockWise128x128.value
+        none = F.SwizzleType.NO_SWIZZLE.value
+        a_scale = torch.empty_strided((128, 2), (1, 128), dtype=torch.float32, device="cuda")
+        w_scale = torch.empty_strided((4, 2), (1, 4), dtype=torch.float32, device="cuda")
+
+        def scaled_mm(scale):
+            return torch._scaled_mm_v2(a, w, [a_scale], [rows], [none], [scale], [blocks], [none], None, torch.bfloat16)
+
+        assert scaled_mm(w_scale).shape == (128, 208)
+        try:
+            scaled_mm(w_scale.t())
+            raise SystemExit("a transposed scale was accepted")
+        except RuntimeError as e:
+            assert "blockwise scaling" in str(e)
         torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
         assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
         torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)

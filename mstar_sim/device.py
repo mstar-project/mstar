@@ -1387,8 +1387,8 @@ def _swap_or_assign() -> None:
 def _relax_blockwise_scaled_mm_meta() -> None:
     """torch 2.10's meta check for block-scaled fp8 GEMMs (``_scaled_mm_v2``, 1x128 x 128x128
     blocks) floors ``N / 128``, so a weight whose last 128-row block is partial (GLM-5.2's
-    fused q_a + kv_a) fails it, though the CUDA kernel takes it. Here the check only
-    decides the output's shape: ``[M, N]``."""
+    fused q_a + kv_a) fails it, though the CUDA kernel takes it with ceil-div scales. Such a
+    weight is checked as if its last block were whole: every other check still applies."""
     import torch._meta_registrations as mr
 
     check = getattr(mr, "_check_scaled_mm_sizes_v2", None)
@@ -1398,10 +1398,17 @@ def _relax_blockwise_scaled_mm_meta() -> None:
     def relaxed(self, mat2, *args, out_dtype=None, **kwargs):
         try:
             return check(self, mat2, *args, out_dtype=out_dtype, **kwargs)
-        except RuntimeError as e:
-            if "blockwise scaling" not in str(e):
+        except RuntimeError as refused:
+            n = mat2.shape[1]
+            if n % 128 == 0:
                 raise
-            return torch.empty(self.shape[0], mat2.shape[1], dtype=out_dtype or self.dtype, device=self.device)
+            whole = torch.empty_strided((mat2.shape[0], -(-n // 128) * 128), mat2.stride(), dtype=mat2.dtype,
+                                        device=mat2.device)
+            try:
+                check(self, whole, *args, out_dtype=out_dtype, **kwargs)
+            except RuntimeError:
+                raise refused from None
+            return torch.empty(self.shape[0], n, dtype=out_dtype or self.dtype, device=self.device)
 
     relaxed._mstar_sim = True
     mr._check_scaled_mm_sizes_v2 = relaxed
