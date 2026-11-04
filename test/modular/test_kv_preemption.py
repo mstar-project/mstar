@@ -223,6 +223,26 @@ def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
     assert "v" not in victims.to_host + victims.to_drop, f"v was chosen with its {flight}, so its move would be refused"
 
 
+def test_a_dropped_request_admitted_again_isnt_chosen_before_its_rebuild_lands():
+    """A dropped request admitted again holds an allotment and no page until its rebuild writes. Asked to give the
+    allotment back, it would leave its rebuild row running on none, and the worker would keep offering that row."""
+    kv = _pool()
+    _running(kv, "o", 4, arrival=0)
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "v", 2, arrival=2)
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    assert _step(kv, "r", 1).ok
+    _remove(kv, "o")
+    assert _admitted(kv, "v")
+    short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
+
+    victims = _preempt(kv, "r", short, droppable=lambda rid: True)
+
+    assert "v" not in victims.to_ask, "v gave back the allotment its rebuild runs on"
+
+
 def test_a_victim_whose_move_fails_comes_off_the_earmark():
     kv = _pool()
     kv._cpu_pool = host._HostPool(16)
