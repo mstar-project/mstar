@@ -280,8 +280,8 @@ def _shallow(args, kwargs):
 
 
 def _rewrap(raw, inputs, index):
-    """Wrap the call's new CPU tensors; give back inputs it returned as they were.
-    ``inputs`` are the call's tensor arguments (cuda ones and plain)."""
+    """Wrap the call's new CPU tensors, value-less if too large to keep; give back inputs it
+    returned as they were. ``inputs`` are the call's tensor arguments (cuda ones and plain)."""
     by_id = {}
     for x in inputs:
         by_id[id(x._data) if isinstance(x, SimTensor) else id(x)] = x
@@ -292,6 +292,9 @@ def _rewrap(raw, inputs, index):
         seen = by_id.get(id(x))
         if seen is not None:
             return seen
+        if x.device.type == "cpu" and x._base is None and not keeps_values(
+                x.dtype, x.untyped_storage().nbytes() // x.element_size()):  # (an expand is a small one)
+            x = x.to(META)
         return SimTensor(x, index)
 
     return tree_map(one, raw)

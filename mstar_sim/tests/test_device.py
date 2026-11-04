@@ -339,6 +339,8 @@ def test_timing_only_holds_shapes_not_values():
         assert stream.kernels == launched  # an allocation is no kernel
         pos = torch.arange(5, device="cuda") + 1
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
+        ones = torch.ones(4096, device="cuda")
+        assert (ones[:, None] * ones[None, :]).sum().item() == 0  # size decides, for a result too
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
         assert logits.argmax(-1).tolist() == [0, 0, 0, 0]  # never computed
         # a small tensor keeps the values last written to it, however it was made: a host
