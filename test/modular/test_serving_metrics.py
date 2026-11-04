@@ -1311,6 +1311,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+    # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     return str(cfg)
 
 
