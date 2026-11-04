@@ -344,6 +344,13 @@ class KVPageCounts(NamedTuple):
     cached: int
 
 
+class Reservation(NamedTuple):
+    """The pages an admit acquired for one stream's group, and the arena's trail before that admit, which
+    `KVManager.rollback_admit` puts back."""
+    pages: list[int]
+    trail: tuple[int, int] | None
+
+
 @dataclass(slots=True)
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: the pages it asked for, less the
@@ -780,7 +787,7 @@ class KVManager(AttentionResource):
         # pre-planned step's admit returns first -- see ``remove_request`` /
         # ``reset_request``.
         # keyed (rid, label, group)
-        self._admit_reserved_pages: dict[tuple[int, str, int], list[int]] = {}
+        self._admit_reserved_pages: dict[tuple[int, str, int], Reservation] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -2091,6 +2098,7 @@ class KVManager(AttentionResource):
             # off `stored_len`: a pre-fork target has to cover the whole prefix
             streams = self._streams
             report = self._index is not None
+            trail = self._arena.trail
             # leases come only from the index, so without one this pass does nothing
             for segment in step.segments if report else ():
                 labels = streams.get(segment.request_id)
@@ -2142,7 +2150,7 @@ class KVManager(AttentionResource):
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
                     if alloc_res.new_pages:
                         self._admit_reserved_pages.setdefault(
-                            (rid, to_label, 0), []).extend(alloc_res.new_pages)
+                            (rid, to_label, 0), Reservation([], trail)).pages.extend(alloc_res.new_pages)
 
             page_size = self.config.tokens_per_page
             sink = step.sink
@@ -2199,7 +2207,8 @@ class KVManager(AttentionResource):
                             ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
                         )
                     if alloc_res.new_pages:
-                        self._admit_reserved_pages.setdefault((rid, label, g), []).extend(alloc_res.new_pages)
+                        self._admit_reserved_pages.setdefault(
+                            (rid, label, g), Reservation([], trail)).pages.extend(alloc_res.new_pages)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -2306,6 +2315,10 @@ class KVManager(AttentionResource):
         Does not touch pages retained by a shared prefix or a lease converted
         onto the stream.
 
+        The arena ends as the admit found it, its free list in the same order
+        and its trail the same, so the next admit takes the pages it takes on a
+        TP rank that never ran this one.
+
         ``page_indices`` maps token position to page, so the reserved pages can
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
@@ -2326,8 +2339,9 @@ class KVManager(AttentionResource):
                     stream.step_in_flight = False
             reserved = self._admit_reserved_pages
             mine = [key for key in reserved if ctx.is_real_row(key[0])]
-            for key in mine:
-                pages = reserved.pop(key)
+            # newest first, since each goes back to the front of the free list
+            for key in reversed(mine):
+                pages, trail = reserved.pop(key)
                 if not pages:
                     continue  # `page_indices[:-0]` would empty the whole stream
                 rid, label, g = key
@@ -2345,7 +2359,8 @@ class KVManager(AttentionResource):
                     )
                     continue
                 del part.page_indices[-len(pages):]
-                self._release(rid, stream, pages)
+                self._arena.give_back(pages)
+                self._arena.trail = trail
                 self._recount(rid)
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
