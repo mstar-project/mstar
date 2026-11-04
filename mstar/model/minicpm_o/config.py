@@ -8,7 +8,7 @@ file: the two disagree on what ends a turn (see ``MiniCPMOConfig.stop_token_ids`
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
@@ -117,7 +117,6 @@ class MiniCPMOConfig:
     audio: AudioConfig
     # tokens that end a reply; filled from the tokenizer by the model
     stop_token_ids: tuple[int, ...] = ()
-    tts_config: dict = field(default_factory=dict)
 
     @classmethod
     def from_hf(cls, local_dir: str) -> "MiniCPMOConfig":
@@ -154,5 +153,4 @@ class MiniCPMOConfig:
                 kv_dim=vision.hidden_size,
             ),
             audio=audio,
-            tts_config=raw.get("tts_config", {}),
         )

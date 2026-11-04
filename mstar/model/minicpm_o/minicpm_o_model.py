@@ -101,7 +101,7 @@ def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
 
     return snapshot_download(
         repo_id=repo_id, cache_dir=cache_dir,
-        allow_patterns=["*.json", "*.txt", "assets/*.wav"],
+        allow_patterns=["*.json", "*.txt"],
     )
 
 
@@ -119,6 +119,8 @@ def _as_pil(image: torch.Tensor):
 
 
 class MiniCPMOModel(Model):
+    # Preprocessing is a few small ops per request, which a thread per core
+    # only slows (Qwen3.5 measured its image preprocessing at 4 threads).
     PREPROCESS_TORCH_THREADS = 4
     # the encoders' segment sizes, which process_prompt settles
     INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS)
@@ -210,11 +212,13 @@ class MiniCPMOModel(Model):
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        knobs = {**DEFAULT_SAMPLING, **{
-            k: model_kwargs[k] for k in ("temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos")
-            if k in model_kwargs
-        }}
-        return {LLM_SAMPLER: SamplingReqConfig(**knobs)}
+        keys = (
+            "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos",
+            "return_logprobs", "logprobs_mode",
+        )
+        knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in keys if k in model_kwargs}}
+        # upstream generates from embeddings, so its penalty sees only generated tokens
+        return {LLM_SAMPLER: SamplingReqConfig(**knobs, penalize_prompt=False)}
 
     # ------------------------------------------------------------------
     # Graph
@@ -498,7 +502,9 @@ class MiniCPMOModel(Model):
             return self.model_path_hf
         from huggingface_hub import snapshot_download
 
-        return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
+        return snapshot_download(
+            repo_id=self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=["*.safetensors", "*.json"],
+        )
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:

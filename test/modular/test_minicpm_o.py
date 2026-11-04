@@ -141,13 +141,11 @@ def model():
 
 
 def an_image(h=448, w=640):
-    torch.manual_seed(0)
-    return torch.rand(3, h, w)
+    return torch.rand(3, h, w, generator=torch.Generator().manual_seed(0))
 
 
 def a_clip(seconds=3.0):
-    torch.manual_seed(1)
-    return 0.1 * torch.randn(int(16000 * seconds))
+    return 0.1 * torch.randn(int(16000 * seconds), generator=torch.Generator().manual_seed(1))
 
 
 @needs_ckpt

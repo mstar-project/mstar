@@ -159,8 +159,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 LLM_KV: KVStep(),
                 LLM_ATTN: AttentionStep(causal=True),
                 LLM_POS: PositionStep(),
-                # The prompt is not tracked: upstream generates from embeddings,
-                # so its penalty sees only generated tokens.
                 LLM_SAMPLER: SamplerStep(apply_penalty=True),
             },
         )
@@ -182,7 +180,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": self._forward(graph_walk, engine_inputs, input_embeds)}
+        return {"new_token": [self._forward(graph_walk, engine_inputs, input_embeds)]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
