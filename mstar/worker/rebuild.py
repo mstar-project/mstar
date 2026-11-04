@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from collections.abc import Collection, ItemsView, Mapping, MutableMapping
 from dataclasses import dataclass, replace
@@ -22,6 +23,8 @@ from mstar.worker.host_pool import HostCopy, HostPool
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.model.submodule_base import HostRows
+
+logger = logging.getLogger(__name__)
 
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
@@ -70,6 +73,8 @@ class Rebuilds:
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
+        # nodes that have logged a prompt the pool couldn't hold
+        self._logged_full: set[str] = set()
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
         """Copy the prompt of each row of the policy's walk whose request keeps no ids yet to the host, once
@@ -89,6 +94,14 @@ class Rebuilds:
             copy = self._pool.copy_out(prompt, node_batch.completion_event)
             if copy is not None:
                 kept[rid] = KeptIds(copy, array("i"))
+            elif node_batch.node_name not in self._logged_full:
+                self._logged_full.add(node_batch.node_name)
+                logger.warning(
+                    "%s: the rebuild host pool has no room for a %d-byte prompt, with %d of %d bytes in use, so its "
+                    "request keeps no ids and can't be dropped. Only the first on each node is logged, and the "
+                    "serving config's rebuild_host_mb sizes the pool.",
+                    node_batch.node_name, prompt.nbytes, self._pool.nbytes_used(), self._pool.nbytes,
+                )
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
