@@ -872,6 +872,10 @@ def _merged_checkpoint(args, out: Path, adapter_path: str) -> Path:
         alias.update({k: f"{names[0]}.weight" for k in (spec.module_map.rules.native(f"{n}.weight") for n in names)
                       if k is not None})
     out.mkdir(parents=True, exist_ok=True)
+    # every file holding a tensor is merged, not the first: a snapshot can hold another
+    # checkpoint under the same names (Chatterbox's multilingual T3 beside t3_cfg), and
+    # the loader reads only one of them
+    merged = set()
     for path in snapshot.rglob("*"):
         target = out / path.relative_to(snapshot)
         if path.is_dir():
@@ -884,11 +888,12 @@ def _merged_checkpoint(args, out: Path, adapter_path: str) -> Path:
             os.symlink(path.resolve(), target)
             continue
         for k in hit:
-            delta = deltas.pop(alias[native(k)])
-            tensors[k] = (tensors[k].float() + delta.view_as(tensors[k])).to(tensors[k].dtype)
+            name = alias[native(k)]
+            merged.add(name)
+            tensors[k] = (tensors[k].float() + deltas[name].view_as(tensors[k])).to(tensors[k].dtype)
         save_file(tensors, str(target))
-    if deltas:
-        raise SystemExit(f"merge: {sorted(deltas)[:5]} are in no checkpoint shard")
+    if missing := sorted(set(deltas) - merged):
+        raise SystemExit(f"merge: {missing[:5]} are in no checkpoint shard")
     return out
 
 
