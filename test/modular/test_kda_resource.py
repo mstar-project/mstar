@@ -141,9 +141,8 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 def test_default_kernels(monkeypatch):
     """The resource picks the fused kernels where they run the pool and the layers it binds,
     and the torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline
-    PTX), at a head dim or activation dtype they aren't validated for, and for a layer with a
-    full-rank output gate or a forget-gate bound past what their decay blocks hold. A spec that
-    leaves the config's default backend builds."""
+    PTX), at a head dim they aren't validated for, and for a layer with a full-rank output gate.
+    A spec that leaves the config's default backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     assert not kda.prefill_capturable
@@ -160,14 +159,36 @@ def test_default_kernels(monkeypatch):
     kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=False)
     assert isinstance(kda.kernels, TritonKDAKernels) and kda.prefill_capturable
     assert isinstance(built_on_cuda(dim=16).kernels, TorchKDAKernels)
-    assert isinstance(built_on_cuda(dim=128, conv_dtype=torch.float16).kernels, TorchKDAKernels)
-    for gate in (dict(lower_bound=-5.0, full_rank_output_gate=True),
-                 dict(lower_bound=-6.0, full_rank_output_gate=False)):
-        kda = built_on_cuda(dim=128)
-        kda.bind_layer(**gate)
-        assert isinstance(kda.kernels, TorchKDAKernels), gate
+    kda = built_on_cuda(dim=128)
+    kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=True)
+    assert isinstance(kda.kernels, TorchKDAKernels)
     monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
     assert isinstance(built_on_cuda(dim=128).kernels, TorchKDAKernels)
+    # the torch reference takes any activation dtype and bound
+    assert isinstance(built_on_cuda(dim=128, conv_dtype=torch.float16).kernels, TorchKDAKernels)
+
+
+def test_what_the_fused_kernels_cant_run_is_refused_at_load(monkeypatch):
+    """Where the fused kernels would run, an activation dtype or a forget-gate bound they don't
+    take is a ValueError at build or bind, not a fall back to the torch reference (which also
+    leaves prefill uncaptured)."""
+    from mstar.engine.resources.linear_attn import kda as kda_mod
+
+    monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
+    pool_spec, kda_spec = specs(dim=128, conv_dtype=torch.float16)
+    with pytest.raises(ValueError, match="take bf16 activations.*float16"):
+        build_resource(kda_spec, EngineResourceInfo(
+            device=torch.device("cuda"), dependencies={POOL: pool_spec},
+        ))
+    pool_spec, kda_spec = specs(dim=128)
+    kda = build_resource(kda_spec, EngineResourceInfo(
+        device=torch.device("cuda"), dependencies={POOL: pool_spec},
+    ))
+    with pytest.raises(ValueError, match="bound -6.0 is below the fused kernels' -5"):
+        kda.bind_layer(lower_bound=-6.0, full_rank_output_gate=False)
+    # a full-rank gate runs the torch reference, which takes any bound
+    kda.bind_layer(lower_bound=-6.0, full_rank_output_gate=True)
+    assert isinstance(kda.kernels, TorchKDAKernels)
 
 
 def test_eager_plans():

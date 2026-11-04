@@ -104,8 +104,9 @@ class KDAPlan:
 
 
 def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, conv_dtype: torch.dtype):
-    """The fused kernels where they run the pool's shape, else the torch reference. The layers'
-    gates can still move it to the reference (`KDAManager.bind_layer`)."""
+    """The fused kernels where they run the pool's shape, else the torch reference. Where they
+    would run, a dtype they don't take is a config error, not a slow fallback. A full-rank output
+    gate can still move it to the reference (`KDAManager.bind_layer`)."""
     # the Triton kernels inline NVIDIA PTX
     if device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON:
         return kda_torch.TorchKDAKernels()
@@ -114,7 +115,11 @@ def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, conv_dtyp
     elif geometry.conv_kernel_size != 4:
         reason = f"conv width {geometry.conv_kernel_size}"
     elif conv_dtype is not torch.bfloat16:
-        reason = f"{conv_dtype} activations"
+        raise ValueError(
+            f"kda: the fused kernels take bf16 activations, but the pool's conv block is "
+            f"{conv_dtype}; load the KDA layers in bf16 and declare the pool's conv block "
+            "the same (DeltaNetGeometry.to_blocks(conv_dtype=torch.bfloat16))"
+        )
     else:
         return kda_triton.TritonKDAKernels()
     logger.warning("kda: the fused kernels don't run %s; the torch reference runs", reason)
@@ -168,22 +173,25 @@ class KDAManager(LinearAttnManager):
         self._cached_plan_output: dict[str, KDAPlan] | None = None
 
     def bind_layer(self, *, lower_bound: float, full_rank_output_gate: bool) -> None:
-        """A layer's gates, as it binds. The fused kernels apply only the low-rank output gate
-        and a forget-gate bound their decay blocks hold, so a layer they can't run moves every
-        layer to the torch reference."""
+        """A layer's gates, as it binds. The fused kernels apply only the low-rank output gate,
+        so a full-rank one moves every layer to the torch reference; a forget-gate bound past
+        what their decay blocks hold is refused."""
         if not isinstance(self.kernels, kda_triton.TritonKDAKernels):
             return
-        cfg = self.kernels.config
         if full_rank_output_gate:
-            reason = "a full-rank output gate"
-        elif not kda_triton.bound_fits(lower_bound, min(cfg.row_block, cfg.chunk)):
-            reason = f"forget-gate bound {lower_bound}"
-        else:
+            if self._current or self._preplanned:
+                raise RuntimeError("kda: a layer bound after the resource planned with its kernels")
+            logger.warning("kda: the fused kernels don't run a full-rank output gate; the torch "
+                           "reference runs")
+            self.kernels = kda_torch.TorchKDAKernels()
             return
-        if self._current or self._preplanned:
-            raise RuntimeError("kda: a layer bound after the resource planned with its kernels")
-        logger.warning("kda: the fused kernels don't run %s; the torch reference runs", reason)
-        self.kernels = kda_torch.TorchKDAKernels()
+        block = min(self.kernels.config.row_block, self.kernels.config.chunk)
+        if not kda_triton.bound_fits(lower_bound, block):
+            raise ValueError(
+                f"kda: forget-gate bound {lower_bound} is below the fused kernels' "
+                f"{-80.0 / (block // 2):g} (exp(|bound| * {block} / 2) must fit fp32); a "
+                "checkpoint with this bound needs a smaller kda_triton.PrefillConfig.row_block"
+            )
 
     @property
     def prefill_capturable(self) -> bool:
