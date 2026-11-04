@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer
+from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.components.norm import RMSNorm
 
@@ -109,11 +109,9 @@ class TTSBackbone(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor, *, label: str) -> torch.Tensor:
+        # as ``Qwen3DenseLM``: bind the label once, ``run_layers`` advances the index
         self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states=hidden_states)
-        return self.norm(hidden_states)
+        return run_layers(self.layers, hidden_states, self.norm)
 
 
 class MiniCPMTTS(nn.Module):
