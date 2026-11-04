@@ -44,7 +44,7 @@ def _unchunkable_nodes(
                 f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                 "report get_input_sequence_len"
             )
-        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
+        if parallel_groups.get_joint_group_for_node(node).sp_group.world_size > 1:
             off.add(node)
     if off:
         logger.warning(

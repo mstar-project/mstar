@@ -754,7 +754,15 @@ def _chunking_model():
 
 
 def _groups(sp=1):
-    return SimpleNamespace(get_sp_config_for_node=lambda node: SimpleNamespace(world_size=sp))
+    """The worker's real groups, so the call site can't drift from their API."""
+    from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+
+    groups = WorkerParallelGroups(num_workers=sp, global_rank=0)
+    if sp > 1:
+        sp_group = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(sp)))
+        groups.add("LLM", sp_group, "sp")
+        groups.node_to_instance_comm["LLM"] = sp_group
+    return groups
 
 
 def test_a_node_under_sp_has_its_chunking_turned_off(caplog):
