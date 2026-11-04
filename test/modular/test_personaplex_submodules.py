@@ -599,7 +599,7 @@ def test_capture_config_covers_both_generate_walks_up_to_the_batch_cap():
     from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
     for cap, sizes in ((1, [1]), (3, [1, 2, 3]), (8, [1, 2, 4, 8]), (12, [1, 2, 4, 8, 12]),
-                       (32, [1, 2, 4, 8, 16, 32])):
+                       (32, [1, 2, 4, 8, 16, 32]), (128, [1, 2, 4, 8, 16, 32, 64, 128])):
         (config,) = LMSubmodule(PersonaPlexLM(TINY), max_batch_size=cap).get_accelerator_graph_configs(
             torch.device("cpu"))
         assert isinstance(config, BatchedAcceleratorGraphConfig) and config.capture_batch_sizes == sizes

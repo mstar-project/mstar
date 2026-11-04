@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import socket
 import subprocess
 import sys
 import wave
@@ -699,3 +700,130 @@ def test_judge_is_blocked_without_an_asr_model():
 
     assert judge_blocked({"asr_model": "/models/whisper"}) == {}
     assert judge_blocked({})["judge"]["status"] == "BLOCKED"
+
+
+def _session_row(ttfa, stall, complete=True, samples=24000):
+    return {"complete": complete, "time_to_first_audio_s": ttfa, "stall_s": stall, "samples": samples}
+
+
+def test_goodput_counts_only_sessions_meeting_both_limits():
+    from benchmark.personaplex.sessions import slo_summary
+
+    rows = [
+        _session_row(0.1, 0.0),  # meets both
+        _session_row(0.1, 0.01),  # stall at the limit misses it
+        _session_row(0.2, 0.0),  # first audio at the limit misses it
+        _session_row(0.1, 0.0, complete=False),  # an incomplete session never counts
+    ]
+    summary = slo_summary(rows, wall=2.0)
+    assert (summary["met_slo"], summary["met_stall"], summary["met_ttfa"]) == (1, 2, 2)
+    assert summary["goodput_sessions_per_s"] == 0.5
+    assert summary["goodput_audio_s_per_s"] == 0.5
+    assert summary["stall_only_goodput_audio_s_per_s"] == 1.0
+    assert summary["ttfa_s"]["max"] == 0.2  # latencies of completed sessions only
+
+
+def test_goodput_of_a_cell_with_no_completed_session_is_zero():
+    from benchmark.personaplex.sessions import slo_summary
+
+    summary = slo_summary([_session_row(None, 0.0, complete=False, samples=0)], wall=1.0)
+    assert summary["met_slo"] == 0 and summary["goodput_audio_s_per_s"] == 0
+    assert summary["ttfa_s"]["p50"] is None
+
+
+def test_sessions_split_evenly_over_client_processes():
+    from benchmark.personaplex.sessions import split_sessions
+
+    assert split_sessions(1, 1) == [1]
+    assert split_sessions(1, 4) == [1]
+    assert split_sessions(128, 8) == [16] * 8
+    assert split_sessions(10, 4) == [3, 3, 2, 2]
+
+
+def test_client_processes_return_every_session(tmp_path):
+    """Real spawned clients against a closed port: each session comes back recording its failure."""
+    from benchmark.personaplex.sessions import run_sessions
+
+    clip = tmp_path / "user.wav"
+    with wave.open(str(clip), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(np.zeros(1920, dtype="<i2").tobytes())
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    results, wall = run_sessions(f"http://127.0.0.1:{port}", str(clip), "NATF2", 30, 3, client_procs=2)
+    assert len(results) == 3 and wall > 0
+    assert all("error" in row and len(row["pcm"]) == 0 for row in results)
+
+
+def test_sweep_yaml_sizes_the_pool_for_the_clip_and_lifts_the_full_length_cap(tmp_path):
+    import yaml
+
+    from benchmark.personaplex.sweep import sweep_config
+    from mstar.model.personaplex.personaplex_model import PersonaPlexModel
+
+    path = sweep_config("configs/personaplex.yaml", 128, 222, tmp_path / "config.yaml")
+    config = yaml.safe_load(Path(path).read_text())
+    assert config["model_kwargs"]["max_batch_size"] == 128
+    assert "max_concurrent_requests" not in config
+    # (222 + 128) forwards = 3 pages a request, plus the sink page
+    assert config["resources"]["lm_kv"] == {"page_size": 128, "max_num_pages": 385}
+    PersonaPlexModel(skip_weight_loading=True).validate_config_yaml(config, path)
+
+
+def _wave(valid=True, audio=10.0, requests=1.0, met=1, sessions=1, ttfa=0.1, stall=0.0):
+    return {"valid": valid, "sessions": sessions, "completed": sessions, "audio_seconds_throughput": audio,
+            "requests_per_s": requests, "goodput_sessions_per_s": requests, "goodput_audio_s_per_s": audio,
+            "stall_only_goodput_audio_s_per_s": audio, "met_slo": met, "met_stall": met, "met_ttfa": met,
+            "rows": [_session_row(ttfa, stall) for _ in range(sessions)]}
+
+
+def test_sweep_row_takes_the_median_wave_and_pools_latencies():
+    from benchmark.personaplex.sweep import aggregate
+
+    cell = aggregate(2, 30.0, [_wave(audio=1.0, sessions=2, met=2), _wave(audio=9.0, sessions=2, met=2, ttfa=0.5),
+                               _wave(audio=2.0, sessions=2, met=1)])
+    assert cell["status"] == "PASS" and cell["audio_s_per_s"] == 2.0
+    assert cell["sessions"] == 6 and cell["met_slo"] == 5
+    assert cell["ttfa_s"]["max"] == 0.5
+    assert aggregate(2, 30.0, [_wave(), _wave(valid=False)])["status"] == "FAIL"
+
+
+def test_sweep_summary_reports_the_highest_concurrency_where_every_session_met_the_slo():
+    from benchmark.personaplex.sweep import aggregate, summarize
+
+    cells = [aggregate(1, 1.0, [_wave()]), aggregate(4, 1.0, [_wave(sessions=4, met=4)]),
+             aggregate(8, 1.0, [_wave(sessions=8, met=7)]), {"concurrency": 16, "status": "FAIL", "error": "oom"},
+             {"concurrency": 32, "status": "NOT RUN", "reason": "Stopped"}]
+    assert summarize(cells)["highest_concurrency_meeting_slo"] == 4
+    assert summarize(cells[3:])["highest_concurrency_meeting_slo"] is None
+
+
+def test_sweep_stops_at_a_failed_cell_and_exits_nonzero(tmp_path, monkeypatch):
+    from benchmark.personaplex import sweep
+
+    clip = tmp_path / "user.wav"
+    with wave.open(str(clip), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(np.zeros(1920, dtype="<i2").tobytes())
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"server_config": "configs/personaplex.yaml"}))
+
+    def fake_cell(settings, args, concurrency, clip_frames):
+        if concurrency == 4:
+            raise RuntimeError("Server exited 1; inspect server.log")
+        return sweep.aggregate(concurrency, 1.0, [_wave()])
+
+    monkeypatch.setattr(sweep, "run_concurrency", fake_cell)
+    monkeypatch.setattr(sys, "argv", ["sweep", "--settings", str(settings), "--audio", str(clip),
+                                      "--sessions", "1", "4", "8", "--boot-rounds", "0",
+                                      "--output", str(tmp_path / "out")])
+    assert sweep.main() == 1
+    cells = json.loads((tmp_path / "out" / "sweep.json").read_text())["cells"]
+    assert [(c["concurrency"], c["status"]) for c in cells] == [(1, "PASS"), (4, "FAIL"), (8, "NOT RUN")]
+    assert "Server exited 1" in cells[1]["error"]
+    assert "concurrency" in (tmp_path / "out" / "sweep.csv").read_text()

@@ -112,7 +112,24 @@ Speech is 20 ms windows at or above `--voice-threshold` RMS for at least
 session fails or returns the wrong length of audio. A discarded warm-up wave
 runs first. The whole clip is uploaded at once, so zero underruns show the
 server keeps ahead of playback, not that it takes live input. It measures
-streamed delivery; `benchmark.runner` remains the throughput harness.
+streamed delivery; `benchmark.runner` remains the throughput harness. It also
+reports goodput: sessions/s and audio-s/s counting only sessions under the SLO
+(`--stall-limit` 10 ms total stall, `--ttfa-limit` 200 ms to first audio), and the
+counts meeting each limit alone.
+
+`python -m benchmark.personaplex.sweep` runs those cells across concurrency, by
+default 1 to 128, each on a fresh server with `max_batch_size` N. It reports time
+to first audio and stall percentiles, audio-s/s, req/s and goodput per N; boot time
+per N, plus cold and warm boots from emptied and filled compile caches; and, with
+`--asr-model`, the word error rate of one session per N against N=1 and against
+NVIDIA's reply (`--reference-wav`, a parity stage's `nvidia.wav`). Results go to
+`sweep.json` and `sweep.csv` after every cell. It takes the suite's settings file;
+`--resume` and `--deadline-seconds` split it across job lengths.
+
+The sweep's YAML sizes the KV pool for N copies of the one clip and sets no
+`max_concurrent_requests`, so a 128-session cell says nothing about 128 full-length
+requests. All N sessions of a wave start together, which is the hardest case for
+time to first audio. A cold boot may still read the weights from the OS page cache.
 
 ## Limits
 

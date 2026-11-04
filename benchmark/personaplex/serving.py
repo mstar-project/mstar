@@ -217,7 +217,7 @@ class Server:
         self.monitor = threading.Thread(target=monitor, daemon=True)
         self.monitor.start()
         try:
-            deadline = time.monotonic() + 420
+            deadline = time.monotonic() + self.settings.get("ready_timeout", 420)
             while time.monotonic() < deadline:
                 if self.process.poll() is not None:
                     raise RuntimeError(f"Server exited {self.process.returncode}; inspect server.log")

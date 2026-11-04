@@ -412,7 +412,7 @@ class LMSubmodule(ARNodeSubmodule):
         unchanged (sampling draws 7 extra samples on that frame).
         """
         del tp_world_size
-        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, geometric_batch_sizes
 
         dtype = self.lm.temporal.text_emb.weight.dtype
         provided = torch.zeros(1, cfg.NUM_CODEBOOKS, dtype=torch.bool, device=device)
@@ -422,13 +422,11 @@ class LMSubmodule(ARNodeSubmodule):
             tensor_inputs={"target": torch.zeros(1, cfg.NUM_CODEBOOKS, dtype=torch.long, device=device),
                            "provided": provided},
         )
-        cap = self._max_batch_size
-        sizes = sorted({size for size in (1, 2, 4, 8, 16, 32) if size <= cap} | {cap})
         return [BatchedAcceleratorGraphConfig(
             capture_graph_walk=cfg.GENERATE_WALK,
             replay_graph_walks=[cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK],
             single_request_inputs=template,
-            capture_batch_sizes=sizes,
+            capture_batch_sizes=geometric_batch_sizes(self._max_batch_size),
             compile=False,
             input_seq_dims={"input_embeds": 0, "target": 0, "provided": 0},
         )]
