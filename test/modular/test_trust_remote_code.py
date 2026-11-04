@@ -156,7 +156,9 @@ def test_nemotron_tokenizer_needing_repo_code_fails_without_running_it(monkeypat
     assert not marker.exists()
 
 
-# a MiniCPM-o 4.5 config.json, shrunk: the model reads it and the tokenizer only
+# a shrunk MiniCPM-o 4.5 config.json with just the fields MiniCPMOModel() parses;
+# the constructor reads this file and loads the tokenizer, and touches no weights.
+# hidden_size >= 128: the resampler has hidden_size // 128 heads
 MINICPM_O_CONFIG = {
     "version": "4.5", "hidden_size": 128, "num_attention_heads": 4, "query_num": 64,
     "vision_config": {}, "audio_chunk_length": 1.0, "audio_pool_step": 5,
