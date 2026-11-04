@@ -282,8 +282,7 @@ def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_req
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
     Worker._handle_allocation_failure(w, batch, node_batch)
     _remove(kv, "r")
-    # v comes back with its footprint, 9 of the 10 pages
-    _request(kv, "x", 1, arrival=3)
+    _request(kv, "x", 2, arrival=3)
 
     assert _ready(kv, "x"), "x waited behind v on the host"
     assert kv.is_offloaded("v") and "v" in kv._allotments, "v wasn't admitted ahead of x"

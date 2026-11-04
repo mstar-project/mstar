@@ -4,7 +4,9 @@ A new prompt waits in the runner's queue for room, since a pool admits only its 
 A request that grows past what it was allotted can't wait that way: every request beside it
 may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
 them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait in the queue at their
-arrival position, and come back guaranteed once their whole footprint fits, so none of them is preempted twice.
+arrival position. A request on the host returns once its pages and one more page fit, and a dropped request
+once its whole history and one more page fit. One that came back and runs short again waits for its shortage
+rather than moving itself again, unless an older request waits in the queue.
 So the oldest request always gets its page and finishes.
 """
 
@@ -166,8 +168,8 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _step(kv, "r", 1).ok, "the older request didn't get the page its victim freed"
     assert not _admitted(kv, "v"), "v came back into the room r needs to grow"
     _remove(kv, "r")
-    # its prompt's 5 pages and its decode cap's 4
-    assert _admitted(kv, "v") and kv._allotments["v"].pages == 9, "v didn't reserve its footprint"
+    # its history is the prompt's 5 pages and the sample its next step writes
+    assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
 
 
 def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
@@ -258,9 +260,10 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
         assert _queue(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait in the queue for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
-        assert kv._need("r", NODE, WALK, None) == kv._footprint("r"), "r's wait for its shortage outlived its drop"
+        returns = kv._dropped["r"].returns
+        assert kv._need("r", NODE, WALK, None) == returns, "r's wait for its shortage outlived its drop"
         _remove(kv, "older")
-        assert _admitted(kv, "r"), "r didn't return once its footprint fit"
+        assert _admitted(kv, "r"), "r didn't return once its history and a page fit"
     elif then == "waits":
         _remove(kv, "older")
         assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
@@ -309,16 +312,14 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
 
 
-def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_footprint():
+def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_prompt():
     kv = _pool()
     _request(kv, "v", 5, arrival=1)
     assert _ready(kv, "v") and _step(kv, "v", 2 * PAGE_SIZE).ok
 
     kv.drop("v")
 
-    assert kv._need("v", NODE, WALK, None) == 9, (
-        "v would return with room for the pages it wrote and run short on the rest"
-    )
+    assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
 
 
 @pytest.mark.usefixtures("backend")
@@ -524,54 +525,14 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
 
     _remove(kv, "r")
 
-    assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a")], "b returned ahead of a"
-    assert _ready(kv, "a") and kv._allotments["a"].remaining == 4, "a didn't reserve its footprint past its reload"
-    assert _queue(kv) == ["b"], "b came back without room for its footprint"
-
-
-def test_a_request_back_from_the_host_waits_until_its_footprint_fits_and_is_never_moved_again():
-    """A request came back from the host once its pages and one more page fit. On its next page the pool had no
-    room, so the request, the newest holding pages, moved to the host again."""
-    kv = _pool()
-    kv._cpu_pool = host._HostPool(64)
-    _running(kv, "o", 5, arrival=0)
-    _running(kv, "z", 3, arrival=2)
-    assert _step(kv, "o", 2 * PAGE_SIZE).ok, "o grows into the room"
-    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["z"], [], [])
-    _offload(kv, "z")
-    _request(kv, "p", 6, arrival=1)
-    assert not _ready(kv, "p")
-    _remove(kv, "o")
-    assert _ready(kv, "p") and _step(kv, "p", 6 * PAGE_SIZE).ok
-
-    assert not _ready(kv, "z"), "z came back beside p with room for less than it grows into"
-    _remove(kv, "p")
-    assert _ready(kv, "z") and "z" in kv._guaranteed, "z came back preemptible, so a shortage could move it again"
-    for _ in range(4):
-        assert _step(kv, "z", PAGE_SIZE).ok, "z, back with room for what it grows into, ran short"
-
-
-def test_a_request_back_from_a_drop_is_never_chosen_again():
-    kv = _pool()
-    _running(kv, "o", 3, arrival=0)
-    _running(kv, "v", 2, arrival=2)
-    assert _step(kv, "o", 5 * PAGE_SIZE).ok
-    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
-    _drop(kv, "v")
-    _request(kv, "a", 2, arrival=1)
-    _remove(kv, "o")
-    assert _ready(kv, "a") and _admitted(kv, "v")
-    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
-        pass
-
-    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
-
-    assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v was preempted a second time"
+    assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a"), (NODE, "b")], "b returned ahead of a"
+    assert _ready(kv, "a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
+    assert _ready(kv, "b") and not _queue(kv)
 
 
 def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():
-    """`Engine.reload_request` undoes a partial reload by offloading what it reloaded. The KV's offload refused a
-    request that came back guaranteed, so a failed reload left it resident in one pool and on the host in another."""
+    """`Engine.reload_request` undoes a partial reload by offloading what it reloaded, which the KV's offload must not
+    refuse for a request that came back from the host."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(64)
     _running(kv, "o", 5, arrival=0)
@@ -580,7 +541,7 @@ def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():
     assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["z"], [], [])
     _offload(kv, "z")
     _remove(kv, "o")
-    assert _admitted(kv, "z") and "z" in kv._guaranteed
+    assert _admitted(kv, "z")
     refusing = SimpleNamespace(
         supports_eviction=True, residency=lambda rid: Residency.ON_HOST, can_reload=lambda rid: True,
         reload=lambda rid: False,

@@ -463,10 +463,11 @@ from the newest requests, those that arrived after the request that ran short, u
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
 its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
 ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
-request on the host or dropped waits at its place in the queue until its whole footprint fits,
-and comes back guaranteed, so it is never preempted again. A request on the host then has its
-pages copied back, and a dropped one recomputes its KV in prefill chunks cut by its walk's
-chunk budget. A request that streams an output in
+request on the host waits at its place in the queue until its pages and one more page fit, and
+its pages are then copied back. A dropped request waits until its prompt, or its history and one
+more page if that is larger, fits, then recomputes its KV in prefill chunks cut by its walk's
+chunk budget. One that runs short again waits in the queue for the pages it lacks rather than
+moving itself again, unless an older request waits there. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
 are never preempted mid-stream. A request no drop can free, because it holds KV made from media
