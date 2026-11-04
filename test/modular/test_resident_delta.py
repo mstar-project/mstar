@@ -1563,6 +1563,48 @@ def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_cl
     assert _counts(follower) == _counts(leader), "x's allotment here isn't the footprint rank 0 allotted it"
 
 
+def test_a_follower_holds_the_class_and_allotment_rank_0_gave_a_request_as_its_step_admitted(monkeypatch):
+    """r sets the host's two pages aside at admission and grows past them, so rank 0 guarantees r inside the admit
+    of r's next page. The follower's host still has a page free when it admits that step, and deciding for itself it
+    kept r preemptible, on an allotment of the pages it held."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    leader._cpu_pool, follower._cpu_pool = host._HostPool(2), host._HostPool(3)
+    _ingest((leader, follower), "r", 2, arrival=1, rebuildable=False)
+    assert _admits(leader, "r")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for tokens in (2 * PAGE_SIZE, 1):
+        assert _step(leader, "r", tokens).ok and _step(follower, "r", tokens).ok
+    assert "r" in leader._guaranteed and "r" not in leader._cpu_pool.reserved
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert follower._guaranteed == leader._guaranteed, "r is preemptible here and never preempted on rank 0"
+    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower keeps host room r no longer needs"
+    assert _counts(follower) == _counts(leader), "r grows into pages here that rank 0 never allotted it"
+
+
+def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch):
+    """r's grant needs three pages past its allotment where the room has two, so rank 0 allots r those two and
+    drops v for the third. The follower replayed the earmark and the drop, and r's allotment there was two pages
+    short of rank 0's."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "r", 3 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "r", 3 * PAGE_SIZE).ok
+    victims = leader.preempt("r", outcome.reason.pages_short, _ENGINES[id(leader)]._runner.newer_than("r"), bool)
+    assert victims.to_drop == ["v"]
+    lead.drop_request(NODE, "v", 5 * PAGE_SIZE)
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "r's allotment here lacks the room rank 0 counted for its grant"
+
+
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
     """A node's second pool can hold a request back on every readiness check, undoing the first pool's allotment."""
     leader, lead = _pool_rank(monkeypatch, 0)
@@ -1571,6 +1613,21 @@ def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followe
     leader.unreserve("x")
 
     assert not lead.take_resident_delta(), "two moves per pass would pile up for each follower to replay"
+
+
+def test_an_allotment_undone_in_its_sweep_gives_the_host_room_back_on_the_followers_too(monkeypatch):
+    """Admitting x set host room aside for it, and undoing the allotment gives that room back. Cancelling the
+    RESERVE with its UNRESERVE left the follower replaying the room set aside alone, which kept it from the host."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(8)
+    _ingest((leader, follower), "x", 1, arrival=1, rebuildable=False)
+    assert _admits(leader, "x")
+    leader.unreserve("x")
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved == {}, "the follower keeps host room for x"
 
 
 def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
