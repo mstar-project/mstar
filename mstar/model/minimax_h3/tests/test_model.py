@@ -484,20 +484,6 @@ def _tiny_decode_case():
     return vae, H3Config(video_vae=vcfg), layout, torch.randn(2, layout.num_video_rows, 4 * 2 * 2)
 
 
-@pytest.mark.parametrize("count", [2, 3, 4])
-def test_split_decode_nodes_give_the_one_nodes_frames(count):
-    """``count`` clip shares through ``video_combine`` against one ``vae_decoder``; 4 leaves a share empty."""
-    from mstar.model.minimax_h3.submodules import H3VideoCombineSubmodule, H3VideoDecoderSubmodule
-
-    vae, config, layout, rows = _tiny_decode_case()
-    with torch.no_grad():
-        want = H3VideoDecoderSubmodule(vae, config).run_batch(rows, layout)["video_output"]
-        parts = [H3VideoDecoderSubmodule(vae, config, part=(i, count)).run_batch(rows, layout)[f"video_clips_{i}"]
-                 for i in range(count)]
-        got = H3VideoCombineSubmodule(config, count).run_batch(parts, layout)["video_output"]
-    assert got.dtype == torch.uint8 and torch.equal(got, want)
-
-
 def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
     import torch.distributed as dist
 

@@ -4,9 +4,7 @@
                                                -> condition_proj -> token refiner
     vae_encoder    -> H3VaeEncoderSubmodule    keyframes -> conditioning latent rows
     dit            -> H3DenoiseSubmodule       DenoiseLoopSubmodule over the packed-sequence DiT
-    vae_decoder    -> H3VideoDecoderSubmodule  video latent rows -> uint8 frames (or, as
-                                               vae_decoder_<i>, a share of the clips)
-    video_combine  -> H3VideoCombineSubmodule  the shares' clips -> uint8 frames
+    vae_decoder    -> H3VideoDecoderSubmodule  video latent rows -> uint8 frames
     audio_decoder  -> H3AudioDecoderSubmodule  audio latent rows -> 32 kHz stereo waveform
 
 Numerics follow the checkpoint's dtypes (bf16, with the reference's fp32 modules and
@@ -49,7 +47,6 @@ from mstar.model.minimax_h3.components.transformer import (
     rope_inv_freq,
     rope_table,
 )
-from mstar.model.minimax_h3.components.video_vae import ClipWalk
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
     KEYFRAME_ENCODE_SEED,
@@ -390,10 +387,6 @@ def clip_share(num_clips: int, index: int, count: int) -> range:
     return range(min(index * per, num_clips), min((index + 1) * per, num_clips))
 
 
-def video_clips_edge(index: int) -> str:
-    return f"video_clips_{index}"
-
-
 class _VideoFrames(nn.Module):
     """The decode's ends: latent rows to the VAE's input, and its output to frames."""
 
@@ -423,17 +416,15 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
     dropped, unpatchified, denormalized with the VAE's latent statistics, decoded in
     clips and tiles, the ImageNet normalization undone, clamped and rounded.
 
-    As part ``(index, count)`` of a decode spread over ``count`` nodes, it decodes only
-    its contiguous share of the clips (``clip_share``) and passes them on, stitched but
-    not yet cross-faded, to ``H3VideoCombineSubmodule``. As a sequence-parallel node
-    (``sp_group``), each rank decodes its share and the shares are gathered on every rank:
-    the DiT's ranks then decode in lockstep, scheduled by its rank 0 between denoise steps."""
+    As a sequence-parallel node (``sp_group``), each rank decodes its contiguous share of
+    the clips (``clip_share``) and the shares are gathered on every rank: the DiT's ranks
+    then decode in lockstep, scheduled by its rank 0 between denoise steps."""
 
     disable_torch_compile = True
+    output_keys = (VIDEO_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3Config, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 part: tuple[int, int] | None = None, compile_blocks: bool = False,
-                 sp_group: CommGroup | None = None):
+                 compile_blocks: bool = False, sp_group: CommGroup | None = None):
         super().__init__()
         self.vae = vae
         self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
@@ -444,8 +435,6 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         self._max_batch_size = max_batch_size
         # spatial tiles decoded per decoder call: 1 is the reference's order of work
         self.tile_batch = int(tile_batch)
-        self.part = part
-        self.output_keys = (VIDEO_OUTPUT,) if part is None else (video_clips_edge(part[0]),)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={LATENTS: inputs[LATENTS][0]},
@@ -461,13 +450,7 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         z = self.ends.latents(latents.to(self.get_device()), layout)
         if self.sp_group is not None:
             return {VIDEO_OUTPUT: self.ends.frames(self._decode_shared(z))}
-        if self.part is None:
-            return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
-        z, num_clips = self.vae.clip_plan(z)
-        clips = self.vae.decode_clips(z, clip_share(num_clips, *self.part), sdpa_attention, self.tile_batch)
-        # [B, clips, 3, F, H, W]; a part with no clips sends an empty run
-        out = torch.stack(clips, dim=1) if clips else z.new_zeros(z.shape[0], 0, 1, 1, 1, 1)
-        return {self.output_keys[0]: out}
+        return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
 
     def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
         """This rank's ``clip_share`` of the decode, all-gathered in clip order and cross-faded
@@ -481,41 +464,6 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         clips += [clips[-1]] * (per - len(clips))
         gathered = group.all_gather(torch.stack(clips), dim=0)[:num_clips]
         return self.vae.walk.assemble(list(gathered.unbind(0)), num_latents)
-
-
-class H3VideoCombineSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
-    """The clips of a decode spread over ``count`` parts, in order -> uint8 frames: the
-    temporal cross-fade and the frames' end of the decode (``H3VideoDecoderSubmodule``),
-    the same arithmetic as one node decoding every clip."""
-
-    disable_torch_compile = True
-    output_keys = (VIDEO_OUTPUT,)
-
-    def __init__(self, config: H3Config, count: int, max_batch_size: int = 1):
-        super().__init__()
-        self.ends = _VideoFrames(config)
-        self.count = count
-        self._max_batch_size = max_batch_size
-        self.walk = ClipWalk.of(config.video_vae)
-
-    def get_device(self):
-        return self.ends.pixel_mean.device  # no parameters, only the decode's statistics
-
-    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={video_clips_edge(i): inputs[video_clips_edge(i)][0] for i in range(self.count)},
-            resource_step_info=layout_from_metadata(fwd_info.step_metadata),
-        )
-
-    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
-        names = [video_clips_edge(i) for i in range(self.count)]
-        return {"parts": [torch.stack([inp.tensor_inputs[n] for inp in inputs]) for n in names],
-                "layout": inputs[0].resource_step_info}
-
-    def run_batch(self, parts: list[torch.Tensor], layout: H3Layout, **kwargs):
-        device = self.get_device()
-        clips = [clip.to(device) for part in parts for clip in part.unbind(1)]
-        return {VIDEO_OUTPUT: self.ends.frames(self.walk.assemble(clips, layout.latent_frames))}
 
 
 class H3AudioDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
@@ -552,5 +500,5 @@ class H3AudioDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
 
 __all__ = [
     "H3TextEncoderSubmodule", "H3VaeEncoderSubmodule", "H3DenoiseSubmodule", "H3VideoDecoderSubmodule",
-    "H3VideoCombineSubmodule", "H3AudioDecoderSubmodule", "clip_share", "layout_from_metadata", "video_clips_edge",
+    "H3AudioDecoderSubmodule", "clip_share", "layout_from_metadata",
 ]

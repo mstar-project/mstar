@@ -6,7 +6,7 @@ Nodes:
     vae_encoder    the keyframes' conditioning latents
     dit            the 50-block packed-sequence DiT, one step of both schedules per loop
                    iteration (guidance-distilled: one forward per step)
-    vae_decoder    the video VAE's ViT decoder (or vae_decoder_<i> + video_combine)
+    vae_decoder    the video VAE's ViT decoder (in the dit's SP group, a share of the clips per rank)
     audio_decoder  BigVGAN, 32 kHz stereo
 
 Walks: encode_text or encode_keyframes, then generate_{av,video,audio}[_keyframes]: the
@@ -75,9 +75,7 @@ from mstar.model.minimax_h3.submodules import (
     H3DenoiseSubmodule,
     H3TextEncoderSubmodule,
     H3VaeEncoderSubmodule,
-    H3VideoCombineSubmodule,
     H3VideoDecoderSubmodule,
-    video_clips_edge,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -95,7 +93,6 @@ GENERATE_WALKS = {
     frozenset({"audio"}): GENERATE_AUDIO_WALK,
 }
 KEYFRAMES_SUFFIX = "_keyframes"  # a generate walk whose dit also reads cond_latents
-VIDEO_COMBINE_NODE = "video_combine"
 
 
 def _positive_int(model_kwargs: dict, name: str, default: int | None) -> int | None:
@@ -147,8 +144,6 @@ def import_image_processor():
     return AutoImageProcessor
 
 
-def vae_part_node(index: int) -> str:
-    return f"{VAE_DECODER_NODE}_{index}"
 MAX_KEYFRAMES = 2
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 # A ceiling for the loop graph; a request runs its own step count (get_loop_caps).
@@ -177,7 +172,6 @@ class H3Model(Model):
         async_scheduling: bool = True,
         compile: bool = False,
         vae_tile_batch: int = 1,
-        vae_parallel: int = 1,
         vae_compile: bool = False,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -199,10 +193,7 @@ class H3Model(Model):
         self.async_scheduling = bool(async_scheduling)
         self.compile = bool(compile)  # the DiT's blocks
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
-        self.vae_parallel = int(vae_parallel)  # vae_decoder_<i> nodes the clips are split over
         self.vae_compile = bool(vae_compile)
-        if self.vae_parallel < 1:
-            raise ValueError(f"vae_parallel must be >= 1, got {vae_parallel}")
         self._snapshot = None
         self._config: H3Config | None = None
         self.tokenizer = None
@@ -274,25 +265,12 @@ class H3Model(Model):
     def _generate_walk(self, video: bool, audio: bool, keyframes: bool) -> GraphSection:
         decoders: list[GraphSection] = []
         loop_outputs: list[GraphEdge] = []
-        combine: GraphNode | None = None
-        if video and self.vae_parallel == 1:
+        if video:
             loop_outputs.append(GraphEdge(next_node=VAE_DECODER_NODE, name=LATENTS))
             decoders.append(GraphNode(
                 name=VAE_DECODER_NODE, enable_async_scheduling=self.async_scheduling, input_names=[LATENTS],
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=VIDEO_OUTPUT, output_modality="video")],
             ))
-        elif video:
-            for i in range(self.vae_parallel):
-                loop_outputs.append(GraphEdge(next_node=vae_part_node(i), name=LATENTS))
-                decoders.append(GraphNode(
-                    name=vae_part_node(i), enable_async_scheduling=self.async_scheduling, input_names=[LATENTS],
-                    outputs=[GraphEdge(next_node=VIDEO_COMBINE_NODE, name=video_clips_edge(i))],
-                ))
-            combine = GraphNode(
-                name=VIDEO_COMBINE_NODE, enable_async_scheduling=self.async_scheduling,
-                input_names=[video_clips_edge(i) for i in range(self.vae_parallel)],
-                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=VIDEO_OUTPUT, output_modality="video")],
-            )
         if audio:
             loop_outputs.append(GraphEdge(next_node=AUDIO_DECODER_NODE, name=AUDIO_LATENTS))
             decoders.append(GraphNode(
@@ -311,8 +289,7 @@ class H3Model(Model):
             max_iters=MAX_INFERENCE_STEPS,
             outputs=loop_outputs,
         )
-        sections = [loop, decoders[0] if len(decoders) == 1 else Parallel(decoders)]
-        return Sequential(sections + ([combine] if combine is not None else []))
+        return Sequential([loop, decoders[0] if len(decoders) == 1 else Parallel(decoders)])
 
     # ---------------------------------------------------------------- inputs
     def _ensure_tokenizer(self):
@@ -702,13 +679,6 @@ class H3Model(Model):
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
                                            tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
                                            sp_group=sp_group)
-        if node_name.startswith(VAE_DECODER_NODE + "_"):
-            part = (int(node_name.rsplit("_", 1)[1]), self.vae_parallel)
-            return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, part=part,
-                                           compile_blocks=self.vae_compile)
-        if node_name == VIDEO_COMBINE_NODE:
-            return H3VideoCombineSubmodule(config, self.vae_parallel)
         if node_name == AUDIO_DECODER_NODE:
             return H3AudioDecoderSubmodule(weight_loader.build_audio_vae(config, snapshot, device), config)
         logger.warning("MiniMax-H3 has no submodule for node %r; running it dummy", node_name)

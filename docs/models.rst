@@ -1750,10 +1750,8 @@ and a ViT video VAE, at 24 fps with 32 kHz stereo audio. Not ported: ``Ref2VA``
 Nodes: ``text_encoder`` (Qwen3-VL through layer 50, keyframes through its vision tower,
 then the DiT's ``condition_proj`` and token refiner, once per request), ``vae_encoder``
 (keyframes), ``dit`` (the DiT scaffold's denoise loop; Ulysses sequence parallel),
-``vae_decoder`` and ``audio_decoder``. With ``vae_parallel: N`` the video decode is split
-by clips over ``vae_decoder_0`` .. ``vae_decoder_<N-1>`` (place them on the DiT's ranks)
-and cross-faded by ``video_combine``, with the same pixels as one decoder. Placed with the
-``dit`` in its sequence-parallel group instead, ``vae_decoder`` splits the clips over the
+``vae_decoder`` and ``audio_decoder``. Placed with the
+``dit`` in its sequence-parallel group, ``vae_decoder`` splits the clips over the
 DiT's ranks itself and runs in lockstep with it, scheduled by its rank 0 between denoise
 steps, so a finished clip does not wait for another request's denoise
 (``configs/minimax_h3_sp2.yaml``).
@@ -1783,8 +1781,7 @@ binary on the server's ``PATH`` and falls back to video only without it.
 
 Deployment knobs: ``compile`` (the DiT's blocks, static per packed row count: each new count
 compiles once, ~8 s; past the engine's recompile limit new counts run eager), ``vae_tile_batch`` (256-px tiles per
-decoder call; 28 is one 768p clip), ``vae_parallel`` (a per-model stand-in for decode
-parallelism the engine does not provide yet), ``vae_compile`` (the decoder's blocks: a
+decoder call; 28 is one 768p clip), ``vae_compile`` (the decoder's blocks: a
 768p clip's share decodes in 2.1 s instead of 3.2 s on one H200, and the frames of the
 reference's latents stay within 62.9 dB of eager, 96.6% of bytes equal; on in
 ``configs/minimax_h3_sp2.yaml``), ``attention_backend`` (``flashinfer``, or ``sdpa``, the
@@ -1813,8 +1810,6 @@ to end through ``/v1/videos/generations``:
      - 90.5
    * - ``compile``
      - 81.4
-   * - ``compile``, ``vae_parallel: 4``
-     - 77.4
    * - ``compile``, ``vae_decoder`` in the DiT's SP group, ``vae_compile``
        (``configs/minimax_h3.yaml``)
      - 75.3
