@@ -227,7 +227,9 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
     fails here, in the mstar change that adds it."""
     out = run_sim("""
         import ast, importlib, pathlib, re, torch
-        from mstar_sim import cuda, device, libcuda
+        from mstar_sim import cuda, device, libcuda, patches
+
+        assert not patches.SKIPPED, f"patches no longer apply to this mstar: {patches.SKIPPED}"
 
         def dotted(node):
             parts = []

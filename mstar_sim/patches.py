@@ -13,10 +13,11 @@
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
 
 Each patch checks every mstar name it relies on at install, whether or not its
-option is on (:func:`_require`), so a target mstar renamed stops every run with
-the name that moved, never a run with the patch silently missing. Every test in
-``mstar_sim/tests`` installs the emulator against the checked-out mstar, so the
-mstar change that moves a target fails CI.
+option is on (:func:`_require`). One whose target is missing is skipped with a
+warning naming it (``SKIPPED``), so the emulator still runs on an older tree
+(a bisect, a corpus of old bugs). On the current tree none may be skipped:
+``mstar_sim/tests/test_device.py`` checks that in CI, so the mstar change that
+moves a target fails there.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import sys
 
 import torch
 
@@ -262,13 +264,14 @@ def header_only_weights() -> None:
 
     global _real_safe_open
     _real_safe_open = _real_safe_open or safetensors.safe_open
-    iterators = importlib.import_module("mstar.model.loader.iterators")
-    _replace(iterators, "safe_open", _MetaSafeOpen)  # mstar's own target first: none or all apply
+    # the library first: weights stay header-only even where mstar's own reader moved
     safetensors.safe_open = _MetaSafeOpen
     safetensors.torch.safe_open = _MetaSafeOpen
     safetensors.torch.load_file = lambda path, device="cpu": {
         k: _read(path, k) if _small(v) else _meta(v) for k, v in _header(path).items()
     }
+    iterators = importlib.import_module("mstar.model.loader.iterators")
+    _replace(iterators, "safe_open", _MetaSafeOpen)
 
     real_read = iterators._read_tensor
 
@@ -312,7 +315,14 @@ def install() -> None:
             raise  # mstar is there but broken: not a run to make without the patches
         return  # not an mstar process
     for patch in PATCHES:
-        patch()  # a failure stops the process (sitecustomize), naming what moved
+        try:
+            patch()
+        except (ImportError, AttributeError) as e:
+            SKIPPED.append((patch.__name__, str(e)))
+            print(f"mstar_sim: WARNING: patch {patch.__name__} skipped: {e}", file=sys.stderr, flush=True)
+
+
+SKIPPED: list[tuple[str, str]] = []
 
 
 PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag)
