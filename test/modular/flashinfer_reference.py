@@ -4,6 +4,7 @@ attention managers without a GPU (install with ``sys.modules["flashinfer"] = ref
 A helper module rather than ``conftest.py``: several ``conftest.py`` share CPU Core's paths, so a
 test can't import one of them by name reliably."""
 
+import importlib.machinery
 import itertools
 import math
 import types
@@ -32,6 +33,9 @@ def reference_flashinfer() -> types.ModuleType:
     whose first queries FlashInfer's bottom-right mask leaves none. The ragged one attends each
     row's queries over its own keys (``kv_indptr``), and reads keys past its plan as FA3 does."""
     fi = types.ModuleType("flashinfer")
+    # a spec, as an imported module has: importlib.util.find_spec (diffusers probes for
+    # flashinfer when first imported) raises on a module in sys.modules whose __spec__ is None
+    fi.__spec__ = importlib.machinery.ModuleSpec("flashinfer", None)
 
     class Paged:
         base = "log2"
