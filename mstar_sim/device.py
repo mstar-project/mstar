@@ -853,6 +853,25 @@ _ALLOCATORS = {torch.empty, torch.zeros, torch.ones, torch.full, torch.randn, to
                torch.empty_strided}
 
 
+# The ``torch.ops`` namespaces mstar may call and how each runs on the emulated GPU
+# (read by the contract test in tests/test_device.py). Compiled CUDA extensions are
+# not built on a CPU box, so mstar takes its torch path for them.
+OPS_NAMESPACES = {
+    "aten": "dispatched and priced",
+    "prims": "dispatched and priced",
+    "mstar": "Python custom ops: their bodies run on the emulated GPU",
+    "_C": "mstar's compiled CUDA extension: not built here, mstar takes its torch path",
+    "_mstar_moe_C": "mstar's compiled MoE extension: not built here, mstar takes its torch path",
+    "_xpu_C": "XPU only",
+    "symm_mem": "symmetric memory needs NVSHMEM: absent here, mstar keeps NCCL",
+}
+# Python packages for CUDA mstar may import, absent on the emulated GPU, and why
+# that is right
+ABSENT_MODULES = {
+    "cuda": "cuda-python: the KV page copier falls back to its torch copy, which is priced",
+}
+
+
 # --------------------------------------------------------------- installation
 
 _installed = False

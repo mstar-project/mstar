@@ -13,6 +13,7 @@ import itertools
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -170,6 +171,7 @@ class Stream:
         self.stream_id = next(_ids)
         self.cuda_stream = self.stream_id
         self.timeline = clock.Timeline(f"stream{self.stream_id}")
+        _STREAMS[self.stream_id] = self
 
     def wait_event(self, event: Event) -> None:
         if event is not None and event.t is not None:
@@ -282,18 +284,25 @@ def synchronize(device=None) -> None:
     clock.wait_until(max([clock.DEFAULT.free_at, *streams]))
 
 
-_live_streams: list = []
 
 
 def _all_streams():
-    return [current_stream(), *_defaults.values()]
+    return list(_STREAMS.values())
+
+
+# every live stream by its handle (``cuda_stream``): what a device-wide sync
+# waits on, and what an ``ExternalStream`` of a raw handle names
+_STREAMS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def ExternalStream(stream_ptr: int, device=None, **_):  # noqa: N802  (torch.cuda.ExternalStream)
+    stream = _STREAMS.get(stream_ptr)
+    if stream is None:
+        raise RuntimeError(f"mstar_sim: no emulated stream has the handle {stream_ptr}")
+    return stream
 
 
 # ------------------------------------------------------------------- graphs
-
-
-class _Pool:
-    pass
 
 
 def graph_pool_handle():
@@ -372,6 +381,14 @@ def _noop_ctx(*_, **__):
     yield
 
 
+# the CUDA names mstar may reach that are not stand-ins, and why that is right on
+# the emulated GPU (read by the contract test in tests/test_device.py)
+PASSTHROUGH = {
+    "torch.cuda.OutOfMemoryError": "an exception class, nothing to emulate",
+    "torch.cuda.nvtx": "a namespace; install() makes its range and mark functions no-ops",
+}
+
+
 def _noop(*_, **__):
     return None
 
@@ -395,6 +412,13 @@ class Generator(_TorchGenerator):
     @property
     def device(self):
         return self._sim_device or _TorchGenerator.device.__get__(self)
+
+
+TORCH_C = {
+    "_cuda_clearCublasWorkspaces": _noop,
+    # a raw ``cudaStream_t``: the stream's id (no raw CUDA call takes it here, libcudart is refused)
+    "_cuda_getCurrentRawStream": lambda device=None: current_stream().cuda_stream,
+}
 
 
 def install() -> None:
@@ -421,6 +445,7 @@ def install() -> None:
         "set_per_process_memory_fraction": set_per_process_memory_fraction,
         "get_per_process_memory_fraction": get_per_process_memory_fraction,
         "Stream": Stream,
+        "ExternalStream": ExternalStream,
         "Event": Event,
         "current_stream": current_stream,
         "default_stream": default_stream,
@@ -450,7 +475,8 @@ def install() -> None:
     tc.nvtx.mark = _noop
     tc.nvtx.range = _noop_ctx
     torch.version.cuda = torch.version.cuda or "12.8"
-    torch._C._cuda_clearCublasWorkspaces = _noop
+    for name, value in TORCH_C.items():
+        setattr(torch._C, name, value)
     from mstar_sim import libcuda
 
     libcuda.install()

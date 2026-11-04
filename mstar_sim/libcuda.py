@@ -94,6 +94,15 @@ class LibCuda:
     __getitem__ = __getattr__
 
 
+# the native libraries mstar may load through ctypes, and what the emulator does
+# (read by the contract test in tests/test_device.py)
+LIBRARIES = {
+    "libcuda": "this stand-in (graph introspection, contexts)",
+    "libcudart": "refused, as on a box without the runtime: mstar takes its torch copy, which is priced",
+    "libamdhip64": "ROCm only: mstar never loads it on a CUDA device",
+}
+
+
 def install() -> None:
     """``libcuda`` is this stand-in. ``libcudart`` refuses to load, as on a box
     without the runtime: mstar's raw ``cudaMemcpyAsync`` paths (``h2d``, the KV
