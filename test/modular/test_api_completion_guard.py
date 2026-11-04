@@ -157,6 +157,11 @@ MODELS = {
     ),
     "qwen3_tts": _qwen3_tts,
     "vjepa2": lambda: _bare("vjepa2.vjepa2_model", "VJepa2Model", config=SimpleNamespace(frames_per_clip=64)),
+    "voxcpm2": lambda: _bare(
+        "voxcpm2.voxcpm2_model", "VoxCPM2Model",
+        config=SimpleNamespace(audio_vae=SimpleNamespace(sample_rate=16_000)),
+    ),
+    "nemotron_duplex": lambda: _bare("nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
 }
 
 
@@ -239,6 +244,8 @@ def _path(tmp_path, name):
     ("omnivoice", "audio", "garbage.m4a"),
     ("fish_s2_pro", "audio", "garbage.wav"),  # libsndfile alone
     ("qwen3_tts", "audio", "garbage.wav"),
+    ("voxcpm2", "audio", "garbage.wav"),
+    ("nemotron_duplex", "audio", "garbage.wav"),
     ("base", "video", "garbage.mp4"),  # torchcodec
     ("vjepa2", "video", "garbage.mp4"),
 ])
@@ -261,6 +268,8 @@ def test_an_upload_that_will_not_decode_is_a_400(tmp_path, monkeypatch, model, m
     ("chatterbox", "audio", "garbage.m4a", _allocation_fails),
     ("base", "video", "garbage.mp4", _allocation_fails),
     ("base", "video", "removed.mp4", _upload_removed),
+    ("voxcpm2", "audio", "removed.wav", _upload_removed),
+    ("nemotron_duplex", "audio", "removed.wav", _upload_removed),
 ])
 def test_a_server_fault_while_decoding_an_upload_is_a_500(tmp_path, monkeypatch, model, modality, name, fault):
     loader = MODELS[model]()
