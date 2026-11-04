@@ -472,10 +472,11 @@ moving itself again, unless an older request waits there. A request that streams
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
 are never preempted mid-stream. A request no drop can free, because it holds KV made from media
 or another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
-when it is admitted the host pool sets room for its whole footprint aside, and it reserves only
-its prompt. When the host pool can't, it reserves its whole footprint in that pool, as a voice
-request does. So ``cpu_offload_pages`` also sets how many such requests run at once with only
-their prompt reserved.
+when it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt.
+The room grows with each page the request takes after that, so its move always fits. When the
+host pool has no room for it, at admission or later, the request reserves its whole footprint in
+that pool, as a voice request does, and the host pool logs it. So ``cpu_offload_pages`` also sets
+how many pages such requests can hold with only their prompt reserved.
 
 Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
 step that finds no page and nothing to offload holds its requests until they time out. Elsewhere

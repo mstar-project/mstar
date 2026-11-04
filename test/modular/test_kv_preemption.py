@@ -641,8 +641,8 @@ def test_a_guaranteed_request_is_never_moved_to_the_host():
     )
 
 
-@pytest.mark.parametrize("host_pages, guaranteed", [(None, True), (4, True), (64, False)], ids=[
-    "no host pool", "a host pool short of its footprint", "a host pool with room",
+@pytest.mark.parametrize("host_pages, guaranteed", [(None, True), (1, True), (64, False)], ids=[
+    "no host pool", "a host pool short of its prompt", "a host pool with room",
 ])
 def test_a_request_no_drop_can_free_reserves_its_footprint_only_when_the_host_cant_set_it_aside(
     host_pages, guaranteed,
@@ -657,12 +657,12 @@ def test_a_request_no_drop_can_free_reserves_its_footprint_only_when_the_host_ca
     assert ("r" in kv._guaranteed, kv._allotments["r"].pages) == (guaranteed, 6 if guaranteed else 2), (
         "the class didn't follow the room the host can set aside"
     )
-    assert host_pages is None or kv._cpu_pool.reserved == ({} if guaranteed else {"r": 6})
+    assert host_pages is None or kv._cpu_pool.reserved == ({} if guaranteed else {"r": 2})
 
 
 def test_a_victim_that_can_be_rebuilt_never_moves_into_room_set_aside_on_the_host():
     kv = _pool()
-    kv._cpu_pool = host._HostPool(8)
+    kv._cpu_pool = host._HostPool(4)
     _running(kv, "o", 3, arrival=0)
     _running(kv, "r", 2, arrival=1, rebuildable=False)
     _running(kv, "v", 3, arrival=2)
@@ -676,7 +676,7 @@ def test_a_victim_that_can_be_rebuilt_never_moves_into_room_set_aside_on_the_hos
 
 def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
     kv = _pool()
-    kv._cpu_pool = host._HostPool(8)
+    kv._cpu_pool = host._HostPool(4)
     _running(kv, "o", 3, arrival=0)
     _running(kv, "r", 2, arrival=1, rebuildable=False)
     _running(kv, "x", 2, arrival=2)

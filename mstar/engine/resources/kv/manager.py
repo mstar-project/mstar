@@ -699,7 +699,7 @@ class KVManager(AttentionResource):
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
-        #   first `ask`.
+        #   first `ask`, or later when the host has no room to set aside for their move.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -4550,14 +4550,11 @@ class KVManager(AttentionResource):
             if rid not in self._asks:
                 overrides = self._overrides[rid]
                 prompt = overrides.pages(self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config)
-                footprint = self._footprint(rid)
-                # A request that no drop here can free, and that the host can't set room aside for, would wait
-                # holding its pages once it ran short, so it reserves what it grows into.
-                if overrides.unpausable or not (
-                    overrides.rebuildable or self._cpu_pool is not None and self._cpu_pool.reserve(rid, footprint)
-                ):
+                # A request that no drop here can free, and that no host can take, would wait holding its pages once
+                # it ran short, so it reserves what it grows into.
+                if overrides.unpausable or not (overrides.rebuildable or self._cpu_pool is not None):
                     self._guaranteed.add(rid)
-                pages = footprint if rid in self._guaranteed else prompt
+                pages = self._footprint(rid) if rid in self._guaranteed else prompt
                 capacity = self.config.request_pages
                 if pages > capacity:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
@@ -4596,6 +4593,17 @@ class KVManager(AttentionResource):
             if rid in self._allotments:
                 self._allot(rid, self._asks.pop(rid))
                 return None
+            # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
+            # grows it page by page. With no room for even that, the request reserves what it grows into.
+            if (
+                not self._overrides[rid].rebuildable and rid not in self._guaranteed
+                and rid not in self._cpu_pool.reserved and not self._cpu_pool.reserve(rid, self._asks[rid])
+            ):
+                self._guarantee(rid)
+                self._asks[rid] = self._footprint(rid)
+                pages = self._need(rid, node_name, graph_walk, published)
+                if pages > room:
+                    return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), returning=returning)
             self._recount(rid)
@@ -4606,6 +4614,39 @@ class KVManager(AttentionResource):
             allotment = self._allotments.pop(rid)
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
+            # a request that holds nothing waits in the queue with no room set aside on the host
+            if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
+                self._cpu_pool.unreserve(rid)
+
+    def _guarantee(self, rid: str) -> None:
+        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
+        self._guaranteed.add(rid)
+        self._cpu_pool.unreserve(rid)
+        self._cpu_pool.count_guaranteed(rid)
+
+    def _cover_move(self, rid: str, n: int) -> int:
+        """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
+        when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
+        nothing."""
+        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
+        if reserved is None:
+            return 0
+        # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
+        held = sum(
+            len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
+            for stream in self._streams[rid].values()
+        )
+        if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
+            return 0
+        allotment = self._allotments[rid]
+        grows = max(0, self._footprint(rid) - held)
+        short = grows - allotment.remaining - self._room()
+        if short > 0:
+            return short
+        self._guarantee(rid)
+        allotment.pages = self._held(rid) + grows
+        self._recount(rid)
+        return 0
 
     def grew_since(self, mark: RoomMark) -> bool:
         """A newly filed page can raise a waiting request's hit, and a hit page another request
@@ -5081,12 +5122,13 @@ class KVManager(AttentionResource):
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
             if num_new_pages > 0:
+                short = self._cover_move(request_id, num_new_pages)
                 allotment = self._allotments.get(request_id)
                 within = 0 if allotment is None else min(num_new_pages, allotment.remaining)
-                new_pages = self._grant(request_id, label, num_new_pages, num_new_pages - within)
+                new_pages = None if short else self._grant(request_id, label, num_new_pages, num_new_pages - within)
                 if new_pages is None:
                     available = self._allowance(request_id)
-                    pages_short = num_new_pages - available
+                    pages_short = short or num_new_pages - available
                     if self._decides:
                         self._ran_short[request_id] = self._room()
                     return AllocResult(

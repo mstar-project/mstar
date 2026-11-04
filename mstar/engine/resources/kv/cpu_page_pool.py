@@ -99,6 +99,8 @@ class CPUPagePool:
         self.written = 0
         self.cancelled = 0
         self._dropped_logged_at: float | None = None
+        self.guaranteed = 0
+        self._guaranteed_logged_at: float | None = None
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
@@ -114,9 +116,10 @@ class CPUPagePool:
         return pages
 
     def reserve(self, rid: str, pages: int) -> bool:
-        """Set ``pages`` aside for ``rid``'s move here, or return False when the room isn't there. The cached pages
-        the room counts are evicted now, since a host fetch could hold them by the time ``rid`` moves."""
-        if pages > self.room():
+        """Set ``pages`` aside for ``rid``'s move here, in place of what was set aside for it, or return False when
+        the room isn't there. The cached pages the room counts are evicted now, since a host fetch could hold them by
+        the time ``rid`` moves."""
+        if pages > self.arena.num_free + len(self.index.evictable()) - self._set_aside(rid):
             return False
         self.reserved[rid] = pages
         if (kept := self._set_aside(None)) > self.arena.num_free:
@@ -125,6 +128,18 @@ class CPUPagePool:
 
     def unreserve(self, rid: str) -> None:
         self.reserved.pop(rid, None)
+
+    def count_guaranteed(self, rid: str) -> None:
+        """Log that the pool had no room to set aside for ``rid``'s move, so ``rid`` reserves its whole footprint on
+        the device."""
+        self.guaranteed += 1
+        now = time.monotonic()
+        if self._guaranteed_logged_at is None or now - self._guaranteed_logged_at >= _EXHAUSTED_LOG_INTERVAL:
+            logger.warning(
+                "CPU page pool full: no room to set aside for %s's move here, so it reserves its whole KV footprint "
+                "on the device (%d requests so far)", rid, self.guaranteed,
+            )
+            self._guaranteed_logged_at = now
 
     def _set_aside(self, rid: str | None) -> int:
         """The reserved pages no request has moved into yet, other than ``rid``'s."""
