@@ -513,7 +513,8 @@ def test_served_windows_are_upstreams(n):
     torch.nn.Module.__init__(node)
     node.request_states, node.eos_code = {}, eos
     node._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
-    info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "v"})
+    node.model = torch.nn.Linear(1, 1)  # its device
+    info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "v"}, random_seed=0)
     codes = torch.randint(0, eos, (n,)).tolist()
 
     buffer = StreamBuffer(request_id=0, edge_name="tts_code", from_partition="main",
@@ -578,3 +579,51 @@ def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
         commit()
         for i, (name, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], want[name][w], **tol)
+
+
+def test_hift_noise_is_the_requests_own(random_token2wav):
+    """A spoken reply's HiFT excitation comes from its own seed: a window vocodes the same
+    alone and beside another request, whatever the global RNG drew in between."""
+    from types import SimpleNamespace
+
+    from mstar.engine.accelerator_graph_config import PiecewiseCallInputs
+    from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
+    from mstar.model.minicpm_o.submodules import Token2WavSubmodule
+    from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
+
+    model = random_token2wav
+    torch.manual_seed(5)
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, 6), dtype=torch.int32), spk_emb=torch.randn(1, 192),
+        mel=torch.randn(1, 12, 80),
+    ))
+    node = Token2WavSubmodule(model, {"v": voice}, eos_code=6561)
+    frames = window_frames(28, False)
+    region = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
+        node.hift_region(True, frames, False)]
+    kv_steps = _CacheSteps(node.bank, 3, "cpu")
+    mel = torch.randn(1, 80, frames)
+    chunk = InputMetadata(stream_chunks={"tts_code": SimpleNamespace(start_offset=0, context_items=0, num_items=25)})
+
+    def first_window(seeds: dict[str, int]) -> torch.Tensor:
+        rids = list(seeds)
+        for rid, seed in seeds.items():
+            info = SimpleNamespace(rid_handle=rid, step_metadata={"voice": "v"}, random_seed=seed)
+            node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(25)]}, input_metadata=chunk)
+        _, _, _, commit = kv_steps.window(rids, 28, False)
+        resources = {T2W_STATE: kv_steps.pool, **{T2W_KV[n]: kv_steps.resources[n] for n in T2W_KV}}
+        noise = model.window_noise(frames, True, [node.request_state(r)["noise"] for r in rids])
+        region.capture_fn(PiecewiseCallInputs(
+            static_inputs={"mel": mel.expand(len(rids), -1, -1), "phase": noise.phase, "harmonic": noise.harmonic},
+            engine_inputs=ModelInputsFromEngine(request_ids=rids, per_request_info={}, resources=resources),
+        ))
+        commit()
+        # the excitation it held back for the next window: the noise, nearly alone
+        return torch.stack([kv_steps.slot(r)["hift_source"] for r in rids])
+
+    alone = first_window({"a": 7})
+    torch.randn(1000)
+    batched = first_window({"b": 8, "c": 7})
+    scale = alone.abs().max()
+    assert (batched[1:] - alone).abs().max() < 1e-4 * scale
+    assert (batched[:1] - alone).abs().max() > 0.1 * scale

@@ -12,8 +12,8 @@ The tests drive the same modules one request at a time over a ``Token2WavState``
 reference does, which is bit-exact against it at fp32; the batched path matches that to
 summation order and TF32.
 
-The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT draws its
-excitation from the global RNG unless given a generator or the draws themselves.
+The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT's
+excitation draws are an input (``window_noise``), from each request's own generator.
 """
 
 from __future__ import annotations
@@ -498,24 +498,31 @@ class Token2Wav(nn.Module):
         state: SlotRows,
         mel: torch.Tensor,
         first: bool,
-        last: bool = False,
-        noise: HiFTNoise | None = None,
+        last: bool,
+        noise: HiFTNoise,
     ) -> dict[str, torch.Tensor]:
         """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the slot's
         held-back frames unless they are their requests' ``first`` (a shorter input, so the
-        two do not batch). Finish with ``window_finish``."""
+        two do not batch), on ``noise`` (``window_noise``). Finish with ``window_finish``."""
         if first:
             hift_mel, cache_source = mel, None
         else:
             hift_mel = torch.cat([state.get("hift_mel"), mel], dim=2)
             cache_source = state.get("hift_source")
-        if noise is None:
-            noise = self.hift.draw_noise(hift_mel, None)
         magnitude, phase, source = self.hift.spectrum(hift_mel, noise.phase, noise.harmonic, cache_source)
         if not last:
             state.set("hift_mel", hift_mel[..., -HIFT_MEL_CACHE:])
             state.set("hift_source", source[:, :, -HIFT_TAIL:])
         return {"magnitude": magnitude, "phase": phase}
+
+    def window_noise(self, frames: int, first: bool, generators: list[torch.Generator | None]) -> HiFTNoise:
+        """HiFT's excitation draws for windows of ``frames`` mel frames, a row from each
+        generator, each drawn as a one-request ``stream`` call draws it: a request's audio
+        then depends on its own seed alone, not on its batch."""
+        length = (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
+        device = self.speech_window.device
+        rows = [self.hift.m_source.draw_noise(1, length, torch.float32, device, g) for g in generators]
+        return HiFTNoise(phase=torch.cat([r.phase for r in rows]), harmonic=torch.cat([r.harmonic for r in rows]))
 
     @torch.inference_mode()
     def window_finish(

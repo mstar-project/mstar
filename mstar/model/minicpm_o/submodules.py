@@ -42,6 +42,7 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -807,6 +808,8 @@ class Token2WavSubmodule(NodeSubmodule):
         if first:
             codes = torch.cat([self._lead_silence, codes])
             state.add("voice", fwd_info.step_metadata.get("voice"))
+            # HiFT's excitation, window by window from the request's seed
+            state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
         # Window k starts 25k codes into the silence-led stream (its look-back
         # included), which is what its caches hold before it (``_cache_steps``).
         state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
@@ -858,9 +861,11 @@ class Token2WavSubmodule(NodeSubmodule):
                 }
             return make
 
-        def static_mel(frames: int):
+        def static_hift(first: bool, frames: int):
             def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
-                return {"mel": torch.zeros(shape.bs, MEL_BINS_T2W, frames, device=device)}
+                noise = self.model.window_noise(frames, first, [None] * shape.bs)
+                return {"mel": torch.zeros(shape.bs, MEL_BINS_T2W, frames, device=device),
+                        "phase": noise.phase, "harmonic": noise.harmonic}
             return make
 
         def declare_flow(last: bool):
@@ -891,9 +896,10 @@ class Token2WavSubmodule(NodeSubmodule):
 
         def hift(first: bool, last: bool):
             def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-                pool = call.resources[T2W_STATE]
+                pool, inputs = call.resources[T2W_STATE], call.static_inputs
                 return self.model.window_vocode(
-                    SlotRows(pool, pool.addressing("main")), call.static_inputs["mel"], first, last,
+                    SlotRows(pool, pool.addressing("main")), inputs["mel"], first, last,
+                    HiFTNoise(phase=inputs["phase"], harmonic=inputs["harmonic"]),
                 )
             return run
 
@@ -920,19 +926,19 @@ class Token2WavSubmodule(NodeSubmodule):
         }
         for first in (True, False):
             configs[self.hift_region(first, full, False)] = region(
-                hift(first, False), static_mel(full), declare_hift, full, self.WINDOW_CAPTURE_BATCH_SIZES)
+                hift(first, False), static_hift(first, full), declare_hift, full, self.WINDOW_CAPTURE_BATCH_SIZES)
         for n in LAST_WINDOW_TOKENS:
             frames = window_frames(n, True)
             configs[self.flow_region(n, True)] = region(
                 flow(True), static_tokens(n), declare_flow(True), n, self.LAST_CAPTURE_BATCH_SIZES)
             configs[self.hift_region(False, frames, True)] = region(
-                hift(False, True), static_mel(frames), declare_hift, frames, self.LAST_CAPTURE_BATCH_SIZES)
+                hift(False, True), static_hift(False, frames), declare_hift, frames, self.LAST_CAPTURE_BATCH_SIZES)
         for last in (False, True):
             configs[self.eager_region("flow", False, last)] = region(
                 flow(last), static_tokens(WINDOW), declare_flow(last), WINDOW, [])
             for first in (False, True):
                 configs[self.eager_region("hift", first, last)] = region(
-                    hift(first, last), static_mel(full), declare_hift, full, [])
+                    hift(first, last), static_hift(first, full), declare_hift, full, [])
         return configs
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -1017,8 +1023,10 @@ class Token2WavSubmodule(NodeSubmodule):
     ) -> torch.Tensor:
         """``window_vocode`` and then (eagerly: the inverse STFT syncs) ``window_finish``,
         on the rows the region just planned: the rows' samples."""
+        noise = self.model.window_noise(mel.shape[-1], first, [self.request_state(r)["noise"] for r in rids])
         out = runner.run(
-            static_inputs={"mel": mel}, request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),
+            static_inputs={"mel": mel, "phase": noise.phase, "harmonic": noise.harmonic},
+            request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),
         )
         pool = engine_inputs.resources[T2W_STATE]
         state = SlotRows(pool, pool.addressing("main")).head(len(rids))
