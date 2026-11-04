@@ -392,6 +392,19 @@ def test_long_context_refuses_pools_per_page_off_a_power_of_two():
         cfg.check_long_context(page_size=cfg.index_kpool * 3)
 
 
+@pytest.mark.parametrize("kwargs", [
+    {"dsa_long_context": "false"},
+    {"dsa_long_context": True, "dsa_shard_prefill": "false", "max_seq_len": 512},
+    {"dsa_long_context": True, "prefill_window_tokens": 2.5, "max_seq_len": 512},
+    {"dsa_long_context": True, "prefill_window_tokens": True, "max_seq_len": 512},
+    {"dsa_long_context": True, "max_seq_len": 512.9},
+])
+def test_long_context_refuses_a_knob_it_would_misread(kwargs):
+    """A string switch or a fractional count would otherwise load as something else."""
+    with pytest.raises(ValueError, match="must be"):
+        Glm5NextModel("x", config_variant="reduced", **kwargs)
+
+
 @pytest.mark.parametrize("key", ["max_seq_len", "prefill_window_tokens", "dsa_shard_prefill"])
 def test_long_context_keys_need_the_long_context_path(key):
     with pytest.raises(ValueError, match="dsa_long_context"):

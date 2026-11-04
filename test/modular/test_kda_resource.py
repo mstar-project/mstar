@@ -43,6 +43,8 @@ CPU = torch.device("cpu")
 class _Recorder:
     """A bundle that asks for its spans back as the layout and records runs."""
 
+    prefill_capturable = True
+
     def __init__(self):
         self.layouts: list[tuple] = []
         self.runs: list[tuple] = []
@@ -213,6 +215,23 @@ def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
     decode = plan(pool, kda, ["d", "e"], [1, 1],
                   leased(["d", "e"], ["d", "e"], bs=2, tokens=2, walk="decode", slot=1))
     assert decode.is_decode
+
+
+def test_a_captured_prefill_on_the_torch_bundle_is_refused():
+    """The torch bundle's prefill slices the spans on the host, so a replay would run the
+    capture's: a prefill under a lease fails at warmup. Its decode and verify still capture."""
+    pool, kda = build(speculative_tokens=2)
+    assert isinstance(kda.kernels, TorchKDAKernels)
+    with pytest.raises(RuntimeError, match="can't run a captured prefill"):
+        plan(pool, kda, ["a", "pad"], [5, 0], leased(["a"], ["a", "pad"], bs=2, tokens=64))
+    assert plan(pool, kda, ["b"], [5], eager(["b"])).layout is None  # eager prefill runs
+    decode = plan(pool, kda, ["c", "d"], [1, 1],
+                  leased(["c", "d"], ["c", "d"], bs=2, tokens=2, walk="decode", slot=1))
+    assert decode.is_decode
+    verify = plan(pool, kda, ["e"], [3],
+                  leased(["e"], ["e"], bs=1, tokens=3, walk="decode", capture=True),
+                  speculative=True)
+    assert verify.is_verify
 
 
 def test_preplan_promotes_the_staged_plan():

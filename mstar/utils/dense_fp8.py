@@ -7,10 +7,15 @@ in registers (fused_moe.decode's per-pair GEMV), more as a bf16 ``tl.dot`` per s
 order, so the result does not depend on scheduling. Larger batches quantize x to e4m3 per 128
 columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's.
 
+Which of the three runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
+shape and token count where it has one (``mstar/kernels/tables/fp8_linear/``) and the GPU can run
+it, else the built-in rule in ``_builtin``.
+
 With ``glu`` the weight is ``[gate; up]`` on its rows and the output ``silu(x @ gate.T) * (x @ up.T)``.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 
 import torch
@@ -18,32 +23,58 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from mstar.kernels import Impl, KernelOp, register
+from mstar.kernels.registry import on_reset, row_bounds
 from mstar.platforms import current_platform
 from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
 
-# Tokens up to which w8a16 is the fastest (H100); the shared expert's small GEMMs keep it
-# longer. Above, flashinfer's GEMM up to _FI_MAX_TOKENS, cuBLAS's beyond.
+# The built-in rule: tokens up to which w8a16 is the fastest (H100); the shared expert's small
+# GEMMs keep it longer. Above, flashinfer's GEMM up to _FI_MAX_TOKENS, cuBLAS's beyond. A GPU
+# where that differs has its rows in the fp8_linear table.
 _W8A16_MAX_TOKENS = 32
 _W8A16_MAX_TOKENS_BY_SHAPE = {(256, 6144, True): 128, (6144, 256, False): 128}
-# The same per GPU model where it differs (H100 and H200 are both SM90), applied only where
-# flashinfer's GEMM runs: on an H200 it beats w8a16 at 4-16 tokens on GLM-5.2's o_proj and
-# dense-layer down (~8 vs ~10 us a call, cold weights).
-_W8A16_MAX_TOKENS_BY_GPU = {
-    "NVIDIA H200": {(6144, 2048, False): 2, (6144, 1536, False): 2},
-}
 _FI_MAX_TOKENS = 512
 # block-scaled fp8 in torch's scaled_mm (1x128 activations, 128x128 weights), probed per device:
 # the API exists from torch 2.10 but raises off SM90 or on a cuBLASLt before 12.9 (cu128 builds)
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
-# w8a16's token limits per (N, K, glu) on each reserved device
-_W8A16_MAX: dict[torch.device, dict[tuple[int, int, bool], int]] = {}
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
 _MAX_TILES = 4096
+
+
+def _w8a16_unavailable(target) -> str | None:
+    return None if target.device.type == "cuda" else f"needs a GPU, not {target.device.type}"
+
+
+def _fi_unavailable(target) -> str | None:
+    reserve(target.device)
+    return None if _FI_OK.get(target.device) else "flashinfer's SM90 block-scale GEMM does not run here"
+
+
+def _cublas_unavailable(target) -> str | None:
+    reserve(target.device)
+    return None if _W8A8_OK.get(target.device) else "cuBLAS's block-scaled GEMM does not run here"
+
+
+FP8_LINEAR = register(KernelOp(
+    name="fp8_linear", shape=("N", "K", "glu"), bucket="M",
+    impls=(
+        Impl("w8a16", _w8a16_unavailable,
+             doc="the Triton kernel here; its config is the tile (DOT, BN, BK, SPLIT, STAGES, num_warps[, TB]), "
+                 "none for the built-in tile of the token count"),
+        Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
+        Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
+    ),
+    doc="a block-fp8 (128 x 128 scales) dense linear: N outputs (per half with glu), K inputs, glu 1 for "
+        "a [gate; up] weight's SwiGLU; rows by token count",
+))
+# (device, N, K, glu) -> the table's (row bounds, choices), or None where no table has the shape
+_ROWS: dict[tuple, tuple[tuple[int, ...], tuple] | None] = {}
+on_reset(_ROWS.clear)
 
 
 @triton.jit
@@ -222,8 +253,8 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
 
 
 def reserve(device: torch.device | str) -> None:
-    """Allocate the split-K counters for ``device``, load flashinfer's GEMM and resolve the
-    GPU's token limits, outside any graph capture."""
+    """Allocate the split-K counters for ``device`` and probe flashinfer's and cuBLAS's GEMMs
+    there (which loads them), outside any graph capture."""
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -231,14 +262,6 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
-        _W8A16_MAX[device] = _w8a16_max_tokens(torch.cuda.get_device_name(device), _FI_OK[device])
-
-
-def _w8a16_max_tokens(gpu: str, fi_ok: bool) -> dict[tuple[int, int, bool], int]:
-    """w8a16's token limit per (N, K, glu) on a GPU model: the shape table, under the GPU's own
-    rows when flashinfer's GEMM runs there (without it those sizes would go to cuBLAS's GEMM,
-    which is slower than w8a16 at decode sizes)."""
-    return {**_W8A16_MAX_TOKENS_BY_SHAPE, **(_W8A16_MAX_TOKENS_BY_GPU.get(gpu, {}) if fi_ok else {})}
 
 
 def _probe_w8a8(device: torch.device) -> bool:
@@ -405,6 +428,41 @@ def _fi(x, w, s, glu):
     return out
 
 
+def _table_rows(device: torch.device, n: int, k: int, glu: bool):
+    """The fp8_linear table's rows for this shape on ``device``, looked up once, or None."""
+    key = (device, n, k, glu)
+    if key not in _ROWS:
+        entry = FP8_LINEAR.lookup(FP8_DTYPE, {"N": n, "K": k, "glu": int(glu)}, device)
+        _ROWS[key] = None if entry is None else (row_bounds(entry.rows), tuple(c for _, c in entry.rows))
+    return _ROWS[key]
+
+
+def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
+    """GLM-5.2's dispatch on any GPU: w8a16 up to its token limit, flashinfer to _FI_MAX_TOKENS
+    where it runs, then cuBLAS where it runs, else w8a16."""
+    if m <= _W8A16_MAX_TOKENS_BY_SHAPE.get((n, k, glu), _W8A16_MAX_TOKENS):
+        return "w8a16"
+    if m <= _FI_MAX_TOKENS and _FI_OK.get(device):
+        return "flashinfer"
+    return "cublas" if _W8A8_OK.get(device) else "w8a16"
+
+
+def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=(128, 128)):
+    """``(implementation, config)`` for ``m`` tokens: the table's row where it names one that runs
+    on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
+    The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
+    if tuple(block_size) != (128, 128):
+        return "w8a16", None
+    rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
+    if rows is not None:
+        bounds, choices = rows
+        choice = choices[bisect.bisect_left(bounds, m)]
+        if (choice.impl == "w8a16" or (choice.impl == "flashinfer" and _FI_OK.get(device))
+                or (choice.impl == "cublas" and _W8A8_OK.get(device))):
+            return choice.impl, choice.config
+    return _builtin(device, n, k, glu, m), None
+
+
 def _linear(x, w, s, block_size, glu):
     x = x.contiguous()
     assert x.dtype == torch.bfloat16 and w.dtype in (torch.uint8, FP8_DTYPE)
@@ -413,14 +471,12 @@ def _linear(x, w, s, block_size, glu):
     N = w.shape[0] // 2 if glu else w.shape[0]
     if M == 0:
         return x.new_empty(0, N)
-    w8a16_max = _W8A16_MAX.get(x.device, _W8A16_MAX_TOKENS_BY_SHAPE).get((N, K, glu), _W8A16_MAX_TOKENS)
-    if M <= w8a16_max or tuple(block_size) != (128, 128):
-        return _w8a16(x, w, s, block_size, glu)
-    if M <= _FI_MAX_TOKENS and _FI_OK.get(x.device):
+    impl, config = _choose(x.device, N, K, glu, M, block_size)
+    if impl == "flashinfer":
         return _fi(x, w, s, glu)
-    if _W8A8_OK.get(x.device):
+    if impl == "cublas":
         return _w8a8(x, w, s, block_size, glu)
-    return _w8a16(x, w, s, block_size, glu)
+    return _w8a16(x, w, s, block_size, glu, config)
 
 
 @torch.library.custom_op("mstar::fp8_block_linear", mutates_args=())

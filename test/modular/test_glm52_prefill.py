@@ -45,10 +45,11 @@ def test_prefill_buckets_default_without_kwargs():
     assert packed.capture_batch_sizes == Glm52LLMSubmodule.PREFILL_CAPTURE_BATCH_SIZES
 
 
-@pytest.mark.parametrize("buckets", [[], [64, 64]])
+@pytest.mark.parametrize("buckets", [[], [64, 64], [64.5, 128], [True, 64], "64"])
 def test_a_bad_prefill_ladder_is_refused(buckets):
     """Checked as Qwen3.5's and Qwen3-Omni's ladders are: an empty ladder is
-    not the default, and a repeat is not captured twice."""
+    not the default, a repeat is not captured twice, and a float, a bool or a
+    string is not read as some other ladder."""
     model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced", prefill_token_buckets=buckets)
     with pytest.raises(ValueError, match="prefill_token_buckets"):
         _submodule(model.config)

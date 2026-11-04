@@ -597,8 +597,9 @@ class DummyRowPool:
 
     Ingested once and kept for the runner's lifetime: a re-ingest would hand
     the resources a fresh stream and orphan the pages the last capture left
-    resident, and keeping them resident is what lets a step's padding tail
-    allocate nothing.
+    resident. A batched replay's padding rows run capture-length spans on
+    those pages, so its tail allocates nothing; a packed one pads with
+    zero-length rows, so a packed region frees them once captured.
     """
 
     def __init__(

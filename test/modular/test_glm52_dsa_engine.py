@@ -231,6 +231,19 @@ def test_model_kwarg_dsa_long_context():
     assert mtp.config.dsa_long_context and mtp.config.mtp_num_draft_tokens == 2
 
 
+@pytest.mark.parametrize("kwargs", [
+    {"dsa_long_context": "false"},
+    {"dsa_long_context": True, "dsa_shard_prefill": "false"},
+    {"dsa_long_context": True, "prefill_chunk_tokens": 2.5},
+    {"dsa_long_context": True, "prefill_chunk_tokens": True},
+    {"dsa_long_context": True, "max_seq_len": 4096.5},
+])
+def test_model_kwarg_dsa_long_context_refuses_a_knob_it_would_misread(kwargs):
+    """A string switch or a fractional count would otherwise load as something else."""
+    with pytest.raises(ValueError, match="must be"):
+        Glm52Model(model_path_hf="", **kwargs)
+
+
 def test_model_kwarg_dsa_long_context_refuses_old_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace(__version__="0.6.17"))
     with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):

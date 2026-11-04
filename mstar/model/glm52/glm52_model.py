@@ -46,6 +46,7 @@ from mstar.model.utils import (
     ByteIdDetokenizer,
     ByteLevelDetokenizer,
     TextOutput,
+    capture_ladder,
     load_snapshot_tokenizer,
     read_fp8_block_quant_config,
     resolve_checkpoint,
@@ -62,15 +63,6 @@ _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
     "prefill_last_layer_rows")
-
-
-def _capture_ladder(key: str, value) -> list[int]:
-    """A capture ladder from model_kwargs: a 0 or a negative entry would fail the capture
-    build, and an empty one would quietly mean the default."""
-    if (not isinstance(value, (list, tuple)) or not value or len(set(value)) != len(value)
-            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
-        raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
-    return list(value)
 
 
 class Glm52Model(Model):
@@ -107,6 +99,14 @@ class Glm52Model(Model):
         if long_only and not kwargs.get("dsa_long_context", False):
             # they size and split the long-context path only; without it they would be dropped
             raise ValueError(f"{long_only} apply only with dsa_long_context")
+        for key in ("dsa_long_context", "dsa_shard_prefill"):
+            # bool("false") is True
+            if key in kwargs and not isinstance(kwargs[key], bool):
+                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+        for key in ("max_seq_len", "prefill_chunk_tokens"):
+            # int() would take True as 1 and 2.5 as 2
+            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
             # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
             # attention reads the paged latent cache, so the naive
@@ -139,10 +139,12 @@ class Glm52Model(Model):
                 raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
             self.config.graph_compile = kwargs["graph_compile"]
         if prefill_token_buckets is not None:
-            self.config.prefill_token_buckets = [int(n) for n in prefill_token_buckets]
+            # as given: the submodule checks it as Qwen3.5's, and int() would read 64.5 as 64
+            # and "64" as [6, 4]
+            self.config.prefill_token_buckets = prefill_token_buckets
         for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
             if key in kwargs:
-                setattr(self.config, key, _capture_ladder(key, kwargs[key]))
+                setattr(self.config, key, capture_ladder(key, kwargs[key]))
         if "mtp_num_draft_tokens" in kwargs:
             k = kwargs["mtp_num_draft_tokens"]
             if isinstance(k, bool) or not isinstance(k, int) or k < 0:
