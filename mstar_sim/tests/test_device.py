@@ -87,6 +87,13 @@ def test_cuda_semantics():
             raise SystemExit("a transposed scale was accepted")
         except RuntimeError as e:
             assert "blockwise scaling" in str(e)
+        # mstar's custom ops run on the emulated GPU, kept operands included (their torch.empty
+        # scratch is a cuda buffer, not host garbage)
+        @torch.library.custom_op("mstar_sim_test::plus_one", mutates_args=())
+        def plus_one(t: torch.Tensor) -> torch.Tensor:
+            assert t.is_cuda
+            return t + 1
+        assert torch.ops.mstar_sim_test.plus_one(torch.ones(2, device="cuda")).tolist() == [2.0, 2.0]
         torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
         assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
         torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)

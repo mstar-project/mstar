@@ -762,6 +762,8 @@ def _run(func, args, kwargs, index, flat=None):
 
 
 def _is_custom_op(func) -> bool:
+    if isinstance(func, torch._ops.OpOverloadPacket):  # ``torch.ops.mstar.name(...)``
+        return func._qualified_op_name.split("::")[0] not in ("aten", "prim", "prims")
     ns = getattr(func, "namespace", None)  # a higher-order op has a namespace but no schema
     return ns is not None and ns not in ("aten", "prim", "prims") and hasattr(func, "_schema")
 
