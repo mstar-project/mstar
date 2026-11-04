@@ -427,8 +427,9 @@ class KVReqConfig(ResourceReqConfig):
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
-                    # a request with the prefix cache off keys none of its spans
-                    keyed_spans=keyed_spans if self.prefix_cache else 0,
+                    # a request with no keys for the label, as with the prefix cache off for it or for the server,
+                    # keys none of its spans
+                    keyed_spans=keyed_spans if self.keys_of(label) else 0,
                     max_growth=max_growth[0] if max_growth else None,
                 )
                 # a row may leave out the growth bound, as a span row may leave out its later fields

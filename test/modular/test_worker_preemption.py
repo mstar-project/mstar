@@ -362,26 +362,39 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
     assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
-@pytest.mark.parametrize("prefix_cache", [True, False])
-def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
-    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
-    the way of a rebuild."""
+def _rebuildable_keyed_over_part(**conductor) -> bool:
+    """Whether a drop can free a request whose text is two spans of one step, keyed over the first, once the
+    conductor has applied ``conductor`` with the layout."""
     kv = _pool()
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
     w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
     text = [4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill", 0, None, None]
-    # text in two spans of one step, keyed over the first, as the conductor sends a layout
+    # as the conductor sends a layout
     layout = [[[*text, True, "ids"], [*text, False, "ids"]], [["decode", 1]], 0, None, 1]
     config = KVReqConfig()
-    config.apply_conductor_config(
-        prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache, kv_layout={"main": layout}, loop_caps={"decode": 64},
-    )
+    config.apply_conductor_config(kv_layout={"main": layout}, loop_caps={"decode": 64}, **conductor)
     configs = {"kv": config}
 
     w._set_rebuildable(1, configs)
 
-    assert configs["kv"].rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
+    return configs["kv"].rebuildable
+
+
+@pytest.mark.parametrize("prefix_cache", [True, False])
+def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
+    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
+    the way of a rebuild."""
+    rebuildable = _rebuildable_keyed_over_part(prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache)
+
+    assert rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
+
+
+def test_a_request_sent_no_keys_is_rebuildable_though_its_layout_keys_part_of_its_prompt():
+    """With the cache off for the whole server, the conductor sends no keys and leaves the request's ``prefix_cache``
+    on. The layout still said the request keyed part of its prompt, so no Qwen3-Omni video or Bagel edit could be
+    dropped."""
+    assert _rebuildable_keyed_over_part(), "a request would be refused a drop for keys it was never sent"
 
 
 @pytest.mark.parametrize("layout", ["two labels", "two loops"])

@@ -486,7 +486,7 @@ those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image
 Qwen3-Omni request with audio or images in and text out, or a Higgs Audio transcription. A Qwen3-Omni
 request with video in and text out and a Bagel think-mode edit with no guidance key only part of their
 prompt, which a rebuild can't key again, so they are rebuilt only with the prefix cache off for the
-request. A request no drop can free, because it holds KV made from another node's outputs or from
+request or the server. A request no drop can free, because it holds KV made from another node's outputs or from
 media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
 it is admitted the host pool sets room for its whole footprint aside, and it reserves only its
 prompt. Bagel generations, which write a label per guidance, and requests with media above one rank
