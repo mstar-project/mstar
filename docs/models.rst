@@ -692,8 +692,13 @@ Qwen3-Omni notes
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another. On one GPU a
-  decode batch of 8 to 16 tokens also gets its block alignment from that
-  kernel; a smaller one runs its experts as per-pair GEMVs, which need none.
+  decode batch of up to 16 tokens also gets its block alignment from that
+  kernel, unless it is small enough to run its experts as per-pair GEMVs,
+  which need none: up to the ``moe_decode`` kernel table's crossover for the
+  GPU and expert shape (``mstar/kernels/tables/moe_decode``), 2 tokens for the
+  TP1 Thinker on an H200 (aligned from 3), else the built-in 7, swept on an
+  H100 (aligned from 8). The Thinker at TP2 (expert width 384) has no H200
+  entry yet, so it keeps 7 there, unmeasured.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
