@@ -232,6 +232,28 @@ def test_device_time_follows_the_cost_model_not_the_host(gpu):
     assert flops / peak < device_s < 20 * flops / peak
 
 
+def test_an_event_on_an_idle_stream_holds_no_thread_back():
+    """An event is complete when its stream drains, not at the recording thread's clock:
+    a waiter whose host time lags (the emulator's own time on its thread) isn't delayed."""
+    out = run_sim("""
+        import threading, time, torch
+        from mstar_sim import clock
+        event, stream = torch.cuda.Event(), torch.cuda.Stream()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        with clock.computing():
+            time.sleep(0.05)
+        recorder = threading.Thread(target=event.record)
+        recorder.start(); recorder.join()
+        with torch.cuda.stream(stream):
+            start.record(); stream.wait_event(event); torch.empty(8, device="cuda").add_(1); end.record()
+        end.synchronize()
+        assert start.elapsed_time(end) < 25, start.elapsed_time(end)
+        print("ok")
+    """)
+    assert out.strip() == "ok"
+
+
 def test_timing_only_holds_shapes_not_values():
     """Nothing is computed: a 40 GB tensor costs no host memory
     but counts against the card; small integer tensors (what mstar plans with)
