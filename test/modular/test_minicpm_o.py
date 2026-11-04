@@ -272,6 +272,12 @@ def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
     assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
     with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
+    # the voice prompt is the system message, so a request's own is refused, not dropped
+    with pytest.raises(ValueError, match="voice_prompt"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, system_prompt="Be brief.")
+    with pytest.raises(ValueError, match="voice_prompt"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=[
+            PromptPart("text", "Be brief.", role="system"), *parts])
 
 
 @needs_ckpt

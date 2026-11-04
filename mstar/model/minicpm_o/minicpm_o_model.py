@@ -511,18 +511,18 @@ class MiniCPMOModel(Model):
 
         A spoken reply's system message is upstream's voice prompt around the
         voice's reference clip (``voice_audio``, the first audio the prompt
-        holds); without it, the request's ``system_prompt``."""
+        holds; ``process_prompt`` refuses a system message of the request's
+        beside it); without it, the request's ``system_prompt``."""
         tags = {"image": processor.IMAGE_TAG, "audio": processor.AUDIO_TAG}
+        system = system_prompt or None
+        if voice_audio is not None:
+            system = "\n".join([VOICE_PROMPT_PREFIX, processor.AUDIO_TAG, VOICE_PROMPT_SUFFIX])
         msgs = [
             {"role": m["role"], "content": m["content"] if isinstance(m["content"], str) else "\n".join(
                 item["text"] if item["type"] == TEXT else tags[item["type"]] for item in m["content"]
             )}
-            for m in messages_from_parts(parts, default_system=system_prompt or None)
+            for m in messages_from_parts(parts, default_system=system)
         ]
-        if voice_audio is not None:
-            msgs = [{"role": "system", "content": "\n".join(
-                [VOICE_PROMPT_PREFIX, processor.AUDIO_TAG, VOICE_PROMPT_SUFFIX]
-            )}] + [m for m in msgs if m["role"] != "system"]
         return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
@@ -579,6 +579,13 @@ class MiniCPMOModel(Model):
         if not kwargs.get("voice_prompt", True):
             voice_audio = None
         if voice_audio is not None:
+            if kwargs.get("system_prompt") or any(p.role == "system" for p in parts):
+                # upstream's voice prompt is the reply's system message, and a second
+                # one would change what the voice clone was conditioned on
+                raise ValueError(
+                    "a spoken MiniCPM-o reply's system message is its voice prompt; "
+                    "send voice_prompt=false to use your own system prompt"
+                )
             audios = [voice_audio] + audios
         text = self._render(
             parts, bool(audios),

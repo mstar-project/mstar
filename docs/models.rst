@@ -533,8 +533,9 @@ Text, image and audio in; text, or text and 24 kHz speech, out, as upstream's ha
 ``chat()``: the LLM (Qwen3-8B) writes the reply, a TTS reads it into speech codes, and a
 streaming flow-matching vocoder (Step-Audio2's token2wav) turns them into audio. Ask for
 speech with ``output_modalities`` including ``"audio"``; the bundled ``default`` voice is the
-only one. ``voice_prompt: false`` in the request's kwargs uses the request's
-``system_prompt`` instead of upstream's voice-clip system message, as vllm-omni does.
+only one. A spoken reply's system message is upstream's voice-clip prompt, so a spoken
+request with a system prompt of its own is refused (400) unless it sets ``voice_prompt:
+false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 ``streaming_generate``, video input and full duplex are not supported.
 
 ``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
