@@ -42,6 +42,7 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -709,19 +710,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs.setdefault("text_inputs", outputs["new_token"])
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         if self.mtp_k > 0:
@@ -753,16 +747,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         """The loops a plain step's emitted ``token`` stops."""
         state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            return {"decode_loop"}
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                self.request_state(request_id).add("ended_at_prefill", True)
-            return set()
+            # no decode_loop on this walk to stop: a stop token ends the partition before any
+            # decode step runs, and the conductor ends a max_tokens of 1 here
+            return {END_PARTITION} if not ignore_eos and is_eos else set()
         # Total generated = 1 prefill-emitted token + (decode iters + 1):
         # max_tokens counts the token the prefill emits, so the decode loop
         # runs one fewer.
@@ -793,10 +783,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         is_eos = not ignore_eos and any(
             t in self.config.eos_token_ids for t in new_token.tolist())
         if request_info.graph_walk == "prefill":
-            # as in check_stop: the prefill walk has no decode_loop to stop
-            if is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
+            # as in _stops: the prefill walk has no decode_loop to stop
+            return {END_PARTITION} if is_eos else set()
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
