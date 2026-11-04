@@ -53,7 +53,6 @@ from mstar.model.minicpm_o.components.token2wav import (
     SlotRows,
     VoiceBank,
     WindowCaches,
-    voice_entry,
     window_frames,
     window_tokens,
 )
@@ -74,8 +73,6 @@ from mstar.model.minicpm_o.config import (
     RESAMPLER_ATTN,
     T2W_KV,
     T2W_STATE,
-    T2W_VOICE,
-    T2W_VOICES,
     TTS_ATTN,
     TTS_KV,
     TTS_POS,
@@ -760,48 +757,27 @@ class Token2WavSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    def __init__(self, model, voices: dict, eos_code: int, custom_voices: bool = False):
-        """``voices`` are the model's fixed ones; with ``custom_voices`` a request may also
-        bring its own (a 16 kHz clip, the ``voice_audio`` input of the ``T2W_VOICE`` walk),
-        prepared into the ``T2W_VOICES`` pool before its first window."""
+    def __init__(self, model, voices: dict, eos_code: int):
+        """``voices``: the model's bundled ones, by name."""
         super().__init__()
         self.model = model
         self.eos_code = eos_code
-        self.custom_voices = custom_voices
         self.bank = VoiceBank.build(voices)
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
 
-    def _caches(self, resources: Mapping, custom: SlotRows | None = None) -> WindowCaches:
-        """The step's ``WindowCaches`` (and its rows of the voice pool, ``custom``)."""
+    def _caches(self, resources: Mapping) -> WindowCaches:
+        """The step's ``WindowCaches``."""
         return WindowCaches(**{
-            name: AttentionCache(
-                resources[T2W_KV[name]], self.bank.sources[name],
-                None if custom is None else (custom.pool.block(f"src_{name}", 0), custom.rows.slot_indices),
-            )
-            for name in CACHE_FAMILIES
+            name: AttentionCache(resources[T2W_KV[name]], self.bank.sources[name]) for name in CACHE_FAMILIES
         })
 
     def _voice_of(self, rid: str) -> tuple[int, int]:
-        """``rid``'s voice, an index into ``bank`` (-1 for its own in the voice pool), and
-        its prompt length in tokens."""
-        req = self.request_state(rid)
-        if "voice_prompt" in req:
-            return -1, req["voice_prompt"].tokens.shape[1]
-        voice = self.bank.index(req["voice"])
+        """``rid``'s voice, an index into ``bank``, and its prompt length in tokens."""
+        voice = self.bank.index(self.request_state(rid)["voice"])
         return voice, self.bank.prompt_tokens[voice]
 
     def _voice_ids(self, rids: list[str], device: torch.device) -> torch.Tensor:
         return torch.tensor([self._voice_of(r)[0] for r in rids], device=device)
-
-    def _voice_step(self, request_ids: list[str]) -> dict[str, RecurrentStep]:
-        """The voice pool's step: an entry for each request with a custom voice."""
-        if not self.custom_voices:
-            return {}
-        return {T2W_VOICES: RecurrentStep(segments=[
-            Segment(request_id=rid, label="main",
-                    span=int("voice_prompt" in (self.request_states.get(rid) or {})))
-            for rid in request_ids
-        ])}
 
     def _cache_steps(
         self, request_ids: list[str], num_tokens: list[int], lasts: list[bool],
@@ -811,7 +787,7 @@ class Token2WavSubmodule(NodeSubmodule):
         positions = []
         for rid in request_ids:
             req = self.request_states.get(rid)
-            if req is None or not ("voice" in req or "voice_prompt" in req):
+            if req is None or "voice" not in req:
                 # a capture's dummy row: the resource plans it as padding
                 positions.append(None)
             else:
@@ -841,12 +817,6 @@ class Token2WavSubmodule(NodeSubmodule):
         is_final_stream_chunk: bool = False,
         **kwargs: Any,
     ) -> NodeInputs | None:
-        if graph_walk == T2W_VOICE:
-            # the voice encoders run on the CPU, as the reference's; the chunk steps
-            # declare positions from the prompt's length
-            clip = inputs["voice_audio"][0].to("cpu", torch.float32).reshape(-1)
-            self.request_state(fwd_info.rid_handle).add("voice_prompt", self.model.voice_encoder(clip))
-            return NodeInputs(tensor_inputs={}, kwargs={})
         if not inputs.get("tts_code"):
             return None
         # A host sync, which serializes this node's async pipeline. It is needed either
@@ -866,19 +836,12 @@ class Token2WavSubmodule(NodeSubmodule):
         state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
             codes = torch.cat([self._lead_silence, codes])
-            if "voice_prompt" not in state:
-                state.add("voice", fwd_info.step_metadata.get("voice"))
+            state.add("voice", fwd_info.step_metadata.get("voice"))
         return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": is_final_stream_chunk})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
     ) -> SubmoduleStep:
-        if graph_walk == T2W_VOICE:
-            # takes the request's entry of the voice pool, or waits for one
-            return SubmoduleStep(
-                segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
-                steps={T2W_VOICES: RecurrentStep()},
-            )
         # This step admits the windows (slots, positions), which has to happen before
         # the forward. Its plan goes unused: each region re-plans the rows it runs.
         # TODO: an admit-only step would save that plan's host work.
@@ -886,7 +849,6 @@ class Token2WavSubmodule(NodeSubmodule):
             segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
             steps={
                 T2W_STATE: RecurrentStep(),
-                **self._voice_step(request_ids),
                 **self._cache_steps(
                     request_ids, [inp.tensor_inputs["codes"].shape[1] for inp in inputs],
                     [inp.kwargs["last"] for inp in inputs],
@@ -934,7 +896,6 @@ class Token2WavSubmodule(NodeSubmodule):
                     segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
                     steps={
                         T2W_STATE: RecurrentStep(),
-                        **self._voice_step(request_ids),
                         **self._cache_steps(request_ids, list(seq_lens), [last] * len(request_ids)),
                     },
                 )
@@ -949,13 +910,9 @@ class Token2WavSubmodule(NodeSubmodule):
         def flow(last: bool):
             def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
-                custom = None
-                if self.custom_voices:
-                    voices = call.resources[T2W_VOICES]
-                    custom = SlotRows(voices, voices.addressing("main"))
                 return {"mel": self.model.window_flow(
                     SlotRows(pool, pool.addressing("main")), self.bank, call.static_inputs["voices"],
-                    call.static_inputs["tokens"], self._caches(call.resources, custom), last, custom,
+                    call.static_inputs["tokens"], self._caches(call.resources), last,
                 )}
             return run
 
@@ -1011,15 +968,9 @@ class Token2WavSubmodule(NodeSubmodule):
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
 
-    def max_batch_size(self, graph_walk: str):
-        # one at a time: a full voice pool then holds back only the request that waits
-        return 1 if graph_walk == T2W_VOICE else None
-
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
-        if graph_walk == T2W_VOICE:
-            return {}
         device = self.get_device()
         return {"rows": [(inp.tensor_inputs["codes"].to(device), inp.kwargs["last"]) for inp in inputs]}
 
@@ -1029,8 +980,6 @@ class Token2WavSubmodule(NodeSubmodule):
         """Each window in two stages: the flow, batched over every row of one window length
         whatever its voice and position, then HiFT, batched over rows that are all or none
         their request's first window."""
-        if graph_walk == T2W_VOICE:
-            return self._prepare_voices(engine_inputs)
         runners = engine_inputs.piecewise_runners
         first, num_tokens, flows = {}, {}, {}
         for rid, (codes, last) in zip(engine_inputs.request_ids, rows, strict=True):
@@ -1063,18 +1012,6 @@ class Token2WavSubmodule(NodeSubmodule):
                     req.add("started", True)
                     out[rid] = {"audio_chunk": [wav[i]]}
         return out
-
-    @torch.compiler.disable
-    def _prepare_voices(self, engine_inputs: ModelInputsFromEngine) -> dict[str, NameToTensorList]:
-        """Prepare a request's custom voice (the flow over its prompt, as for a bundled
-        voice at load) into its entry of the voice pool. One request a step."""
-        (rid,) = engine_inputs.request_ids
-        pool = engine_inputs.resources[T2W_VOICES]
-        voice = self.model.prepare_voice(self.request_state(rid)["voice_prompt"])
-        entry = SlotRows(pool, pool.addressing("main"))
-        for name, value in voice_entry(voice, dict(pool.config.blocks)).items():
-            entry.set(name, value)
-        return {rid: {}}
 
     def _chunks(self, runner, group: list, last: bool) -> list[list]:
         """``group`` in batches its region can replay (all of it when it runs eagerly)."""

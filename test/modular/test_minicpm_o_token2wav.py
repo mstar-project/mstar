@@ -63,20 +63,6 @@ class _CacheSteps:
         ))
         self.written: dict[str, int] = {}
         self.voice: dict[str, int] = {}
-        self.custom_tokens: dict[str, int] = {}
-        self.voice_pool = None
-
-    def add_voice_pool(self, voice_slots: int, prompt_tokens: int, device):
-        """A pool for custom voices, as the model declares when ``custom_voices`` is set."""
-        from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
-        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-        from mstar.model.minicpm_o.components.token2wav import CacheCapacity, voice_layout
-
-        self.voice_layout = voice_layout(CacheCapacity(prompt_tokens))
-        self.voice_pool = RecurrentStatePool(device, RecurrentStateConfig(
-            num_layers=1, max_slots=voice_slots + 1,
-            blocks={n: RecurrentBlockConfig(shape=b.shape, dtype=b.dtype) for n, b in self.voice_layout.items()},
-        ))
 
     def slot(self, rid) -> dict[str, torch.Tensor]:
         """``rid``'s slot of the state pool, block by block."""
@@ -85,14 +71,11 @@ class _CacheSteps:
 
     def position(self, family, rid):
         voice = self.voice[rid]
-        tokens = self.custom_tokens[rid] if voice < 0 else self.bank.prompt_tokens[voice]
-        return family.position(tokens, self.written.get(rid, 0)), voice
+        return family.position(self.bank.prompt_tokens[voice], self.written.get(rid, 0)), voice
 
-    def window(self, rids, num_tokens: int, last: bool, voices: list[int] | None = None, custom=None):
+    def window(self, rids, num_tokens: int, last: bool, voices: list[int] | None = None):
         """The state rows, caches and per-row voice ids for one window of ``rids`` (each in
-        ``voices``, the bank's first by default; -1 for a custom voice, ``custom[rid]``,
-        prepared into the voice pool on its first window), and a commit to call after it.
-        With a voice pool, also its rows."""
+        ``voices``, the bank's first by default), and a commit to call after it."""
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
         from mstar.engine.resources.recurrent.config import RecurrentStep
         from mstar.engine.resources.step import Segment, StepContext
@@ -104,25 +87,6 @@ class _CacheSteps:
         state_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1) for r in rids])
         assert self.pool.admit(state_step, ctx).ok
         state = SlotRows(self.pool, self.pool.plan(state_step, ctx)["main"])
-        voice_rows = None
-        if self.voice_pool is not None:
-            from mstar.model.minicpm_o.components.token2wav import voice_entry
-
-            # a custom voice is prepared first, one request a step, as the t2w_voice walk does
-            for r in rids:
-                if self.voice[r] < 0 and r not in self.custom_tokens:
-                    self.custom_tokens[r] = custom[r].prompt.tokens.shape[1]
-                    one_ctx = StepContext(request_ids=[r], graph_walk="t2w_voice", slot=0, capture=False)
-                    one_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1)])
-                    assert self.voice_pool.admit(one_step, one_ctx).ok
-                    entry = SlotRows(self.voice_pool, self.voice_pool.plan(one_step, one_ctx)["main"])
-                    for name, value in voice_entry(custom[r], self.voice_layout).items():
-                        entry.set(name, value)
-                    self.voice_pool.commit(one_step, one_ctx)
-            voice_step = RecurrentStep(segments=[
-                Segment(request_id=r, label="main", span=1 if self.voice[r] < 0 else 0) for r in rids])
-            assert self.voice_pool.admit(voice_step, ctx).ok
-            voice_rows = SlotRows(self.voice_pool, self.voice_pool.plan(voice_step, ctx)["main"])
         caches, steps = {}, {}
         for name, family in self.families.items():
             positions = {}
@@ -136,9 +100,7 @@ class _CacheSteps:
             resource = self.resources[name]
             assert resource.admit(step, ctx).ok
             resource.plan(step, ctx)
-            own = None if voice_rows is None else (
-                self.voice_pool.block(f"src_{name}", 0), voice_rows.rows.slot_indices)
-            caches[name] = AttentionCache(resource, self.bank.sources[name], own)
+            caches[name] = AttentionCache(resource, self.bank.sources[name])
 
         def commit():
             self.pool.commit(state_step, ctx)
@@ -147,8 +109,6 @@ class _CacheSteps:
             for r in rids:
                 self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
         ids = torch.tensor([self.voice[r] for r in rids], device=self.bank.spk.device)
-        if self.voice_pool is not None:
-            return state, WindowCaches(**caches), ids, commit, voice_rows
         return state, WindowCaches(**caches), ids, commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
@@ -539,32 +499,3 @@ def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
         commit()
         for i, (name, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], want[name][w], **tol)
-
-
-@pytest.mark.parametrize("device", [
-    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
-])
-def test_custom_voice_matches_the_bank(random_token2wav, device):
-    """A voice prepared into the voice pool (a custom voice) behaves as the same voice in
-    the model's bank: one row of each, same codes, in every flow batch, equal mel."""
-    import copy
-
-    model = copy.deepcopy(random_token2wav).to(device)
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
-    torch.manual_seed(4)
-    p = 56
-    prompt = VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
-        spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
-    )
-    bank = VoiceBank.build({"v": model.prepare_voice(prompt)})
-    kv_steps = _CacheSteps(bank, 3, device)
-    kv_steps.add_voice_pool(1, 64, device)
-    custom = {"c": model.prepare_voice(prompt)}
-    windows = list(stream_windows(torch.randint(0, 6561, (150,)).tolist()))
-    for win, last in windows:
-        tokens = torch.tensor([win, win], dtype=torch.int32, device=device)
-        state, kv, ids, commit, voice_rows = kv_steps.window(["b", "c"], len(win), last, [0, -1], custom)
-        mel = model.window_flow(state, bank, ids, tokens, kv, last, voice_rows)
-        commit()
-        torch.testing.assert_close(mel[1], mel[0], **tol)

@@ -309,35 +309,6 @@ CACHE_FAMILIES = {
 }
 
 
-def voice_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
-    """A custom voice's entry in the voice pool, for prompts of up to
-    ``capacity.prompt_tokens`` tokens: per cache family its caches in stream order
-    (``src_<family>``), its speaker embedding and its initial conv state."""
-    meta = Token2WavState.allocate(capacity, "meta")
-    out = {
-        f"src_{name}": SlotBlock(
-            (f.num_layers, f.rows, f.num_heads, f.rate * capacity.prompt_tokens, 2 * f.head_dim), torch.float32)
-        for name, f in CACHE_FAMILIES.items()
-    }
-    out["spk"] = SlotBlock((MEL_BINS,), torch.float32)
-    out["enc_cnn"] = SlotBlock(tuple(meta.enc_cnn.shape[1:]), torch.float32)
-    out["dit_cnn"] = SlotBlock(tuple(meta.dit_cnn.shape), torch.float32)
-    return out
-
-
-def voice_entry(voice: Token2WavVoice, layout: dict[str, SlotBlock]) -> dict[str, torch.Tensor]:
-    """``voice`` as one row (``[1, *shape]``) of the voice pool laid out as ``layout``."""
-    init = voice_blocks(voice)
-    out = {"spk": voice.spk, "enc_cnn": init["enc_cnn"], "dit_cnn": init["dit_cnn"]}
-    for name, f in CACHE_FAMILIES.items():
-        src = f.source(voice)
-        pad = layout[f"src_{name}"].shape[-2] - src.shape[-2]
-        if pad < 0:
-            raise ValueError(f"a {voice.prompt.tokens.shape[1]}-token voice prompt is longer than the pool holds")
-        out[f"src_{name}"] = F.pad(src, (0, 0, 0, pad))[None]
-    return out
-
-
 class SlotRows(NamedTuple):
     """A batch's rows of the vocoder's state pool (``slot_layout``): the pool and the step's
     addressing of them, the same in a captured and an eager forward. Reads and writes go
@@ -405,17 +376,13 @@ class VoiceBank(NamedTuple):
 
 class AttentionCache(NamedTuple):
     """Where a batch's caches of one family are: the bounded KV resource (whose step
-    planned the batch's rows), the model's voices' sources (``VoiceBank.sources``), and
-    for rows in a custom voice their entries of the voice pool (its ``src_<family>`` block
-    and the rows' slots)."""
+    planned the batch's rows) and the model's voices' sources (``VoiceBank.sources``)."""
 
     resource: object
     sources: torch.Tensor
-    custom: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def layer(self, idx: int) -> BoundedLayerKV:
-        row_source = None if self.custom is None else (self.custom[0][:, idx], self.custom[1])
-        return BoundedLayerKV(self.resource, idx, self.sources[:, idx], row_source)
+        return BoundedLayerKV(self.resource, idx, self.sources[:, idx])
 
 
 class WindowCaches(NamedTuple):
@@ -626,25 +593,17 @@ class Token2Wav(nn.Module):
         tokens: torch.Tensor,
         caches: WindowCaches,
         last: bool = False,
-        custom: SlotRows | None = None,
     ) -> torch.Tensor:
         """The flow for ``B`` windows at any positions, each in its own voice: ``tokens [B, n]``
-        -> mel ``[B, 80, frames]``. ``voices [B]`` indexes ``bank``, or is -1 for a row whose
-        voice is its entry of the voice pool (``custom``, the batch's rows of it). ``caches``
-        know each row's position; rows on their first window (``state.fresh``) read their
-        voice's conv state rather than their slot's. A last window writes no caches.
-        Capturable."""
+        -> mel ``[B, 80, frames]``. ``voices [B]`` indexes ``bank``. ``caches`` know each
+        row's position; rows on their first window (``state.fresh``) read their voice's conv
+        state rather than their slot's. A last window writes no caches. Capturable."""
         b = tokens.shape[0]
         fresh = state.fresh
-        known = voices.clamp(min=0)
 
         def per_row(name: str, stacked: torch.Tensor) -> torch.Tensor:
-            """Each row's voice's ``name`` (the bank's, or its pool entry's)."""
-            value = stacked.index_select(0, known)
-            if custom is None:
-                return value
-            mask = (voices < 0).view(-1, *([1] * (value.dim() - 1)))
-            return torch.where(mask, custom.get(name), value)
+            """Each row's voice's ``name``."""
+            return stacked.index_select(0, voices)
 
         def conv_cache(name: str, init: torch.Tensor) -> torch.Tensor:
             current = state.get(name)

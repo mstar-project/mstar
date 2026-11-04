@@ -850,7 +850,7 @@ def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     for clip in VOICES.values():
         sf.write(tmp_path / "assets" / clip, torch.zeros(6 * 16000).numpy(), 16000)
     return _bare(
-        MiniCPMOModel, max_seq_len=64, local_dir=str(tmp_path), tts_config=TTSConfig(), custom_voices=0,
+        MiniCPMOModel, max_seq_len=64, local_dir=str(tmp_path), tts_config=TTSConfig(),
         config=MiniCPMOConfig(
             llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
         ),

@@ -74,13 +74,12 @@ class DenseKV:
 class BoundedLayerKV:
     """One layer's cache on the engine's bounded KV resource, for the rows its step
     planned (at any positions): ``source [voices, rows, H, L, 2d]`` the layer's voices in
-    stream order (``token2wav.CACHE_FAMILIES``), ``row_source`` the custom voices'."""
+    stream order (``token2wav.CACHE_FAMILIES``)."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor, row_source=None):
+    def __init__(self, resource, layer_idx: int, source: torch.Tensor):
         self.resource = resource
         self.layer_idx = layer_idx
         self.source = source
-        self.row_source = row_source
 
     def retained(self) -> torch.Tensor:
         """``[rows]`` each row's retained entries, which is also its noise offset."""
@@ -95,8 +94,7 @@ class BoundedLayerKV:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
-        return self.resource.attend(self.layer_idx, q, k, v, self.source, rel_bias=rel_bias,
-                                    row_source=self.row_source)
+        return self.resource.attend(self.layer_idx, q, k, v, self.source, rel_bias=rel_bias)
 
 
 # what an attention layer is handed
