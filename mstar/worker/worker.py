@@ -1469,25 +1469,31 @@ class Worker:
         Applied as the message arrives: a load touches no slot state an admit decides
         from (``LoraAdapterPool``'s docstring), so the ranks of a lockstep instance need
         not apply it at the same step. A pool that fails rolls back the ones that loaded,
-        and the conductor rolls back the other workers."""
+        and the conductor rolls back the other workers. A load of a name still being read
+        waits for that load's ack, as an unload does."""
         if self._lora_loads is None:
             self._lora_loads = LoraLoads()
+        elif self._lora_loads.defer(body):
+            return
         self._lora_loads.start(body, self.engine_manager.engine.lora_pools())
         self._finish_lora_loads()
 
     def _finish_lora_loads(self) -> None:
-        """Acknowledge the runtime loads whose reads completed, then the unloads that
-        arrived behind them."""
+        """Acknowledge the runtime loads whose reads completed, then apply the loads and
+        unloads that arrived behind them, in order."""
         for load in self._lora_loads.finish():
             self._ack_lora_adapter(load.body.op_id, load.error)
-            for unload in load.unloads:
-                self._unload_lora_adapter(unload)
+            for body in load.behind:
+                if isinstance(body, LoadLoraAdapter):
+                    self._load_lora_adapter(body)
+                else:
+                    self._unload_lora_adapter(body)
 
     def _unload_lora_adapter(self, body: UnloadLoraAdapter) -> None:
         """Stop serving an adapter to new requests; running ones keep it until they end.
         Any moment will do, for the reason ``_load_lora_adapter`` gives, except while a
         load of the name is still being read: it waits for that load's ack."""
-        if self._lora_loads and self._lora_loads.defer_unload(body):
+        if self._lora_loads and self._lora_loads.defer(body):
             return
         error = None
         try:

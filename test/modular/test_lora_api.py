@@ -526,6 +526,41 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert d.roots.root("a1") not in (None, root)
 
 
+def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
+    """worker_1's read outlasts the timeout: the 504 rolls the load back everywhere, and
+    the client retries at once. worker_1 applies load, rollback and retry in order, so
+    the retry is served on both workers."""
+    d = _Deployment(paths)
+    answers, clock = [], SimpleNamespace(now=0.0)
+
+    def send(peer, message):
+        message = _wire(message)
+        if peer == "api_server":
+            answers.append(message.body)
+        else:
+            d.workers[peer]._process_message_list([message])
+
+    d.ops = LoraAdapterOps(
+        make_spec({}, runtime_updates=True, runtime_update_timeout_s=10.0),
+        ["worker_0", "worker_1"], send, clock=lambda: clock.now,
+    )
+    gate, store = threading.Event(), d.pools["worker_1"].store
+    read = store._read
+    store._read = lambda name, path: (gate.wait(30), read(name, path))[1]
+    d.ops.load(LoadLoraAdapter(op_id="op1", lora_name="a1", lora_path=paths["a1"]))
+    _finish_when_read(d.workers["worker_0"])
+    clock.now = 10.0
+    d.ops.expire()
+    assert answers[-1].status == 504
+    d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"]))
+    _finish_when_read(d.workers["worker_0"])
+    gate.set()
+    while d.workers["worker_1"]._lora_loads:
+        _finish_when_read(d.workers["worker_1"])
+    assert answers[-1] == LoraAdapterResult(op_id="op2", status=200, served=True)
+    assert all(pool.serves("a1") for pool in d.pools.values())
+
+
 def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io_error(paths):
     d = _Deployment(paths, fail_on="worker_1")
     with pytest.raises(REFUSED) as err:

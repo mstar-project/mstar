@@ -29,10 +29,11 @@ class LoraLoad:
     body: LoadLoraAdapter
     reads: list[tuple["LoraAdapterPool", Future]] = field(default_factory=list)
     error: str | None = None
-    # unloads of the same name that arrived while it was read, applied after its ack: an
-    # unload before the load lands would be a no-op, and the load would then serve a
-    # name nothing else does
-    unloads: list[UnloadLoraAdapter] = field(default_factory=list)
+    # later loads and unloads of the same name, applied in order after its ack: an
+    # unload before the load lands would be a no-op, and the load would then serve a name
+    # nothing else does; a load (a retry after the conductor gave up on this one) would
+    # race this one's read and the rollback behind it
+    behind: list[LoadLoraAdapter | UnloadLoraAdapter] = field(default_factory=list)
 
 
 class LoraLoads:
@@ -58,11 +59,11 @@ class LoraLoads:
                 break
         self._loads.append(load)
 
-    def defer_unload(self, body: UnloadLoraAdapter) -> bool:
+    def defer(self, body: LoadLoraAdapter | UnloadLoraAdapter) -> bool:
         """Hold ``body`` behind a load of the same name still being read; False if none is."""
         for load in self._loads:
             if load.body.lora_name == body.lora_name:
-                load.unloads.append(body)
+                load.behind.append(body)
                 return True
         return False
 
