@@ -59,7 +59,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
-       LM, text in / text out, fp8 checkpoint, on 8x or 4x H200 with MTP k=3. See
+       LM, text in / text out, fp8 checkpoint, on 8x or 4x H200, plain or with greedy MTP k=3. See
        `GLM-5.3-Flash and GLM-5.2`_ for the configs and the long-context override.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
@@ -78,8 +78,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        RVQ codec; user speech in, agent text and 22.05 kHz speech out.
    * - ``glm52``
      - ``zai-org/GLM-5.2-FP8``
-     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, on 8x H200
-       with MTP k=3. ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, on 8x H200,
+       plain or with greedy MTP k=3. ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or
        ``reference``, the numerics anchor, served eager. See `GLM-5.3-Flash and GLM-5.2`_.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
@@ -614,6 +614,8 @@ is served. See :doc:`clients` for the agent clients.
 
 Any sampling works on these configs: ``temperature``, ``top_p``, ``max_tokens`` and
 ``seed`` are the standard fields, and ``repetition_penalty`` goes in the request body.
+GLM-5.3-Flash always reasons, so a request that turns thinking off (``enable_thinking:
+false``) is a 400.
 
 **MTP, for greedy workloads.** Each decode step can draft 3 tokens from the checkpoint's MTP
 layer and verify them in one pass (GLM-5.3-Flash emits about 2.6 tokens a step).

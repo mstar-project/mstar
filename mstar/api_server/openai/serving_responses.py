@@ -13,7 +13,7 @@ Where the APIs differ:
   which Codex reads and sends back. There is no summary, and
   ``encrypted_content`` stays unset: the reasoning is no secret.
 * ``reasoning.effort`` asks the template for ``low`` (``minimal``, ``low``),
-  ``high`` (``medium``) or ``max`` (``high``, ``xhigh``), or for its lowest
+  ``high`` (``medium``, ``high``) or ``max`` (``xhigh``), or for its lowest
   level when it has no such one; ``none`` turns thinking off.
 * A reply cut off by ``max_output_tokens`` is ``incomplete``, and so is a call
   it cut, its ``arguments`` as far as they got.

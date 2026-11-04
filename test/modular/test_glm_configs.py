@@ -110,9 +110,10 @@ def test_deployment_starts(name, overrides, tmp_path):
 
 @pytest.mark.parametrize("name, overrides", DEPLOYMENTS)
 def test_pools_hold_every_request(name, overrides):
-    """No admitted request finds the KV pool (or GLM-5.3's KDA pool) full: the short configs
-    hold every request's whole window, the long-context ones one full window. Each pool keeps
-    one page (slot) back as its sink."""
+    """The short configs hold every request's whole window (and GLM-5.3's KDA pool a slot per
+    request), so no admitted request finds a pool full. The long-context ones hold one full
+    window only: their live contexts can outgrow the pool (test_glm5next_dsa's full-pool
+    xfail). Each pool keeps one page (slot) back as its sink."""
     cfg = _config(name, overrides)
     model, requests = _model(cfg), cfg["max_concurrent_requests"]
     # past the largest decode capture the scheduler splits decode into two steps

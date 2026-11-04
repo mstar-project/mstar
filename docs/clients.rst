@@ -515,8 +515,8 @@ the Python frontend only (``--rust-frontend`` answers ``404``): ``POST /v1/chat/
 Anthropic's ``POST /v1/messages`` and ``POST /v1/messages/count_tokens`` (Claude Code), and
 OpenAI's ``POST /v1/responses`` (Codex). All three run one chat path: the messages and
 ``tools`` go to the checkpoint's chat template, and the reply comes back with its reasoning
-and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model,
-``count_tokens`` counts the prompt as the same request would render it, and responses are
+and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model
+(with LoRA adapters served, ``model`` picks one as on chat completions), ``count_tokens`` counts the prompt as the same request would render it, and responses are
 stateless.
 
 - **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages)
@@ -547,9 +547,9 @@ stateless.
   ``store: true``, ``background``). Hints (``metadata``, ``cache_control``,
   ``prompt_cache_key``, ``client_metadata``) are dropped.
 - **MTP** (``mtp_num_draft_tokens > 0``) verifies greedily: a ``temperature`` above 0 is a
-  ``400``, and a request that sets none runs greedy. With ``dsa_long_context`` each step
-  books k + 1 cache rows, so ``max_tokens`` may be at most a (k + 1)th of what the prompt
-  leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
+  ``400``, and a request that sets none runs greedy. On GLM-5.3 with ``dsa_long_context``
+  each step books k + 1 cache rows, so ``max_tokens`` may be at most a (k + 1)th of what the
+  prompt leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
   lowers that.
 
 An agent's system prompt and tools alone outgrow the 2,048-token window of the GLM
