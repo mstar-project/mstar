@@ -1025,6 +1025,14 @@ class Model(ABC):
 
         return TensorAndMetadata(img)
 
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        """What :meth:`load_image` returns, for an image that reached the API
+        server already decoded: RGB uint8 ``[3, H, W]``, as ``read_image(path,
+        rgb=True)`` decodes a file. A model that takes such images (e.g. from
+        the openpi endpoint) overrides this so the two paths agree; the rest
+        take images only as files."""
+        raise NotImplementedError(f"{type(self).__name__} takes images only as files")
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a

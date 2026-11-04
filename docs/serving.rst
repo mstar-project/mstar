@@ -294,6 +294,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``openpi``
+     - *(optional, pi0.5 only)* Serves openpi's policy WebSocket at ``/`` (see
+       :doc:`clients`), mapping an openpi observation onto the request, as openpi's
+       per-robot input and output transforms do. ``images``: the observation keys of the
+       cameras, in slot order. ``state``: the keys whose values are joined, in order,
+       into the robot state. ``action_dims``: how many leading action dims a reply keeps
+       (default all). ``metadata``: the frame sent on connect (default ``{}``). A block
+       the model can't serve (more cameras than ``num_cameras``, an unknown key) stops
+       the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
        WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.

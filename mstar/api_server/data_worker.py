@@ -62,6 +62,7 @@ from mstar.model.base import (
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
+    charge_decoded_image,
     check_audio_duration,
     check_file_counts,
     check_media_limits,
@@ -840,16 +841,29 @@ class PreprocessWorkerThread:
 
     def _load_media(
         self, file_paths: dict[str, list[str]] | None,
+        images: list[torch.Tensor] | None = None,
     ) -> tuple[NameToTensorList, dict[str, list[dict]]]:
         """Raw modality tensors and their metadata, keyed ``{modality}_inputs``.
-        The files are held to one media budget together."""
+        The files, and ``images`` that arrived decoded (which stand in for image
+        files), are held to one media budget together."""
         tensors: NameToTensorList = {}
         input_metadata = {}
-        if not file_paths:
+        if not file_paths and not images:
             return tensors, input_metadata
-        counts = {modality: len(paths) for modality, paths in file_paths.items()}
+        counts = {modality: len(paths) for modality, paths in (file_paths or {}).items()}
+        if images:
+            counts["image"] = len(images)
         check_file_counts(counts, self.model.max_input_files())
         budget = RequestMediaBudget(sum(counts.values()))
+        if images:
+            tensors["image_inputs"], input_metadata["image_inputs"] = [], []
+            for image in images:
+                with budget.file():
+                    charge_decoded_image(image)
+                    out = self.model.load_decoded_image(image, self.device)
+                tensors["image_inputs"].append(out.data)
+                input_metadata["image_inputs"].append(out.metadata)
+        file_paths = file_paths or {}
         for modality, paths in file_paths.items():
             key = f"{modality}_inputs"
             tensors[key] = []
@@ -894,7 +908,10 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        tensors, input_metadata = self._load_media(input.file_paths)
+        if input.images and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+            # a prefix key hashes each image's file, and these have none
+            raise ValueError("this deployment keys image prompts by their files; send the images as files")
+        tensors, input_metadata = self._load_media(input.file_paths, input.images)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -1015,6 +1032,8 @@ class PreprocessWorkerThread:
                     found.append(os.stat(path).st_size)
                 except (OSError, ValueError):
                     pass  # gone or not a valid path: its load fails, and the failure is counted
+        if input.images:
+            sizes["image"] = [image.nbytes for image in input.images]
         return DataWorkerProfile(
             request_id=input.request_id,
             dequeue_time=dequeue_time,
@@ -1381,6 +1400,12 @@ class PreprocessWorkerThread:
                 modality=modality,
                 count=len(paths),
                 total_bytes=total_bytes,
+            ))
+        if input.images:
+            infos.append(InputInfo(
+                modality="image",
+                count=len(input.images),
+                total_bytes=sum(image.nbytes for image in input.images),
             ))
         return infos
 

@@ -23,12 +23,13 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
 
 import msgpack
+import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -42,6 +43,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -412,6 +414,16 @@ def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
     return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
 
 
+def _check_decoded_images(images: list[torch.Tensor], file_paths: dict[str, list[str]] | None) -> None:
+    """Refuse decoded images that are not RGB uint8 ``[3, H, W]``, or that come
+    beside image files, whose order among them nothing would say."""
+    if "image" in (file_paths or {}):
+        raise ValueError("a request sends its images either decoded or as files, not both")
+    for image in images:
+        if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8 or image.ndim != 3 or image.shape[0] != 3:
+            raise ValueError("a decoded image is an RGB uint8 tensor of shape [3, H, W]")
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -466,6 +478,11 @@ class APIServer:
         self.model_name = model_name
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(model_name, model_config)
+        # The openpi WebSocket at `/`, when the config maps robot observations to this model.
+        openpi_block = (model_config or {}).get("openpi")
+        self.openpi_policy = (
+            None if openpi_block is None else OpenpiPolicy.from_config(openpi_block, model_name, model)
+        )
         specs = lora_specs(model, model_config)
         lora_spec = specs[0] if specs else None
         # Every adapter the serving config names, checked against every LoRA spec and
@@ -703,6 +720,7 @@ class APIServer:
         model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
+        images: list[torch.Tensor] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -732,7 +750,13 @@ class APIServer:
         in :meth:`stream_input`: one the model lacks is refused with a 400.
         ``process_prompt`` routes the opening's files, so a name is only
         checked.
+
+        ``images`` are the request's images already decoded, RGB uint8
+        ``[3, H, W]`` in order, in place of image files: the model loads them
+        with ``Model.load_decoded_image``, so nothing is written or decoded.
         """
+        if images is not None:
+            _check_decoded_images(images, file_paths)
         if request_id is None:
             request_id = str(uuid.uuid4())
         check_request_id(request_id)
@@ -805,6 +829,7 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             ends=ending,
+            images=images,
         ))
 
         logger.info(
@@ -2746,6 +2771,24 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """``/health`` as openpi's policy server answers its probe."""
+    await health_check()
+    return PlainTextResponse("OK\n")
+
+
+@app.websocket("/")
+async def openpi_ws(websocket: WebSocket):
+    """openpi's policy protocol (see :mod:`mstar.api_server.openpi`), where
+    ``openpi_client`` connects: the server's root. Refused unless the config
+    has an ``openpi:`` block."""
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await serve_connection(websocket, api_server)
+
+
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
     """Prometheus metrics, when the server runs with ``--enable-metrics``."""
@@ -2825,8 +2868,6 @@ def _set_preprocess_threads(model, config: dict) -> None:
             return
     else:
         threads = model.PREPROCESS_TORCH_THREADS or cpus.plan().preprocess_threads
-    import torch
-
     torch.set_num_threads(int(threads))
 
 
@@ -2940,6 +2981,9 @@ def main(argv: list[str] | None = None):
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        if config.get("openpi") is not None:
+            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
+                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight

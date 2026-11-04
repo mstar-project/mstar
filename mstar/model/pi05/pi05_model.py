@@ -575,7 +575,10 @@ class Pi05Model(Model):
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
         normalizes uint8 on the GPU, so the API server skips a float pass per
         camera and stages a quarter of the bytes for the worker."""
-        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
+        return self.load_decoded_image(read_image(filepath, rgb=True), device)
+
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        return TensorAndMetadata(image.to(device))
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}
