@@ -6,6 +6,17 @@ from mstar.engine.resources.step import (
     SlotLease,
     SubmoduleStep,  # noqa: F401
 )
+from mstar.engine.state.calls import (
+    at_last_token,
+    causal_conv,
+    gated_delta_net,
+    kernel_setting,  # noqa: F401
+    last_sampled,
+    position,
+    positions,
+    rope,
+    sample,
+)
 from mstar.engine.state.contract import (
     Array,
     ArrayStep,
@@ -30,8 +41,9 @@ from mstar.engine.state.contract import (
     Window,
 )
 
-# `SubmoduleStep` stays out of `__all__`, whose names can't be removed after release. It is the engine's own dataclass,
-# and the rebuild after release replaces its `steps`, `cg_key_info` and `_ctx`.
+# `kernel_setting` and `SubmoduleStep` stay out of `__all__`, whose names can't be removed after release.
+# `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release replaces
+# its `steps`, `cg_key_info` and `_ctx`.
 __all__ = [
     "Array",
     "ArrayStep",
@@ -57,4 +69,12 @@ __all__ = [
     "TensorType",
     "Value",
     "Window",
+    "at_last_token",
+    "causal_conv",
+    "gated_delta_net",
+    "last_sampled",
+    "position",
+    "positions",
+    "rope",
+    "sample",
 ]

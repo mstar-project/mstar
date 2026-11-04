@@ -1,4 +1,5 @@
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -134,6 +135,11 @@ class StepContext:
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
 
+    @property
+    def replays(self) -> bool:
+        """Whether this step replays a captured graph, so its forward runs no Python."""
+        return self.slot_lease is not None and not self.capture
+
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
 
@@ -178,6 +184,22 @@ class StepContext:
 
     def set_piecewise_leases(self, leases: "Mapping[str, SlotLease]"):
         self.piecewise_leases = leases
+
+
+class StepHandle(ABC):
+    """What a layer holds for something a step's ``state`` lists. The engine opens it around each step's calls."""
+
+    @abstractmethod
+    def begin_step(self, step: "SubmoduleStep") -> None:
+        """Answer for ``step`` from here on. Raises if the handle is already open."""
+
+    @abstractmethod
+    def check_step(self, step: "SubmoduleStep") -> None:
+        """Refuse the step's calls as a whole, before any resource commits them."""
+
+    @abstractmethod
+    def end_step(self, step: "SubmoduleStep") -> None:
+        """Close the handle, on any path out of the step."""
 
 
 @dataclass(frozen=True)

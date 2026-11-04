@@ -14,10 +14,18 @@ from collections.abc import Mapping
 
 sys.path.insert(0, ".")
 
+import pytest
+
 from mstar.engine import state
+from mstar.engine.state.calls import ArrayHandle, WithinStepHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
 _POSITIONAL = {"Reached", "Segment", "SlotLease", "Span"}
+# The calls take the handle first, then what every call names, and only then keywords.
+_CALLS = {
+    "at_last_token", "causal_conv", "gated_delta_net", "last_sampled", "position", "positions",
+    "rope", "sample",
+}
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
     "Array": [
@@ -160,6 +168,70 @@ SNAPSHOT = {
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "at_last_token": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["x", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "causal_conv": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["x", "POSITIONAL_OR_KEYWORD", None],
+        ["weight", "KEYWORD_ONLY", None],
+        ["bias", "KEYWORD_ONLY", 'None'],
+    ],
+    "gated_delta_net": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["q", "POSITIONAL_OR_KEYWORD", None],
+        ["k", "POSITIONAL_OR_KEYWORD", None],
+        ["v", "POSITIONAL_OR_KEYWORD", None],
+        ["a", "POSITIONAL_OR_KEYWORD", None],
+        ["b", "POSITIONAL_OR_KEYWORD", None],
+        ["a_log", "POSITIONAL_OR_KEYWORD", None],
+        ["dt_bias", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "last_sampled": [
+        ["s", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "position": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["request", "POSITIONAL_OR_KEYWORD", None],
+        ["label", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "positions": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "rope": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["q", "POSITIONAL_OR_KEYWORD", None],
+        ["k", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "sample": [
+        ["s", "POSITIONAL_OR_KEYWORD", None],
+        ["logits", "POSITIONAL_OR_KEYWORD", None],
+    ],
+}
+
+
+HANDLE_SNAPSHOT = {
+    "add": [
+        ["self", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["keep", "KEYWORD_ONLY", "None"],
+        ["fields", "VAR_KEYWORD", None],
+    ],
+    "read": [
+        ["self", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["q", "POSITIONAL_OR_KEYWORD", "None"],
+        ["mask_args", "VAR_KEYWORD", None],
+    ],
+    "write": [
+        ["self", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["at", "KEYWORD_ONLY", "None"],
+        ["fields", "VAR_KEYWORD", None],
+    ],
 }
 
 
@@ -188,9 +260,18 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
+@pytest.mark.parametrize("handle", [ArrayHandle, WithinStepHandle])
+def test_a_handles_calls_equal_the_snapshot(handle):
+    surface = {
+        name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]
+        for name in HANDLE_SNAPSHOT
+    }
+    assert surface == HANDLE_SNAPSHOT, "`add`, `read` and `write` are the surface a layer calls"
+
+
 def test_every_field_after_the_first_is_keyword_only():
     positional = {
         name: [p[0] for p in params[1:] if p[1] != "KEYWORD_ONLY"]
-        for name, params in _surface().items() if name not in _POSITIONAL
+        for name, params in _surface().items() if name not in _POSITIONAL | _CALLS
     }
     assert not any(positional.values()), positional
