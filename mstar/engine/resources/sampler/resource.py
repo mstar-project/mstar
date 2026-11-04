@@ -17,6 +17,7 @@ from mstar.engine.resources.sampler.config import (
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
+    FusedDrawArgs,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
@@ -725,6 +726,21 @@ class SamplerResource(Resource):
         device by slot (the graph-buffer path): what the device-side
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
+
+    @torch.compiler.disable
+    def fused_draw_args(self) -> FusedDrawArgs | None:
+        """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
+        on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
+        `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
+        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with `advance_offsets`."""
+        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
+            return None
+        return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
+
+    @torch.compiler.disable
+    def advance_offsets(self, draws: int) -> None:
+        """Move each row's RNG offset past ``draws`` draws, as that many `sample` calls would."""
+        self._cg_sampler.advance_offsets(draws)
 
     def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,
