@@ -783,8 +783,10 @@ class Token2WavSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> NodeInputs | None:
         if not inputs.get("tts_code"):
-            # a text-only reply's stream closes with one empty chunk
-            return None
+            # The TTS never ran: the spoken reply ended at the LLM's prefill, and its
+            # stream's one chunk is final and empty. It still runs, voicing nothing,
+            # as the empty step below does.
+            return NodeInputs(tensor_inputs={"codes": torch.zeros(1, 0, dtype=torch.int32)}, kwargs={"last": True})
         # A host sync, which serializes this node's async pipeline. It is needed either
         # way: a window's length decides its capture and its cache writes. Filtering
         # the stop code on the device would need check_stop to filter outputs (an
@@ -821,13 +823,16 @@ class Token2WavSubmodule(NodeSubmodule):
         # This step admits the windows (slots, positions), which has to happen before
         # the forward. Its plan goes unused: each region re-plans the rows it runs.
         # TODO: an admit-only step would save that plan's host work.
+        # A row with no codes voices nothing (``forward_batched``), so it declares
+        # nothing: a reply that never reached the TTS takes no slot.
+        rows = [(rid, inp) for rid, inp in zip(request_ids, inputs, strict=True) if inp.tensor_inputs["codes"].shape[1]]
         return SubmoduleStep(
-            segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+            segments=[Segment(request_id=rid, label="main", span=1) for rid, _ in rows],
             steps={
                 T2W_STATE: RecurrentStep(),
                 **self._cache_steps(
-                    request_ids, [inp.tensor_inputs["codes"].shape[1] for inp in inputs],
-                    [inp.kwargs["last"] for inp in inputs],
+                    [rid for rid, _ in rows], [inp.tensor_inputs["codes"].shape[1] for _, inp in rows],
+                    [inp.kwargs["last"] for _, inp in rows],
                 ),
             },
         )

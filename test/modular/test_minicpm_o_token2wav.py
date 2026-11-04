@@ -493,13 +493,15 @@ def test_assets_load_completely():
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
 
 
-@pytest.mark.parametrize("n", [1, 21, 22, 23, 24, 25, 49, 99, 100, 230])
+@pytest.mark.parametrize("n", [0, 1, 21, 22, 23, 24, 25, 49, 99, 100, 230])
 def test_served_windows_are_upstreams(n):
     """The TTS streams ``n`` codes and then its stop code; the policy's chunks, through
     ``prepare_inputs``, are the reference's windows of the codes: every code voiced once and the
     same last window, also when the stop code ends a full window (``n = 25j + 24``). Every
-    chunk of a started stream still runs, voicing nothing past the last window: a skipped
-    step never completes the node, which then refuses the stream's final chunk."""
+    chunk still runs, voicing nothing past the last window: a skipped step never completes the
+    node, which then refuses the stream's final chunk. ``n = 0`` is a reply that ended at the
+    LLM's prefill: the TTS never ran, and the stream's one chunk is an empty, last step that
+    declares no row (so takes no slot)."""
     from types import SimpleNamespace
 
     from mstar.model.minicpm_o.components.token2wav import HOP, LEAD_SILENCE, SILENCE_CODE
@@ -519,8 +521,8 @@ def test_served_windows_are_upstreams(n):
 
     buffer = StreamBuffer(request_id=0, edge_name="tts_code", from_partition="main",
                           policy=LeftContextChunkPolicy(chunk=HOP, left_context=LEAD_SILENCE))
-    served, started = [], False
-    for i, code in enumerate(codes + [eos, None]):
+    served = []
+    for i, code in enumerate((codes + [eos] if n else []) + [None]):
         if code is None:
             buffer.signal_done()
         else:
@@ -534,13 +536,18 @@ def test_served_windows_are_upstreams(n):
                 is_final_stream_chunk=chunk.is_final,
                 input_metadata=InputMetadata(stream_chunks={"tts_code": chunk.info} if data is not None else {}),
             )
-            assert got is not None or not started
-            if got is not None and got.tensor_inputs["codes"].numel():
+            assert got is not None
+            if got.tensor_inputs["codes"].numel():
                 served.append((got.tensor_inputs["codes"][0].tolist(), got.kwargs["last"]))
                 # each window's caches hold what the windows before it wrote
                 assert node.request_state(0)["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
-                started = True
-    assert served == reference_windows(codes)
+    assert got.kwargs["last"]
+    if n:
+        assert served == reference_windows(codes)
+    else:
+        assert served == [] and node.request_states == {}
+        step = node.declare_step("t2w_chunk", [0], [got])
+        assert all(not s.segments for s in step.steps.values())
 
 
 @pytest.mark.parametrize("device", [
