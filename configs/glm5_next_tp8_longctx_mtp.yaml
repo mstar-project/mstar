@@ -25,10 +25,10 @@ model_kwargs:
   prefill_graphs: true
 resources:
   kv_cache:
-    # 12 latent planes + 12 index planes (the MTP layer's too), one 576-wide bf16 row per
-    # token each (512 + the rope slot that masks the sparse plan's padding): 27.6 KB per token
-    # per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of others,
-    # ~32 GB/rank next to ~38 GB of weights.
+    # 12 latent planes (the MTP layer's too), a 576-wide bf16 row per token each (512 + the
+    # rope slot that masks the sparse plan's padding), and 12 index planes 384 wide: 23.0 KB
+    # per token per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of
+    # others, ~26 GB/rank next to ~43 GB of weights.
     max_num_pages: 8960
     page_size: 128
     # the prefix cache above one rank: rank 0 decides each hit and the other ranks adopt it
