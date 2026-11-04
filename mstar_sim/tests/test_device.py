@@ -200,16 +200,16 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         import time
         g5 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g5):
-            clock.on_replay(lambda: time.sleep(0.2))
+            clock.on_replay(lambda: time.sleep(1))
             a @ a
         took = timed(g5.replay, queued=0.0)  # idle: a late launch would show
-        assert took < 0.1, took
+        assert took < 0.5, took
         # nor is what it does around a stand-in kernel
         from mstar_sim import device
-        count_storages, device.count_storages = device.count_storages, lambda out: time.sleep(0.2)
+        count_storages, device.count_storages = device.count_storages, lambda out: time.sleep(1)
         before = clock.vnow()
         clock.kernel_fn("test.idle")(lambda: None)()
-        assert clock.vnow() - before < 0.1, clock.vnow() - before
+        assert clock.vnow() - before < 0.5, clock.vnow() - before
         device.count_storages = count_storages
         try:
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
@@ -305,13 +305,13 @@ def test_an_event_on_an_idle_stream_holds_no_thread_back():
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()
         with clock.computing():
-            time.sleep(0.2)
+            time.sleep(1)
         recorder = threading.Thread(target=event.record)
         recorder.start(); recorder.join()
         with torch.cuda.stream(stream):
             start.record(); stream.wait_event(event); torch.empty(8, device="cuda").add_(1); end.record()
         end.synchronize()
-        assert start.elapsed_time(end) < 100, start.elapsed_time(end)
+        assert start.elapsed_time(end) < 500, start.elapsed_time(end)
         print("ok")
     """)
     assert out.strip() == "ok"
@@ -388,7 +388,7 @@ def test_device_side_assert_surfaces_once_the_device_reaches_it_and_stays():
         from mstar_sim import clock
         table, ids = torch.empty(50, 8, device="cuda"), torch.tensor([3, 77], device="cuda")
         torch.cuda.synchronize()
-        clock.charge(0.5)  # device work queued ahead of the bad index
+        clock.charge(2)  # device work queued ahead of the bad index
         torch.nn.functional.embedding(ids, table)
         (ids + 1)  # launched before the device got to the fault
         stream, event = torch.cuda.Stream(), torch.cuda.Event()
