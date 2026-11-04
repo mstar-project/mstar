@@ -40,20 +40,17 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
 
     APIServer.submit_request = submitted
 
-    def snapshot(manager, event, rid=None, **extra):
+    def snapshot(manager, event, rid, **extra):
+        # The Rust bookkeeper holds the tensors and their counts (RustTensorStore).
         store = manager.tensor_store
         rows = []
-        ids = store.get_all_uuids(rid) if rid is not None else list(store._uuid_to_rid)
-        records = getattr(store.bookkeeping, "_ref_info", {})
-        for uuid in ids:
-            rec = records.get(uuid)
+        for uuid in store.get_all_uuids(rid):
             info = store.get_info(uuid)
             rows.append(
                 dict(
                     uuid=uuid,
                     name=manager.uuid_to_edge_name.get(uuid),
-                    refs=None if rec is None else rec.ref_cnt,
-                    persist=None if rec is None else rec.persist,
+                    refs=store._rust.ref_count(uuid),
                     dims=None if info is None else info.dims,
                 )
             )
@@ -65,7 +62,7 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
             request_id=wire_ids.get(rid, rid if isinstance(rid, str) else None),
             entity=manager.my_entity_id,
             tensors=rows,
-            total_tensors=len(store._uuid_to_rid),
+            total_tensors=store._rust.stored_counts()[0],
             **extra,
         )
         if torch.cuda.is_initialized():

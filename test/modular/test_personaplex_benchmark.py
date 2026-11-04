@@ -319,7 +319,7 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
 
     store = types.SimpleNamespace(
         get_all_uuids=lambda rid: [5], get_info=lambda uuid: None,
-        bookkeeping=types.SimpleNamespace(_ref_info={}), _uuid_to_rid={5: 7},
+        _rust=types.SimpleNamespace(ref_count=lambda uuid: 1, stored_counts=lambda: (1, 1)),
     )
     manager = types.SimpleNamespace(tensor_store=store, uuid_to_edge_name={}, my_entity_id="worker_0")
     assert StubRustRuntime().add_request("wire-request") == 7
@@ -331,6 +331,50 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
             for line in path.read_text().splitlines()]
     assert [(row["event"], row["rid"]) for row in rows] == [("after_decoder_inputs_consumed", 7)]
     assert rows[0]["request_id"] == "wire-request"
+
+
+def test_ownership_observer_reads_the_real_rust_tensor_store(tmp_path, monkeypatch):
+    """A stub store hid that the observer read attributes the Rust store no longer has."""
+    pytest.importorskip("mstar_rust")
+    import runpy
+    import types
+
+    import torch
+
+    from mstar.api_server.entrypoint import APIServer
+    from mstar.communication.arena import ArenaShmCommunicationManager
+    from mstar.communication.tensor_store import RustTensorBookkeeping, TensorStore
+    from mstar.communication.tensors import TensorCommunicationManager
+    from mstar.engine.engine import Engine
+    from mstar.graph.base import TensorPointerInfo
+    from mstar.graph.runtime.rust import RustGraphRuntime
+
+    for cls, name in (
+        (TensorCommunicationManager, "cleanup_collectable"),
+        (TensorCommunicationManager, "force_cleanup_request"),
+        (ArenaShmCommunicationManager, "cleanup_collectable"),
+        (RustGraphRuntime, "cleanup_consumed_inputs"),
+        (RustGraphRuntime, "add_request"),
+        (Engine, "remove_request"),
+        (APIServer, "submit_request"),
+    ):
+        monkeypatch.setattr(cls, name, cls.__dict__[name])
+    monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_OBSERVE", "1")
+    monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_ROOT", str(tmp_path))
+    observer = runpy.run_path(str(Path("benchmark/personaplex/observe/sitecustomize.py")))
+
+    store = TensorStore(bookkeeping=RustTensorBookkeeping())
+    info = TensorPointerInfo(dims=[1, 8, 1], dtype=torch.int64, nbytes=64, address=0, stride=[1, 1, 1], uuid=5,
+                             source_session_id="s", source_entity="w0")
+    store.put_tensor(7, 5, torch.zeros(1, 8, 1, dtype=torch.int64), info)
+    store.increment_ref(5, n=2)
+    manager = types.SimpleNamespace(tensor_store=store, uuid_to_edge_name={5: "agent_frame"}, my_entity_id="worker_0")
+    observer["snapshot"](manager, "before_hard_cleanup", 7)
+
+    (row,) = [json.loads(line) for path in tmp_path.glob("ownership-events-*.jsonl")
+              for line in path.read_text().splitlines()]
+    assert row["total_tensors"] == 1
+    assert row["tensors"] == [{"uuid": 5, "name": "agent_frame", "refs": 2, "dims": [1, 8, 1]}]
 
 
 def test_ownership_gate_correlates_http_ids_and_recycled_handles():
