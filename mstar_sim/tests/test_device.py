@@ -181,6 +181,11 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             packed = source[:, None].expand(3, 2).contiguous()
         source.add_(1); g7.replay()
         assert copied.tolist() == [1, 1, 2, 2, 3, 3] and packed.tolist() == [[1, 1], [2, 2], [3, 3]], packed.tolist()
+        # a result too large to keep is value-less, so a replay has nothing to re-run for it
+        wide, g9 = torch.ones(4096, device="cuda"), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g9):
+            outer = wide[:, None] * wide[None, :]
+        assert not [run for _, run in g9.tape.nodes if run]
         # a stand-in kernel's work on kept values re-runs at each replay too (timed as under --fast),
         # and capture writes nothing: here the top-k transform's slots from the latest page table
         import flashinfer

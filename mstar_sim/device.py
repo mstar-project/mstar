@@ -776,9 +776,9 @@ def _fast(func, args, kwargs, flat, index):
         raw = meta_call(func, uargs, ukwargs, tensors)
     else:
         if func not in _UNINITIALIZED and (clock.capturing() is not None or any(never_computed(t) for t in tensors)):
-            # captured: deferred to the replays per aten op (a view function that has to copy
-            # arrives as the copy), and priced there; a never-computed operand: per aten op,
-            # which says what each one reads and writes
+            # captured: deferred to the replays per aten op, and priced there (a view function
+            # that has to copy arrives as the copy, or whole and unpriced under inference mode);
+            # a never-computed operand: per aten op, which says what each one reads and writes
             with _Observe(torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None):
                 raw = func(*uargs, **ukwargs)
             return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
@@ -947,9 +947,14 @@ def _captured_values(func, args, kwargs):
             return m
         if id(m) in real:
             return real[id(m)]
+        if not keeps_values(m.dtype, m.numel()):
+            return m
         return torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
 
     out = tree_map(buffer, out)
+    tensors = [t for t in tree_flatten(out)[0] if isinstance(t, torch.Tensor)]
+    if tensors and all(_is_meta(t) for t in tensors):
+        return out  # too large to keep, as eagerly: value-less, with nothing to re-run
 
     def rerun():
         fresh = _kept_op(func, args, kwargs)
