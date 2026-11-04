@@ -414,28 +414,31 @@ class CodecSubmodule(ARNodeSubmodule):
 
         Warmed as a step runs it eagerly (past the captures, or with a bucket's
         slots taken): on fresh tensors, where the captures pass views of their
-        static buffers, as one graph for every chunk width and every batch size
-        past 1, and one for a single row. The sizes are declared dynamic with
-        their bounds, so a guard that would split them into ranges (a conv's
-        backend choice, say) fails this warm-up instead of compiling on a live
-        step. Warmed at the largest such step: Inductor picks its kernels' tiles
-        by the sizes it compiled at, and the large steps are the ones whose time
-        counts."""
+        static buffers, as one graph for every batch size past 1 and every
+        chunk width past 1, and one for a single row; a 1-frame window, like a
+        single row, gets its own. Those sizes are declared dynamic with their
+        bounds, so a guard on the batch size or the width alone that would split
+        its range (a conv's backend choice, say) fails this warm-up instead of
+        compiling on a live step. Torch checks the bounds against such
+        single-size guards only: one on rows and width together would pass.
+        Warmed at the largest such step: Inductor picks its kernels' tiles by the
+        sizes it compiled at, and the large steps are the ones whose time counts."""
         device, blocks = self.get_device(), self.incremental.state_blocks()
+        wide = [width for width in self.windows if width > 1]  # 0/1 specialization: 1 is its own graph
 
-        def example(rows):
-            width = self.windows[-1]
+        def example(rows, width):
             state = {name: torch.zeros(rows, *b.shape, dtype=b.dtype, device=device) for name, b in blocks.items()}
             codes = torch.zeros(rows, self.config.num_codebooks, width, dtype=torch.long, device=device)
             lengths = torch.full((rows,), width, dtype=torch.long, device=device)
             if rows > 1:
                 for tensor in (codes, lengths, *state.values()):
                     torch._dynamo.mark_dynamic(tensor, 0, min=2, max=self.MAX_BATCH_SIZE)
-            if len(self.windows) > 1:
-                torch._dynamo.mark_dynamic(codes, 2, min=self.windows[0], max=self.windows[-1])
+            if width > 1 and len(wide) > 1:
+                torch._dynamo.mark_dynamic(codes, 2, min=wide[0], max=wide[-1])
             return codes, state, lengths
 
-        return {"incremental": [example(1), example(self.MAX_BATCH_SIZE)]}
+        widths = ([wide[-1]] if wide else []) + ([1] if self.windows[0] == 1 else [])
+        return {"incremental": [example(rows, width) for width in widths for rows in (1, self.MAX_BATCH_SIZE)]}
 
     def _bucket(self, frames: int) -> int:
         """Smallest captured chunk width that holds ``frames``."""

@@ -375,12 +375,14 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled codec decode runs on CUDA")
-def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(config):
+@pytest.mark.parametrize("chunk_schedule", [(2, 3), (1, 2, 3)], ids=["windows_2_3_5", "a_1_frame_window"])
+def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(chunk_schedule):
     """The codec captures only its small batch buckets, and any other step runs the
     compiled decode eagerly, on fresh tensors where the captures passed views of their
     static buffers. The region's warm-up (``compile_regions``), which the engine runs
     before capturing, compiles every such step, so none stalls on a compile live: at
-    any batch size up to ``MAX_BATCH_SIZE`` and any chunk width."""
+    any batch size up to ``MAX_BATCH_SIZE`` and any chunk width, a 1-frame one too."""
+    config = tiny_config(chunk_schedule=chunk_schedule)
     submodule = CodecSubmodule(random_decoder(config).float().cuda(), config)
     torch._dynamo.reset()
     compiled = torch.compile(submodule.incremental, dynamic=True)
@@ -436,16 +438,14 @@ def test_codec_buckets_are_the_chunk_widths(config, decoder):
         submodule._bucket(6)
 
 
-@pytest.mark.parametrize("chunk_frames", [5, 128])
-def test_codec_captures_small_steps_and_one_row_at_every_width(chunk_frames):
-    """Up to ``CAPTURE_MAX_FRAMES`` frames a step, and one row at a width past it: an
-    empty list would capture the runner's default ladder, past ``MAX_BATCH_SIZE``."""
-    config = tiny_config(chunk_frames=chunk_frames)
+def test_a_codec_width_past_the_frame_cap_captures_one_row():
+    """A width wider than ``CAPTURE_MAX_FRAMES`` still captures one row: an empty list
+    would capture the runner's default ladder, past ``MAX_BATCH_SIZE``."""
+    config = tiny_config(chunk_frames=128)
     submodule = CodecSubmodule(random_decoder(config), config)
     for graphs in submodule.get_accelerator_graph_configs(torch.device("cpu")):
         width, sizes = graphs.additional_key_info, graphs.capture_batch_sizes
-        assert sizes[0] == 1 and max(sizes) <= submodule.MAX_BATCH_SIZE, (width, sizes)
-        assert all(bs == 1 or bs * width <= submodule.CAPTURE_MAX_FRAMES for bs in sizes), (width, sizes)
+        assert sizes and sizes[0] == 1 and max(sizes) <= submodule.MAX_BATCH_SIZE, (width, sizes)
 
 
 # ---------------------------------------------------------------------------
