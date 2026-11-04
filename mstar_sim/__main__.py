@@ -83,14 +83,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--report", default=None,
                         help="write per-process simulated-device stats here at exit")
     args, rest = parser.parse_known_args(argv)
-    from mstar_sim import gpus, tables
-
-    try:
-        gpus.lookup(args.gpu)
-    except (KeyError, ValueError) as e:
-        parser.error(f"--gpu {args.gpu}: {e}")
-    if args.cost == "tables" and not os.path.isdir(tables.data_dir()):
-        parser.error(f"--cost tables: no AIConfigurator data at {tables.data_dir()}; {tables.FETCH}")
     if rest and rest[0] == "--":
         command = rest[1:]
         isolated = {"-I", "-E"} & set(command[: command.index("-m")] if "-m" in command else command[:1])

@@ -193,11 +193,55 @@ def _track(wrapper, data: torch.Tensor) -> None:
     with _track_lock:
         entry = _STORAGES.get(key)
         if entry is None:
-            entry = _STORAGES[key] = [storage.nbytes(), 0]
+            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes())]
             ALLOCATED[0] += entry[0]
             ALLOCATED[1] = max(ALLOCATED[1], ALLOCATED[0])
         entry[1] += 1
     weakref.finalize(data, _release, key)
+
+
+# Value-less storages get addresses in [2^60, 2^62): unique per storage, never
+# reused, and non-canonical on x86-64 and arm64, so code that compares or offsets
+# pointers sees distinct storages, and code that reads through one faults loudly
+# (``faulthandler`` prints the Python stack) instead of reading host memory.
+_FAKE_NEXT = [1 << 60]
+_FAKE_UNTRACKED: dict[int, int] = {}
+
+
+def _fake_range(nbytes: int) -> int:
+    with _track_lock:
+        base = _FAKE_NEXT[0]
+        _FAKE_NEXT[0] += -(-max(nbytes, 1) // 512) * 512 + 512
+    return base
+
+
+def fake_base(storage) -> int:
+    """The fake address of a value-less storage."""
+    entry = _STORAGES.get(storage._cdata)
+    if entry is not None:
+        return entry[2]
+    base = _FAKE_UNTRACKED.get(storage._cdata)
+    if base is None:
+        base = _FAKE_UNTRACKED[storage._cdata] = _fake_range(storage.nbytes())
+    return base
+
+
+class _FakeStorage:
+    """A value-less tensor's ``untyped_storage()``: the meta storage with its fake
+    address, so callers that key storages by ``data_ptr()`` see them as distinct.
+    Handing it to C++ (``set_``) raises."""
+
+    def __init__(self, storage):
+        self._storage = storage
+
+    def data_ptr(self) -> int:
+        return fake_base(self._storage)
+
+    def __getattr__(self, name):
+        return getattr(self._storage, name)
+
+    def __len__(self):
+        return len(self._storage)
 
 
 def _unwrap(x):
@@ -653,11 +697,11 @@ def _host_read(name):
 
 
 def _data_ptr(self) -> int:
-    """A real address, or for a value-less tensor a stable fake one per storage."""
+    """A real address, or for a value-less tensor its storage's fake one."""
     data = self._data
     if data.device.type != "meta":
         return data.data_ptr()
-    return (data.untyped_storage()._cdata << 4) + data.storage_offset() * data.element_size()
+    return fake_base(data.untyped_storage()) + data.storage_offset() * data.element_size()
 
 
 def _copy_(self, src, non_blocking=False):
@@ -689,7 +733,8 @@ _METHODS = {
     T.__float__: _host_read("__float__"),
     T.__index__: _host_read("__index__"),
     T.data_ptr: _data_ptr,
-    T.untyped_storage: lambda self: self._data.untyped_storage(),
+    T.untyped_storage: lambda self: (_FakeStorage(self._data.untyped_storage()) if _is_meta(self._data)
+                                     else self._data.untyped_storage()),
     T.is_pinned: lambda self, *a, **k: False,
     T.pin_memory: lambda self, *a, **k: self,
     T.share_memory_: lambda self: self,
@@ -819,6 +864,9 @@ def install() -> None:
     if _installed:
         return
     _installed = True
+    import faulthandler
+
+    faulthandler.enable()  # a read through a fake address prints the Python stack
     # Moving a module to cuda keeps each Parameter object, as on a GPU (where a
     # CPU and a CUDA tensor share an impl type and torch sets `.data`): tied
     # weights stay tied and references taken before the move stay live.

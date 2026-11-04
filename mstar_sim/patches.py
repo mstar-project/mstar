@@ -12,11 +12,11 @@
 - ``header_only_weights``: weights are read from safetensors headers only.
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
 
-Each patch names the mstar attributes it replaces through :func:`_replace`,
-which refuses one that no longer exists. A patch whose target mstar moved stops
-the process (:func:`install`) naming the patch: a run without it would give
-wrong numbers or run out of host memory. ``mstar_sim/tests/test_contract.py``
-applies every patch in CI, so the mstar change that moves a target fails there.
+Each patch checks every mstar name it relies on at install, whether or not its
+option is on (:func:`_require`), so a target mstar renamed stops every run with
+the name that moved, never a run with the patch silently missing. Every test in
+``mstar_sim/tests`` installs the emulator against the checked-out mstar, so the
+mstar change that moves a target fails CI.
 """
 
 from __future__ import annotations
@@ -30,9 +30,14 @@ import torch
 
 def _replace(owner, name: str, value) -> None:
     """``owner.name = value``, for an attribute mstar still has."""
-    if not hasattr(owner, name):
-        raise AttributeError(f"{getattr(owner, '__name__', owner)}.{name} is gone")
+    _require(owner, name)
     setattr(owner, name, value)
+
+
+def _require(owner, name: str) -> None:
+    if not hasattr(owner, name):
+        raise AttributeError(f"{getattr(owner, '__name__', owner)}.{name} is gone: mstar changed under "
+                             "mstar_sim; update mstar_sim/patches.py")
 
 
 def _cap(values, limit):
@@ -43,12 +48,16 @@ def _cap(values, limit):
 
 
 def cap_captures() -> None:
+    # targets first, whether or not the caps are set: a rename fails every run
+    cfg = importlib.import_module("mstar.engine.accelerator_graph_config")
+    runner = importlib.import_module("mstar.engine.accelerator_graph_runner")
+    _require(cfg.AcceleratorGraphConfig, "__init__")
+    _require(cfg.PackedAcceleratorGraphConfig, "__init__")
+    _require(cfg.PiecewiseAcceleratorGraphConfig, "__post_init__")
     tokens = int(os.environ.get("MSTAR_SIM_MAX_CAPTURE_TOKENS", "0"))
     batch = int(os.environ.get("MSTAR_SIM_MAX_CAPTURE_BATCH", "0"))
     if not tokens and not batch:
         return
-    cfg = importlib.import_module("mstar.engine.accelerator_graph_config")
-    runner = importlib.import_module("mstar.engine.accelerator_graph_runner")
     for cls in (runner.AcceleratorGraphRunner, *runner.AcceleratorGraphRunner.__subclasses__()):
         if "CAPTURE_BATCH_SIZES" in vars(cls):
             cls.CAPTURE_BATCH_SIZES = _cap(cls.CAPTURE_BATCH_SIZES, batch)
@@ -123,6 +132,13 @@ def no_graphs() -> None:
     """``MSTAR_SIM_NO_GRAPHS``: ``1`` captures nothing, so every step runs the eager
     forward (module hooks fire, ops can be inspected one by one); ``A,B`` runs only
     those graph nodes eagerly (one whose capture needs a real Triton build, say)."""
+    runner = importlib.import_module("mstar.engine.accelerator_graph_runner")
+    engine = importlib.import_module("mstar.engine.engine")
+    _require(engine.Engine, "_build_piecewise_runners")
+    for attr in ("_capture_configs", "_submodule_name"):  # set in the runner's __init__
+        if attr not in runner.AcceleratorGraphRunner.__init__.__code__.co_names:
+            raise AttributeError(f"AcceleratorGraphRunner.{attr} is gone: mstar changed under mstar_sim; "
+                                 "update mstar_sim/patches.py")
     value = os.environ.get("MSTAR_SIM_NO_GRAPHS", "")
     if not value:
         return
@@ -131,15 +147,13 @@ def no_graphs() -> None:
     def eager(node) -> bool:
         return nodes is None or node in nodes
 
-    runner = importlib.import_module("mstar.engine.accelerator_graph_runner")
-    engine = importlib.import_module("mstar.engine.engine")
     init = runner.AcceleratorGraphRunner.__init__
 
     @functools.wraps(init)
     def no_capture(self, *args, **kwargs):
         init(self, *args, **kwargs)
         if eager(self._submodule_name):
-            _replace(self, "_capture_configs", [])
+            self._capture_configs = []
 
     runner.AcceleratorGraphRunner.__init__ = no_capture
     build = engine.Engine._build_piecewise_runners
@@ -264,14 +278,12 @@ def worker_process_target(*args, **kwargs):
 def install() -> None:
     try:
         importlib.import_module("mstar")
-    except ImportError:
+    except ModuleNotFoundError as e:
+        if e.name != "mstar":
+            raise  # mstar is there but broken: not a run to make without the patches
         return  # not an mstar process
     for patch in PATCHES:
-        try:
-            patch()
-        except (ImportError, AttributeError) as e:
-            raise SystemExit(f"mstar_sim: patch {patch.__name__} no longer applies, mstar changed under "
-                             f"it ({e}); update mstar_sim/patches.py") from e
+        patch()  # a failure stops the process (sitecustomize), naming what moved
 
 
 PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag)

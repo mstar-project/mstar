@@ -143,6 +143,10 @@ def test_timing_only_holds_shapes_not_values():
         free1, _ = torch.cuda.mem_get_info()
         assert total == torch.cuda.get_device_properties().total_memory
         assert free0 - free1 == 40 * 2**30
+        a, b = torch.empty(1000, device="cuda"), torch.empty(3000, device="cuda")
+        sa, sb = a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr()
+        assert sa and sb and abs(sa - sb) >= 4000  # distinct storages: mstar keys bytes by pointer
+        assert a[10:].data_ptr() == sa + 40
         pos = torch.arange(5, device="cuda") + 1
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
