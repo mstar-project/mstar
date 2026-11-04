@@ -715,6 +715,8 @@ The spec types are:
        a CUDA graph interns) and opens the forward's context (``context``, then ``use``);
        the layers write their keys, select and attend through ``dsa.paged``
        (``write_index``, ``select``, ``sparse_attend``), on device and under CUDA graphs.
+       A pass over some of a step's rows writes at their own slots inside
+       ``KVManager.token_rows(rows)``, as ``token_window`` does for a run of them.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
        (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
