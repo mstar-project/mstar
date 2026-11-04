@@ -401,29 +401,28 @@ Per-model notes:
 - **Whisper / Higgs-Audio** — for Whisper, ``language`` (ISO-639-1) skips language
   detection and ``prompt`` conditions the decoder on prior text (it reaches the model
   as ``initial_prompt``); for Higgs-Audio, ``prompt`` is the transcription instruction
-  (the model has a default) and ``language`` has no effect. ``response_format``
+  (the model has a default) and nothing detects the language: ``verbose_json``'s
+  ``language`` is the request's ``language`` as given, or null. ``response_format``
   ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
-  model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server;
-  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
-  one segment per window, timed to the windows. A
-  streaming client receives only the spoken words. Uploads longer than 30 s
-  are served as consecutive windows. By default Whisper's run in order,
-  openai-whisper style: each window gets the transcript so
-  far as ``initial_prompt`` and the first window's detected language, is decoded
-  with timestamps so the next window can start where its last closed segment
-  ended (no word is split by a boundary), and is decoded again when its text is
-  a repetition loop (gzip compression ratio above 2.4): first without the
-  conditioning text, then at rising temperatures — after which the transcript
-  so far stops conditioning later windows.
-  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
-  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
-  once, each cut at the quietest moment before its boundary; Higgs-Audio's run
-  that way by default. Segment timestamps are offset to the whole file.
-  ``window_seconds`` in ``extra_body`` (5 to 30) sets the window length for one
-  request, and an upload longer than it is windowed. An upload, like any audio a request attaches, is refused once it
-  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
-  worker). The decode up to that point still runs, so this bounds memory, not
+  model for timestamps. Whisper's language and timestamp tokens travel in the text
+  stream and are lifted into ``language`` / ``segments`` by the server; Higgs-Audio
+  emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get one segment per
+  window, timed to the windows. A streaming client receives only the spoken words.
+  Uploads longer than 30 s are served as consecutive windows. By default Whisper's run
+  in order, openai-whisper style: each window gets the transcript so far as
+  ``initial_prompt`` and the first window's detected language, is decoded with
+  timestamps so the next window can start where its last closed segment ended (no word
+  is split by a boundary), and is decoded again when its text is a repetition loop
+  (gzip compression ratio above 2.4): first without the conditioning text, then at
+  rising temperatures — after which the transcript so far stops conditioning later
+  windows. Leave ``temperature`` at 0 to get that fallback; a pinned temperature is
+  used as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
+  once, each cut at the quietest moment before its boundary; Higgs-Audio's run that
+  way by default. Segment timestamps are offset to the whole file. ``window_seconds``
+  in ``extra_body`` (5 to 30) sets the window length for one request, and an upload
+  longer than it is windowed. An upload, like any audio a request attaches, is refused
+  once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
+  data worker). The decode up to that point still runs, so this bounds memory, not
   time: refusing a 31 min file takes about as long as decoding it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
