@@ -749,10 +749,10 @@ def _fast(func, args, kwargs, flat, index):
         tensors = [t for t in _shallow(uargs, ukwargs)]
         raw = meta_call(func, uargs, ukwargs, tensors)
     else:
-        if func not in _UNINITIALIZED and (
-                (clock.capturing() is not None and func not in _VIEWS) or any(never_computed(t) for t in tensors)):
-            # captured: deferred to the replays per aten op, and priced there; a never-computed
-            # operand: per aten op, which says what each one reads and writes
+        if func not in _UNINITIALIZED and (clock.capturing() is not None or any(never_computed(t) for t in tensors)):
+            # captured: deferred to the replays per aten op (a view function that has to copy
+            # arrives as the copy), and priced there; a never-computed operand: per aten op,
+            # which says what each one reads and writes
             with _Observe(torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None):
                 raw = func(*uargs, **ukwargs)
             return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)

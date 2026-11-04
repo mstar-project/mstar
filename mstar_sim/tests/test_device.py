@@ -166,6 +166,13 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         staged.fill_(10); g2.replay(); g2.replay(); torch.cuda.synchronize()
         assert step.item() == 2 and mailbox.tolist() == [12], (step.item(), mailbox.tolist())
         assert cast.tolist() == [10], cast.tolist()
+        # so does a reshape that has to copy: a view function only when it can be one
+        source = torch.arange(3, device="cuda")
+        g7 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g7):
+            copied = source[:, None].expand(3, 2).reshape(-1)
+        source.add_(1); g7.replay()
+        assert copied.tolist() == [1, 1, 2, 2, 3, 3], copied.tolist()
         # a stand-in kernel's work on kept values re-runs at each replay too (timed as under --fast),
         # and capture writes nothing: here the top-k transform's slots from the latest page table
         import flashinfer
@@ -203,10 +210,10 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             torch.nn.functional.embedding((ids - 50).clamp_(0, 49), table)  # a TP vocab shard's clamp
             torch.where(ids > 20, torch.arange(2, device="cuda").expand(2, 2), -1)  # an expanded operand
         g3.replay()
-        weight, g7 = torch.nn.Parameter(torch.zeros(4, device="cuda")), torch.cuda.CUDAGraph()
-        with torch.no_grad(), torch.cuda.graph(g7):
+        weight, g8 = torch.nn.Parameter(torch.zeros(4, device="cuda")), torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(g8):
             weight[:2].add_(1)
-        g7.replay()  # autograd doesn't see a replay, whatever the caller's grad mode
+        g8.replay()  # autograd doesn't see a replay, whatever the caller's grad mode
         assert weight.tolist() == [1, 1, 0, 0], weight.tolist()
         # capture runs nothing: an index that is out of range only before an in-place clamp
         # is fine, and an op whose output shape depends on values is refused, as on CUDA
