@@ -431,7 +431,7 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
         evictable_nodes=lambda: [], add_request=lambda rid, cfg, info=None: ingested.append(rid),
         engine=SimpleNamespace(publisher_nodes={}),
     )
-    w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
+    w.request_state = SimpleNamespace(add_request=lambda rid, info: None, per_request_info={})
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sharding: None,
         start_read_tensors=lambda *a, **kw: pytest.fail("a drained request started a read"),

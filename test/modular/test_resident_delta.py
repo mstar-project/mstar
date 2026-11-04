@@ -722,7 +722,7 @@ def _second_node(engine) -> _Resource:
     """Give ``engine`` a node ``other`` in the same role as ``node``, with a resource of its own."""
     resource = _Resource()
     engine._resources["other_kv"] = resource
-    engine._submodules["other"] = SimpleNamespace(resources={"other_kv": resource})
+    engine._submodules["other"] = SimpleNamespace(resources={"other_kv": resource}, resident=None)
     for nodes in (engine._tp_leader_nodes, engine._tp_follower_nodes):
         if "node" in nodes:
             nodes.add("other")
@@ -1269,7 +1269,7 @@ def _pool_rank(monkeypatch, rank: int) -> tuple[KVManager, Engine]:
     kv.local_loops = {"decode"}
     engine = Engine.__new__(Engine)
     engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
-    engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, submodule=SimpleNamespace(
+    engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, resident=None, submodule=SimpleNamespace(
         cleanup_request=lambda rid: None))}
     engine._runner, engine._loopback_steps = StepRunner({"kv": kv}), {}
     engine._chunking = ChunkingManagement({})
