@@ -1140,6 +1140,8 @@ def _offload_engine(resources, planner):
     engine._resources = resources
     engine._submodules = {"n": SimpleNamespace(resources=resources, resident=planner)}
     engine._graph_runtime = SimpleNamespace(get_rid_string=str, get_rid_handle=int)
+    # these requests were taken in by their resources alone, so no admission queue holds them
+    engine._runner = SimpleNamespace(readmit=lambda rid, node: None)
     return engine
 
 
@@ -1156,6 +1158,8 @@ def _refused_worker(engine, line):
     worker._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, graphs: worker.pushed.append(rids))
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker.eviction_policy = SimpleNamespace(value="last_in_line")
+    # preemption declines, as it does for a pool with no host memory and no rebuilds, so the offload and the hold run
+    worker._preemption = SimpleNamespace(preempt=lambda node_batch: False)
     worker.scheduler = SimpleNamespace(
         arrival=list(line), hold_requests=worker.held.extend, could_refill=lambda *a: False,
         last_in_line=lambda node, walk, rids: max(rids, key=line.index),
