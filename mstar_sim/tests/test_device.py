@@ -705,6 +705,13 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             assert len([]) == 1
         def test_shape_mistake_on_cuda_tensors():
             torch.ones(3, device="cuda") + torch.ones(4, device="cuda")
+        def test_shape_mistake_in_a_collective(tmp_path):
+            import torch.distributed as dist
+            dist.init_process_group("nccl", init_method=f"file://{tmp_path}/group", rank=0, world_size=1)
+            try:
+                dist.all_gather_into_tensor(torch.zeros(3, device="cuda"), torch.zeros(2, device="cuda"))
+            finally:
+                dist.destroy_process_group()
         def test_shape_mistake_inside_a_stand_in():
             stand_in = eval(compile("lambda a, b: a + b", "/mstar_sim/fake_libs/x.py", "eval"))
             stand_in(torch.ones(3, device="cuda"), torch.ones(4, device="cuda"))
@@ -751,6 +758,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_a_sealed_buffer_reports_flashinfers_number[True]": "XFAIL",
                         "test_a_sealed_buffer_reports_flashinfers_number[False]": "FAILED",
                         "test_shape_mistake_on_cuda_tensors": "FAILED",
+                        "test_shape_mistake_in_a_collective": "FAILED",
                         "test_shape_mistake_inside_a_stand_in": "XFAIL",
                         "test_index_into_what_a_never_computed_mask_selected": "XFAIL",
                         "test_mstars_own_raise_after_a_never_computed_mask": "FAILED",

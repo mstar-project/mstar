@@ -35,9 +35,12 @@ Every other failure stays a failure: an exception mstar's own code raised (a lif
 or planning error, an API that moved, a crash), whatever ran before it, or an assertion
 made before any such read. A failure raised inside the emulator's own code, or in a test listed in
 ``_STAND_IN_LACKS``, is an emulator gap: reported as an expected failure and listed at
-the end of the run, so a gap never reads as a fault of mstar's. A ``pytest.raises`` that
-saw nothing after a stand-in kernel ran expected the kernel's own error check, which a
-stand-in doesn't have.
+the end of the run, so a gap doesn't read as a fault of mstar's. Torch's own error on an
+op the interposer ran is mstar's: a ``RuntimeError`` or ``IndexError`` only, so a
+``TypeError`` from a bad call stays a gap, and an emulator bug raising a plain
+``RuntimeError`` from the interposer reads as mstar's. A ``pytest.raises`` that saw nothing
+after a stand-in kernel ran expected the kernel's own error check, which a stand-in doesn't
+have.
 """
 
 from __future__ import annotations
@@ -125,20 +128,20 @@ def _missing_from_stand_in(excinfo) -> str | None:
 _EMULATOR = "/mstar_sim/"
 
 
-_INTERPOSERS = ("/mstar_sim/device.py",)  # what runs torch's ops for mstar's code
+_INTERPOSERS = ("/mstar_sim/device.py", "/mstar_sim/dist.py")  # what runs torch's ops for mstar's code
 
 
 def _torchs_verdict(excinfo) -> bool:
     """A torch error on an op's operands, which a GPU's op raises too (a shape, an index):
     torch raised it, not a ``raise`` of this tree's, and not about what the emulator made of
-    them (no shape-only kernel, a meta payload, a limit of torch's CPU kernels, a device mix
-    among payloads: one CUDA refuses is the emulator's own check, and tagged). A bug in the
-    emulator that raises a plain error from an interposer reads as torch's: the loud side."""
+    them (no shape-only kernel, a meta payload, a limit of torch's CPU kernels or of gloo, the
+    backend standing in for NCCL, a device mix among payloads: one CUDA refuses is the
+    emulator's own check, and tagged)."""
     raised_in = str(excinfo.traceback[-1].path)
     return (excinfo.errisinstance((RuntimeError, IndexError)) and not excinfo.errisinstance(NotImplementedError)
             and (_library(raised_in) or raised_in.endswith(_INTERPOSERS))
-            and not re.search("meta|mstar_sim|two devices|Unsupported dtype|not implemented for",
-                              str(excinfo.value)))
+            and not re.search("meta|mstar_sim|two devices|Unsupported dtype|not implemented for|"
+                              "Gloo.*support|does not support", str(excinfo.value)))
 
 
 def _raised_in_emulator(excinfo) -> str | None:
