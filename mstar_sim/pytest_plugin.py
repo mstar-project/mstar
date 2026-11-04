@@ -113,20 +113,30 @@ def _missing_from_stand_in(excinfo) -> str | None:
 _EMULATOR = "/mstar_sim/"
 
 
+def _torchs_verdict(excinfo) -> bool:
+    """A torch error on an op's operands, which a GPU's op raises too (a shape, an index):
+    not one about what the emulator made of them (no shape-only kernel, a meta payload)."""
+    return (excinfo.errisinstance((RuntimeError, IndexError)) and not excinfo.errisinstance(NotImplementedError)
+            and not re.search("meta|mstar_sim", str(excinfo.value)))
+
+
 def _raised_in_emulator(excinfo) -> str | None:
     """Where the exception started, when that is the emulator's own code: a gap in
     the emulator, not a fault of mstar's. What the emulator raises as the GPU stack
-    would (out of memory, a device-side assert, a capture refusal) is mstar's."""
+    would (out of memory, a device-side assert, a capture refusal) is mstar's, and so
+    is torch's verdict on an op the interposer ran for mstar's code."""
     if getattr(excinfo.value, "_mstar_sim_gpu", False):
         return None
+    verdict = _torchs_verdict(excinfo)
     # the innermost frame of this tree (not torch, triton or the stdlib under it) decides
     for entry in reversed(excinfo.traceback):
         path = str(entry.path)
         if _library(path):
             continue
-        if _EMULATOR in path and "/mstar_sim/tests/" not in path:
+        if _EMULATOR not in path or "/mstar_sim/tests/" in path:
+            return None
+        if not (verdict and path.endswith("/mstar_sim/device.py")):  # the interposer: its caller decides
             return f"{path.rsplit(_EMULATOR, maxsplit=1)[-1]}:{entry.lineno + 1}"
-        return None
     return None
 
 

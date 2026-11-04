@@ -623,6 +623,13 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             tokens = flashinfer.sampling_from_probs(torch.empty(2, 512, device="cuda"))
             eval(compile("lambda t: t.tolist()", "/mstar/worker.py", "eval"))(tokens)
             assert len([]) == 1
+        def test_shape_mistake_on_cuda_tensors():
+            torch.ones(3, device="cuda") + torch.ones(4, device="cuda")
+        def test_shape_mistake_inside_a_stand_in():
+            stand_in = eval(compile("lambda a, b: a + b", "/mstar_sim/fake_libs/x.py", "eval"))
+            stand_in(torch.ones(3, device="cuda"), torch.ones(4, device="cuda"))
+        def test_index_into_what_a_never_computed_mask_selected():
+            torch.empty(2, 4, device="cuda").gt(0.5).nonzero()[0]
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
     """))
@@ -637,6 +644,9 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
                         "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
                         "test_lifecycle_assert_after_mstar_reads_a_sampled_token": "FAILED",
+                        "test_shape_mistake_on_cuda_tensors": "FAILED",
+                        "test_shape_mistake_inside_a_stand_in": "XFAIL",
+                        "test_index_into_what_a_never_computed_mask_selected": "XFAIL",
                         "test_passing_value_check": "PASSED"}, out
 
 

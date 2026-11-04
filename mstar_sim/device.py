@@ -125,7 +125,7 @@ def set_never_computed(t: torch.Tensor, value: bool = True) -> None:
 # stand-in kernels run so far: a test that expected a kernel's own error check
 # (pytest.raises around a launch) can't see it from a stand-in
 KERNELS_RUN = [0]
-# ops run on zeros because their output shape depends on values never computed:
+# ops whose output shape depends on values never computed, so was shaped by zeros:
 # any failure after one is the emulator's, not mstar's
 VALUE_SHAPES = [0]
 
@@ -591,6 +591,8 @@ def _reads_never_computed(func, args, kwargs) -> bool:
 def _kept_op(func, args, kwargs):
     """Run an aten op on kept values: what it writes is computed only if all it read was."""
     never = _reads_never_computed(func, args, kwargs)
+    if never and torch.Tag.dynamic_output_shape in func.tags:
+        VALUE_SHAPES[0] += 1
     out = func(*args, **kwargs)
     for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
         if isinstance(t, torch.Tensor) and t.device.type == "cpu":
