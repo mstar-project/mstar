@@ -137,6 +137,8 @@ class MLAAttention(nn.Module):
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
             self.register_buffer("fused_qkv_a_proj_scale_inv", None, persistent=False)  # dense_fp8
+            self.lora_unservable = dict.fromkeys(
+                self._ABSORBED_SOURCE_PROJS, "folded into the absorbed MLA weights at load (mla_absorb)")
         # engine-built, bound once at load (bind_resources)
         self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv_label, self._cache_layer = kv_label, cache_layer
@@ -148,9 +150,9 @@ class MLAAttention(nn.Module):
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key] if self.use_rope else None
-        if self.mla_fused_prep and self._pos.cos_sin_table is None:
-            # the fused prep rotates from the position resource's cos/sin table
-            # (PositionConfig.rope_table_dtype); without one the op-by-op path serves
+        if self.mla_fused_prep and (self._pos.cos_sin_table is None or not self._pos.interleave):
+            # the fused prep turns interleaved pairs from the position resource's cos/sin
+            # table (PositionConfig.rope_table_dtype); otherwise the op-by-op path serves
             self.mla_fused_prep = False
 
     def _rope(
@@ -166,6 +168,11 @@ class MLAAttention(nn.Module):
             k_pe.clone(memory_format=torch.contiguous_format), pos_ids=position_ids)
 
     @property
+    def _label(self) -> dict:
+        """``label=kv_label`` for every KV and attention call, nothing for the default stream."""
+        return {} if self._kv_label is None else {"label": self._kv_label}
+
+    @property
     def cache_layer_idx(self) -> int:
         """The KV layer this attention writes and reads: ``cache_layer``, else its own index."""
         if self._cache_layer is not None:
@@ -177,7 +184,7 @@ class MLAAttention(nn.Module):
     @torch.compiler.disable
     def _write_and_attend(self, q, k, v, q_pe=None):
         layer_idx = self.cache_layer_idx
-        label = {} if self._kv_label is None else {"label": self._kv_label}
+        label = self._label
         self._kv.write_kv(k, v, layer_idx=layer_idx, **label)
         layer = self._kv.layer_view(layer_idx)
         if q_pe is None:
@@ -421,12 +428,13 @@ class MLAAttention(nn.Module):
     @torch.compiler.disable
     def _write_fused_and_attend(self, q_nope, q, fused, position_ids, selection=None, **sparse):
         layer = self._kv.layer_view(self.cache_layer_idx)
-        pages, offsets = self._kv.write_slots()
+        label = self._label
+        pages, offsets = self._kv.write_slots(**label)
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
             self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
         if selection is None:
-            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
+            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
         return self._attend_written(selection, q_nope, q_pe, **sparse)
 
     # A selecting subclass that implements ``_attend_written`` takes the fused prep too.

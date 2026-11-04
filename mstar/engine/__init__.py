@@ -59,9 +59,12 @@ def apply_dynamo_config() -> None:
 
 def with_recompile_limit(fn, submodule):
     """Wrap ``fn``, one of ``submodule``'s torch.compile'd callables, so dynamo compiles it under
-    the submodule's ``dynamo_recompile_limit()`` where that is above this thread's limit. The
-    limit is that submodule's alone: other nodes, and calls outside it, keep the engine's. A
-    submodule that doesn't override the hook gets ``fn`` back as is."""
+    the submodule's ``dynamo_recompile_limit()`` where that is above the current limit, for
+    the call's duration. A submodule that doesn't override the hook gets ``fn`` back as is.
+
+    From torch 2.12 dynamo's config is per thread. Before it the patch is process-wide while
+    the call runs, so other nodes keep the engine's limit only because a worker runs one
+    compiled call at a time (capture before its loop, then its one GPU thread)."""
     from mstar.model.submodule_base import NodeSubmodule
 
     hook = getattr(type(submodule), "dynamo_recompile_limit", None)

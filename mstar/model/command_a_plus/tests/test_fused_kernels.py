@@ -77,6 +77,18 @@ class FusedKernelTests(unittest.TestCase):
         torch.testing.assert_close(out[:, 1400:], (F.silu(gate) * up) * 0.5, atol=0, rtol=0)
         self.assertTrue((out[:, :1400] == 0).all())
 
+    def test_route_align_stays_a_sigmoid_route_by_default(self):
+        """The decoder path passes no ``softmax``, as it did before the kernel moved."""
+        import mstar.utils.fused_moe.route as moved
+        from mstar.model.command_a_plus.kernels import ROUTE_ALIGN_MAX_SLOTS, route_align
+
+        self.assertIs(route_align, moved.route_align)
+        self.assertEqual(ROUTE_ALIGN_MAX_SLOTS, moved.ROUTE_ALIGN_MAX_SLOTS)
+        logits = self.randn(4, 128).to(torch.bfloat16)
+        weights, _, _ = route_align(logits, 8, 16, torch.bfloat16)
+        softmax, _, _ = route_align(logits, 8, 16, torch.bfloat16, softmax=True)
+        self.assertFalse(torch.equal(weights, softmax))
+
     def test_route_align_matches_topk_and_moe_align(self):
         from mstar.model.command_a_plus.kernels import route_align
         from mstar.utils.fused_moe.align import moe_align_block_size

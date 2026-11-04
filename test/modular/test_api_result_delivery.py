@@ -17,13 +17,14 @@ import weakref
 from types import SimpleNamespace
 
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.communication.event import EventWakeup
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import OutputInfo, RequestProfile
@@ -109,8 +110,8 @@ def test_result_reads_drain_ahead_of_preprocess():
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(),
         result_tensor_queue=queue.Queue(),
-        out_queue=queue.Queue(),
-        profile_queue=queue.Queue(),
+        out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
         reads_done_queue=queue.Queue(),
@@ -149,6 +150,7 @@ def test_result_reads_drain_ahead_of_preprocess():
 
 class _StubPreprocessWorker:
     def __init__(self, pending=False, final=True):
+        self.results_wakeup = EventWakeup()
         self.pending = pending
         self.final = final
         self.cleaned = []
@@ -569,10 +571,10 @@ def _deliver_result_chunks(server, *chunks):
         server.running = False
         return []
 
-    server.communicator = SimpleNamespace(get_all_new_messages=stop_after_this_pass)
+    server.communicator = StandInSocket(stop_after_this_pass)
     server.preprocess_worker = SimpleNamespace(
         get_profile_updates=lambda: [], get_result_chunks=lambda: chunks,
-        abort_request=lambda rid: None,
+        abort_request=lambda rid: None, results_wakeup=EventWakeup(),
     )
     server.running = True
     server._process_messages()
@@ -615,6 +617,34 @@ def test_output_totals_survive_draining_and_native_collection(monkeypatch, strea
         [OutputInfo(modality="text", count=2, total_bytes=3), OutputInfo(modality="audio", count=1, total_bytes=4)]
         if log_stats else []
     )
+
+
+def test_the_profile_timeline_keeps_the_stage_labels_its_readers_parse(tmp_path):
+    """The worker's span sits beside the checkpoint chain, not in it: the wan22
+    bench reads ``conductor ingest → first chunk`` as its compute span, and a
+    streamed first chunk can land before the worker's last step."""
+    from benchmark.request_timeline.report import parse
+    from benchmark.wan22.profile_log import parse_profile_file
+    from mstar.profile.display import pretty_print_profile
+    from mstar.profile.format import GraphTiming, RequestTiming
+
+    prof = RequestProfile(rid="r", timing=RequestTiming(
+        recv_time=0.0, preprocess_finish_time=0.01, conductor_ingest_time=0.02,
+        first_chunk_time=0.03, last_output_read_time=0.05, last_chunk_time=0.06,
+        conductor_finish_time=0.07, finish_time=0.08, output_postprocess_s=0.002,
+    ), graph_timings=[GraphTiming(
+        "dit", "denoise", 2, 0.04, 0.03, 0.005, 0.005, first_start=0.021, last_end=0.055,
+    )])
+    path = tmp_path / "stats.txt"
+    pretty_print_profile(prof, str(path))
+
+    (wan,) = parse_profile_file(str(path))
+    assert wan.timeline_seg("conductor ingest -> first chunk") == pytest.approx(10.0)
+    (timeline,) = parse(path.read_text())
+    assert list(timeline.offsets) == [
+        "recv", "preprocess done", "conductor ingest", "first chunk", "last chunk", "conductor done", "finish",
+    ]
+    assert timeline.worker_span_ms == pytest.approx(34.0)
 
 
 def test_profile_counts_accepted_errors_and_outputs_after_the_error(monkeypatch):

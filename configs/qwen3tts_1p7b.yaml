@@ -1,9 +1,18 @@
 # Qwen3-TTS-12Hz-1.7B-CustomVoice: built-in speakers, optional style instruction (instruct=...)
-# Same graph, resources and single-GPU placement as the 0.6B deployment
-# (configs/qwen3tts.yaml); only the checkpoint differs. KV geometry is
-# identical across sizes (28 layers, 8 KV heads, head_dim 128).
+# Same graph and single-GPU placement as the 0.6B deployment
+# (configs/qwen3tts.yaml); the checkpoint and the codec settings below
+# differ. KV geometry is identical across sizes (28 layers, 8 KV heads,
+# head_dim 128).
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
+model_kwargs:
+  # bf16 codec decoder (RMSNorm and RoPE stay fp32): 101 Seed-TTS req/s under
+  # the streaming SLO where float32 holds 90 (H200), at 35 dB SNR from the
+  # float32 decode and the same WER (docs/models.rst)
+  codec_dtype: bfloat16
+  # A 4-frame first chunk (320 ms of audio): [1, 3, 8, 16] halves idle first
+  # audio (15 vs 31 ms p50 at 1 req/s) but holds 90 Seed-TTS req/s, not 101
+  codec_chunk_schedule: [4, 8, 16]
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
 # On B300 (sm_103) FA2 stays the decode backend too: trtllm-gen rebuilds its
@@ -13,6 +22,11 @@ max_seq_len: 32768
 resources:
   talker_attn:
     flashinfer_backend: fa2
+  # 511 codec streams (one slot is the pool's sink): past the default 256, a
+  # new stream waits for a slot to free, which delays its first audio near
+  # capacity.
+  codec_state:
+    max_slots: 512
 node_groups:
   - node_names: [Talker]
     ranks: [0]
@@ -20,3 +34,8 @@ node_groups:
   - node_names: [Codec]
     ranks: [0]
     graph_walks: [codec_chunk]
+# A large decode step keeps more young objects alive than CPython's 700-object
+# gen-0 threshold, so a collection runs almost every step and now and then a
+# full one (~8 ms), longer than a stream's 10 ms pause budget leaves room for.
+knobs:
+  gc_gen0_threshold: 10000

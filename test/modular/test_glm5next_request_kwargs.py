@@ -3,7 +3,8 @@ process_prompt (a 400) before any rank sees the request."""
 
 import pytest
 
-from mstar.engine.resources import SamplerSpec
+from mstar.engine.resources import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sampler.config import BOOL_KNOBS, INT_KNOB_RULES, REAL_KNOB_RULES
 from mstar.model.glm5_next.config import SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 
@@ -30,6 +31,19 @@ def test_a_null_temperature_under_mtp_is_greedy():
     m = _model(mtp_num_draft_tokens=3)
     assert m.process_prompt("Hi", ["text"], ["text"], temperature=None).new_input_tensors["text_inputs"][0].numel() == 2
     assert m.get_request_resource_configs({}, {"temperature": None})[SAMPLER].temperature == 0
+
+
+@pytest.mark.parametrize("knob", [*REAL_KNOB_RULES, *INT_KNOB_RULES, *BOOL_KNOBS])
+def test_a_sampler_knob_is_honored_or_refused(knob):
+    """A knob the API accepts reaches the sampler, or process_prompt refuses it: never dropped."""
+    value = (not getattr(SamplingReqConfig(), knob) if knob in BOOL_KNOBS
+             else 5 if knob in INT_KNOB_RULES else 0.5)
+    m = _model()
+    try:
+        m.process_prompt("Hi", ["text"], ["text"], **{knob: value})
+    except ValueError:
+        return
+    assert getattr(m.get_request_resource_configs({}, {knob: value})[SAMPLER], knob) == value
 
 
 @pytest.mark.parametrize("kwargs", [
