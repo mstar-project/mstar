@@ -284,12 +284,13 @@ def test_a_request_holding_a_served_walk_in_its_lease_doesnt_move_itself():
 
 def test_a_victim_whose_move_fails_comes_off_the_earmark():
     kv = _pool()
-    kv._cpu_pool = host._HostPool(16)
+    kv._cpu_pool = host._HostPool(4)
+    _running(kv, "x", 2, arrival=0)
     _running(kv, "r", 5, arrival=1)
-    _running(kv, "v", 5, arrival=2)
+    _running(kv, "v", 3, arrival=2)
     assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
-    # the host fills before v moves
-    kv._cpu_pool.arena.acquire(kv._cpu_pool.arena.num_free)
+    # an offload no victim chose fills the host before v moves
+    assert kv.offload("x") == 2
 
     assert _offload(kv, "v") == 0
     assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
