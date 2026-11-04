@@ -58,6 +58,7 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
                 read += 1  # collect_results released it before raising
                 raise
             read += 1
+            # bytes: MediaJSONResponse writes them into the body as they are
             data.extend(
                 {"b64_json": base64.b64encode(c.data), "url": None}
                 for c in chunks

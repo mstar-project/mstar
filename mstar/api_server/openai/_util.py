@@ -52,13 +52,14 @@ except ImportError:  # pragma: no cover
 
 
 class MediaJSONResponse(Response):
-    """The JSON body of an images or videos response, whose ``b64_json`` values the
-    handlers leave as the ``bytes`` ``base64.b64encode`` returned. A bytes value is
-    written as a JSON string as it is (base64 needs no escaping); everything else is
-    rendered as ``JSONResponse`` renders it, so the body is the one ``JSONResponse``
-    gives for the same values as str. That render escapes an ``ensure_ascii=False``
-    string a character at a time, on the event loop: about 40 ms for a 1024x1024
-    PNG and 160 ms for an 8 MB clip, against 6 and 22 ms for this body."""
+    """The JSON body of an images or videos response. The handlers leave each
+    ``b64_json`` as the bytes ``base64.b64encode`` returned, and a bytes value is
+    written into the body as a JSON string unescaped, so it must need no escaping,
+    as base64 never does. Everything else renders as in ``JSONResponse``, and the
+    body is the one ``JSONResponse`` gives for the same values as str. That one
+    escapes an ``ensure_ascii=False`` string a character at a time on the event
+    loop: ~40 ms for a 1024x1024 PNG and ~160 ms for an 8 MB clip, against 6 and
+    22 ms here."""
 
     media_type = "application/json"
 
