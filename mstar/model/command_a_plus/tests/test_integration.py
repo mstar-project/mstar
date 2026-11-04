@@ -14,8 +14,8 @@ from torch import nn
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources import AttentionStep, SamplingReqConfig
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.resources import AttentionStep, SamplingReqConfig, StepContext
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -30,10 +30,10 @@ from mstar.model.command_a_plus.config import (
     CommandAPlusConfig,
 )
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule
-from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
+from mstar.model.command_a_plus.tests.test_backbone import MemoryKV, bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import PromptPart
-from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine, engine_step
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
@@ -53,8 +53,7 @@ class ToyLM(nn.Module):
         self.model.embed_tokens = nn.Embedding.from_pretrained(torch.eye(vocab))
         self.model.embed = self.model.embed_tokens
 
-    def forward(self, x, *, label):
-        assert label == "main"
+    def forward(self, x):
         return x
 
     def compute_logits(self, x):
@@ -69,17 +68,33 @@ class NodeTests(unittest.TestCase):
             ToyLM(self.config.vocab_size), self.config, config.vision_config.image_token_id,
         )
 
+    def bind(self, attention, sampler):
+        """The node's handles over doubles, as the engine binds them at load."""
+        model = SimpleNamespace(config=self.config, max_seq_len=self.config.max_position_embeddings)
+        declared = CommandAPlusModel.declare_state(model)
+        resources = {KV_CACHE: MemoryKV(), ROPE: None, LOCAL_ATTN: attention, GLOBAL_ATTN: attention, SAMPLER: sampler}
+        self.node.bind_node_state(node_handles(SimpleNamespace(declare_state=lambda: declared), "LLM", resources))
+
+    def begin_step(self, walk, rids, inputs):
+        """What the engine does ahead of a forward."""
+        step = engine_step(self.node, graph_walk=walk, request_ids=rids, inputs=inputs)
+        step.set_ctx(StepContext(tuple(rids), walk, 0, False))
+        step.end_calls()
+        step.begin_calls()
+        return step
+
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
         sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x, label: x[[2, 4]]))
-        engine = ModelInputsFromEngine(["a", "b"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
+        self.bind(attention, sampler)
+        engine = ModelInputsFromEngine(["a", "b"], {}, {})
         for walk, rows, expected in (
             ("prefill", [[2, 5, 7], [11, 13]], [7, 13]),
             ("decode", [[17], [19]], [17, 19]),
         ):
             inputs = [self.node.prepare_inputs(walk, info(walk), {"text_inputs": [torch.tensor(row)]})
                       for row in rows]
-            step = self.node.declare_step(walk, engine.request_ids, inputs)
+            step = self.begin_step(walk, engine.request_ids, inputs)
             self.assertEqual([s.span for s in step.segments], [len(row) for row in rows])
             self.assertEqual(set(step.steps), {KV_CACHE, LOCAL_ATTN, GLOBAL_ATTN, ROPE, SAMPLER})
             for key in (LOCAL_ATTN, GLOBAL_ATTN):
@@ -137,8 +152,9 @@ class NodeTests(unittest.TestCase):
 
         sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=lambda x, label: x[-1:])
-        engine = ModelInputsFromEngine(["a"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
-        step = self.node.declare_step("prefill_image", ["a"], [inputs])
+        self.bind(attention, sampler)
+        engine = ModelInputsFromEngine(["a"], {}, {})
+        step = self.begin_step("prefill_image", ["a"], [inputs])
         self.assertEqual(step.steps[SAMPLER].prefill_tracked_tokens["a"].tolist(), ids.tolist())
         output = self.node.forward_batched(
             "prefill_image", engine, **self.node.preprocess("prefill_image", engine, [inputs]),
@@ -201,7 +217,7 @@ class ModelIntegrationTests(unittest.TestCase):
         local.select_last_hidden = lambda hidden, label: hidden[-1:]
         sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
-        node.bind_node_resources(resources)
+        node.bind_node_state(node_handles(self.model, "LLM", resources))
         engine = ModelInputsFromEngine(["a"], {}, resources)
         tokens = torch.tensor([2, 9, 4, 7, 11])
         offset = 0
@@ -210,7 +226,10 @@ class ModelIntegrationTests(unittest.TestCase):
                 walk = "prefill" if step == 0 else "decode"
                 request = info(walk, max_tokens=20, ignore_eos=True, index=max(0, step - 1))
                 inputs = [node.prepare_inputs(walk, request, {"text_inputs": [tokens]})]
-                declaration = node.declare_step(walk, ["a"], inputs)
+                declaration = engine_step(node, graph_walk=walk, request_ids=["a"], inputs=inputs)
+                declaration.set_ctx(StepContext(("a",), walk, 0, False))
+                declaration.end_calls()
+                declaration.begin_calls()
                 self.assertEqual(declaration.segments[0].span, len(tokens))
                 pos.positions["main"] = torch.arange(offset, offset + len(tokens))
                 offset += len(tokens)
@@ -334,7 +353,7 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
         tensors, metadata = self.model.process_prompt("hello", ["text"], ["text"])
         self.assertEqual(tensors["text_inputs"][0].tolist(), [2, 10, 11])
-        layout = metadata["kv_layout"]["kv_cache"]["main"]
+        layout = metadata["state_layout"]["kv_cache"]["main"]
         self.assertEqual([span.length for span in layout.spans], [3])
         self.assertEqual(layout.growth, (("decode_loop", 1),))
         tokenizer.apply_chat_template.assert_called_once_with(
@@ -389,7 +408,7 @@ class ModelIntegrationTests(unittest.TestCase):
         tile = [image] * 4 + [line_break]
         self.assertEqual(result["text_inputs"][0].tolist(), [2, start, *tile * 2, end, 11, start, *tile, end])
         torch.testing.assert_close(result["pixel_values"], [t.to(torch.bfloat16) for t in tiles])
-        (span,) = metadata["kv_layout"]["kv_cache"]["main"].spans
+        (span,) = metadata["state_layout"]["kv_cache"]["main"].spans
         self.assertEqual((span.kind, span.walk, span.length), ("rows", "prefill_image", len(result["text_inputs"][0])))
         torch.testing.assert_close(processor.call_args_list[0].kwargs["images"][0],
                                    (photos[0] * 255).round().to(torch.uint8))

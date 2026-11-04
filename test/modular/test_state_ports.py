@@ -1,9 +1,9 @@
-"""A ported model's specs equal the ones it wrote by hand, field for field.
+"""A ported model's specs, steps and layouts equal the ones it wrote by hand, field for field.
 
-Nothing in the engine changes when a model moves to declarations, because it sees the same specs. The hand-written
-lists below are the reference, copied from the models as they stood before the port, so the adapter can't pass by
-agreeing with itself. Each is compared per key with dataclass equality, with a block's dtype as the pool stores it,
-before and after a deployment's overrides.
+Nothing in the engine changes when a model moves to declarations, because it sees the same objects. The hand-written
+specs and steps below are the reference, copied from the models as they stood before the port, so the adapter can't
+pass by agreeing with itself. Each is compared per key with dataclass equality, with a block's dtype as the pool stores
+it, before and after a deployment's overrides.
 """
 
 from __future__ import annotations
@@ -21,18 +21,21 @@ import torch
 import yaml
 
 from mstar.engine.node_dtype import resolve_model_dtype
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
+from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
-from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
-from mstar.engine.state.adapters import node_resources
+from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.engine.state import Layout, Span
+from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources
 from mstar.engine.state.analysis import state_declaration_problems
-from mstar.model.base import parse_autocast_dtype, serving_resources
+from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.qwen3_5.config import (
     ATTN,
     CONV,
@@ -49,6 +52,7 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.registry import MODEL_REGISTRY
+from mstar.model.submodule_base import ARNodeInputs, engine_step
 
 _MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
 
@@ -136,6 +140,37 @@ def _qwen3_5_reference(config) -> list:
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetion_penalty=True,
         ),
     ]
+
+
+class _StubResource:
+    """Stands in for any built resource a handle reads at bind."""
+
+    def layer_view(self, i):
+        return torch.empty(0)
+
+    def block(self, name, i):
+        return torch.empty(0)
+
+
+def _bind(node, model, node_name="LLM"):
+    resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
+    node.bind_node_state(node_handles(model, node_name, resources))
+    return node
+
+
+def _assert_steps_equal(step: SubmoduleStep, reference: SubmoduleStep) -> None:
+    """Per key, with the tracked tokens apart, because dataclass equality can't compare a dict of tensors."""
+    assert step.state, "a ported walk should declare its state, not write today's step classes"
+    assert step.steps.keys() == reference.steps.keys()
+    assert step.segments == reference.segments and step.cg_key_info == reference.cg_key_info
+    for key, expected in reference.steps.items():
+        actual = step.steps[key]
+        if isinstance(expected, SamplerStep):
+            tokens, want = actual.prefill_tracked_tokens, expected.prefill_tracked_tokens
+            assert tokens.keys() == want.keys()
+            assert all(torch.equal(tokens[rid], want[rid]) for rid in want)
+            actual, expected = replace(actual, prefill_tracked_tokens={}), replace(expected, prefill_tracked_tokens={})
+        assert actual == expected, f"{key} differs from the hand-written step"
 
 
 def _stored(spec, kv_dtype: torch.dtype | None):
@@ -364,13 +399,13 @@ def test_command_a_plus_keeps_the_window_on_its_local_read_only(tmp_path):
 
 
 def test_command_a_plus_global_read_lists_the_layers_outside_the_window(tmp_path):
-    [kv] = _command_a_plus(tmp_path, _COMMAND_A_PLUS).declare_state()
+    kv = _command_a_plus(tmp_path, _COMMAND_A_PLUS).declare_state()[0]
     assert kv.reads[_GLOBAL_ATTN].layers == {i for i in range(32) if i % 4 == 3}
     assert kv.reads[_LOCAL_ATTN].layers | kv.reads[_GLOBAL_ATTN].layers == kv.layers, "a layer with no read"
 
 
-def test_command_a_plus_writes_only_positions_and_the_sampler_by_hand(tmp_path):
-    assert {spec.resource_key for spec in _command_a_plus(tmp_path).get_node_resources()} == {ROPE, SAMPLER}
+def test_command_a_plus_writes_no_spec_by_hand(tmp_path):
+    assert _command_a_plus(tmp_path).get_node_resources() == []
 
 
 def test_command_a_plus_passes_a_shorter_max_seq_len_to_the_array(tmp_path):
@@ -382,3 +417,47 @@ def test_command_a_plus_passes_a_shorter_max_seq_len_to_the_array(tmp_path):
 @pytest.mark.parametrize("text", [None, _COMMAND_A_PLUS], ids=["tiny", "published"])
 def test_command_a_plus_declarations_have_no_problems(tmp_path, text):
     assert state_declaration_problems(_command_a_plus(tmp_path, text)) == []
+
+
+def _command_a_plus_reference_step(walk, rids, inputs) -> SubmoduleStep:
+    return SubmoduleStep(
+        segments=[
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(rids, inputs, strict=True)
+        ],
+        steps={
+            KV_CACHE: KVStep(),
+            _LOCAL_ATTN: AttentionStep(causal=True),
+            _GLOBAL_ATTN: AttentionStep(causal=True),
+            ROPE: PositionStep(),
+            SAMPLER: SamplerStep(
+                apply_penalty=True,
+                prefill_tracked_tokens={
+                    rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True)
+                } if walk in command_a_plus_config.PREFILL_WALKS else {},
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize("walk, lengths", [
+    ("prefill", [5, 2]), ("prefill_image", [9]), ("decode", [1, 1, 1]),
+])
+def test_command_a_plus_steps_equal_the_hand_written_ones(tmp_path, walk, lengths):
+    model = _command_a_plus(tmp_path)
+    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, 0), model)
+    rids = list(range(len(lengths)))
+    inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in lengths]
+    step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _command_a_plus_reference_step(walk, rids, inputs))
+
+
+def test_command_a_plus_layout_converts_to_the_hand_written_one(tmp_path):
+    model = _command_a_plus(tmp_path)
+    span = Span("ids", "prefill", 7, 7, "text_inputs")
+    converted = kv_layouts(
+        model.declare_state(), {KV_CACHE: {"main": Layout(spans=(span,), growth=(("decode_loop", 1),))}}, {},
+    )
+    reference = {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+    assert converted == reference
+    assert converted[KV_CACHE]["main"].row() == reference[KV_CACHE]["main"].row()
