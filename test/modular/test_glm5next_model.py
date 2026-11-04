@@ -393,21 +393,6 @@ def _specs_by_key(model: Glm5NextModel) -> dict:
     return {s.resource_key: s for s in specs}
 
 
-@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
-def test_serve_yaml_pages_cover_the_slot_pool(name):
-    """Every slot can hold a full-length request without the KV pool refusing it (under MTP
-    a request's rejected drafts take cache rows too)."""
-    import yaml
-
-    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
-    kv, kda = serve["resources"]["kv_cache"], serve["resources"]["kda_state"]
-    cfg = Glm5NextModelConfig(max_seq_len=serve["max_seq_len"])
-    cfg.mtp_num_draft_tokens = serve["model_kwargs"]["mtp_num_draft_tokens"]
-    # both pools hold a sink out of circulation
-    requests = kda["max_slots"] - 1
-    assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * cfg.kv_rows
-
-
 def test_glm5next_model_constructs_from_config():
     """The five node resources, full-size and reduced; each builds on CPU."""
     model = object.__new__(Glm5NextModel)

@@ -108,7 +108,7 @@ class Glm52Model(Model):
             # they size and split the long-context path only; without it they would be dropped
             raise ValueError(f"{long_only} apply only with dsa_long_context")
         if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
