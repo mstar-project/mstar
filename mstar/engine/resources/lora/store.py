@@ -135,6 +135,8 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
 
 def inspect_keys(spec: LoraSpec, items) -> AdapterInfo:
     """``inspect_adapter`` over ``(checkpoint key, shape)`` pairs, as a header lists them."""
+    items = list(items)
+    refuse_non_adapter(key for key, _ in items)
     shapes: dict[str, dict[str, tuple[int, ...]]] = {}
     for key, shape in items:
         # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
@@ -170,10 +172,6 @@ def check_adapter_file(
     from the checkpoint's header; returns its digest. The digest is read once per way the
     specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.
     Raises ``ValueError`` for an adapter the deployment cannot serve."""
-    from safetensors import safe_open
-
-    with safe_open(path, "pt") as f:
-        refuse_non_adapter(f.keys())
     digests: dict = {}  # convert_keys -> the digest of the file read that way
     for each in (spec, *others):
         each.check_adapter(name, inspect_adapter(each, path))

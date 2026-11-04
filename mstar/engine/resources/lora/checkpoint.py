@@ -218,6 +218,7 @@ def normalize_lora_state_dict(
     default_alpha: Callable[[str, int], float] | None = None,
 ) -> LoraAdapter:
     """Group raw LoRA tensors into per-module ``(A, B, alpha)`` triples in reference-library naming."""
+    refuse_non_adapter(state_dict)
     sd = {normalize_lora_key(key): value for key, value in state_dict.items()}
     if convert_keys is not None:
         sd = convert_keys(sd)

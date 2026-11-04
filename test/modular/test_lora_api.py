@@ -49,7 +49,7 @@ from mstar.conductor.lora_ops import LoraAdapterOps  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
 from mstar.engine.resources.lora import LORA_ADAPTER_KWARG, LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
-from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE  # noqa: E402
+from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE, describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.identity import (  # noqa: E402
     AdapterPrefixRoots,
     adapter_prefix_root,
@@ -587,6 +587,9 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
         answers.add(_message(err.value))
     # a missing file, a file of another kind, a directory and a model's weights read the same
     assert len(answers) == 1 and "could not be read" in answers.pop()
+    # as they do on a worker, should the file change after the API server's check
+    read = LoraAdapterPool(make_spec({}), "cpu").load_adapter_async("x", str(model))
+    assert "could not be read" in describe_load_error(read.exception(timeout=30))
     # an adapter the deployment cannot serve is refused with its reason, before any worker
     wide = tmp_path / "wide.safetensors"
     write_adapter(wide, rank=8, seed=9)  # above make_spec's max_rank of 4
