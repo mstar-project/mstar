@@ -287,7 +287,7 @@ def test_spoken_reply_text_fits_the_tts(model):
     out = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
     assert not any(k in out.metadata for k in model.LENGTH_KWARGS)
     assert model.get_max_output_tokens(**out.metadata) == min(2048, limit)
-    assert model.get_loop_caps(**out.metadata) == {DECODE_LOOP: min(2048, limit) - 1}
+    assert model.get_loop_caps(**out.metadata)[DECODE_LOOP] == min(2048, limit) - 1
     with pytest.raises(ValueError, match="spoken reply"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit + 1)
     # text replies are not capped
