@@ -619,11 +619,15 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
             node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(25)]}, input_metadata=chunk)
         _, _, _, commit = kv_steps.window(rids, 28, False)
         resources = {T2W_STATE: kv_steps.pool, **{T2W_KV[n]: kv_steps.resources[n] for n in T2W_KV}}
-        noise = model.window_noise(frames, True, [node.request_state(r)["noise"] for r in rids])
-        region.capture_fn(PiecewiseCallInputs(
-            static_inputs={"mel": mel.expand(len(rids), -1, -1), "phase": noise.phase, "harmonic": noise.harmonic},
-            engine_inputs=ModelInputsFromEngine(request_ids=rids, per_request_info={}, resources=resources),
-        ))
+        engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={}, resources=resources)
+
+        class Runner:  # the region, run eagerly on the rows the step planned
+            def run(self, static_inputs, **kwargs):
+                out = region.capture_fn(PiecewiseCallInputs(static_inputs=static_inputs, engine_inputs=engine_inputs))
+                return SimpleNamespace(get_view=out.__getitem__)
+
+        # the node draws the noise itself
+        node._run_hift(engine_inputs, Runner(), rids, mel.expand(len(rids), -1, -1), True, False)
         commit()
         # the excitation it held back for the next window: the noise, nearly alone
         return torch.stack([kv_steps.slot(r)["hift_source"] for r in rids])
