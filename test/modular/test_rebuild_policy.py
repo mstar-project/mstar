@@ -232,8 +232,8 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None, rebuild=fro
     )
     infos = {rid: SimpleNamespace(step_metadata={"is_prefill": True}) for rid in inputs}
     return SimpleNamespace(
-        node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, per_request_info=infos, chunk_ranges={},
-        completion_event=None,
+        node_name=NODE, step_context=ctx, request_ids=list(inputs), per_request_input_tensors=inputs,
+        per_request_info=infos, cached_rids=set(), chunk_ranges={}, completion_event=None,
     )
 
 
@@ -264,6 +264,25 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
         "the rebuild row would read its ids in another dtype than the walk's"
     )
     assert not kept[B].records, "a decode row's input, or an unread row's, would be taken for its prompt"
+
+
+def test_only_the_rows_that_ran_are_recorded():
+    """The engine takes a row it skipped or failed out of the step's rows and their infos, but not out of its
+    inputs."""
+    rebuilds = _rebuilds()
+    step = _ran(PREFILL, _rows(R, A, B))
+    step.cached_rids.add(B)  # the prefix cache served B's step whole
+    for rid in (A, B):
+        step.request_ids.remove(rid)
+        del step.per_request_info[rid]
+
+    rebuilds.record(step)
+
+    kept = rebuilds._kept[NODE]
+    assert len(kept[R].records) == 1 and not kept[A].records, "a row that never ran would be recorded"
+    assert "keeps no log" in rebuilds.refusal(B, NODE, DECODE, {}, None), (
+        "a request whose step the cache served would be rebuilt from a log missing that step"
+    )
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
@@ -344,7 +363,8 @@ def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="mixed", slot=0, capture=False,
                       request_walks={rid: info.graph_walk for rid, info in infos.items()})
     return SimpleNamespace(node_name=NODE, request_ids=list(rids), per_request_info=infos,
-                           per_request_input_tensors=inputs, step_context=ctx, chunk_ranges={}, **fields)
+                           per_request_input_tensors=inputs, cached_rids=set(), step_context=ctx, chunk_ranges={},
+                           **fields)
 
 
 def test_a_step_of_no_prefill_walk_records_nothing():

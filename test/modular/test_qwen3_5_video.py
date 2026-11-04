@@ -909,7 +909,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         node_name=NODE, request_ids=[R], per_request_info={R: SimpleNamespace(graph_walk="prefill_vision",
                                                                                step_metadata=metadata)},
         per_request_input_tensors=inputs, step_context=StepContext((R,), "prefill_vision", 0, False),
-        completion_event=None, chunk_ranges={},
+        cached_rids=set(), completion_event=None, chunk_ranges={},
     )
     w._rebuilds.record(prefilled)
     w._rebuilds.flush()

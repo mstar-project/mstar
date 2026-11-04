@@ -299,7 +299,7 @@ class Rebuilds:
 
         A step other than the one the request's layout says comes next, by walk or by length, or one missing an input
         the node reads, as a row the prefix cache served past its encoder, leaves the request with no log, so it is
-        never dropped."""
+        never dropped. So does a step the prefix cache served whole, which never ran."""
         node = node_batch.node_name
         prefilling = self._prefilling.get(node)
         if not prefilling:
@@ -309,9 +309,14 @@ class Rebuilds:
         if ctx.graph_walk not in walks and walks.keys().isdisjoint(ctx.request_walks.values()):
             return
         ids_input = self._policies[node].ids_input
-        for rid, inputs in node_batch.per_request_input_tensors.items():
+        for rid in [rid for rid in node_batch.cached_rids if rid in prefilling and ctx.walk_of(rid) in walks]:
+            self._forget(node, rid)
+        # The rows that ran: the engine takes a row it skipped or failed out of the step's rows and their infos,
+        # but not out of its inputs.
+        for rid in node_batch.request_ids:
             if rid not in prefilling or rid in ctx.rebuild_rids:
                 continue
+            inputs = node_batch.per_request_input_tensors.get(rid)
             chunk, walk = node_batch.chunk_ranges.get(rid), ctx.walk_of(rid)
             # A later chunk is cut from the input its first prepared, and a TP follower's unread row has no inputs,
             # which the step fails.
