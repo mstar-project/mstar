@@ -279,12 +279,17 @@ def _shallow(args, kwargs):
             yield a
 
 
+def _aliases(out, operands) -> bool:
+    """Whether a tensor of ``out`` shares a storage with one of the payloads ``operands``."""
+    storages = {t.untyped_storage()._cdata for t in operands}
+    return any(isinstance(t, torch.Tensor) and t.untyped_storage()._cdata in storages for t in tree_flatten(out)[0])
+
+
 def _rewrap(raw, inputs, index):
-    """Wrap the call's new CPU tensors, value-less if too large to keep; give back inputs it
-    returned as they were. ``inputs`` are the call's tensor arguments (cuda ones and plain)."""
-    by_id = {}
-    for x in inputs:
-        by_id[id(x._data) if isinstance(x, SimTensor) else id(x)] = x
+    """Wrap the call's CPU tensors, a new one value-less if too large to keep (one that shares
+    an operand's storage is a view of it, whatever its size); give back inputs it returned as
+    they were. ``inputs`` are the call's tensor arguments (cuda ones and plain)."""
+    by_id = {(id(x._data) if isinstance(x, SimTensor) else id(x)): x for x in inputs}
 
     def one(x):
         if not isinstance(x, torch.Tensor) or isinstance(x, SimTensor):
@@ -292,8 +297,8 @@ def _rewrap(raw, inputs, index):
         seen = by_id.get(id(x))
         if seen is not None:
             return seen
-        if x.device.type == "cpu" and x._base is None and not keeps_values(
-                x.dtype, x.untyped_storage().nbytes() // x.element_size()):  # (an expand is a small one)
+        if x.device.type == "cpu" and not keeps_values(x.dtype, x.numel()) and not _aliases(
+                x, [t._data if isinstance(t, SimTensor) else t for t in inputs]):
             x = x.to(META)
         return SimTensor(x, index)
 
@@ -930,10 +935,8 @@ def _captured_values(func, args, kwargs):
         if not isinstance(e, NotImplementedError) and torch.Tag.dynamic_output_shape not in func.tags:
             raise
         refuse_while_capturing(f"{func.overloadpacket.__name__}'s output shape depends on its input values")
-    if func.is_view:
-        operands = {m.untyped_storage()._cdata for m in metas}
-        if any(t.untyped_storage()._cdata in operands for t in tree_flatten(out)[0] if isinstance(t, torch.Tensor)):
-            return func(*args, **kwargs)
+    if func.is_view and _aliases(out, metas):
+        return func(*args, **kwargs)
 
     def buffer(m):
         if not isinstance(m, torch.Tensor):

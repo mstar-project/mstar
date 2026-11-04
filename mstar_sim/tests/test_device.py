@@ -342,6 +342,10 @@ def test_timing_only_holds_shapes_not_values():
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
         ones = torch.ones(4096, device="cuda")
         assert (ones[:, None] * ones[None, :]).sum().item() == 0  # size decides, for a result too
+        raw = torch.zeros(1 << 16, dtype=torch.uint8, device="cuda")
+        floats = raw.view(torch.float32)  # no new result: a view, however large it reads as floats
+        floats[0] = 1.0
+        assert raw[:4].tolist() == [0, 0, 128, 63] and floats.data_ptr() == raw.data_ptr()
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
         assert logits.argmax(-1).tolist() == [0, 0, 0, 0]  # never computed
         # a small tensor keeps the values last written to it, however it was made: a host
