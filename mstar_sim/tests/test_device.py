@@ -619,9 +619,10 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
     stays its own, whatever library it names. An assert is a value check, the one failure
     the plugin expects, only once the test has read a never-computed value: not for making a
     scratch buffer, or exporting a storage. A pass isn't reported for a test whose own code
-    read a never-computed value: that check can't answer."""
+    read a never-computed value: that check can't answer. A test listed as needing what a
+    stand-in lacks is a gap, and fails the run once it passes."""
     (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
-        import torch
+        import pytest, torch
         def test_host_read_in_capture():
             pos = torch.arange(4, device="cuda")
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
@@ -673,6 +674,9 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
         def test_index_into_what_a_never_computed_mask_selected():
             import flashinfer
             flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1).gt(0.5).nonzero()[0]
+        @pytest.mark.parametrize("fails", [True, False])
+        def test_a_sealed_buffer_reports_flashinfers_number(fails):
+            assert not fails
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
     """))
@@ -687,6 +691,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
                         "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
                         "test_lifecycle_assert_after_mstar_reads_a_sampled_token": "FAILED",
+                        "test_a_sealed_buffer_reports_flashinfers_number[True]": "XFAIL",
+                        "test_a_sealed_buffer_reports_flashinfers_number[False]": "FAILED",
                         "test_shape_mistake_on_cuda_tensors": "FAILED",
                         "test_shape_mistake_inside_a_stand_in": "XFAIL",
                         "test_index_into_what_a_never_computed_mask_selected": "XFAIL",

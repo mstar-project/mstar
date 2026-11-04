@@ -19,20 +19,23 @@ an error bound) can't be answered. A test is reported as an expected failure whe
 - it fails in any way after an op whose output shape depends on never-computed values
   (``nonzero`` of a mask, run on zeros).
 
-A value is never computed when no kernel computed it (``device.never_computed``):
-a large tensor's, one a stand-in wrote, an allocation not written yet, and what kept
-ops derive from those. So a pass means every value the test itself read was computed,
-as far as the emulator can tell: it can't tell of a host value mstar read from one
-and handed on (a sampled token in a list, whose check then passes on zeros or fails
-as mstar's), of a value a real write made over part of such a tensor, or whether a
-real value could show what the test is for (a race, when values land at launch).
+A value is never computed when no kernel computed it (``device.never_computed``): a
+large tensor's, one a stand-in wrote, and what kept ops derive from those, until a real
+write covers it. So a pass means every value the test itself read was computed, as far
+as the emulator can tell. It can't tell of a host value mstar read from one and handed on
+(a sampled token in a list, whose check then passes on zeros or fails as mstar's), of an
+allocation nothing wrote or a stand-in wrote without saying so (those read as zeros), of
+another rank's value (the fact doesn't cross ranks), or whether a real value could show
+what the test is for (a race, when values land at launch). The fact is per storage, so a
+real value beside a never-computed one reads as never computed, until a whole write.
 
 Every other failure stays a failure: an exception from mstar's own code (a lifecycle
 or planning error, an API that moved, a crash), or an assertion made before any such
-read. A failure raised inside the emulator's own code is an emulator gap: reported as
-an expected failure and listed at the end of the run, so a gap never reads as a fault
-of mstar's. A ``pytest.raises`` that saw nothing after a stand-in kernel ran expected
-the kernel's own error check, which a stand-in doesn't have.
+read. A failure raised inside the emulator's own code, or in a test listed in
+``_STAND_IN_LACKS``, is an emulator gap: reported as an expected failure and listed at
+the end of the run, so a gap never reads as a fault of mstar's. A ``pytest.raises`` that
+saw nothing after a stand-in kernel ran expected the kernel's own error check, which a
+stand-in doesn't have.
 """
 
 from __future__ import annotations
@@ -50,6 +53,13 @@ import pytest
 from mstar_sim import device
 
 GAPS: list[tuple[str, str]] = []
+# tests of what a stand-in doesn't do, which no rule can tell from a failure of mstar's, so
+# each is a gap; one that passes fails the run, so an entry can't go stale
+_STAND_IN_LACKS = dict.fromkeys(
+    ("test_a_sealed_buffer_reports_flashinfers_number",
+     "test_a_captured_paged_wrapper_grows_on_its_first_plan_and_its_later_plans_go_direct",
+     "test_every_wrapper_grows_on_the_real_planner_and_its_next_plan_fits"),
+    "flashinfer's stand-in planner never runs out of workspace")
 # host reads of never-computed values by the test's own code
 TEST_READS = [0]
 
@@ -144,6 +154,11 @@ def _raised_in_emulator(excinfo) -> str | None:
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    lacks = _STAND_IN_LACKS.get(item.name.split("[")[0])
+    if lacks and report.passed and report.when == "call":
+        report.outcome = "failed"
+        report.longrepr = f"mstar_sim: passed, though listed in _STAND_IN_LACKS ({lacks}): delete its entry"
+        return
     if report.passed and report.when == "call" and TEST_READS[0]:
         report.outcome = "skipped"
         report.wasxfail = f"mstar_sim: passed, but it read {TEST_READS[0]} never-computed value(s): unanswered"
@@ -154,7 +169,7 @@ def pytest_runtest_makereport(item, call):
         report.outcome = "skipped"
         report.longrepr = (str(item.path), item.location[1] or 0, "Skipped: needs the Hugging Face Hub (offline)")
         return
-    where = _raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
+    where = lacks or _raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
     if where:
         GAPS.append((item.nodeid, f"{where}: {call.excinfo.exconly()[:160]}"))
         report.outcome = "skipped"
