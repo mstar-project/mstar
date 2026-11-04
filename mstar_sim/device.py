@@ -501,7 +501,7 @@ class _Observe(TorchDispatchMode):
 # A device-side assert: an index out of bounds in a kernel. As on CUDA, it is sticky:
 # every later device call fails, so a server that ran one doesn't serve on.
 FAULT = [""]
-_TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_"}
+_TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_", "take", "index_fill", "index_fill_"}
 
 
 def _check_bounds(func, args) -> None:
@@ -520,7 +520,14 @@ def _check_bounds(func, args) -> None:
     elif name == "take":
         pairs = [(args[1], args[0].numel())]
     elif name in _TAKES_NEGATIVE and len(args) > 1 and isinstance(args[1], (list, tuple)):
-        pairs = [(ix, args[0].shape[i]) for i, ix in enumerate(args[1]) if i < args[0].dim()]
+        dim = 0
+        for ix in args[1]:
+            if isinstance(ix, torch.Tensor) and ix.dtype in (torch.bool, torch.uint8):
+                dim += ix.dim()  # a mask indexes as many dimensions as it has
+                continue
+            if dim < args[0].dim():
+                pairs.append((ix, args[0].shape[dim]))
+            dim += 1
     pairs = [(ix, size) for ix, size in pairs if isinstance(ix, torch.Tensor) and ix.device.type == "cpu"
              and ix.numel() and ix.dtype != torch.bool and not ix.is_floating_point()]
     if not pairs:

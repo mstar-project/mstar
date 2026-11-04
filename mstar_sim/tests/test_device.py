@@ -56,6 +56,14 @@ def test_cuda_semantics():
             assert "same device" in str(e)
         assert (x + torch.tensor(1.0)).is_cuda          # CPU scalars are fine
         assert x[torch.tensor([0, 2])].shape == (2, 8)  # so is a CPU index
+        # indices CUDA accepts raise no device-side assert: negative ones where the kernel wraps
+        # them, and an index after a mask, which counts against the dimension after the mask's
+        ids = torch.arange(6, device="cuda")
+        assert torch.take(ids, torch.tensor([-1], device="cuda")).tolist() == [5]
+        assert ids.clone().index_fill_(0, torch.tensor([-1], device="cuda"), 9).tolist()[-1] == 9
+        cube = torch.zeros(2, 3, 7, dtype=torch.long, device="cuda")
+        assert cube[torch.ones(2, 3, dtype=torch.bool, device="cuda"), torch.tensor([5], device="cuda")].shape == (6,)
+        torch.cuda.synchronize()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             assert m(x).dtype == torch.bfloat16
         # small host floats keep their values; beside a never-computed operand they join it
