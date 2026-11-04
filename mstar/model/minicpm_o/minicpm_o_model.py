@@ -22,9 +22,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from transformers import AutoProcessor
+from transformers import Qwen2TokenizerFast, WhisperFeatureExtractor
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
@@ -48,6 +47,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.minicpm_o import processor
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     AUDIO_FEATURE_LENS,
@@ -94,14 +94,14 @@ _WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
-    """Config, tokenizer and processor files only; workers fetch weights."""
+    """Config and tokenizer files only; workers fetch weights."""
     if Path(repo_id).is_dir():
         return repo_id
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
         repo_id=repo_id, cache_dir=cache_dir,
-        allow_patterns=["*.json", "*.py", "*.txt", "assets/*.wav"],
+        allow_patterns=["*.json", "*.txt", "assets/*.wav"],
     )
 
 
@@ -116,13 +116,6 @@ def _as_pil(image: torch.Tensor):
     if image.shape[0] == 1:
         image = image.expand(3, -1, -1)
     return Image.fromarray(image.permute(1, 2, 0).cpu().contiguous().numpy(), mode="RGB")
-
-
-def _bound_positions(bounds: torch.Tensor) -> torch.Tensor:
-    """Concatenated ``[start, end)`` ranges of ``[n, 2]`` placeholder bounds."""
-    if bounds.numel() == 0:
-        return torch.zeros(0, dtype=torch.long)
-    return torch.cat([torch.arange(int(a), int(b)) for a, b in bounds.reshape(-1, 2).tolist()])
 
 
 class MiniCPMOModel(Model):
@@ -141,9 +134,11 @@ class MiniCPMOModel(Model):
         self.max_seq_len = limit if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= limit:
             raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
-        self._processor = None
-        tokenizer = self.processor.tokenizer
+        # upstream's tokenizer class is Qwen2's with token-name attributes added
+        tokenizer = Qwen2TokenizerFast.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
+        # upstream's mel: Whisper's, as its own audio processor configures it
+        self._mel = WhisperFeatureExtractor(feature_size=self.config.audio.num_mel_bins)
         # A reply ends on <|im_end|> (the tokenizer's eos; config.json names
         # only that) or <|endoftext|>, as upstream's `chat` terminators; and
         # a spoken reply's text closes with <|tts_eos|> just before <|im_end|>,
@@ -152,16 +147,6 @@ class MiniCPMOModel(Model):
             tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>", "<|tts_eos|>")
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
-
-    @property
-    def processor(self):
-        """Upstream's processor: image slicing, the Whisper-style mel and the
-        placeholder layout, run in the API server's preprocessing."""
-        if self._processor is None:
-            self._processor = AutoProcessor.from_pretrained(
-                self.local_dir, cache_dir=self.cache_dir, trust_remote_code=True,
-            )
-        return self._processor
 
     def checkpoint_path(self) -> str | None:
         return self.local_dir
@@ -285,17 +270,12 @@ class MiniCPMOModel(Model):
     def _render(
         self,
         parts: list[PromptPart],
-        images: list,
-        audios: list[np.ndarray],
+        has_audio: bool,
         enable_thinking: bool,
         system_prompt: str | None,
-    ) -> tuple[str, list[int]]:
-        """The chat string as upstream's `chat` renders it, and a part id per
-        audio. Each clip gets its own: the processor encodes clips that share an
-        id as one, but sizes their placeholders clip by clip, and the two round
-        differently (upstream's own `chat` fails on such prompts)."""
+    ) -> str:
+        """The chat string as upstream's `chat` renders it, with a tag per attachment."""
         msgs: list[dict] = []
-        audio_parts: list[int] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         user: list[str] = []
@@ -303,21 +283,19 @@ class MiniCPMOModel(Model):
             if part.modality == TEXT:
                 user.append(part.text or "")
             elif part.modality == "image":
-                user.append("<image>./</image>")
+                user.append(processor.IMAGE_TAG)
             elif part.modality == "audio":
-                user.append("<audio>./</audio>")
-                audio_parts.append(len(audio_parts))
+                user.append(processor.AUDIO_TAG)
         msgs.append({"role": "user", "content": "\n".join(user)})
-        text = self.tokenizer.apply_chat_template(
+        return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
             add_generation_prompt=True,
             # upstream turns the speech template on whenever audio is anywhere
             # in the request
-            use_tts_template=bool(audios),
+            use_tts_template=has_audio,
             enable_thinking=enable_thinking,
         )
-        return text, audio_parts
 
     def process_prompt(
         self,
@@ -345,61 +323,64 @@ class MiniCPMOModel(Model):
         if not any(p.text for p in parts if p.modality == TEXT) and not raw_images and not raw_audios:
             raise ValueError("MiniCPM-o got a request with no text and no attachments")
 
-        images = [_as_pil(img) for img in raw_images]
         audios = [a.reshape(-1).float().cpu().numpy() for a in raw_audios]
-        text, audio_parts = self._render(
-            parts, images, audios,
+        text = self._render(
+            parts, bool(audios),
             enable_thinking=bool(kwargs.get("enable_thinking", False)),
             system_prompt=kwargs.get("system_prompt"),
         )
-        out = self.processor(
-            [text], [images], [audios], [audio_parts],
-            max_slice_nums=kwargs.get("max_slice_nums"),
-            return_tensors="pt",
+        max_slice_nums = kwargs.get("max_slice_nums")
+        max_slice_nums = processor.MAX_SLICE_NUMS if max_slice_nums is None else max_slice_nums
+        p, queries = self.config.vision.patch_size, self.config.resampler.num_queries
+        sliced = [processor.slice_image(_as_pil(img), max_slice_nums, p) for img in raw_images]
+        text = processor.expand_tags(
+            text,
+            [processor.image_placeholder(i, grid, queries) for i, (_, grid) in enumerate(sliced)],
+            [processor.audio_placeholder(len(a), self.config.audio) for a in audios],
         )
-        input_ids = out["input_ids"][0].long()
+        input_ids, image_positions, audio_positions = processor.prompt_ids(self.tokenizer, text)
         result: NameToTensorList = {"text_inputs": [input_ids]}
         metadata: dict[str, Any] = {}
 
-        if images:
-            strips = out["pixel_values"][0]
-            # [3, p, n * p] strips -> [n, 3, p, p] patches; bf16 is what the
-            # tower casts them to before its patch conv, so the cast is exact
-            p = self.config.vision.patch_size
-            patches = torch.cat([
-                s.view(3, p, s.shape[-1] // p, p).permute(2, 0, 1, 3) for s in strips
-            ]).to(torch.bfloat16)
-            positions = _bound_positions(out["image_bound"][0])
-            if positions.numel() != len(strips) * self.config.resampler.num_queries:
+        if sliced:
+            patches, tgt_sizes = zip(
+                *(processor.slice_patches(s, p) for slices, _ in sliced for s in slices), strict=True,
+            )
+            if image_positions.numel() != len(tgt_sizes) * queries:
                 raise ValueError(
-                    f"image placeholders ({positions.numel()}) do not match "
-                    f"{len(strips)} slices x {self.config.resampler.num_queries} queries"
+                    f"image placeholders ({image_positions.numel()}) do not match "
+                    f"{len(tgt_sizes)} slices x {queries} queries"
                 )
-            result["pixel_values"] = [patches]
-            metadata[IMAGE_TGT_SIZES] = [(int(h), int(w)) for h, w in out["tgt_sizes"][0].tolist()]
-            result["image_positions"] = [positions]
+            # bf16 is what the tower casts them to before its patch conv, so the cast is exact
+            result["pixel_values"] = [torch.cat(patches).to(torch.bfloat16)]
+            metadata[IMAGE_TGT_SIZES] = list(tgt_sizes)
+            result["image_positions"] = [image_positions]
 
         if audios:
-            lens = out["audio_feature_lens"][0].reshape(-1).long()
-            feats = out["audio_features"]
+            mel = self._mel(
+                [piece for a in audios for piece in processor.audio_pieces(a)],
+                sampling_rate=processor.SAMPLE_RATE, padding="max_length",
+                return_attention_mask=True, return_tensors="pt",
+            )
             # a piece shorter than one pooling step (a clip under ~0.1 s, or what
             # is left of a long one past its last 30 s cut) pools to no tokens
-            keep = [i for i, n in enumerate(lens.tolist()) if self.config.audio.pooled_tokens(n) > 0]
-            lens = lens[keep]
-            pieces = [feats[i, :, :n] for i, n in zip(keep, lens.tolist(), strict=True)]
-            positions = _bound_positions(out["audio_bounds"][0])
-            tokens = sum(self.config.audio.pooled_tokens(n) for n in lens.tolist())
-            if positions.numel() != tokens:
+            lens = [
+                (i, n) for i, n in enumerate(mel["attention_mask"].sum(dim=1).tolist())
+                if self.config.audio.pooled_tokens(n) > 0
+            ]
+            pieces = [mel["input_features"][i, :, :n] for i, n in lens]
+            tokens = sum(self.config.audio.pooled_tokens(n) for _, n in lens)
+            if audio_positions.numel() != tokens:
                 # upstream sizes the placeholder off the whole clip but encodes
                 # 30 s pieces, which disagree for some long clips
                 raise ValueError(
-                    f"audio placeholders ({positions.numel()}) do not match the "
+                    f"audio placeholders ({audio_positions.numel()}) do not match the "
                     f"{tokens} tokens its {len(pieces)} piece(s) encode to"
                 )
             if pieces:  # else the clips are all too short to encode, and the prompt is text only
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
-                metadata[AUDIO_FEATURE_LENS] = lens.tolist()
-                result["audio_positions"] = [positions]
+                metadata[AUDIO_FEATURE_LENS] = [n for _, n in lens]
+                result["audio_positions"] = [audio_positions]
         # the prefill writes every prompt row, placeholders included, then a row per decode step
         rows = int(input_ids.numel())
         layout = LabelLayout(

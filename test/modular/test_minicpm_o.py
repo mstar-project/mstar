@@ -2,7 +2,7 @@
 
 The resampler's sincos keys and the navit position buckets are checked
 against upstream's own formulas on the CPU. Everything else needs the
-checkpoint's tokenizer and processor (not its weights), so it skips unless
+checkpoint's config and tokenizer (not its weights), so it skips unless
 MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot.
 """
 
@@ -122,7 +122,7 @@ def test_prefill_token_counts_toward_the_budget(walk):
     assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
 
 
-# --- with the checkpoint's tokenizer and processor -------------------------
+# --- with the checkpoint's config and tokenizer ---------------------------
 
 @pytest.fixture(scope="module")
 def model():

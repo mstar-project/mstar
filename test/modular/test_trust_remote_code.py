@@ -3,7 +3,8 @@
 Qwen3-Omni, OmniVoice and the Nemotron duplex tokenizer passed
 ``trust_remote_code=True``. None of their checkpoints needs repo code:
 Qwen3-Omni and Nemotron-H are native in transformers, and ``omnivoice`` is
-registered with AutoConfig by the installed package. The mocked tests pin the
+registered with AutoConfig by the installed package. MiniCPM-o's tokenizer is
+Qwen2's, and its processor is ported. The mocked tests pin the
 flag at each call site; the Nemotron ones run the real AutoTokenizer against a
 directory whose repo code would leave a marker file if it ran.
 """
@@ -79,7 +80,7 @@ def test_omnivoice_checkpoint_config_without_remote_code(monkeypatch):
     assert seen == [config]
 
 
-def _nemotron_tokenizer_dir(path, tokenizer_config, extra_files):
+def _tokenizer_dir(path, tokenizer_config, extra_files):
     from tokenizers import Tokenizer, models, pre_tokenizers
 
     tok = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]"))
@@ -105,7 +106,7 @@ def _nemotron_model(monkeypatch, tokenizer_dir):
 
 def test_nemotron_tokenizer_ignores_config_repo_code(monkeypatch, tmp_path):
     """The Spark repo's ``nano/config.json`` maps AutoConfig to repo code."""
-    marker = _nemotron_tokenizer_dir(
+    marker = _tokenizer_dir(
         tmp_path,
         {"tokenizer_class": "PreTrainedTokenizerFast"},
         {
@@ -131,7 +132,7 @@ def test_nemotron_tokenizer_ignores_config_repo_code(monkeypatch, tmp_path):
 
 
 def test_nemotron_tokenizer_needing_repo_code_fails_without_running_it(monkeypatch, tmp_path):
-    marker = _nemotron_tokenizer_dir(
+    marker = _tokenizer_dir(
         tmp_path,
         {
             "tokenizer_class": "RepoTokenizer",
@@ -151,5 +152,38 @@ def test_nemotron_tokenizer_needing_repo_code_fails_without_running_it(monkeypat
 
     with pytest.raises(ValueError, match="custom code"):
         model.tokenizer  # noqa: B018
+
+    assert not marker.exists()
+
+
+def test_minicpm_o_loads_without_its_repo_code(tmp_path):
+    """The checkpoint maps its tokenizer and processor to repo code."""
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    planted = "import pathlib\npathlib.Path(MARKER).write_text('ran')\n"
+    marker = _tokenizer_dir(
+        tmp_path,
+        {
+            "tokenizer_class": "MiniCPMOTokenizerFast",
+            "auto_map": {"AutoTokenizer": ["tokenization_minicpmo_fast.MiniCPMOTokenizerFast", None]},
+        },
+        {
+            "config.json": json.dumps({
+                "version": "4.5", "hidden_size": 64, "num_attention_heads": 4, "query_num": 64,
+                "vision_config": {}, "audio_chunk_length": 1.0, "audio_pool_step": 5,
+                "audio_config": {
+                    "d_model": 32, "encoder_layers": 1, "encoder_attention_heads": 2, "encoder_ffn_dim": 64,
+                    "num_mel_bins": 80, "max_source_positions": 1500, "activation_function": "gelu",
+                },
+            }),
+            "preprocessor_config.json": json.dumps({
+                "processor_class": "MiniCPMOProcessor",
+                "auto_map": {"AutoProcessor": "processing_minicpmo.MiniCPMOProcessor"},
+            }),
+            "tokenization_minicpmo_fast.py": planted,
+            "processing_minicpmo.py": planted,
+        },
+    )
+    MiniCPMOModel(str(tmp_path))
 
     assert not marker.exists()
