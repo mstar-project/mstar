@@ -26,6 +26,14 @@ def test_a_slice_given_back_merges_with_its_free_neighbors():
     assert pool.take(64) == HostSlice(0, 64), "the pool stayed in pieces, so a long prompt would find no room"
 
 
+def test_the_pool_hands_out_all_the_pinned_allocator_takes():
+    """The pinned allocator rounds an allocation up to a power of two, so a 1088 MiB pool pinned 2 GiB and never
+    handed out the other 960 MiB."""
+    pool = HostPool(96, torch.device("cpu"))
+
+    assert pool.take(128) == HostSlice(0, 128), "the pool would pin memory it never hands out"
+
+
 @requires_cuda
 def test_kept_ids_copy_after_the_steps_completion_event():
     device = torch.device("cuda")

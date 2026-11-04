@@ -35,11 +35,13 @@ class HostCopy(NamedTuple):
 
 class HostPool:
     """``nbytes`` of host memory allocated once, pinned where ``device`` takes pinned memory, and handed out
-    first fit. Copies run on streams of the pool's own, one each way, so a copy never waits behind a later step, and a
+    first fit. The pool rounds ``nbytes`` up to a power of two, as the pinned allocator does, so it hands out all it
+    pins. Copies run on streams of the pool's own, one each way, so a copy never waits behind a later step, and a
     copy back to the device never waits behind copies to the host."""
 
     def __init__(self, nbytes: int, device: torch.device) -> None:
         self.device = device
+        nbytes = 1 << (nbytes - 1).bit_length()
         self._memory = torch.empty(nbytes, dtype=torch.uint8, pin_memory=DeviceCapability.of(device).pin_memory)
         # sorted by offset, with no two adjacent
         self._free = [HostSlice(0, nbytes)]
