@@ -798,14 +798,18 @@ class Token2WavSubmodule(NodeSubmodule):
         last = is_final_stream_chunk or bool((codes == self.eos_code).any())
         codes = codes[codes != self.eos_code]
         chunk = input_metadata.stream_chunks["tts_code"]
-        if chunk.context_items == chunk.num_items:
-            # No new codes: the stream's final chunk after a window that held the stop
-            # code, which only repeats that window's tail. It still runs, voicing
-            # nothing (``forward_batched``): a skipped step never completes the node,
-            # which then refuses the stream's end.
-            return NodeInputs(tensor_inputs={"codes": codes[None, :0]}, kwargs={"last": True})
         # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
+        if chunk.start_offset > state.get("last_window", chunk.start_offset):
+            # Past the last window: the stream's final chunk after the window that held
+            # the stop code, which only repeats that window's tail. It still runs,
+            # voicing nothing (``forward_batched``): a skipped step never completes the
+            # node, which then refuses the stream's end. Told by the last window's
+            # offset, not by the chunk being all look-back: a stream that ends at a
+            # full window without the stop code has a last window that is all look-back.
+            return NodeInputs(tensor_inputs={"codes": codes[None, :0]}, kwargs={"last": True})
+        if last:
+            state.add("last_window", chunk.start_offset)
         first = chunk.start_offset == 0
         if first:
             codes = torch.cat([self._lead_silence, codes])
