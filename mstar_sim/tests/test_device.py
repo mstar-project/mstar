@@ -174,11 +174,14 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         table_ids, wide = torch.arange(50, device="cuda"), torch.tensor([200, 10], device="cuda")
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             table_ids[(wide - 50).clamp_(0, 49)]
-            try:
-                torch.nonzero(ids)
-                raise SystemExit("nonzero was captured")
-            except RuntimeError as e:
-                assert "capturing" in str(e)
+            # so are synchronous copies from host memory: a blocking H2D copy, a tensor from host data
+            for sync in (lambda: torch.nonzero(ids), lambda: ids.copy_(torch.tensor([1, 2])),
+                         lambda: torch.tensor([1, 2], device="cuda"), lambda: torch.tensor([1, 2]).cuda()):
+                try:
+                    sync()
+                    raise SystemExit("a synchronizing call was captured")
+                except RuntimeError as e:
+                    assert "capturing" in str(e)
         g4, bad = torch.cuda.CUDAGraph(), torch.tensor([1, 2], device="cuda")
         with torch.cuda.graph(g4):
             torch.nn.functional.embedding(bad + 0, table)

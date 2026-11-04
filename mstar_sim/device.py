@@ -428,6 +428,13 @@ def gpu_error(error: BaseException) -> BaseException:
     return error
 
 
+def refuse_while_capturing(what: str) -> None:
+    """CUDA refuses a synchronizing call (``what``) on a capturing stream."""
+    if clock.capturing() is not None:
+        raise gpu_error(RuntimeError(
+            f"CUDA error: operation not permitted when stream is capturing (mstar_sim: {what})"))
+
+
 def host_wait() -> None:
     """A host read of device data: wait for the current stream, refuse under capture
     (and, under ``torch.cuda.set_sync_debug_mode``, warn or refuse as CUDA does)."""
@@ -438,11 +445,7 @@ def host_wait() -> None:
         import warnings
 
         warnings.warn(message, stacklevel=3)
-    if clock.capturing() is not None:
-        raise gpu_error(RuntimeError(
-            "CUDA error: operation not permitted when stream is capturing "
-            "(mstar_sim: a host read of a cuda tensor during graph capture)"
-        ))
+    refuse_while_capturing("a host read of a cuda tensor")
     clock.wait_until(clock.current_timeline().free_at)
     check_fault()
 
@@ -977,9 +980,7 @@ def _captured_values(func, args, kwargs):
     except (NotImplementedError, RuntimeError) as e:
         if not isinstance(e, NotImplementedError) and torch.Tag.dynamic_output_shape not in func.tags:
             raise
-        raise gpu_error(RuntimeError(
-            "CUDA error: operation not permitted when stream is capturing (mstar_sim: "
-            f"{func.overloadpacket.__name__}'s output shape depends on its input values)")) from None
+        refuse_while_capturing(f"{func.overloadpacket.__name__}'s output shape depends on its input values")
 
     def buffer(m):
         if not isinstance(m, torch.Tensor):
@@ -1056,9 +1057,13 @@ def _to(self, *args, **kwargs):
     if is_cuda_device(device):
         if self.device.type not in ("cpu", "meta"):
             raise RuntimeError(f"mstar_sim: can't move a {self.device} tensor to cuda")
+        if not non_blocking:
+            refuse_while_capturing("a blocking host-to-device copy")
         with torch._C.DisableTorchFunctionSubclass():
             src = self.to(dtype=dtype) if dtype is not None and dtype != self.dtype else self
         data = to_device_storage(src)
+        if data.device.type == "cpu":  # captured: reads its host buffer at each replay, not now
+            clock.on_replay(lambda: data.copy_(self))
         clock.charge(_copy_seconds(data.numel() * data.element_size(), "h2d"))
         return SimTensor(data, _index(device))
     if _is_meta(self) and (device is None or device.type in ("cpu", "meta")):
@@ -1103,6 +1108,8 @@ def _data_ptr(self) -> int:
 def _copy_(self, src, non_blocking=False):
     if isinstance(self, SimTensor):
         if not isinstance(src, SimTensor):
+            if not non_blocking:
+                refuse_while_capturing("a blocking host-to-device copy")
             clock.charge(_copy_seconds(src.numel() * src.element_size(), "h2d"))
             if not _is_meta(self._data) and not _is_meta(src):
                 dst = self._data
@@ -1208,8 +1215,10 @@ def _create(func, args, kwargs, device):
     """A factory call on the cuda device: meta unless small ints."""
     index = _index(device)
     target = CPU
-    shape = func(*args, **dict(kwargs, device=META))
     from_host = func in (torch.tensor, torch.as_tensor, torch.from_numpy)
+    if from_host:
+        refuse_while_capturing(f"torch.{func.__name__} copies host data synchronously")
+    shape = func(*args, **dict(kwargs, device=META))
     if isinstance(shape, T) and not keeps_values(shape.dtype, shape.numel(), from_host):
         target = META
     with _Observe():
