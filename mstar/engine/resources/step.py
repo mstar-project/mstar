@@ -219,6 +219,8 @@ class SubmoduleStep:
     # declared array or sampler -> what this step does to it, which the engine
     # expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)
     state: Mapping[str, Any] = field(default_factory=dict)
+    # the handles of what ``state`` lists, set by that expansion
+    state_handles: tuple[StepHandle, ...] = field(default=(), init=False)
 
     def __post_init__(self):
         if self.segments is None:
@@ -235,6 +237,21 @@ class SubmoduleStep:
         # the step is frozen so a submodule can't rewrite its own declaration;
         # the engine still owns this one field
         object.__setattr__(self, "_ctx", ctx)
+
+    def set_state_handles(self, handles: tuple[StepHandle, ...]) -> None:
+        object.__setattr__(self, "state_handles", handles)
+
+    def begin_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.begin_step(self)
+
+    def check_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.check_step(self)
+
+    def end_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.end_step(self)
 
     def get(self, key: str) -> ResourceStep | None:
         return self.steps.get(key)

@@ -42,23 +42,29 @@ def state_declaration_problems(model: "Model") -> list[str]:
     return problems
 
 
+def position_key(array: Array) -> str:
+    """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
+    return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
 def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
     """Names share one namespace while they are resource keys, so a read can't reuse an array's name."""
     problems: list[str] = []
-    declared: set[str] = set()
+    declared: dict[str, str] = {}
     for field, name in (
         *(
             pair for array in arrays for pair in (
                 (f"Array {array.name!r}.name", array.name),
                 *((f"Array {array.name!r}.reads", key) for key in array.reads),
                 *((f"Array {array.name!r}.updates", key) for key in array.updates),
+                *(() if array.positions is None else ((f"Array {array.name!r}.positions", position_key(array)),)),
             )
         ),
         *((f"Sampler {sampler.name!r}.name", sampler.name) for sampler in samplers),
     ):
         if name in declared:
-            problems.append(f"{field}: the name {name!r} is declared twice")
-        declared.add(name)
+            problems.append(f"{field}: the name {name!r} is declared twice, also by {declared[name]}")
+        declared.setdefault(name, field)
     return problems
 
 
@@ -132,6 +138,17 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
                 clashes.add((other, key))
                 problems.append(f"{where}.layers: layer {layer} on walk {walk!r} is also read through reads[{other!r}]")
     return problems
+
+
+def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """What a deployment's ``resources:`` block asks of a declared sampler that it can't do."""
+    return [
+        f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
+        "per step"
+        for declared in model.declare_state()
+        if isinstance(declared, Sampler) and declared.draws > 1
+        and resources.get(declared.name, {}).get("enable_logprobs")
+    ]
 
 
 def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:

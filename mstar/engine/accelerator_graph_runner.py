@@ -30,6 +30,8 @@ from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, S
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK
+from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -1164,7 +1166,7 @@ class AcceleratorGraphRunner:
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
         if step is not None:
-            step = replace(step, _ctx=StepContext(
+            step.set_ctx(StepContext(
                 request_ids=tuple(dummy_rids),
                 graph_walk=walk,
                 slot=spec.slot,
@@ -1183,11 +1185,17 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            return self._submodule.preprocess(
-                graph_walk=walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
+            try:
+                if step is not None:
+                    step.begin_calls()
+                return self._submodule.preprocess(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    inputs=dummy_inputs,
+                )
+            finally:
+                if step is not None:
+                    step.end_calls()
 
         try:
             static_inputs = prepare()
@@ -1218,11 +1226,19 @@ class AcceleratorGraphRunner:
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
-                out = forward(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    **static_inputs,
-                )
+                try:
+                    if step is not None:
+                        step.begin_calls()
+                    out = forward(
+                        graph_walk=walk,
+                        engine_inputs=engine_inputs,
+                        **static_inputs,
+                    )
+                    if step is not None:
+                        step.check_calls()
+                finally:
+                    if step is not None:
+                        step.end_calls()
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out
@@ -1761,12 +1777,14 @@ class PiecewiseAcceleratorGraphRunner:
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
         lora_keys: tuple[str, ...] = (),
+        state_handles: Mapping[str, Any] = EMPTY,
     ):
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
         # the node's LoRA pools (`_region_step`, `can_lease`)
         self._lora_keys = lora_keys
+        self._state_handles = state_handles
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
@@ -2108,7 +2126,16 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            return self._normalize_output(fn(call))
+            try:
+                if step is not None:
+                    step.begin_calls()
+                out = self._normalize_output(fn(call))
+                if step is not None:
+                    step.check_calls()
+            finally:
+                if step is not None:
+                    step.end_calls()
+            return out
 
         try:
             self._plan(step, shape)
@@ -2194,8 +2221,9 @@ class PiecewiseAcceleratorGraphRunner:
 
     def _region_step(self, request_ids: list[int], seq_lens: list[int]):
         """The config's step for the region, with the node's LoRA rows laid out from its
-        own segments (``lora_rows``)."""
-        return lora_rows(self._config.region_step(list(request_ids), list(seq_lens)), self._lora_keys)
+        own segments (``lora_rows``), and what it declares about its state expanded (``state_steps``)."""
+        step = lora_rows(self._config.region_step(list(request_ids), list(seq_lens)), self._lora_keys)
+        return state_steps(step, self._state_handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

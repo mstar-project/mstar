@@ -115,6 +115,20 @@ def test_two_arrays_may_not_share_a_name():
     assert _one_problem(_array(), _array()).startswith("Array 'kv'.name: the name 'kv'")
 
 
+def test_two_arrays_may_not_derive_one_positions_key():
+    problem = _one_problem(
+        _array(positions=Positions()), _array("mem", reads={"other": _read()}, positions=Positions()),
+    )
+    assert problem == "Array 'mem'.positions: the name 'rope' is declared twice, also by Array 'kv'.positions"
+
+
+def test_a_positions_key_may_not_equal_another_declared_name():
+    problem = _one_problem(_array("thinker_kv", reads={"thinker_pos": _read()}, positions=Positions()))
+    assert problem == (
+        "Array 'thinker_kv'.positions: the name 'thinker_pos' is declared twice, also by Array 'thinker_kv'.reads"
+    )
+
+
 def test_a_read_may_not_reuse_an_array_name():
     problem = _one_problem(_array(), _array("other", reads={"kv": _read()}))
     assert problem.startswith("Array 'other'.reads: the name 'kv'")

@@ -49,6 +49,7 @@ from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.lora.identity import AdapterPrefixRoots
 from mstar.engine.resources.lora.serving import lora_specs
+from mstar.engine.state.adapters import kv_layouts
 from mstar.model.base import (
     ClientChunk,
     Model,
@@ -907,7 +908,10 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
+        for name in (
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
+            *internal,
+        ):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -924,7 +928,12 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            layouts = model_kwargs.pop("kv_layout", {})
+            state_layout = model_kwargs.pop("state_layout", None)
+            keyed_spans = model_kwargs.pop("keyed_spans", {})
+            layouts = (
+                model_kwargs.pop("kv_layout", {}) if state_layout is None
+                else kv_layouts(self._declarations, state_layout, keyed_spans)
+            )
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
                 for key, by_label in layouts.items()
@@ -1134,6 +1143,12 @@ class PreprocessWorkerThread:
                 request_id=request_id, inputs=[], request_info=None, partition_name=partition,
                 producer_done={CLIENT}, producer_done_items=counts,
             )))
+
+    @cached_property
+    def _declarations(self) -> list:
+        """Built once, since a prompt on this thread holds up the API server's GIL, and building them on each prompt
+        took a tenth of Qwen3.5's one-token throughput."""
+        return self.model.declare_state()
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:

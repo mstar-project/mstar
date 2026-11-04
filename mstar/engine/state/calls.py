@@ -28,6 +28,7 @@ class ArrayHandle(StepHandle):
         self.label = "main"
         self.reads = {key: resources[key] for key in array.reads}
         self.first_read = next(iter(self.reads.values()), None)
+        self.positions_key = positions_key
         self.positions = None if positions_key is None else resources[positions_key]
         rope = None if array.positions is None else array.positions.rope
         self.rope_dtype = None if rope is None else rope.dtype

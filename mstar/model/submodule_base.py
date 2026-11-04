@@ -14,6 +14,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.engine.resources.lora.config import LoraStep
+from mstar.engine.state.adapters import state_steps
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -879,6 +880,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # This node's handles on its declared state (`mstar.engine.state`), bound once at load.
+        self.state_handles: Mapping[str, Any] = {}
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
         """Receive the engine-built resources for this submodule's node, and
@@ -899,6 +902,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         from mstar.model.components.lora.modules import bind_module_lora
 
         self.lora_keys = bind_module_lora(self, resources)
+
+    def bind_node_state(self, handles: Mapping[str, Any]) -> None:
+        """Receive this node's state handles, by declared name, and pass them to each module with a ``bind_state``:
+        the layers that call them and the submodule itself."""
+        self.state_handles = handles
+        for module in self.modules():
+            bind = getattr(module, "bind_state", None)
+            if bind is not None:
+                bind(handles)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1494,9 +1506,10 @@ def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> Submodule
 def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, with the LoRA
     pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
-    no LoRA step."""
+    no LoRA step, and what it declares about its state expanded (``state_steps``)."""
     # the engine drives duck-typed submodules too
-    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    step = lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    return state_steps(step, getattr(submodule, "state_handles", {}))
 
 
 class ARNodeSubmodule(NodeSubmodule):
@@ -1534,6 +1547,14 @@ class ARNodeSubmodule(NodeSubmodule):
                     f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
                 )
             self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
+
+    def bind_node_state(self, handles: Mapping[str, Any]) -> None:
+        super().bind_node_state(handles)
+        loopback = self.device_loopback
+        sampler = None if loopback is None else handles.get(loopback.sampler)
+        if sampler is not None and sampler.sampler.draws > 1:
+            raise ValueError(f"Sampler {loopback.sampler!r}: a device loop-back reads one token per step, and draws "
+                             f"is {sampler.sampler.draws}")
 
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
