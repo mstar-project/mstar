@@ -617,7 +617,9 @@ The spec types are:
        (``AuxPlanes(num_layers, width)``, DSA's index keys for one): it shares the page
        table, is copied and freed with the pages, and is read and written through
        ``KVManager.aux_view`` and ``write_aux``. CPU offload, a cross-instance KV
-       retrieve and a pool that keeps a window (below) refuse aux planes for now.
+       retrieve and a pool that keeps a window (below) refuse aux planes for now. An eager
+       forward that runs a long step's tokens in windows writes each window at its own
+       slots inside ``KVManager.token_window(start, end)``.
        A pool keeps only a window of the layers a windowed attention over it runs
        (``AttentionConfig.sliding_window``, below); its ``page_size``, ``max_num_pages``
        and ``cpu_offload_pages`` then work as described there.
