@@ -630,6 +630,16 @@ def base_language(code: str) -> str:
     return code.replace("_", "-").split("-")[0].lower()
 
 
+def capture_ladder(key: str, value) -> list[int]:
+    """A capture ladder (token buckets or batch sizes) from model_kwargs: a 0, negative or
+    repeated entry would go into the capture build, and an empty one would quietly mean the
+    default."""
+    if (not isinstance(value, (list, tuple)) or not value or len(set(value)) != len(value)
+            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
+        raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
+    return list(value)
+
+
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
     """Raise unless ``loaded`` names every parameter of ``module``: one built on
     ``meta`` and filled by a loader would otherwise serve uninitialized memory."""

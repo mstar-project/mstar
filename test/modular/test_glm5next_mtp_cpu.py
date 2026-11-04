@@ -528,9 +528,9 @@ def test_long_context_mtp_at_a_real_geometry():
         assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference, drafts
 
 
-def test_long_context_mtp_layer_selects_with_its_own_indexer():
+def test_long_context_mtp_pass_keys_every_prompt_row_on_its_own_plane():
     """The prompt's MTP pass writes every prompt row's index key to the MTP layer's own plane,
-    so its drafts select over the whole context."""
+    which its drafts select over (that they select well shows only as acceptance)."""
     engine, sub, cfg = _build_engine(2, long_context=True)
     attn = sub.language_model.mtp.transformer_layer.self_attn
     assert attn.index_plane == attn.kv_plane

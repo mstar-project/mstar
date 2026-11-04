@@ -21,14 +21,15 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    args = adapter.chat_to_request(req, api.upload_dir)
-    parser = adapter.make_output_parser(req)
-    stops = adapter.stop_strings(req)
-    # checked before the request runs: a raise after submit leaves it running with no reader
+    # checked before the adapter saves any upload, which only the finally below removes,
+    # and before submit, after which a raise leaves the request running with no reader
     stream_options = getattr(req, "stream_options", None) or {}
     if not isinstance(stream_options, dict):
         raise ValueError("stream_options must be an object")
     include_usage = bool(stream_options.get("include_usage"))
+    args = adapter.chat_to_request(req, api.upload_dir)
+    parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 

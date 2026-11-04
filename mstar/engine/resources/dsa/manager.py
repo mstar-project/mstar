@@ -54,6 +54,15 @@ class DSAManager(Resource):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
+    def build_accelerator_graph_buffers(self, slots, max_bs: int, max_seq_len: int) -> None:
+        # a captured step plans its bucket's rows as one sparse plan, which FlashInfer takes up
+        # to sparse_mla.MAX_ROWS; refused here whichever ladder, the model's or the serving
+        # config's, the buckets came from
+        past = sorted({spec.num_tokens for spec in slots if spec.num_tokens > sparse_mla.MAX_ROWS})
+        if past:
+            raise ValueError(f"DSA: captured buckets of {past} tokens pass one sparse plan's "
+                             f"{sparse_mla.MAX_ROWS} rows; cap the node's prefill ladder there")
+
     @property
     def force_double_buffer(self) -> bool:
         # a captured slot's sparse plan is re-planned in preprocess through FlashInfer's

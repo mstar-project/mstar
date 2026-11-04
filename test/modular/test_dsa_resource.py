@@ -83,6 +83,23 @@ def test_a_cache_without_index_planes_is_refused():
 # ---------------------------------------------------------------------------
 
 
+def test_a_capture_past_one_sparse_plan_is_refused_before_it_runs():
+    """A captured step plans its whole bucket as one sparse plan, which FlashInfer faults on
+    past ``MAX_ROWS`` rows: the resource refuses such a bucket when the captures are sized."""
+    from mstar.engine.resources.base import CGSlotSpec
+    from mstar.engine.resources.dsa.sparse_mla import MAX_ROWS
+    from mstar.engine.resources.step import BucketKey
+
+    def specs(*tokens):
+        return [CGSlotSpec(bucket=BucketKey("prefill", 1, n), slot=0, config=None) for n in tokens]
+
+    dsa = _manager()
+    dsa.build_accelerator_graph_buffers(specs(64, MAX_ROWS), max_bs=1, max_seq_len=MAX_ROWS)
+    with pytest.raises(ValueError, match="sparse plan"):
+        dsa.build_accelerator_graph_buffers(specs(64, 2 * MAX_ROWS), max_bs=1,
+                                            max_seq_len=2 * MAX_ROWS)
+
+
 def test_an_eager_prefill_stages_its_rows_and_pages():
     """Each request's new rows and its pages, flat, from the KV plan, as the layers read them."""
     dsa = _manager()

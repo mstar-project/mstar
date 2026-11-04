@@ -33,11 +33,15 @@ def test_a_submodules_recompile_limit_holds_inside_its_calls_only():
     class _Default:  # a submodule that keeps the base hook
         dynamo_recompile_limit = NodeSubmodule.dynamo_recompile_limit
 
+    config = torch._dynamo.config
     seen = []
-    before = torch._dynamo.config.recompile_limit
-    wrapped = with_recompile_limit(lambda: seen.append(torch._dynamo.config.recompile_limit), _Wide())
+    before = (config.recompile_limit, config.accumulated_recompile_limit)
+    wrapped = with_recompile_limit(
+        lambda: seen.append((config.recompile_limit, config.accumulated_recompile_limit)), _Wide())
     wrapped()
-    assert seen == [500] and torch._dynamo.config.recompile_limit == before
+    # past dynamo's per-code-object total too, or the entries over it would run uncompiled
+    assert seen == [(500, 500)]
+    assert (config.recompile_limit, config.accumulated_recompile_limit) == before
 
     def plain():
         return None

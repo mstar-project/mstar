@@ -1045,6 +1045,18 @@ _PNG_URL = "data:image/png;base64," + base64.b64encode(
 ).decode()
 
 
+@pytest.mark.parametrize("model", ["qwen3_5_0.8b", "qwen3_omni"])
+def test_a_chat_refused_for_its_stream_options_leaves_no_upload(client_and_stub, model):
+    """Nothing cleans up after a chat refused before it is submitted."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    r = client.post("/v1/chat/completions", json={"model": model, "stream_options": "yes", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                     {"type": "image_url", "image_url": {"url": _PNG_URL}}]}]})
+    assert r.status_code == 400 and stub.last_submit is None
+    assert list(stub.upload_dir.iterdir()) == []
+
+
 def _wav_b64(seconds=1, rate=16000) -> str:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
