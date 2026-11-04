@@ -774,7 +774,7 @@ class AcceleratorGraphRunner:
         self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
 
         self.max_bs = max(
-            (max(self._batch_sizes(config)) for config in self._capture_configs),
+            (max(self._batch_sizes(config), default=1) for config in self._capture_configs),
             default=1,
         )
 
@@ -783,12 +783,14 @@ class AcceleratorGraphRunner:
         return bool(self._buckets)
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
-        return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        # None defers to the defaults; [] captures nothing, as in the piecewise runner
+        return self.CAPTURE_BATCH_SIZES if config.capture_batch_sizes is None else config.capture_batch_sizes
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
         return max(
-            (max(self._batch_sizes(config)) for config in self._capture_configs if config.capture_graph_walk in walks),
+            (max(self._batch_sizes(config), default=0)
+             for config in self._capture_configs if config.capture_graph_walk in walks),
             default=0,
         )
 
@@ -1438,7 +1440,7 @@ class AcceleratorGraphRunner:
         capped = [
             max(self._batch_sizes(config)) for config in self._capture_configs
             if graph_walk in config.replay_graph_walks
-            and config.caps_eager_batch_size
+            and config.caps_eager_batch_size and self._batch_sizes(config)
         ]
         return max(capped) if capped else None
 

@@ -60,7 +60,8 @@ class AcceleratorGraphConfig(ABC):
         # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
 
-        # Per-config override for the set of batch sizes to capture
+        # Per-config override for the set of batch sizes to capture (None: the
+        # runner's defaults; []: none)
         capture_batch_sizes: list[int] | None = None,
         # Method on the submodule to capture
         capture_forward_method: str = "forward_batched",

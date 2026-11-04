@@ -2023,7 +2023,8 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
   therefore serve several walks, for example ``prefill_audio`` reusing ``prefill_text``.
-- ``capture_batch_sizes`` lists the batch sizes to record.
+- ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
+  default; ``[]`` records none.
 - ``additional_key_info`` is an extra hashable component of the capture bucket key. Use it
   when one walk must be captured more than once because the batch shape alone does not
   identify the capture. Its value must equal both the value returned by the submodule's
@@ -2184,7 +2185,12 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   none, since its replay would address every request's tokens to the first request's
   adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
-  default.
+  default; ``[]`` records none, for an eager-only region (below).
+- ``eager_fallback`` runs a shape with no graph eagerly through ``run`` instead of
+  raising: the runner declares, plans and commits the region's step over the real rows
+  (as a replay declares it, without padding), so the caller has one path for captured
+  and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
+  uses it, with eager-only regions for the shapes it never captures.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.
