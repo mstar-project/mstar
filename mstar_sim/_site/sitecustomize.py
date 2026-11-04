@@ -18,7 +18,6 @@ if os.environ.get("MSTAR_SIM"):
 _here = os.path.dirname(os.path.abspath(__file__))
 for _path in sys.path:
     if _path and os.path.abspath(_path) != _here:
-        _spec = importlib.util.find_spec  # noqa: F841
         _candidate = os.path.join(_path, "sitecustomize.py")
         if os.path.isfile(_candidate):
             _s = importlib.util.spec_from_file_location("_mstar_sim_next_sitecustomize", _candidate)

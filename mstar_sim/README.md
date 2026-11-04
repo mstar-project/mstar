@@ -21,7 +21,7 @@ python -m mstar_sim.checkpoint Qwen/Qwen3.5-27B ~/ckpt/q27
 python -m mstar_sim --gpu h100 -- -m pytest test/modular/test_x.py
 ```
 
-Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_phases`).
+Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_phases`). To run your own code in every process the launcher starts (fault injection, tracing, a per-rank override), put a `sitecustomize.py` on `PYTHONPATH`: the emulator's own `sitecustomize` runs it after installing.
 
 ## How it works
 
@@ -86,6 +86,8 @@ the roofline.
   whose emulation outlasts its device time reads host-bound. A different CPU or a loaded box moves
   host-bound results; device time is unaffected (the report's `device_busy_s` against `wall_s`
   says which bound a run was).
+- `--eager-nodes A,B` runs just those nodes eagerly. Use it for a node whose capture needs a real
+  Triton build.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
   room, so admission paths that depend on it only run with graphs on.
 - A value that was never computed reads as zeros: data-dependent control flow on device values

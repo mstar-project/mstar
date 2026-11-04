@@ -379,6 +379,24 @@ def _noop(*_, **__):
 # ------------------------------------------------------------------ install
 
 
+_TorchGenerator = torch.Generator
+
+
+class Generator(_TorchGenerator):
+    """``torch.Generator``, which on ``cuda:N`` is a CPU generator reporting that
+    device: what it seeds is never computed, but seeding and its state work."""
+
+    def __new__(cls, device="cpu"):
+        dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        gen = _TorchGenerator.__new__(cls, "cpu" if dev.type == "cuda" else dev)
+        gen._sim_device = torch.device("cuda", dev.index or 0) if dev.type == "cuda" else None
+        return gen
+
+    @property
+    def device(self):
+        return self._sim_device or _TorchGenerator.device.__get__(self)
+
+
 def install() -> None:
     """Make ``torch.cuda`` and ``torch.accelerator`` describe the emulated GPU."""
     tc = torch.cuda
@@ -461,6 +479,7 @@ def install() -> None:
         setattr(acc, name, value)
     torch.Stream = Stream
     torch.Event = Event
+    torch.Generator = Generator
     # the C++ binding refuses an emulated stream before any override sees it, and the
     # caching allocator's cross-stream lifetime has nothing to defer here
     torch.Tensor.record_stream = lambda self, stream: None

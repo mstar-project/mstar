@@ -421,8 +421,15 @@ def _build(desc, tensors):
 
 
 def meta_call(func, uargs, ukwargs, tensors):
-    """``func`` over value-less operands, its output shapes cached per signature."""
-    key = _signature(func, uargs, ukwargs, tensors)
+    """``func`` over value-less operands, its output shapes cached per signature.
+
+    Ops whose output aliases an input are not cached: a view rebuilt from the
+    cache would be a new storage (counted again, a different address), and an
+    in-place view op (``transpose_``, inside ``stft``) changes its argument's
+    own shape, which a cache hit would skip. On meta tensors they are cheap."""
+    aliases = (getattr(func, "is_view", False) or func in _VIEWS
+               or torch.Tag.inplace_view in getattr(func, "tags", ()))
+    key = None if aliases else _signature(func, uargs, ukwargs, tensors)
     if key is not None:
         desc = _SHAPES.get(key)
         if desc is not None:
@@ -693,7 +700,7 @@ def _rebuild(data, index):
     return SimTensor(data, index)
 
 
-_PLAIN = {T.to, T.cuda, T.copy_, T.pin_memory, T.is_pinned}
+_PLAIN = {T.to, T.cuda, T.copy_, T.module_load, T.pin_memory, T.is_pinned}
 
 
 def _plain(func, args, kwargs):
@@ -706,6 +713,9 @@ def _plain(func, args, kwargs):
         return _copy_(*args, **kwargs)
     if func is T.copy_ and _is_meta(args[1]) and not _is_meta(args[0]):
         return args[0]  # a header-only weight into a host tensor: keeps its values
+    if func is T.module_load and _is_meta(args[1]) and not _is_meta(args[0]) \
+            and not (kwargs.get("assign") or (len(args) > 2 and args[2])):
+        return args[0].detach()  # the same, through load_state_dict's parameter swap
     if func is T.pin_memory:
         return args[0]
     if func is T.is_pinned:

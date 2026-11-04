@@ -120,10 +120,17 @@ def conv_kernels() -> None:
 
 
 def no_graphs() -> None:
-    """``MSTAR_SIM_NO_GRAPHS=1``: capture nothing, so every step runs the eager
-    forward (module hooks fire, ops can be inspected one by one)."""
-    if os.environ.get("MSTAR_SIM_NO_GRAPHS") != "1":
+    """``MSTAR_SIM_NO_GRAPHS``: ``1`` captures nothing, so every step runs the eager
+    forward (module hooks fire, ops can be inspected one by one); ``A,B`` runs only
+    those graph nodes eagerly (one whose capture needs a real Triton build, say)."""
+    value = os.environ.get("MSTAR_SIM_NO_GRAPHS", "")
+    if not value:
         return
+    nodes = None if value == "1" else set(value.split(","))
+
+    def eager(node) -> bool:
+        return nodes is None or node in nodes
+
     runner = importlib.import_module("mstar.engine.accelerator_graph_runner")
     engine = importlib.import_module("mstar.engine.engine")
     init = runner.AcceleratorGraphRunner.__init__
@@ -131,10 +138,16 @@ def no_graphs() -> None:
     @functools.wraps(init)
     def no_capture(self, *args, **kwargs):
         init(self, *args, **kwargs)
-        _replace(self, "_capture_configs", [])
+        if eager(self._submodule_name):
+            _replace(self, "_capture_configs", [])
 
     runner.AcceleratorGraphRunner.__init__ = no_capture
-    _replace(engine.Engine, "_build_piecewise_runners", lambda self, *args, **kwargs: {})
+    build = engine.Engine._build_piecewise_runners
+
+    def piecewise(self, node_name, *args, **kwargs):
+        return {} if eager(node_name) else build(self, node_name, *args, **kwargs)
+
+    _replace(engine.Engine, "_build_piecewise_runners", piecewise)
 
 
 # ------------------------------------------------------------------- weights

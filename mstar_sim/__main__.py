@@ -28,8 +28,8 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
     env["MSTAR_SIM_MAX_CAPTURE_BATCH"] = str(args.max_capture_batch)
     if args.cost:
         env["MSTAR_SIM_COST"] = args.cost
-    if args.no_graphs:
-        env["MSTAR_SIM_NO_GRAPHS"] = "1"
+    if args.no_graphs or args.eager_nodes:
+        env["MSTAR_SIM_NO_GRAPHS"] = "1" if args.no_graphs else args.eager_nodes
     if args.memory_gb:
         env["MSTAR_SIM_MEMORY_GB"] = str(args.memory_gb)
     if args.profile_db:
@@ -63,6 +63,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-graphs", action="store_true",
                         help="capture no accelerator graphs: every step runs eagerly "
                              "(for debugging: module hooks fire on every forward)")
+    parser.add_argument("--eager-nodes", default=None, metavar="A,B",
+                        help="run only these graph nodes eagerly, capturing the rest (a node "
+                             "whose capture needs a real Triton build)")
     parser.add_argument("--cost", choices=["tables", "roofline"], default=None,
                         help="kernel times: 'tables' (default when the AIConfigurator data is "
                              "found: measured per-GPU tables, roofline for the rest) or 'roofline'")
