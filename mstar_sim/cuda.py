@@ -208,26 +208,29 @@ def _begin_allocate_to_pool(device, mempool_id, *_) -> None:
     its thread), until it ends."""
     from mstar_sim import device as dev
 
-    p = dev.pool(_as_index(device), mempool_id)
-    p.graphs += 1
-    p.recording = threading.get_ident()
+    with dev._track_lock:
+        p = dev.pool(_as_index(device), mempool_id)
+        p.graphs += 1
+        p.recording = threading.get_ident()
 
 
 def _end_allocate_to_pool(device, mempool_id) -> None:
     from mstar_sim import device as dev
 
-    p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
-    if p is None or p.recording is None:
-        raise dev.gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
-    p.recording = None
+    with dev._track_lock:
+        p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+        if p is None or p.recording is None:
+            raise dev.gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
+        p.recording = None
 
 
 def _release_pool(device, mempool_id) -> None:
     from mstar_sim import device as dev
 
-    p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
-    if p is not None:
-        p.graphs -= 1
+    with dev._track_lock:
+        p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+        if p is not None:
+            p.graphs -= 1
 
 
 # ------------------------------------------------------------ streams, events

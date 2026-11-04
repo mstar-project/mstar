@@ -222,14 +222,16 @@ _track_lock = threading.RLock()
 
 def pool(index: int, handle=DEFAULT_POOL) -> Pool:
     key = (index, tuple(handle))
-    found = POOLS.get(key)
-    if found is None:
-        found = POOLS[key] = Pool(*key)
-    return found
+    with _track_lock:
+        found = POOLS.get(key)
+        if found is None:
+            found = POOLS[key] = Pool(*key)
+        return found
 
 
 def reserved(index: int) -> int:
-    return sum(p.reserved for p in POOLS.values() if p.device == index)
+    with _track_lock:
+        return sum(p.reserved for p in POOLS.values() if p.device == index)
 
 
 def release_cached(index: int) -> None:
