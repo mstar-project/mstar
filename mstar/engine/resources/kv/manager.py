@@ -366,12 +366,12 @@ class Dropped(NamedTuple):
 
 class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
-    their own, already given back their leases and allotment to ask again. ``waits`` is set when no move covers
-    the shortage, and the request that ran short asks the pool for it instead."""
+    their own, already given back their leases and allotment to ask again. When no move covers the shortage,
+    ``waits`` is the pages the request that ran short asks the pool for instead, and 0 otherwise."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
-    waits: bool = False
+    waits: int = 0
 
 
 class ShortGrant(NamedTuple):
@@ -4704,7 +4704,7 @@ class KVManager(AttentionResource):
                         self._hosted.add(rid)
                     return Victims([rid], [], []) if to_host else Victims([], [rid], [])
                 self._asks[rid] = short.pages
-                return Victims([], [], [], waits=True)
+                return Victims([], [], [], waits=short.pages)
             freed = self._frees(victims)
             for victim in list(victims):
                 rest = [other for other in victims if other != victim]

@@ -190,7 +190,7 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
 
     waits = _preempt(kv, "r2", _short(kv, "r2"), droppable=lambda rid: True)
-    assert waits == Victims([], [], [], waits=True), "r2 took r1's victim or moved itself"
+    assert waits == Victims([], [], [], waits=1), "r2 took r1's victim or moved itself"
     _runner(kv).readmit("r2", NODE)
     assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], [], []), "r1 chose again"
     _drop(kv, "v")
@@ -286,7 +286,9 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
     drops = then == "drops itself"
-    assert victims == Victims([], ["r"] if drops else [], [], waits=not drops), "r waits only when it can't drop itself"
+    assert victims == Victims([], ["r"] if drops else [], [], waits=0 if drops else 1), (
+        "r waits only when it can't drop itself"
+    )
     assert not kv._earmarks, "nothing newer frees a page"
     if not drops:
         _runner(kv).readmit("r", NODE)
@@ -324,7 +326,7 @@ def test_a_waiting_request_asks_for_the_room_its_grant_counted_too():
     _running(kv, "a", 4, arrival=0)
     _running(kv, "r", 5, arrival=1)
     short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
-    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits == 2, "r asked for less than its grant needs"
     _runner(kv).readmit("r", NODE)
 
     assert not _admitted(kv, "r"), "r was let go into the one free page, though its grant needs two"
