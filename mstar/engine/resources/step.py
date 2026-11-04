@@ -132,8 +132,8 @@ class StepContext:
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
     # the node's idle-capable resources (`Resource.idle_capture`) sit this step
-    # out: an idle lease's, or an eager step none of whose rows carries their
-    # request config. Set by the engine; a piecewise region's step is never idle.
+    # out: an idle lease's, or an eager step `Resource.idle_for` answers True for.
+    # Set by the engine; a piecewise region's step takes its bucket's.
     idle: bool = False
 
     def walk_of(self, rid: int) -> str:
