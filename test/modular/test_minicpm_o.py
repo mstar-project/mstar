@@ -131,6 +131,15 @@ def test_bad_request_knobs_are_refused(knob, value):
         a_bare_model().process_prompt("Hi.", ["text"], ["text"], **{knob: value})
 
 
+def test_min_p_is_served():
+    """Upstream's ``chat`` hands ``min_p`` to HF ``generate``, which honours it."""
+    from mstar.engine.resources import SamplerSpec
+
+    model = a_bare_model(max_seq_len=4096)
+    [spec] = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec)]
+    model.get_request_resource_configs({}, {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
+
+
 # --- with the checkpoint's config and tokenizer ---------------------------
 
 @pytest.fixture(scope="module")

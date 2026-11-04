@@ -180,6 +180,8 @@ class MiniCPMOModel(Model):
             SamplerSpec(
                 resource_key=LLM_SAMPLER, nodes={LLM},
                 vocab_size=llm.vocab_size, enable_repetion_penalty=True,
+                # upstream's `chat` hands min_p to HF `generate`, which honours it
+                enable_min_p=True,
             ),
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={VISION},
