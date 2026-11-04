@@ -1174,7 +1174,6 @@ class Worker:
         # once the api server finished reading the outputs.
         laps = PhaseLaps("worker.msg.remove_request.")
         self._mark_removed(body.request_id)
-        self._settle_side_admit()
         freed = self.engine_manager.remove_request(request_id)
         if freed:
             self.scheduler.lift_batch_caps(freed)
@@ -2546,16 +2545,6 @@ class Worker:
                     "%.0f s; scheduling and teardowns wait for it",
                     self.worker_id, pending.node_name, pending.graph_walk, waited,
                 )
-
-    def _settle_side_admit(self) -> None:
-        """Before a teardown: wait for the side lane's step in flight to admit
-        (``_await_admit_settled``), as the top of a pass does for the chain's.
-        A teardown releases the state that admit reads on the GPU thread, so
-        the step admits against the state between two teardowns, never one
-        half done. The lane launches at the top of a pass, so its admit can
-        still be outstanding at any teardown later in it."""
-        if self._side_steps is not None:
-            self._await_admit_settled(self._side_steps.pending)
 
     def _submit_gpu_step(
         self,

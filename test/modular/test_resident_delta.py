@@ -926,8 +926,6 @@ class _ForwardingLeader:
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
     _mark_removed = Worker._mark_removed
-    _settle_side_admit = Worker._settle_side_admit
-    _side_steps = None
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False

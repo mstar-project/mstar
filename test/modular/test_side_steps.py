@@ -8,7 +8,6 @@ lane filter, and which configs the startup decision refuses.
 from __future__ import annotations
 
 import contextlib
-import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -680,35 +679,6 @@ def test_a_full_pool_keeps_the_row_queued_while_the_chain_runs_on():
     eng.remove_request(1)
 
     assert sorted(_next_batch(sched, codec, lane=SIDE_LANE).request_to_worker_graph) == [2]
-
-
-def _teardown_worker():
-    from test_removed_request_messages import _new
-    from test_removed_request_messages import _worker as _messages_worker
-
-    w = _messages_worker()
-    w._process_message_list([_new("A#1")])
-    return w
-
-
-def test_a_teardown_waits_for_the_side_steps_admit():
-    """The step admits on the GPU thread from the state a teardown releases."""
-    from test_removed_request_messages import _remove
-
-    w = _teardown_worker()
-    admitted = threading.Event()
-    seen = []
-    w.engine_manager.remove_request = lambda rid: seen.append(admitted.is_set())
-    lane = w._side_steps = SideStepLane(w)
-    lane.pending = _step([5], done=False)
-    lane.pending.node_batch.launch_started_event = admitted
-    w._phase_period = 0
-    w._span = lambda *a, **k: contextlib.nullcontext()
-    threading.Timer(0.2, admitted.set).start()
-
-    w._process_message_list([_remove("A#1")])
-
-    assert seen == [True], "the teardown ran while the side step had yet to admit"
 
 
 # ----- the scheduler ---------------------------------------------------------
