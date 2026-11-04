@@ -443,6 +443,30 @@ def test_moe_decode_keeps_the_builtin_table_where_none_has_the_shape(decode_on):
     assert decode._tuning(GPU, DECODE_SHAPE) is decode._H100
 
 
+THINKER = (2048, 128, 768, 8)  # Qwen3-Omni's Thinker experts at TP1: H, E, I, K
+
+
+def test_the_routed_path_takes_its_gpus_shipped_entry_and_keeps_the_builtin_table_elsewhere(monkeypatch):
+    """bf16 experts (``routed_experts``) take their crossover and tiles from the package's
+    moe_decode table for the GPU, the H200's Thinker entry there. Without an entry (an H100,
+    the Talker's shape) the built-in table runs, as before the registry had one."""
+    pytest.importorskip("triton")
+    from mstar.utils.fused_moe import decode
+
+    def on(name):
+        monkeypatch.setattr(registry, "device_key", lambda device: DeviceKey(name, "sm_90"))
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: name)
+        registry.reset_lookups()
+        return lambda shape: decode._tuning(GPU, shape, torch.bfloat16)
+
+    try:
+        assert on("NVIDIA H200")(THINKER) is not decode._UNSCALED
+        assert on("NVIDIA H200")((1024, 128, 384, 8)) is decode._UNSCALED  # the Talker's
+        assert on("NVIDIA H100 80GB HBM3")(THINKER) is decode._UNSCALED
+    finally:
+        decode._TUNINGS.clear()
+
+
 def test_the_routed_paths_lookup_is_a_constant_to_dynamo(decode_on, on_gpu):
     """The routed path decides and launches inside compiled forwards (dynamic=False for a
     captured bucket, dynamic=None for an eager one): the table lookup, the fit check and the
