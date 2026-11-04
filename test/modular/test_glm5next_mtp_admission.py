@@ -46,3 +46,10 @@ def test_shipped_configs_admit_one_request_per_kda_slot(name):
 
     cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
     assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
+
+
+@pytest.mark.parametrize("k", [-1, -3])
+def test_a_negative_draft_count_is_refused(k):
+    # -1 would size the cache at zero rows and fail building the graph; -3 would serve unnoticed
+    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
+        Glm5NextModel("x", tokenizer_mode="byte", mtp_num_draft_tokens=k)

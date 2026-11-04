@@ -1,7 +1,10 @@
 """The shared KDA layer on CPU: through the KDA resource it computes what its dense reference
-does, for both output gates, and TP ranks loaded from one checkpoint sum to the full layer.
+does, for both output gates, and TP ranks loaded from one checkpoint, each through its own
+sharded pool, sum to the full layer.
 """
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -46,23 +49,28 @@ def _randomize(layer: torch.nn.Module) -> None:
                 p.normal_(0.0, 0.1)
 
 
-def _resources(cfg: KDAConfig):
+def _resources(cfg: KDAConfig, tp: int = 1, speculative_tokens: int = 0):
+    """The layer's pool and KDA resource, sharded over ``tp`` ranks as the engine builds them."""
     geometry = DeltaNetGeometry(
         num_k_heads=cfg.num_heads, num_v_heads=cfg.num_heads, head_k_dim=cfg.head_dim,
         head_v_dim=cfg.head_dim, conv_kernel_size=cfg.conv_kernel_size,
     )
     pool_spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
-        num_layers=2, blocks=geometry.to_blocks(conv_dtype=torch.float64), max_slots=4,
+        num_layers=2, max_slots=4,
+        blocks=geometry.to_blocks(conv_dtype=torch.float64, speculative_tokens=speculative_tokens),
     ))
     kda_spec = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
     ))
-    pool = build_resource(pool_spec, EngineResourceInfo(device=CPU))
-    kda = build_resource(kda_spec, EngineResourceInfo(device=CPU, dependencies={POOL: pool_spec}))
+    group = SimpleNamespace(world_size=tp) if tp > 1 else None
+    pool = build_resource(pool_spec, EngineResourceInfo(device=CPU, joint_comm_group=group))
+    kda = build_resource(kda_spec, EngineResourceInfo(
+        device=CPU, joint_comm_group=group, dependencies={POOL: pool_spec},
+    ))
     return pool, kda
 
 
-def _step(pool, kda, spans: dict[str, int], walk: str):
+def _step(pool, kda, spans: dict[str, int], walk: str, speculative: bool = False):
     segments = tuple(Segment(rid, "main", n) for rid, n in spans.items())
     for rid in spans:
         if rid not in pool._slots:  # once per request, as the worker does (#725)
@@ -71,7 +79,7 @@ def _step(pool, kda, spans: dict[str, int], walk: str):
     pool_step = RecurrentStep(segments=segments)
     assert pool.admit(pool_step, ctx).ok
     ctx.plan_results[POOL] = pool.plan(pool_step, ctx)
-    kda.plan(LinearAttnStep(segments=segments), ctx)
+    kda.plan(LinearAttnStep(segments=segments, speculative=speculative), ctx)
     return pool_step, ctx
 
 
@@ -120,6 +128,9 @@ class _FakeGroup:
     def all_reduce(self, x):
         return x
 
+    def all_reduce_buffer(self, shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
 
 def _checkpoint(full: KimiDeltaAttention) -> dict[str, tuple[torch.Tensor, str | None]]:
     """The full layer's tensors under the module's names; the conv as the checkpoints store
@@ -130,27 +141,51 @@ def _checkpoint(full: KimiDeltaAttention) -> dict[str, tuple[torch.Tensor, str |
     return {**ckpt, **{f"conv1d.weight/{s}": (t.clone(), s) for s, t in zip("qkv", taps, strict=True)}}
 
 
+def _serve(layer, pool, kda, steps) -> list[torch.Tensor]:
+    """``steps`` through the layer and its resources: (spans, walk, input, accepted drafts
+    for a verify step or None)."""
+    layer.bind_resources({POOL: pool, KDA: kda})
+    outs = []
+    for spans, walk, x, accepted in steps:
+        verify = accepted is not None
+        pool_step, ctx = _step(pool, kda, spans, walk, speculative=verify)
+        outs.append(layer(x, 1))
+        if verify:
+            layer.mix.set_prefix_len(accepted)
+            kda.commit(LinearAttnStep(segments=pool_step.segments, speculative=True), ctx)
+        pool.commit(pool_step, ctx)
+    return outs
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("full_rank", [False, True], ids=["low_rank_gate", "full_rank_gate"])
 def test_tensor_parallel_ranks_sum_to_the_full_layer(full_rank):
+    """Each rank serves its heads from its own sharded pool, speculative blocks included, and
+    the ranks' o_proj partials sum to the unsharded layer's output at every step."""
     torch.manual_seed(1)
-    cfg = _config(full_rank, heads=4)
-    full = KimiDeltaAttention(cfg, dtype=torch.float64)
+    cfg, k, tp = _config(full_rank, heads=4), 2, 2
+    full = ParallelKimiDeltaAttention(cfg, dtype=torch.float64)
     _randomize(full)
     ckpt = _checkpoint(full)
-    x = torch.randn(1, 9, cfg.hidden_size, dtype=torch.float64)
-    want, _, _ = full.prefill(x, *full.init_state(1))
-    tp, total = 2, torch.zeros_like(want)
+    full.process_weights_after_loading("cpu")
+    x = lambda n: torch.randn(n, cfg.hidden_size, dtype=torch.float64)  # noqa: E731
+    steps = [({"a": 5, "b": 70}, "prefill", x(75), None), ({"a": 1, "b": 1}, "decode", x(2), None)]
+    steps += [({"a": k + 1, "b": k + 1}, "decode", x(2 * (k + 1)), torch.tensor(accepted))
+              for accepted in ([1, 0], [2, 2], [0, 1])]
+    want = _serve(full, *_resources(cfg, speculative_tokens=k), steps)
+    total = [torch.zeros_like(w) for w in want]
     for rank in range(tp):
         layer = ParallelKimiDeltaAttention(cfg, comm_group=_FakeGroup(rank, tp), dtype=torch.float64)
         params = dict(layer.named_parameters())
         for key, (tensor, shard) in ckpt.items():
             param = params[key.split("/")[0]]
             loader = getattr(param, "weight_loader", None)
-            if loader is None:  # the head dim's norm weight: replicated
+            if loader is None:  # the head dim's weights: replicated
                 param.copy_(tensor)
             else:
                 loader(param, tensor, shard)
-        out, _, _ = layer.prefill(x, *layer.init_state(1))
-        total += out
-    torch.testing.assert_close(total, want, atol=1e-10, rtol=1e-8)
+        layer.process_weights_after_loading("cpu")
+        for out, partial in zip(total, _serve(layer, *_resources(cfg, tp, k), steps), strict=True):
+            out += partial
+    for i, (got, w) in enumerate(zip(total, want, strict=True)):
+        torch.testing.assert_close(got, w, atol=1e-10, rtol=1e-8, msg=lambda m, i=i: f"step {i}: {m}")
