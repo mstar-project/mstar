@@ -24,6 +24,15 @@ def _warn_ragged_dense_fallback(reason: str, fallback: RaggedAttnBackend) -> Non
     )
 
 
+@functools.cache
+def _warn_dense_on_flashinfer(what: str, reason: str) -> None:
+    logger.warning(
+        "%s backend 'dense' requested, but no varlen kernel is available (%s); "
+        "running it on FlashInfer's ragged prefill instead.",
+        what, reason,
+    )
+
+
 class DenseRaggedManager(_RaggedSelfManagerBase):
     wrapper_class = DenseRaggedPrefillWrapper
 

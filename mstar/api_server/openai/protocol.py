@@ -141,6 +141,8 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "mstar"
+    # a LoRA adapter's base model; None (and left out of the JSON) for the base itself
+    parent: str | None = None
 
 
 class ModelList(BaseModel):

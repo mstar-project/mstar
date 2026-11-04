@@ -94,6 +94,8 @@ class WorkerProfileInfo:
                 forward_time=fwd_end - fwd_start,
                 preprocess_time=fwd_start - start,
                 postprocess_time=end_time - fwd_end,
+                first_start=start,
+                last_end=end_time,
             )
             rid_timings = self.per_rid_graph_timings.setdefault(rid, {})
             if (node, walk) in rid_timings:

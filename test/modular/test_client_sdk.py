@@ -98,6 +98,7 @@ def test_stream_without_content_type_charset():
             r"Server stream failed \(status 500\): capture failed",
         ),
         ({"error": "bridge failed"}, "Server stream failed: bridge failed"),
+        ({"error": "bridge failed", "status": 503}, r"Server stream failed \(status 503\): bridge failed"),
     ],
 )
 def test_stream_raises_in_band_server_errors(payload, message):
@@ -113,6 +114,25 @@ def test_stream_raises_in_band_server_errors(payload, message):
     with mock.patch.object(client._session, "post", return_value=ctx):
         with pytest.raises(RuntimeError, match=message):
             list(client._stream("http://x/generate", {}, None))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_refused_request_raises_http_error_with_the_server_message(stream):
+    requests = pytest.importorskip("requests")
+    resp = requests.Response()
+    resp.status_code = 400
+    resp.reason = "Bad Request"
+    resp.headers["Content-Type"] = "application/json"
+    resp.raw = io.BytesIO(json.dumps({"detail": "top_p must be in (0, 1]"}).encode())
+
+    client = MStarClient("http://x")
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(client._session, "post", return_value=ctx if stream else resp):
+        with pytest.raises(requests.HTTPError, match=r"400 Bad Request: top_p must be") as e:
+            result = client.generate(text="hi", stream=stream, top_p=0)
+            list(result)
+    assert e.value.response is resp
 
 
 @pytest.mark.parametrize("modality", ["action", "scalar", "tensor", "video"])

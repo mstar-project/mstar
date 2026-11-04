@@ -38,11 +38,11 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
+    TokenStop,
 )
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +66,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__()
+        super().__init__(config.prefill_token_buckets)
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # the step's row ends, in one pinned H2D
-        self._index_stager = PinnedStager(torch.long)
-        # Per request, in its request_state: "ended_at_prefill", the prefill sampled a stop
-        # token: the prefill walk has no loop to stop, so the first decode step stops
-        # decode_loop and emits nothing.
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.eos_token_ids),
+            sampler=SAMPLER_RESOURCE, prefill_walks=frozenset({"prefill"}),
+        )
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -196,7 +195,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return []
         if self._moe_capture_blocked(tp_world_size):
             return []
-        prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
@@ -213,7 +211,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             _PackedPrefillConfig(
                 max_row_tokens=self._context_limit(),
                 capture_graph_walk="prefill",
-                capture_token_lengths=list(prefill_buckets),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
                     input_seq_len=n,
@@ -289,7 +287,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 )
         # pinned staging: a pageable torch.tensor(..., device=cuda) here
         # drains the stream before the step even starts
-        seq_len_t = self._index_stager.to_device(seq_lens, self.get_device())
+        seq_len_t = to_device_nonblocking(seq_lens, self.get_device(), dtype=torch.long)
         return {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
             # eager prefill: the last row per request, when no plan buffer
@@ -375,61 +373,3 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-        if self.request_state(request_id).get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        token = outputs["new_token"][0].item() if "new_token" in outputs else None
-        return self._stops(request_id, request_info, token)
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist`` of the step's tokens."""
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
-            loops = self._stops(rid, request_infos[rid], values[i])
-            if loops:
-                stops[rid] = loops
-        return stops
-
-    def _stops(
-        self, request_id: str, request_info: CurrentForwardPassInfo, token: int | None,
-    ) -> set[str]:
-        """The loops the request's new ``token`` stops; None when the step emitted none."""
-        state = self.request_state(request_id)
-        if state.get("ended_at_prefill"):
-            return {"decode_loop"}
-        if token is None:
-            return set()
-        ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
-        is_eos = token in self.config.eos_token_ids
-        if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
-        # max_tokens counts the token the prefill emits, so the total is
-        # 1 + (iters + 1) decode tokens
-        generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()

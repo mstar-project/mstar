@@ -32,7 +32,7 @@ jobs:
   cpu-tests:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +57,11 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -96,6 +101,14 @@ jobs:
           # Its metadata pins transformers==4.57.3 and packages mstar never
           # imports, so it goes in without them, after pip check.
           python -m pip install --no-deps "qwen-tts==0.1.1"
+      - name: Build and install the extension
+        env:
+          # maturin develop wants a virtualenv; setup-python's interpreter is
+          # the one the tests run on.
+          VIRTUAL_ENV: ${{ env.pythonLocation }}
+        run: |
+          python -m pip install maturin
+          maturin develop --release -m rust/Cargo.toml
       - name: Run CPU tests
         env:
           HF_HUB_OFFLINE: "1"
@@ -135,8 +148,8 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: pytest test/modular/test_dynamo_bridges.py test/modular/test_dynamo_registration_smoke.py -v
-  # Vendored Rust transport (rust/): cargo tests, then the pyzmq interop
-  # pytest against a freshly built extension.
+  # Vendored Rust transport (rust/): cargo tests, then pytest test/rust
+  # against a freshly built extension.
   rust-transport:
     runs-on: ubuntu-latest
     steps:
@@ -178,7 +191,7 @@ jobs:
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
           # parity cases run the Python app through fastapi's TestClient
-          pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml prometheus-client \
+          pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
             fastapi uvicorn python-multipart httpx
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
