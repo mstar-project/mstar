@@ -191,6 +191,7 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         table_ids, wide = torch.arange(50, device="cuda"), torch.tensor([200, 10], device="cuda")
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             table_ids[(wide - 50).clamp_(0, 49)]
+            torch._assert(wide.max() < 1000, "a check torch.compile leaves out of a capture on a GPU")
             # so are synchronous copies from host memory: a blocking H2D copy, a tensor from host data
             for sync in (lambda: torch.nonzero(ids), lambda: ids.copy_(torch.tensor([1, 2])),
                          lambda: torch.tensor([1, 2], device="cuda"), lambda: torch.tensor([1, 2]).cuda()):

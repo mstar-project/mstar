@@ -805,6 +805,8 @@ def _function_body(func, args, kwargs):
         # attribute getters (device, shape, dtype, data, ...) read the wrapper itself
         with torch._C.DisableTorchFunctionSubclass():
             return func(*args, **kwargs)
+    if func is torch._assert and clock.capturing() is not None:
+        return None  # torch.compile drops it from a captured region; here that region runs eagerly
     if func in _HOST_READS:
         host_wait()
     if func in _HOST_VALUED:
