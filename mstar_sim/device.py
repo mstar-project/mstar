@@ -599,6 +599,9 @@ def _function_body(func, args, kwargs):
             return func(*args, **kwargs)
     if func in _HOST_READS:
         host_wait()
+    if func in _HOST_VALUED:
+        host_wait()
+        return func(*tree_map(_host_arg, args), **tree_map(_host_arg, kwargs))
     device = kwargs.get("device")
     if device is not None and not is_cuda_device(device) and not isinstance(device, int):
         # a host allocation shaped like a cuda tensor (``zeros_like(x, device="cpu")``)
@@ -728,6 +731,7 @@ _METHODS = {
     T.tolist: _host_read("tolist"),
     T.numpy: _host_read("numpy"),
     T.item: _host_read("item"),
+    T.__format__: _host_read("__format__"),
     T.__bool__: _host_read("__bool__"),
     T.__int__: _host_read("__int__"),
     T.__float__: _host_read("__float__"),
@@ -743,9 +747,19 @@ _METHODS = {
     torch._has_compatible_shallow_copy_type: lambda a, b: type(a) is type(b),
 }
 _HOST_READS = {torch.equal}
+# functions that answer the host with a Python value: computed on the host values
+# (zeros for what was never computed), since a meta tensor has none
+_HOST_VALUED = {torch.equal, T.equal, torch.allclose, T.allclose}
+_READS = {T.tolist, T.item, T.numpy, T.__bool__, T.__int__, T.__float__, T.__index__, T.__format__}
 # copies, indexing, and load_state_dict(assign=True) into a module built on the CPU
 _MIXED_OK = {T.copy_, torch.Tensor.__getitem__, torch.Tensor.__setitem__, T.index_put_,
              torch.index_put, T.to, T.__getitem__, T.module_load}
+
+
+def _host_arg(x):
+    if isinstance(x, SimTensor):
+        return host_value(x._data)
+    return host_value(x) if _is_meta(x) else x
 
 
 def _rebuild(data, index):
@@ -819,6 +833,8 @@ class SimMode(TorchFunctionMode):
         if func in _PASSTHROUGH or any(type(a) is SimTensor for a in _shallow(args, kwargs)):
             # a call over cuda tensors: SimTensor handles it, devices included
             return _emulated(func, args, kwargs)
+        if args and _is_meta(args[0]) and (func in _READS or func in _HOST_VALUED):
+            return func(*tree_map(_host_arg, args), **tree_map(_host_arg, kwargs))
         if func in _PLAIN:
             out = _emulated(_plain, (func, args, kwargs), {})
             if out is not NotImplemented:
@@ -829,6 +845,11 @@ class SimMode(TorchFunctionMode):
             shape = func(*args, **dict(kwargs, device=META))
             if isinstance(shape, T) and shape.is_floating_point() and shape.numel() >= CPU_META_FLOATS:
                 return shape  # e.g. a weight of a model built on the CPU
+        tensors = [t for t in _shallow(args, kwargs) if isinstance(t, T)]
+        if any(t.device.type == "meta" for t in tensors) and any(t.device.type == "cpu" for t in tensors):
+            # host work mixing a never-computed value (a header-only weight) with real data:
+            # the value reads as zeros, as any host read of it does
+            return func(*tree_map(_host_arg, args), **tree_map(_host_arg, kwargs))
         return func(*args, **kwargs)
 
 

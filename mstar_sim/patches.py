@@ -185,8 +185,28 @@ def _header(path) -> dict:
     return header
 
 
+# tensors this small are read for real (a LoRA alpha, a norm, a test's fixture):
+# cheap, and host code reads their values; only weights this large go value-less
+SMALL_WEIGHT = 1 << 16
+
+
+def _small(info: dict) -> bool:
+    n = 1
+    for d in info["shape"]:
+        n *= d
+    return n < SMALL_WEIGHT
+
+
 def _meta(info: dict) -> torch.Tensor:
     return torch.empty(info["shape"], dtype=_DTYPES.get(info["dtype"], torch.uint8), device="meta")
+
+
+def _read(path, name):
+    with _real_safe_open(path, framework="pt") as f:
+        return f.get_tensor(name)
+
+
+_real_safe_open = None
 
 
 class _MetaSlice:
@@ -207,6 +227,7 @@ class _MetaSafeOpen:
     """``safetensors.safe_open`` over a file's header only: tensors are meta."""
 
     def __init__(self, path, framework="pt", device="cpu"):
+        self._path = path
         self._header = _header(path)
 
     def __enter__(self):
@@ -225,28 +246,36 @@ class _MetaSafeOpen:
         return {}
 
     def get_tensor(self, name):
-        return _meta(self._header[name])
+        info = self._header[name]
+        return _read(self._path, name) if _small(info) else _meta(info)
 
     def get_slice(self, name):
         return _MetaSlice(self._header[name])
 
 
 def header_only_weights() -> None:
-    """Weights are read from safetensors headers only: every tensor is meta,
-    no byte of weight data is read, and a checkpoint of sparse files will do."""
+    """Weights are read from safetensors headers only: every tensor above
+    ``SMALL_WEIGHT`` elements is meta, so no large weight is read and a
+    checkpoint of sparse files will do (its small tensors read as zeros)."""
     import safetensors
     import safetensors.torch
 
+    global _real_safe_open
+    _real_safe_open = _real_safe_open or safetensors.safe_open
     iterators = importlib.import_module("mstar.model.loader.iterators")
     _replace(iterators, "safe_open", _MetaSafeOpen)  # mstar's own target first: none or all apply
     safetensors.safe_open = _MetaSafeOpen
     safetensors.torch.safe_open = _MetaSafeOpen
     safetensors.torch.load_file = lambda path, device="cpu": {
-        k: _meta(v) for k, v in _header(path).items()
+        k: _read(path, k) if _small(v) else _meta(v) for k, v in _header(path).items()
     }
+
+    real_read = iterators._read_tensor
 
     def read_tensor(fd, rd):
         shape = rd.shape
+        if rd.nbytes < SMALL_WEIGHT * rd.dtype.itemsize:
+            return real_read(fd, rd)
         if rd.narrow is not None:
             dim, start, stop = rd.narrow
             shape = shape[:dim] + (stop - start,) + shape[dim + 1:]
