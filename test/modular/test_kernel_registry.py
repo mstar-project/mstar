@@ -394,6 +394,21 @@ def test_shipped_tables_are_well_formed(path):
             assert set(tuning.router or ()) == ({"bk", "splits", "warps"} if fp8 else set())
 
 
+
+def test_the_moe_decode_sweep_refuses_bf16_experts_and_a_bf16_miss_names_no_sweep(fake_moe_decode_sweep, on_gpu):
+    """moe_decode's sweep times the fp8 kernels only, so a bf16 entry is measured end to end: a bf16
+    miss names no sweep command to run, and the sweep refuses bf16 rather than write rows for it."""
+    from benchmark.kernels import sweep as sweep_mod
+
+    _, written, decode = fake_moe_decode_sweep
+    shape = {"H": 64, "E": 8, "I": 32, "K": 2}
+    assert decode.MOE_DECODE.sweep_command(torch.bfloat16, shape) is None
+    assert decode.MOE_DECODE.sweep_command(torch.float8_e4m3fn, shape) is not None
+    with pytest.raises(SystemExit, match="end to end"):
+        sweep_mod.sweep("moe_decode", shape, torch.bfloat16, [1], quick=True, note=None,
+                        out_dir=on_gpu / "out", report=[], min_gain=0.02)
+    assert not written.exists()
+
 # --- moe_decode: fused_moe.decode's tiles from the registry, the built-in table otherwise -----
 
 DECODE_SHAPE = (6144, 256, 256, 8)  # GLM-5.2-FP8's experts at TP8: H, E, I, K
