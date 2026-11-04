@@ -261,6 +261,7 @@ def _engine_with(pool, captured_keys, model_key="cfg"):
     engine._submodules = {"LLM": SimpleNamespace(
         submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
         accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
+        resident=None,
     )}
     return engine, asked
 
@@ -300,6 +301,7 @@ def test_the_declaration_check_still_compares_the_nodes_own_key():
 
     engine = object.__new__(Engine)
     engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
+    engine._pre_plan_done = {}
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, LoraBaseOnly("cfg")))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)

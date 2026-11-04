@@ -130,8 +130,8 @@ def test_image_prompt_matches_transformers(tmp_path):
             mm_token_type_ids=(ids == IMAGE).long()[None], pixel_values=pixels,
             image_grid_thw=torch.tensor(grids), use_cache=False, output_hidden_states=True,
         ).hidden_states[TAP]
-        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, 2, torch.device("cpu"))
-        merged, deepstack = vision(pixels, indices, weights, vision_position_ids(grids, 2, torch.device("cpu")))
+        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, 2)
+        merged, deepstack = vision(pixels, indices, weights, vision_position_ids(grids, 2))
         text_cfg = reference.config.text_config
         prompt = qwen3_vl_prompt(
             ids, IMAGE, grids, 2, merged, deepstack, encoder.embed_tokens,

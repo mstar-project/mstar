@@ -61,6 +61,7 @@ from mstar.model.minimax_h3.config import (
 )
 from mstar.model.minimax_h3.schedule import H3Schedule, h3_schedule, h3_step
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +175,12 @@ class H3TextEncoderSubmodule(NodeSubmodule):
         vision, device = self.vision, ids.device
         merge = vision.config.spatial_merge_size
         self._frames.lengths = vision_seq_lengths(grids)
-        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, merge, device)
-        merged, deepstack = vision(pixels, indices, weights, vision_position_ids(grids, merge, device))
+        indices, weights = vision_interpolation(grids, vision.config.num_grid_per_side, merge)
+        positions = vision_position_ids(grids, merge)
+        merged, deepstack = vision(
+            pixels, to_device_nonblocking(indices, device), to_device_nonblocking(weights, device),
+            to_device_nonblocking(positions, device),
+        )
         prompt = qwen3_vl_prompt(
             ids, self.h3_config.image_token_id, grids, merge, merged, deepstack, self.encoder.embed_tokens,
             self.mrope_inv_freq, list(self.h3_config.mrope_section),

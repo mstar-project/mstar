@@ -5,6 +5,7 @@ wrong values (72: max |diff| 2.25 against a torch reference where 128 gives
 import pytest
 import torch
 
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FLASHINFER_HEAD_DIMS,
     FlashInferDecodeWrapper,
@@ -29,7 +30,10 @@ def test_other_head_dims_are_refused_with_padding_advice(head_dim):
 @pytest.mark.parametrize("cls", [FlashInferPrefillWrapper, FlashInferDecodeWrapper])
 def test_wrappers_refuse_before_touching_flashinfer(cls):
     with pytest.raises(ValueError, match="head_dim 72"):
-        cls(workspace_buffer=torch.empty(0), num_qo_heads=16, num_kv_heads=16, head_dim=72, page_size=16, device=_CUDA)
+        cls(
+            workspace_buffer=Workspace(torch.empty(0), "test"), num_qo_heads=16, num_kv_heads=16, head_dim=72,
+            page_size=16, device=_CUDA,
+        )
 
 
 def test_non_cuda_devices_are_not_checked():

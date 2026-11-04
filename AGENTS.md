@@ -77,7 +77,7 @@ If a change is globally beneficial, it should be extensively tested on other mod
 
 ### 5. There is one graph runtime, and it is in `rust/`
 
-A behavior change to the graph runtime, the wire format, or edge semantics lands in `rust/` with a `test/rust` case, which the CI `rust-transport` job runs. `mstar/graph/runtime/rust.py` is the wrapper; `mstar/graph/runtime/base.py` is the interface.
+A behavior change to the graph runtime, the wire format, or edge semantics lands in `rust/` with a `test/rust` case, which the CI `rust-transport` job runs. `mstar/graph/runtime/rust.py` is the wrapper; `mstar/graph/runtime/base.py` is the interface. The control mesh has one transport too, the extension's ZeroMQ one, which `mstar/communication/rust_communicator.py` wraps.
 
 ### 6. Be careful about CPU overhead
 
@@ -194,7 +194,7 @@ pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
-The CPU suites build a graph runtime, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
+The CPU suites build a graph runtime and the Rust communicator, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
 
 The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 

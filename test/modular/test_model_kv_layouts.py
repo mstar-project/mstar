@@ -245,11 +245,17 @@ def test_bagel_runs_a_walk_for_each_span_of_its_layout(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen", "fish_s2_pro"])
 def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
     """The prefill emits the first of max_output_tokens, so the decode loop's
     cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
     ends at the prefill."""
+    if model_name == "fish_s2_pro":
+        from test_fish_s2_pro_model import tiny_ar, tiny_model
+
+        caps = tiny_model().get_loop_caps(max_output_tokens=max_tokens)
+        assert caps[tiny_ar().token_stop.loop] == max(1, max_tokens - 1)
+        return
     if model_name == "canary":
         from mstar.model.canary.canary_model import CanaryModel
 
@@ -394,25 +400,6 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert [span.scratch for span in laid_out.spans[1:]] == [plan.units * per_unit for plan in schedule.windows()]
         assert laid_out.scratch == 0, f"{label}'s denoise is counted on top of its last window"
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_fish_s2_pro_model import tiny_ar, tiny_model
-
-    ar = tiny_ar()
-    outputs = {"new_token": [torch.tensor([4])]}
-    ar.request_state("r").add("generated_frames", 0)
-    ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
-    ar.check_stop("r", prefill, outputs)
-
-    cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-
-    assert cap == _stops_after(
-        ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("clone", [False, True])

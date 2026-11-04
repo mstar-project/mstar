@@ -139,7 +139,7 @@ def _scribble(mgr: KVManager) -> None:
 
 
 def _assert_pages_conserved(mgr: KVManager) -> None:
-    free = list(mgr._arena.allocator.free_pages.queue)
+    free = mgr._arena.free_pages()
     held = [
         page
         for streams in mgr._streams.values()

@@ -24,7 +24,11 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    ExactOps,
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
@@ -44,6 +48,7 @@ from mstar.model.components.diffusion.image_io import (
 )
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
@@ -148,12 +153,16 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
+        bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
+        # A low-precision transformer's bf16 twin, for the steps a schedule runs in bf16.
+        self.bf16_transformer = bf16_transformer
         self.config = config
         self.rope = MultiAxisRoPE(config.transformer.rope_theta, config.transformer.axes_dims_rope)
         self._compiled_shapes: set[tuple] = set()
@@ -161,9 +170,12 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            compile_transformer_forward(
-                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-            )
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                    )
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
@@ -224,7 +236,8 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        velocity = self.transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
         velocity = velocity[:, : latents.shape[1]]
         return euler_step(latents, velocity, sigma, sigma_next)
 
@@ -254,10 +267,11 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
-        # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
-        # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
-        # the compiled decode is not launch-bound (measured), so the node declares no captures.
+        # torch.compile (max-autotune, no cudagraphs) took the 1024^2 decode from 89 to 29 ms on an
+        # H100, moving the image by <= 5.6e-2 in [-1, 1] (~56 dB), before the folded upsample and the
+        # split GroupNorm (compile_vae_decode). Not bit-exact, so it is a deployment knob and stays off
+        # for the bit-exact parity path. CUDA graphs would add nothing: the compiled decode is not
+        # launch-bound (measured), so the node declares no captures.
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         # compiled: only these batch sizes are ever decoded (larger batches are split into them)
