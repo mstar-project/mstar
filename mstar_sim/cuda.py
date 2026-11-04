@@ -146,11 +146,13 @@ def reset_peak_memory_stats(device=None) -> None:
 
 
 def empty_cache() -> None:
+    _check_fault()
     for index in range(device_count()):
         memory.release_cached(index)
 
 
 def mem_get_info(device=None) -> tuple[int, int]:
+    _check_fault()
     total = spec().total
     return total - memory_reserved(device), total
 
@@ -234,10 +236,12 @@ class Stream:
         _STREAMS[self.stream_id] = self
 
     def wait_event(self, event: Event) -> None:
+        _check_fault()
         if event is not None and event.t is not None:
             self.timeline.free_at = max(self.timeline.free_at, event.t)
 
     def wait_stream(self, stream: Stream) -> None:
+        _check_fault()
         self.timeline.free_at = max(self.timeline.free_at, stream.timeline.free_at)
 
     def record_event(self, event: Event | None = None) -> Event:
@@ -364,8 +368,6 @@ def _check_fault() -> None:
     device.check_fault()
 
 
-
-
 def _all_streams():
     return list(_STREAMS.values())
 
@@ -402,6 +404,7 @@ class CUDAGraph:
         self._holds_pool = False
 
     def capture_begin(self, pool=None, capture_error_mode: str = "global"):
+        _check_fault()
         self._pool = tuple(pool) if pool is not None else graph_pool_handle()
         self._device = current_device()
         _begin_allocate_to_pool(self._device, self._pool)

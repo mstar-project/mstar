@@ -750,6 +750,10 @@ def _is_view_index(index) -> bool:
     return not any(isinstance(i, torch.Tensor) or type(i) in (list, bool) for i in items)
 
 
+def _is_view(func, args) -> bool:
+    return func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
+
+
 def _fast(func, args, kwargs, flat, index):
     """``func`` as one kernel (or none): run on shapes, price by its traffic."""
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
@@ -770,8 +774,7 @@ def _fast(func, args, kwargs, flat, index):
         if func in _UNINITIALIZED:
             raw.zero_()
             set_never_computed(raw)
-    view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
-    if not view and func not in _UNINITIALIZED and not clock.FAST:
+    if not _is_view(func, args) and func not in _UNINITIALIZED and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
         key = (func, tuple((t.shape, t.dtype) for t in tensors), tuple((o.shape, o.dtype) for o in outs))
         seconds = _FAST_COST.get(key)
@@ -837,7 +840,8 @@ def _custom_impl(func):
 
 
 def _function(func, args, kwargs):
-    check_fault()
+    if not _no_cuda_call(func, args):
+        check_fault()
     if clock.FAST:
         return _function_body(func, args, kwargs)
     # the interposer's own time is not the host's: the device stamps exclude it
@@ -846,6 +850,11 @@ def _function(func, args, kwargs):
         return _function_body(func, args, kwargs)
     finally:
         clock.compute_end(token)
+
+
+def _no_cuda_call(func, args) -> bool:
+    """A view, a getter or an address: answered on the host, so a faulted device can't fail it."""
+    return func is T.data_ptr or getattr(func, "__name__", "") == "__get__" or _is_view(func, args)
 
 
 def _function_body(func, args, kwargs):
@@ -993,6 +1002,7 @@ def _to(self, *args, **kwargs):
             return value.to(copy=True, **{k: v for k, v in opts.items() if k != "copy"})
         return self._data.to(device, **opts)
     if is_cuda_device(device):
+        check_fault()
         if self.device.type not in ("cpu", "meta"):
             raise RuntimeError(f"mstar_sim: can't move a {self.device} tensor to cuda")
         if not non_blocking:
@@ -1064,6 +1074,7 @@ def _copy_(self, src, non_blocking=False):
             return self
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
+    check_fault()
     _d2h(src)
     if not non_blocking:
         host_wait()
@@ -1145,7 +1156,6 @@ def _plain(func, args, kwargs):
 
 def _emulated(fn, args, kwargs):
     """Emulator work: the host's own time stops at this call."""
-    check_fault()
     if clock.FAST:
         return fn(*args, **kwargs)
     depth = clock.compute_begin()
@@ -1156,7 +1166,8 @@ def _emulated(fn, args, kwargs):
 
 
 def _create(func, args, kwargs, device):
-    """A factory call on the cuda device: meta unless small ints."""
+    """A factory call on the cuda device: meta unless small (:func:`keeps_values`)."""
+    check_fault()
     index = _index(device)
     target = CPU
     from_host = func in (torch.tensor, torch.as_tensor, torch.from_numpy)

@@ -391,12 +391,16 @@ def test_device_side_assert_surfaces_once_the_device_reaches_it_and_stays():
         clock.charge(0.5)  # device work queued ahead of the bad index
         torch.nn.functional.embedding(ids, table)
         (ids + 1)  # launched before the device got to the fault
-        for call in (torch.cuda.synchronize, lambda: torch.empty(1, device="cuda")):
+        stream, event = torch.cuda.Stream(), torch.cuda.Event()
+        for call in (torch.cuda.synchronize, lambda: torch.empty(1, device="cuda"), torch.cuda.mem_get_info,
+                     lambda: stream.wait_stream(torch.cuda.current_stream()), lambda: stream.wait_event(event),
+                     torch.cuda.empty_cache, lambda: torch.cuda.CUDAGraph().capture_begin()):
             try:
                 call()
                 raise SystemExit("a CUDA call after the fault succeeded")
             except RuntimeError as e:
                 assert "device-side assert" in str(e), e
+        assert ids.view(2, 1).data_ptr() and ids.data.shape == (2,)  # no CUDA call: nothing to fail
         print("ok")
     """)
     assert out.strip() == "ok"
