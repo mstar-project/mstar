@@ -765,6 +765,23 @@ def test_a_pass_with_no_step_of_the_instance_sends_rank_0s_moves_in_a_step_with_
     assert follower.resource.offloaded == {"a"}, "the follower never got rank 0's offload"
 
 
+def test_rank_0_sends_its_moves_to_the_instance_it_leads_before_its_first_step():
+    """A request can fail before rank 0 sends any step of the instance, and teardowns wait while the journal holds
+    moves. Rank 0 knows its followers from the deployment, so the moves go out at once rather than with the next
+    request's first step."""
+    leader = _Leader()
+    leader.worker_id, leader._all_wg_nodes = "rank0", {0: {"encoder"}, 1: {"node"}}
+    instances = {0: [["rank0"]], 1: [["rank2", "rank3"], ["rank0", "rank1"]]}
+    leader._tp_followers = Worker._instance_followers(leader, instances)
+    leader.engine.offload_request("node", "a")
+
+    leader._flush_tp_moves()
+
+    assert [(worker, msg.body.request_ids) for worker, msg in leader.sent] == [("rank1", [])], (
+        "rank 0 held its moves until a step of the instance went out"
+    )
+
+
 # --- the wiring: a follower does not run rank 0's OOM recovery --------------
 
 
