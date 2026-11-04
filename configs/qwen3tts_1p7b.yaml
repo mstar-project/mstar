@@ -5,6 +5,11 @@
 # head_dim 128).
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
+# The Talker KV pool reserves only prompts. Past capacity, uncapped admission
+# fills its 2048 pages with prompts, and the running streams' decode then finds
+# no page and stops (Seed-TTS 160 req/s on an H200). 128 is the decode capture's
+# largest batch, and later requests wait in the conductor's queue.
+max_concurrent_requests: 128
 model_kwargs:
   # bf16 codec decoder (RMSNorm and RoPE stay fp32): 101 Seed-TTS req/s under
   # the streaming SLO where float32 holds 90 (H200), at 35 dB SNR from the

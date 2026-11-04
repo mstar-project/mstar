@@ -759,6 +759,14 @@ Qwen3-TTS notes
   ordered sentence chunks of about 400 characters (one Talker request each,
   two kept in flight while the current one streams); set
   ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
+- ``configs/qwen3tts_1p7b.yaml`` caps ``max_concurrent_requests`` at 128, the
+  decode capture's largest batch. The Talker KV pool reserves only prompts (see
+  :doc:`serving`). Uncapped, load past capacity fills its 2048 pages with
+  prompts, and the running streams stop for want of a page until their clients
+  give up. On an H200, the cap keeps c128 at 637 audio-s/s, and Seed-TTS within
+  the streaming SLO at 128 req/s. On LibriTTS test-clean, it raises the rate at
+  which 90% of requests meet the SLO from 80 to 96 req/s: uncapped, 4.9% of the
+  streams pause at 96 req/s, and capped, none do.
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
   own (first audio one Talker step after prefill), the next chunks add 3, 8
   and 16 frames, then 25 frames a chunk. The decoder is causal, so the codec
