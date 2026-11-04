@@ -550,14 +550,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             last_hidden = torch.stack(hidden)
             new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
             if nxt is not None:
-                seeds = []
-                for i, r in enumerate(last):  # its MTP row again, now with the sampled token
-                    self._dsa.ctx = ctx.rows(r, r + 1)
-                    with kv.token_window(r, r + 1, LABEL):
-                        embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
-                        seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
-                stored = ctx.pos.index_select(0, _upload(self._long_stager, last, ctx.pos.device)) + 1
-                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
+                # each request's last MTP row again, now with its sampled token: one pass
+                rows = _upload(self._long_stager, last, input_ids.device)
+                self._dsa.ctx = ctx.pick(last)
+                with kv.token_rows(rows, LABEL):
+                    embeds = lm.model.embed_tokens(new_tokens) * mtp_keep.index_select(0, rows)[:, None]
+                    seeds = lm.mtp(embeds, last_hidden)
+                self._mtp_seed(engine_inputs, seeds, new_tokens, ctx.pos.index_select(0, rows) + 1)
         finally:
             self._dsa.ctx = ctx
         return new_tokens
