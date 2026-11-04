@@ -135,6 +135,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
+    from mstar.engine.state import Array
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -767,6 +768,13 @@ class Model(ABC):
         hands each node the subset naming it.
         """
         pass
+
+    def declare_state(self) -> "list[Array]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
 
     def get_lora_specs(self) -> list["LoraSpec"]:
         """The per-request LoRA adapters this model can serve: a spec per node they
