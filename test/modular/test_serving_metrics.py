@@ -485,6 +485,7 @@ def test_a_served_request_is_not_a_refusal(served):
 
 
 def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
+    pytest.importorskip("prometheus_client")
     from mstar.api_server import auth
 
     server = make_test_api_server(preprocess_worker=_DataWorker())
