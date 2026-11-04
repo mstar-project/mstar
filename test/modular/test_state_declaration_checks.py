@@ -1,0 +1,268 @@
+"""A declaration is checked against the model that made it, and every process can compare what it built.
+
+Layer code still picks its resource key by name, so a read naming a walk the model doesn't have, or two reads over one
+layer and walk, would otherwise run the wrong mask silently. The digest is how the conductor and the workers will
+compare declarations, so it can't rest on Python's ``hash``, which randomizes strings per process.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Tuple
+
+sys.path.insert(0, ".")
+
+import pytest
+import torch
+
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    CausalConv,
+    Entry,
+    GatedDeltaNet,
+    KVEntry,
+    Read,
+    TensorType,
+    Value,
+    Window,
+)
+from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
+from mstar.engine.state.contract import Mask
+from mstar.graph.base import GraphNode
+
+_ATTEND = Attend(q_heads=8)
+
+
+class _StubModel:
+    """Serves declarations and walks without building anything."""
+
+    def __init__(self, *arrays, combined=None):
+        self.arrays = list(arrays)
+        self.combined = combined or {}
+
+    def declare_state(self):
+        return self.arrays
+
+    def get_graph_walk_graphs(self):
+        return {
+            "prefill": GraphNode(name="LLM", input_names=[], outputs=[]),
+            "decode": GraphNode(name="LLM", input_names=[], outputs=[]),
+            "encode": GraphNode(name="vision", input_names=[], outputs=[]),
+        }
+
+    def get_combined_graph_walks(self):
+        return self.combined
+
+
+class _NoWalks(_StubModel):
+    """Fails the way a model whose walk graphs read a checkpoint does."""
+
+    def get_graph_walk_graphs(self):
+        raise OSError("no checkpoint here")
+
+
+def _array(name="kv", **overrides) -> Array:
+    return Array(name, **{"nodes": {"LLM"}, "layers": {0, 1, 2}, "entry": KVEntry(heads=4, head_dim=8),
+                          "max_len": 16, **overrides})
+
+
+def _read(**overrides) -> Read:
+    return Read(**{"mask": Causal(), "op": _ATTEND, **overrides})
+
+
+def _one_problem(*arrays, **kwargs) -> str:
+    problems = state_declaration_problems(_StubModel(*arrays, **kwargs))
+    assert len(problems) == 1, problems
+    return problems[0]
+
+
+def test_a_model_that_declares_nothing_never_builds_its_walk_graphs():
+    assert state_declaration_problems(_NoWalks()) == []
+
+
+def test_the_walk_graphs_are_built_once_since_building_them_can_read_checkpoints():
+    class _Counting(_StubModel):
+        builds = 0
+
+        def get_graph_walk_graphs(self):
+            self.builds += 1
+            return super().get_graph_walk_graphs()
+
+    model = _Counting(_array())
+    assert state_declaration_problems(model) == [] and model.builds == 1
+
+
+def test_a_good_declaration_has_no_problems():
+    assert state_declaration_problems(_StubModel(
+        _array(reads={"local": _read(mask=Window(4), layers={0, 1}), "global": _read(layers={2})}),
+    )) == []
+
+
+def test_two_arrays_may_not_share_a_name():
+    assert _one_problem(_array(), _array()).startswith("Array 'kv'.name: the name 'kv'")
+
+
+def test_a_read_may_not_reuse_an_array_name():
+    problem = _one_problem(_array(), _array("other", reads={"kv": _read()}))
+    assert problem.startswith("Array 'other'.reads: the name 'kv'")
+
+
+def test_an_update_may_not_reuse_a_read_key():
+    gdn = Entry({"conv": TensorType((32, 3), dtype=None)})
+    problem = _one_problem(
+        _array(reads={"attn": _read()}),
+        Value("gdn", nodes={"LLM"}, layers={0}, entry=gdn, updates={"attn": CausalConv()}),
+    )
+    assert problem.startswith("Array 'gdn'.updates: the name 'attn'")
+
+
+def test_a_node_must_be_in_the_model():
+    assert _one_problem(_array(nodes={"LLM", "dit"})).startswith("Array 'kv'.nodes: 'dit'")
+
+
+def test_a_read_must_name_a_real_walk():
+    problem = _one_problem(_array(reads={"r": _read(walks={"nope"})}))
+    assert problem.startswith("Array 'kv'.reads['r'].walks: 'nope' is not a walk of the model")
+
+
+def test_a_read_must_name_a_walk_of_the_array_nodes():
+    problem = _one_problem(_array(reads={"r": _read(walks={"encode"})}))
+    assert problem.startswith("Array 'kv'.reads['r'].walks: 'encode' runs none")
+
+
+def test_a_combined_walk_is_refused_because_its_rows_read_by_their_own_walk():
+    problem = _one_problem(
+        _array(reads={"r": _read(walks={"mixed"})}), combined={"LLM": {"mixed": {"prefill", "decode"}}},
+    )
+    assert problem.startswith("Array 'kv'.reads['r'].walks: 'mixed' is a combined walk")
+
+
+def test_two_reads_may_not_cover_one_layer_and_walk():
+    problem = _one_problem(_array(reads={"a": _read(layers={0, 1}), "b": _read(layers={1, 2})}))
+    assert problem.startswith("Array 'kv'.reads['b'].layers: layer 1"), "layer 1 reads through both"
+
+
+def test_layers_none_expands_to_every_layer_of_the_array():
+    problem = _one_problem(_array(reads={"a": _read(), "b": _read(layers={2})}))
+    assert problem.startswith("Array 'kv'.reads['b'].layers: layer 2"), "a has every layer, so 2 is read twice"
+
+
+def test_walks_none_expands_to_every_walk_of_the_nodes():
+    problem = _one_problem(_array(reads={"a": _read(), "b": _read(walks={"decode"})}))
+    assert "on walk 'decode'" in problem, "a has every walk of LLM, so decode is read twice"
+
+
+def test_two_reads_may_share_a_layer_on_different_walks():
+    assert state_declaration_problems(_StubModel(_array(reads={
+        "p": _read(walks={"prefill"}), "d": _read(walks={"decode"}),
+    }))) == []
+
+
+def test_a_layer_with_no_read_is_allowed():
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read(layers={0})}))) == []
+
+
+def test_every_problem_is_reported():
+    problems = state_declaration_problems(_StubModel(_array(nodes={"dit"}), _array(nodes={"sit"})))
+    assert len(problems) == 3, f"the clashing name and both unknown nodes: {problems}"
+
+
+def _declarations() -> list[Array]:
+    entry = Entry({
+        "state": TensorType((4, 8, 8), dtype=torch.float32, shard=0),
+        "conv": TensorType((32, 3), dtype=None, shard=0),
+    }, host={"seen": tuple[int, ...], "done": bool})
+    return [
+        _array(reads={"local": _read(mask=Window(4), layers={0, 1}, walks={"prefill", "decode"}),
+                      "global": _read(layers={2})}),
+        Value("gdn", nodes={"LLM", "vision"}, layers={3, 5}, entry=entry,
+              updates={"conv": CausalConv(), "delta": GatedDeltaNet(qk_l2norm=True, scale=0.5)}),
+    ]
+
+
+def test_the_digest_ignores_the_order_of_arrays_and_keys():
+    a, b = _declarations()
+    swapped = Array(a.name, nodes=a.nodes, layers=a.layers, entry=a.entry, max_len=a.max_len,
+                    reads=dict(reversed(list(a.reads.items()))))
+    assert declaration_digest([b, swapped]) == declaration_digest([a, b])
+
+
+def test_the_digest_matches_across_processes_with_different_hash_seeds():
+    script = (
+        "import sys; sys.path.insert(0, 'test/modular'); sys.path.insert(0, '.')\n"
+        "from test_state_declaration_checks import _declarations\n"
+        "from mstar.engine.state.analysis import declaration_digest\n"
+        "print(declaration_digest(_declarations()))\n"
+    )
+    digests = {
+        subprocess.run(
+            [sys.executable, "-c", script], env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        for seed in ("0", "1", "2024")
+    }
+    assert digests == {declaration_digest(_declarations())}, "the digest moved with PYTHONHASHSEED"
+
+
+@dataclass(frozen=True)
+class _OtherMask(Mask):
+    """Has no fields, as `Causal` has none, so only its class tells them apart."""
+
+
+_T = TensorType((4, 8), dtype=None, shard=0)
+_READ = Read(mask=Causal(), op=_ATTEND)
+_FIELD_CHANGES = {
+    "mask class": _array(reads={"r": Read(mask=_OtherMask(), op=_ATTEND)}),
+    "name": _array("kv2", reads={"r": _READ}),
+    "nodes": _array(nodes={"vision"}, reads={"r": _READ}),
+    "layers": _array(layers={0, 1, 3}, reads={"r": _READ}),
+    "max_len": _array(max_len=17, reads={"r": _READ}),
+    "rewritable": _array(rewritable=True, reads={"r": _READ}),
+    "read key": _array(reads={"s": _READ}),
+    "no reads": _array(),
+    "mask": _array(reads={"r": Read(mask=Window(4), op=_ATTEND)}),
+    "window size": _array(reads={"r": Read(mask=Window(5), op=_ATTEND)}),
+    "op": _array(reads={"r": Read(mask=Causal(), op=Attend(q_heads=4))}),
+    "no op": _array(reads={"r": Read(mask=Causal())}),
+    "read layers": _array(reads={"r": Read(mask=Causal(), op=_ATTEND, layers={0})}),
+    "other read layers": _array(reads={"r": Read(mask=Causal(), op=_ATTEND, layers={1})}),
+    "read walks": _array(reads={"r": Read(mask=Causal(), op=_ATTEND, walks={"decode"})}),
+    "other read walks": _array(reads={"r": Read(mask=Causal(), op=_ATTEND, walks={"prefill"})}),
+    "tensor shape": _array(entry=KVEntry(heads=4, head_dim=16), reads={"r": _READ}),
+    "tensor dtype": _array(entry=Entry({"k": TensorType((4, 8), dtype=torch.bfloat16, shard=0), "v": _T}),
+                           reads={"r": Read(mask=Causal())}),
+    "tensor shard": _array(entry=Entry({"k": TensorType((4, 8), dtype=None), "v": _T}),
+                           reads={"r": Read(mask=Causal())}),
+    "tensor name": _array(entry=Entry({"k": _T, "w": _T}), reads={"r": Read(mask=Causal())}),
+    "host field": _array(entry=Entry({"k": _T, "v": _T}, host={"done": bool}), reads={"r": _READ}),
+    "host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": tuple[bool, ...]}), reads={"r": _READ}),
+    "typing host type": _array(entry=Entry({"k": _T, "v": _T}, host={"done": Tuple[int, ...]}), reads={"r": _READ}),
+}
+
+
+def test_every_field_change_moves_the_digest():
+    base = declaration_digest([_array(reads={"r": _READ})])
+    digests = {name: declaration_digest([array]) for name, array in _FIELD_CHANGES.items()}
+    assert all(digest != base for digest in digests.values()), [n for n, d in digests.items() if d == base]
+    assert len(set(digests.values())) == len(digests), "two changes landed on one digest"
+
+
+@pytest.mark.parametrize("first, second", [
+    (CausalConv(), CausalConv(activation=None)),
+    (GatedDeltaNet(), GatedDeltaNet(qk_l2norm=False)),
+    (GatedDeltaNet(), GatedDeltaNet(scale=0.5)),
+    (CausalConv(), GatedDeltaNet()),
+])
+def test_an_update_field_change_moves_the_digest(first, second):
+    entry = Entry({
+        "state": TensorType((4, 8, 8), dtype=torch.float32), "conv": TensorType((32, 3), dtype=None),
+    })
+
+    def value(update):
+        return Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"u": update})
+    assert declaration_digest([value(first)]) != declaration_digest([value(second)])
