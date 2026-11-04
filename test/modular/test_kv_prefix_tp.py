@@ -507,7 +507,7 @@ def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s
         kv.ingest_request("v", replace(_config([prompt], decode=len(reply)), rebuildable=True))
         _run(kv, "v", prompt)
         _write(kv, "v", len(reply) - 1, "decode")
-        kv.drop("v")
+        kv.drop("v", len(prompt) + len(reply) - 1)
     assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("v", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "v", leader._allotments["v"].pages, [])
     # as rank 0's readiness check starts the rebuild

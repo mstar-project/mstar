@@ -71,7 +71,9 @@ class Preemption:
         def droppable(rid: int) -> bool:
             held = self._held(rid, nodes)
             return bool(held) and all(
-                self._rebuild_refusal(rid, node) is None and engine.drop_refusal(node, rid) is None for node in held
+                self._rebuild_refusal(rid, node) is None
+                and engine.drop_refusal(node, rid, self._tokens(rid, node)) is None
+                for node in held
             )
 
         newer = engine.newer_than(reason.request_id)
@@ -83,9 +85,10 @@ class Preemption:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits in the queue for its shortage of %d pages, since moving what "
-                "the pool can move wouldn't cover it (%d earlier waits not logged)",
-                node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), reason.pages_short,
+                "KV short on node=%s walk=%s: %s waits in the queue for %d pages past its allotment, since moving "
+                "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
+                node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
+                reason.pages_short,
             )
         counts = self.counts[node_name]
         for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
@@ -125,6 +128,10 @@ class Preemption:
             self._scheduler.prefilling(node_name, rid, info.graph_walk),
         )
 
+    def _tokens(self, rid: int, node_name: str) -> int:
+        """`Rebuilds.tokens` for ``rid``, which keeps ids or is mid-prefill once `_rebuild_refusal` allows its drop."""
+        return self._rebuilds.tokens(rid, node_name, self._prefilling(rid, node_name))
+
     def _drop(self, rid: int, node_name: str) -> int:
         """Drop ``rid``'s KV on ``node_name``, which a rebuild can write again, and return the pages freed."""
         why = self._rebuild_refusal(rid, node_name)
@@ -133,9 +140,7 @@ class Preemption:
         if any(rid in batch.request_to_worker_graph for (node, _), batch in self._scheduler.backlog.items()
                if node == node_name):
             raise RuntimeError(f"{self._rid_str(rid)} is in a backlog on {node_name}")
-        return self._engine_manager.get_engine(node_name).drop_request(
-            node_name, rid, self._rebuilds.kept_count(rid, node_name),
-        )
+        return self._engine_manager.get_engine(node_name).drop_request(node_name, rid, self._tokens(rid, node_name))
 
     def _move(self, kv: PagedKVCache, nodes: list[str], victims: Victims, pages_short: int) -> None:
         """Move each victim to the host, drop it, or ask the node's resources again for one that gave back its

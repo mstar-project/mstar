@@ -3173,25 +3173,25 @@ class Engine:
         `Admission.readmit`."""
         self._runner.readmit(request_id, node_name)
 
-    def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
+    def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
         """Discard the request's state on this node that can be recomputed from
-        its token ids, and return the pages freed. ``kept`` is how many of those ids
-        this rank keeps, which rank 0 journals for its followers to check."""
+        the ``tokens`` token ids its rebuild writes, and return the pages freed. Rank 0
+        journals ``tokens`` for its followers to drop with."""
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
-        refusal = self.drop_refusal(node_name, request_id)
+        refusal = self.drop_refusal(node_name, request_id, tokens)
         if refusal is not None:
             raise RuntimeError(refusal)
-        freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
         if node_name in self._tp_leader_nodes:
-            self._journal(MoveKind.DROP, request_id, kept, node=node_name)
+            self._journal(MoveKind.DROP, request_id, tokens, node=node_name)
         self._runner.readmit(request_id, node_name)
         return freed
 
-    def drop_refusal(self, node_name: str, request_id: int) -> str | None:
+    def drop_refusal(self, node_name: str, request_id: int, tokens: int) -> str | None:
         """Why `drop_request` would refuse the request on this node, or None."""
         for resource in self._submodules[node_name].resources.values():
-            refusal = resource.check_drop(request_id)
+            refusal = resource.check_drop(request_id, tokens)
             if refusal is not None:
                 return refusal
         return None

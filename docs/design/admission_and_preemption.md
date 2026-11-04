@@ -41,7 +41,7 @@ The model declares the footprint as KV spans (#832). A span's kind says what its
 - `digest`: an encoder's output
 - `rows`: another node's outputs
 
-Each pool decides the class once, at the request's first `ask`, from two facts. The conductor marks a request that streams an output that can't pause, and that mark holds in every pool. The worker marks whether a drop there can free the request's pages: every node of the pool that writes the request's KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible when the host pool can set its footprint aside, and guaranteed otherwise.
+Each pool decides the class once, at the request's first `ask`, from two facts. The conductor marks a request that streams an output that can't pause, and that mark holds in every pool. The worker marks whether a drop there can free the request's pages: every node of the pool that writes the request's KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible while the host pool sets aside room for its move: its prompt when it is admitted, and each page it takes after that before it takes it. When the host pool has no room for that, at admission or later, it becomes guaranteed, and the host pool logs and counts it.
 
 | # | A request with | Class | Why |
 |---|---|---|---|
@@ -60,7 +60,8 @@ Why this shape:
 - **The class comes from the request.** A priority or a per-request flag would be one more input to tune, when the footprint and the output can be used to make the decision.
 - **An output that can't pause holds in every pool.** A Qwen3-Omni request with streamed audio out must not be dropped by the Thinker's worker while its Talker is speaking, so the conductor marks it. A span no rebuild can write again holds only in its node's pools: for an unstreamed reply, a Thinker rebuild only delays the Talker's rows.
 - **Only streamed outputs that can't pause.** The model declares them (`Model.UNPAUSABLE_OUTPUTS`, audio by default), and a deployment overrides them with `unpausable_outputs`, as an Orpheus deployment may to keep a fast first chunk. A streamed text reply that pauses is late, not broken, and an unstreamed audio reply is played after it arrives.
-- **Room on the host is set aside, not assumed.** A request that can only move to the host must be able to move when it is the oldest one short (§5.5). Room counted at that moment is whatever other moves left, so a full host pool would leave it holding its pages, and a pool of such requests stalls as in #307. Its footprint set aside at its first ask makes its move fit. Past `cpu_offload_pages`, the rest are guaranteed.
+- **Room on the host is set aside, not assumed.** A request that can only move to the host must be able to move when it is the oldest one short (§5.5). Room counted at that moment is whatever other moves left, so a full host pool would leave it holding its pages, and a pool of such requests stalls as in #307. The room set aside always covers the pages it holds, so its move fits. Past `cpu_offload_pages`, the rest are guaranteed.
+- **The room grows with what it holds.** Setting its whole footprint aside at its first ask held host room for pages it might never write, and for requests still waiting in the queue, so few requests got room and the host prefix tier was left little. Turning guaranteed at the page the host can't cover needs the rest of its footprint free on the device, and until it is, the request is short of those pages as a decode step is short of one (§3).
 - **Not the worst case for every request.** With 32 Bagel text chats beside 16 image chats on 64 pages, chat TTFT p50 was 559 ms with every request guaranteed and 69.7 ms with two classes.
 - **Seeded requests stay preemptible.** Guaranteeing them would charge the worst case to every request that sets a seed. A rebuilt seeded request may not repeat its output (§5.4).
 
@@ -141,9 +142,9 @@ Say request R's grant is short by `pages_short` pages, one for a decode row. A r
 
 Then:
 
-1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
-2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
-3. Otherwise, R keeps its reservation and asks the pool for its shortage. It waits in the queue at its arrival, parked as a new prompt is, until the room covers the shortage.
+1. If the victims free enough, the worker earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
+2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued. A request that came back from a drop or the host does so only when an older request waits in the queue.
+3. Otherwise, R keeps its reservation and asks the pool for every page its grant needed past it. It waits in the queue at its arrival, parked as a new prompt is, until the room covers them.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
@@ -155,6 +156,7 @@ Why this shape:
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
 - **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
+- **A request that came back waits rather than moving itself.** It came back with one page more than its history, so its next page can find no room, and moving itself then would copy or rebuild all of its pages for a page of decode. Older requests can still choose it. It moves itself for an older request waiting in the queue, though, since the queue admits that request first and it may need these pages, and the two would otherwise wait on each other.
 - **A waiting request waits in the queue.** It is measured again only when the room grows, and let go only once the room covers its whole shortage. Its arrival keeps newer prompts from taking that room first.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
@@ -165,11 +167,11 @@ Why this shape:
 @dataclass
 class Earmark:
     rid: str            # R, the request whose grant failed
-    pages: int          # what R was short
-    victims: set[str]   # the victims whose moves cover it
+    pages: int          # what R's grant needed past its reservation
+    victims: set[str]   # the victims whose moves cover the rest
 ```
 
-As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+The room R's grant counted joins R's reservation at once. As each victim's move lands, what it frees joins too, up to what the grant needed past the reservation, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
 Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
@@ -185,10 +187,11 @@ Lifecycle:
 
 ```python
 class KVManager:
-    def drop(self, rid: str) -> int:
+    def drop(self, rid: str, tokens: int) -> int:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
-        evictable pages. Needs no host pool."""
+        evictable pages. Needs no host pool. tokens is what rid's rebuild
+        writes: its kept ids but the last, or the chunks its prompt ran."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
@@ -202,6 +205,7 @@ A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
 - one not yet decoding
 - one with a host copy
 - one with a step, a KV read or a sample in flight, until that lands
+- one whose rebuild would write other than the tokens its KV holds
 
 At a drop, the other resources:
 
@@ -238,7 +242,7 @@ No field holds the state: residency, the host pool, the queue and the log's rebu
 
 Lifecycle:
 
-- A request that was dropped or moved to the host is never chosen again, since it comes back guaranteed (§5.2).
+- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then.
 - Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check
@@ -246,20 +250,22 @@ Lifecycle:
 A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
 
 ```
-need(V) = V's footprint
+need(V) = the larger of V's prompt and, for each label, the pages
+          V's kept history fills, plus 1, capped at V's footprint
 
 return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
 ```
 
-When it passes, V reserves `need(V)` as a guaranteed request and readiness starts its rebuild.
+When it passes, V reserves `need(V)` and readiness starts its rebuild. The drop counts the history from the tokens V's KV held and the sample its next step writes.
 
-A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes and the rest of its footprint. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
+A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes, plus one page per stream, capped at its footprint, or its queued prompt if that is larger. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
 
 Why this shape:
 
-- **Its whole footprint, not its pages and one more.** With room for one page, its next page finds none, and as the newest request holding pages it moves itself again, so each round trip copies all its pages both ways for a page of decode. The footprint is the one amount after which it never needs room it didn't reserve, and the ingest 400 bounds it.
-- **Guaranteed once back.** As a preemptible request its unused reservation would count toward the next older request's shortage, and it would be that request's first victim. So each request is preempted at most once.
+- **A whole history and a page, not the prompt alone.** A victim readmitted once its prompt fit would take back its own pages, and R would fail again. A victim dropped partway through its prompt still writes the rest of it, so it returns with the whole prompt at least.
+- **Capped at the footprint.** The ingest 400 bounds the footprint, not the history plus a page.
+- **Not its whole footprint.** A footprint far larger than what the request held kept it at the head of the queue while pages were free, and every prompt behind it waited too. When it runs short again it waits for its shortage instead (§3.2).
 - **Outside `check_ready`.** After a partial cache hit, `admit_retrieve` would move the position counter past what the rebuild restores, so no `admit_retrieve` runs on a request between its drop and the end of its rebuild.
 
 ### 5.3 The rebuild row
@@ -282,7 +288,7 @@ The rebuild prefills the kept ids minus the last, under the policy's walk, as ro
 
 A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
+The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied in the dtype the walk reads them in (int64, 8 B a token) to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
 
 Why this shape:
 
@@ -302,18 +308,17 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 ### 5.5 Why every request finishes
 
-A guaranteed request reserves its whole footprint and is never preempted, so it finishes.
+A guaranteed request reserves its whole footprint and is never preempted, so once admitted it finishes.
 
-Take the oldest preemptible request:
+Take the oldest request in the pool:
 
-1. When it runs short, newer requests move to the host or are dropped first, and it gives up its own pages only when none of them can free a page for it. It always can: it is dropped, or moves into the room the host set aside for it (§1).
-2. It then waits at the head of its queue, where nothing newer is admitted past it.
-3. It returns guaranteed once its whole footprint fits, so it is never preempted again.
-4. Its footprint fits the pool, so it returns once the older requests finish, and then finishes.
+1. While it waits in the queue it is first there, and nothing newer is admitted past it. A newer request that runs short with no newer victim moves itself rather than wait behind it, so the pages newer requests hold come back to the room until its reservation fits. The ingest 400 bounds that reservation by the pool.
+2. When it runs short, newer requests move to the host or are dropped first. When none of them can free a page, it gives up its own pages, by a drop or a move into the room the host set aside for it (§1), or it waits for its shortage, if it came back from an earlier move, and point 1 applies.
+3. No request chooses a victim older than itself, so while it is the oldest only its own move takes it off the device, and that happens at most once. It returns with its history and one more page, and finishes.
 
 The next oldest request then takes its place in the argument.
 
-For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs its whole footprint to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
+For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
 
 ---
 
@@ -361,10 +366,9 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 ## 8. Trade-offs
 
-- **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt, once at most, since it comes back guaranteed.
-- **A request comes back late.** A request moved off the device waits at the head of its queue for its whole footprint, and the prompts behind it wait with it.
+- **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again each time an older request runs short.
 - **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
-- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 128 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

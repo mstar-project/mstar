@@ -133,7 +133,16 @@ def test_mps_that_is_not_a_bool_is_refused(tmp_path):
 def test_unpausable_outputs_that_are_not_a_list_are_refused(tmp_path):
     _refused(
         _Model(), _cfg(tmp_path, unpausable_outputs="audio"),
-        r"unpausable_outputs must be a list of output modalities, got 'audio'",
+        r"unpausable_outputs must be a list of output modalities from \[.*\], got 'audio'",
+    )
+
+
+@pytest.mark.parametrize("outputs", [["Audio"], ["speech"]])
+def test_unpausable_outputs_that_name_no_output_modality_are_refused(tmp_path, outputs):
+    """A misspelled modality matched no request's outputs, so every voice stream was preemptible."""
+    _refused(
+        _Model(), _cfg(tmp_path, unpausable_outputs=outputs),
+        rf"unpausable_outputs must be a list of output modalities from \[.*\], got \['{outputs[0]}'\]",
     )
 
 

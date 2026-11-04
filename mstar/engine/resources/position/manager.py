@@ -217,7 +217,7 @@ class RopeManager(PositionManager):
 
     supports_drop = True
 
-    def drop(self, rid: str) -> int:
+    def drop(self, rid: str, tokens: int) -> int:
         # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
         self.reset_request(rid)
         return 0

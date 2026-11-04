@@ -8,6 +8,7 @@ from the policy's input the first time a step runs the policy's walk, and each s
 
 from __future__ import annotations
 
+import logging
 from array import array
 from types import SimpleNamespace
 
@@ -134,6 +135,19 @@ def test_a_full_pool_keeps_no_ids():
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
 
     assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE], "two requests' ids would share host memory"
+
+
+def test_a_full_pool_is_logged_once_and_not_per_request(caplog):
+    rebuilds = _rebuilds(32)
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.rebuild"):
+        for rid in (R, A, B):
+            rebuilds.keep_prompts(_ran(PREFILL, {rid: {"text_inputs": [torch.arange(8)]}}))
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert len(lines) == 1 and "64-byte prompt, with 0 of 32 bytes in use" in lines[0], (
+        "requests that can never be dropped would go unnoticed, or log a line each"
+    )
 
 
 def test_removing_a_request_gives_its_slice_back():
@@ -263,6 +277,17 @@ def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its
     assert (cursor.walk, cursor.total, cursor.length, cursor.resumes_prefill) == (PREFILL, 4, 10, True), (
         "the rebuild would run past where the prompt stood, or release the input the prompt's next chunk reads"
     )
+
+
+@pytest.mark.parametrize("prefilling", [None, Prefilling(PREFILL, 4, 10)], ids=["kept ids", "mid-prefill"])
+def test_a_drop_is_checked_against_the_tokens_its_rebuild_writes(prefilling):
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    rebuilds.start(R, NODE, prefilling)
+
+    assert tokens == rebuilds.cursor(R, NODE).total, "the drop would check one count and the rebuild write another"
 
 
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():

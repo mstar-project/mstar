@@ -368,7 +368,7 @@ A layout has six fields:
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request with a ``"digest"`` or ``"rows"`` span can't be rebuilt from
   its token ids, so in a pool that decides admission it can only move to the host, into room
-  set aside at its first ask, and reserves its whole footprint when the host can't set it aside.
+  the host sets aside for the pages it holds, and reserves its whole footprint when the host can't.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
@@ -1870,6 +1870,15 @@ request_ids, values)``. Under a CUDA-graph slot the store is captured into a per
 buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
+
+A kernel in the forward can draw its rows' tokens itself, as Qwen3-TTS's depth-loop kernel
+does for fifteen draws a step. ``sampler.fused_draw_args()`` returns the step's per-row
+temperature, top-k, top-p, seed and offset, in the forward's row order, and the kernel draws
+each row with ``mstar.engine.resources.sampler.fused_draw.draw_row``, which picks the token
+``fused_sample`` would. After the launch, ``sampler.advance_offsets(draws)`` moves the offsets
+as that many ``sample`` calls would. ``fused_draw_args()`` returns None when ``sample`` would
+do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
+TP); the model then calls ``sample``.
 
 .. warning::
 
