@@ -1744,17 +1744,14 @@ MiniMax-H3 (``minimax_h3``)
 Text- and first/last-frame-to-audio+video on **MiniMax-H3** (``MiniMaxAI/MiniMax-H3``,
 its ``FL2VA`` checkpoint; MiniMax H3 Community License Agreement): a 33B packed-sequence
 audio-video DiT, guidance-distilled (one forward per step), a Qwen3-VL-32B conditioner
-and a ViT video VAE, at 24 fps with 32 kHz stereo audio. Not ported: ``Ref2VA``
-(reference audio/video/images), the H3-Context-IR prompt rewriter and the 2K regenerator.
+and a ViT video VAE, at 24 fps with 32 kHz stereo audio. Not ported: ``Ref2VA``, the
+H3-Context-IR prompt rewriter and the 2K regenerator.
 
-Nodes: ``text_encoder`` (Qwen3-VL through layer 50, keyframes through its vision tower,
-then the DiT's ``condition_proj`` and token refiner, once per request), ``vae_encoder``
-(keyframes), ``dit`` (the DiT scaffold's denoise loop; Ulysses sequence parallel),
-``vae_decoder`` and ``audio_decoder``. Placed with the
-``dit`` in its sequence-parallel group, ``vae_decoder`` splits the clips over the
-DiT's ranks itself and runs in lockstep with it, scheduled by its rank 0 between denoise
-steps, so a finished clip does not wait for another request's denoise
-(``configs/minimax_h3_sp2.yaml``).
+Nodes: ``text_encoder`` (Qwen3-VL to layer 50, keyframes through its vision tower, then
+the DiT's ``condition_proj`` and token refiner; once per request), ``vae_encoder``
+(keyframes), ``dit`` (the DiT scaffold's denoise loop, Ulysses SP), ``vae_decoder`` and
+``audio_decoder``. In the SP configs ``vae_decoder`` sits in the DiT's SP group: each rank
+decodes a share of the clips, between denoise steps.
 
 .. code-block:: bash
 
@@ -1764,66 +1761,49 @@ steps, so a finished clip does not wait for another request's denoise
    mstar serve minimax_h3 --config configs/minimax_h3_2gpu.yaml  # 2 GPUs, no SP
 
 Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32, aspect 1:4 to
-4:1; default 768x1344, or the first keyframe's aspect ratio), ``num_frames`` (snapped up
-to 17n+5, 5 to 15 s; default 124), ``num_inference_steps`` (default 50 sigma points, i.e.
-49 forwards), ``flow_shift`` / ``audio_flow_shift`` (12 / 3), ``seed``; with one or two
-images, ``keyframe_anchors`` (``first`` / ``last`` per image; default ``first``, or both).
-A prompt longer than the text encoder's 262,144 positions (keyframe tokens included;
-``max_prompt_tokens`` sets a lower bound), a packed sequence over ``max_packed_rows`` rows
-(prompt, keyframe, audio and video rows), or Qwen's vision tokens typed into the prompt are
-a 400. The ``max_packed_rows`` default, 131072, covers the longest clip at 768p (14.4 s,
-~105k rows) with a ~25k-token prompt; a step's attention grows with the square of the rows,
-so a deployment may lower it. One request runs per denoise step.
-Outputs are an H.264 ``video`` and a stereo ``audio`` chunk (16-bit PCM).
-``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC (``image``
-is the first frame, ``extra_body.last_image`` the last); the mux needs the ``ffmpeg``
-binary on the server's ``PATH`` and falls back to video only without it.
+4:1; default 768x1344, or the first keyframe's aspect), ``num_frames`` (snapped up to
+17n+5, 5 to 15 s; default 124), ``num_inference_steps`` (sigma points, default 50: 49
+forwards), ``flow_shift`` / ``audio_flow_shift`` (12 / 3), ``seed``, and with one or two
+images ``keyframe_anchors`` (``first`` / ``last`` per image). These are a 400: a prompt
+over the text encoder's 262,144 positions (keyframe tokens included; ``max_prompt_tokens``
+lowers it), a packed sequence over ``max_packed_rows`` (default 131072: the longest 768p
+clip, 14.4 s, with a ~25k-token prompt), Qwen's vision tokens in the prompt, and a last
+keyframe outside 1:4 to 4:1 next to a first one (it is cropped to the canvas). One request
+runs per denoise step. ``POST /v1/videos/generations``
+returns one mp4 with the audio as AAC (``image`` is the first frame,
+``extra_body.last_image`` the last; the mux needs ``ffmpeg`` on ``PATH``).
 
-Deployment knobs: ``compile`` (the DiT's blocks, static per packed row count: each new count
-compiles once, ~8 s; past the engine's recompile limit new counts run eager), ``vae_tile_batch`` (256-px tiles per
-decoder call; 28 is one 768p clip), ``vae_compile`` (the decoder's blocks: a
-768p clip's share decodes in 2.1 s instead of 3.2 s on one H200, and the frames of the
-reference's latents stay within 62.9 dB of eager, 96.6% of bytes equal; on in
-``configs/minimax_h3_sp2.yaml``), ``attention_backend`` (``flashinfer``, or ``sdpa``, the
-reference's kernel). Runtime needs: PyAV (video encoding), transformers' image processor
-(keyframes; a server that cannot import it, for example next to a torchaudio built for
-another torch, refuses to start), FlashInfer (``attention_backend: flashinfer``), and the
-``ffmpeg`` binary for the mp4's AAC track.
+Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_batch: 28`` and
+``vae_compile``):
 
-At ``attention_backend: sdpa``, the serving code driven by ``test/minimax_h3/parity.py``
-(the nodes' modules without the engine, fp32 matmuls at "highest") is bit-identical to
-diffusers' MiniMax-H3 pipeline end to end (latents, frames, waveform). FlashInfer's FA3 and
-the compiled DiT are not bit-exact; served at 768p they stay within the reference's own
-spread across SDPA kernels.
+- ``compile``: the DiT's blocks, static per packed row count. The prompt length is part of
+  the count, so nearly every new prompt length compiles (~8 s) mid-request; past the
+  engine's recompile limit (``MSTAR_RECOMPILE_LIMIT``, 84) new counts run eager.
+- ``vae_tile_batch``: 256-px tiles per decoder call (28 is one 768p clip).
+- ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
+  another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
+  on one H200, within 62.9 dB of eager.
+- ``attention_backend``: ``flashinfer``, or ``sdpa`` (the reference's kernel).
 
-Measured on 4x H200 SXM with the node's other four GPUs idle, torch 2.12.1+cu132 and
-FlashInfer 0.7.2 (``benchmark/minimax_h3/bench_video.py``, one request at a time;
-1344x768, 124 frames, 50 steps, text only; one warmup and one timed request per row), end
-to end through ``/v1/videos/generations``:
+Async scheduling is on for the DiT and the decoder, the default for parallel nodes
+(``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
+PyAV, transformers' image processor (a server that can't import it, e.g. next to a
+torchaudio built for another torch, refuses to start), FlashInfer, and ``ffmpeg``.
 
-.. list-table::
-   :header-rows: 1
+At ``attention_backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3/parity.py``
+(fp32 matmuls at "highest"), are bit-identical to diffusers' MiniMax-H3 pipeline end to end
+(latents, frames, waveform); with ``--exact`` the script exits nonzero when one isn't.
+FA3 and the compiled DiT are not bit-exact; served at 768p they stay within the
+reference's own spread across SDPA kernels.
 
-   * - Settings
-     - Seconds per clip
-   * - eager, one ``vae_decoder``
-     - 90.5
-   * - ``compile``
-     - 81.4
-   * - ``compile``, ``vae_decoder`` in the DiT's SP group, ``vae_compile``
-       (``configs/minimax_h3.yaml``)
-     - 75.3
-
-The DiT's 49 steps are ~73 s of a clip (~1.50 s each), and the GPUs run at their power
-cap throughout. On the same four GPUs SGLang 0.5.21 (Ulysses 4, ``--performance-mode
-speed``) takes 76.0 s, and with two requests at a time finishes 47.5 clips an hour to
-M*'s 48.2 (the last row with #1118's packed Ulysses exchange). Busy neighbours on the
-node's other GPUs cost ~8%. On all eight GPUs (``configs/minimax_h3_sp8.yaml``, the same
-layout at SP8) a clip takes 39.1 s, and two at a time finish 94.4 an hour; vllm-omni 0.32.0
-on the same GPUs, at the same 49 DiT forwards, takes 40.7 s and finishes 89.8. Async
-scheduling for the DiT (``tp_async_sched: [dit]``) measured within noise and is left off.
-Not done: CUDA-graph capture, more than one request per step, tensor parallelism, and the
-``Ref2VA`` checkpoint.
+Seconds per clip on 4x H200 (torch 2.12.1+cu132, FlashInfer 0.7.2,
+``benchmark/minimax_h3/bench_video.py``; 1344x768, 124 frames, 50 steps, text only, one
+request at a time, through ``/v1/videos/generations``): eager 90.5, ``compile`` 81.4,
+``configs/minimax_h3.yaml`` 75.3. The DiT's 49 steps are ~73 s of it. SGLang 0.5.21
+(Ulysses 4) takes 76.0 s; two at a time, 47.5 clips an hour to M*'s 48.2. At SP8
+(``configs/minimax_h3_sp8.yaml``) a clip takes 39.1 s and two at a time finish 94.4 an
+hour; vllm-omni 0.32.0, at the same 49 forwards, takes 40.7 s and finishes 89.8. Not done:
+CUDA-graph capture, more than one request per step, tensor parallelism, ``Ref2VA``.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
