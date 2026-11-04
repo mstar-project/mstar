@@ -124,9 +124,12 @@ the roofline.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
   room, so admission paths that depend on it only run with graphs on.
 - A value that was never computed reads as zeros: data-dependent control flow on device values
-  (beyond small tensors) takes the zero branch. A small tensor counts as never computed while
-  it is unwritten, once a stand-in wrote it (a Triton launch: any tensor it was handed), and
-  after an op reads such a value; a real write over any part of it clears that.
+  (beyond small tensors) takes the zero branch. A small tensor counts as never computed once a
+  stand-in wrote it (a Triton launch: any tensor it was handed) and after an op reads such a
+  value; a real write of all of it ends that, and a real write of part doesn't. An allocation
+  nothing wrote also reads as zeros, and doesn't count.
+- Exporting a kept tensor for IPC moves its storage into shared memory, so its `data_ptr()`
+  changes at the export, which a GPU's doesn't.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
   ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
   here are not validated and not accurate (see the top of this file).
