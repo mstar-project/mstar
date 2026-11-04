@@ -159,6 +159,7 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w._rebuilds = Rebuilds({}, {})
     w._preemption = SimpleNamespace(
         preempt=lambda node_batch: False, rebuilt=lambda rid, node, tokens: None, remove_request=lambda rid: None,
+        prune_log=lambda rid, node: None,
     )
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())

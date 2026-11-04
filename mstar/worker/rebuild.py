@@ -395,6 +395,10 @@ class Rebuilds:
             self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
             self._droppable[node][rid] = HostSlice(piece.offset, used)
 
+    def forget(self, rid: int, node: str) -> None:
+        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} still reads its log"
+        self._forget(node, rid)
+
     def _forget(self, node: str, rid: int) -> None:
         kept = self._kept[node].pop(rid, None)
         self._prefilling[node].discard(rid)

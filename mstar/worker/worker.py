@@ -4010,6 +4010,7 @@ class Worker:
                         engine.restore_chunk_inputs(rid, node)
                     continue
                 engine.land_rebuild(node, rid)
+                self._preemption.prune_log(rid, node)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)

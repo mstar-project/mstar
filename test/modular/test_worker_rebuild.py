@@ -22,7 +22,7 @@ from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch, PagedKVCache
 from mstar.engine.resources import Residency, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
@@ -250,6 +250,40 @@ def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
 
     assert eng.landed == [R] and not w._rebuilds.rebuilding(R, NODE), "the request would never be ready to decode again"
     assert w.infos[R].graph_walk == DECODE, "the runtime's view of the request left its decode walk"
+
+
+def _landing(monkeypatch, guaranteed: bool):
+    """Land R's rebuild in a step of its rebuild row alone, on a pool that returns R ``guaranteed`` or not, with R's
+    log holding a slice of the host pool, and return the worker."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    w, eng, batch, node_batch = _rebuilding()
+    kv = _pool()
+    if guaranteed:
+        kv._guaranteed.add(R)
+    w.engine_manager.engine = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)])
+    w._preemption = Preemption(w.engine_manager, w._rebuilds, w.scheduler, w.request_state, w._log_throttled, str)
+    w._rebuilds._droppable[NODE][R] = w._rebuilds._pool.take(64)
+
+    w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+
+    assert eng.landed == [R]
+    return w
+
+
+def test_a_landed_rebuild_its_pool_returns_guaranteed_gives_up_its_log(monkeypatch):
+    """A request back from a drop kept its log and its slice of the host pool, about 17.6 MB for a Bagel image,
+    until it ended, though a pool that returns it guaranteed never drops it again."""
+    w = _landing(monkeypatch, guaranteed=True)
+
+    assert w._rebuilds.kept(R, NODE) is None and w._rebuilds._pool.take(1 << 10) is not None, (
+        "the log would hold its slice of the host pool until the request ended"
+    )
+
+
+def test_a_landed_rebuild_its_pool_returns_preemptible_keeps_its_log(monkeypatch):
+    w = _landing(monkeypatch, guaranteed=False)
+
+    assert w._rebuilds.kept(R, NODE) is not None, "a second drop would find no log to rebuild the request from"
 
 
 def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing():

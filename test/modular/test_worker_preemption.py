@@ -189,6 +189,24 @@ def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_t
     assert _step(kv, "r", 1).ok
 
 
+def test_a_victim_the_host_takes_and_returns_guaranteed_gives_up_its_log():
+    """A request moved to the host comes back guaranteed, so no drop takes it again, and its log held its slice of
+    the host pool until it ended."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.ON_HOST
+    assert w._rebuilds.kept("v", NODE) is None, "the log would hold its slice of the host pool until the request ended"
+
+
 def test_a_request_that_can_only_wait_waits_in_the_queue_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         kv, w = _preempting("nothing to drop")
