@@ -807,7 +807,15 @@ Qwen3-TTS notes
   unfused ops: the sampled residual codes can differ at near-ties. Each Talker
   keeps the sum it had before the two shared the component: Qwen3-TTS
   accumulates in the model dtype, rounding after every add (the reference sums
-  in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once.
+  in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With
+  ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more
+  SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
+  over runs the whole loop, sampling included, as one persistent kernel
+  (``mstar.model.qwen3_tts.components.depth_frame``). The kernel needs Triton
+  3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs
+  why and runs the loop. torchaudio has no build for torch 2.12, and decoding a
+  reference clip imports it, so a Base deployment that clones voices can't turn
+  the kernel on yet.
 - The Codec does not run beside the Talker on a side stream (``side_stream``,
   see :doc:`serving`): its windows read and write their streams' ``codec_state``
   rows, and the side lane only takes a node that holds no resources, since it

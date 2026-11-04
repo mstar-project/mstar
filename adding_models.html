@@ -2516,6 +2516,14 @@ stores the next ones from the forward with <code class="docutils literal notrans
 buffer and commit persists it, so the step must list the name in
 <code class="docutils literal notranslate"><span class="pre">SamplerStep(loopback_writes=...)</span></code>. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.</p>
+<p>A kernel in the forward can draw its rows’ tokens itself, as Qwen3-TTS’s depth-loop kernel
+does for fifteen draws a step. <code class="docutils literal notranslate"><span class="pre">sampler.fused_draw_args()</span></code> returns the step’s per-row
+temperature, top-k, top-p, seed and offset, in the forward’s row order, and the kernel draws
+each row with <code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.sampler.fused_draw.draw_row</span></code>, which picks the token
+<code class="docutils literal notranslate"><span class="pre">fused_sample</span></code> would. After the launch, <code class="docutils literal notranslate"><span class="pre">sampler.advance_offsets(draws)</span></code> moves the offsets
+as that many <code class="docutils literal notranslate"><span class="pre">sample</span></code> calls would. <code class="docutils literal notranslate"><span class="pre">fused_draw_args()</span></code> returns None when <code class="docutils literal notranslate"><span class="pre">sample</span></code> would
+do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
+TP); the model then calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>.</p>
 <div class="admonition warning">
 <p class="admonition-title">Warning</p>
 <p>Where the callable is passed into a traced function, create one <code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code>
