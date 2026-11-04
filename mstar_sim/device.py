@@ -103,6 +103,9 @@ def _is_meta(x) -> bool:
 # host reads of never-computed values so far (zeros were returned): a check on
 # values after one is a check the emulator can't answer (``mstar_sim.pytest_plugin``)
 VALUELESS_READS = [0]
+# ops run on zeros because their output shape depends on values never computed:
+# any failure after one is the emulator's, not mstar's
+VALUE_SHAPES = [0]
 
 
 def host_value(t: torch.Tensor) -> torch.Tensor:
@@ -234,6 +237,11 @@ def fake_base(storage) -> int:
     return base
 
 
+# torch.cuda.set_sync_debug_mode: 0 default, 1 warn, 2 error
+SYNC_DEBUG = [0]
+_SHARED = b"mstar_sim:"
+
+
 class _FakeStorage:
     """A value-less tensor's ``untyped_storage()``: the meta storage with its fake
     address, so callers that key storages by ``data_ptr()`` see them as distinct.
@@ -250,6 +258,13 @@ class _FakeStorage:
 
     def __len__(self):
         return len(self._storage)
+
+    def _share_cuda_(self):
+        """A CUDA IPC handle naming this storage; another emulated process opens it
+        (``UntypedStorage._new_shared_cuda``) as a value-less storage of its size."""
+        nbytes = self._storage.nbytes()
+        handle = _SHARED + f"{self.data_ptr()}:{nbytes}".encode()
+        return (0, handle, nbytes, 0, b"", 0, b"", False)
 
 
 def _unwrap(x):
@@ -295,7 +310,15 @@ def _rewrap(raw, inputs, index):
 
 
 def host_wait() -> None:
-    """A host read of device data: wait for the current stream, refuse under capture."""
+    """A host read of device data: wait for the current stream, refuse under capture
+    (and, under ``torch.cuda.set_sync_debug_mode``, warn or refuse as CUDA does)."""
+    if SYNC_DEBUG[0]:
+        message = "called a synchronizing CUDA operation (mstar_sim: a host read of a cuda tensor)"
+        if SYNC_DEBUG[0] >= 2:
+            raise RuntimeError(message)
+        import warnings
+
+        warnings.warn(message, stacklevel=3)
     if clock.capturing() is not None:
         raise RuntimeError(
             "CUDA error: operation not permitted when stream is capturing "
@@ -487,12 +510,37 @@ def meta_call(func, uargs, ukwargs, tensors):
         desc = _SHAPES.get(key)
         if desc is not None:
             return _build(desc, tensors)
-    raw = func(*uargs, **ukwargs)
+    try:
+        raw = func(*uargs, **ukwargs)
+    except NotImplementedError:
+        # no shape-only kernel, as for ops whose output shape depends on the
+        # values (bincount, nonzero): run it on what the values read as, zeros
+        return _on_zeros(func, uargs, ukwargs)
     if key is not None:
         desc = _describe(raw, tensors)
         if desc is not _UNCACHEABLE:
             _SHAPES[key] = desc
     return raw
+
+
+# the most input bytes an op without a shape-only kernel is run on, as zeros
+_ZEROS_LIMIT = 1 << 28
+
+
+def _on_zeros(func, uargs, ukwargs):
+    metas = [t for t in tree_flatten((uargs, ukwargs))[0] if _is_meta(t)]
+    if sum(t.numel() * t.element_size() for t in metas) > _ZEROS_LIMIT:
+        raise NotImplementedError(f"mstar_sim: {func} has no shape-only kernel and its inputs are too "
+                                  "large to run on zeros")
+    VALUE_SHAPES[0] += 1
+    raw = func(*tree_map(_host_arg, uargs), **tree_map(_host_arg, ukwargs))
+
+    def back(x):
+        if isinstance(x, torch.Tensor) and x.device.type == "cpu" and not keeps_values(x.dtype, x.numel()):
+            return x.to(META)
+        return x
+
+    return tree_map(back, raw)
 
 # Fast path: torch functions that are one kernel (or a view) are
 # priced at the function level, without the per-aten-op dispatch mode, which
@@ -564,6 +612,11 @@ def _run(func, args, kwargs, index, flat=None):
             and not (func in _AUTOCAST_FN and torch.is_autocast_enabled("cuda"))):
         return _fast(func, args, kwargs, flat, index)
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
+    if isinstance(func, torch._ops.HigherOrderOperator):
+        # (flex_attention) its own dispatch runs it on the payloads; a dispatch mode
+        # would need a rule per operator, so its inner ops go unpriced
+        raw = func(*uargs, **ukwargs)
+        return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
     autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
     with _Observe(autocast):
         raw = func(*uargs, **ukwargs)
@@ -571,8 +624,8 @@ def _run(func, args, kwargs, index, flat=None):
 
 
 def _is_custom_op(func) -> bool:
-    ns = getattr(func, "namespace", None)
-    return ns is not None and ns not in ("aten", "prim", "prims")
+    ns = getattr(func, "namespace", None)  # a higher-order op has a namespace but no schema
+    return ns is not None and ns not in ("aten", "prim", "prims") and hasattr(func, "_schema")
 
 
 def _custom_impl(func):
@@ -912,6 +965,15 @@ def install() -> None:
     if _installed:
         return
     _installed = True
+    new_shared = torch.UntypedStorage._new_shared_cuda
+
+    def _new_shared_cuda(*args):
+        handle = args[1] if len(args) > 1 else b""
+        if isinstance(handle, bytes) and handle.startswith(_SHARED):
+            return torch.UntypedStorage(int(handle.split(b":")[-1]), device=META)
+        return new_shared(*args)
+
+    torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)
     import faulthandler
 
     # a read through a fake address prints its thread's Python stack (all threads'

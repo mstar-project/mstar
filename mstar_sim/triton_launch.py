@@ -40,3 +40,8 @@ def install() -> None:
 
     launch.__mstar_sim_kernel__ = True
     interpreter.InterpretedFunction.run = launch
+    from triton.runtime import autotuner
+
+    # nothing to benchmark on the emulated GPU (the real path asks for a CUDA driver):
+    # every config ties, so the autotuner keeps the first
+    autotuner.Autotuner._bench = lambda self, *args, config, **meta: [0.0, 0.0, 0.0]

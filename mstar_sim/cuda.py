@@ -414,8 +414,25 @@ class Generator(_TorchGenerator):
         return self._sim_device or _TorchGenerator.device.__get__(self)
 
 
+def _set_sync_debug_mode(mode) -> None:
+    from mstar_sim import device
+
+    names = {"default": 0, "warn": 1, "error": 2}
+    device.SYNC_DEBUG[0] = names[mode] if isinstance(mode, str) else int(mode)
+
+
+def _get_sync_debug_mode() -> int:
+    from mstar_sim import device
+
+    return device.SYNC_DEBUG[0]
+
+
 TORCH_C = {
     "_cuda_clearCublasWorkspaces": _noop,
+    "_cuda_set_sync_debug_mode": _set_sync_debug_mode,
+    "_cuda_get_sync_debug_mode": _get_sync_debug_mode,
+    "_cuda_sleep": _noop,  # a spin of N cycles; nothing to wait for
+    "_cuda_getDevice": current_device,
     # a raw ``cudaStream_t``: the stream's id (no raw CUDA call takes it here, libcudart is refused)
     "_cuda_getCurrentRawStream": lambda device=None: current_stream().cuda_stream,
 }

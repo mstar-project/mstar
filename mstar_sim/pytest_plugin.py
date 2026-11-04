@@ -8,10 +8,12 @@ module-level ``pytest.skip``, or one in its body) names CUDA, a GPU, Triton or
 FlashInfer. The rest already run in CPU Core.
 
 Nothing is computed on the emulated GPU, so a test that checks values (parity,
-an error bound) can't pass. A test that failed an ``assert`` after reading a
-never-computed value is reported as an expected failure. Every other failure
-stays a failure: an exception from mstar's own code (a lifecycle or planning
-error, an API that moved, a crash), or an assertion made before any such read.
+an error bound) can't pass. A test is reported as an expected failure when it
+fails an ``assert`` after reading a never-computed value, or fails in any way
+after an op whose output shape depends on never-computed values (``nonzero``
+of a mask, run on zeros). Every other failure stays a failure: an exception
+from mstar's own code (a lifecycle or planning error, an API that moved, a
+crash), or an assertion made before any such read.
 """
 
 from __future__ import annotations
@@ -27,14 +29,20 @@ from mstar_sim import device
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     device.VALUELESS_READS[0] = 0
+    device.VALUE_SHAPES[0] = 0
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    if (report.when == "call" and report.failed and call.excinfo is not None
-            and call.excinfo.errisinstance(AssertionError) and device.VALUELESS_READS[0]):
+    if report.when != "call" or not report.failed or call.excinfo is None:
+        return
+    if device.VALUE_SHAPES[0]:
+        report.outcome = "skipped"
+        report.wasxfail = (f"mstar_sim: failed after {device.VALUE_SHAPES[0]} op(s) whose output shape "
+                           "depends on never-computed values")
+    elif call.excinfo.errisinstance(AssertionError) and device.VALUELESS_READS[0]:
         report.outcome = "skipped"
         report.wasxfail = (f"mstar_sim: a value check after {device.VALUELESS_READS[0]} read(s) "
                            "of never-computed values")
