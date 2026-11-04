@@ -43,8 +43,8 @@ _MIB = 2**20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
-# a node with no float32 setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None)
+# a node with no float32 or cuDNN-search setting of its own
+_NO_PRECISION = SimpleNamespace(fp32_precision=None, submodule=SimpleNamespace(capture_cudnn_benchmark=False))
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -66,12 +66,14 @@ class _StubMeasuredRunner:
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
+    _capture_stream = None
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
         self._lent = set()
@@ -344,10 +346,14 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
             ))},
         )
 
+    opened = set()
+
     def ensure(key, bs):
         rids = list(range(-bs, 0))
         for rid in rids:
-            kv.ingest_capture_row(rid)
+            if rid not in opened:  # each padding row once, as DummyRowPool keeps its rows
+                opened.add(rid)
+                kv.ingest_capture_row(rid)
         return rids
 
     runner = _StubMeasuredRunner(torch.device("cuda", 0), {wide: _cost(100), fits: _cost(10)})
@@ -668,6 +674,29 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
         pytest.fail(f"torch {torch.__version__} refuses the snapshot call, so every capture would fail: {error}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the reference is dropped in torch's CUDA snapshot")
+def test_sizing_a_throwaway_capture_keeps_the_references_to_its_pool_id(monkeypatch):
+    """Sizing leaves the id's references as they were: past 256 pools the id is no cached
+    small int, so a dropped reference frees it while the pool's handle still holds it."""
+    pool_id = (0, int("1000007"))
+    held = [pool_id[1]] * 4  # so the id outlives a dropped reference and the count stays readable
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool_id)
+    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
+    measured = ExecutableMemory()
+    measured.per_node = 0.0
+    before = sys.getrefcount(pool_id[1])
+
+    memory = accelerator_graph_runner._capture_thrown_away(
+        lambda pool, keep_graph: (object(), {}), "decode", measured,
+    )
+    # read as `before` was: inside the assert, pytest's rewrite holds one more reference
+    after = sys.getrefcount(pool_id[1])
+
+    assert memory is not None
+    assert after == before, "sizing the capture dropped a reference to its pool id"
+    del held
+
+
 def _cost(graph: int, kept: int = 0, peak: int = 0, slots: int = 1) -> CaptureCost:
     """A bucket's cost, in MiB."""
     return CaptureCost(peak=peak * _MIB, graph=graph * _MIB, kept=kept * _MIB, slots=slots)
@@ -765,6 +794,7 @@ class _StubPlannedRunner:
         self._capture_costs = {bucket: _cost(100) for bucket in buckets}
         self._device = torch.device("cpu")
         self._submodule_name = "Thinker"
+        self._resident = None
         self._num_slots = 1
         self._buckets = {}
         self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())

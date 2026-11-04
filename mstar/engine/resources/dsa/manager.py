@@ -37,7 +37,7 @@ class DSAManager(Resource):
 
     def __init__(self, config: DSAConfig, kv_config, device: torch.device):
         self.config = config
-        self.page_size = kv_config.page_size
+        self.page_size = kv_config.tokens_per_page
         self.kv_rows = kv_config.max_seq_len  # cache rows a request may hold
         self.num_heads = kv_config.num_qo_heads  # this rank's
         self.kv_lora_rank = kv_config.kv_lora_rank
@@ -90,7 +90,9 @@ class DSAManager(Resource):
             pad = len(kv_out.views) * -(-self.kv_rows // self.page_size) - parts[-1].numel()
             parts.append(torch.zeros(pad, dtype=torch.int32))
         n_pos, n_req = len(pos), indptr.numel() - 1
-        staged = self._int_stager.to_device(torch.cat(parts), self._device)
+        host = torch.cat(parts).numpy()
+        staged = torch.empty(host.size, dtype=torch.int32, device=self._device)
+        self._int_stager.copy_(staged, host)
         lens = attn_lens(pos, topk, kpool)  # a padding row's is 1
         # score width: the step's most pools; a decode graph's the serving window's, and a
         # captured prefill holds whole prompts no longer than its bucket

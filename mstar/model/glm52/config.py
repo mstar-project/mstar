@@ -141,10 +141,10 @@ class Glm52ModelConfig:
     # alone outsize a device at TP8 on the real 753B checkpoint.
     moe_fp8_resident: bool = True
     # "auto": the tuned kernels, each picking per GPU from its module's table: the fused fp8
-    # MoE with its decode chain and router kernel, the MLA latent prep in two kernels, each
-    # TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at prefill on
-    # the sampled rows only. "reference": the numerics anchor, all of those op by op, served
-    # eager. The MoE prefill kernels keep the runner's bits and run under both.
+    # MoE with its prefill and decode kernels and router kernel, the MLA latent prep in two
+    # kernels, each TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at
+    # prefill on the sampled rows only. "reference": the numerics anchor, all of those op by op
+    # (the routed experts in a per-expert loop), served eager.
     kernels: str = "auto"
     # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
     # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that

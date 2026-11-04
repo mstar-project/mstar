@@ -16,9 +16,10 @@ import yaml
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
+from mstar.engine.resources import KVSpec, RaggedAttentionSpec, SlotLease  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
+from mstar.model.components.aut_submodule import AUT_ENCODE  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
@@ -32,8 +33,15 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 )
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
+from mstar.model.qwen3_omni.config import AUDIO_ATTN  # noqa: E402
+from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import (  # noqa: E402
+    END_PARTITION,
+    HostRows,
+    ModelInputsFromEngine,
+    NodeInputs,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -188,29 +196,16 @@ def test_prompt_layout_matches_reference_template():
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64, 8192])
-def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_tokens):
-    """The request's cap is the iteration check_stop ends decode on, and the graph's
-    decode loop runs to the context, so a length past the default cap is served
-    rather than refused at intake."""
-    from types import SimpleNamespace
-
-    from mstar.engine.resources import SamplingReqConfig
-    from mstar.model.qwen3_asr.config import DECODE_LOOP, SAMPLER
+def test_the_decode_loop_holds_any_cap_the_context_does(max_tokens):
+    """The request's cap ends decode, and the graph's decode loop runs to the
+    context, so a length past the default cap is served rather than refused at
+    intake."""
+    from mstar.model.qwen3_asr.config import DECODE_LOOP
 
     model = _make_model()
     cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
     assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
 
-    llm = Qwen3ASRLLMSubmodule(None, model.config)
-    word = {"new_token": [torch.tensor([1234])]}
-    stopped = next(
-        k + 1 for k in range(cap + 1)
-        if llm.check_stop("r", SimpleNamespace(
-            graph_walk=DECODE_WALK, max_tokens=cap, dynamic_loop_iter_counts={DECODE_LOOP: k},
-            resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
-        ), word)
-    )
-    assert stopped == cap, "the cap and the stop check end decode on different iterations"
 
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
@@ -295,29 +290,96 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert all(s.label == "main" for s in step.segments)
 
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs("abc"), rows)
-    assert batch["audio_features"].shape == (3, cfg.num_mel_bins, 305) and batch["feature_lens"] == [230, 150, 305]
     with torch.no_grad():
         out = sub.forward_batched(PREFILL_WALK, _engine_inputs("abc"), **batch)
-        single = sub.forward(PREFILL_WALK, _engine_inputs("b"),
-                             audio_features=rows[1].tensor_inputs["audio_features"], feature_lens=[150])
+        alone = sub.preprocess(PREFILL_WALK, _engine_inputs("b"), rows[1:2])
+        single = sub.forward(PREFILL_WALK, _engine_inputs("b"), **alone)
     assert [out[r]["audio_embeds"][0].shape[0] for r in "abc"] == [r.input_seq_len for r in rows]
     assert out["a"]["audio_embeds"][0].shape[1] == cfg.audio.output_dim
     assert torch.allclose(out["b"]["audio_embeds"][0], single["audio_embeds"][0], atol=1e-5)
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
+class _WindowedAttention:
+    """The ragged attention resource's answer: each planned window attends only to itself."""
+
+    def __init__(self, spans: list[int]):
+        self.spans = spans
+
+    def run(self, q, k, v):
+        return torch.cat([
+            torch.nn.functional.scaled_dot_product_attention(*(t.transpose(0, 1) for t in qkv)).transpose(0, 1)
+            for qkv in zip(q.split(self.spans), k.split(self.spans), v.split(self.spans), strict=True)
+        ])
+
+
+class _Replay:
+    """The captured stack's answer: the layers over the windows the replay was handed."""
+
+    def __init__(self, sub):
+        self.sub = sub
+
+    def run(self, static_inputs, request_ids, seq_lens, real_bs):
+        self.seq_lens = seq_lens
+        self.sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(seq_lens)})
+        return {"embeds": self.sub.encoder.encode(static_inputs["hidden"], None)}
+
+
+@pytest.mark.parametrize("leased", [False, True], ids=["eager", "replayed"])
+def test_packed_clips_split_by_the_encoder_s_own_window(leased):
+    """Each clip of a packed step, over several conv chunks and attention
+    windows, comes back as HF's encoder gives it alone, whether the step
+    replays the captured stack or runs it under its own plan. Qwen3-Omni's
+    ``n_window`` of 52 makes a 104-frame clip 13 embeddings, where the
+    default window's count would claim 14."""
+    hf_config = pytest.importorskip("transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe")
+    hf_modeling = pytest.importorskip("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe")
+    config = hf_config.Qwen3OmniMoeAudioEncoderConfig(
+        encoder_layers=1, d_model=32, encoder_attention_heads=2, encoder_ffn_dim=64, output_dim=16,
+        downsample_hidden_size=8, n_window=52,
+    )
+    hf = hf_modeling.Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
+    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), attn_key=AUDIO_ATTN).eval()
+    encoder.load_weights(list(hf.state_dict().items()))
+    sub = AudioEncoderSubmodule(encoder, config=None)  # Qwen3-Omni's node, fed log-mel features
+
+    rids = ["a", "b", "c"]
+    # one chunk; under one chunk; ten chunks over two attention windows
+    clips = (torch.randn(128, 104), torch.randn(128, 60), torch.randn(128, 1000))
+    rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio_features": [clip]}) for clip in clips]
+    windows = [segment.span for segment in sub.declare_step(PREFILL_WALK, rids, rows).segments]
+    sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(windows)})
+    runner = _Replay(sub)
+    # the forward replays the region only on a step that leased it
+    engine_inputs = _engine_inputs(rids)
+    engine_inputs.piecewise_runners[AUT_ENCODE] = runner
+    if leased:
+        engine_inputs.piecewise_leases = {AUT_ENCODE: SlotLease(slot=0, bucket=None)}
+    with torch.no_grad():
+        packed = sub.forward_batched(PREFILL_WALK, engine_inputs, **sub.preprocess(PREFILL_WALK, engine_inputs, rows))
+        alone = [hf(clip, feature_lens=torch.tensor([clip.shape[-1]])).last_hidden_state for clip in clips]
+
+    assert len(windows) == 4, "the long clip was not split over two attention windows"
+    if leased:
+        assert runner.seq_lens == windows, "the replay attended over windows other than the step's"
+    assert [packed[rid]["audio_embeds"][0].shape for rid in rids] == [a.shape for a in alone], (
+        "a packed clip's embeddings were split at a window other than the encoder's"
+    )
+    for rid, ref in zip(rids, alone, strict=True):
+        torch.testing.assert_close(packed[rid]["audio_embeds"][0], ref, rtol=1e-4, atol=1e-4)
+
+
 def test_encoder_replays_exactly_when_leased():
-    """A leased step declares nothing of its own, so the forward replays
-    then and runs eagerly otherwise, whatever the runner's buckets allow."""
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one."""
     from types import SimpleNamespace
 
-    from mstar.model.qwen3_asr.submodules import AUT_ENCODE
+    from mstar.model.components.aut_submodule import AUT_ENCODE
 
     class Runner:
-        has_bucket = True
-
         def can_run(self, batch_size, total_tokens):
-            return self.has_bucket
+            return True
 
         def run(self, **kwargs):
             self.ran = kwargs
@@ -325,28 +387,35 @@ def test_encoder_replays_exactly_when_leased():
 
     sub, runner = object.__new__(Qwen3ASREncoderSubmodule), Runner()
 
-    def replay(step):
-        engine_inputs = SimpleNamespace(piecewise_runners={AUT_ENCODE: runner}, request_ids=["a", "b"], step=step)
+    def replay(leases):
+        engine_inputs = SimpleNamespace(
+            piecewise_runners={AUT_ENCODE: runner}, piecewise_leases=leases, request_ids=["a", "b"],
+        )
         return sub._replay_encode(engine_inputs, torch.zeros(12, 8), [4, 8])
 
-    assert replay(step=object()) is None
+    assert replay({}) is None
     assert not hasattr(runner, "ran")
-    # no declaration but no bucket either (a forward driven outside the engine)
-    runner.has_bucket = False
-    assert replay(step=None) is None
-    assert not hasattr(runner, "ran")
-    runner.has_bucket = True
-    assert replay(step=None) == "replayed"
+    assert replay({AUT_ENCODE: object()}) == "replayed"
     assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
 
 
+def test_encoder_packs_a_step_only_up_to_its_largest_capture():
+    """Past the largest captured token count a step runs its clips one by one,
+    so an eager step's activations are one clip's, not the whole batch's."""
+    sub = _encoder_submodule(_tiny_config())
+    top = sub.ENCODE_TOKEN_BUCKETS[-1]
+
+    def rows(*lens):
+        return [NodeInputs(input_seq_len=n) for n in lens]
+
+    assert sub.can_batch(None, rows(top - 100, 100))
+    assert not sub.can_batch(None, rows(top - 100, 101))
+    assert sub.can_batch(None, rows(5 * top))
+
+
 def _llm_submodule(cfg):
-    sub = object.__new__(Qwen3ASRLLMSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states, sub.node_resources = {}, {}
-    sub.config, sub.stop_token_ids = cfg, cfg.stop_token_ids
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
-    sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
+    sub = Qwen3ASRLLMSubmodule(type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})(), cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     return sub
 
@@ -391,11 +460,17 @@ def test_llm_check_stop():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == set()
+    # a stop token first ends the request: there is no decode loop yet
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    # any other walk outside the loop may be followed by one the transition runs
+    assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
+    # the budget counts the prefill's token, and the loop's cap is at least 1: 1 ends there
+    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == {"decode_loop"}
+    # the budget is the loop cap's to end
+    assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == set()
 
 
 def test_llm_check_stop_batched_agrees_with_per_request():
@@ -419,24 +494,22 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
-    # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
     host_rows = HostRows(row_rids, {"new_token": tokens})
-    batched = sub.check_stop_batched(check, infos, host_rows, step_walk=None)
+    batched = sub.check_stop_batched(check, infos, host_rows)
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
     assert batched == per_request == {
-        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
+        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "prefill": {END_PARTITION},
     }
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 
-@pytest.mark.parametrize("step_walk", [DECODE_WALK, None])
-def test_engine_stop_check_takes_the_batched_path(step_walk):
-    """The engine passes ``step_walk``; a signature without it raised, and the
-    engine silently fell back to one ``check_stop`` per row."""
+def test_engine_stop_check_takes_the_batched_path():
+    """The engine's stop check reaches the batched path rather than falling
+    back to one ``check_stop`` per row."""
     from types import SimpleNamespace
 
     from mstar.engine.engine import Engine
@@ -459,10 +532,6 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
     batch = SimpleNamespace(
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(
-            graph_walk=DECODE_WALK,
-            request_walks=None if step_walk else {"end": DECODE_WALK, "word": DECODE_WALK},
-        ),
     )
     engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])

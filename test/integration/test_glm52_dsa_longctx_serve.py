@@ -29,7 +29,7 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -236,22 +236,21 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         submodule.postprocess(serve.rid, info, out)
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
-        # as the runtime: the prefill walk's stop check (it ends no loop, but marks a stop
-        # token for the first decode step), then the decode walk's
-        submodule.check_stop(serve.rid, info, out)
-        info.graph_walk = "decode"
-
-        for step in range(max_tokens + 4):  # +slack; check_stop must break first
-            out = serve.step("decode", info, next_token)
-            new_token = out["new_token"][0]
-            submodule.postprocess(serve.rid, info, out)
-            info.dynamic_loop_iter_counts["decode_loop"] = step
-            stop = submodule.check_stop(serve.rid, info, out)
-            generated.append(int(new_token.item()))
-            next_token = out["text_inputs"][0]
-            if stop:
-                stopped = True
-                break
+        # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
+        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
+        if not stopped:
+            info.graph_walk = "decode"
+            for step in range(max_tokens + 4):  # +slack; check_stop must break first
+                out = serve.step("decode", info, next_token)
+                new_token = out["new_token"][0]
+                submodule.postprocess(serve.rid, info, out)
+                info.dynamic_loop_iter_counts["decode_loop"] = step
+                stop = submodule.check_stop(serve.rid, info, out)
+                generated.append(int(new_token.item()))
+                next_token = out["text_inputs"][0]
+                if stop:
+                    stopped = True
+                    break
         stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
         assert dsa.ctx is None  # each forward closed the context it opened on the resource
     finally:

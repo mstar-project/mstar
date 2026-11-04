@@ -9,6 +9,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.components.moe import (
+    NoAuxTcRouter,
     _down_proj_fp8_weight_loader,
     _down_proj_weight_loader,
     _gate_up_fp8_weight_loader,
@@ -18,9 +19,6 @@ from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 from mstar.platforms import current_platform
 from mstar.utils.fp8_block import dequantize_fp8_block_weight
-
-# HF Glm5NextTextTopkRouter: denominator = topk_weights.sum(...) + 1e-20.
-_TOPK_NORM_EPS = 1e-20
 
 MOE_QUANT_KERNELS = ("reference", "triton", "auto")
 
@@ -49,80 +47,6 @@ class Glm5NextGatedMLP(ParallelGatedMLP):
         gate = gate.clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(self.act(gate) * up)
-
-
-class Glm5NextMoEGate(nn.Module):
-    """DeepSeek-V3 noaux_tc sigmoid router, groupless (n_group=1), with the
-    ``+ 1e-20`` topk-norm eps of HF's ``Glm5NextTextTopkRouter``.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        n_routed_experts: int,
-        num_experts_per_tok: int,
-        routed_scaling_factor: float,
-        norm_topk_prob: bool = True,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.n_routed_experts = n_routed_experts
-        self.top_k = num_experts_per_tok
-        self.routed_scaling_factor = routed_scaling_factor
-        self.norm_topk_prob = norm_topk_prob
-
-        self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(n_routed_experts, dtype=torch.float32)
-        )
-        # fp32 copy of ``weight`` from ``finalize_weights``, so the forward does not cast the
-        # router every step. A plain attribute, not a buffer, so model.to(bf16) leaves it fp32.
-        self._weight_fp32: torch.Tensor | None = None
-
-    def finalize_weights(self) -> None:
-        """Cache the fp32 router weight; call after the weights are loaded."""
-        self._weight_fp32 = self.weight.detach().float()
-
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flat = hidden_states.reshape(-1, self.hidden_size)
-        if flat.shape[0] <= _DECODE_MAX_TOKENS and fused_decode.fused_available(flat):
-            from mstar.utils.fused_moe import decode as moe_decode
-
-            return moe_decode.route(
-                flat.contiguous(), self.weight, self.e_score_correction_bias, top_k=self.top_k,
-                scale=self.routed_scaling_factor, normalize=self.norm_topk_prob)
-        if fused_decode.fused_available(flat) and flat.dtype == self.weight.dtype == torch.bfloat16:
-            # bf16 x bf16 products are exact in fp32, so this is the fp32 router with another
-            # summation order, minus the fp32 copy of the activations
-            logits = torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
-            return fused_decode.router_topk(
-                logits, self.e_score_correction_bias, top_k=self.top_k,
-                scale=self.routed_scaling_factor, normalize=self.norm_topk_prob)
-        h = flat.float()
-        w = self._weight_fp32
-        if w is None or w.device != self.weight.device:
-            w = self.weight.float()
-        if fused_decode.fused_available(h):
-            with torch.autocast(device_type="cuda", enabled=False):
-                logits = F.linear(h, w)
-            return fused_decode.router_topk(
-                logits, self.e_score_correction_bias, top_k=self.top_k,
-                scale=self.routed_scaling_factor, normalize=self.norm_topk_prob)
-        scores = F.linear(h, w).sigmoid()  # (T, E)
-
-        biased = scores + self.e_score_correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_ids)
-
-        if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + _TOPK_NORM_EPS
-            topk_weights = topk_weights / denominator
-        if self.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * self.routed_scaling_factor
-
-        return topk_weights, topk_ids
 
 
 class Glm5NextSparseMoeBlock(nn.Module):
@@ -155,7 +79,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         # set by process_weights_after_loading; without it (CPU tests) the reference path runs
         self._use_fused = False
 
-        self.gate = Glm5NextMoEGate(
+        self.gate = NoAuxTcRouter(
             hidden_size=config.hidden_size,
             n_routed_experts=config.n_routed_experts,
             num_experts_per_tok=config.num_experts_per_tok,
@@ -261,7 +185,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         if self._use_decode(flat):
             out = self._forward_decode(flat)
         else:
-            topk_weights, topk_ids = self.gate(flat)
+            topk_weights, topk_ids, _ = self.gate(flat)
             if self._use_fused:  # the shared add rides the top-k sum
                 out = self._dispatch_fused(
                     flat, topk_weights, topk_ids, shared=self.shared_expert(flat))
@@ -391,9 +315,9 @@ class Glm5NextSparseMoeBlock(nn.Module):
 
     def process_weights_after_loading(self, device) -> None:
         """Finalize the fp32 router copy and resolve reference-vs-fused."""
-        self.gate.finalize_weights()
         if not self.fp8_experts:
             self._use_fused = False
+            self.gate.finalize_weights()
             return
         dev = torch.device(device) if device is not None else torch.device("cpu")
         kernel = self.quant_kernel
@@ -411,3 +335,4 @@ class Glm5NextSparseMoeBlock(nn.Module):
                 "clamped reference dispatch."
             )
         self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)
+        self.gate.finalize_weights(topk_kernel=self._use_fused)
