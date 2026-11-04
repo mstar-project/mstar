@@ -309,6 +309,12 @@ class H3VideoDecoder(nn.Module):
             for _ in windows
         ]
 
+    def empty_clip(self, z: torch.Tensor) -> torch.Tensor:
+        """Zeros shaped as one of ``decode_clips``' clips of padded latents ``z``."""
+        frames = (self.walk.chunk + self.walk.token_overlap) * self.decoder.pt
+        return z.new_zeros(z.shape[0], self.decoder.out_channels, frames, z.shape[-2] * self.ratio,
+                           z.shape[-1] * self.ratio, dtype=self.decoder.proj_out.weight.dtype)
+
     def decode(self, z: torch.Tensor, attend: Attend, tile_batch: int = 1) -> torch.Tensor:
         """``AutoencoderKLMiniMaxH3._decode``: denormalized latents ``[B, C, F, H, W]`` ->
         pixels in the VAE's ImageNet-normalized space: every clip decoded, then the

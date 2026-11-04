@@ -497,8 +497,12 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
         group = CommGroup(rank, rank, list(range(world)))
         group.device_group, group.initialized = dist.group.WORLD, True
         vae, config, layout, rows = _tiny_decode_case()
+        calls = []
+        decode = vae.decoder.forward
+        vae.decoder.forward = lambda *args, **kwargs: calls.append(1) or decode(*args, **kwargs)
         with torch.no_grad():
             frames = H3VideoDecoderSubmodule(vae, config, sp_group=group).run_batch(rows, layout)["video_output"]
+            torch.save(len(calls), f"{out}.{rank}.calls")
             if rank == 0:  # at the same thread count: CPU reductions round by it
                 torch.save(H3VideoDecoderSubmodule(vae, config).run_batch(rows, layout)["video_output"], f"{out}.one")
         torch.save(frames, f"{out}.{rank}")
@@ -509,7 +513,7 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
 @pytest.mark.parametrize("world", [2, 4])
 def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_frames(tmp_path, world):
     """``vae_decoder`` as an SP node: each rank's share, gathered, against one decode; 4 ranks
-    over 3 clips leaves one rank without a share."""
+    over 3 clips leaves one rank without a share, which decodes nothing."""
     import torch.multiprocessing as mp
 
     out = str(tmp_path / "frames")
@@ -517,6 +521,8 @@ def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_frames(tmp_path
     want = torch.load(f"{out}.one")
     for rank in range(world):
         assert torch.equal(torch.load(f"{out}.{rank}"), want)
+    calls = [torch.load(f"{out}.{rank}.calls") for rank in range(world)]
+    assert calls[-1] == (0 if world > 3 else 1) and all(calls[:3]), calls  # one tile per clip
 
 
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):

@@ -459,14 +459,16 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
 
     def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
         """This rank's ``clip_share`` of the decode, all-gathered in clip order and cross-faded
-        on every rank. A rank with no share decodes the last clip for the gather's shape."""
+        on every rank. A rank short of a full share pads it with zeros, which only the last
+        ranks are and the trim to ``num_clips`` drops, so a rank with no share decodes nothing."""
         group, num_latents = self.sp_group, z.shape[2]
         z, num_clips = self.vae.clip_plan(z)
-        share = clip_share(num_clips, group.rank, group.world_size) or range(num_clips - 1, num_clips)
-        clips = self.vae.decode_clips(z, share, sdpa_attention, self.tile_batch)
+        clips = self.vae.decode_clips(z, clip_share(num_clips, group.rank, group.world_size), sdpa_attention,
+                                      self.tile_batch)
         # rank r holds clips r * per ..., padded to per, so the gather lists them in order
         per = -(-num_clips // group.world_size)
-        clips += [clips[-1]] * (per - len(clips))
+        if len(clips) < per:
+            clips += [self.vae.empty_clip(z)] * (per - len(clips))
         gathered = group.all_gather(torch.stack(clips), dim=0)[:num_clips]
         return self.vae.walk.assemble(list(gathered.unbind(0)), num_latents)
 
