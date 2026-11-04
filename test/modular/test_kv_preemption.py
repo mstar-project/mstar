@@ -464,6 +464,22 @@ def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     )
 
 
+def test_room_the_host_set_aside_stays_when_a_host_fetch_holds_the_cached_pages_it_counted():
+    """The host set a request's room aside out of cached pages, and a host fetch then held them, leaving the room
+    at -3 and the request with no way off the device."""
+    cpu = host._HostPool(6)
+    cached, keys = cpu.arena.acquire(4), [bytes([i]) * 32 for i in range(4)]
+    cpu.index.insert_run(keys, cached, None)
+    cpu.arena.release(cached)
+    assert cpu.reserve("r", 5)
+
+    cpu.retain_run(keys)
+
+    assert cpu.room() >= 0 and cpu.place("r", "main", (GroupPages(list(range(5))),), [], position=0) is not None, (
+        "a host fetch held the pages set aside for r's move"
+    )
+
+
 def test_the_page_check_catches_a_host_page_counted_as_room_that_eviction_cant_free():
     """The host's room counts the evictable set its arena keeps current, so a page counted there that eviction
     can't free would send a victim to a host that can't take it."""
