@@ -761,7 +761,7 @@ def _fast(func, args, kwargs, flat, index):
             raw.zero_()
             set_never_computed(raw)
     view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
-    if not view and not clock.FAST:
+    if not view and func not in _UNINITIALIZED and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
         key = (func, tuple((t.shape, t.dtype) for t in tensors), tuple((o.shape, o.dtype) for o in outs))
         seconds = _FAST_COST.get(key)
