@@ -235,6 +235,28 @@ def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream
     assert r.status_code == 400 and "unknown LoRA adapter" in r.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_request_with_integers_past_64_bits_comes_back_whole(client_and_stub, stream):
+    """JSON integers have no limit, and a tool schema may name uint64's maximum: the
+    response object echoes its request's tools and metadata."""
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Hm.</think>Hi.", 3))
+    tool = {**SHELL, "parameters": {"type": "object", "properties": {"n": {"type": "integer", "maximum": 2**64}}}}
+    r = client.post("/v1/responses", json=_codex(tools=[tool], metadata={"n": 2**70}, stream=stream))
+    response = _events(r.text)[-1]["response"] if stream else r.json()
+    assert response["status"] == "completed" and response["metadata"] == {"n": 2**70}
+    assert response["tools"][0]["parameters"]["properties"]["n"]["maximum"] == 2**64
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e400"])
+def test_a_number_json_does_not_have_is_a_400(client_and_stub, number):
+    client, stub = client_and_stub
+    r = client.post("/v1/responses", content=f'{{"model": "m", "input": "hi", "metadata": {{"n": {number}}}}}',
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 400 and "not JSON" in r.json()["error"]["message"]
+    assert stub.last_submit is None
+
+
 def test_a_model_without_the_api_is_a_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"

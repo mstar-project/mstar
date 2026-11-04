@@ -314,6 +314,15 @@ def test_the_model_field_picks_a_lora_adapter_as_on_chat(client_and_stub, stream
     assert r.status_code == 400 and "unknown LoRA adapter" in r.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "1e400"])
+def test_a_number_json_does_not_have_is_an_anthropic_400(client_and_stub, number):
+    client, stub = client_and_stub
+    body = json.dumps(_body(tools=[WEATHER])).replace('"type": "integer"', f'"type": "integer", "maximum": {number}')
+    r = client.post("/v1/messages", content=body, headers={"content-type": "application/json"})
+    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
+    assert "not JSON" in r.json()["error"]["message"] and stub.last_submit is None
+
+
 def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9), stop=True)

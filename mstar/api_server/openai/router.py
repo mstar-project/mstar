@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -131,6 +132,23 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     return JSONResponse(result)
 
 
+def _json_body(raw: bytes):
+    """The body as JSON proper: Python's json also reads NaN, Infinity and 1e400
+    (as inf), which no JSON encoder writes back, and a response object echoes
+    its request."""
+
+    def finite(text: str) -> float:
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"{text} is out of range")
+        return value
+
+    def constant(name: str):
+        raise ValueError(f"{name} is not JSON")
+
+    return json.loads(raw, parse_float=finite, parse_constant=constant)
+
+
 def _anthropic_error(status: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content=serving_messages.error_body(status, message))
 
@@ -142,9 +160,9 @@ async def _anthropic(require: str, raw_request: Request, handle):
     if err is not None:
         return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
     try:
-        body = await raw_request.json()
-    except ValueError:
-        return _anthropic_error(400, "the request body is not JSON")
+        body = _json_body(await raw_request.body())
+    except ValueError as e:
+        return _anthropic_error(400, f"the request body is not JSON: {e}")
     try:
         result = await handle(api, model_name, adapter, body)
     except Exception as e:  # noqa: BLE001 — surface as an Anthropic error
@@ -175,9 +193,9 @@ async def responses(raw_request: Request):
     if err is not None:
         return err
     try:
-        body = await raw_request.json()
-    except ValueError:
-        return _error(400, "the request body is not JSON")
+        body = _json_body(await raw_request.body())
+    except ValueError as e:
+        return _error(400, f"the request body is not JSON: {e}")
     try:
         result = await serving_responses.create_response(api, model_name, adapter, body, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
