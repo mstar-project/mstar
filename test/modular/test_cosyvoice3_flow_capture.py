@@ -90,7 +90,7 @@ def _runners(
 ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
     monkeypatch.setattr(
         cgr, "capture_into_graph",
-        lambda run, pool, dev, dtype, keep_graph=False, node_name=None: (_EagerReplay(run), run()),
+        lambda run, pool, dev, dtype, keep_graph=False, node_name=None, stream=None: (_EagerReplay(run), run()),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
     # the capture's memory accounting has no CPU backend
