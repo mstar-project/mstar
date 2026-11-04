@@ -1,11 +1,13 @@
-"""Stand-ins for FlashInfer's sampling kernels: one token per row (token 0,
-the probabilities having no values), priced as a few passes over the rows."""
+"""Stand-ins for FlashInfer's sampling kernels: one value-less token per row (it reads
+as token 0, as torch's own sampling path does; the emulator doesn't check an index no
+kernel computed), priced as a few passes over the rows."""
 
 from __future__ import annotations
 
 import torch
 
 from mstar_sim import clock
+from mstar_sim.device import SimTensor
 
 
 def _cost(probs, *args, **kwargs) -> tuple[float, float]:
@@ -16,7 +18,7 @@ def _cost(probs, *args, **kwargs) -> tuple[float, float]:
 def _drawn(probs, indices, return_valid):
     rows = indices.numel() if indices is not None else probs.shape[0]
     dtype = indices.dtype if indices is not None else torch.int32
-    samples = torch.zeros(rows, dtype=dtype, device=probs.device)
+    samples = SimTensor(torch.empty(rows, dtype=dtype, device="meta"), probs.device.index)
     return (samples, torch.ones(rows, dtype=torch.bool, device=probs.device)) if return_valid else samples
 
 

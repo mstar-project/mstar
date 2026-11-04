@@ -336,6 +336,16 @@ def test_device_side_assert_surfaces_once_the_device_reaches_it_and_stays():
         print("ok")
     """)
     assert out.strip() == "ok"
+    # an index no kernel computed (a sampled token) can't fault: its value is unknown, not 0
+    out = run_sim("""
+        import flashinfer, torch
+        tokens = flashinfer.sampling_from_probs(torch.empty(2, 512, device="cuda"))
+        torch.nn.functional.embedding(tokens - 10, torch.empty(50, 8, device="cuda"))
+        torch.cuda.synchronize()
+        assert tokens.tolist() == [0, 0]
+        print("ok")
+    """)
+    assert out.strip() == "ok"
 
 
 def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
