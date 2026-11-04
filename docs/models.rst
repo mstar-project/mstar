@@ -1416,14 +1416,16 @@ is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
-(``max_gen_batch_size``, default 8) for video, image and sound; the action step
-runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+(``max_gen_batch_size``, default 8) for video, image, sound and action. With
+``compile_denoise_batched`` (default on) the layer stack these steps share is
 compiled with the same mode, once, while the server starts, with the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
-per-request patchify, rotary tables and unpatchify around it run eager. At
-832x480x121 one request's guidance pair is 24k tokens, which already fills the
-GPU's GEMM and attention throughput, so a batch of N costs about N single
-steps: batching keeps requests in step rather than adding throughput.
+per-request patchify, rotary tables and unpatchify around it run eager.
+Compiled, a batched action step's outputs differ from the eager stack's at the
+kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
+which already fills the GPU's GEMM and attention throughput, so a batch of N
+costs about N single steps: batching keeps requests in step rather than adding
+throughput.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:

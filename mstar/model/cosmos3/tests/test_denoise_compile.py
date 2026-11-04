@@ -91,9 +91,9 @@ def test_no_compile_leaves_every_forward_eager():
 def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(monkeypatch):
     """The warmup runs one two-request step through the real step at the
     default size with the layer stack compiled, so no request pays for it: a
-    row of another size, against the attention a served step binds, runs what
-    the warmup built."""
-    sub, model, _, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=9)
+    row of another size, and an action row with and without guidance, against
+    the attention a served step binds, run what the warmup built."""
+    sub, model, cfg, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=9)
     step, calls = model.denoise_step_batched, []
 
     def recording_step(requests, label, attn):
@@ -118,6 +118,29 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
         ((cond_v, uncond_v),) = step([row], CFG_BATCHED_LABEL, res.attn)
     assert cond_v.shape == uncond_v.shape == latents.shape
+
+    compiled, stacks = model.gen_layers_batched, []
+    monkeypatch.setattr(model, "gen_layers_batched", lambda *a: stacks.append(a) or compiled(*a))
+    a_static = sub._build_action_static(list(range(5)), 64, 64, 9, 4, "policy", 10.0, 10.0, 1, "cpu")
+    areq = {
+        "latents": torch.randn(sub._latent_shape(64, 64, 9)), "action_latents": torch.randn(1, 4, cfg.max_action_dim),
+        "vision_timesteps": torch.full((a_static["num_noisy_vision_tokens"],), 500.0),
+        "action_timesteps": torch.full((a_static["num_noisy_action_tokens"],), 500.0),
+        "rotary_cond": a_static["rotary"], "rotary_uncond": a_static["rotary"],
+        "vision_token_shapes": a_static["vision_token_shapes"],
+        "vision_noisy_frame_indexes": a_static["vision_noisy_frame_indexes"],
+        "vision_mse_loss_indexes": a_static["mse_gen_indexes"],
+        "action_token_shapes": a_static["action_token_shapes"],
+        "action_noisy_frame_indexes": a_static["action_noisy_frame_indexes"],
+        "action_mse_gen_indexes": a_static["action_mse_gen_indexes"], "action_domain_id": torch.tensor([2]),
+    }
+    m = a_static["num_vision_tokens"] + a_static["num_action_tokens"]
+    for with_cfg, groups in ((True, [(COND_LABEL, m), (UNCOND_LABEL, m)]), (False, [(COND_LABEL, m)])):
+        res.plan(CFG_BATCHED_LABEL, groups, causal=False)
+        with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+            (branches,) = model.denoise_step_action_batched([areq], CFG_BATCHED_LABEL, res.attn, with_cfg)
+        assert len(branches) == len(groups)
+    assert [a[0].shape[0] for a in stacks] == [2 * m, m]
 
 
 def test_warmup_compiles_is_a_no_op_without_the_compiled_layer_stack(monkeypatch):
