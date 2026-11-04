@@ -117,8 +117,9 @@ def never_computed(t: torch.Tensor) -> bool:
 
 def set_never_computed(t: torch.Tensor, value: bool = True) -> None:
     """Record that kept payload ``t`` (its whole storage: views alias it) holds a value no
-    kernel computed: it was allocated and not written yet, a stand-in wrote it, or an op
-    that read such a value did. It holds zeros, or what is left of the real values."""
+    kernel computed: a stand-in wrote it, or an op that read such a value did. It holds
+    zeros, or what is left of the real values. An allocation isn't one: what no one wrote
+    is undefined on a GPU too, and here reads as zeros."""
     t.untyped_storage()._sim_never_computed = value
 
 
@@ -388,7 +389,6 @@ class _Observe(TorchDispatchMode):
                 # an allocation, not a kernel (a graph doesn't re-run it): undefined values read
                 # as zeros, never as the host's leftover bytes
                 out = func(*args, **kwargs).zero_()
-                set_never_computed(out)
         if clock.FAST or func.is_view or clock.in_kernel():
             return out  # unpriced, or inside a stand-in (its own cost is charged)
         from mstar_sim import cost
@@ -567,10 +567,8 @@ def _join(args, kwargs, ints: bool = True):
 
 
 _WRITES: dict = {}
-# aten ops that don't read what they write: only their other operands decide its values
-_OVERWRITES = {"copy_", "fill_", "zero_", "normal_", "uniform_", "random_", "exponential_", "bernoulli_",
-               "index_copy_", "index_put_", "_index_put_impl_", "scatter_", "index_fill_", "masked_fill_",
-               "masked_scatter_"}
+# aten ops that write all they are given and read none of it
+_OVERWRITES = {"copy_", "fill_", "zero_", "normal_", "uniform_", "random_", "exponential_", "bernoulli_"}
 
 
 def _written(func, args, kwargs) -> list:
@@ -582,9 +580,19 @@ def _written(func, args, kwargs) -> list:
     return tree_flatten([args[i] if i < len(args) else kwargs.get(name) for i, name in places])[0]
 
 
+def _covers(t: torch.Tensor) -> bool:
+    return t.numel() * t.element_size() >= t.untyped_storage().nbytes()
+
+
 def _reads_never_computed(func, args, kwargs) -> bool:
-    overwrites = func.overloadpacket.__name__ in _OVERWRITES or func._schema.overload_name == "out"
-    written = _written(func, args, kwargs) if overwrites else ()
+    """Whether a value no kernel computed goes into what an aten op leaves. ``zeros_like`` and
+    ``new_ones`` take only a shape. A write over part of a storage leaves the rest as it was,
+    so it counts as reading that storage."""
+    name = func.overloadpacket.__name__
+    if name.endswith("_like") or name.startswith("new_"):
+        return False
+    overwrites = name in _OVERWRITES or any(a.is_out for a in func._schema.arguments)
+    written = [t for t in _written(func, args, kwargs) if _covers(t)] if overwrites else ()
     return any(never_computed(t) for t in _shallow(args, kwargs) if not any(t is w for w in written))
 
 
@@ -777,7 +785,6 @@ def _fast(func, args, kwargs, flat, index):
         raw = func(*uargs, **ukwargs)  # kept values: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
-            set_never_computed(raw)
     if not _is_view(func, args) and func not in _UNINITIALIZED and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
         key = (func, tuple((t.shape, t.dtype) for t in tensors), tuple((o.shape, o.dtype) for o in outs))
@@ -940,9 +947,7 @@ def _captured_values(func, args, kwargs):
             return m
         if id(m) in real:
             return real[id(m)]
-        made = torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
-        set_never_computed(made)
-        return made
+        return torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
 
     out = tree_map(buffer, out)
 
@@ -1073,8 +1078,7 @@ def _copy_(self, src, non_blocking=False):
                 dst, host = self._data, _zeros(src)
 
                 def write():
-                    dst.copy_(host, non_blocking=non_blocking)
-                    set_never_computed(dst, never_computed(host))
+                    _kept_op(torch.ops.aten.copy_.default, (dst, host, non_blocking), {})
 
                 if clock.capturing() is None:
                     write()
@@ -1188,8 +1192,7 @@ def _create(func, args, kwargs, device):
     with _Observe():
         out = func(*args, **dict(kwargs, device=target))
     if target is CPU and func in _UNINITIALIZED:
-        out.zero_()  # a never-computed value reads as zeros, not as the host heap's garbage
-        set_never_computed(out)
+        out.zero_()  # what no one wrote reads as zeros, not as the host heap's garbage
     if from_host and isinstance(out, T):
         clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
     return tree_map(

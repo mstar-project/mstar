@@ -369,6 +369,29 @@ def test_timing_only_holds_shapes_not_values():
         assert staged.tolist() == [1, 1]
         g.replay()
         assert staged.tolist() == [0, 0]
+        # no kernel computed what a stand-in wrote: a write over part of it leaves the rest so, one
+        # that adds to it reads it, and only a write of all of it, with computed values, ends that
+        import flashinfer
+        from mstar_sim.device import never_computed
+        stand_in = lambda: flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
+        row, mask = torch.tensor([0], device="cuda"), torch.eye(2, 4, dtype=torch.bool, device="cuda")
+        for write in (lambda t: t[1:].zero_(), lambda t: t[1:].copy_(torch.zeros(1, 4)),
+                      lambda t: t.masked_fill_(mask, 0.0), lambda t: t.index_fill_(0, row, 0.0),
+                      lambda t: t.index_put_((row,), torch.ones(1, device="cuda"), accumulate=True),
+                      lambda t: t.scatter_(0, row[:, None], 1.0, reduce="add")):
+            written = stand_in()
+            write(written)
+            assert never_computed(written._data), write
+        for write in (lambda t: t.zero_(), lambda t: t.copy_(torch.ones(2, 4, device="cuda")),
+                      lambda t: t.copy_(torch.ones(2, 4)), lambda t: torch.neg(torch.ones(2, 4, device="cuda"), out=t),
+                      lambda t: torch.sort(torch.ones(2, 4, device="cuda"), out=(t, row.new_zeros(2, 4)))):
+            written = stand_in()
+            write(written)
+            assert not never_computed(written._data), write
+        # and an op that takes only a shape from a tensor reads none of it
+        for make in (torch.zeros_like, torch.ones_like, lambda t: torch.full_like(t, 2.0), lambda t: t.new_zeros(2),
+                     lambda t: t.new_ones(2), lambda t: t.new_full((2,), 2.0)):
+            assert not never_computed(make(stand_in())._data), make
         torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         del big
@@ -529,6 +552,15 @@ def test_tensor_parallel_collectives_are_timed_not_sent():
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record(); dist.all_reduce(x); end.record(); end.synchronize()
             assert dist.get_backend() == "gloo" and start.elapsed_time(end) > 1.0, start.elapsed_time(end)
+            # kept values are sent for real: what ranks agreed on was computed, unless a rank's wasn't
+            import flashinfer
+            from mstar_sim.device import never_computed
+            lengths = torch.empty(4, dtype=torch.long, device="cuda")
+            dist.all_gather_into_tensor(lengths, torch.arange(2, device="cuda") + 2 * r)
+            assert lengths.tolist() == [0, 1, 2, 3] and not never_computed(lengths._data)
+            gathered = torch.zeros(4, 4, device="cuda")
+            dist.all_gather_into_tensor(gathered, flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1))
+            assert never_computed(gathered._data)
             dist.destroy_process_group()
 
         if __name__ == "__main__":
@@ -595,19 +627,24 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             raise AttributeError("the flashinfer wrapper has no plan")
         def test_tensor_lacks_an_attribute():
             torch.ones(2, device="cuda").no_such_attribute
-        def test_filled_scratch_buffer():
+        def test_scratch_buffer_filled_by_rows():
             buf = torch.empty(4, device="cuda")
-            buf.fill_(1.0)
+            buf[:2] = 1.0
             assert buf.tolist() == [2.0] * 4
         def test_exported_storage():
             t = torch.arange(4, device="cuda")
             t.untyped_storage()._share_cuda_()
             assert t.sum().item() == 7
-        def test_unwritten_scratch_buffer():
-            assert (torch.empty(4, device="cuda") + 1).tolist() == [2.0] * 4
+        def test_captured_stand_in_read_after_a_replay():
+            import flashinfer
+            graph, probs = torch.cuda.CUDAGraph(), torch.ones(2, 4, device="cuda")
+            with torch.cuda.graph(graph):
+                rows = flashinfer.top_k_renorm_probs(probs, 1) * 2
+            graph.replay()
+            torch.testing.assert_close(rows, torch.zeros(2, 4, device="cuda"))
         def test_never_computed_write():
             kept = torch.arange(4, device="cuda")
-            kept[:2] = torch.empty(1 << 14, dtype=torch.long, device="cuda")[:2]
+            kept[:2] = torch.empty(1 << 21, dtype=torch.long, device="cuda")[:2]
             assert kept.tolist() == [5, 6, 2, 3]
         def test_parity_of_two_never_computed_values():
             import flashinfer
@@ -629,7 +666,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             stand_in = eval(compile("lambda a, b: a + b", "/mstar_sim/fake_libs/x.py", "eval"))
             stand_in(torch.ones(3, device="cuda"), torch.ones(4, device="cuda"))
         def test_index_into_what_a_never_computed_mask_selected():
-            torch.empty(2, 4, device="cuda").gt(0.5).nonzero()[0]
+            import flashinfer
+            flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1).gt(0.5).nonzero()[0]
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
     """))
@@ -639,8 +677,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                 if line.startswith(("FAILED", "XFAIL", "PASSED"))}
     assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
                         "test_own_error_names_a_library": "FAILED", "test_tensor_lacks_an_attribute": "FAILED",
-                        "test_filled_scratch_buffer": "FAILED",
-                        "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL",
+                        "test_scratch_buffer_filled_by_rows": "FAILED",
+                        "test_exported_storage": "FAILED", "test_captured_stand_in_read_after_a_replay": "XFAIL",
                         "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
                         "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
                         "test_lifecycle_assert_after_mstar_reads_a_sampled_token": "FAILED",
