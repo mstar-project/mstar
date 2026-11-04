@@ -1,13 +1,22 @@
-# mstar_sim: GPU-time simulation for mstar
+# mstar_sim: run mstar without a GPU, for correctness testing
 
-Run mstar on a box with no GPU and get GPU timing. `mstar_sim` is an add-on: it
+Run mstar on a box with no GPU and test that it behaves correctly. **Use it for
+correctness, not performance: its timing is a model, not a measurement, and has
+not been validated against a real GPU, so don't quote its throughput or latency
+numbers, or compare two changes by them.** It computes no kernels, so it can't
+check model output either. What it does find is bugs in mstar's own code: crashes,
+hangs, lifecycle and admission errors, bad indices, out-of-memory, API mistakes.
+
+`mstar_sim` is an add-on: it
 changes no mstar file. mstar believes it is on CUDA (an H100 by default) and
 runs its real code: API server, conductor, worker, micro-scheduler, async
 worker, engine, resources, FlashInfer attention wrappers, CUDA-graph capture
 and replay, the sampler. No kernel is computed. Each is charged its time on
 the simulated GPU, taken from NVIDIA AIConfigurator's measured per-GPU tables
 where they cover it and a roofline elsewhere, on per-stream timelines that the
-host waits on exactly where CUDA would make it wait.
+host waits on exactly where CUDA would make it wait. That timing exists to give
+mstar's host code realistic orderings (queues that fill while the GPU is busy), not
+to predict performance.
 
 ```bash
 # serve on emulated GPUs; any mstar command works
@@ -117,7 +126,8 @@ the roofline.
 - A value that was never computed reads as zeros: data-dependent control flow on device values
   (beyond small integer tensors) takes the zero branch.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
-  ~5-10% for measured tables).
+  ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
+  here are not validated and not accurate (see the top of this file).
 - Collectives assume symmetric ranks (no waiting on the slowest rank).
 - Nothing checks numerics: a port's wrong math (a transposed weight, a bad mask) still serves.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
