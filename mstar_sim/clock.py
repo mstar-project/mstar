@@ -15,6 +15,7 @@ own fused kernels) one kernel of its own cost.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import threading
@@ -134,7 +135,7 @@ def charge(seconds: float, launched: float | None = None) -> float:
     seconds *= TIME_SCALE
     tape = capturing()
     if tape is not None:
-        tape.entries.append(seconds)
+        tape.nodes.append((seconds, None))
         return time.perf_counter()
     with _LOCK:
         return current_timeline().launch(seconds, launched)
@@ -145,14 +146,15 @@ def charge(seconds: float, launched: float | None = None) -> float:
 
 @dataclass
 class Tape:
-    """What a captured graph launches, in order: each kernel's cost in seconds,
-    or a callable pricing it at replay time (a kernel whose cost depends on
-    the values in its arguments, such as attention over the latest plan); and
-    ``effects``, the work on values the emulator keeps (small ints, host copies
-    to and from them), re-run in order at each replay as the graph would."""
+    """What a captured graph launches, in order. Each node is ``(cost, effect)``: a
+    kernel's cost in seconds, or a callable pricing it at replay time (a kernel whose
+    cost depends on the values in its arguments, such as attention over the latest
+    plan), or None; and the work it does on values the emulator keeps (small ints, host
+    copies to and from them), re-run at each replay, or None. A replay runs the nodes in
+    order, so a cost reads the values the nodes before it left."""
 
-    entries: list[float | Callable[[], float]] = field(default_factory=list)
-    effects: list[Callable[[], None]] = field(default_factory=list)
+    nodes: list[tuple[float | Callable[[], float] | None, Callable[[], None] | None]] = field(
+        default_factory=list)
     # ``(device, pool handle)``: the private memory pool its allocations come from
     pool: tuple | None = None
 
@@ -161,7 +163,7 @@ def on_replay(effect: Callable[[], None]) -> None:
     """While capturing, re-run ``effect`` at each replay of the graph."""
     tape = capturing()
     if tape is not None:
-        tape.effects.append(effect)
+        tape.nodes.append((None, effect))
 
 
 def capturing() -> Tape | None:
@@ -192,7 +194,8 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
 
     The decorated function computes nothing: it returns what the kernel would
     (its ``out`` arguments, or empty tensors of the right shape), and the
-    tensor ops it uses for that are not charged. ``cost`` (same arguments)
+    tensor ops it uses for that are not charged.
+    Captured, those ops on kept values run at each replay, like any others. ``cost`` (same arguments)
     returns ``(flops, bytes)``, or ``(flops, bytes, features)`` with the
     geometry a measured table needs (:func:`mstar_sim.cost.kernel_seconds`),
     priced once; or a callable returning that, for a cost that depends on the
@@ -208,8 +211,6 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
 
             if in_kernel():
                 return fn(*args, **kwargs)
-            if FAST:
-                return _flag_values(fn(*args, **kwargs), args if writes_args else ())
 
             def price(terms) -> float:
                 flops, nbytes, *features = terms
@@ -219,19 +220,22 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
             launched = vnow()
             _tls.in_kernel = getattr(_tls, "in_kernel", 0) + 1
             try:
-                with computing():
-                    out = _flag_values(fn(*args, **kwargs), args if writes_args else ())
+                with contextlib.nullcontext() if FAST else computing():
+                    out = fn(*args, **kwargs)
             finally:
                 _tls.in_kernel -= 1
+            out = _flag_values(out, args if writes_args else ())
+            if FAST:
+                return out
             tape = capturing()
             with computing():
                 terms = cost(*args, **kwargs) if cost is not None else (0.0, 0.0)
                 if tape is None:
                     charge(price(terms() if callable(terms) else terms), launched)
                 elif callable(terms):
-                    tape.entries.append(lambda: price(terms()))
+                    tape.nodes.append((lambda: price(terms()), None))
                 else:
-                    tape.entries.append(graph_node_seconds(lambda: price(terms)))
+                    tape.nodes.append((graph_node_seconds(lambda: price(terms)), None))
             return out
 
         wrapper.__mstar_sim_kernel__ = name

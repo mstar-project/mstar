@@ -482,7 +482,7 @@ class _Observe(TorchDispatchMode):
                 # an allocation, not a kernel (a graph doesn't re-run it): undefined values read
                 # as zeros, never as the host's leftover bytes
                 out = func(*args, **kwargs).zero_()
-            elif clock.capturing() is not None and not func.is_view and not clock.in_kernel():
+            elif clock.capturing() is not None and not func.is_view:
                 out = _captured_values(func, args, kwargs)
             else:
                 out = func(*args, **kwargs)
@@ -493,7 +493,7 @@ class _Observe(TorchDispatchMode):
         seconds = cost.op_seconds(func, args, kwargs, out)
         tape = clock.capturing()
         if tape is not None:
-            tape.entries.append(seconds)
+            tape.nodes.append((seconds, None))
         elif seconds:
             clock.charge(seconds, launched)
         return out
@@ -986,27 +986,26 @@ def _captured_values(func, args, kwargs):
 
 
 def replay(tape: clock.Tape) -> None:
-    """Run a captured graph: its work on kept values in order, then one launch
-    charging its kernels' time back to back."""
+    """Run a captured graph's nodes in order (their work on kept values, and the
+    pricing of each kernel on the values before it), as one launch charging its
+    kernels' time back to back."""
     from mstar_sim import cost
 
     check_fault()
     clock.STATS["replays"] += 1
     launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
+    total, kernels = 0.0, 0
     with contextlib.nullcontext() if clock.FAST else clock.computing():
-        for effect in tape.effects:
-            if FAULT[0]:
-                break  # the device faulted: nothing after it runs
-            effect()
-    if clock.FAST:
-        return
-    with clock.computing():
-        total, nodes = 0.0, 0
-        for entry in tape.entries:
-            seconds = entry if type(entry) is float else clock.graph_node_seconds(entry)
-            total += seconds
-            nodes += seconds > 0 or type(entry) is not float
-        clock.charge(total + nodes * cost.graph_node_seconds() + cost.graph_launch_seconds(), launched)
+        for seconds, effect in tape.nodes:
+            if effect is not None and not FAULT[0]:  # the device faulted: nothing after it runs
+                effect()
+            if seconds is None or clock.FAST:
+                continue
+            priced = seconds if type(seconds) is float else clock.graph_node_seconds(seconds)
+            total += priced
+            kernels += priced > 0 or type(seconds) is not float
+        if not clock.FAST:
+            clock.charge(total + kernels * cost.graph_node_seconds() + cost.graph_launch_seconds(), launched)
 
 
 # ------------------------------------------------------------ special methods

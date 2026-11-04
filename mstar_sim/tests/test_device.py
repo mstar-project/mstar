@@ -133,6 +133,22 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         staged.fill_(10); g2.replay(); g2.replay(); torch.cuda.synchronize()
         assert step.item() == 2 and mailbox.tolist() == [12], (step.item(), mailbox.tolist())
         assert cast.tolist() == [10], cast.tolist()
+        # a stand-in kernel's work on kept values re-runs at each replay too (timed as under --fast),
+        # and capture writes nothing: here the top-k transform's slots from the latest page table
+        import flashinfer
+        scores = torch.empty(2, 64, device="cuda")
+        table = torch.arange(16, dtype=torch.int32, device="cuda").view(2, 8)
+        lengths, rows = torch.tensor([3, 1], device="cuda"), torch.arange(2, device="cuda")
+        raw = torch.full((2, 4), 7, dtype=torch.int32, device="cuda")
+        g6 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g6):
+            slots = flashinfer.top_k_page_table_transform(scores, table, lengths, 4, row_to_batch=rows,
+                                                          out_raw_indices=raw)
+        assert raw.tolist() == [[7] * 4] * 2, raw.tolist()
+        table.add_(100); lengths.copy_(torch.tensor([1, 2]))
+        g6.replay()
+        assert slots.tolist() == [[100, -1, -1, -1], [108, 109, -1, -1]], slots.tolist()
+        assert raw.tolist() == [[0, -1, -1, -1], [0, 1, -1, -1]], raw.tolist()
         # the emulator's own work at a replay (re-running ops on kept values) is not host time
         import time
         g5 = torch.cuda.CUDAGraph()

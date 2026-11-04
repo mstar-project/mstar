@@ -38,8 +38,9 @@ def top_k_page_table_transform(scores, page_table, lengths, k, *, row_to_batch=N
              if row_to_batch is not None else torch.zeros(rows, dtype=torch.long, device=device))
     starts = (page_table_row_starts.to(device=device, dtype=torch.long).reshape(-1)[:rows, None]
               if page_table_row_starts is not None else torch.zeros(rows, 1, dtype=torch.long, device=device))
-    col = torch.clamp(starts + j // page_size, max=page_table.shape[1] - 1)
-    page = page_table.to(torch.long)[batch.clamp(max=page_table.shape[0] - 1)[:, None], col]
+    # only past a row's length is a column dead (read as 0); a live one past the table is a bad read
+    col = torch.where(live, starts + j // page_size, 0)
+    page = page_table.to(torch.long)[torch.where(n > 0, batch[:, None], 0), col]
     slots = torch.where(live, page * page_size + j % page_size, -1).to(torch.int32)
     if out_raw_indices is not None:
         out_raw_indices.copy_(torch.where(live, j.expand(rows, k), -1).to(out_raw_indices.dtype))
