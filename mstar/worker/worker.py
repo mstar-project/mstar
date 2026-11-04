@@ -211,6 +211,23 @@ def _make_graph_runtime(
     )
 
 
+def _make_rebuilds(
+    model: Model | None, model_config: dict | None, node_names: set[str], lockstep_nodes: set[str],
+    device: torch.device,
+) -> Rebuilds:
+    """What a dropped request is rebuilt from, on each node here whose model declares how."""
+    policies = model.rebuild_policies() if model is not None else {}
+    # A lockstep node's KV refuses every drop, so its requests keep no ids.
+    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
+    host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+    if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
+        raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+    return Rebuilds(
+        policies, model.get_graph_walk_graphs() if model is not None else {},
+        HostPool(host_mb << 20, device) if host_mb and policies.keys() & node_names else None,
+    )
+
+
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     """``MSTAR_TP_ASYNC_SCHED``: ``0``/``false``/empty off, ``1``/``true`` every
     parallel node, or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
@@ -761,15 +778,7 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        # What a dropped request is rebuilt from, on each node whose model declares how.
-        policies = model.rebuild_policies() if model is not None else {}
-        host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-        if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-            raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-        self._rebuilds = Rebuilds(
-            policies, model.get_graph_walk_graphs() if model is not None else {},
-            HostPool(host_mb << 20, self.device) if host_mb and policies.keys() & node_names else None,
-        )
+        self._rebuilds = _make_rebuilds(model, model_config, node_names, self.parallel_nodes, self.device)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
