@@ -572,6 +572,25 @@ def test_long_context_decode_stops_while_the_next_block_fits():
     engine.remove_request("r")
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "under mtp_trims the host books every verify step's whole block and never takes the "
+    "rejected rows back, so a request holds up to k + 1 pages' rows a token and process_prompt "
+    "refuses max_tokens past (kv_rows - prompt) / (k + 1); follow-up: release step N - 1's "
+    "rejected rows when planning N + 1, from its verdict (the same on every rank)"))
+def test_long_context_mtp_books_at_most_a_block_past_the_rows_it_holds(long_reference):
+    """Rejected drafts cost no cache rows: the host's rows stay within a block of the device's."""
+    engine, sub, _ = _build_engine(3, long_context=True)
+    _oracle(sub, long_reference, wrong_every=1)  # every draft rejected
+    kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, _ = _step(engine, "prefill", {"a": LONG_PROMPTS["a"]}, LONG_MAX_TOKENS)
+    for step in range(6):
+        out, _ = _step(engine, "decode", {"a": out["a"]["text_inputs"][0]}, LONG_MAX_TOKENS, step)
+        held = int(pool.block(MTP_LEN)[pool._slots["a"]["main"].index, 0])
+        assert kv._streams["a"]["main"].stored_len <= held + sub.mtp_block, (step, held)
+    engine.remove_request("a")
+
+
 def _serve_joining(engine, sub, prompts, arrivals, max_tokens):
     """Requests served as a worker does: each prefills alone before decode step ``arrivals``
     names, joins the decode batch and leaves at its own stop, its KDA slot free for a later
