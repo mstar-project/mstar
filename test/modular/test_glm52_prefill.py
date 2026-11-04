@@ -1,4 +1,4 @@
-"""GLM-5.2 prefill: capture buckets from model_kwargs, the router under autocast."""
+"""GLM-5.2 prefill: capture batch sizes from model_kwargs, the router under autocast."""
 import sys
 from pathlib import Path
 
@@ -26,36 +26,21 @@ def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
     return packed
 
 
-def test_prefill_buckets_from_model_kwargs():
+def test_prefill_capture_batch_sizes_from_model_kwargs():
     model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
-                       prefill_token_buckets=[16, 32, 64],
                        prefill_capture_batch_sizes=[1, 4])
-    assert model.config.prefill_token_buckets == [16, 32, 64]
     assert model.config.prefill_capture_batch_sizes == [1, 4]
-    packed = _prefill_config(_submodule(model.config))
-    assert packed.get_total_tokens(1) == [16, 32, 64]
-    assert packed.capture_batch_sizes == [1, 4]
+    assert _prefill_config(_submodule(model.config)).capture_batch_sizes == [1, 4]
 
 
 def test_prefill_buckets_default_without_kwargs():
     model = Glm52Model("", tokenizer_mode="byte", config_variant="full")
-    assert model.config.prefill_token_buckets is None
     packed = _prefill_config(_submodule(model.config))
     assert packed.get_total_tokens(1) == Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS
     assert packed.capture_batch_sizes == Glm52LLMSubmodule.PREFILL_CAPTURE_BATCH_SIZES
 
 
-@pytest.mark.parametrize("buckets", [[], [64, 64]])
-def test_a_bad_prefill_ladder_is_refused(buckets):
-    """Checked as Qwen3.5's and Qwen3-Omni's ladders are: an empty ladder is
-    not the default, and a repeat is not captured twice."""
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced", prefill_token_buckets=buckets)
-    with pytest.raises(ValueError, match="prefill_token_buckets"):
-        _submodule(model.config)
-
-
-def test_config_default_buckets_unchanged():
-    assert Glm52ModelConfig().prefill_token_buckets is None
+def test_config_default_batch_sizes_unchanged():
     assert Glm52ModelConfig().prefill_capture_batch_sizes is None
 
 
@@ -197,11 +182,10 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
         torch._dynamo.reset()
 
 
-def test_prefill_buckets_past_the_context_limit_skip_small_batches():
+def test_prefill_buckets_past_the_context_limit_skip_small_batches(monkeypatch):
     # a 4096-token bucket needs two rows under the 2048-token limit
-    cfg = Glm52ModelConfig(prefill_token_buckets=[1024, 2048, 3072, 4096],
-                           prefill_capture_batch_sizes=[1, 2, 4])
-    packed = _prefill_config(_submodule(cfg))
+    monkeypatch.setattr(Glm52LLMSubmodule, "PREFILL_TOKEN_BUCKETS", [1024, 2048, 3072, 4096])
+    packed = _prefill_config(_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 2, 4])))
     assert packed.get_total_tokens(1) == [1024, 2048]
     assert packed.get_total_tokens(2) == [1024, 2048, 3072, 4096]
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]

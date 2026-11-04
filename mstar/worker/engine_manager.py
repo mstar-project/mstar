@@ -323,6 +323,17 @@ class EngineManager:
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
         )
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        ladders = model_config.get("prefill_token_buckets") or {}
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (
+            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
+            ("prefill_token_buckets", ladders),
+        ):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         engine.load_model(
             submodules,
             specs=specs,
@@ -331,14 +342,8 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            token_ladders=ladders,
         )
-        budgets = model_config.get("max_batch_tokens") or {}
-        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
-            unknown = sorted(set(setting) - known)
-            if unknown:
-                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
         engine.set_chunking_policies(model.chunking_policy_of())

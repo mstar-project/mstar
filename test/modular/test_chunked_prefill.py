@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.chunking import ChunkRange
@@ -706,6 +707,62 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
 
     assert engine._chunking._overruns == {("LLM", "mixed"): 1}
     assert "over its budget of 1024" in caplog.records[0].getMessage()
+
+
+# ── engine: the serving config's prefill_token_buckets ─────────────────
+
+
+def _orpheus_prefill_buckets(ladders, budgets=None) -> list[int]:
+    """The token counts the engine's runner captures Orpheus's ``prefill`` at
+    (batch size 1), given the serving config's ladders and budgets. Its
+    ``prefill`` and ``mixed`` steps replay that one capture."""
+    import functools
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+    engine = _mixed_engine()
+    engine.set_token_budgets(budgets or {}, WALKS, COMBINED)
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM",
+        # its capture configs read no weights
+        submodule=object.__new__(OrpheusLLMSubmodule), resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1,
+        token_ladders=ladders, step_budget=functools.partial(engine._chunking.step_budget, "LLM"),
+    )
+    return sorted({
+        spec.bucket.num_tokens for spec in runner._get_slot_specs()
+        if spec.bucket.graph_walk == "prefill" and spec.bucket.bs == 1
+    })
+
+
+def test_a_ladder_reaches_the_capture_of_a_model_that_plumbs_none():
+    assert _orpheus_prefill_buckets({"prefill": [48, 16]}) == [16, 48]
+
+
+def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
+    """The capture replays ``prefill`` and ``mixed`` steps, both scheduled under
+    ``mixed``'s 1024 (not ``prefill``'s own 512); with no budget nothing is dropped."""
+    ladder = {"prefill": [256, 1024, 2048, 4096]}
+    assert _orpheus_prefill_buckets(ladder) == [256, 1024]
+    assert _orpheus_prefill_buckets({"prefill": [256, 1500, 4096]}) == [256, 1500]
+    assert _orpheus_prefill_buckets(ladder, budgets={"LLM": None}) == [256, 1024, 2048, 4096]
+
+
+@pytest.mark.parametrize("ladders, match", [
+    # ``mixed`` replays the ``prefill`` capture but has none of its own
+    ({"mixed": [64]}, "no packed capture"),
+    ({"decode": [64]}, "no packed capture"),
+    ([64, 128], "capture walk -> ladder"),
+    ({"prefill": []}, "distinct positive"),
+    ({"prefill": [64, 64]}, "distinct positive"),
+    ({"prefill": [0, 64]}, "distinct positive"),
+    ({"prefill": 2048}, "distinct positive"),
+])
+def test_a_ladder_that_cannot_apply_is_refused(ladders, match):
+    with pytest.raises(ValueError, match=match):
+        _orpheus_prefill_buckets(ladders)
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────

@@ -144,7 +144,6 @@ class Glm52ModelConfig:
     # would otherwise fail every capture and serve eager.
     graph_compile: bool = True
 
-    prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent
@@ -285,7 +284,6 @@ class Glm52ModelConfig:
             max_seq_len=512,
             eos_token_ids=(250, 251, 252),
             pad_token_id=250,
-            prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
 

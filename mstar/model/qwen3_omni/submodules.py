@@ -400,9 +400,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self,
         thinker_model: nn.Module,
         config: Qwen3OmniModelConfig,
-        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__(prefill_token_buckets)
+        super().__init__()
         self.model = thinker_model  # Qwen3OmniThinkerModel
         self.config = config
         # only a decode row's token ends the loop; a prefill is not in it yet
@@ -1053,7 +1052,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len(model_inputs) > 1
 
-    # A deployment sets its own with `model_kwargs.prefill_token_buckets`.
+    # A deployment sets its own with the serving config's `prefill_token_buckets`.
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     # past 4 for thinker_mixed, whose decode rows ride in these captures
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]

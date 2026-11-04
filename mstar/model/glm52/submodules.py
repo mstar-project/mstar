@@ -66,7 +66,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
     def __init__(self, language_model: nn.Module, config: Glm52ModelConfig):
-        super().__init__(config.prefill_token_buckets)
+        super().__init__()
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config

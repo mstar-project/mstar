@@ -100,6 +100,14 @@ class ChunkingManagement:
                 return self._overrides[key]
         return budget
 
+    def step_budget(self, node_name: str, graph_walk: str) -> int | None:
+        """The budget a step of ``graph_walk`` was scheduled under: that of
+        the combined walk it runs in, if any. A combined batch whose rows share
+        one real walk runs relabelled to it (`ScheduledBatch.relabel_if_uniform`)
+        and still ran under the combined walk's budget."""
+        walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
+        return self.max_batch_tokens(node_name, walk)
+
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,

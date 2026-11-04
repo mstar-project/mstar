@@ -316,6 +316,19 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, one token budget for every walk the model budgets, or a
        mapping of walk -> budget; null turns a walk's chunking off. Overrides the
        model's defaults. See *Chunked prefill budgets* below.
+   * - ``prefill_token_buckets``
+     - *(optional)* Per node, a mapping of walk -> the token counts its packed graph
+       captures are taken at (the model's ``capture_token_lengths``), in place of the
+       model's ladder. The walk is the one a packed capture is captured on (Orpheus's
+       ``mixed`` steps replay its ``prefill`` capture, so name ``prefill``); a step
+       pads to the smallest rung that holds it, and a longer one runs eagerly. A
+       ladder runs to the first rung that holds the token budget of the steps its
+       capture replays (``max_batch_tokens``; a walk inside a combined walk runs
+       under the combined walk's), and the rungs past it, which no step would
+       reach, are dropped and logged. Each rung adds captures, graph memory and
+       startup time. Loading fails if a node is not in any node group, if a ladder
+       is not a non-empty list of distinct positive ints, or if the walk has no
+       packed capture on the node.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.

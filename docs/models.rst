@@ -467,12 +467,11 @@ Text prefill and mixed steps replay captured graphs by total tokens, on the
 ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
 step's decode rows and batches a few tokens over; a mixed step keeps only the
 powers of two past 2176); a step pads to its bucket and a longer one runs
-eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
-deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
-and 2176 for a mixed step, since the LLM's 2048-token step budget
-(``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time.
+eagerly. The serving config's ``prefill_token_buckets`` sets a deployment's
+own ladder per walk (see :doc:`serving`): ``configs/qwen3_5_9b*.yaml`` take
+the powers of two to 2048 for ``prefill_text`` and ``mixed``, since the LLM's
+2048-token step budget (``MAX_BATCH_TOKENS``) caps both. Each bucket adds
+captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -686,9 +685,10 @@ Qwen3-Omni notes
   ops. Its 15 depth steps feed each sampled code into the next, so small
   differences can change later codes at near-ties.
 - The Thinker's text and audio prefill replay captured graphs on the ladder
-  ``128 ... 2048`` tokens, and a longer step runs eagerly.
-  ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
-  ladder. Each bucket adds captures, graph memory and startup time.
+  ``128 ... 2048`` tokens, and a longer step runs eagerly. The serving
+  config's ``prefill_token_buckets: {Thinker: {prefill_text: [...]}}`` sets a
+  deployment's own ladder (see :doc:`serving`). Each bucket adds captures,
+  graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another. On one GPU a

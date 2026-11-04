@@ -1,5 +1,6 @@
 
 
+import functools
 import logging
 import os
 import threading
@@ -191,6 +192,8 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # the serving config's prefill_token_buckets for the node: capture walk -> ladder
+    token_ladders: Mapping[str, Any] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -603,7 +606,10 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        token_ladders: Mapping[str, Any] | None = None,
     ):
+        """``token_ladders``: the serving config's ``prefill_token_buckets``,
+        node -> capture walk -> ladder, which the node's captures take at warmup."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -695,6 +701,7 @@ class Engine:
                 # the dtype the engine manager cast this node to
                 node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                token_ladders=(token_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
             self._submodules[node_name].lora_pools = tuple(
@@ -853,6 +860,8 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
+                token_ladders=submodule_mgmt.token_ladders,
+                step_budget=functools.partial(self._chunking.step_budget, node_name),
             )
             self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(

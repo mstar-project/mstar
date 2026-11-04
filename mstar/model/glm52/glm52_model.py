@@ -84,9 +84,8 @@ class Glm52Model(Model):
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "graph_compile" in kwargs:
             self.config.graph_compile = bool(kwargs["graph_compile"])
-        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = [int(n) for n in kwargs["prefill_capture_batch_sizes"]]
         if int(kwargs.get("mtp_num_draft_tokens", 0)) > 0:
             raise ValueError(
                 "mtp_num_draft_tokens > 0: GLM-5.2 MTP speculative decoding is "

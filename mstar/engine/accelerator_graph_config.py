@@ -1,4 +1,6 @@
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -7,6 +9,8 @@ import torch
 
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+
+logger = logging.getLogger(__name__)
 
 # A compile mode of the engine's own rather than torch.compile's: Inductor's
 # defaults in its deterministic mode, which picks each kernel's config by rule
@@ -243,6 +247,56 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return [
             self.make_node_input(n) for n in seq_lens
         ]
+
+
+def apply_token_ladders(
+    node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
+    step_budget: Callable[[str], int | None],
+) -> None:
+    """Take a serving config's ``prefill_token_buckets`` for ``node``
+    (capture walk -> ladder) as the ``capture_token_lengths`` of the node's
+    packed captures of that walk.
+
+    A ladder runs to the first rung that holds the token budget of the steps
+    its capture replays (``step_budget`` of each replay walk; none where any of
+    them has none): the scheduler builds no step past it, so a rung beyond
+    would never replay. A walk with no packed capture on the node is refused.
+    """
+    if not isinstance(ladders, Mapping):
+        raise ValueError(
+            f"prefill_token_buckets for {node} takes capture walk -> ladder, got {ladders!r}"
+        )
+    packed = [c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)]
+    for walk, ladder in ladders.items():
+        if (
+            not isinstance(ladder, (list, tuple)) or not ladder
+            or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in ladder)
+            or len(set(ladder)) < len(ladder)
+        ):
+            raise ValueError(
+                f"prefill_token_buckets for {node}/{walk} must be a non-empty list of "
+                f"distinct positive token counts, got {ladder!r}"
+            )
+        targets = [c for c in packed if c.capture_graph_walk == walk]
+        if not targets:
+            raise ValueError(
+                f"prefill_token_buckets names walk {walk!r} of {node}, which has no packed capture; "
+                f"its packed captures are {sorted({c.capture_graph_walk for c in packed})}"
+            )
+        for config in targets:
+            budgets = [step_budget(w) for w in config.replay_graph_walks]
+            rungs = sorted(ladder)
+            if None not in budgets:
+                budget = max(budgets)
+                held = next((i for i, n in enumerate(rungs) if n >= budget), len(rungs) - 1)
+                if held + 1 < len(rungs):
+                    logger.info(
+                        "%s/%s: drops prefill_token_buckets %s, past the first that holds its "
+                        "%d-token step budget", node, walk, rungs[held + 1:], budget,
+                    )
+                rungs = rungs[:held + 1]
+            config.capture_token_lengths = rungs
+
 
 class PiecewiseConfigType(Enum):
     BATCHED = "batched"

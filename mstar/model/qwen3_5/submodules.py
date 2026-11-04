@@ -109,9 +109,9 @@ class LLMSubmodule(ARNodeSubmodule):
     # batch of prompts up to a power of two long fills one exactly. 2176, 4352
     # and 8704 add 1/16 above them for the decode rows a mixed step carries
     # beside four prompts and for batches a few tokens over, which would
-    # otherwise pad to twice the width. A deployment sets its own with
-    # `model_kwargs.prefill_token_buckets` (static buffers are sized by the
-    # largest bucket).
+    # otherwise pad to twice the width. A deployment sets its own per walk with
+    # the serving config's `prefill_token_buckets` (static buffers are sized by
+    # the largest bucket).
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
@@ -155,16 +155,13 @@ class LLMSubmodule(ARNodeSubmodule):
         model: Qwen3_5ForCausalLM,
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
-        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__(prefill_token_buckets)
+        super().__init__()
         if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
             logger.warning(
                 "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
-                "with `model_kwargs.prefill_token_buckets` in the serving config",
+                "with `prefill_token_buckets` in the serving config",
             )
-        # follows a deployment's own prefill ladder
-        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
         self.model = model
         self.config = config
         self.vision_config = vision_config
