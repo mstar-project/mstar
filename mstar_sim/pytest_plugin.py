@@ -12,16 +12,28 @@ the ones that check for a GPU in their body
 (on a CPU they ``print`` and ``return``, and pass).
 
 Nothing is computed on the emulated GPU, so a test that checks values (parity,
-an error bound) can't pass. A test is reported as an expected failure when it
-fails an ``assert`` after reading a never-computed value, or fails in any way
-after an op whose output shape depends on never-computed values (``nonzero``
-of a mask, run on zeros). Every other failure stays a failure: an exception
-from mstar's own code (a lifecycle or planning error, an API that moved, a
-crash), or an assertion made before any such read. A failure raised inside
-the emulator's own code is an emulator gap: reported as an expected failure and
-listed at the end of the run, so a gap never reads as a fault of mstar's.
-A ``pytest.raises`` that saw nothing after a stand-in kernel ran expected the
-kernel's own error check, which a stand-in doesn't have.
+an error bound) can't be answered. A test is reported as an expected failure when:
+
+- it fails an ``assert`` after a host read of a never-computed value, or fails in
+  any way after an op whose output shape depends on never-computed values
+  (``nonzero`` of a mask, run on zeros);
+- it passes, but its own code (directly, or through ``torch.testing``) read a
+  never-computed value: such a check saw zeros, and can't have failed.
+
+A value is never computed when no kernel computed it (``device.never_computed``):
+a large tensor's, one a stand-in wrote, an allocation not written yet, and what kept
+ops derive from those. So a pass means every value the test itself read was computed,
+as far as the emulator can tell: it can't tell of a host value mstar read from one
+and handed on (a sampled token in a list), of a value a real write made over part
+of such a tensor, or whether a real value could show what the test is for (a race,
+when values land at launch).
+
+Every other failure stays a failure: an exception from mstar's own code (a lifecycle
+or planning error, an API that moved, a crash), or an assertion made before any such
+read. A failure raised inside the emulator's own code is an emulator gap: reported as
+an expected failure and listed at the end of the run, so a gap never reads as a fault
+of mstar's. A ``pytest.raises`` that saw nothing after a stand-in kernel ran expected
+the kernel's own error check, which a stand-in doesn't have.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ from __future__ import annotations
 import ast
 import functools
 import inspect
+import os
 import re
 import sys
 import textwrap
@@ -38,11 +51,37 @@ import pytest
 from mstar_sim import device
 
 GAPS: list[tuple[str, str]] = []
+# host reads of never-computed values by the test's own code
+TEST_READS = [0]
+_host_read = device.uncomputed
+
+
+def _uncomputed() -> None:
+    _host_read()
+    frame = sys._getframe(1)
+    while frame is not None:  # the reader: the innermost frame that isn't torch's or the emulator's
+        path = frame.f_code.co_filename
+        if not _library(path) and (_EMULATOR not in path or "/mstar_sim/tests/" in path):
+            TEST_READS[0] += _test_code(path)
+            return
+        frame = frame.f_back
+
+
+device.uncomputed = _uncomputed
+
+
+def _library(path: str) -> bool:
+    return "site-packages" in path or "/lib/python" in path or "<" in path
+
+
+def _test_code(path: str) -> bool:
+    return "/test/" in path or "/tests/" in path or os.path.basename(path).startswith(("test_", "conftest"))
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     device.VALUELESS_READS[0] = 0
+    TEST_READS[0] = 0
     device.VALUE_SHAPES[0] = 0
     device.KERNELS_RUN[0] = 0
     # a device-side assert poisons the process, as on CUDA; each test reports its own
@@ -87,7 +126,7 @@ def _raised_in_emulator(excinfo) -> str | None:
     # the innermost frame of this tree (not torch, triton or the stdlib under it) decides
     for entry in reversed(excinfo.traceback):
         path = str(entry.path)
-        if "site-packages" in path or "/lib/python" in path or "<" in path:
+        if _library(path):
             continue
         if _EMULATOR in path and "/mstar_sim/tests/" not in path:
             return f"{path.rsplit(_EMULATOR, maxsplit=1)[-1]}:{entry.lineno + 1}"
@@ -99,6 +138,10 @@ def _raised_in_emulator(excinfo) -> str | None:
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    if report.passed and report.when == "call" and TEST_READS[0]:
+        report.outcome = "skipped"
+        report.wasxfail = f"mstar_sim: passed, but it read {TEST_READS[0]} never-computed value(s): unanswered"
+        return
     if not report.failed or call.excinfo is None or report.when not in ("setup", "call"):
         return
     if _needs_the_hub(call.excinfo):

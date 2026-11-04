@@ -120,7 +120,7 @@ def kv_scatter() -> None:
 
     # (layer, k, v, page_idx, cache_idx); older trees put the cache and a layer index first:
     # either way k is the fourth from last
-    @clock.kernel_fn("triton._kv_scatter_nhd_kernel",
+    @clock.kernel_fn("triton._kv_scatter_nhd_kernel", writes_args=True,
                      cost=lambda *a: (0.0, 4.0 * a[-4].numel() * a[-4].element_size()))
     def scatter_nhd(*args):
         return None  # in place

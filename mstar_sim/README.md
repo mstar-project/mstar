@@ -59,7 +59,7 @@ Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-c
 ## Repro tips
 
 - **Models by name, no weights.** `python -m mstar_sim.checkpoint <repo> --hf-home <dir>` writes a shapes-only copy into a Hugging Face cache (headers over sparse files, about 20 MB for 27B). Run with `HF_HOME=<dir> HF_HUB_OFFLINE=1`, and `from_pretrained`, `snapshot_download` and `hf_hub_download` find it.
-- **GPU-only tests.** `python -m mstar_sim --fast -- -m pytest -p mstar_sim.pytest_plugin --gpu-only <paths>` runs the tests a CPU box skips for want of a GPU. It reports value checks the emulator can't answer as expected failures, and lists its own gaps at the end.
+- **GPU-only tests.** `python -m mstar_sim --fast -- -m pytest -p mstar_sim.pytest_plugin --gpu-only <paths>` runs the tests a CPU box skips for want of a GPU. It reports value checks the emulator can't answer as expected failures, whether they failed or passed (a test whose own code read a never-computed value saw zeros, and can't have failed), and lists its own gaps at the end. The plugin's docstring says what a pass does and doesn't show.
 - **Timing-shaped bugs** (queues that fill while the GPU is busy): drop `--fast`, and slow the GPU with `--time-scale K`. Under `--fast` every CUDA event has completed by the time anyone asks, so code that branches on `event.query()` only takes its "still pending" path in a timed run. A copy's value lands when it is launched, in either mode.
 - **Hangs.** `kill -USR1 <server pid>` prints every thread's stack in that process and in all its children (the workers).
 - **Your own probes** (a `sitecustomize.py` on `PYTHONPATH`):

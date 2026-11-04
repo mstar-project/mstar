@@ -576,7 +576,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
     failure; a name an emulated object lacks is the emulator's gap; mstar's own error
     stays its own, whatever library it names. An assert is a value check, the one failure
     the plugin expects, only once a never-computed value has been read: not for making a
-    scratch buffer, or exporting a storage."""
+    scratch buffer, or exporting a storage. A pass isn't reported for a test whose own code
+    read a never-computed value: that check can't have failed."""
     (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
         import torch
         def test_host_read_in_capture():
@@ -603,16 +604,29 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             kept = torch.arange(4, device="cuda")
             kept[:2] = torch.empty(1 << 14, dtype=torch.long, device="cuda")[:2]
             assert kept.tolist() == [5, 6, 2, 3]
+        def test_parity_of_two_never_computed_values():
+            import flashinfer
+            rows = flashinfer.top_k_renorm_probs(torch.empty(2, 4, device="cuda"), 1)  # small: kept
+            torch.testing.assert_close(rows * 2, torch.zeros(2, 4, device="cuda"))
+        def test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape():
+            import flashinfer
+            tokens = flashinfer.sampling_from_probs(torch.empty(2, 512, device="cuda"))
+            helper = eval(compile("lambda t: t.tolist()", "/mstar/worker.py", "eval"))
+            assert len(helper(tokens)) == 2
+        def test_passing_value_check():
+            assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
     """))
-    out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfx", "test_cases.py", emulated=True,
+    out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfxp", "test_cases.py", emulated=True,
                      MSTAR_SIM_FAST="1")
     outcomes = {line.split()[1].split("::")[1]: line.split()[0] for line in out.splitlines()
-                if line.startswith(("FAILED", "XFAIL"))}
+                if line.startswith(("FAILED", "XFAIL", "PASSED"))}
     assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
                         "test_own_error_names_a_library": "FAILED", "test_tensor_lacks_an_attribute": "FAILED",
                         "test_filled_scratch_buffer": "FAILED",
                         "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL",
-                        "test_never_computed_write": "XFAIL"}, out
+                        "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
+                        "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
+                        "test_passing_value_check": "PASSED"}, out
 
 
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
