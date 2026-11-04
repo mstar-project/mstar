@@ -32,7 +32,7 @@ def install() -> None:
     def launch(self, *args, grid, warmup, **kwargs):
         name = f"triton.{getattr(self.fn, '__name__', 'kernel')}"
 
-        @clock.kernel_fn(name, cost=_traffic, static=True)
+        @clock.kernel_fn(name, cost=_traffic, static=True, writes_args=True)
         def body(*a, **k):
             return None  # its outputs are value-less: nothing to run
 

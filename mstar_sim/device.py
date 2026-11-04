@@ -100,9 +100,20 @@ def _is_meta(x) -> bool:
     return isinstance(x, torch.Tensor) and x.device.type == "meta"
 
 
-# host reads of never-computed values so far (zeros were returned): a check on
+# never-computed values so far: host reads of value-less tensors (zeros were
+# returned), and value-holding tensors that stand in for a kernel's output (a
+# zero-filled empty, a stand-in's or a Triton launch's small ints). A check on
 # values after one is a check the emulator can't answer (``mstar_sim.pytest_plugin``)
 VALUELESS_READS = [0]
+
+
+def uncomputed() -> None:
+    VALUELESS_READS[0] += 1
+
+
+# stand-in kernels run so far: a test that expected a kernel's own error check
+# (pytest.raises around a launch) can't see it from a stand-in
+KERNELS_RUN = [0]
 # ops run on zeros because their output shape depends on values never computed:
 # any failure after one is the emulator's, not mstar's
 VALUE_SHAPES = [0]
@@ -590,6 +601,7 @@ def _fast(func, args, kwargs, flat, index):
         raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
+            uncomputed()
     view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
     if not view and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
@@ -872,6 +884,7 @@ def _create(func, args, kwargs, device):
         out = func(*args, **dict(kwargs, device=target))
     if target is CPU and func in _UNINITIALIZED:
         out.zero_()  # a never-computed value reads as zeros, not as the host heap's garbage
+        uncomputed()
     if func in (torch.tensor, torch.as_tensor, torch.from_numpy) and isinstance(out, T):
         clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
     return tree_map(

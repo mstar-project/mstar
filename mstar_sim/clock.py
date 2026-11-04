@@ -158,7 +158,20 @@ def set_capturing(tape: Tape | None) -> Tape | None:
     return previous
 
 
-def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, static: bool = False):
+def _flag_values(out, written):
+    """A stand-in's value-holding outputs (small ints: a sampled token) hold no
+    kernel's values; nor do value-holding tensors it was handed to write."""
+    from mstar_sim import device
+
+    device.KERNELS_RUN[0] += 1
+    if any(isinstance(t, device.SimTensor) and t._data.device.type != "meta"
+           for t in device.tree_flatten((out, written))[0]):
+        device.uncomputed()
+    return out
+
+
+def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, static: bool = False,
+              writes_args: bool = False):
     """Make a stand-in one kernel of the simulated GPU.
 
     The decorated function computes nothing: it returns what the kernel would
@@ -167,15 +180,18 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
     returns ``(flops, bytes)``, or ``(flops, bytes, features)`` with the
     geometry a measured table needs (:func:`mstar_sim.cost.kernel_seconds`).
     ``static``: the cost depends only on argument shapes, so a captured graph
-    prices it once rather than on every replay."""
+    prices it once rather than on every replay. ``writes_args``: it writes its
+    arguments in place, with no telling which (a Triton launch)."""
 
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             from mstar_sim import cost as cost_model
 
-            if FAST or in_kernel():
+            if in_kernel():
                 return fn(*args, **kwargs)
+            if FAST:
+                return _flag_values(fn(*args, **kwargs), args if writes_args else ())
 
             def seconds() -> float:
                 flops, nbytes, *features = cost(*args, **kwargs) if cost is not None else (0.0, 0.0)
@@ -186,7 +202,7 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
             _tls.in_kernel = getattr(_tls, "in_kernel", 0) + 1
             try:
                 with computing():
-                    out = fn(*args, **kwargs)
+                    out = _flag_values(fn(*args, **kwargs), args if writes_args else ())
             finally:
                 _tls.in_kernel -= 1
             tape = capturing()

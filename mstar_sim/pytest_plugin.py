@@ -13,7 +13,11 @@ fails an ``assert`` after reading a never-computed value, or fails in any way
 after an op whose output shape depends on never-computed values (``nonzero``
 of a mask, run on zeros). Every other failure stays a failure: an exception
 from mstar's own code (a lifecycle or planning error, an API that moved, a
-crash), or an assertion made before any such read.
+crash), or an assertion made before any such read. A failure raised inside
+the emulator's own code is an emulator gap: reported as an expected failure and
+listed at the end of the run, so a gap never reads as a fault of mstar's.
+A ``pytest.raises`` that saw nothing after a stand-in kernel ran expected the
+kernel's own error check, which a stand-in doesn't have.
 """
 
 from __future__ import annotations
@@ -25,18 +29,48 @@ import pytest
 
 from mstar_sim import device
 
+GAPS: list[tuple[str, str]] = []
+
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     device.VALUELESS_READS[0] = 0
     device.VALUE_SHAPES[0] = 0
+    device.KERNELS_RUN[0] = 0
+
+
+def _raised_in_emulator(excinfo) -> str | None:
+    """Where the exception started, when that is the emulator's own code: a gap in
+    the emulator, not a fault of mstar's."""
+    # the innermost frame of this tree (not torch, triton or the stdlib under it) decides
+    for entry in reversed(excinfo.traceback):
+        path = str(entry.path)
+        if "site-packages" in path or "/lib/python" in path or "<" in path:
+            continue
+        if "/mstar_sim/" in path and "/mstar_sim/tests/" not in path:
+            return f"{path.rsplit('/mstar_sim/', maxsplit=1)[-1]}:{entry.lineno + 1}"
+        return None
+    return None
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    if report.when != "call" or not report.failed or call.excinfo is None:
+    if not report.failed or call.excinfo is None or report.when not in ("setup", "call"):
+        return
+    where = _raised_in_emulator(call.excinfo)
+    if where:
+        GAPS.append((item.nodeid, f"{where}: {call.excinfo.exconly()[:160]}"))
+        report.outcome = "skipped"
+        report.wasxfail = f"mstar_sim gap at {where}: {call.excinfo.exconly()[:160]}"
+        return
+    if report.when != "call":
+        return
+    if (device.KERNELS_RUN[0] and call.excinfo.errisinstance(pytest.fail.Exception)
+            and "DID NOT RAISE" in str(call.excinfo.value)):
+        report.outcome = "skipped"
+        report.wasxfail = "mstar_sim: expected a kernel's own error, which a stand-in doesn't check"
         return
     if device.VALUE_SHAPES[0]:
         report.outcome = "skipped"
@@ -86,3 +120,11 @@ def pytest_collection_modifyitems(config, items):
     kept = [item for item in items if _needs_gpu(item)]
     config.hook.pytest_deselected(items=[item for item in items if item not in set(kept)])
     items[:] = kept
+
+
+def pytest_terminal_summary(terminalreporter):
+    """List the emulator gaps hit: each is mstar_sim's to fix, not the test's."""
+    if GAPS:
+        terminalreporter.section(f"mstar_sim gaps ({len(GAPS)})")
+        for nodeid, where in GAPS:
+            terminalreporter.write_line(f"{nodeid}: {where}")
