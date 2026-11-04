@@ -19,12 +19,12 @@ ported.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from transformers import Qwen2TokenizerFast, WhisperFeatureExtractor
+from transformers import Qwen2Tokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -65,6 +65,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
 )
+from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -86,6 +87,7 @@ from mstar.model.minicpm_o.config import (
     LLM_KV,
     LLM_POS,
     LLM_SAMPLER,
+    PREFILL_WALKS,
     RESAMPLER_ATTN,
     SPEECH_TEXT_TOKENS,
     T2W_KV,
@@ -166,6 +168,8 @@ _WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
         LLM: ("text_inputs", "image_positions", "audio_positions"),
     },
 }
+# TokenStop ends a reply on a stop sampled in PREFILL_WALKS, so each prefill walk is there
+assert set(_WALK_INPUTS) == PREFILL_WALKS
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
@@ -213,10 +217,10 @@ class MiniCPMOModel(Model):
             raise ValueError(f"max_seq_len must be in 1..{limit} (max_position_embeddings), got {max_seq_len!r}")
         # upstream's tokenizer class is Qwen2's with token-name attributes added
         self.tts_config = TTSConfig.from_hf(self.config.tts_config)
-        tokenizer = Qwen2TokenizerFast.from_pretrained(self.local_dir)
+        tokenizer = Qwen2Tokenizer.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
         # upstream's mel: Whisper's, as its own audio processor configures it
-        self._mel = WhisperFeatureExtractor(feature_size=self.config.audio.num_mel_bins)
+        self.log_mel = LogMelSpectrogram(num_mel_bins=self.config.audio.num_mel_bins)
         # A reply ends on <|im_end|> (the tokenizer's eos; config.json names
         # only that) or <|endoftext|>, as upstream's `chat` terminators; and
         # a spoken reply's text closes with <|tts_eos|> just before <|im_end|>,
@@ -225,7 +229,7 @@ class MiniCPMOModel(Model):
             tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>", "<|tts_eos|>")
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
-        self._voices: dict[str, np.ndarray] = {}
+        self._voices: dict[str, torch.Tensor] = {}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """A spoken reply holds a slot of each ``t2w_*`` resource, so one count sizes
@@ -274,6 +278,8 @@ class MiniCPMOModel(Model):
             SamplerSpec(
                 resource_key=LLM_SAMPLER, nodes={LLM},
                 vocab_size=llm.vocab_size, enable_repetion_penalty=True,
+                # upstream's `chat` hands min_p to HF `generate`, which honours it
+                enable_min_p=True,
             ),
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={VISION},
@@ -521,7 +527,7 @@ class MiniCPMOModel(Model):
         has_audio: bool,
         enable_thinking: bool,
         system_prompt: str | None,
-        voice_audio: np.ndarray | None,
+        voice_audio: torch.Tensor | None,
         speech: bool,
     ) -> str:
         """The chat string as upstream's `chat` renders it: a message per turn,
@@ -589,7 +595,7 @@ class MiniCPMOModel(Model):
         if not any(p.text for p in parts if p.modality == TEXT) and not raw_images and not raw_audios:
             raise ValueError("MiniCPM-o got a request with no text and no attachments")
 
-        audios = [a.reshape(-1).float().cpu().numpy() for a in raw_audios]
+        audios = [a.reshape(-1).float().cpu() for a in raw_audios]
         # `voice_prompt=False` leaves the voice clip out of the system message
         # (the reply is still spoken in the voice): what vllm-omni's examples
         # send, so the two can be compared on the same conditioning
@@ -638,18 +644,16 @@ class MiniCPMOModel(Model):
             result["image_positions"] = [image_positions]
 
         if audios:
-            mel = self._mel(
-                [piece for a in audios for piece in processor.audio_pieces(a)],
-                sampling_rate=processor.SAMPLE_RATE, padding="max_length",
-                return_attention_mask=True, return_tensors="pt",
-            )
+            all_pieces = [piece for a in audios for piece in processor.audio_pieces(a)]
+            # each piece padded to Whisper's 30 s window, then cut to its own frames
+            mel = self.log_mel(torch.stack([self.log_mel.pad_or_trim(piece) for piece in all_pieces]))
             # a piece shorter than one pooling step (a clip under ~0.1 s, or what
             # is left of a long one past its last 30 s cut) pools to no tokens
             lens = [
-                (i, n) for i, n in enumerate(mel["attention_mask"].sum(dim=1).tolist())
+                (i, n) for i, n in enumerate(math.ceil(len(piece) / HOP_LENGTH) for piece in all_pieces)
                 if self.config.audio.pooled_tokens(n) > 0
             ]
-            pieces = [mel["input_features"][i, :, :n] for i, n in lens]
+            pieces = [mel[i, :, :n] for i, n in lens]
             tokens = sum(self.config.audio.pooled_tokens(n) for _, n in lens)
             if audio_positions.numel() != tokens:
                 # upstream sizes the placeholder off the whole clip but encodes
@@ -715,7 +719,7 @@ class MiniCPMOModel(Model):
     def get_default_voice(self) -> str:
         return DEFAULT_VOICE
 
-    def voice_audio(self, voice: str | None) -> np.ndarray:
+    def voice_audio(self, voice: str | None) -> torch.Tensor:
         """A bundled voice's 16 kHz reference clip, which the LLM hears in the
         system prompt (and token2wav clones)."""
         name = voice or DEFAULT_VOICE
@@ -728,7 +732,7 @@ class MiniCPMOModel(Model):
             audio, rate = sf.read(Path(self.local_dir) / "assets" / VOICES[name], dtype="float32")
             if rate != 16000 or audio.ndim != 1:
                 raise ValueError(f"voice {name!r} is not 16 kHz mono")
-            cached = self._voices[name] = audio
+            cached = self._voices[name] = torch.from_numpy(audio)
         return cached
 
     def text_output(self) -> TextOutput:
@@ -900,7 +904,7 @@ class MiniCPMOModel(Model):
         # the reference prepares voice prompts on the CPU; it is once per voice
         t2w.voice_encoder.cpu()
         voices = {
-            name: t2w.prepare_voice(t2w.voice_encoder(torch.from_numpy(self.voice_audio(name))))
+            name: t2w.prepare_voice(t2w.voice_encoder(self.voice_audio(name)))
             for name in VOICES
         }
         logger.info("Loaded MiniCPM-o token2wav with voices %s onto %s", sorted(voices), device)

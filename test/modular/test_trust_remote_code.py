@@ -156,6 +156,20 @@ def test_nemotron_tokenizer_needing_repo_code_fails_without_running_it(monkeypat
     assert not marker.exists()
 
 
+# a shrunk MiniCPM-o 4.5 config.json with just the fields MiniCPMOModel() parses;
+# the constructor reads this file and loads the tokenizer, and touches no weights.
+# hidden_size >= 128: the resampler has hidden_size // 128 heads
+MINICPM_O_CONFIG = {
+    "version": "4.5", "hidden_size": 128, "num_attention_heads": 4, "query_num": 64,
+    "vision_config": {}, "audio_chunk_length": 1.0, "audio_pool_step": 5,
+    "audio_config": {
+        "d_model": 32, "encoder_layers": 1, "encoder_attention_heads": 2, "encoder_ffn_dim": 64,
+        "num_mel_bins": 80, "max_source_positions": 1500, "activation_function": "gelu",
+    },
+    "tts_config": {"backbone_model": "llama", "condition_type": "hidden_text_merge"},
+}
+
+
 def test_minicpm_o_loads_without_its_repo_code(tmp_path):
     """The checkpoint maps its tokenizer and processor to repo code."""
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
@@ -168,15 +182,7 @@ def test_minicpm_o_loads_without_its_repo_code(tmp_path):
             "auto_map": {"AutoTokenizer": ["tokenization_minicpmo_fast.MiniCPMOTokenizerFast", None]},
         },
         {
-            "config.json": json.dumps({
-                "version": "4.5", "hidden_size": 64, "num_attention_heads": 4, "query_num": 64,
-                "vision_config": {}, "audio_chunk_length": 1.0, "audio_pool_step": 5,
-                "audio_config": {
-                    "d_model": 32, "encoder_layers": 1, "encoder_attention_heads": 2, "encoder_ffn_dim": 64,
-                    "num_mel_bins": 80, "max_source_positions": 1500, "activation_function": "gelu",
-                },
-                "tts_config": {"backbone_model": "llama", "condition_type": "hidden_text_merge"},
-            }),
+            "config.json": json.dumps(MINICPM_O_CONFIG),
             "preprocessor_config.json": json.dumps({
                 "processor_class": "MiniCPMOProcessor",
                 "auto_map": {"AutoProcessor": "processing_minicpmo.MiniCPMOProcessor"},

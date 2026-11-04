@@ -1,10 +1,10 @@
-"""MiniCPM-o 4.5's prompt preprocessing: image slicing, the audio mel and the
+"""MiniCPM-o 4.5's prompt preprocessing: image slicing, audio pieces and the
 placeholder layout, ported from the checkpoint's ``processing_minicpmo.py`` so
 no Python from the checkpoint repo runs (#509).
 
 The rendered chat marks each attachment with a tag; ``expand_tags`` swaps each
-for its run of ``<unk>`` placeholder tokens, and ``placeholder_positions``
-finds the runs in the tokenized prompt, as upstream's ``_convert`` does.
+for its run of ``<unk>`` placeholder tokens, and ``prompt_ids`` finds the runs
+in the tokenized prompt, as upstream's ``_convert`` does.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE
 from mstar.model.minicpm_o.config import AudioConfig
 
 IMAGE_TAG = "<image>./</image>"
@@ -23,10 +24,8 @@ AUDIO_TAG = "<audio>./</audio>"
 # the 4.5 checkpoint's preprocessor_config.json
 SCALE_RESOLUTION = 448
 MAX_SLICE_NUMS = 9
-SAMPLE_RATE = 16000
 # upstream encodes a clip in pieces of at most this long
 MAX_AUDIO_SECONDS = 30
-_MEL_HOP = 160
 
 
 # ----------------------------------------------------------------------------
@@ -115,15 +114,18 @@ def slice_patches(image: Image.Image, patch_size: int) -> tuple[torch.Tensor, tu
 # ----------------------------------------------------------------------------
 
 
-def audio_pieces(audio: np.ndarray) -> list[np.ndarray]:
-    """A clip cut into the pieces upstream encodes one by one."""
+def audio_pieces(audio: torch.Tensor) -> list[torch.Tensor]:
+    """A clip cut into the pieces upstream encodes one by one. Each clip is
+    its own: upstream merges the clips of one message into one, but sizes
+    their placeholders clip by clip, and the two round differently (upstream's
+    own `chat` fails on such prompts)."""
     step = MAX_AUDIO_SECONDS * SAMPLE_RATE
     return [audio[i:i + step] for i in range(0, len(audio), step)] or [audio]
 
 
 def audio_placeholder(num_samples: int, audio: AudioConfig) -> str:
     """A clip's placeholder text, sized off the whole clip (not its pieces)."""
-    tokens = audio.pooled_tokens(math.ceil(num_samples / _MEL_HOP))
+    tokens = audio.pooled_tokens(math.ceil(num_samples / HOP_LENGTH))
     return "<|audio_start|>" + "<unk>" * tokens + "<|audio_end|>"
 
 
@@ -134,8 +136,12 @@ def audio_placeholder(num_samples: int, audio: AudioConfig) -> str:
 
 def expand_tags(text: str, image_placeholders: list[str], audio_placeholders: list[str]) -> str:
     """``text`` with each attachment tag replaced by its placeholder, in order."""
-    images, audios = iter(image_placeholders), iter(audio_placeholders)
     chunks = re.split(f"({re.escape(IMAGE_TAG)}|{re.escape(AUDIO_TAG)})", text)
+    # a tag typed into the prompt or system prompt leaves a tag with no attachment
+    for tag, placeholders in ((IMAGE_TAG, image_placeholders), (AUDIO_TAG, audio_placeholders)):
+        if (n := chunks.count(tag)) != len(placeholders):
+            raise ValueError(f"the prompt contains {n} {tag} attachment tags for {len(placeholders)} attachments")
+    images, audios = iter(image_placeholders), iter(audio_placeholders)
     return "".join(
         next(images) if chunk == IMAGE_TAG else next(audios) if chunk == AUDIO_TAG else chunk
         for chunk in chunks
