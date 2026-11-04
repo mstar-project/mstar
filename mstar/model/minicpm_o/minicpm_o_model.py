@@ -50,7 +50,9 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    AUDIO_FEATURE_LENS,
     DECODE_LOOP,
+    IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -76,16 +78,16 @@ DEFAULT_SAMPLING = dict(temperature=0.7, top_p=0.8, top_k=100, repetition_penalt
 _WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
     "prefill_text": {LLM: ("text_inputs",)},
     "prefill_image": {
-        VISION: ("pixel_values", "image_tgt_sizes"),
+        VISION: ("pixel_values",),
         LLM: ("text_inputs", "image_positions"),
     },
     "prefill_audio": {
-        AUDIO: ("audio_features", "audio_feature_lens"),
+        AUDIO: ("audio_features",),
         LLM: ("text_inputs", "audio_positions"),
     },
     "prefill_omni": {
-        VISION: ("pixel_values", "image_tgt_sizes"),
-        AUDIO: ("audio_features", "audio_feature_lens"),
+        VISION: ("pixel_values",),
+        AUDIO: ("audio_features",),
         LLM: ("text_inputs", "image_positions", "audio_positions"),
     },
 }
@@ -125,6 +127,8 @@ def _bound_positions(bounds: torch.Tensor) -> torch.Tensor:
 
 class MiniCPMOModel(Model):
     PREPROCESS_TORCH_THREADS = 4
+    # the encoders' segment sizes, which process_prompt settles
+    INTERNAL_KWARGS = (IMAGE_TGT_SIZES, AUDIO_FEATURE_LENS)
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None, max_seq_len: int | None = None, **kwargs: Any,
@@ -242,11 +246,11 @@ class MiniCPMOModel(Model):
             )
 
         vision = GraphNode(
-            name=VISION, input_names=["pixel_values", "image_tgt_sizes"],
+            name=VISION, input_names=["pixel_values"],
             outputs=[GraphEdge(next_node=LLM, name="vision_embeds")],
         )
         audio = GraphNode(
-            name=AUDIO, input_names=["audio_features", "audio_feature_lens"],
+            name=AUDIO, input_names=["audio_features"],
             outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
         )
         decode = Loop(
@@ -355,6 +359,7 @@ class MiniCPMOModel(Model):
         )
         input_ids = out["input_ids"][0].long()
         result: NameToTensorList = {"text_inputs": [input_ids]}
+        metadata: dict[str, Any] = {}
 
         if images:
             strips = out["pixel_values"][0]
@@ -371,7 +376,7 @@ class MiniCPMOModel(Model):
                     f"{len(strips)} slices x {self.config.resampler.num_queries} queries"
                 )
             result["pixel_values"] = [patches]
-            result["image_tgt_sizes"] = [out["tgt_sizes"][0].int()]
+            metadata[IMAGE_TGT_SIZES] = [(int(h), int(w)) for h, w in out["tgt_sizes"][0].tolist()]
             result["image_positions"] = [positions]
 
         if audios:
@@ -393,7 +398,7 @@ class MiniCPMOModel(Model):
                 )
             if pieces:  # else the clips are all too short to encode, and the prompt is text only
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
-                result["audio_feature_lens"] = [lens]
+                metadata[AUDIO_FEATURE_LENS] = lens.tolist()
                 result["audio_positions"] = [positions]
         # the prefill writes every prompt row, placeholders included, then a row per decode step
         rows = int(input_ids.numel())
@@ -401,7 +406,7 @@ class MiniCPMOModel(Model):
             spans=(Span("rows", self._prefill_walk(result), rows, rows, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )
-        return ProcessPromptOutput(result, {"kv_layout": {LLM_KV: {"main": layout}}})
+        return ProcessPromptOutput(result, {**metadata, "kv_layout": {LLM_KV: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill samples the first of max_output_tokens, so the loop runs one fewer
@@ -460,10 +465,12 @@ class MiniCPMOModel(Model):
             is_prefill=True,
         )
         inputs = self._walk_inputs(walk, input_signals)
+        model_kwargs = model_kwargs or {}
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
+            step_metadata={k: model_kwargs[k] for k in self.INTERNAL_KWARGS if k in model_kwargs},
         )
 
     def get_partition_forward_pass_args(

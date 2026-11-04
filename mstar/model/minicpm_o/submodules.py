@@ -32,7 +32,9 @@ from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    AUDIO_FEATURE_LENS,
     DECODE_LOOP,
+    IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -54,6 +56,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -230,10 +233,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        tgt_sizes = [
-            (int(h), int(w)) for t in inputs["image_tgt_sizes"] for h, w in t.reshape(-1, 2).tolist()
-        ]
-        layout = slice_layout(tgt_sizes, self.config.vision)
+        layout = slice_layout([tuple(hw) for hw in fwd_info.step_metadata[IMAGE_TGT_SIZES]], self.config.vision)
         patches = torch.cat(inputs["pixel_values"])
         return NodeInputs(
             input_seq_len=patches.shape[0],
@@ -275,12 +275,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
         device = self.get_device()
 
         def cat(name):
-            return torch.cat([inp.tensor_inputs[name] for inp in inputs]).to(device)
+            return torch.cat([inp.tensor_inputs[name] for inp in inputs])
 
         return {
-            "patches": cat("patches"),
-            "position_ids": cat("position_ids"),
-            "grid_coords": cat("grid_coords"),
+            "patches": cat("patches").to(device),
+            # built on the host: a pageable copy would wait out the running step
+            "position_ids": to_device_nonblocking(cat("position_ids"), device),
+            "grid_coords": to_device_nonblocking(cat("grid_coords"), device),
             "slices_per_request": [len(inp.kwargs["seq_lengths"]) for inp in inputs],
         }
 
@@ -326,7 +327,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        mel_lens = [int(n) for t in inputs["audio_feature_lens"] for n in t.reshape(-1).tolist()]
+        mel_lens = list(fwd_info.step_metadata[AUDIO_FEATURE_LENS])
         features = torch.cat(inputs["audio_features"], dim=-1)
         frames = [self.config.audio.conv_frames(n) for n in mel_lens]
         return NodeInputs(

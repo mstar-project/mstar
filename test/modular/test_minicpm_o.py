@@ -146,15 +146,16 @@ def a_clip(seconds=3.0):
 def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
     from mstar.model.multimodal import PromptPart
 
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["image", "text"], ["text"],
         tensors={"image_inputs": [an_image()]},
         prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
         max_slice_nums=max_slice_nums,
-    ).new_input_tensors
+    )
+    out = prompt.new_input_tensors
     ids = out["text_inputs"][0]
     positions = out["image_positions"][0]
-    tgt = out["image_tgt_sizes"][0]
+    tgt = torch.tensor(prompt.metadata["image_tgt_sizes"])
     assert positions.numel() == tgt.shape[0] * model.config.resampler.num_queries
     unk = model.tokenizer.convert_tokens_to_ids("<unk>")
     assert (ids[positions] == unk).all()
@@ -165,12 +166,13 @@ def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
 def test_audio_placeholders_line_up_with_pooled_tokens(model):
     from mstar.model.multimodal import PromptPart
 
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["text", "audio"], ["text"],
         tensors={"audio_inputs": [a_clip()]},
         prompt_parts=[PromptPart("text", "Transcribe."), PromptPart("audio")],
-    ).new_input_tensors
-    lens = out["audio_feature_lens"][0].tolist()
+    )
+    out = prompt.new_input_tensors
+    lens = prompt.metadata["audio_feature_lens"]
     assert out["audio_positions"][0].numel() == sum(model.config.audio.pooled_tokens(n) for n in lens)
     # audio anywhere turns upstream's speech template on: the prompt ends on <|tts_bos|>
     assert out["text_inputs"][0][-1].item() == model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
@@ -185,19 +187,47 @@ def test_audio_placeholders_line_up_for_any_clips(model, seconds):
     from mstar.model.multimodal import PromptPart
 
     clips = [a_clip(s) for s in seconds]
-    out = model.process_prompt(
+    prompt = model.process_prompt(
         None, ["text"] + ["audio"] * len(clips), ["text"],
         tensors={"audio_inputs": clips},
         prompt_parts=[PromptPart("text", "Transcribe.")] + [PromptPart("audio")] * len(clips),
-    ).new_input_tensors
+    )
+    out = prompt.new_input_tensors
     audio = model.config.audio
-    if "audio_feature_lens" not in out:  # nothing long enough to encode
+    if "audio_feature_lens" not in prompt.metadata:  # nothing long enough to encode
         assert seconds == (0.06,)
         return
-    lens = out["audio_feature_lens"][0].tolist()
+    lens = prompt.metadata["audio_feature_lens"]
     assert min(audio.pooled_tokens(n) for n in lens) > 0
     assert out["audio_positions"][0].numel() == sum(audio.pooled_tokens(n) for n in lens)
     assert out["audio_features"][0].shape[-1] == sum(lens)
+
+
+@needs_ckpt
+def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
+    """The slice grids and mel lengths reach the encoders as step metadata,
+    and their segments cover the patches and frames the prompt carries."""
+    from mstar.model.minicpm_o.submodules import AudioEncoderSubmodule, VisionEncoderSubmodule
+    from mstar.model.multimodal import PromptPart
+
+    prompt = model.process_prompt(
+        None, ["image", "audio", "text"], ["text"],
+        tensors={"image_inputs": [an_image()], "audio_inputs": [a_clip()]},
+        prompt_parts=[PromptPart("image"), PromptPart("audio"), PromptPart("text", "What is this?")],
+    )
+    out = prompt.new_input_tensors
+    signals = {name: [None] for name in out}
+    args = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, model_kwargs=prompt.metadata)
+    assert args.full_metadata.graph_walk == "prefill_omni"
+    info = SimpleNamespace(step_metadata=args.step_metadata)
+    vision = VisionEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"pixel_values": out["pixel_values"]},
+    )
+    assert sum(vision.kwargs["seq_lengths"]) == vision.input_seq_len == out["pixel_values"][0].shape[0]
+    audio = AudioEncoderSubmodule(torch.nn.Identity(), model.config).prepare_inputs(
+        "prefill_omni", info, {"audio_features": out["audio_features"]},
+    )
+    assert sum(audio.kwargs["mel_lens"]) == out["audio_features"][0].shape[-1]
 
 
 @needs_ckpt
@@ -238,10 +268,9 @@ def test_max_seq_len_sizes_the_kv_and_the_decode_loop():
     "tensors, walk",
     [
         ({"text_inputs"}, "prefill_text"),
-        ({"text_inputs", "pixel_values", "image_tgt_sizes", "image_positions"}, "prefill_image"),
-        ({"text_inputs", "audio_features", "audio_feature_lens", "audio_positions"}, "prefill_audio"),
-        ({"text_inputs", "pixel_values", "image_tgt_sizes", "image_positions",
-          "audio_features", "audio_feature_lens", "audio_positions"}, "prefill_omni"),
+        ({"text_inputs", "pixel_values", "image_positions"}, "prefill_image"),
+        ({"text_inputs", "audio_features", "audio_positions"}, "prefill_audio"),
+        ({"text_inputs", "pixel_values", "image_positions", "audio_features", "audio_positions"}, "prefill_omni"),
     ],
 )
 def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
