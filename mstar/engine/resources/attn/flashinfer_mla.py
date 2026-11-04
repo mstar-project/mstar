@@ -26,7 +26,7 @@ from mstar.engine.resources.attn.base import (
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel
+from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -353,7 +353,9 @@ class FlashInferMLAManager(AttentionManager):
     def _bind_placement(self, placement: ContextParallel) -> None:
         # the latent is every TP rank's, so under TP placement it is attended for every partner's heads
         cfg = self._kv_config
-        self._wrapper_kwargs.update(placement.local_geometry(cfg.tokens_per_page, cfg.num_qo_heads))
+        self._wrapper_kwargs.update(
+            ContextParallelWrapper.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads),
+        )
         # the merge reads the natural-log lse fa2 and fa3 are known to return (`AttentionManager.build`
         # refuses the others); under auto a plan they refuse would fall through to another backend
         if self._wrapper_kwargs["backend"] == "auto" and torch.device(self._device).type == "cuda":

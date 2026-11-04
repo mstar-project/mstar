@@ -33,7 +33,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.context_parallel import merge
+from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
@@ -329,7 +329,7 @@ def _reference(q, k, v, causal=True):
 def _reference_flashinfer() -> types.ModuleType:
     """FlashInfer's paged prefill/decode and ragged wrappers as dense torch math on CPU, with
     their lse bases. A paged plan refuses a row FlashInfer's split-KV planner would miscount: no
-    pages, or a last page holding no slot (see ``ContextParallel.local_indptrs``). The ragged one
+    pages, or a last page holding no slot (see ``ContextParallelWrapper.local_indptrs``). The ragged one
     reads keys past each row's end as FA3 does."""
     fi = types.ModuleType("flashinfer")
 
@@ -825,7 +825,10 @@ def test_mla_ranks_refuse_the_same_steps_past_the_fa_planners_work_item_cap(monk
     ]
     # the context lengths each rank plans
     indptrs = case.plan["main"].cpu_indptrs
-    lens = [place.local_indptrs(indptrs.context_only(CP_PAGE), CP_PAGE)[0].kv_lens.tolist() for _, place in ranks]
+    lens = [
+        ContextParallelWrapper.local_indptrs(place, indptrs.context_only(CP_PAGE), CP_PAGE)[0].kv_lens.tolist()
+        for _, place in ranks
+    ]
     assert lens[0] != lens[1]
 
     def refuses(attn) -> bool:
