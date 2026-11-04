@@ -13,6 +13,7 @@ mstar.utils.logging\_config
 
    .. autosummary::
    
+      log_off_thread
       quiet_noisy_loggers
    
    
