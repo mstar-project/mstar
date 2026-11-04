@@ -15,15 +15,14 @@ the request there:
   mirror on the set add up before they are priced.
 
 Every cost is in request-equivalents. The cheapest replica wins, ties to the
-one picked longest ago (among never-picked ones, at random), so requests that
-never overlap still take turns over the replicas. Groups whose replicas sit on
-the same ranks, replica for replica, pick one index together, so a request's
-walks stay on one set of workers. A prediction never changes outputs: a wrong
-one makes a request slower.
+one picked longest ago, so requests that never overlap still take turns over
+the replicas. Groups whose replicas sit on the same ranks, replica for
+replica, pick one index together, so a request's walks stay on one set of
+workers. A prediction never changes outputs: a wrong one makes a request
+slower.
 """
 
 import logging
-import random
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
@@ -194,9 +193,9 @@ class ReplicaRouter:
                     for i in range(len(unit.instances))
                 ]
                 least = min(cost)
-                tied = [i for i, c in enumerate(cost) if c == least]
-                oldest = min(self._last_pick[(u, i)] for i in tied)
-                choice = random.choice([i for i in tied if self._last_pick[(u, i)] == oldest])
+                choice = min(
+                    (i for i, c in enumerate(cost) if c == least), key=lambda i: self._last_pick[(u, i)],
+                )
                 if row is not None:
                     picked[u] = row[choice]
             for group in unit.groups:

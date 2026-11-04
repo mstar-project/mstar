@@ -535,9 +535,9 @@ replica. The conductor picks it per request, at ingest, as the replica with the 
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
 ingest), plus the price of what the conductor predicts about the request there. Ties go
-to the replica picked longest ago (among replicas never picked, at random), so requests
-that never overlap still take turns. Every term is in request-equivalents. Groups whose
-replicas sit on the same ranks, replica for replica, take one pick together.
+to the replica picked longest ago, so requests that never overlap still take turns. Every
+term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
+replica, take one pick together.
 
 Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
 KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``

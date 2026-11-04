@@ -6,6 +6,7 @@ concurrent requests spread over the replicas instead of landing on one at random
 and ties go to the replica picked longest ago, so requests that never overlap take
 turns."""
 import math
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -40,10 +41,20 @@ PAGE = 4
 
 @pytest.fixture(autouse=True, params=["first", "last"])
 def tie(request, monkeypatch):
-    """Ties go to the first replica, then to the last, so a case that a tie would
-    pass by luck fails under one of them when what it tests is gone."""
-    pick = (lambda seq: seq[0]) if request.param == "first" else (lambda seq: seq[-1])
-    monkeypatch.setattr("mstar.conductor.routing.random.choice", pick)
+    """A tie between replicas no request has been recorded on goes to the first,
+    then, with each router built as if they had been picked last to first, to the
+    last, so a case that a tie would pass by luck fails under one of them when what
+    it tests is gone."""
+    if request.param == "last":
+        init = ReplicaRouter.__init__
+
+        def last_first(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            self._last_pick = Counter({
+                (u, i): -1 - i for u, unit in enumerate(self._units) for i in range(len(unit.instances))
+            })
+
+        monkeypatch.setattr(ReplicaRouter, "__init__", last_first)
 
 
 def _wg(group_id, ranks, sp_size=1, nodes=("llm",), walk="prefill"):
