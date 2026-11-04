@@ -264,6 +264,24 @@ def test_a_request_holding_a_served_walk_in_its_lease_isnt_chosen():
     assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], "a move released the served walk's KV"
 
 
+def test_a_request_holding_a_served_walk_in_its_lease_doesnt_move_itself():
+    """With nothing newer to move, a request that ran short goes to the host itself, and the move releases its
+    leases. A page on another label made it look movable while its lease held a served walk's KV."""
+    node = _LayoutNode()
+    kv = node.kv
+    kv._cpu_pool = host._HostPool(64)
+    assert _ready(kv, RID)
+    node.walk(TEXT_WALK, len(TEXT))
+    step, ctx = KVStep(segments=(Segment(RID, "other", PAGE_SIZE),)), _ctx(RID)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+    victims = kv.preempt(RID, 1, [], droppable=lambda rid: False)
+
+    assert RID not in victims.to_host, "r1 moved itself to the host, releasing the served walk's KV"
+
+
 def test_a_victim_whose_move_fails_comes_off_the_earmark():
     kv = _pool()
     kv._cpu_pool = host._HostPool(16)
