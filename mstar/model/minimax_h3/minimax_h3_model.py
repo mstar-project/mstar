@@ -506,6 +506,9 @@ class H3Model(Model):
             TEXT_INPUTS: [torch.tensor(ids, dtype=torch.long)],
             VISION_PIXELS: [vision["pixel_values"].to(torch.float32)],
             KEYFRAME_PIXELS: [pixels.contiguous()],
+            # the decoded uploads are spent (no node reads them); the store would hold
+            # them for the whole request
+            "image_inputs": [],
         }
 
     @staticmethod

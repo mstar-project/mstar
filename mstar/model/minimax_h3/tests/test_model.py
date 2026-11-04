@@ -181,6 +181,14 @@ def test_prompts_refused_before_any_work(monkeypatch):
             model.process_prompt("a dog", ["text", "image"], ["video", "audio"], image, **size)
 
 
+class _VisionProcessor:
+    """Qwen3-VL's image processor's two outputs for keyframes on a canvas it keeps as is."""
+
+    def __call__(self, images, return_tensors):
+        grids = [[1, image.size[1] // 16, image.size[0] // 16] for image in images]
+        return {"image_grid_thw": torch.tensor(grids), "pixel_values": torch.zeros(sum(h * w for _, h, w in grids), 8)}
+
+
 def _data_worker(model):
     """The data worker's media and prompt stage, without its threads or sockets."""
     from mstar.api_server.data_worker import PreprocessWorkerThread
@@ -210,6 +218,22 @@ def test_files_the_model_cannot_take_are_refused_before_decoding(tmp_path, monke
     for files in ({"image": [image] * 3}, {"video": [image]}, {"audio": [image]}):
         with pytest.raises(ValueError, match="at most"):
             worker._load_media(files)
+
+
+def test_the_raw_keyframes_are_not_stored(tmp_path):
+    """``process_prompt`` returns the keyframes on the canvas; the decoded uploads it read
+    them from would otherwise be stored, and held, for the whole request."""
+    from mstar.api_server.request_types import PreprocessInput
+
+    model = _model()
+    model.tokenizer, model._image_processor = _Tokenizer(), _VisionProcessor()
+    images = [_png(tmp_path / "first.png"), _png(tmp_path / "last.png")]
+    prepared = _data_worker(model)._prepare_input(PreprocessInput(
+        request_id="r", text="a dog", file_paths={"image": images}, input_modalities=["image", "text"],
+        output_modalities=["video", "audio"], model_kwargs={"keyframe_anchors": ["first", "last"]},
+    ))
+    assert prepared.tensors["image_inputs"] == []
+    assert prepared.tensors["keyframe_pixels"][0].shape[0] == 2 and prepared.tensors["vision_pixels"]
 
 
 def test_the_row_cap_counts_every_packed_row():
