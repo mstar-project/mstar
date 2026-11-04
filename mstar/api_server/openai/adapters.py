@@ -1545,9 +1545,8 @@ class HiggsAudioAdapter(OpenAIAdapter):
     ``prompt`` is the transcription instruction (the model has a default)."""
 
     supports_transcriptions = True
-    # The model drops or repeats text on long audio (on H100, 120 s windows of
-    # LibriSpeech scored 35-55% WER, 30 s windows 1-2.5%, as per utterance), so
-    # uploads go as 30 s windows. It takes no previous text, so they run at once.
+    # The model drops or repeats text on long audio, so uploads go as windows of
+    # at most 30 s. It takes no previous text, so they run at once.
     max_audio_seconds = 30.0
     long_form = "parallel"
 

@@ -273,7 +273,7 @@ Higgs Audio notes
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
 - The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
-  cuts an upload longer than 30 s into 30 s windows run in parallel.
+  cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
 - Decode keeps each request's last token in the sampler's slot master and
