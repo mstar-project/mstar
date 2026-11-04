@@ -1454,7 +1454,11 @@ def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeyp
 
 
 def test_enable_metrics_with_the_rust_frontend_starts(monkeypatch, tmp_path):
+    from mstar.api_server import rust_frontend
+
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    # main() resolves the binary before loading anything; CI builds none.
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     assert _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
 
 
