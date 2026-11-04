@@ -15,7 +15,7 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
-from mstar.engine.resources.dsa.paged import DSAContext, attn_lens
+from mstar.engine.resources.dsa.paged import DSAContext, attn_lens, attn_lens_device
 from mstar.engine.resources.step import StepContext
 from mstar.utils.h2d import PinnedStager
 
@@ -158,6 +158,32 @@ class DSAManager(Resource):
             topk=self.config.topk, kpool=self.config.kpool,
             needs_selection=meta["needs_selection"], decode_rows=meta["decode_rows"],
             sparse_plan=meta["sparse_plan"])
+
+    def move_rows(self, ctx: DSAContext, kv, pos: torch.Tensor, captured: bool, pad_kpe: float,
+                  label: str = "main") -> None:
+        """Move this step's rows to the device positions ``pos``, each at or before the one the
+        host planned (an MTP verify block placed after the last step's accepted rows, not its
+        whole block): the cache slots its latents and index keys go to, and the positions it
+        selects and attends from. A captured step keeps its plan, made for the planned rows
+        (``step_inputs(mtp_trims=True)``): each row's entries past its own length attend the
+        cache's spare row, whose rope slot gets ``pad_kpe`` for the caller's queries to mask. An
+        eager step replans exact rows, from one host read of ``pos``."""
+        size = ctx.page_size
+        pages, offsets = kv.write_slots(label)
+        page = ctx.pages[(ctx.page_start[ctx.row_req.long()] + pos // size).long()]
+        pages.copy_(page.to(pages.dtype))
+        offsets.copy_((pos % size).to(offsets.dtype))
+        ctx.pos = pos.to(ctx.pos.dtype)
+        if not captured:
+            ctx.host_pos = pos.tolist()
+            return
+        if not self.kpe:
+            raise ValueError("a captured step's spare entries are masked in the rope slot, "
+                             "and this cache has none")
+        slot, row = kv.spare_row()
+        row[:, self.kv_lora_rank:].fill_(pad_kpe)
+        ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
+        ctx.pad_slot = slot
 
     @contextmanager
     def use(self, ctx: DSAContext | None) -> Iterator[None]:
