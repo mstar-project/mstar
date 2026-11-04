@@ -14,6 +14,7 @@ import tempfile
 import threading
 import types
 from concurrent.futures import wait
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -411,6 +412,34 @@ def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_1"))
     ops.load(LoadLoraAdapter(op_id="op2", lora_name="a2", lora_path=paths["a2"]))
     assert len(out.answers()) == 1 and out.to("worker_0")[-1].body.op_id == "op2"
+
+
+def test_the_conductors_ops_update_each_workers_copy_of_the_spec(paths):
+    """Requests are validated against each worker's copy of the spec, which caches what it
+    read of an adapter: a reload under the same name must be checked as the new file."""
+    spec = make_spec({}, runtime_updates=True)
+    copy = replace(spec, nodes=set(spec.nodes))
+    out = _Outbox()
+    conductor = object.__new__(Conductor)
+    conductor._node_resources_cache = [spec]
+    conductor._resource_specs_cache = [{LORA_RESOURCE_KEY: copy}]
+    conductor.worker_ids = ["worker_0"]
+    conductor._per_worker_graphs = {"worker_0": [SimpleNamespace(section=SimpleNamespace(get_nodes=lambda: ["LLM"]))]}
+    conductor.communicator = SimpleNamespace(send=out)
+    ops = conductor._lora_ops()
+
+    def run(body):
+        getattr(ops, "load" if isinstance(body, LoadLoraAdapter) else "unload")(body)
+        ops.ack(LoraAdapterAck(op_id=body.op_id, worker_id="worker_0"))
+
+    run(LoadLoraAdapter(op_id="l1", lora_name="x", lora_path=paths["a2"]))
+    LoraReqConfig(adapter="x").validate(copy)
+    assert copy.adapter_info("x").rank == 3
+    run(UnloadLoraAdapter(op_id="u1", lora_name="x"))
+    with pytest.raises(ValueError, match="unknown LoRA adapter 'x'"):
+        LoraReqConfig(adapter="x").validate(copy)
+    run(LoadLoraAdapter(op_id="l2", lora_name="x", lora_path=paths["a3"]))
+    assert copy.adapter_info("x").rank == 4
 
 
 def _finish_when_read(worker):

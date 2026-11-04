@@ -778,10 +778,17 @@ class Conductor:
 
     def _lora_ops(self) -> LoraAdapterOps:
         """Runtime LoRA loads and unloads, against the specs requests are validated with
-        and the workers hosting their nodes. Built on first use."""
+        and the workers hosting their nodes. Built on first use.
+
+        Each worker's ``_resource_specs`` holds its own copy of a spec, with its own
+        adapter-info cache, so a load or unload updates the copies as well."""
         ops = getattr(self, "_lora_ops_cache", None)
         if ops is None:
-            specs = [s for s in self._resource_specs().values() if isinstance(s, LoraSpec)]
+            specs = [s for s in self._node_resources() if isinstance(s, LoraSpec)]
+            copies = [
+                s for per_worker in self._resource_specs() for s in per_worker.values()
+                if isinstance(s, LoraSpec)
+            ]
             nodes = set().union(*(s.nodes for s in specs))
             workers = [
                 worker_id for worker_id in self.worker_ids
@@ -789,7 +796,8 @@ class Conductor:
                        for wg in self._per_worker_graphs[worker_id])
             ]
             ops = self._lora_ops_cache = LoraAdapterOps(
-                specs[0] if specs else None, workers, self.communicator.send, others=specs[1:],
+                specs[0] if specs else None, workers, self.communicator.send,
+                others=[*specs[1:], *copies],
             )
         return ops
 

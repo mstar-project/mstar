@@ -53,8 +53,9 @@ class LoraAdapterOps:
     """The conductor's half of ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``.
 
     ``spec`` is the conductor's own ``LoraSpec`` (None for a deployment without LoRA), the
-    one requests are validated against, and ``others`` the model's LoRA specs for other
-    nodes, which serve the same adapters; ``workers`` are the workers hosting any of their
+    one whose adapters it answers from, and ``others`` every other ``LoraSpec`` that
+    serves the same adapters (other nodes' specs, and the per-worker copies requests are
+    validated against); ``workers`` are the workers hosting any of their
     nodes; ``send(peer, message)`` is the conductor's communicator; ``clock`` its
     monotonic time.
     """
