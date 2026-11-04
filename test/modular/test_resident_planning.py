@@ -982,7 +982,7 @@ def _preplan_engine(res, planner):
     engine = Engine.__new__(Engine)
     engine._enable_nvtx = False
     engine._device = CPU
-    engine._pre_plan_done = {}
+    engine._pre_plan_done, engine._plan_peers = {}, {"n": ("n",)}
     engine._runner = StepRunner(resources)
     runner = SimpleNamespace(
         plan_stream=lambda: None, pad_inputs=lambda lease, inputs, uniform=None: inputs,

@@ -267,7 +267,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     fake = SimpleNamespace(
         _device=torch.device("cpu"),
         _pre_plan_done={},
-        _order_after_pre_plans=lambda: None,
+        _order_after_pre_plans=lambda node: None,
         _runner=SimpleNamespace(
             pre_admit=lambda step: SimpleNamespace(ok=True),
             pre_plan=_raiser(RuntimeError("plan failed")),
@@ -296,18 +296,28 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     assert batch.preplan_event is None
 
 
-def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> None:
-    # nodes can share a resource's slot buffers, so every node's latest
-    # pre-plan is waited on, not just the stepping node's
+def test_a_step_is_ordered_after_the_pre_plans_of_every_node_sharing_a_resource(monkeypatch) -> None:
+    # nodes can share a resource's slot buffers, directly or through what the
+    # resource depends on, so those nodes' latest pre-plans are waited on too;
+    # a node sharing nothing (a codec on its own lane) waits on its own alone
     waits = []
     stream = SimpleNamespace(wait_event=waits.append)
     monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: stream)
-    fake = SimpleNamespace(_device=torch.device("cpu"), _pre_plan_done={})
-    Engine._order_after_pre_plans(fake)
+    engine = object.__new__(Engine)
+    engine._device = torch.device("cpu")
+    engine._resources = {
+        "kv": SimpleNamespace(depends_on=set), "attn": SimpleNamespace(depends_on=lambda: {"kv"}),
+        "codec_state": SimpleNamespace(depends_on=set),
+    }
+    engine._pre_plan_done = {}
+    engine._plan_peers = engine._plan_peers_of({"enc": ["kv"], "dec": ["attn"], "codec": ["codec_state"]})
+    engine._order_after_pre_plans("enc")
     assert waits == []
-    fake._pre_plan_done.update(enc="e1", dec="e2")
-    Engine._order_after_pre_plans(fake)
-    assert waits == ["e1", "e2"]
+    engine._pre_plan_done.update(enc="e1", dec="e2", codec="e3")
+
+    engine._order_after_pre_plans("enc")
+    engine._order_after_pre_plans("codec")
+    assert waits == ["e2", "e1", "e3"]
 
 
 def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() -> None:
@@ -324,7 +334,7 @@ def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() ->
     engine = object.__new__(Engine)
     engine._enable_nvtx = False
     engine._runner = SimpleNamespace(plan=plan)
-    engine._order_after_pre_plans = lambda: calls.append("wait")
+    engine._order_after_pre_plans = lambda node: calls.append("wait")
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))

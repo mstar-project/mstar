@@ -686,6 +686,8 @@ class Engine:
             declared_by=declared_by,
             on_lane=self._lane_contexts(node_names, declared_by, prefix_caches),
         )
+        # node -> the nodes whose pre-plans its steps wait for (``_order_after_pre_plans``)
+        self._plan_peers = self._plan_peers_of({n: node_to_resources.get(n, ()) for n in node_names})
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
@@ -2093,7 +2095,7 @@ class Engine:
                 )
             step.set_ctx(ctx)
             # before any copy this plan issues, the resident stage's included
-            self._order_after_pre_plans()
+            self._order_after_pre_plans(batch.node_name)
             # promoted and inline plans per resource, apart
             plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
             if ctx.resident is not None:
@@ -3087,7 +3089,7 @@ class Engine:
             event = torch.Event(device=self._device)
             try:
                 with stream if stream is not None else nullcontext():
-                    self._order_after_pre_plans()
+                    self._order_after_pre_plans(batch.node_name)
                     # A raise here takes what a raise from `pre_plan` below takes:
                     # `Worker._preplan_spec` resets the pre-plan, whose reservation
                     # stays with its streams for exec's admit to find.
@@ -3109,17 +3111,43 @@ class Engine:
             batch.step_context.is_preplan = False
         return True
 
-    def _order_after_pre_plans(self) -> None:
-        """Order the current stream after every copy a pre-plan has issued.
+    def _plan_peers_of(self, node_to_resources: Mapping[str, Collection[str]]) -> dict[str, tuple[str, ...]]:
+        """Each node, and the nodes that share a resource with it, directly or
+        through what their resources depend on: the pre-plans whose copies a
+        step of the node can skip or overwrite (``_order_after_pre_plans``)."""
+        def reach(keys: Collection[str]) -> set[str]:
+            seen: set[str] = set()
+            todo = list(keys)
+            while todo:
+                key = todo.pop()
+                if key not in seen and key in self._resources:
+                    seen.add(key)
+                    todo.extend(self._resources[key].depends_on())
+            return seen
+
+        held = {node: reach(keys) for node, keys in node_to_resources.items()}
+        return {
+            node: tuple(sorted(other for other, theirs in held.items() if other == node or keys & theirs))
+            for node, keys in held.items()
+        }
+
+    def _order_after_pre_plans(self, node_name: str) -> None:
+        """Order the current stream after every copy a pre-plan that
+        ``node_name``'s step could depend on has issued.
 
         Resources skip a copy into a slot's buffer that already holds the
         bytes (``H2DMirror``, ``_SlotBuffer.zero_prefix``), recorded when the
         copy is issued. A pre-plan's copy runs on its node's plan stream, and
         the pre-plan may be dropped before its batch runs, so nothing else
         orders a later step that skips its own copy, or overwrites the buffer,
-        after it. Every plan stream is waited on, not just this node's: nodes
-        can share a resource and its slot buffers."""
-        events = tuple(self._pre_plan_done.values())
+        after it. Every buffer a plan copies into belongs to one resource, or
+        to the node's resident tables, so the step waits on its own node's
+        plan stream and on those of the nodes sharing a resource with it
+        (``_plan_peers``), the last writers of what it touches; a step on a
+        lane, whose resources no other node holds and none pre-plans, waits on
+        nothing."""
+        done = self._pre_plan_done
+        events = tuple(done[n] for n in self._plan_peers[node_name] if n in done)
         if events:
             stream = torch.accelerator.current_stream(self._device)
             for event in events:

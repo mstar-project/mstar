@@ -301,7 +301,7 @@ def test_the_declaration_check_still_compares_the_nodes_own_key():
 
     engine = object.__new__(Engine)
     engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
-    engine._pre_plan_done = {}
+    engine._pre_plan_done, engine._plan_peers = {}, {"LLM": ("LLM",)}
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, LoraBaseOnly("cfg")))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)

@@ -541,6 +541,7 @@ def _state_engine(pool, chain_pool=None):
     eng._enable_nvtx = eng._enable_profile = False
     eng._device = torch.device("cpu")
     eng._pre_plan_done = {}
+    eng._plan_peers = eng._plan_peers_of({"Codec": [POOL], "Talker": list(resources.keys() - {POOL})})
     eng._loopback_steps = {}
     eng._chunking = SimpleNamespace(forget_request=lambda rid: None, release=lambda rid, node: None)
     eng._submodules = {"Codec": SubmoduleManagement(

@@ -255,6 +255,7 @@ def _engine(resources: dict) -> Engine:
     eng._enable_profile = False
     eng._device = torch.device("cpu")
     eng._pre_plan_done = {}
+    eng._plan_peers = {"n": ("n",)}
     eng._submodules = {"n": SubmoduleManagement(
         submodule=_Sub(list(resources)), forward=None, forward_batched=None,
         joint_comm_group=None, resources=resources,

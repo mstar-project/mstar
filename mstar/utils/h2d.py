@@ -26,8 +26,10 @@ class H2DMirror:
     and that lives as long as its mirror -- hence an object the owner keeps
     with it, not a cache keyed by address (the allocator reuses addresses).
     A skip is recorded when the copy is issued, possibly on another stream;
-    the engine orders each step after every earlier pre-plan's copies
-    (``Engine._order_after_pre_plans``), which makes it sound across streams.
+    the engine orders each step after the pre-plans of every node that shares
+    a resource with it (``Engine._order_after_pre_plans``), which makes it
+    sound across streams for a destination that belongs to one resource or to
+    one node's resident tables -- not one shared by nodes some other way.
     """
 
     __slots__ = ("_key", "_values")
