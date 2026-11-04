@@ -6,7 +6,7 @@
 ``test/integration``, and any test whose skip (a ``skipif`` marker, a
 module-level ``pytest.skip``, or one in its body) names CUDA, a GPU, Triton or
 FlashInfer, or that checks for one itself (``torch.cuda.is_available()`` in its
-body or its skipif). The rest already run in CPU Core. ``--skipped-in`` keeps
+body, a fixture or same-module helper it calls, or its skipif). The rest already run in CPU Core. ``--skipped-in`` keeps
 those a plain run skipped, plus the ones that check for a GPU in their body
 (on a CPU they ``print`` and ``return``, and pass).
 
@@ -138,13 +138,25 @@ _SKIPIF_GPU = re.compile(r"skipif\(\s*[^,)]*cuda\.(?:is_available|device_count)\
 
 
 def _checks_gpu(item) -> bool:
+    """The test, a fixture it takes or a helper of its module it calls checks for a GPU."""
+    module = getattr(item, "module", None)
     try:
-        if _CHECKS_GPU.search(inspect.getsource(item.function)):
-            return True
+        body = inspect.getsource(item.function)
     except (OSError, TypeError):
-        pass
-    if any(item.iter_markers("skipif")) and getattr(item.module, "__file__", None):
-        with open(item.module.__file__) as f:
+        body = ""
+    names = set(re.findall(r"\b(\w+)\(", body)) | set(getattr(item, "fixturenames", ()))
+    helpers = [getattr(module, n, None) for n in sorted(names)]
+    for fn in [item.function, *helpers]:
+        fn = getattr(fn, "__wrapped__", fn)  # a fixture's own function
+        if not inspect.isfunction(fn) or (fn is not item.function and fn.__module__ != module.__name__):
+            continue
+        try:
+            if _CHECKS_GPU.search(inspect.getsource(fn)):
+                return True
+        except (OSError, TypeError):
+            pass
+    if any(item.iter_markers("skipif")) and getattr(module, "__file__", None):
+        with open(module.__file__) as f:
             return bool(_SKIPIF_GPU.search(f.read()))
     return False
 
