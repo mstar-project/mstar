@@ -353,7 +353,7 @@ class FlashInferManager(AttentionManager):
 
             if self._placement is not None:
                 laps.lap("wrapper")
-                wrapper.plan(kv_out, causal=step.causal)
+                wrapper.plan(kv_out, causal=step.causal, real_rows=ctx.real_rows())
                 laps.lap("wrapper_plan")
                 plan_states[label] = wrapper
                 continue

@@ -549,6 +549,8 @@ class FlashInferMLAManager(AttentionManager):
                 wrapper = self._eager_wrapper(label, ctx.slot, is_decode)
             if self._placement is not None:
                 self._refuse_past_work_item_cap(indptrs.qo_indptr)
+                # every row, padding included: the own-token kernel reads each row's own pages alone,
+                # so a padding row's latents reach no real row
                 wrapper.plan(kv_out, causal=step.causal)
             else:
                 wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())

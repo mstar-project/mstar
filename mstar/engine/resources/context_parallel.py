@@ -195,9 +195,15 @@ class ContextParallelWrapper:
         self._pinned_done: torch.Event | None = None
 
     @torch.compiler.disable
-    def plan(self, kv_out, causal: bool = True):
+    def plan(self, kv_out, causal: bool = True, real_rows: frozenset | None = None):
         """``kv_out``: the step's logical ``KVPlanOutput`` for this label. The context attention reads
-        its indptrs for a one-token-a-row step, its stored context alone otherwise."""
+        its indptrs for a one-token-a-row step, its stored context alone otherwise.
+
+        ``real_rows``: a replay's real requests when it has padding rows (``StepContext.real_rows``),
+        which follow the real rows in each label. The own-token part then plans the real rows alone,
+        so the padding's keys lie past its plan, where ``run`` zeroes them: the kernel reads keys
+        past a row's end to its KV tile's, and a NaN the model's layers left in a padding row's
+        keys would reach the real rows before it."""
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
@@ -215,7 +221,9 @@ class ContextParallelWrapper:
             if self._pinned_done is not None:
                 self._pinned_done.record()
         if self.new is not None:
-            self.new.plan(context.qo_indptr, causal=causal)
+            qo = context.qo_indptr
+            own = None if real_rows is None else _leading_rows(kv_out, real_rows)
+            self.new.plan(qo if own is None else qo[: own + 1], causal=causal)
         self._qo_indptr_buf = getattr(self.context, "_qo_indptr_buf", None)
         valid = np.repeat(valid_rows, np.diff(context.qo_indptr.numpy()))
         n = len(valid)
@@ -274,6 +282,15 @@ class ContextParallelWrapper:
         """Whether the step attends the keys ``run`` is passed (``AttentionManager.reads_step_kv``):
         any step but one token a row."""
         return self.new is not None
+
+
+def _leading_rows(kv_out, real_rows: frozenset) -> int | None:
+    """How many of ``kv_out``'s rows are ``real_rows``, which lead it; None when all are, or none."""
+    rids = [view.request_id for view in kv_out.views] if kv_out.rows is None else [row[0] for row in kv_out.rows]
+    n = sum(rid in real_rows for rid in rids)
+    if not all(rid in real_rows for rid in rids[:n]):
+        raise ValueError(f"a padding row comes before a real one in a plan of rows {rids}")
+    return n if 0 < n < len(rids) else None
 
 
 def merge(outs: torch.Tensor, lses: torch.Tensor) -> torch.Tensor:
