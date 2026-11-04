@@ -64,6 +64,10 @@ _MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_position
 
 
 class LLMSubmodule(ARNodeSubmodule):
+    # off, as on the other Qwen3DenseLM nodes: compiled, Canary-Qwen's
+    # throughput was 7-15% lower (its H100 A/B)
+    disable_torch_compile = True
+
     def __init__(self, model: Qwen3DenseLM, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
@@ -210,6 +214,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
     navit SigLIP attends within each slice, then the resampler turns each slice
     into 64 tokens. Requests pack too; their slices stay apart by segment."""
 
+    # Every request brings its own slice count and patch grid, which a compiled
+    # forward would recompile for; it runs once a request.
+    disable_torch_compile = True
+
     def __init__(self, model: MiniCPMOVision, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
@@ -301,6 +309,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
 class AudioEncoderSubmodule(NodeSubmodule):
     """A request's audio pieces (30 s each at most), packed with any other
     request's; each piece is its own block-causal segment."""
+
+    # Every clip has its own length, which a compiled forward would recompile
+    # for; it runs once a request.
+    disable_torch_compile = True
 
     def __init__(self, model: MiniCPMOAudio, config: MiniCPMOConfig):
         super().__init__()
