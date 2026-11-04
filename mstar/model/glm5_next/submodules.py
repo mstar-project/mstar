@@ -757,11 +757,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # max_tokens counts the token the prefill emits, so the decode loop
         # runs one fewer.
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        # The next step takes the context to prompt + generated, and it may
-        # already be scheduled when this stop lands, so stop while it still
-        # fits: past index_topk prepare_inputs refuses it.
+        # The next step takes the context to prompt + generated and may already
+        # be scheduled when this stop lands, so stop while it still fits, before
+        # a step past index_topk (which prepare_inputs refuses) is scheduled. A
+        # next step that emits the reply's last token ends the loop at its cap
+        # with nothing after it, so it may fill the window.
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
-        full = prompt_len + generated >= self.config.index_topk
+        full = (prompt_len + generated >= self.config.index_topk
+                and generated + 1 < request_info.max_tokens)
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()
