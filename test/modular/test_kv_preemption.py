@@ -693,6 +693,77 @@ def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
     assert victims == Victims(["r"], [], []) and _offload(kv, "r"), "r had no way off the device once the host was full"
 
 
+def test_the_host_sets_room_aside_when_a_request_is_admitted_and_not_while_it_waits():
+    """Room set aside at a request's first ask held host room for requests still waiting in the queue."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "x", 9, arrival=0)
+    _request(kv, "r", 2, arrival=1, rebuildable=False)
+    assert not _ready(kv, "r")
+    assert kv._cpu_pool.reserved == {}, "r held room on the host while it waited in the queue"
+
+    _remove(kv, "x")
+
+    assert _ready(kv, "r") and kv._cpu_pool.reserved == {"r": 2}, "the host didn't set room aside for r's prompt"
+
+
+def test_a_request_whose_admission_is_undone_waits_with_no_room_set_aside_on_the_host():
+    """A request is admitted in every pool it asks or in none, so a pool that admitted it gives the allotment back
+    when another can't."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _request(kv, "r", 2, arrival=0, rebuildable=False)
+    assert _ready(kv, "r")
+
+    kv.unreserve("r")
+
+    assert kv._cpu_pool.reserved == {}, "r held room on the host while it waited for another pool"
+
+
+def test_the_room_the_host_sets_aside_grows_with_each_page_a_request_takes():
+    """qwen3_asr_realtime's sessions each set their whole decode cap aside on the host at their first ask, so few of
+    them got room, and the host's prefix tier was left little."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+
+    assert _step(kv, "r", PAGE_SIZE).ok
+
+    assert kv._cpu_pool.reserved == {"r": 3}, "the room set aside isn't the pages r holds"
+
+
+def test_a_request_the_full_host_cant_cover_turns_guaranteed_at_that_page_and_is_counted(caplog):
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    # s sets aside the host's last page
+    _running(kv, "s", 1, arrival=1, rebuildable=False)
+    assert "r" not in kv._guaranteed and kv._cpu_pool.reserved == {"r": 2, "s": 1}
+
+    assert _step(kv, "r", PAGE_SIZE).ok
+
+    assert "r" in kv._guaranteed and kv._cpu_pool.reserved == {"s": 1}, "r took a page its move had no room for"
+    assert kv._cpu_pool.guaranteed == 1 and "no room to set aside for r's move" in caplog.text
+    for _ in range(3):
+        assert _step(kv, "r", PAGE_SIZE).ok, "r turned guaranteed without reserving what it grows into"
+
+
+def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_footprint_and_can_still_move():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    _running(kv, "s", 1, arrival=1, rebuildable=False)
+    _running(kv, "x", 6, arrival=2)
+
+    outcome = _step(kv, "r", PAGE_SIZE)
+
+    # the 4 pages it grows into, less the 1 page of room
+    assert not outcome.ok and outcome.reason.pages_short == 3, "r took a page its move had no room for"
+    assert _preempt(kv, "r", 3, droppable=lambda rid: False) == Victims(["r"], [], []) and _offload(kv, "r"), (
+        "r had no way off the device"
+    )
+
+
 class _StubHostRefusingB(host._HostPool):
     """Refuses stream ``b``, as a host whose room runs out partway through a move does."""
 
