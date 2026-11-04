@@ -2,8 +2,11 @@
 
 ``plan()`` reads its host arrays once, checks them as FlashInfer does, copies
 them where FlashInfer keeps them (the caller's static buffers under
-``use_cuda_graph``, else device copies) and prices the attention the plan
-describes from each request's query and key counts. ``run`` is one kernel
+``use_cuda_graph``, else device copies), then calls its planner module
+(``_cached_module.plan``, FlashInfer's own signature), which prices the
+attention the plan describes from each request's query and key counts. So a
+caller that calls the planner module directly, as mstar's captured wrappers do
+on a checked FlashInfer version, prices the same step. ``run`` is one kernel
 (``clock.kernel_fn``) charged the latest plan's price, so a graph replay
 prices whatever the last plan was.
 
@@ -82,6 +85,47 @@ def _copy(src: torch.Tensor, device) -> torch.Tensor:
     return src.to(device=device, dtype=torch.int32, copy=True)
 
 
+def _host(x) -> list[int]:
+    """A planner's host array, or a kept device buffer read without a sync."""
+    return [int(v) for v in getattr(x, "_data", x).tolist()]
+
+
+class PrefillPlanner:
+    """FlashInfer's batch prefill planner module (fa2/fa3; tensor-core decode uses it
+    too): ``plan`` takes FlashInfer's arguments and returns the plan info. It prices
+    its wrapper's next run."""
+
+    def __init__(self, wrapper):
+        self._wrapper = wrapper
+
+    def plan(self, float_workspace, int_workspace, pinned_int_workspace, qo_indptr, kv_indptr, kv_len_arr,
+             total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,
+             head_dim_qk, head_dim_vo, causal, window_left, *fa2_args) -> list[int]:
+        qo, kv_pages, lens = _host(qo_indptr), _host(kv_indptr), _host(kv_len_arr)[:batch_size]
+        self._wrapper._price(qo, kv_pages, lens, num_qo_heads, num_kv_heads, page_size, head_dim_qk,
+                             head_dim_vo, bool(causal), int(window_left))
+        return [int(total_num_rows), int(batch_size), qo[-1], kv_pages[-1], sum(lens)]
+
+
+class DecodePlanner:
+    """FlashInfer's batch decode planner module (CUDA-core decode): its plan sees the
+    page counts only; the lengths come from the last-page lengths already copied."""
+
+    def __init__(self, wrapper):
+        self._wrapper = wrapper
+
+    def plan(self, float_workspace, int_workspace, pinned_int_workspace, indptr, batch_size, num_qo_heads,
+             num_kv_heads, page_size, enable_cuda_graph, window_left, logits_soft_cap, head_dim_qk,
+             head_dim_vo, empty_q_data, empty_kv_data) -> list[int]:
+        w = self._wrapper
+        kv_pages = _host(indptr)
+        last = _host(w._paged_kv_last_page_len_buf)
+        lens = [paged_kv_len(kv_pages[r + 1] - kv_pages[r], last[r], page_size) for r in range(batch_size)]
+        w._price(list(range(batch_size + 1)), kv_pages, lens, num_qo_heads, num_kv_heads, page_size,
+                 head_dim_qk, head_dim_vo, False, int(window_left))
+        return [int(batch_size), kv_pages[-1], sum(lens)]
+
+
 class PagedAttention:
     """The plan and run of a paged-KV wrapper. Subclasses parse their own
     ``plan`` arguments and call ``_set_plan``."""
@@ -122,6 +166,17 @@ class PagedAttention:
         self._max_total_num_rows: int | None = None
         self._planned = False
         self._cost = (0.0, 0.0)
+        # FlashInfer's planner workspaces and per-plan state, as its wrappers keep them
+        self._int_workspace_buffer = torch.empty(8 << 20, dtype=torch.uint8, device=self.device)
+        self._pin_memory_int_workspace_buffer = torch.empty(8 << 20, dtype=torch.uint8, device="cpu")
+        self._jit_module = None
+        self._cached_module = None
+        self._plan_info = None
+        self._custom_mask_buf = None
+        self._prefix_len_ptr = None
+        self._pos_encoding_mode = "NONE"
+        self._logits_soft_cap = 0.0
+        self._window_left = -1
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -193,29 +248,55 @@ class PagedAttention:
         self._cached_kv_data_type = canonical_dtype(kv_data_type or q_data_type)
         self._cached_o_data_type = canonical_dtype(o_data_type or q_data_type)
         self._qo_indptr_last = total_rows
+        lens = [paged_kv_len(kv_host[r + 1] - kv_host[r], last_host[r], page_size) for r in range(batch)]
+        self._max_q_len = max((qo_host[r + 1] - qo_host[r] for r in range(batch)), default=0)
+        self._max_kv_len = max(lens, default=0)
         self._planned = True
 
+        as_tensor = lambda x: torch.tensor(x, dtype=torch.int32)  # noqa: E731 - host arrays, as FlashInfer's
+        workspaces = (self._float_workspace_buffer, self._int_workspace_buffer, self._pin_memory_int_workspace_buffer)
+        if self._cuda_core_decode():
+            self._cached_module = self._cached_module or DecodePlanner(self)
+            self._plan_info = self._cached_module.plan(
+                *workspaces, as_tensor(kv_host), batch, num_qo_heads, num_kv_heads, page_size,
+                self._use_cuda_graph, self._window_left, self._logits_soft_cap, head_dim_qk, self._head_dim_vo,
+                torch.empty(0, dtype=self._cached_q_data_type), torch.empty(0, dtype=self._cached_kv_data_type))
+        else:
+            self._cached_module = self._cached_module or PrefillPlanner(self)
+            args = [*workspaces, as_tensor(qo_host), as_tensor(kv_host), as_tensor(lens),
+                    self._max_total_num_rows or total_rows, batch, num_qo_heads, num_kv_heads, page_size,
+                    self._use_cuda_graph, head_dim_qk, self._head_dim_vo, self._causal, self._window_left]
+            if self._backend == "fa2":
+                args += [-1, False, 0, 0]  # fixed_split_size, disable_split_kv, num_colocated_ctas, uniform_q_len
+            self._plan_info = self._cached_module.plan(*args)
+
+    def _cuda_core_decode(self) -> bool:
+        """Whether this wrapper plans with FlashInfer's batch decode module (CUDA-core
+        decode), not the batch prefill module."""
+        return False
+
+    def _price(self, qo: list[int], kv_pages: list[int], lens: list[int], num_qo_heads: int,
+               num_kv_heads: int, page_size: int, head_dim_qk: int, head_dim_vo: int, causal: bool,
+               window_left: int) -> None:
         pairs, pages, rows = 0, 0, []
-        for r in range(batch):
-            n = qo_host[r + 1] - qo_host[r]
-            npages = kv_host[r + 1] - kv_host[r]
-            m = paged_kv_len(npages, last_host[r], page_size)
-            seen = visible_keys(n, m, self._causal, self._window_left)
+        for r in range(len(lens)):
+            n = qo[r + 1] - qo[r]
+            m = lens[r]
+            seen = visible_keys(n, m, causal, window_left)
             pairs += seen
-            pages += npages if n > 0 else 0
+            pages += kv_pages[r + 1] - kv_pages[r] if n > 0 else 0
             if n > 0:
                 rows.append((n, m, seen))
         q_el = element_size(self._cached_q_data_type)
         kv_el = element_size(self._cached_kv_data_type)
         o_el = element_size(self._cached_o_data_type)
-        flops = 2.0 * pairs * num_qo_heads * (head_dim_qk + self._head_dim_vo)
+        flops = 2.0 * pairs * num_qo_heads * (head_dim_qk + head_dim_vo)
         nbytes = (
-            total_rows * num_qo_heads * (head_dim_qk * q_el + self._head_dim_vo * o_el)
-            + pages * page_size * num_kv_heads * (head_dim_qk + self._head_dim_vo) * kv_el
+            qo[-1] * num_qo_heads * (head_dim_qk * q_el + head_dim_vo * o_el)
+            + pages * page_size * num_kv_heads * (head_dim_qk + head_dim_vo) * kv_el
         )
         self._cost = (flops, float(nbytes), table_features(
-            rows, num_qo_heads, num_kv_heads, head_dim_qk, self._head_dim_vo,
-            self._cached_kv_data_type))
+            rows, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, self._cached_kv_data_type))
 
     # ------------------------------------------------------------------- run
 

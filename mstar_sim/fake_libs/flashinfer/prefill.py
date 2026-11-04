@@ -98,6 +98,9 @@ class BatchPrefillWithPagedKVCacheWrapper(PagedAttention):
             prefix_len_ptr=prefix_len_ptr, token_pos_in_items_ptr=token_pos_in_items_ptr,
             max_item_len_ptr=max_item_len_ptr,
         )
+        if self._backend == "auto":  # FlashInfer's choice: fa3 on Hopper, fa2 elsewhere
+            self._backend = "fa3" if torch.cuda.get_device_capability(self.device) == (9, 0) else "fa2"
+        self._logits_soft_cap = logits_soft_cap or 0.0
         self._set_plan(
             qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, head_dim_qk=head_dim_qk,

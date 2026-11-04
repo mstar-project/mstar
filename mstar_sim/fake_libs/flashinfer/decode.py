@@ -37,6 +37,9 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
     def use_tensor_cores(self) -> bool:
         return self._use_tensor_cores
 
+    def _cuda_core_decode(self) -> bool:
+        return not self._use_tensor_cores and self._q_len_per_req == 1
+
     def plan(
         self,
         indptr: torch.Tensor,
@@ -75,6 +78,9 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
         if data_type is not None:
             q_data_type = kv_data_type = data_type
+        if self._use_tensor_cores and self._backend == "auto":
+            self._backend = "fa2"  # tensor-core decode plans with the fa2 prefill module
+        self._logits_soft_cap = logits_soft_cap or 0.0
         self._set_plan(
             None, indptr, indices, last_page_len, num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads, head_dim_qk=head_dim, head_dim_vo=None,

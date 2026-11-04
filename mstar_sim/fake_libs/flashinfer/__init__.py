@@ -7,9 +7,10 @@ and charges the simulated device once, as one fused kernel
 (``mstar_sim.clock``). What mstar references but this does not emulate
 raises ``NotImplementedError`` when called.
 
-The version is not one mstar's attention wrappers restate FlashInfer's
-planner internals for (``DIRECT_PLAN_FLASHINFER_VERSIONS``), so they plan
-through ``plan()``, which is what this emulates.
+It reports mstar's pinned version, so mstar's captured attention wrappers
+take their direct planner path (``DIRECT_PLAN_FLASHINFER_VERSIONS``): the
+wrappers keep the planner state and modules that path reads, and a direct
+planner call prices the step as ``plan()`` does (``_paged.py``).
 """
 
 from . import (
@@ -47,7 +48,7 @@ from .sampling import (
 )
 from .topk import TopKTieBreak, top_k_page_table_transform
 
-__version__ = "0.7.2+mstar_sim"
+__version__ = "0.7.2"
 
 __all__ = [
     "BatchDecodeWithPagedKVCacheWrapper",
