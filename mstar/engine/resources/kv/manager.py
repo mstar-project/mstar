@@ -4717,9 +4717,10 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, and no step or
-        read is in flight on its pages."""
-        return rid not in self._earmarks and not any(
+        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, no step or read is in
+        flight on its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its
+        allotment."""
+        return rid not in self._earmarks and rid not in self._dropped and not any(
             stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
         )
 
