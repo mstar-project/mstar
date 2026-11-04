@@ -2367,8 +2367,7 @@ class KVManager(AttentionResource):
     def _decode_locations(
         views: list[SequenceView], page_size: int,
     ) -> tuple[list[int], list[int]]:
-        """(page, offset-in-page) for each token a row writes: the last
-        ``to_compute`` of its stream (one for decode, k+1 for an MTP verify).
+        """Each decode row's (page, offset-in-page) for the token it writes.
 
         Off the stream's page count, not its logical length: that is what
         `build_paged_indptrs` hands attention, so a stream holding more pages
