@@ -30,6 +30,8 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
         env["MSTAR_SIM_COST"] = args.cost
     if args.fast:
         env["MSTAR_SIM_FAST"] = "1"
+    if args.time_scale is not None:
+        env["MSTAR_SIM_TIME_SCALE"] = str(args.time_scale)
     if args.no_graphs or args.eager_nodes:
         env["MSTAR_SIM_NO_GRAPHS"] = "1" if args.no_graphs else args.eager_nodes
     if args.memory_gb:
@@ -66,6 +68,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="host control flow only, for repros: no kernel is priced and no host "
                              "read waits for simulated device time (graphs, value and capture "
                              "semantics unchanged)")
+    parser.add_argument("--time-scale", type=float, default=None, metavar="K",
+                        help="every kernel takes K times its predicted time (a slow GPU, for "
+                             "timing-shaped bugs: queues that fill while the GPU is busy)")
     parser.add_argument("--no-graphs", action="store_true",
                         help="capture no accelerator graphs: every step runs eagerly "
                              "(for debugging: module hooks fire on every forward)")

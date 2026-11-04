@@ -29,6 +29,9 @@ _tls = threading.local()
 # timeouts still fire. Graph capture, host-read refusal under capture and value
 # semantics are unchanged.
 FAST = os.environ.get("MSTAR_SIM_FAST") == "1"
+# MSTAR_SIM_TIME_SCALE=K (``--time-scale K``): every kernel takes K times its predicted
+# time, so a slower GPU (or a host that outruns it) can be staged for timing-shaped bugs
+TIME_SCALE = float(os.environ.get("MSTAR_SIM_TIME_SCALE", "1"))
 
 
 @dataclass
@@ -128,6 +131,7 @@ def charge(seconds: float, launched: float | None = None) -> float:
     work goes on the tape instead."""
     if FAST:
         return time.perf_counter()
+    seconds *= TIME_SCALE
     tape = capturing()
     if tape is not None:
         tape.entries.append(seconds)
