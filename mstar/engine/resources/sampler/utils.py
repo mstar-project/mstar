@@ -1969,7 +1969,7 @@ class AcceleratorGraphableSampler(BaseSampler):
         ``last_token_buf`` is left out: the resource decides whether anything reads it."""
         if (
             self.offset_buf.device.type != "cuda" or self.min_p_buf is not None or self.history is not None
-            or self.order is not None or self.ingraph_scatter
+            or self.order is not None or self.ingraph_scatter or self.logprob_buf is not None
             or (self.tp_group is not None and self.tp_group.world_size > 1)
         ):
             return None

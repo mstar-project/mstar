@@ -75,6 +75,13 @@ def test_a_cpu_graph_sampler_has_no_fused_draw():
 
 
 @requires_cuda
+def test_a_step_that_writes_logprobs_has_no_fused_draw():
+    _, sampler, _ = _sampler("cuda")
+    sampler.logprob_buf = torch.zeros(4, device="cuda")
+    assert sampler.fused_draw_args(apply_filters=True) is None, "nothing would write the logprobs the step asks for"
+
+
+@requires_cuda
 def test_fused_draws_then_one_advance_equal_as_many_sample_calls():
     logits = torch.randn(15, 4, 2048, device="cuda")
     bufs, sampler, rids = _sampler("cuda")
