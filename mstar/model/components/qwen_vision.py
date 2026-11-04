@@ -118,14 +118,24 @@ class FrameSDPA:
         return torch.cat(out)
 
 
+class ConvPatchEmbed(VisionPatchEmbed):
+    """The patch embed as transformers runs it, a strided conv. ``VisionPatchEmbed``'s
+    matmul is faster on long videos but rounds differently in bf16 at Qwen3-VL's width."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
+        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+
+
 class QwenVisionModel(nn.Module):
-    """The rotary tables go into the blocks fp32, as transformers keeps them (Qwen3.5's
-    and Qwen3-Omni's towers round them to the activations' dtype)."""
+    """Rounds as transformers' tower does: the patch embed is its conv, and the rotary
+    tables go into the blocks fp32 (Qwen3.5's and Qwen3-Omni's towers round them to the
+    activations' dtype)."""
 
     def __init__(self, config: QwenVisionConfig, attn_key: str = VISION_ATTN):
         super().__init__()
         self.config = config
-        self.patch_embed = VisionPatchEmbed(config)
+        self.patch_embed = ConvPatchEmbed(config)
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
         self.blocks = nn.ModuleList(VisionBlock(config, attn_key) for _ in range(config.depth))

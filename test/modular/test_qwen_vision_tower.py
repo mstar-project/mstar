@@ -77,6 +77,26 @@ def test_bf16_tower_matches_transformers_with_fp32_rope():
     assert torch.equal(features[0], want.deepstack_features[0])
 
 
+def test_bf16_patch_embed_matches_transformers_at_the_checkpoints_width():
+    """The tiny tower's short reduction rounds a matmul and the conv alike; Qwen3-VL's
+    16-px patches at width 1152 don't."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
+
+    sizes = {**SIZES, "depth": 1, "hidden_size": 1152, "patch_size": 16}
+    torch.manual_seed(0)
+    reference = Qwen3VLVisionPatchEmbed(Qwen3VLVisionConfig(**sizes))
+    with torch.no_grad():
+        for param in reference.parameters():
+            param.normal_(0, 0.2)
+    reference = reference.to(torch.bfloat16)
+    ours = QwenVisionModel(QwenVisionConfig(**sizes)).patch_embed
+    ours.load_state_dict(reference.state_dict())
+    ours = ours.to(torch.bfloat16)
+    pixels = torch.randn(64, 3 * 2 * 16 * 16).to(torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(ours(pixels), reference(pixels))
+
+
 def test_a_node_without_the_resource_keeps_the_binding():
     """The engine binds a node's resources into every layer; a tower its owner bound to
     per-frame attention keeps it on a node that declares no vision resource."""
