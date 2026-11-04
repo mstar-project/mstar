@@ -343,6 +343,21 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
     assert out.strip() == "ok"
 
 
+def test_small_dev_shm_answers_every_statvfs_form():
+    """``--shm-mb``: ``os.statvfs`` of ``/dev/shm`` by str, bytes or path is the small
+    tmpfs, indexable like the real result; a file descriptor is the real call's."""
+    out = run_sim("""
+        import os, pathlib
+        for path in ("/dev/shm", b"/dev/shm/", pathlib.Path("/dev/shm")):
+            st = os.statvfs(path)
+            assert st.f_blocks * st.f_frsize == 64 << 20 and st[2] == st.f_blocks, (path, st)
+        fd = os.open("/dev/shm", os.O_RDONLY)
+        assert os.statvfs(fd).f_blocks == os.fstatvfs(fd).f_blocks
+        print("ok")
+    """, MSTAR_SIM_SHM_MB="64")
+    assert out.strip() == "ok"
+
+
 def test_memory_tracking_lock_is_reentrant():
     """A tensor freed by a garbage collection that runs while the tracker holds
     its lock releases its storage on the same thread: a plain lock deadlocks."""

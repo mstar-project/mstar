@@ -86,39 +86,32 @@ def thread_dumps() -> None:
 
 
 def _small_dev_shm(mib: int) -> None:
-    """``--shm-mb N``: ``statvfs("/dev/shm")`` answers as an N MiB tmpfs, its free
+    """``--shm-mb N``: ``os.statvfs`` of ``/dev/shm`` answers as an N MiB tmpfs, its free
     space N MiB less what every ``mstar_*`` file in it really holds (a dead run's
-    leftovers included; other mstar runs on the box count too). Only what mstar
-    reads to size its arena and files changes: writes past N still succeed."""
+    leftovers included; other mstar runs on the box count too). Only what mstar's
+    Python reads to size its arena and files changes: writes past N still succeed,
+    and the Rust arena's own growth check (``fstatvfs`` on a segment) sees the real
+    tmpfs."""
     real = os.statvfs
     total = mib << 20
 
-    class _Result:
-        f_bsize = f_frsize = 4096
-        f_blocks = total // 4096
-        f_files = f_ffree = f_favail = 1 << 20
-        f_flag = 0
-        f_namemax = 255
-
-        def __init__(self, used: int):
-            self.f_bfree = self.f_bavail = max(0, total - used) // 4096
-
     def used() -> int:
         held = 0
-        try:
-            for entry in os.scandir("/dev/shm"):
-                if entry.name.startswith("mstar_"):
+        for entry in os.scandir("/dev/shm"):
+            if entry.name.startswith("mstar_"):
+                files = [entry.path] if not entry.is_dir(follow_symlinks=False) else [
+                    os.path.join(d, f) for d, _, names in os.walk(entry.path) for f in names]
+                for path in files:
                     try:
-                        held += entry.stat(follow_symlinks=False).st_blocks * 512
+                        held += os.lstat(path).st_blocks * 512
                     except OSError:
                         pass
-        except OSError:
-            pass
         return held
 
     def statvfs(path, *args, **kwargs):
-        if os.fspath(path).rstrip("/") == "/dev/shm":
-            return _Result(used())
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fsdecode(path).rstrip("/") == "/dev/shm":
+            free = max(0, total - used()) // 4096
+            return os.statvfs_result((4096, 4096, total // 4096, free, free, 1 << 20, 1 << 20, 1 << 20, 0, 255))
         return real(path, *args, **kwargs)
 
     os.statvfs = statvfs
