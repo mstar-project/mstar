@@ -1354,8 +1354,12 @@ def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkey
     """Rank 0 pre-plans the next decode step of r and s, whose tokens each need a fourth page, and throws the stage
     away: N's verdict voids the head, or `prepare_inputs` drops s from a yield-away step it planned. A follower never
     planned the step, so rank 0 has to give back both pages, or the two ranks admit later steps from different
-    counts. The pages go back to the end of rank 0's free list, which only the prefix cache reads."""
+    counts. The pages go back where they came from, or the next prompt takes other pages on each rank and the next
+    cache hit names pages the follower doesn't hold."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        # as under MSTAR_KV_DEBUG_ASSERTS with the prefix cache open
+        kv._arena.trail = (0, 0)
     _ingest((leader, follower), "r", 3, arrival=1)
     _ingest((leader, follower), "s", 3, arrival=2)
     assert _admits(leader, "r") and _admits(leader, "s")
@@ -1378,7 +1382,8 @@ def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkey
         f"rank 0 holds {held(leader)} pages for r and s after throwing its pre-plan away, and a follower that never "
         f"planned the step holds {held(follower)}"
     )
-    assert _counts(leader)[:-1] == _counts(follower)[:-1] and leader._arena.num_free == follower._arena.num_free
+    assert _counts(leader) == _counts(follower), "rank 0's free list is in another order than the follower's"
+    assert leader._arena.trail == follower._arena.trail, "a follower checking rank 0's page trail would stop"
 
 
 def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_0_stops(monkeypatch):

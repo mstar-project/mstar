@@ -227,6 +227,21 @@ def test_a_commit_keeps_another_rows_unwind_record():
     assert kv._arena.num_free == free - 2, "only row 1's committed pages stay held"
 
 
+def test_a_refused_admit_leaves_the_free_list_as_it_found_it():
+    """The next admit then takes the pages it would have taken had the refused one never run, as on a TP rank that
+    never ran it."""
+    kv = _kv("kv", pages=6)  # 5 usable: two rows fit, the third does not
+    runner = StepRunner({"kv": kv})
+    for rid in (1, 2, 3):
+        kv.ingest_request(rid, None)
+    free = kv._arena.free_pages()
+    step = SubmoduleStep(steps={"kv": KVStep(segments=tuple(Segment(rid, "main", 2 * PAGE) for rid in (1, 2, 3)))})
+
+    assert not _drive(runner, step, _ctx(1, 2, 3)).ok
+
+    assert kv._arena.free_pages() == free, "the refused admit put its pages back in another order"
+
+
 # --- the unbatched fallback admits all or nothing -----------------------------
 
 

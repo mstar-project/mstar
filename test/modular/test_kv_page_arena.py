@@ -175,3 +175,19 @@ def test_a_page_a_release_leaves_to_the_index_is_queued_for_the_host(backend):
     assert queued == [b"key0"]
     arena.release(pages)  # page 0 freed, page 1 left to its one owner
     assert queued == [b"key0", b"key1"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_pages_given_back_go_out_again_first_and_in_their_order(backend):
+    """An undone acquire leaves the free list as the acquire found it, even after a release behind it. A rank
+    that never ran the acquire then hands out the same pages next."""
+    arena = new_page_arena(6, backend)
+    arena.acquire(1)
+    taken = arena.acquire(2)
+    arena.release([0])
+    arena.give_back(taken)
+    assert arena.free_pages() == [1, 2, 3, 4, 5, 0], "the pages went back somewhere other than where they came from"
+    held = arena.acquire(1)
+    arena.retain(held)
+    with pytest.raises(AssertionError):
+        arena.give_back(held)
