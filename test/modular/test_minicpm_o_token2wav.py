@@ -493,15 +493,18 @@ def test_assets_load_completely():
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
 
 
-@pytest.mark.parametrize("n", [0, 1, 21, 22, 23, 24, 25, 49, 99, 100, 230])
-def test_served_windows_are_upstreams(n):
-    """The TTS streams ``n`` codes and then its stop code; the policy's chunks, through
-    ``prepare_inputs``, are the reference's windows of the codes: every code voiced once and the
-    same last window, also when the stop code ends a full window (``n = 25j + 24``). Every
+@pytest.mark.parametrize(("n", "stop"), [
+    *((n, True) for n in [1, 21, 22, 23, 24, 25, 49, 99, 100, 230]), (0, False), (25, False), (50, False),
+])
+def test_served_windows_are_upstreams(n, stop):
+    """The TTS streams ``n`` codes and then its stop code, or none when it ends at its cap; the
+    policy's chunks, through ``prepare_inputs``, are the reference's windows of the codes: every
+    code voiced once and the same last window, also when the stop code ends a full window
+    (``n = 25j + 24``) or a capped reply's codes do (``n = 25j``). Every
     chunk still runs, voicing nothing past the last window: a skipped step never completes the
     node, which then refuses the stream's final chunk. ``n = 0`` is a reply that ended at the
     LLM's prefill: the TTS never ran, and the stream's one chunk is an empty, last step that
-    declares no row (so takes no slot)."""
+    declares no row (so leases no slot)."""
     from types import SimpleNamespace
 
     from mstar.model.minicpm_o.components.token2wav import HOP, LEAD_SILENCE, SILENCE_CODE
@@ -522,7 +525,7 @@ def test_served_windows_are_upstreams(n):
     buffer = StreamBuffer(request_id=0, edge_name="tts_code", from_partition="main",
                           policy=LeftContextChunkPolicy(chunk=HOP, left_context=LEAD_SILENCE))
     served = []
-    for i, code in enumerate((codes + [eos] if n else []) + [None]):
+    for i, code in enumerate((codes + [eos] if stop else codes) + [None]):
         if code is None:
             buffer.signal_done()
         else:
