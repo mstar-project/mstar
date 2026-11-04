@@ -2649,6 +2649,9 @@ its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<o
 on a shared component gets them without code of its own: the component looks its shape up once
 per process and keeps the default config where no table has it, and the server logs the sweep
 command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
+count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
+GPU's row names one that runs there.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.
