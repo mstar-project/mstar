@@ -121,3 +121,40 @@ def test_poll_for_messages_parity(tmp_path):
         a.send(f"pfm_{tag}_b", {"hello": tag})
         assert b.poll_for_messages(timeout_ms=2000) is True
         assert b.get_all_new_messages() == [{"hello": tag}]
+
+
+def test_runtime_lora_messages_cross_the_rust_transport_both_ways(pair):
+    """The LoRA load/unload control messages (``/v1/load_lora_adapter``) need no Rust
+    code: the transport moves opaque frames and both ends encode with the Python wire
+    codec. Every message of the flow, typed, through a Rust and a pyzmq peer."""
+    from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult
+    from mstar.utils.ipc_format import (
+        ConductorMessage,
+        ConductorMessageType,
+        LoadLoraAdapter,
+        LoraAdapterAck,
+        UnloadLoraAdapter,
+        WorkerMessage,
+        WorkerMessageType,
+    )
+
+    load = LoadLoraAdapter(op_id="op", lora_name="sql", lora_path="/a/adapter_model.safetensors")
+    unload = UnloadLoraAdapter(op_id="op", lora_name="sql")
+    messages = [
+        ConductorMessage(ConductorMessageType.LOAD_LORA_ADAPTER, load),
+        ConductorMessage(ConductorMessageType.UNLOAD_LORA_ADAPTER, unload),
+        WorkerMessage(WorkerMessageType.LOAD_LORA_ADAPTER, load),
+        WorkerMessage(WorkerMessageType.UNLOAD_LORA_ADAPTER, unload),
+        ConductorMessage(ConductorMessageType.LORA_ADAPTER_ACK,
+                         LoraAdapterAck(op_id="op", worker_id="worker_1", error="boom")),
+        APIServerMessage(message_type="lora_adapter_result",
+                         body=LoraAdapterResult(op_id="op", error_message="no", status=400)),
+    ]
+    orig, rust = pair
+    for message in messages:
+        orig.send("rust", message)
+    got = _wait_msgs(rust, n=len(messages))
+    assert got == messages and [type(m.body) for m in got] == [type(m.body) for m in messages]
+    for message in messages:
+        rust.send("orig", message)
+    assert _wait_msgs(orig, n=len(messages)) == messages
