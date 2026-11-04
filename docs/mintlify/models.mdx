@@ -197,6 +197,7 @@ On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs, 
 - On `/v1/audio/speech`, text longer than one piece is synthesized as ordered sentence pieces, as the reference frontend does: about 80 tokens (320 characters) of English, or 80 characters of text with Chinese, each piece cloning the same voice. In one request the LM ends long text early or garbles its end. A Chinese sentence over 300 characters, which the reference keeps whole, is also cut at its commas, so that each piece stays under the LM's 512 tokens of transcript and text. `sentence_chunking: false` sends the text whole.
 - Japanese written in kana alone, with spaces between words, is read poorly, as it is by the official model: in tests both garbled common words such as ゆっくり and ありがとうございました on every seed.
 - The flow's DiT estimator runs in bfloat16 by default; the Euler state, the rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor float64). `model_kwargs: {flow_estimator_dtype: float32}` in the deployment YAML runs the estimator at the reference's precision instead, at lower throughput.
+- The flow's Euler solve is captured at startup as CUDA graphs, one per frame bucket and batch size (`flow_capture_frame_buckets`, `flow_capture_batch_sizes`, `flow_capture_batch_frames`), which takes GPU memory and startup time. `model_kwargs: {flow_capture_frame_buckets: []}` captures none, and every solve runs eagerly.
 
 ## Qwen3-TTS notes {#qwen3-tts-notes}
 

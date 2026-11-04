@@ -242,7 +242,7 @@ Where `process_prompt` computes a length that a walk computes another way, such 
 
 Loading fails in three cases, and a request fails in two:
 
-- A paged pool has no labels. The message is `` <Model> declares no labels for its paged pool '<key>'; add them to `kv_labels`, and return each request's layout for them from `process_prompt ``\`. A ring pool needs none.
+- A paged pool has no labels. The message is `` <Model> declares no labels for its paged pool '<key>'; add them to `kv_labels`, and return each request's layout for them from `process_prompt` ``. A ring pool needs none.
 - A label's growth or keys name a walk the model never runs. The message is `<Model> declares '<key>'/'<label>' over ['<walk>'], which it never runs; its walks are [...]`.
 - A label grows on a loop its walk doesn't run. The message is `<Model> declares '<key>'/'<label>' growing on '<loop>', which '<walk>' doesn't run; its loops are [...]`.
 - A request's layout leaves out a label the request opens, or lays out one the model doesn't declare. The request fails with a 500, `<Model> returned no kv_layout for '<key>'/'<label>', which the request opens`, or `<Model> returned a kv_layout for '<key>'/'<label>', which it does not declare`.
@@ -717,7 +717,7 @@ def declare_step(self, graph_walk, request_ids, inputs,
 
 `piecewise_leases` names the inner regions of this node that hold their own slot for this step. Such a region declares, plans and commits its own work. Any resource that the region owns must therefore be excluded from the outer declaration. See [Piecewise CUDA graphs (capturing an inner loop)](/adding_models#piecewise-cuda-graphs-capturing-an-inner-loop).
 
-**Advanced \`\`KVStep\`\` fields.** These fields cover cases that the engine previously handled as special cases. BAGEL uses all of them, in `mstar/model/bagel/submodules.py`:
+**Advanced `KVStep` fields.** These fields cover cases that the engine previously handled as special cases. BAGEL uses all of them, in `mstar/model/bagel/submodules.py`:
 
 - `commit=False`: the step reads and plans, but its writes do not become resident yet.
 - `combined_labels={("main", "cfg_img"): "cfg_batched"}`: pack several labels into a single plan. Batched classifier-free guidance uses this to run two branches through one attention call. Positions take their packing from the KV plan, so the grouping is declared once here, and `PositionStep` keys its `pos_ids` by the combined label.

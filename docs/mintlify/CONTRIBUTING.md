@@ -54,9 +54,10 @@ Official instructions: [quickstart](https://www.mintlify.com/docs/quickstart),
 - Both copies are maintained manually during migration. There is no automatic
   RST-to-MDX synchronization.
 
-The `.rst` files remain the canonical sources during this transition, as required
-by the repository's contribution and agent instructions. Update a guide's `.rst`
-and `.mdx` files together when changing overlapping content. Check code blocks,
+The `.rst` files remain the canonical sources during this transition. Update a
+guide's `.rst` and `.mdx` files in the same PR when changing overlapping content;
+this rule also appears in the [root contributor guide](../../CONTRIBUTING.md#documentation)
+and [AGENTS.md invariant 9](../../AGENTS.md#9-update-the-documentation). Check code blocks,
 tables, callouts, internal links, and section anchors in the local preview.
 
 Converted headings have explicit IDs, such as `## Metrics {#serving-metrics}`.
