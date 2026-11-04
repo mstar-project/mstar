@@ -479,7 +479,7 @@ class MicroScheduler:
         self.read_failed_rids: set[int] = set()
         self._warned_read_check = False
 
-        # lockstep-parallel (TP / SP instance) scheduling
+        # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = parallel_leader_nodes
         self.tp_batches_pending_schedule = deque()
         self.num_consec_tp_follower_batches = 0

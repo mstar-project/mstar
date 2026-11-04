@@ -587,7 +587,7 @@ these common members:
   config carries ``splits`` must return them here. ``AttentionSpec`` and
   ``LinearAttnSpec`` return their config's ``splits``.
 
-Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+Two lockstep-parallel nodes on one worker (TP, SP or CFG nodes placed on the same ranks) must not
 share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
 a resource implementing ``supports_eviction``, ``lease_cached_prefix`` or ``page_trail``, which
 the paged KV cache does with or without host offload. The other ranks replay each decision
@@ -1982,7 +1982,7 @@ batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
-speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+speculated nor planned ahead and lands between two chain steps: a TP, SP or CFG node, a node
 alone on its worker, a device without streams, a node with chain walks or resources, and a
 side walk that is not the node's alone, sits in a combined walk, or has output spans or a
 stop check. A config without the field keeps the node on the chain, whatever it declares.

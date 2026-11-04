@@ -163,8 +163,8 @@ def _side_lane_keys(
         if not side:
             raise refuse("its submodule declares no side_stream_walks")
         if parallel_groups.get_instance_world_size_for_node(name) > 1:
-            raise refuse("it runs tensor or sequence parallel: when a side step lands is per rank, "
-                         "and every rank of a lockstep instance has to agree on it")
+            raise refuse("it runs in a lockstep instance (TP, SP or CFG): when a side step lands "
+                         "is per rank, and every rank of the instance has to agree on it")
         if set(node_names) <= {name}:
             raise refuse("it is the only node on its worker, so there is no chain to run beside")
         if not accelerator:

@@ -631,7 +631,7 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
 
 @pytest.mark.parametrize("kwargs, reason", [
     (dict(submodules={"Codec": _Plain(), "Talker": object()}), "declares no side_stream_walks"),
-    (dict(groups=_Groups(world=2)), "tensor or sequence parallel"),
+    (dict(groups=_Groups(world=2)), "runs in a lockstep instance"),
     (dict(nodes=("Codec",)), "only node on its worker"),
     (dict(accelerator=False), "no streams"),
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _codec_node()})), "also runs"),

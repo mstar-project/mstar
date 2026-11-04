@@ -603,7 +603,7 @@ comes ready meanwhile batches into the next one. It applies to the walks the nod
 submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
 ``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
 worker and one CUDA context, unlike a split with MPS. Startup fails with a
-``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
+``ValueError`` naming the field where the lane can't apply: a TP, SP or CFG node, a node
 alone on its worker, a device without streams, a node that also runs walks on the
 chain or holds resources, or a side walk that isn't the node's alone, is part of a
 combined walk, or has output spans or a stop check. Without the field the node runs on
@@ -1048,7 +1048,7 @@ second old:
 The engine workers also send the conductor their own metrics every second, which it
 adds to its status message, so these can be up to two seconds old. ``component`` is the
 graph node; a node with replicas on several workers shows their sum, and the ranks of a
-tensor or sequence parallel instance count once (the instance's first rank reports).
+TP, SP or CFG instance count once (the instance's first rank reports).
 The histograms and counters count from the first request after the warmup requests, as
 the API server's do (the gauges show the current state), so read them with ``rate()``
 or ``increase()``.
