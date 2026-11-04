@@ -30,7 +30,7 @@ from test_micro_scheduler import NODE as SCHED_NODE
 from test_micro_scheduler import WALK as SCHED_WALK
 from test_micro_scheduler import _batch as _sched_batch
 
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources import (
     AdmitOutcome,
     AllocationFailed,
@@ -693,6 +693,10 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
 
 class _FakeMgmt:
     """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
+
+    # no idle-capable resource
+    idle_keys = ()
+    rows_idle = SubmoduleManagement.rows_idle
 
     def __init__(
         self, submodule, num_slots: int, next_slot: int, seen: list,

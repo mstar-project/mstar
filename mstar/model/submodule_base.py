@@ -12,8 +12,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
-from mstar.engine.resources.lora.config import LoraStep
+from mstar.engine.resources import Resource, ResourceStep, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -845,13 +844,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
-    # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
-    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
-    # and to each piecewise region's (``lora_rows``), from its segments: in order, the
-    # rows the adapted linears see, each a request's span of tokens (a request may have
-    # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
-    # declares its own ``LoraStep`` under the pool's key.
-    lora_keys: tuple[str, ...] = ()
+    # The keys of this node's resources whose step is its segments
+    # (``Resource.steps_from_segments``: the LoRA pools); set by `bind_node_resources`. The
+    # engine adds a step of the segments under each to the node's step (``engine_step``),
+    # and to each piecewise region's from the region's own: in order, the rows the node's
+    # computation sees, each a request's span of tokens (a request may have several, as
+    # CFG's cond and uncond copies). A step that lays its rows out otherwise declares its
+    # own step under the resource's key.
+    segment_keys: tuple[str, ...] = ()
 
     def __init__(self):
         super().__init__()
@@ -877,6 +877,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         names a label this node doesn't have fails at bind rather than in the
         middle of a forward.
         """
+        self.segment_keys = tuple(
+            key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
+        )
         self.node_resources = resources
         for module in self.modules():
             bind = getattr(module, "bind_resources", None)
@@ -884,7 +887,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
                 bind(resources)
         from mstar.model.components.lora.modules import bind_module_lora
 
-        self.lora_keys = bind_module_lora(self, resources)
+        bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1452,25 +1455,26 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self.request_states.pop(request_id, None)
 
 
-def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
-    """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
-    itself, its rows the step's segments, as a new step (a declaration reused across
-    calls keeps its own). A step without segments gets none: an adapted module it runs
-    refuses for want of a plan (``LoraLayerDelta``)."""
-    if lora_keys and step is not None and step.segments is not None:
+def with_segment_steps(step: SubmoduleStep | None, keys: Sequence[str]) -> SubmoduleStep | None:
+    """``step`` with a ``ResourceStep`` of its segments under each of ``keys`` (the
+    resources whose step is the segments, ``Resource.steps_from_segments``) that it does
+    not declare itself, as a new step (a declaration reused across calls keeps its own). A
+    step without segments gets none: a resource that needs one refuses for want of a plan
+    (``LoraLayerDelta``)."""
+    if keys and step is not None and step.segments is not None:
         segments = tuple(step.segments)
-        added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
+        added = {key: ResourceStep(segments=segments) for key in keys if key not in step.steps}
         if added:
             step = replace(step, steps={**step.steps, **added})
     return step
 
 
 def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
-    """What the engine calls for a node's step: its ``declare_step``, with the LoRA
-    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
-    no LoRA step."""
+    """What the engine calls for a node's step: its ``declare_step``, with a step of its
+    segments under each resource that takes them as they are (``with_segment_steps``),
+    so a model declares nothing for such a resource (a LoRA pool)."""
     # the engine drives duck-typed submodules too
-    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    return with_segment_steps(submodule.declare_step(*args, **kwargs), getattr(submodule, "segment_keys", ()))
 
 
 class ARNodeSubmodule(NodeSubmodule):

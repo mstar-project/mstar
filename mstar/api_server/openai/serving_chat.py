@@ -29,7 +29,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         # resolved once, before it is submitted: the response names the adapter that
         # served it, as vLLM's does, whether the model field or the lora_adapter kwarg
         # picked it
-        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+        model_kwargs = api.lora_kwargs(req.model, args.model_kwargs).model_kwargs
         served = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
         if served is not None:
             model_name = served

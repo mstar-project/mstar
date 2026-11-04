@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -129,6 +130,32 @@ class Resource(ABC):
 
     def can_capture(self) -> bool:
         return True
+
+    # Whether this resource's kernels may be left out of a step none of whose rows uses
+    # it (``idle_for``); at most one on a node. The engine then captures each bucket whose
+    # step drives it a second time, idle (``BucketKey.idle``), and tells the resource
+    # through ``StepContext.idle``, eager steps included. Its kernels must hold no
+    # collective: TP ranks can replay different twins of one step, when a row is removed
+    # on one rank while another leases (``SubmoduleManagement.rows_idle``).
+    idle_capture: bool = False
+
+    def idle_for(self, request_ids) -> bool:
+        """Whether an ``idle_capture`` resource sits out a step of ``request_ids``: none of
+        them uses it. Read from state every rank of a lockstep instance sets alike (its
+        ingests). Called on the thread that leases the step's graph."""
+        return False
+
+    def outside_step(self) -> AbstractContextManager[None]:
+        """Run an ``idle_capture`` resource's callers outside any planned step (a
+        compile's warm-up) on this thread, as in an idle step."""
+        return nullcontext()
+
+    # Whether this resource's step on a node is the node's own segments
+    # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
+    # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
+    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
+    # node's tokens).
+    steps_from_segments: bool = False
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False

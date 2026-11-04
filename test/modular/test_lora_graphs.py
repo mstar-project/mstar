@@ -1,6 +1,7 @@
-"""Per-request LoRA under capture, torch.compile, the async worker and the step's compute
-scope, on CPU. A CUDA graph cannot be captured on a CPU, so a replay is emulated by
-running the kernels on the views the capture planned, after the replay's plan wrote them."""
+"""Per-request LoRA under capture (idle captures included), torch.compile, the async worker
+and the step's compute scope, on CPU. A CUDA graph cannot be captured on a CPU, so a replay
+is emulated by running the kernels on the views the capture planned, after the replay's
+plan wrote them."""
 
 from __future__ import annotations
 
@@ -16,9 +17,12 @@ pytest.importorskip("safetensors")
 import lora_module_helpers as Q  # noqa: E402
 import test_lora_pool as P  # noqa: E402
 
-from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
+from mstar.engine.accelerator_graph_config import (  # noqa: E402
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
-from mstar.engine.resources.lora import LoraBaseOnly, LoraReqConfig, LoraStep  # noqa: E402
+from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
 from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool, _Layout  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
@@ -26,13 +30,14 @@ from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
     PIECEWISE_WALK,
     BucketKey,
+    ResourceStep,
     Segment,
     SlotLease,
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.qwen3_5.config import LLM_MIXED, LORA  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, engine_step  # noqa: E402
+from mstar.model.qwen3_5.config import LLM_MIXED  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step  # noqa: E402
 
 F64 = torch.float64
 CPU = torch.device("cpu")
@@ -51,7 +56,7 @@ def qwen_adapters(tmp_path):
 def _llm(paths, with_pool=True):
     rows = Q._Rows()
     pool = LoraAdapterPool(Q.lora_spec(paths), "cpu", backend=LoraOpsBackend()) if with_pool else None
-    llm = Q.bind(Q.build_stack(Q.hf_text_weights()), rows, {LORA: pool} if pool is not None else {})
+    llm = Q.bind(Q.build_stack(Q.hf_text_weights()), rows, {LORA_RESOURCE_KEY: pool} if pool is not None else {})
     return llm, pool, rows
 
 
@@ -108,7 +113,7 @@ def _capture_plan(llm, pool, config, bs, n):
     for rid in rids:
         pool.ingest_capture_row(rid)
     lease = SlotLease(slot=0, bucket=BucketKey(walk, bs, n, config.additional_key_info))
-    step = engine_step(llm, walk, rids, config.get_node_inputs(bs, n), slot_lease=lease).steps[LORA]
+    step = engine_step(llm, walk, rids, config.get_node_inputs(bs, n), slot_lease=lease).steps[LORA_RESOURCE_KEY]
     ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=True, slot_lease=lease,
                       force_prefill=isinstance(config, PackedAcceleratorGraphConfig))
     assert pool.admit(step, ctx).ok
@@ -119,7 +124,7 @@ def test_lora_changes_no_capture_bucket_and_captures_on_the_zero_slot(qwen_adapt
     """Buckets and keys are the plain node's; every capture, the mixed walk's included, spans
     its whole bucket on the zero adapter in 16-byte aligned arrays and takes no slot."""
     (plain, *_), (served, pool, _) = _llm(qwen_adapters, with_pool=False), _llm(qwen_adapters)
-    assert served.lora_keys == (LORA,) and not served.disable_torch_compile
+    assert served.segment_keys == (LORA_RESOURCE_KEY,) and not served.disable_torch_compile
     configs = served.get_accelerator_graph_configs(CPU)
 
     def buckets(configs):
@@ -135,7 +140,7 @@ def test_lora_changes_no_capture_bucket_and_captures_on_the_zero_slot(qwen_adapt
             inputs, rids = config.get_node_inputs(bs, config.get_total_tokens(bs)[0]), list(range(-1, -1 - bs, -1))
             with_lora, without = engine_step(served, walk, rids, inputs), engine_step(plain, walk, rids, inputs)
             assert with_lora.cg_key_info == without.cg_key_info
-            assert set(with_lora.steps) - set(without.steps) == {LORA}
+            assert set(with_lora.steps) - set(without.steps) == {LORA_RESOURCE_KEY}
             for n in config.get_total_tokens(bs):
                 addr, lease = _capture_plan(served, pool, config, bs, n)
                 assert addr.token_order.shape == (n,), (walk, bs, n)
@@ -161,7 +166,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
     llm, pool, _ = _llm(qwen_adapters)
     named = {"d0": "a1", "d1": None, "d2": "a2", "p0": "a2"}
     for rid, _, _ in rows:
-        pool.ingest_request(rid, LoraReqConfig(adapter=named[rid]))
+        pool.ingest_request(rid, None if named[rid] is None else LoraReqConfig(adapter=named[rid]))
     config = next(c for c in llm.get_accelerator_graph_configs(CPU) if c.capture_graph_walk == walk)
     captured, lease = _capture_plan(llm, pool, config, bs, n)
     # the replay's plan, padded as AcceleratorGraphRunner pads it, on the capture's handles
@@ -169,7 +174,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
     inputs = [ARNodeInputs(input_seq_len=s, input_ids=torch.zeros(s, dtype=torch.long), graph_walk=w)
               for _, w, s in rows] + (config.get_node_inputs(bs - len(rows), 0) if bs > len(rows) else [])
     padded = [*rids, *list(range(-1, -1 - bs, -1))[len(rids):]]
-    step = engine_step(llm, walk, padded, inputs, slot_lease=lease).steps[LORA]
+    step = engine_step(llm, walk, padded, inputs, slot_lease=lease).steps[LORA_RESOURCE_KEY]
     ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease)
     ctx.set_padded_rids(padded)
     assert pool.admit(step, ctx).ok
@@ -184,7 +189,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
         base = torch.randn(n, t.out_features, generator=g, dtype=F64)
         replayed = base.clone()
         LoraOpsBackend().apply_(x, replayed, d.a, d.b, captured, d.ranks, d.scalings, d.out_slices)
-        eager_step = LoraStep(segments=tuple(Segment(rid, "main", span) for rid, _, span in rows))
+        eager_step = ResourceStep(segments=tuple(Segment(rid, "main", span) for rid, _, span in rows))
         eager_ctx = StepContext(request_ids=rids, graph_walk="eager", slot=0, capture=False)
         assert pool.admit(eager_step, eager_ctx).ok
         pool.plan(eager_step, eager_ctx)
@@ -224,7 +229,7 @@ class _Plain(Resource):
 
 
 def _runner_step(rids, keys):
-    step = SubmoduleStep(segments=[Segment(r, "main", 1) for r in rids], steps={k: LoraStep() for k in keys})
+    step = SubmoduleStep(segments=[Segment(r, "main", 1) for r in rids], steps={k: ResourceStep() for k in keys})
     step.set_ctx(StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=False))
     return step
 
@@ -317,7 +322,7 @@ class _Warmed(torch.nn.Module):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(compiled, monkeypatch):
+def test_a_warm_up_outside_any_step_runs_a_bound_module_as_an_idle_step(compiled, monkeypatch):
     """The engine warms compile_regions (and warmup_compiles) outside any step: a bound
     module there adds no delta, eager or traced, instead of refusing for want of a plan,
     and the pool is left with none."""
@@ -331,21 +336,20 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
                         else (lambda fn, **kw: fn))
     torch._dynamo.reset()
-    with torch.device("meta"):
-        spec = module_lora_spec(_Warmed(), resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(lambda _: _Warmed(), nodes={"N"}, root_path="")
     node, pool = _Warmed(), lora_pool(serve(spec, {}))
     bind_module_lora(node, {"lora": pool})
     engine = object.__new__(Engine)
     engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
     engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
-                                               lora_pools=(pool,))}
+                                               idle_keys=("lora",), resources={"lora": pool})}
     engine._compile_regions()
     assert pool._current is None and pool.active
     with pytest.raises(RuntimeError, match="no plan"):
         node.fc(torch.ones(2, 4, dtype=F64))
 
 
-# --- base-only captures ------------------------------------------------------------------
+# --- idle captures ----------------------------------------------------------------------
 
 class _CountingBackend(LoraOpsBackend):
     calls = 0
@@ -364,78 +368,168 @@ def _delta_runs(pool, backend, tokens=2):
     return backend.calls > before
 
 
-def test_every_bucket_is_captured_again_under_a_base_only_key_beside_the_nodes_own():
-    """Each bucket under the node's own key (a model's cg_key_info) and under LoraBaseOnly
-    of it, sharing the config; a node without LoRA captures exactly what it did."""
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+def test_every_bucket_is_captured_again_idle_beside_its_plain_one():
+    """A node with an idle-capable resource captures each bucket twice, sharing the config;
+    one without captures exactly what it did. An idle bucket is kept only beside its plain
+    one, and is not reported as running eagerly while that one replays its steps."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, _with_plain_twin
 
     configs = [PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill", capture_token_lengths=[16, 32], capture_batch_sizes=[1, 2],
         make_node_input=lambda n: ARNodeInputs(input_seq_len=n), additional_key_info=cfg,
     ) for cfg in (True, False)]
 
-    def specs(lora_keys):
+    def runner(idle_capture):
         runner = object.__new__(AcceleratorGraphRunner)
         runner._capture_configs, runner._num_slots = configs, 2
-        runner._submodule = SimpleNamespace(lora_keys=lora_keys)
-        return runner._get_slot_specs()
+        runner._resources = {"res": SimpleNamespace(idle_capture=idle_capture)}
+        runner._submodule_name, runner._blocked_buckets = "LLM", []
+        return runner
 
-    plain, served = specs(()), specs((LORA,))
-    assert {s.bucket.cg_key_info for s in plain} == {True, False} and len(served) == 2 * len(plain)
+    plain, served = runner(False)._get_slot_specs(), runner(True)._get_slot_specs()
+    assert {s.bucket.cg_key_info for s in plain} == {True, False} and not any(s.bucket.idle for s in plain)
     own = {(s.bucket, s.slot, s.config_idx) for s in plain}
-    twins = {(s.bucket, s.slot, s.config_idx) for s in served} - own
-    assert twins == {
-        (BucketKey(b.graph_walk, b.bs, b.num_tokens, LoraBaseOnly(b.cg_key_info)), slot, idx) for b, slot, idx in own
+    assert {(s.bucket, s.slot, s.config_idx) for s in served} == own | {
+        (BucketKey(b.graph_walk, b.bs, b.num_tokens, b.cg_key_info, idle=True), slot, idx) for b, slot, idx in own
     }
-    assert str(LoraBaseOnly(True)) == "lora-base-only:True"
+    big, small = BucketKey("prefill", 2, 32, True), BucketKey("prefill", 1, 16, True)
+    big_idle, small_idle = BucketKey("prefill", 2, 32, True, idle=True), BucketKey("prefill", 1, 16, True, idle=True)
+    assert _with_plain_twin({big, big_idle, small_idle}) == {big, big_idle}
+    reporting = runner(True)
+    reporting._report_dropped([big, big_idle, small, small_idle], {big, small})
+    assert reporting.dropped_buckets == []
+    reporting._report_dropped([big, big_idle, small, small_idle], {big, big_idle})
+    assert reporting.dropped_buckets == [small, small_idle]
 
 
-def _engine_with(pool, captured_keys, model_key="cfg"):
-    """An engine whose node keys captures ``model_key`` and has ``captured_keys``; and what it asks."""
+def test_only_a_config_whose_step_drives_the_idle_resource_captures_idle_twins():
+    """A config whose declared step carries no step under the idle-capable resource's key
+    would capture the same kernels twice."""
+    from unittest.mock import Mock
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    configs = [BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", capture_batch_sizes=[1, 2], additional_key_info=drives,
+        single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+    ) for drives in (True, False)]
+
+    def declare_step(slot_lease, **kwargs):
+        return SimpleNamespace(steps={"lora": object()} if slot_lease.bucket.cg_key_info else {})
+
+    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, idle_capture=True)
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", resources={"lora": resource}, step_runner=Mock(), device=CPU,
+        submodule=SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step),
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+    )
+
+    buckets = {spec.bucket for spec in runner.prepare_for_capture()}
+    assert {(b.cg_key_info, b.idle) for b in buckets} == {(True, False), (True, True), (False, False)}
+    assert len(buckets) == 6 and not runner.dropped_buckets
+
+
+def test_a_node_takes_at_most_one_idle_capable_resource():
+    """A step is idle or not as a whole, so one idle twin cannot leave two resources out."""
+    from mstar.engine.engine import SubmoduleManagement
+
+    resource = SimpleNamespace(idle_capture=True, force_double_buffer=False, supports_preplan=False)
+    with pytest.raises(ValueError, match="at most one idle-capable resource"):
+        SubmoduleManagement(None, None, None, None, resources={"lora": resource, "vision_lora": resource})
+
+
+def _mgmt(idle_keys, runner=None, adapters=None):
+    """A node whose idle-capable resources answer from ``adapters`` (rid -> the adapter
+    it was ingested with), as a pool answers from its ingests."""
+    from mstar.engine.engine import SubmoduleManagement
+
+    named = adapters or {}
+    resource = SimpleNamespace(
+        idle_capture=True, force_double_buffer=False, supports_preplan=False,
+        idle_for=lambda rids: all(named.get(rid) is None for rid in rids),
+    )
+    return SubmoduleManagement(
+        SimpleNamespace(cg_key_info=lambda walk, info, **kw: "cfg"), None, None, None,
+        resources=dict.fromkeys(idle_keys, resource), accelerator_graph_runner=runner,
+    )
+
+
+def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,), adapters=None):
+    """An engine whose node captured the decode buckets ``captured``, (bs, idle) pairs."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphBucket, AcceleratorGraphRunner
     from mstar.engine.engine import Engine
 
-    asked = []
-
-    def lease_slot(graph_walk, bs, slot, num_tokens=None, cg_key_info=None):
-        asked.append(cg_key_info)
-        return SlotLease(slot, BucketKey(graph_walk, 8, 8, cg_key_info)) if cg_key_info in captured_keys else None
-
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+    )
+    runner = object.__new__(AcceleratorGraphRunner)
+    runner._buckets = {
+        BucketKey("decode", bs, bs, "cfg", idle=idle): AcceleratorGraphBucket(config, 0, slots=[None])
+        for bs, idle in captured
+    }
     engine = object.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(
-        submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
-        accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
-    )}
-    return engine, asked
+    engine._submodules = {"LLM": _mgmt(idle_keys, runner, adapters)}
+    return engine
 
 
 def _batch(rids):
-    batch = SimpleNamespace(node_name="LLM", slot=0, request_ids=list(rids), inputs=None, cg_key_info=None,
-                            per_request_info_wrapped={}, per_request_input_metadata={},
-                            step_context=SimpleNamespace(graph_walk="decode", force_prefill=None))
-    batch.lease_slot = lambda lease: setattr(batch, "lease", lease)
+    infos = {rid: SimpleNamespace(resource_configs={}) for rid in rids}
+    batch = SimpleNamespace(node_name="LLM", slot=0, request_ids=list(infos), inputs=None, cg_key_info=None,
+                            per_request_info=infos, per_request_input_metadata={}, per_request_info_wrapped={},
+                            step_context=StepContext(request_ids=list(infos), graph_walk="decode", slot=0,
+                                                     capture=False))
+    batch.lease_slot = lambda lease: setattr(batch.step_context, "slot_lease", lease)
     return batch
 
 
-def test_the_lease_takes_the_base_only_capture_only_when_no_row_names_an_adapter(adapters):
-    pool = P.make_pool(adapters[1])
-    for rid, name in (("b0", None), ("b1", None), ("r", "a1")):
-        P.ingest(pool, rid, name)
-    engine, asked = _engine_with(pool, {"cfg", LoraBaseOnly("cfg")})
-    lease = engine.reserve_replay_slot(_batch(["b0", "b1"]))
-    assert lease.bucket.cg_key_info == LoraBaseOnly("cfg") and asked == [LoraBaseOnly("cfg")]
-    # one adapter row: the LoRA graph, never asked for the base-only one
-    asked.clear()
-    assert engine.reserve_replay_slot(_batch(["b0", "r"])).bucket.cg_key_info == "cfg"
-    assert asked == ["cfg"]
-    # no base-only bucket fits (not captured, or dropped): the LoRA graph serves it
-    engine, asked = _engine_with(pool, {"cfg"})
-    assert engine.reserve_replay_slot(_batch(["b0"])).bucket.cg_key_info == "cfg"
-    assert asked == [LoraBaseOnly("cfg"), "cfg"]
+@pytest.mark.parametrize("rows,captured,leased,ctx_idle", [
+    # base rows replay the idle capture
+    ({"b0": None, "b1": None}, {(8, False), (8, True)}, (8, True), True),
+    # one adapter row: the plain capture
+    ({"b0": None, "r": "a1"}, {(8, False), (8, True)}, (8, False), False),
+    # the tightest plain bucket has no idle twin (not captured, or dropped): it serves the
+    # step rather than a looser idle bucket, and the resource plans for its kernels
+    ({"b0": None}, {(1, False), (8, False), (8, True)}, (1, False), False),
+    # nothing captured: eager, and idle
+    ({"b0": None}, set(), None, True),
+])
+def test_the_lease_takes_the_idle_twin_only_when_no_row_uses_the_resource(rows, captured, leased, ctx_idle):
+    engine = _engine_with(captured, adapters=rows)
+    batch = _batch(rows)
+    lease = engine.reserve_replay_slot(batch)
+    assert (lease and (lease.bucket.bs, lease.bucket.idle)) == leased
+    assert batch.step_context.idle is ctx_idle and batch.cg_key_info == "cfg"
+    # a node without an idle-capable resource leases the plain capture, and is never idle
+    engine = _engine_with(captured, idle_keys=(), adapters=rows)
+    batch = _batch(rows)
+    lease = engine.reserve_replay_slot(batch)
+    assert (lease is None or not lease.bucket.idle) and not batch.step_context.idle
 
 
-def test_the_declaration_check_still_compares_the_nodes_own_key():
-    """The engine's lease/declare_step check unwraps only the pool's part: a model whose
-    declare_step disagrees with its cg_key_info still fails under a base-only lease."""
+def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
+    """One spec over two nodes is served as a pool per node (``serving_resources``),
+    keyed ``lora@<node>`` in the conductor as on the workers: a request on an adapter is
+    opened with a config under each pool's key. A base-model request carries none."""
+    import dataclasses
+
+    from mstar.conductor.conductor import Conductor
+    from mstar.engine.resources.lora import LORA_ADAPTER_KWARG
+
+    spec = P.make_spec({})
+    spec.nodes = {"LLM", "vision"}
+    spec.targets = {"qkv": dataclasses.replace(P.QKV, node="LLM"), "o": dataclasses.replace(P.O, node="vision")}
+    conductor = object.__new__(Conductor)
+    conductor.model = SimpleNamespace(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
+    conductor._kv_labels = {}
+    configs = conductor._get_resource_configs({LORA_ADAPTER_KWARG: "a1"}, {})
+    assert configs == {"lora@LLM": LoraReqConfig("a1"), "lora@vision": LoraReqConfig("a1")}
+    assert conductor._get_resource_configs({}, {}) == {}
+
+
+def test_an_idle_lease_checks_the_models_key():
+    """The lease/declare_step check compares the model's own key, the same under an idle
+    lease."""
     from mstar.engine.engine import Engine
 
     def plan(step, phase):
@@ -443,58 +537,59 @@ def test_the_declaration_check_still_compares_the_nodes_own_key():
 
     engine = object.__new__(Engine)
     engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
-    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, LoraBaseOnly("cfg")))
-    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
-    mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, "cfg", idle=True))
+    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease, idle=True)
 
-    def drive(key):
-        engine._drive_step(SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},
-                           ctx, lease, True, SubmoduleStep(steps={}, cg_key_info=key), False)
+    def drive(key, info):
+        batch = SimpleNamespace(node_name="LLM", preplan_event=None, per_request_info={1: info})
+        engine._drive_step(batch, _mgmt((LORA_RESOURCE_KEY,)), [1], [], {}, ctx, lease, True,
+                           SubmoduleStep(steps={}, cg_key_info=key), False)
 
     with pytest.raises(RuntimeError, match="disagree"):
-        drive("other")
-    with pytest.raises(RuntimeError, match="disagree"):
-        drive(LoraBaseOnly("cfg"))  # a model never stamps the pool's part itself
+        drive("other", SimpleNamespace(resource_configs={}))
     with pytest.raises(NotImplementedError, match="reached plan"):
-        drive("cfg")
+        drive("cfg", SimpleNamespace(resource_configs={}))
 
 
-def test_a_base_only_step_launches_no_delta_captured_or_eager(adapters):
+def test_an_idle_step_launches_no_delta_and_a_plain_lease_stages_addressing(adapters):
+    """The pool reads only ``ctx.idle``. Idle, captured or eager, it stages nothing and
+    launches nothing. A step of base rows replaying the plain bucket (its idle twin was not
+    captured) stages its rows on the zero adapter, which the recorded kernels read."""
     pool = LoraAdapterPool(P.make_spec(adapters[1]), "cpu", backend=(backend := _CountingBackend()))
     P.ingest(pool, "b", None)
     P.ingest(pool, "r", "a1")
-    # captured under the base-only key: no addressing staged, no buffer, no kernel
-    base_only, rids = SlotLease(slot=0, bucket=BucketKey("decode", 2, 2, LoraBaseOnly())), [-1, -2]
-    s, c = P.step(rids), P.ctx(rids, capture=True, lease=base_only)
+    rids = [-1, -2]
+    idle = SlotLease(slot=0, bucket=BucketKey("decode", 2, 2, None, idle=True))
+    s, c = P.step(rids), P.ctx(rids, capture=True, lease=idle, idle=True)
     assert pool.admit(s, c).ok and pool.plan(s, c) is None
     assert not pool.active and not pool._cg and not _delta_runs(pool, backend)
     pool.commit(s, c)
-    # its own key's capture records the kernels
-    s, c = P.step(rids), P.ctx(rids, capture=True, lease=SlotLease(slot=0, bucket=BucketKey("decode", 2, 2, None)))
+    plain = SlotLease(slot=0, bucket=BucketKey("decode", 2, 2, None))
+    s, c = P.step(rids), P.ctx(rids, capture=True, lease=plain)
     assert pool.admit(s, c).ok and pool.plan(s, c) is not None
     assert pool.active and _delta_runs(pool, backend)
-    # eager: base rows alone skip; one adapter row runs every row's delta
-    for rows, runs in ((["b"], False), (["b", "r"], True), (["b"], False)):
-        s, c = P.step(rows), P.ctx(rows)
+    pool.commit(s, c)
+    # the plain-bucket fallback: a base row and a padding row, both on the zero adapter
+    s, c = P.step(["b", -2]), P.ctx(["b"], lease=plain, padded=["b", -2])
+    assert pool.admit(s, c).ok and pool.plan(s, c) is not None
+    assert pool.active and P.token_slots_of(pool.addressing()) == [0, 0]
+    pool.commit(s, c)
+    for rows, step_idle in ((["b"], True), (["b", "r"], False), (["b"], True)):
+        s, c = P.step(rows), P.ctx(rows, idle=step_idle)
         assert pool.admit(s, c).ok
         pool.plan(s, c)
-        assert _delta_runs(pool, backend, tokens=len(rows)) == runs, rows
+        assert _delta_runs(pool, backend, tokens=len(rows)) is not step_idle, rows
         pool.commit(s, c)
-    # a base-only replay of a row that names an adapter would drop its delta silently
-    s, c = P.step(["r", -2]), P.ctx(["r"], lease=base_only, padded=["r", -2])
-    assert pool.admit(s, c).ok
-    with pytest.raises(RuntimeError, match="base-only"):
-        pool.plan(s, c)
 
 
-def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapters):
+def test_a_piecewise_region_inside_an_idle_step_hands_its_state_back(adapters):
     """A region whose capture records LoRA kernels plans its own rows (active), and its commit restores
-    the enclosing base-only step's state for the eager code after it. Past the step, and
+    the enclosing idle step's state for the eager code after it. Past the step, and
     past a region's capture (which plans outside any step), no plan is left: a delta
-    refuses, eager or compiled, rather than add a base-only skip or a capture's rows."""
+    refuses, eager or compiled, rather than add an idle skip or a capture's rows."""
     pool = LoraAdapterPool(P.make_spec(adapters[1]), "cpu", backend=(backend := _CountingBackend()))
     P.ingest(pool, "b", None)
-    outer_s, outer_c = P.step(["b"]), P.ctx(["b"])
+    outer_s, outer_c = P.step(["b"]), P.ctx(["b"], idle=True)
     assert pool.admit(outer_s, outer_c).ok
     pool.plan(outer_s, outer_c)
     assert not pool.active
@@ -546,16 +641,16 @@ def _region_runner(pool, **config):
     return PiecewiseAcceleratorGraphRunner(
         label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
         step_runner=step_runner,
-        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
+        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", segment_keys=("lora",),
     )
 
 
-def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_base_rows(adapters):
+def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_idle_rows(adapters):
     """A region's step carries the node's LoRA rows, laid out from its segments as the
     node's are. A region replayed as one row per step, which addresses every row to the
-    first request's adapter, is captured base-only, recording no LoRA kernel, and leased
-    only for a step none of whose rows runs one; a step with one runs the region eagerly
-    under the node's step."""
+    first request's adapter, is captured idle, recording no LoRA kernel, and leased only
+    for a step none of whose rows runs one; a step with one runs the region eagerly under
+    the node's step."""
     pool = P.make_pool(adapters[1])
     runner = _region_runner(pool, capture_batch_sizes=[2])
     bucket = BucketKey(PIECEWISE_WALK, 2, 8, "N_region")
@@ -567,8 +662,8 @@ def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_bas
         P.ingest(pool, rid, adapter)
     one_row = _region_runner(pool, capture_batch_sizes=[1], lease_before_step=True, one_row_per_step=True)
     assert one_row.prepare_for_capture() and not one_row.dropped_shapes
-    assert {spec.bucket.cg_key_info for spec in runner._step_runner.built} == {"N_region"}
-    assert {spec.bucket.cg_key_info for spec in one_row._step_runner.built} == {LoraBaseOnly("N_region")}
+    assert {(spec.bucket.cg_key_info, spec.bucket.idle) for spec in runner._step_runner.built} == {("N_region", False)}
+    assert {(spec.bucket.cg_key_info, spec.bucket.idle) for spec in one_row._step_runner.built} == {("N_region", True)}
     assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
     # every row, not only the first one the replay names
     with pytest.raises(RuntimeError, match="replays one row per step"):
@@ -576,7 +671,7 @@ def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_bas
     assert runner.can_lease([], ["b0", "r1"])
 
 
-def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
+def test_the_idle_choice_is_the_same_on_every_rank(adapters):
     """It reads only which adapter each request named (and which adapters the files say
     are empty, the same on every rank): two ranks whose ingests landed in another order,
     and whose slots differ, pick the same capture."""
@@ -589,9 +684,9 @@ def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
     for n in range(1, 5):
         for rows in itertools.permutations(named, n):
             want = any(named[r] is not None for r in rows)
-            assert [pool.runs_adapters(rows) for pool in ranks] == [want, want], rows
+            assert [not pool.idle_for(rows) for pool in ranks] == [want, want], rows
     # once the adapter rows are removed, the shortcut agrees too
     for pool in ranks:
         pool.remove_request("r1")
         pool.remove_request("r2")
-        assert not pool._live and not pool.runs_adapters(list(named))
+        assert not pool._live and pool.idle_for(list(named))

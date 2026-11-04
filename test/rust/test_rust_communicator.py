@@ -138,7 +138,8 @@ def test_runtime_lora_messages_cross_the_rust_transport_both_ways(pair):
         WorkerMessageType,
     )
 
-    load = LoadLoraAdapter(op_id="op", lora_name="sql", lora_path="/a/adapter_model.safetensors")
+    load = LoadLoraAdapter(op_id="op", lora_name="sql", lora_path="/a/adapter_model.safetensors",
+                           lora_digest="ab" * 32)
     unload = UnloadLoraAdapter(op_id="op", lora_name="sql")
     messages = [
         ConductorMessage(ConductorMessageType.LOAD_LORA_ADAPTER, load),
