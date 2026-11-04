@@ -11,9 +11,15 @@ import os
 import sys
 
 if os.environ.get("MSTAR_SIM"):
-    import mstar_sim.install
+    try:
+        import mstar_sim.install
 
-    mstar_sim.install.install()
+        mstar_sim.install.install()
+    except Exception as e:  # site.py would print one line and run on without the emulator
+        import traceback
+
+        traceback.print_exc()
+        raise SystemExit(f"mstar_sim: the emulator failed to install ({e!r}); not running without it") from e
 
 _here = os.path.dirname(os.path.abspath(__file__))
 for _path in sys.path:

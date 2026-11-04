@@ -13,9 +13,10 @@
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
 
 Each patch names the mstar attributes it replaces through :func:`_replace`,
-which refuses one that no longer exists, and :func:`install` applies each on
-its own: a patch whose target mstar renamed is skipped with a warning naming
-it, and the simulation runs on without it (slower or less exact, not broken).
+which refuses one that no longer exists. A patch whose target mstar moved stops
+the process (:func:`install`) naming the patch: a run without it would give
+wrong numbers or run out of host memory. ``mstar_sim/tests/test_contract.py``
+applies every patch in CI, so the mstar change that moves a target fails there.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from __future__ import annotations
 import functools
 import importlib
 import os
-import sys
 
 import torch
 
@@ -36,7 +36,7 @@ def _replace(owner, name: str, value) -> None:
 
 
 def _cap(values, limit):
-    if not limit or values is None:
+    if not limit or not values:
         return values
     kept = [v for v in values if v <= limit]
     return kept or [min(values)]
@@ -223,13 +223,13 @@ def header_only_weights() -> None:
     import safetensors
     import safetensors.torch
 
+    iterators = importlib.import_module("mstar.model.loader.iterators")
+    _replace(iterators, "safe_open", _MetaSafeOpen)  # mstar's own target first: none or all apply
     safetensors.safe_open = _MetaSafeOpen
     safetensors.torch.safe_open = _MetaSafeOpen
     safetensors.torch.load_file = lambda path, device="cpu": {
         k: _meta(v) for k, v in _header(path).items()
     }
-    iterators = importlib.import_module("mstar.model.loader.iterators")
-    _replace(iterators, "safe_open", _MetaSafeOpen)
 
     def read_tensor(fd, rd):
         shape = rd.shape
@@ -266,9 +266,12 @@ def install() -> None:
         importlib.import_module("mstar")
     except ImportError:
         return  # not an mstar process
-    for patch in (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag):
+    for patch in PATCHES:
         try:
             patch()
         except (ImportError, AttributeError) as e:
-            print(f"mstar_sim: WARNING: patch {patch.__name__} skipped (mstar changed under it: {e})",
-                  file=sys.stderr, flush=True)
+            raise SystemExit(f"mstar_sim: patch {patch.__name__} no longer applies, mstar changed under "
+                             f"it ({e}); update mstar_sim/patches.py") from e
+
+
+PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag)
