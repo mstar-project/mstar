@@ -323,6 +323,13 @@ def test_a_number_json_does_not_have_is_an_anthropic_400(client_and_stub, number
     assert "not JSON" in r.json()["error"]["message"] and stub.last_submit is None
 
 
+def test_a_body_nested_past_the_decoders_depth_is_an_anthropic_400(client_and_stub):
+    client, stub = client_and_stub
+    r = client.post("/v1/messages", content="[" * 100_000, headers={"content-type": "application/json"})
+    assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error"
+    assert "nests too deeply" in r.json()["error"]["message"] and stub.last_submit is None
+
+
 @pytest.mark.xfail(strict=True, reason="stop_sequences has no cap, and the event loop matches every stop on "
                    "each token (10,000 of 100 chars: ~14 ms a token, which every request waits out); follow-up")
 def test_a_stop_sequence_list_past_a_cap_is_a_400(client_and_stub):

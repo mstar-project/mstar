@@ -146,7 +146,11 @@ def _json_body(raw: bytes):
     def constant(name: str):
         raise ValueError(f"{name} is not JSON")
 
-    return json.loads(raw, parse_float=finite, parse_constant=constant)
+    try:
+        return json.loads(raw, parse_float=finite, parse_constant=constant)
+    except RecursionError:
+        # the decoder recurses once per nesting level
+        raise ValueError("it nests too deeply") from None
 
 
 def _anthropic_error(status: int, message: str) -> JSONResponse:

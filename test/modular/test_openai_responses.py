@@ -257,6 +257,13 @@ def test_a_number_json_does_not_have_is_a_400(client_and_stub, number):
     assert stub.last_submit is None
 
 
+def test_a_body_nested_past_the_decoders_depth_is_a_400(client_and_stub):
+    client, stub = client_and_stub
+    r = client.post("/v1/responses", content='{"input": ' + "[" * 100_000, headers={"content-type": "application/json"})
+    assert r.status_code == 400 and "nests too deeply" in r.json()["error"]["message"]
+    assert stub.last_submit is None
+
+
 def test_a_model_without_the_api_is_a_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
