@@ -335,7 +335,7 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
 
 
 def test_ownership_observer_reads_the_real_rust_tensor_store(tmp_path, monkeypatch):
-    """A stub store hid that the observer read attributes the Rust store no longer has."""
+    """The observer reads only what the real Rust store has."""
     pytest.importorskip("mstar_rust")
     import runpy
     import types

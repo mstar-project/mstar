@@ -8,8 +8,8 @@ reports per session, from timestamped chunk arrivals (monotonic clock):
   first text event. Every generate frame emits one, even a padding token's empty
   one, and conditioning emits none, so setup (upload, Mimi encode, conditioning and
   the first frame) ends there, and what remains is the wait for the first audio
-  block. A live server's call open does this setup before its first-audio clock
-  starts, so only the second part compares with one;
+  block. A live server's first-audio clock may start after some of this setup, so
+  check how such a number is defined before comparing it with either part;
 * response onset on the audio timeline: the start of the first agent speech
   segment beginning at or after ``speech_end - window``, as signed seconds
   from the user's speech end (negative = the agent began first). An agent

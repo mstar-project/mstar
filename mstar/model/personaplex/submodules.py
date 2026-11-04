@@ -22,7 +22,7 @@ and depformer run once over every row, while each row keeps its own cache
 
 The depformer stops after the last depth step any row samples
 (``depth_steps_needed``): the user's codebooks are always forced here, so a
-generate frame runs 8 of its 16 depth steps, and the first one runs 1.
+generate frame runs 8 of its 16 depth steps, and eagerly the first one runs 1.
 
 The generate step is captured as an accelerator graph: ``step`` is the
 tensor-only part the graph holds (8 depth steps), and ``commit`` folds each
@@ -496,7 +496,7 @@ class MimiDecoderSubmodule(_MimiSubmodule):
     audio depends only on its frames, not on how the stream grouped them.
     Past the context, the decoder's 8 stacked windowed attention layers reach
     further back than the window, so a block can differ slightly from a
-    whole-track decode (the same trade-off as Qwen3-TTS's codec). Emission
+    whole-track decode. Emission
     stops at the input's sample count; the stream can end on an empty chunk,
     which still runs.
     """

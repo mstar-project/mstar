@@ -179,10 +179,8 @@ class PersonaPlexModel(Model):
             next_node=cfg.MIMI_DECODER_NODE, name="agent_frame", target_partition=cfg.CODEC_PARTITION,
         ))
         if with_text:
-            # Text goes to the client every frame instead of accumulating: an
-            # accumulated client output is sent only when the loop ends, and by
-            # then the worker has reused the pinned host buffers that staged the
-            # earlier frames, so every frame arrived as the last token.
+            # Each frame's text goes straight to the client: an accumulated client output is
+            # sent only when the loop ends, after the worker has reused the frames' host buffers.
             lm.outputs.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
         return Loop(name=cfg.DECODE_LOOP, section=lm, max_iters=cfg.MAX_TEMPORAL_FORWARDS, outputs=[])
 

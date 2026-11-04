@@ -1929,6 +1929,10 @@ request), barge-in and tensor parallelism are out of scope.
    # the Hugging Face cache on first use; set model_kwargs.voice_dir in a copy
    # of configs/personaplex.yaml to use a local directory instead.
 
+``torchcodec`` must match the torch build, or every request fails decoding its
+audio. With a torch from a PyTorch CUDA index, install ``torchcodec`` from the same
+index (on ``2.10.0+cu129``, ``torchcodec==0.10.0+cu129``).
+
 Concurrent requests share LM and decoder steps, up to
 ``model_kwargs.max_batch_size`` (default 8) and the YAML's
 ``max_concurrent_requests``. A batched step rounds differently from a request
@@ -1942,8 +1946,7 @@ stream needs few decodes. Each block is decoded behind the request's last 500 fr
 decoder transformer attends 125 frames per layer, but its 8 stacked layers
 reach further back. On a long reply measured under TF32, 500 and 1,000 frames
 gave the same maximum absolute error against a whole-track decode, with RMSE
-2.70e-5 and 2.62e-5 respectively; this is not a general error bound.
-Qwen3-TTS's codec makes the same trade-off. Only the
+2.70e-5 and 2.62e-5 respectively; this is not a general error bound. Only the
 transformer runs over that context; the causal SEANet decoder reruns over 4
 frames before the new ones, its receptive field. A request's audio does not
 depend on how the stream groups its frames. ``python -m
@@ -1982,14 +1985,14 @@ Status, checked with the released checkpoint against NVIDIA's reference
 implementation on H100 and GH200 GPUs:
 
 - With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
-  audio to within 5.1e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
+  audio to within 5.7e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
   different rounding flips near-tied token choices (first flips at logit
   margins of 0 to 0.0625, at most one bfloat16 step), so a long greedy
-  trajectory departs from NVIDIA's after some frames. NVIDIA's own code moves
-  as much when only PyTorch's attention kernel changes: on a 222-frame clip
-  762 agent codes differed between M* and NVIDIA, and 779 between NVIDIA's
-  default and math SDPA kernels, both first flipping at the same frame.
-  Batching changes rounding the same way.
+  trajectory departs from NVIDIA's after some frames. NVIDIA's own code departs
+  comparably when only PyTorch's attention kernel changes, first flipping at the
+  same decision: on a 222-frame clip, 762 agent codes differed between M* and
+  NVIDIA and 779 between NVIDIA's default and math SDPA kernels on an H100, and
+  216 and 130 on a GH200. Batching changes rounding the same way.
 - Cancellation, recovery and malformed inputs (rejected with 400) are checked
   on a live server; a 20-minute mixed-load soak kept
   GPU memory flat.
@@ -2014,9 +2017,9 @@ implementation on H100 and GH200 GPUs:
   second); from 16 sessions none did. Throughput levelled off at 18 to 22 seconds
   of audio per second from 32 to 128 sessions. Time to first audio was 2.8 s at
   one session and 30 s at 128, since conditioning runs before the first frame, so
-  no session met a 200 ms limit. On an 18 s clip, one wave per N, setup took 2.6,
-  4.3 and 9.1 s at 1, 8 and 32 sessions, and the first audio came 63, 190 and
-  510 ms after the first generated frame.
+  no session met a 200 ms limit. On an 18 s clip, one wave per N, setup (upload,
+  Mimi encode, conditioning and the first generated frame) took 2.6, 4.3 and 9.1 s
+  at 1, 8 and 32 sessions, and the first audio came 63, 190 and 511 ms after it.
 - Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge. Listening to matched
