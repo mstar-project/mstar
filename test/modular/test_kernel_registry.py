@@ -390,6 +390,10 @@ def test_shipped_tables_are_well_formed(path):
                 gate_up, down = decode._tiles(tokens, tuning)
                 assert set(gate_up) == {"bj", "bk", "bjs", "bks", "warps"} and set(down) == {"bn", "bc", "warps"}
             assert set(tuning.router) == {"bk", "splits", "warps"}
+        if op.name == "fp8_linear":
+            for _, choice in entry.rows:
+                if choice.impl == "w8a16" and choice.config is not None:
+                    assert {"DOT", "BN", "BK", "SPLIT", "STAGES", "num_warps"} <= set(choice.config)
 
 
 # --- moe_decode: fused_moe.decode's tiles from the registry, the built-in table otherwise -----
