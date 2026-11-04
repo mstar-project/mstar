@@ -1,37 +1,142 @@
 """MiniCPM-o token2wav: window arithmetic, per-request state layout and truncation, and the
 streaming flow/vocoder on random weights (CPU).
 
-The truncation test replays the reference's own cache bookkeeping (``Token2wav.stream``: the
-25 Hz conformer cache tiled twice, both 50 Hz caches cut to the prompt's frames plus the last
-100) on labelled entries and checks the slot holds the same entries. Loading the real assets
-skips unless MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot; bit-exactness against the
-reference lives in the parity harness, not here.
+The oracle for the batched path is the reference's one-request driver (upstream's
+``Token2wav.stream``) over the same modules, defined here. Its truncation test replays the
+reference's own cache bookkeeping (the 25 Hz conformer cache tiled twice, both 50 Hz caches
+cut to the prompt's frames plus the last 100) on labelled entries and checks the state holds
+the same entries. Loading the real assets skips unless MINICPM_O_CKPT points at a MiniCPM-o 4.5
+snapshot; bit-exactness against the reference lives in the parity harness, not here.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pytest
 import torch
 
 from mstar.model.minicpm_o.components.token2wav import (
+    HIFT_MEL_CACHE,
     HIFT_TAIL,
     KEEP_RECENT,
+    SAMPLES_PER_FRAME,
+    UP_RATE,
     CacheCapacity,
     SineGen2Source,
     Token2Wav,
     Token2WavState,
+    Token2WavVoice,
     VoiceBank,
     fade_in_out,
-    num_windows,
     slot_layout,
-    stream_windows,
     window_frames,
-    window_samples,
     window_tokens,
 )
 from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt
+
+# ---------------------------------------------------------------------------
+# The reference's one-request driver (upstream's ``Token2wav.stream``) over the served
+# modules, on a request's own ``Token2WavState``
+# ---------------------------------------------------------------------------
+
+
+def reference_windows(codes: list[int]) -> list[tuple[list[int], bool]]:
+    """The recorder's driver loop, verbatim: ``(window, last)`` per ``stream`` call."""
+    buf = [4218] * 3 + codes
+    out = []
+    while len(buf) >= 28:
+        out.append((buf[:28], False))
+        buf = buf[25:]
+    out.append((buf, True))
+    return out
+
+
+def window_samples(num_tokens: int, last: bool, first: bool) -> int:
+    """Samples ``stream`` returns for a window."""
+    if first:
+        return window_frames(num_tokens, last) * SAMPLES_PER_FRAME
+    total = (HIFT_MEL_CACHE + window_frames(num_tokens, last)) * SAMPLES_PER_FRAME
+    return total if last else total - HIFT_TAIL
+
+
+def truncate(state: Token2WavState) -> None:
+    """The reference's bound: past ``2P + 100`` frames the 50 Hz caches keep their first
+    ``2P`` entries and last 100. The 25 Hz cache follows the reference's tiled layout,
+    which in effect keeps its first ``P + 50``."""
+    limit = state.prompt_frames + KEEP_RECENT
+    if state.dit_len > limit:
+        n = state.dit_len
+        state.dit_kv[..., state.prompt_frames:limit, :] = state.dit_kv[..., n - KEEP_RECENT:n, :].clone()
+        state.dit_len = limit
+    if state.enc_len2 > limit:
+        n2, n1 = state.enc_len2, state.enc_len1
+        assert n2 == UP_RATE * n1
+        kept = list(range(state.prompt_frames)) + list(range(n2 - KEEP_RECENT, n2))
+        src = [i % n1 for i in kept[: limit // UP_RATE]]
+        if src != list(range(len(src))):
+            idx = torch.tensor(src, device=state.enc_kv1.device)
+            state.enc_kv1[..., : len(src), :] = state.enc_kv1.index_select(3, idx)
+        state.enc_len1 = len(src)
+        state.enc_kv2[..., state.prompt_frames:limit, :] = state.enc_kv2[..., n2 - KEEP_RECENT:n2, :].clone()
+        state.enc_len2 = limit
+
+
+def new_state(model: Token2Wav, voice: Token2WavVoice, capacity: CacheCapacity | None = None) -> Token2WavState:
+    """A request's state, starting from its voice's, in a slot that may be larger."""
+    state = Token2WavState.allocate(capacity or CacheCapacity(voice.prompt.tokens.shape[1]), model.speech_window.device)
+    for f in dataclasses.fields(state):
+        src, dst = getattr(voice.initial, f.name), getattr(state, f.name)
+        if isinstance(dst, torch.Tensor):
+            dst[tuple(slice(0, n) for n in src.shape)].copy_(src)
+        else:
+            setattr(state, f.name, src)
+    return state
+
+
+@torch.inference_mode()
+def flow_chunk(model: Token2Wav, state: Token2WavState, voice: Token2WavVoice, tokens: torch.Tensor,
+               last: bool) -> torch.Tensor:
+    """``tokens [1, n]`` -> mel ``[1, 80, window_frames(n, last)]``; advances the caches."""
+    mel = model.flow(tokens, voice.spk, None, last, state.enc_cnn, state.dit_cnn, state.kv_caches())
+    frames = mel.shape[2]
+    state.enc_len1 += frames // UP_RATE
+    state.enc_len2 += frames
+    state.dit_len += frames
+    truncate(state)
+    return mel
+
+
+@torch.inference_mode()
+def vocode_chunk(model: Token2Wav, state: Token2WavState, chunk_mel: torch.Tensor, last: bool,
+                 noise=None, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Mel chunk -> this call's samples ``[1, N]``, with the previous call's last 8 mel
+    frames re-vocoded in front and cross-faded with its held-back tail."""
+    first = state.calls == 0
+    mel = chunk_mel if first else torch.cat([state.hift_mel, chunk_mel], dim=2)
+    if noise is None:
+        noise = model.hift.draw_noise(mel, generator)
+    speech, source = model.hift.vocode(mel, cache_source=None if first else state.hift_source, noise=noise)
+    if not first:
+        speech = fade_in_out(speech, state.hift_speech, model.speech_window)
+    state.hift_mel.copy_(mel[..., -HIFT_MEL_CACHE:])
+    state.hift_source.copy_(source[:, :, -HIFT_TAIL:])
+    state.hift_speech.copy_(speech[:, -HIFT_TAIL:])
+    state.calls += 1
+    if last:
+        return speech
+    if first:
+        return torch.cat([speech.new_zeros(1, HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
+    return speech[:, :-HIFT_TAIL]
+
+
+def stream(model: Token2Wav, state: Token2WavState, voice: Token2WavVoice, tokens: list[int], last: bool,
+           generator: torch.Generator | None = None) -> torch.Tensor:
+    """One ``Token2wav.stream`` call."""
+    mel = flow_chunk(model, state, voice, torch.tensor([tokens], dtype=torch.int32, device=model.speech_window.device),
+                     last)
+    return vocode_chunk(model, state, mel, last, generator=generator)
 
 
 class _CacheSteps:
@@ -132,23 +237,9 @@ CKPT = os.environ.get("MINICPM_O_CKPT")
 needs_ckpt = pytest.mark.skipif(not CKPT, reason="set MINICPM_O_CKPT to a MiniCPM-o 4.5 snapshot")
 
 
-def reference_windows(codes: list[int]) -> list[tuple[list[int], bool]]:
-    """The recorder's driver loop, verbatim."""
-    buf = [4218] * 3 + codes
-    out = []
-    while len(buf) >= 28:
-        out.append((buf[:28], False))
-        buf = buf[25:]
-    out.append((buf, True))
-    return out
-
-
 @pytest.mark.parametrize("n", [0, 1, 24, 25, 26, 50, 127, 269, 300])
-def test_windows_match_reference_driver(n):
-    codes = list(range(n))
-    windows = list(stream_windows(codes))
-    assert windows == reference_windows(codes)
-    assert num_windows(n) == len(windows)
+def test_windows_voice_every_code_once(n):
+    windows = reference_windows(list(range(n)))
     # every code is synthesised exactly once: non-last windows emit 25 tokens' worth
     frames = sum(window_frames(len(w), last) for w, last in windows)
     assert frames == 2 * (n + 3)
@@ -216,7 +307,7 @@ def test_truncation_matches_reference_bookkeeping(p):
         s.enc_len1 += t
         s.enc_len2 += 2 * t
         s.dit_len += 2 * t
-        s.truncate()
+        truncate(s)
         assert s.enc_len2 == ref_conf2.shape[0] == ref_tiled.shape[0]
         assert torch.equal(s.enc_kv1[0, 0, 0, : s.enc_len1, 0], ref_tiled[: ref_tiled.shape[0] // 2])
         assert torch.equal(s.enc_kv2[0, 0, 0, : s.enc_len2, 0], ref_conf2)
@@ -274,14 +365,14 @@ def test_stream_shapes_and_capacity_independence(random_token2wav):
     )
     voice = model.prepare_voice(prompt)
     assert (voice.initial.enc_len1, voice.initial.enc_len2, voice.initial.dit_len) == (p, 2 * p, 2 * p)
-    windows = list(stream_windows(list(range(100, 130))))
+    windows = reference_windows(list(range(100, 130)))
     outs = []
     for extra in (0, 9):
-        state = model.new_state(voice, CacheCapacity(p + extra))
+        state = new_state(model, voice, CacheCapacity(p + extra))
         gen = torch.Generator().manual_seed(3)
         wavs = []
         for i, (win, last) in enumerate(windows):
-            wavs.append(model.stream(state, voice, win, last, generator=gen))
+            wavs.append(stream(model, state, voice, win, last, generator=gen))
             assert wavs[-1].shape == (1, window_samples(len(win), last, i == 0))
             assert state.dit_len <= 2 * p + KEEP_RECENT or last
         outs.append(torch.cat(wavs, dim=1))
@@ -324,7 +415,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
     bank = VoiceBank.build({"v": voice})
     kv_steps = _CacheSteps(bank, 3, device)
     codes = [torch.randint(0, 6561, (215,)).tolist() for _ in range(2)]
-    wins = [list(stream_windows(c)) for c in codes]  # 9 windows each, the last of 18 tokens
+    wins = [reference_windows(c) for c in codes]  # 9 windows each, the last of 18 tokens
     gen = torch.Generator().manual_seed(9)
 
     def noise(rows, calls, win, last):
@@ -344,20 +435,21 @@ def test_batched_windows_on_pool(random_token2wav, device):
         for name, t in kv_steps.slot(rid).items():
             torch.testing.assert_close(t, getattr(st, name).reshape(t.shape), **tol, msg=name)
 
-    ref = model.new_state(voice)
+    ref = new_state(model, voice)
     mels, noises = [], []
     for i, (win, last) in enumerate(wins[0]):
         first = i == 0
         nz = noise(2, 0 if first else 1, win, last)
         row0 = HiFTNoise(phase=nz.phase[:1], harmonic=nz.harmonic[:1])
-        mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
-        want = model.vocode_chunk(ref, mel, last, noise=row0)
+        mel = flow_chunk(model, ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
+        want = vocode_chunk(model, ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-        out = model.window_spectrum(state, bank, ids, first, tokens, kv, last, row0)
+        got_mel = model.window_flow(state, bank, ids, tokens, kv, last)
+        out = model.window_vocode(state, got_mel, first, last, row0)
         got = model.window_finish(state, out["magnitude"], out["phase"], first, last)
         commit()
-        torch.testing.assert_close(out["mel"], mel, **tol)
+        torch.testing.assert_close(got_mel, mel, **tol)
         torch.testing.assert_close(got, want, **tol)
         if not last:
             check_slot("r0", ref)
@@ -396,15 +488,15 @@ def test_assets_load_completely():
     p = prompt.tokens.shape[1]
     assert prompt.mel.shape == (1, 2 * p, 80) and prompt.spk_emb.shape == (1, 192)
     voice = model.prepare_voice(prompt)
-    state = model.new_state(voice)
-    wav = model.stream(state, voice, [4218] * 3 + [100] * 25, last=False)
+    state = new_state(model, voice)
+    wav = stream(model, state, voice, [4218] * 3 + [100] * 25, last=False)
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
 
 
 @pytest.mark.parametrize("n", [1, 21, 22, 23, 24, 25, 49, 99, 100, 230])
 def test_served_windows_are_upstreams(n):
     """The TTS streams ``n`` codes and then its stop code; the policy's chunks, through
-    ``prepare_inputs``, are ``stream_windows`` of the codes: every code voiced once and the
+    ``prepare_inputs``, are the reference's windows of the codes: every code voiced once and the
     same last window, also when the stop code ends a full window (``n = 25j + 24``). Every
     chunk of a started stream still runs, voicing nothing past the last window: a skipped
     step never completes the node, which then refuses the stream's final chunk."""
@@ -447,7 +539,7 @@ def test_served_windows_are_upstreams(n):
                 # each window's caches hold what the windows before it wrote
                 assert node.request_state(0)["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
                 started = True
-    assert served == list(stream_windows(codes))
+    assert served == reference_windows(codes)
 
 
 @pytest.mark.parametrize("device", [
@@ -455,7 +547,7 @@ def test_served_windows_are_upstreams(n):
 ])
 def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
     """Two voices with prompts of different lengths, one row of each in every flow batch,
-    a window apart: each row matches its own voice's one-row ``stream``."""
+    a window apart: each row matches its own voice's one-request run."""
     import copy
 
     model = copy.deepcopy(random_token2wav).to(device)
@@ -469,11 +561,11 @@ def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
         for name, p in (("short", 50), ("long", 64))
     }
     bank = VoiceBank.build(voices)
-    full = [w for w, last in stream_windows(torch.randint(0, 6561, (180,)).tolist()) if not last]
+    full = [w for w, last in reference_windows(torch.randint(0, 6561, (180,)).tolist()) if not last]
     want = {}
     for name, voice in voices.items():
-        ref = model.new_state(voice)
-        want[name] = [model.flow_chunk(ref, voice, torch.tensor([w], dtype=torch.int32, device=device), False)
+        ref = new_state(model, voice)
+        want[name] = [flow_chunk(model, ref, voice, torch.tensor([w], dtype=torch.int32, device=device), False)
                       for w in full]
     kv_steps = _CacheSteps(bank, 3, device)
     lag = 1

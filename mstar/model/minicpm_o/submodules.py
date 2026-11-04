@@ -707,9 +707,9 @@ class Token2WavSubmodule(NodeSubmodule):
     at any position, and HiFT, separately for a request's first window, whose
     input is shorter. A last window has one of a few lengths, each a one-row
     capture; other shapes run eagerly. The inverse STFT and cross-fade stay eager.
-    The per-request ``Token2Wav.stream`` path is bit-exact against the reference at
-    full fp32; this one attends the DiT's cache in another order and runs on fused
-    TF32 kernels.
+    The tests' one-request driver over the same modules is bit-exact against the
+    reference at full fp32; this path attends the DiT's cache in another order and
+    runs on fused TF32 kernels.
     """
 
     WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]

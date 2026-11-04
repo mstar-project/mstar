@@ -2,14 +2,14 @@
 
 Ported from Step-Audio2's ``Token2wav`` streaming path (``set_stream_cache`` + ``stream``,
 ``minicpmo-utils``, Apache-2.0). A voice's caches are prepared once by running the flow over
-its prompt; each window of 28 codes (25 new, 3 lookahead; ``stream_windows``) then becomes mel
+its prompt; each window of 28 codes (25 new, 3 lookahead) then becomes mel
 (``token2wav_flow``) and audio (HiFT), cross-faded with the previous window's tail.
 
-Two paths. The per-request one (``stream`` over a ``Token2WavState``) is bit-exact against the
-reference at fp32; serving does not use it, the tests compare against it. The batched one runs
-a window in two captured stages: ``window_flow``, whose attention caches are on bounded KV
-resources (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode`` (HiFT),
-which batches a request's first window apart from later ones. It matches the reference to
+A window runs in two captured stages: ``window_flow``, whose attention caches are on bounded
+KV resources (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode``
+(HiFT), which batches a request's first window apart from later ones, then ``window_finish``.
+The tests drive the same modules one request at a time over a ``Token2WavState`` as the
+reference does, which is bit-exact against it at fp32; the batched path matches that to
 summation order and TF32.
 
 The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT draws its
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import NamedTuple
 
@@ -60,7 +60,7 @@ SILENCE_CODE = 4218
 LEAD_SILENCE = 3
 WINDOW = 28
 HOP = 25
-# frames of generated context the reference keeps after the prompt's (``stream``'s truncation)
+# frames of generated context the reference keeps after the prompt's (its ``stream``'s truncation)
 KEEP_RECENT = 100
 HIFT_MEL_CACHE = 8
 SAMPLES_PER_FRAME = 480
@@ -73,31 +73,9 @@ MAX_LAST_TOKENS = WINDOW - 1
 # ---------------------------------------------------------------------------
 
 
-def stream_windows(codes: list[int]) -> Iterator[tuple[list[int], bool]]:
-    """``(window, last)`` per ``stream`` call for a whole utterance's codes."""
-    buf = [SILENCE_CODE] * LEAD_SILENCE + list(codes)
-    while len(buf) >= WINDOW:
-        yield buf[:WINDOW], False
-        buf = buf[HOP:]
-    yield buf, True
-
-
-def num_windows(num_codes: int) -> int:
-    n = num_codes + LEAD_SILENCE
-    return 1 + (0 if n < WINDOW else (n - WINDOW) // HOP + 1)
-
-
 def window_frames(num_tokens: int, last: bool) -> int:
     """50 Hz mel frames a window yields: the lookahead only counts on the last one."""
     return UP_RATE * (num_tokens if last else num_tokens - PRE_LOOKAHEAD)
-
-
-def window_samples(num_tokens: int, last: bool, first: bool) -> int:
-    """Samples ``stream`` returns for a window."""
-    if first:
-        return window_frames(num_tokens, last) * SAMPLES_PER_FRAME
-    total = (HIFT_MEL_CACHE + window_frames(num_tokens, last)) * SAMPLES_PER_FRAME
-    return total if last else total - HIFT_TAIL
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +102,9 @@ class CacheCapacity:
 
 @dataclass(slots=True)
 class Token2WavState:
-    """A request's state on the per-request path (and a voice's prepared caches), float32,
-    batch dims of 1 kept. The batched path keeps the attention caches on bounded KV
-    resources and the rest in a slot (``slot_layout``).
+    """A voice's prepared caches (and, in the tests, a request's state on the reference's
+    one-request path), float32, batch dims of 1 kept. Serving keeps a request's attention
+    caches on bounded KV resources and the rest in a slot (``slot_layout``).
 
     - ``enc_cnn``, ``dit_cnn``: the conformer's and DiT's conv left context;
     - ``enc_kv1`` / ``enc_kv2``: the 25 Hz / 50 Hz conformer keys|values, oldest first;
@@ -165,44 +143,12 @@ class Token2WavState:
             prompt_frames=0,
         )
 
-    def copy_from(self, other: Token2WavState) -> None:
-        """Load ``other``'s contents (e.g. a voice's initial state) into this slot, whose
-        capacity may be larger."""
-        for f in fields(self):
-            src, dst = getattr(other, f.name), getattr(self, f.name)
-            if isinstance(dst, torch.Tensor):
-                dst[tuple(slice(0, n) for n in src.shape)].copy_(src)
-            else:
-                setattr(self, f.name, src)
-
     def kv_caches(self) -> FlowKV:
         return FlowKV(
             [DenseKV(kv, self.enc_len1) for kv in self.enc_kv1],
             [DenseKV(kv, self.enc_len2) for kv in self.enc_kv2],
             [[DenseKV(kv, self.dit_len) for kv in step] for step in self.dit_kv],
         )
-
-    def truncate(self) -> None:
-        """The reference's bound: past ``2P + 100`` frames the 50 Hz caches keep their first
-        ``2P`` entries and last 100. The 25 Hz cache follows the reference's tiled layout,
-        which in effect keeps its first ``P + 50``."""
-        limit = self.prompt_frames + KEEP_RECENT
-        if self.dit_len > limit:
-            n = self.dit_len
-            self.dit_kv[..., self.prompt_frames:limit, :] = self.dit_kv[..., n - KEEP_RECENT:n, :].clone()
-            self.dit_len = limit
-        if self.enc_len2 > limit:
-            n2, n1 = self.enc_len2, self.enc_len1
-            assert n2 == UP_RATE * n1
-            kept = list(range(self.prompt_frames)) + list(range(n2 - KEEP_RECENT, n2))
-            src = [i % n1 for i in kept[: limit // UP_RATE]]
-            if src != list(range(len(src))):
-                idx = torch.tensor(src, device=self.enc_kv1.device)
-                self.enc_kv1[..., : len(src), :] = self.enc_kv1.index_select(3, idx)
-            self.enc_len1 = len(src)
-            self.enc_kv2[..., self.prompt_frames:limit, :] = self.enc_kv2[..., n2 - KEEP_RECENT:n2, :].clone()
-            self.enc_len2 = limit
-
 
 # Token2WavState's tensors as slot blocks: the batch axis of 1 each tensor keeps for the
 # modules is dropped in the pool and re-added (as a view) by `state_from_slot`.
@@ -232,11 +178,10 @@ def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
 
 # Each attention cache keeps a sink and a window of a stream that starts with the voice's
 # own cache (its source) and continues with the request's windows, as upstream's
-# truncation does (``Token2WavState.truncate``): past ``2P + 100`` frames the 50 Hz caches
-# keep their first ``2P`` entries and their last 100, and the 25 Hz one its first
-# ``P + 50``. The DiT attends ``[newest window, ..., voice]`` without positions, so its
-# stream is the voice reordered and each window last-first, which makes upstream's
-# "first 2P" a window.
+# truncation does: past ``2P + 100`` frames the 50 Hz caches keep their first ``2P``
+# entries and their last 100, and the 25 Hz one its first ``P + 50``. The DiT attends
+# ``[newest window, ..., voice]`` without positions, so its stream is the voice reordered
+# and each window last-first, which makes upstream's "first 2P" a window.
 
 
 def _enc1_retention(source_len: int) -> SinkWindow:
@@ -511,72 +456,6 @@ class Token2Wav(nn.Module):
         state.enc_len1, state.enc_len2, state.dit_len = p, UP_RATE * p, UP_RATE * p
         return Token2WavVoice(prompt=prompt, spk=spk, initial=state)
 
-    # -- the per-request path: not used in serving; the tests' reference, and where voice
-    # cloning (per-request voices) would start ------------------------------------------
-
-    def new_state(self, voice: Token2WavVoice, capacity: CacheCapacity | None = None) -> Token2WavState:
-        state = Token2WavState.allocate(
-            capacity or CacheCapacity(voice.prompt.tokens.shape[1]), self.speech_window.device,
-        )
-        state.copy_from(voice.initial)
-        return state
-
-    @torch.inference_mode()
-    def flow_chunk(
-        self, state: Token2WavState, voice: Token2WavVoice, tokens: torch.Tensor, last: bool,
-    ) -> torch.Tensor:
-        """``tokens [1, n]`` -> mel ``[1, 80, window_frames(n, last)]``; advances the caches."""
-        mel = self.flow(tokens, voice.spk, None, last, state.enc_cnn, state.dit_cnn, state.kv_caches())
-        frames = mel.shape[2]
-        state.enc_len1 += frames // UP_RATE
-        state.enc_len2 += frames
-        state.dit_len += frames
-        state.truncate()
-        return mel
-
-    @torch.inference_mode()
-    def vocode_chunk(
-        self,
-        state: Token2WavState,
-        chunk_mel: torch.Tensor,
-        last: bool,
-        noise: HiFTNoise | None = None,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """Mel chunk -> this call's samples ``[1, N]``, with the previous call's last 8 mel
-        frames re-vocoded in front and cross-faded with its held-back tail."""
-        first = state.calls == 0
-        mel = chunk_mel if first else torch.cat([state.hift_mel, chunk_mel], dim=2)
-        if noise is None:
-            noise = self.hift.draw_noise(mel, generator)
-        speech, source = self.hift.vocode(mel, cache_source=None if first else state.hift_source, noise=noise)
-        if not first:
-            speech = fade_in_out(speech, state.hift_speech, self.speech_window)
-        state.hift_mel.copy_(mel[..., -HIFT_MEL_CACHE:])
-        state.hift_source.copy_(source[:, :, -HIFT_TAIL:])
-        state.hift_speech.copy_(speech[:, -HIFT_TAIL:])
-        state.calls += 1
-        if last:
-            return speech
-        if first:
-            return torch.cat([speech.new_zeros(1, HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
-        return speech[:, :-HIFT_TAIL]
-
-    def stream(
-        self,
-        state: Token2WavState,
-        voice: Token2WavVoice,
-        tokens: list[int] | torch.Tensor,
-        last: bool,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """One ``Token2wav.stream`` call."""
-        if not torch.is_tensor(tokens):
-            tokens = torch.tensor([tokens], dtype=torch.int32, device=self.speech_window.device)
-        mel = self.flow_chunk(state, voice, tokens, last)
-        return self.vocode_chunk(state, mel, last, generator=generator)
-
-
     # -- windows batched over pool slots ---------------------------------------------------
 
     @torch.inference_mode()
@@ -639,23 +518,6 @@ class Token2Wav(nn.Module):
         return {"magnitude": magnitude, "phase": phase}
 
     @torch.inference_mode()
-    def window_spectrum(
-        self,
-        state: SlotRows,
-        bank: VoiceBank,
-        voices: torch.Tensor,
-        first: bool,
-        tokens: torch.Tensor,
-        caches: WindowCaches,
-        last: bool = False,
-        noise: HiFTNoise | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """``window_flow`` and ``window_vocode`` for ``B`` windows that are all, or all not,
-        their request's ``first``."""
-        mel = self.window_flow(state, bank, voices, tokens, caches, last)
-        return {"mel": mel, **self.window_vocode(state, mel, first, last, noise)}
-
-    @torch.inference_mode()
     def window_finish(
         self,
         state: SlotRows,
@@ -664,9 +526,9 @@ class Token2Wav(nn.Module):
         first: bool,
         last: bool = False,
     ) -> torch.Tensor:
-        """``window_spectrum``'s spectrum -> each row's samples ``[B, window_samples(...)]``:
-        the inverse STFT (kept out of the capture: it syncs), the cross-fade with the slot's
-        held-back tail, and the new tail, as ``vocode_chunk`` does them."""
+        """``window_vocode``'s spectrum -> each row's samples: the inverse STFT (kept out of
+        the capture: it syncs), the cross-fade with the slot's held-back tail, and the new
+        tail, as the reference's ``stream`` does them."""
         speech = self.hift.waveform(magnitude, phase)
         if not first:
             speech = fade_in_out(speech, state.get("hift_speech"), self.speech_window)
@@ -676,22 +538,6 @@ class Token2Wav(nn.Module):
         if first:
             return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
         return speech[:, :-HIFT_TAIL]
-
-    def stream_batched(
-        self,
-        state: SlotRows,
-        bank: VoiceBank,
-        voices: torch.Tensor,
-        first: bool,
-        tokens: torch.Tensor,
-        caches: WindowCaches,
-        last: bool = False,
-        noise: HiFTNoise | None = None,
-    ) -> torch.Tensor:
-        """``B`` ``stream`` calls of one voice, all or none of them ``first``, eagerly."""
-        out = self.window_spectrum(state, bank, voices, first, tokens, caches, last, noise)
-        return self.window_finish(state, out["magnitude"], out["phase"], first, last)
-
 
 # The token counts a last window after a full one can have: the left context plus 0 to
 # HOP - 1 new codes (a full window's worth would have made a full window).
