@@ -18,11 +18,13 @@ from . import (
     decode,
     gdn_decode,
     gdn_prefill,
+    gemm,
     mla,
     norm,
     prefill,
     rope,
     sampling,
+    topk,
     utils,
 )
 from .activation import silu_and_mul
@@ -43,6 +45,7 @@ from .sampling import (
     top_p_renorm_probs,
     top_p_sampling_from_probs,
 )
+from .topk import TopKTieBreak, top_k_page_table_transform
 
 __version__ = "0.7.2+mstar_sim"
 
@@ -61,6 +64,7 @@ __all__ = [
     "fused_add_rmsnorm",
     "gdn_decode",
     "gdn_prefill",
+    "gemm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "mla",
@@ -71,6 +75,9 @@ __all__ = [
     "sampling",
     "sampling_from_probs",
     "silu_and_mul",
+    "TopKTieBreak",
+    "top_k_page_table_transform",
+    "topk",
     "top_k_renorm_probs",
     "top_k_top_p_sampling_from_probs",
     "top_p_renorm_probs",
