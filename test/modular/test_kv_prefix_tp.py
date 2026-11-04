@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from array import array
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,10 +17,12 @@ from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
 from test_tp_async_teardown_order import _rank, _Stop
+from test_tp_rebuild_land import _Rank
+from test_worker_rebuild import _kept
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.engine.engine import Engine
-from mstar.engine.resources import StepRunner, apply_yaml_overrides
+from mstar.engine.resources import Rebuild, StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
@@ -109,7 +112,7 @@ def _engine(kv: KVManager) -> Engine:
     engine = Engine.__new__(Engine)
     engine._resources = {"kv": kv}
     engine._runner = StepRunner(engine._resources, node_resources={NODE: ["kv"]})
-    engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule())}
+    engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule(), resources=engine._resources)}
     engine._keyed_walks = {NODE: {WALK, IMAGE_WALK}}
     engine._prefix_model = "_Model"
     engine._graph_runtime = SimpleNamespace(
@@ -489,3 +492,45 @@ def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
     first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
 
     assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)
+
+
+def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s_hit():
+    """Rank 0 starts a dropped request's rebuild before it sends the rebuild's first row, and the rebuild keys the
+    request as a prompt of its prompt and its reply. The hit rank 0 sends with the row is what the cache holds under
+    those keys. A follower that took the hit before it started the rebuild looked it up under the request's old keys,
+    found only the prompt's pages, and stopped."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    prompt, reply = _tokens(2 * PAGE_SIZE + 3, seed=0), _tokens(2 * PAGE_SIZE, seed=1)
+    # an earlier request with the same prompt and reply, whose rebuild cached its pages under the rebuild's keys
+    _cache(ranks, "a", prompt + reply[:-1])
+    for kv in ranks:
+        kv.ingest_request("v", replace(_config([prompt], decode=len(reply)), rebuildable=True))
+        _run(kv, "v", prompt)
+        _write(kv, "v", len(reply) - 1, "decode")
+        kv.drop("v")
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("v", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "v", leader._allotments["v"].pages, [])
+    # as rank 0's readiness check starts the rebuild
+    leader.prepare_rebuild("v", Rebuild(WALK, array("i", prompt + reply)))
+    lead = _engine(leader)
+    head = ScheduleTPNode(
+        NODE, WALK, ["v"], prefix_hits=lead.decide_cached_prefix(_batch("v")), page_trails=lead.page_trails(NODE),
+    )
+    assert len(leader._streams["v"]["main"].lease) > len(prompt) // PAGE_SIZE, "rank 0's hit is the prompt's alone"
+    one = _Rank(follower, _engine(follower))
+    one.rebuilds._kept[NODE]["v"] = _kept(*reply, prompt=prompt)
+    one.scheduler.register_tp_follow(head)
+
+    batch = one.scheduler._try_schedule_tp_follow(one.worker.request_state)
+
+    assert batch.rebuild_rids == {"v"}, "the follower took v's row as one of its own"
+    assert follower._streams["v"]["main"].lease == leader._streams["v"]["main"].lease, (
+        "the follower holds other cached pages for v than rank 0"
+    )
+
+
+def _write(kv: KVManager, rid: str, length: int, walk: str) -> None:
+    step, ctx = KVStep(segments=(Segment(rid, "main", length),)), _ctx(rid, walk)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
