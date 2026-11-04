@@ -374,10 +374,16 @@ class Victims(NamedTuple):
     waits: bool = False
 
 
+class ShortGrant(NamedTuple):
+    """A grant that ran short: the room then, and the pages it needed past what its request's allotment had left."""
+    room: int
+    pages: int
+
+
 @dataclass(slots=True)
 class Earmark:
-    """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``granted`` counts the pages
-    the moves applied so far added to ``rid``'s allotment."""
+    """The pages ``rid``'s grant needed past its allotment, which the room it counted and the moves of ``victims``
+    add to the allotment. ``granted`` counts the pages added so far."""
     rid: str
     pages: int
     victims: set[str]
@@ -705,11 +711,11 @@ class KVManager(AttentionResource):
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark, or None when the victim is the request that ran short.
         # `_hosted`: the victims that move to the host, decided when they are chosen.
-        # `_ran_short`: request -> the room when its last grant ran short.
+        # `_ran_short`: request -> its last grant that ran short.
         self._earmarks: dict[str, Earmark] = {}
         self._victims: dict[str, Earmark | None] = {}
         self._hosted: set[str] = set()
-        self._ran_short: dict[str, int] = {}
+        self._ran_short: dict[str, ShortGrant] = {}
         if _DEBUG_ASSERTS and tp_cache:
             self._arena.trail = (0, 0)
         self._device = device
@@ -2338,8 +2344,9 @@ class KVManager(AttentionResource):
             # Record the room again after the rollback. Otherwise `preempt` would count the pages the step's other
             # rows gave back as released since the grant ran short.
             for segment in step.segments:
-                if segment.request_id in self._ran_short:
-                    self._ran_short[segment.request_id] = self._room()
+                short = self._ran_short.get(segment.request_id)
+                if short is not None:
+                    self._ran_short[segment.request_id] = short._replace(room=self._room())
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -4642,22 +4649,29 @@ class KVManager(AttentionResource):
         self, rid: str, pages_short: int, newer: Iterable[str] | None, droppable: Callable[[str], bool],
     ) -> Victims | None:
         """Choose requests from ``newer``, the requests that arrived after ``rid``, newest first, to move off the
-        device for ``rid``'s shortage of ``pages_short`` pages, and earmark what they free for ``rid``. A victim
-        the host can take whole moves there, and any other is dropped, once ``droppable`` says its launched
-        steps allow it.
+        device for ``rid``'s shortage of ``pages_short`` pages, and earmark what they free for ``rid``. The room
+        its grant counted goes into its allotment with them, so its next grant can't fail. A victim the host can
+        take whole moves there, and any other is dropped, once ``droppable`` says its launched steps allow it.
 
         Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none while ``rid`` waits
-        for its earlier victims to move. When no move covers the shortage, ``rid`` keeps its allotment and asks
-        for the shortage, and waits for it in the pool's queue once the runner asks again. None when the pool
-        doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
+        for its earlier victims to move or once the room covers its grant. When no move covers the shortage,
+        ``rid`` keeps its allotment and asks for every page its grant needed past it, and waits for them in the
+        pool's queue once the runner asks again. None when the pool doesn't decide or ``newer`` is None, as it
+        is for a request the conductor gave no number.
         """
         if not self._decides or newer is None:
             return None
         with self._lock:
-            room, then = self._room(), self._ran_short.pop(rid, None)
-            if then is not None:
-                pages_short -= max(0, room - then)
-            if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
+            room = self._room()
+            short = self._ran_short.pop(rid, ShortGrant(room, pages_short))
+            # the room the grant counted when it ran short, as the room has grown or shrunk since
+            counted = short.pages - pages_short + room - short.room
+            claim = max(0, min(short.pages, counted, room))
+            pages_short = short.pages - claim
+            if rid in self._earmarks or rid in self._victims:
+                return Victims([], [], [])
+            if pages_short <= 0:
+                self._allot(rid, claim)
                 return Victims([], [], [])
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
             left, hosted, asking, moving = on_host, set(), set(), False
@@ -4689,14 +4703,15 @@ class KVManager(AttentionResource):
                     if to_host:
                         self._hosted.add(rid)
                     return Victims([rid], [], []) if to_host else Victims([], [rid], [])
-                self._asks[rid] = pages_short
+                self._asks[rid] = short.pages
                 return Victims([], [], [], waits=True)
             freed = self._frees(victims)
             for victim in list(victims):
                 rest = [other for other in victims if other != victim]
                 if self._frees(rest) == freed:
                     victims = rest
-            earmark = Earmark(rid, pages_short, set(victims))
+            earmark = Earmark(rid, short.pages, set(victims), claim)
+            self._allot(rid, claim)
             for victim in victims:
                 self._victims[victim] = earmark
             self._hosted.update(hosted.intersection(victims))
@@ -5039,7 +5054,7 @@ class KVManager(AttentionResource):
                     available = self._allowance(request_id)
                     pages_short = num_new_pages - available
                     if self._decides:
-                        self._ran_short[request_id] = self._room()
+                        self._ran_short[request_id] = ShortGrant(self._room(), num_new_pages - within)
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(
