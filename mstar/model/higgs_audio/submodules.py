@@ -258,7 +258,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
 
     Dispatches on graph_walk:
       - prefill_audio: the ChatML text around the encoder's audio
-        embeddings, one span into the KV cache.
+        embeddings, three spans into the KV cache in one step.
       - decode:        embed the previous token, single-step decode.
 
     Every walk samples a token; ``postprocess`` drops it for a prefill step
@@ -331,7 +331,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             return row
 
         if graph_walk == "prefill_audio":
-            # the audio between the ChatML text around it, prefilled as one span
+            # the audio between the ChatML text around it, three spans prefilled in one step
             audio = inputs["audio_embeds"][0].to(device)
             pre, post = (
                 self.model.embed_tokens(inputs[name][0].to(device).reshape(-1))

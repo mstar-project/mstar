@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
 
-# The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
-# at 4 B each.
+# The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
+# at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
 # The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
 # what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.

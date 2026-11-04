@@ -16,8 +16,8 @@ Architecture (2 nodes, single partition):
 
 Graph walks:
     prefill_audio — audio_encoder -> LLM: the ChatML text around the audio
-                    and the audio embeddings, prefilled as one span that
-                    samples the first token
+                    and the audio embeddings, three spans prefilled in one
+                    step that samples the first token
     decode        — LLM loop
 
 Not implemented from the reference pipeline: silero-VAD chunk
@@ -265,7 +265,7 @@ class HiggsAudioModel(Model):
     ) -> ForwardPassArgs:
         """One ``prefill_audio`` step: the ChatML text before the audio, the
         audio's mel features (to the encoder) and the text after it, prefilled
-        as one span. ``process_prompt`` emits the two ``text_inputs`` (the
+        as three spans. ``process_prompt`` emits the two ``text_inputs`` (the
         prompt split at the audio splice point) and the per-chunk features."""
         texts = input_signals.get("text_inputs", [])
         audio_features = input_signals.get("audio_features", [])

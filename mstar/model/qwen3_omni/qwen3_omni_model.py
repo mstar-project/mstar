@@ -451,7 +451,8 @@ class Qwen3OmniModel(Model):
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # Audio, images and video are rebuilt from host copies of the encoders' outputs, one embedding per slot, and
-        # for vision one more per deepstack layer. The Talker's KV is built from the Thinker's states, which no
+        # for vision one more per deepstack layer. A prompt with a video keys only its leading text, so it's rebuilt
+        # only with the prefix cache off for the request. The Talker's KV is built from the Thinker's states, which no
         # rebuild recomputes.
         vision = self.config.vision
         return {"Thinker": RebuildPolicy(

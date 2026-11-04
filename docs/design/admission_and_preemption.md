@@ -269,7 +269,7 @@ Why this shape:
 class RebuildPolicy:
     """How a node rebuilds a dropped request's KV, as its model declares it."""
     walks: frozenset[str]   # the prefill walks its rebuild rows run, those the request prefilled in
-    ids_input: str          # the input that carries the prompt's ids
+    ids_input: str          # the input a row's ids go under, which the ids sampled since follow
     sample_output: str      # the output that carries each sampled id
     loop: str               # the loop each of whose iterations samples one id
     copy_width: Mapping[str, int]           # a walk that reads more than the ids -> values its copies hold per KV slot

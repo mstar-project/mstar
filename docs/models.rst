@@ -273,7 +273,7 @@ Higgs Audio notes
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
 - One prefill step per request: the ChatML text around the audio and the audio
-  embeddings go into the KV cache as one span.
+  embeddings go into the KV cache as three spans.
 - Decode keeps each request's last token in the sampler's slot master and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
