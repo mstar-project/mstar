@@ -32,6 +32,7 @@ mod media;
 mod protocol;
 mod refusals;
 mod serving;
+mod speech_chunking;
 mod tokenizer;
 mod utf8;
 
@@ -62,15 +63,19 @@ use protocol::{
     VideoGenerationRequest,
 };
 use serving::{
-    collect, now, result_stream, rid, try_result_stream, AppState, Out, DUPLICATE_ID_GRACE,
+    collect, now, result_stream, rid, try_result_stream, AppState, Out, OutStream, DUPLICATE_ID_GRACE,
 };
 use utf8::Utf8Stream;
 
 #[tokio::main]
 async fn main() {
-    let model_name = std::env::args()
-        .nth(1)
-        .expect("usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]");
+    const USAGE: &str =
+        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]";
+    let model_name = std::env::args().nth(1).expect(USAGE);
+    if model_name == "-h" || model_name == "--help" {
+        println!("{USAGE}");
+        return;
+    }
     let port: u16 = std::env::args()
         .nth(2)
         .and_then(|p| p.parse().ok())
@@ -328,12 +333,11 @@ fn detail_error(status: u16, message: &str) -> Response {
     (code, Json(json!({"detail": message}))).into_response()
 }
 
-/// Turn a `Json` extractor rejection into FastAPI + pydantic's `422` +
-/// `{"detail": [{"loc", "msg", "type"}]}` shape, instead of axum's default
-/// `400` + `text/plain`, so a malformed/invalid body looks the same as the
-/// Python frontend's validation error. Handlers take
+/// Turn a `Json` extractor rejection into the Python frontend's answer to a
+/// schema-invalid body: `400` in the OpenAI envelope, like every other refused
+/// input (axum's default is `400` + `text/plain`). Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
-fn json_422(rej: JsonRejection) -> Response {
+fn json_400(rej: JsonRejection) -> Response {
     if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
         let mb = body_limit_mb();
         return error(
@@ -342,15 +346,7 @@ fn json_422(rej: JsonRejection) -> Response {
             "invalid_request_error",
         );
     }
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({"detail": [{
-            "loc": ["body"],
-            "msg": rej.body_text(),
-            "type": "value_error",
-        }]})),
-    )
-        .into_response()
+    error(400, &rej.body_text(), "invalid_request_error")
 }
 
 /// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
@@ -493,7 +489,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Chat) {
         Ok(a) => a,
@@ -514,7 +510,11 @@ async fn chat_completions(
     let request_id = rid("chatcmpl");
 
     if req.stream.unwrap_or(false) {
-        return chat_sse(st, args, request_id).into_response();
+        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => base,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        return chat_sse(st, base, request_id).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(build_chat_response(
@@ -525,22 +525,30 @@ async fn chat_completions(
     }
 }
 
+/// `base` once its first item is in, replayed; a refusal is `Err` before any 200 is sent.
+/// A client that leaves meanwhile drops this future, and the stream's guard aborts.
+async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
+    match base.next().await {
+        Some(Out::Error { status, message }) => Err((status, message)),
+        first => Ok(Box::pin(futures::stream::iter(first).chain(base))),
+    }
+}
+
 /// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
 /// rides on the first delta (the finish one when there is none), as in
 /// `serving_chat.py`: clients time the first token from the first chunk.
 fn chat_sse(
     st: AppState,
-    args: SubmitArgs,
+    base: OutStream,
     request_id: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let base = result_stream(&st, &args, &request_id, true);
     let payloads = chat_sse_payloads(base, request_id, now(), st.model_name.clone());
     Sse::new(payloads.map(|s| Ok(Event::default().data(s)))).keep_alive(KeepAlive::default())
 }
 
 /// The `data:` payloads of [`chat_sse`], in order.
 fn chat_sse_payloads(
-    base: serving::OutStream,
+    base: OutStream,
     request_id: String,
     created: i64,
     model: String,
@@ -687,65 +695,100 @@ async fn audio_speech(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Speech) {
         Ok(a) => a,
         Err(r) => return r,
     };
+    let stream = req.stream.unwrap_or(false);
+    // Before the request is translated, as in `create_speech`: a format this
+    // frontend cannot produce is the client's error.
+    let fmt = match media::check_audio_format(&req.response_format, stream) {
+        Ok(fmt) => fmt,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let args = match adapter.speech_to_request(&req) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let request_id = rid("speech");
-    let fmt = req.response_format.to_ascii_lowercase();
-    // Only wav / pcm are produced natively; unlike Python (soundfile encodes
-    // the real container), the Rust frontend has no compressed-audio encoder,
-    // so reject an unsupported format instead of silently returning WAV bytes
-    // under the requested container's name.
-    if !matches!(fmt.as_str(), "wav" | "pcm") {
-        return error(
-            400,
-            &format!(
-                "response_format {fmt:?} is not supported by the Rust frontend \
-                 (only 'wav' and 'pcm'); run the Python frontend for compressed \
-                 containers"
-            ),
-            "invalid_request_error",
-        );
-    }
+    let chunking = adapter.speech_chunking();
+    let pieces =
+        match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
+            Ok(pieces) => pieces,
+            Err(e) => return error(400, &e, "invalid_request_error"),
+        };
+    let n = pieces.len();
+    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream);
+    // Pieces in flight ahead of the one being read; dropping one unread aborts it.
+    let mut pending: std::collections::VecDeque<OutStream> =
+        (0..chunking.lookahead.clamp(1, n)).map(&*submit).collect();
+    let mut submitted = pending.len();
 
-    if req.stream.unwrap_or(false) {
-        // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
-        // A backend error ends the byte stream (the connection closes
-        // mid-WAV, matching mstar's generator exception).
-        let header = media::wav_stream_header(st.sample_rate, 1);
-        let base = result_stream(&st, &args, &request_id, true);
-        let audio_only = base.filter_map(|item| async move {
-            match item {
-                Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
-                    Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+    if stream {
+        let first = match open_stream(pending.pop_front().unwrap()).await {
+            Ok(first) => first,
+            Err((status, message)) => return error(status, &message, error_type(status)),
+        };
+        // The next piece generates while this one plays.
+        if submitted < n {
+            pending.push_back(submit(submitted));
+            submitted += 1;
+        }
+        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM,
+        // the pieces' audio in order. A later error aborts the body: the status
+        // is already sent, and a cleanly ended stream would pass for a complete
+        // answer.
+        let playing = futures::stream::unfold(
+            Some((first, pending, submitted)),
+            move |state| {
+                let submit = submit.clone();
+                async move {
+                    let (mut cur, mut pending, mut submitted) = state?;
+                    loop {
+                        match cur.next().await {
+                            Some(Out::Chunk(c)) if c.modality == "audio" && !c.data.is_empty() => {
+                                return Some((Ok(Bytes::from(c.data)), Some((cur, pending, submitted))));
+                            }
+                            Some(Out::Chunk(_)) => {}
+                            Some(Out::Error { message, .. }) => {
+                                return Some((Err(std::io::Error::other(message)), None));
+                            }
+                            None => {
+                                cur = pending.pop_front()?;
+                                if submitted < n {
+                                    pending.push_back(submit(submitted));
+                                    submitted += 1;
+                                }
+                            }
+                        }
+                    }
                 }
-                _ => None,
-            }
-        });
-        let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
-            .chain(audio_only);
+            },
+        );
+        let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
+        let body = futures::stream::iter(header).chain(playing);
         return Response::builder()
-            .header("content-type", "audio/wav")
+            .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
             .body(Body::from_stream(body))
             .unwrap();
     }
 
-    let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
-        Ok(chunks) => chunks,
-        Err((status, msg)) => return error(status, &msg, error_type(status)),
-    };
     let mut pcm: Vec<u8> = Vec::new();
-    for c in &chunks {
-        if c.modality == "audio" {
-            pcm.extend_from_slice(&c.data);
+    for _ in 0..n {
+        if submitted < n {
+            pending.push_back(submit(submitted));
+            submitted += 1;
+        }
+        let chunks = match collect(pending.pop_front().unwrap()).await {
+            Ok(chunks) => chunks,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        for c in &chunks {
+            if c.modality == "audio" {
+                pcm.extend_from_slice(&c.data);
+            }
         }
     }
     let (bytes, mime) = media::pcm16_to_container(&pcm, st.sample_rate, &fmt);
@@ -753,6 +796,27 @@ async fn audio_speech(
         .header("content-type", mime)
         .body(Body::from(bytes))
         .unwrap()
+}
+
+/// Submits piece `i` of a speech request and returns its result stream. One
+/// piece goes out under the request's id; several under `<id>-<i>`, each with
+/// its own text and `chunk_kwargs`.
+fn piece_submitter(
+    st: AppState,
+    args: SubmitArgs,
+    pieces: Vec<String>,
+    request_id: String,
+    stream: bool,
+) -> Arc<dyn Fn(usize) -> OutStream + Send + Sync> {
+    Arc::new(move |i| {
+        let piece = SubmitArgs {
+            text: Some(pieces[i].clone()),
+            model_kwargs: speech_chunking::chunk_kwargs(&args.model_kwargs, i),
+            ..args.clone()
+        };
+        let id = if pieces.len() == 1 { request_id.clone() } else { format!("{request_id}-{i}") };
+        result_stream(&st, &piece, &id, stream)
+    })
 }
 
 // ---- POST /v1/images/generations, /v1/images/edits -----------------------
@@ -763,7 +827,7 @@ async fn images_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
@@ -785,7 +849,7 @@ async fn images_generations(
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
         if let (Some(s), true) = (seed, i > 0) {
-            args.model_kwargs.insert("seed".to_string(), Value::from(s + i));
+            args.model_kwargs.insert("seed".to_string(), Value::from(s.wrapping_add(i)));
         }
         let st = st.clone();
         async move {
@@ -834,7 +898,7 @@ async fn videos_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Videos) {
         Ok(a) => a,
@@ -859,7 +923,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
-    let known = ["image", "prompt", "model", "n", "size", "response_format"];
+    // `size` is kept: the adapter maps "WxH" onto the model's width / height
+    let known = ["image", "prompt", "model", "n", "response_format"];
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
     let mut prompt = String::new();
@@ -1242,11 +1307,16 @@ async fn generate_finish(
             Ok(base) => base,
             Err((status, message)) => return detail_error(status, &message),
         };
+        let base = match open_stream(base).await {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
+                // after the 200 is committed the status travels in-band
+                Out::Error { status, message } => {
+                    let mut s = json!({"error": message, "status": status}).to_string();
                     s.push('\n');
                     s.into_bytes()
                 }
@@ -1508,8 +1578,9 @@ mod tests {
                 output_modalities: outputs.iter().map(|m| m.to_string()).collect(),
                 ..SubmitArgs::default()
             };
-            let (status, _, data) =
-                body(chat_sse(state(None), args, "r".into()).into_response()).await;
+            let st = state(None);
+            let base = result_stream(&st, &args, "r", true);
+            let (status, _, data) = body(chat_sse(st, base, "r".into()).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text

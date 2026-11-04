@@ -18,14 +18,19 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_ingest_unpersist import _conductor, _ToyModel
 
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
+from mstar.graph.base import GraphEdge, GraphNode, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
+    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     PrefixKeys,
@@ -36,7 +41,8 @@ from mstar.model.base import (
 )
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.streaming.topology import PartitionTopology
+from mstar.streaming.topology import PartitionTopology, StreamingGraphEdge
+from mstar.utils.ipc_format import NewRequestConductor
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -93,6 +99,10 @@ class _Model:
     def max_input_files(self):
         return {}
 
+    def checkpoint_path(self):
+        # a model that names no checkpoint and sets no salt keys nothing
+        return "/a/checkpoint"
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
@@ -125,7 +135,10 @@ def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
 
 
 def _deployment(page_size: int = PAGE_SIZE) -> dict:
-    return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
+    return {
+        "model": "stub", "resources": {"kv": {"page_size": page_size}},
+        "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
+    }
 
 
 def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
@@ -326,6 +339,30 @@ def test_each_resource_config_is_handed_only_its_own_chain():
     )
 
 
+def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
+    class _Thinker:
+        """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
+
+        def get_node_resources(self):
+            return [KVSpec("kv", {"Thinker"}, PagedKVConfig(
+                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=PAGE_SIZE,
+            ))]
+
+        def checkpoint_path(self):
+            return "/a/checkpoint"
+
+    # qwen3omni_thinker_tp2's placement: rank 2 holds none of the cache's nodes
+    config = {"node_groups": [
+        {"node_names": ["Thinker"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["audio_encoder", "vision_encoder"], "ranks": [0]},
+        {"node_names": ["Talker"], "ranks": [2]},
+        {"node_names": ["Code2Wav"], "ranks": [2]},
+    ]}
+    assert _kv_page_sizes(_Thinker(), config) == {}, (
+        "every prompt was keyed and its media hashed for a cache no engine opens"
+    )
+
+
 # ── one request opting out ──────────────────────────────────────────────
 
 
@@ -351,6 +388,70 @@ def test_a_request_that_says_nothing_is_still_cached():
     )
 
 
+class _Talking(_ToyModel):
+    """Keys a layout on an LLM that streams every prefill walk to a talker,
+    which runs only when the request asks for audio."""
+
+    def __init__(self):
+        def llm():
+            return GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                StreamingGraphEdge(next_node="talker", name="hidden", target_partition="Talker"),
+            ])
+
+        vit = GraphNode(name="vit", input_names=["pixels"], outputs=[GraphEdge(next_node="LLM", name="text_inputs")])
+        talker = GraphNode(name="talker", input_names=["hidden"], outputs=[
+            GraphEdge(next_node=EMIT_TO_CLIENT, name="audio", output_modality="audio"),
+        ])
+        super().__init__(
+            {"prefill": llm(), "prefill_image": Sequential([vit, llm()]), "talk": talker}, None,
+            partitions=[
+                PartitionDefinition("LLM", {"prefill", "prefill_image"}, "prefill"),
+                PartitionDefinition("Talker", {"talk"}, "talk", ["LLM"]),
+            ],
+        )
+
+    def get_node_resources(self):
+        return [KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+        ))]
+
+    def kv_labels(self):
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill", "prefill_image")))}}
+
+    def get_initial_forward_pass_args(
+        self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None,
+    ):
+        walk = "prefill" if partition_name == "LLM" else "talk"
+        return ForwardPassArgs(
+            full_metadata=CurrentForwardConductorMetadata(
+                input_modalities=input_modalities, output_modalities=output_modalities,
+                graph_walk=walk, is_prefill=True,
+            ),
+            inputs=[], unpersist_tensors=[],
+            request_done=partition_name == "Talker" and "audio" not in output_modalities,
+        )
+
+
+def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
+    conductor = _conductor(_Talking(), [{"node_names": ["vit", "LLM", "talker"], "ranks": [0]}], tmp_path, monkeypatch)
+
+    layout = LabelLayout(spans=(Span("ids", "prefill", 4, 4, "text_inputs"),))
+    cached = {}
+    for out in ("audio", "text"):
+        conductor._do_ingest_request(NewRequestConductor(
+            request_id=out, initial_signals={}, initial_input_modalities=["text"],
+            initial_output_modalities=[out], input_metadata={},
+            model_kwargs={"kv_layout": {"kv": {"main": layout.row()}}},
+        ))
+        cached[out] = conductor.requests[out].resource_configs["kv"].prefix_cache
+
+    assert cached == {"audio": False, "text": True}, (
+        "a request whose prefill streams to a running talker was cached, so a "
+        "walk the cache serves would leave the talker short of rows"
+    )
+
+
 # ── a config for every resource that declared a stream ──────────────────
 
 
@@ -368,7 +469,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)

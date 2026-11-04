@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+DENOISE_COMPILE_MODES = ("deterministic", "default", "level")
+
 
 def _filtered(cls: type, d: dict[str, Any]) -> dict[str, Any]:
     """Keep only the dict entries that name a field on the dataclass ``cls``."""
@@ -305,6 +307,12 @@ class Cosmos3Config:
     action_gen: bool = True
     max_action_dim: int = 64
     num_embodiment_domains: int = 32
+    # Action dims the served checkpoint takes as 1 - x: DROID's gripper (7) for
+    # the released DROID policies. Every action a request sends (a policy's
+    # robot_state, a forward-dynamics action) is mapped on the way in and every
+    # predicted action on the way out, so a client sends and reads the robot's
+    # own values (the same robot_state a pi0.5 DROID policy takes).
+    inverted_action_dims: tuple[int, ...] = ()
     sound_gen: bool = True
     sound_dim: int | None = 64
     sound_latent_fps: float = 25.0
@@ -346,6 +354,12 @@ class Cosmos3Config:
     # stream's first window (fresh or resumed); a stream's windows all go to
     # the decoder copy it was admitted to.
     windowed_decode_context_latents: int = 8
+    # Latents a chained window's head (ChainedWindowHead) decodes behind the
+    # frames it re-encodes, so the causal decoder is warm at them. 1-2 hold a
+    # rollout as well as a whole window does and keep the per-boundary cost
+    # small (the head runs between every two windows); 0 reads as 1, since a
+    # mid-stream latent is not a clip start.
+    chained_head_context_latents: int = 2
     # Keep each live stream's VAE decoder cache (the last frames every causal
     # conv saw) in its request state, so a window decodes only its new latents.
     # Without compile, at windowed_decode_latents_per_call=1 and the contiguous
@@ -377,10 +391,21 @@ class Cosmos3Config:
     # Run the streaming decode on channels-last weights and activations,
     # cuDNN's native conv3d layout: no per-conv layout conversion kernels.
     # Same math; bf16 output differs from the default layout only by rounding.
-    # The streaming node then loads its own copy of the VAE decoder instead of
-    # sharing the whole-clip decoder's, which keeps the default layout: a fixed
-    # ~1.03 GiB of bf16 weights (Wan2.2 VAE) in a process hosting both nodes.
+    # The decoders that convert share one decoder-only copy of the VAE per
+    # device (~1.03 GiB of bf16 weights for Wan2.2): the streaming node and a
+    # chained window's head here, the whole-clip decoder under
+    # ``vae_decode_fast``. A node with its switch off shares the default-layout
+    # instance instead.
     vae_decode_channels_last: bool = True
+    # Decode a video clip (the non-windowed video walks) with the shared Wan
+    # VAE decoder: the same per-latent decoder calls as ``vae.decode`` from an
+    # empty cache, channels-last, in the decode dtype (fp32 below cuDNN 9.16),
+    # on the decoder-only copy of the VAE (~1 GiB in bf16). The first two calls
+    # run eager, every later one compiled in Inductor's deterministic mode. An
+    # image (one latent) keeps the compiled stock ``vae.decode`` on the same
+    # copy, faster for a single frame. False decodes everything with the
+    # compiled stock ``vae.decode``.
+    vae_decode_fast: bool = True
     # Let cuDNN time its conv algorithms for each new streaming-decode shape
     # (once, then cached) instead of its heuristic pick. Same math, but the
     # timed pick can differ between server launches, and so can the frames
@@ -398,6 +423,12 @@ class Cosmos3Config:
     # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
+    # A generation step whose requests total more vision tokens than this runs
+    # request by request. Off by default: it is a per-GPU number. On an H100,
+    # two 832x480 Nano clips of 189 frames batched took 2.4x one's step time,
+    # and two 121-frame Edge clips were slower than serial too, so an H100
+    # deployment sets 16384 in its model_kwargs.
+    max_batched_vision_tokens: int | None = None
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
@@ -425,6 +456,19 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # The timestep interval [lo, hi] outside which an action request's step runs
+    # the conditional branch alone; None guides every step. A request's
+    # ``guidance_interval`` wins.
+    guidance_interval_action: tuple[float, float] | None = None
+    # Policy-request defaults a policy checkpoint ships in ``checkpoint.json``
+    # (its "policy" section): the chunk the reply carries, the observation fps
+    # and the embodiment, so a client sends only the observation, the prompt
+    # and the robot_state. None keeps the generic action defaults (16 rows,
+    # ``fps``, and a domain the request must name). The Nano DROID checkpoint's
+    # file is empty, so its yaml sets them.
+    policy_action_chunk_size: int | None = None
+    policy_conditioning_fps: float | None = None
+    policy_domain_name: str | None = None
     # Default output size (width, height) for image and video requests that
     # send no ``size``: Nano/Super serve 1024^2 images and the same square for
     # video unless the deployment says otherwise; Edge is 480p-native (the
@@ -484,6 +528,23 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
+    # How the denoise step compiles, as the engine's compile modes of the same
+    # names (``accelerator_graph_runner.compile_kwargs``): "deterministic" is
+    # Inductor's defaults in its deterministic mode (kernel configs picked by
+    # rule, so every server process runs the same kernels and one seed gives
+    # one video); "default" is torch.compile's defaults, which time some kernel
+    # configs on first use; "level" takes the ``mstar serve -O`` level's
+    # options (-O2: max-autotune).
+    denoise_compile_mode: str = "deterministic"
+    # Compile the cross-request denoise step (two or more requests in one
+    # forward) too, with the same mode: the video, image and sound steps; the
+    # action step (``denoise_step_action_batched``) runs eager. Eager, the
+    # norms, rotary and residuals cost about 80 ms of GPU per extra row at
+    # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
+    # with the pack length dynamic, so no batch size or mix of resolutions
+    # compiles mid-traffic; the per-request patchify, rotary tables and
+    # unpatchify run eager.
+    compile_denoise_batched: bool = True
     # torch.compile the reasoner's captured decode step before the CUDA-graph
     # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
     # norms', rotary's and residuals' pointwise pieces; fused, the step runs
@@ -532,11 +593,13 @@ class Cosmos3Config:
         reinterpret silently: a non-boolean switch (a yaml ``"false"`` is
         truthy), a negative warm-stream cap (read as no cap), or more latents
         per call than the default window holds (read as one call per window)."""
-        for name in ("windowed_decode_warm_cache", "vae_decode_channels_last", "vae_decode_cudnn_benchmark"):
+        for name in ("windowed_decode_warm_cache", "vae_decode_channels_last", "vae_decode_cudnn_benchmark",
+                     "vae_decode_fast"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
-        for name in ("windowed_decode_max_warm_streams", "windowed_decode_latents_per_call"):
+        for name in ("windowed_decode_max_warm_streams", "windowed_decode_latents_per_call",
+                     "chained_head_context_latents"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Cosmos3 {name} must be an integer >= 0, got {value!r}.")
@@ -547,6 +610,19 @@ class Cosmos3Config:
                 f"Cosmos3 windowed_decode_latents_per_call={self.windowed_decode_latents_per_call} is more "
                 f"than the {window} latent frames of the smaller default window ({default_frames} frames); "
                 "0 decodes each window's new latents in one call."
+            )
+
+    def check_compile(self) -> None:
+        """Reject compile settings that would be read as something else: a
+        non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
+        for name in ("compile_denoise", "compile_denoise_batched"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
+        if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
+            raise ValueError(
+                f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "
+                f"got {self.denoise_compile_mode!r}."
             )
 
     @property
@@ -611,6 +687,17 @@ class Cosmos3Config:
             for name, value in EDGE_RECIPE_DEFAULTS.items():
                 if getattr(cfg, name) == getattr(defaults, name):
                     setattr(cfg, name, value)
+
+        ckpt_path = root / "checkpoint.json"
+        if ckpt_path.exists():
+            with open(ckpt_path) as f:
+                policy = (json.load(f) or {}).get("policy") or {}
+            if policy.get("action_chunk_size") is not None:
+                cfg.policy_action_chunk_size = int(policy["action_chunk_size"])
+            if policy.get("conditioning_fps") is not None:
+                cfg.policy_conditioning_fps = float(policy["conditioning_fps"])
+            if policy.get("domain_name"):
+                cfg.policy_domain_name = str(policy["domain_name"])
 
         modular_path = root / "modular_model_index.json"
         if modular_path.exists():

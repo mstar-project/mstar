@@ -134,6 +134,35 @@ def test_dense_without_a_varlen_kernel_falls_back_to_autos_backend(monkeypatch, 
     assert "using the paged 'flashinfer' backend" in caplog.text
 
 
+class _FakeCudaPlatform:
+    def __init__(self, capability):
+        self.capability = capability
+
+    def cuda_capability(self, device=None):
+        return self.capability
+
+
+@pytest.mark.parametrize(
+    ("capability", "has_kernel"),
+    [((8, 0), True), ((8, 9), True), ((9, 0), True), ((7, 5), False), ((10, 0), False), ((10, 3), False),
+     ((12, 0), False)],
+    ids=str,
+)
+def test_dense_needs_a_kernel_for_the_gpus_capability(capability, has_kernel, monkeypatch):
+    """fa3-fwd imports on any NVIDIA GPU but has kernels only for sm_80 and sm_90a."""
+    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    monkeypatch.setattr(dense_module, "current_platform", _FakeCudaPlatform(capability))
+    dense_module._fa3_unavailable_reason.cache_clear()
+    try:
+        reason = dense_module._fa3_unavailable_reason(torch.device("cuda", 0))
+    finally:
+        dense_module._fa3_unavailable_reason.cache_clear()
+    if has_kernel:
+        assert reason is None
+    else:
+        assert reason == f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
+
+
 @pytest.mark.parametrize("backend", [AttnBackend.AUTO, AttnBackend.FLASHINFER], ids=str)
 def test_cross_attention_builds_flashinfer(backend):
     manager = CrossAttentionManager.build(cross_spec(backend=backend), kv_info(paged_config()))
@@ -164,6 +193,7 @@ def _clear_fa3_caches():
     from mstar.engine.resources.attn.ragged import dense as ragged_dense
 
     ragged_dense._warn_ragged_dense_fallback.cache_clear()
+    ragged_dense._warn_dense_on_flashinfer.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -209,7 +239,7 @@ def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
     finally:
         _clear_fa3_caches()
     assert type(manager) is manager_class
-    assert "using the ragged 'flashinfer' backend" in caplog.text
+    assert "running it on FlashInfer's ragged prefill" in caplog.text
 
 
 def test_block_causal_dense_falls_back_even_with_the_kernel_present(monkeypatch, caplog):

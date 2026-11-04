@@ -52,8 +52,9 @@ To work on the code, install from source in editable mode:
 
    uv pip install --torch-backend=auto -e .
 
-This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
-console scripts, ``mstar`` and ``mstar-serve``.
+This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
+console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
+extension (see `Rust extension`_).
 
 .. important::
 
@@ -89,8 +90,13 @@ interactive shell and check GPU access:
      -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v mstar-cache:/root/.cache/mstar \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+The ``mstar-cache`` volume keeps compiled kernels across containers. It is a named volume
+rather than ``$HOME/.cache/mstar`` because the container runs as root, and root-owned files
+there would stop a later native run from writing its cache.
 
 Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
 one for the encoders and decoder, and two for the LLM.
@@ -129,9 +135,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
        when installing both.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
-       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
-       **Also needs** ``flash-attn``, which is installed separately —
-       see `flash-attn (Qwen3-Omni, LingBot-World)`_.
+       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). It needs
+       ``transformers>=5.18``. Its encoders attend through FlashInfer, so it needs no
+       ``flash-attn``.
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -144,10 +150,16 @@ Model families and some output formats need extra packages, exposed as pip *extr
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
+       comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
+       Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[glm]``
+     - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
        and ``tensordict`` for reference validation. The pinned TAEHV implementation
@@ -181,7 +193,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
        Convenient for a machine that serves multiple models; heavier and slower to
        install than a single family's extra. It excludes the separately installed
        TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
-       `flash-attn (Qwen3-Omni, LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
+       `flash-attn (LingBot-World)`_ and `qwen-tts (Qwen3-TTS)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -215,8 +227,7 @@ Or, in an existing Python 3.12 environment:
 
    If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
    index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
-   command above, Qwen3-Omni still needs ``flash-attn``, and Qwen3-TTS still needs
-   ``qwen-tts`` (see `qwen-tts (Qwen3-TTS)`_):
+   command above, and Qwen3-TTS still needs ``qwen-tts`` (see `qwen-tts (Qwen3-TTS)`_):
 
    .. code-block:: bash
 
@@ -236,8 +247,11 @@ The GPU model families depend on:
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
-- **flash-attn** — used by Qwen3-Omni and LingBot-World. **Not installed by any extra**; install it separately
-  (see `flash-attn (Qwen3-Omni, LingBot-World)`_).
+  Pinned to the version the attention wrappers' direct planner calls were checked against
+  (``DIRECT_PLAN_FLASHINFER_VERSIONS`` in ``mstar/engine/resources/attn/wrappers.py``); on any
+  other version they fall back to FlashInfer's own ``plan()``.
+- **flash-attn** — used by LingBot-World's ``reference_numerics`` mode. **Not installed by any extra**; install it separately
+  (see `flash-attn (LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
@@ -286,18 +300,19 @@ its dependencies:
 
 ``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
 them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
-FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice, which needs
-``transformers>=5.3``, and installing it after them downgrades their dependencies.
+FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice
+(``transformers>=5.3``) or Qwen3-Omni (``transformers>=5.18``). Installing it after them
+downgrades their dependencies.
 mstar reads only the speech-tokenizer source files and runs them under transformers
 4.57.3 or 5.x, so the package's own requirements are not needed. ``pip check`` still
 lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
 others) as unmet for ``qwen-tts``; that is expected.
 
-flash-attn (Qwen3-Omni, LingBot-World)
---------------------------------------
+flash-attn (LingBot-World)
+--------------------------
 
-``flash-attn`` is only needed for **Qwen3-Omni** and **LingBot-World**, and it is **not** pulled in by
-``.[qwen3_omni]``, ``.[lingbot_world]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
+``flash-attn`` is only needed for **LingBot-World** with ``reference_numerics: true``, and it is **not** pulled in by
+``.[lingbot_world]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
 publishes no wheels on PyPI, so ``pip``/``uv`` fall back to compiling it from source, which is
 slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build; otherwise
 build from source (see `No matching wheel — build from source`_ below).
@@ -378,6 +393,9 @@ default. That backend needs the **flash-attn-4** package, which provides
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
 PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
 
+Install it after ``flash-attn`` (FA2): the FA2 package ships an older
+``flash_attn/cute`` that overwrites flash-attn-4's.
+
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with ``Block sparse tensors ...
 require explicit sparse_block_size[0]``. Note this rules out the flash-attn
@@ -457,16 +475,21 @@ Verify the install
    mstar --help
    mstar-serve --help
 
-Optional: Rust support
-----------------------
+Rust extension
+--------------
 
-Parts of the runtime can run on Rust components (vendored in ``rust/``),
-each optional and selectable per process — without the extension everything
-runs on the pure-Python paths as before. Migrated so far (see
-:doc:`environment_variables` for the flags):
+Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
+runtime is Rust and every process sends on its ZeroMQ transport, so the
+conductor refuses to start without it. Importing ``mstar`` does not need it.
+The extension carries (see :doc:`environment_variables` for the flags):
 
-* **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
-  format as pyzmq.
+* **Graph runtime**: graph state, scheduling, routing and speculation, and the
+  frames a worker sends. It holds a share of the Rust transport and of the Rust
+  tensor bookkeeper, and needs the msgpack codec.
+* **ZeroMQ control mesh**: the transport every process sends its control
+  messages on. Each process logs it at startup (``control mesh transport:
+  rust <version> from <path>``) and refuses an extension of another version
+  than the one its ``mstar`` expects.
 * **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship
@@ -476,24 +499,31 @@ runs on the pure-Python paths as before. Migrated so far (see
   extension or not. The legacy ``pickle`` codec is no longer supported.
   Loosely typed metadata uses data-only extensions; upgrade all deployment
   processes together, since legacy pickle frames are rejected.
-* **Graph runtime** — ``MSTAR_RUST_GRAPH``: graph state, scheduling,
-  routing and speculation, and the frames a worker sends. Unlike the others
-  this is not free-standing — it holds a share of the Rust transport and of
-  the Rust tensor bookkeeper, so it runs only where ``MSTAR_RUST_ZMQ``
-  resolved to Rust and the msgpack codec is in use. ``AUTO`` takes it
-  wherever that holds, so on a machine with the extension built, installing
-  it is what moves a worker onto the Rust runtime.
 
-Build the extension into your environment with `maturin
-<https://www.maturin.rs>`_ (needs a Rust toolchain; ``rustup`` works):
+There are two ways to get it. The Linux wheels of ``mstar-ai`` on PyPI (x86_64
+and aarch64, CPython 3.12 to 3.14) carry the extension, so ``pip install
+mstar-ai`` there is all it takes; other platforms get a pure-Python wheel with
+no extension, which cannot serve. The extension statically links libzmq
+4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
+the upstream `v4.3.4 release <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>`_.
+Elsewhere, or from a checkout (``pip install -e .`` does not compile it), build
+the extension into your environment with `maturin <https://www.maturin.rs>`_
+(needs `rustup <https://rustup.rs>`_, which installs the compiler version pinned
+in ``rust-toolchain.toml``):
 
 .. code-block:: bash
 
    uv pip install maturin
    maturin develop --release -m rust/Cargo.toml
 
-Build with ``--release`` — an unoptimized debug build (maturin's default)
-costs real latency on the hot receive path. Verify with:
+The CPU test suites build a graph runtime too, so contributors need it as well,
+Mac contributors included: install ``cargo`` through rustup and run the same
+command. Build with ``--release`` — an unoptimized debug build (maturin's
+default) costs real latency on the hot receive path. If ``mstar-ai`` came from a Linux
+wheel that carries the extension, this build (a separate ``mstar-rust``
+distribution) takes precedence over the wheel's copy in the same environment;
+``pip uninstall mstar-rust`` goes back to the wheel's, and neither uninstall
+removes the other's files. Verify with:
 
 .. code-block:: bash
 
@@ -503,25 +533,28 @@ costs real latency on the hot receive path. Verify with:
 ``test/rust`` is skipped wholesale when the extension is not importable, so
 a green run there without the build above proves nothing.
 
-The Rust-side tests need one extra flag. The crate's default features turn on
-``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
+The Rust-side tests need different features. The crate's default features turn
+on ``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
 for the cdylib, which resolves CPython symbols from the interpreter that
 imports it, wrong for ``cargo test``, which is an executable and has to link
-it itself. Without this the link fails on ``undefined symbol:
-PyEval_RestoreThread``:
+it itself. Without ``--no-default-features`` the link fails on ``undefined
+symbol: PyEval_RestoreThread``; ``--features python`` keeps the bindings and
+the graph runtime, whose tests need them:
 
 .. code-block:: bash
 
    export LD_LIBRARY_PATH="$(python -c 'import sysconfig
    print(sysconfig.get_config_var("LIBDIR"))')"
-   cargo test --release --no-default-features --manifest-path rust/Cargo.toml
+   cargo test --release --no-default-features --features python --manifest-path rust/Cargo.toml
 
 Optional: the Rust HTTP frontend
 --------------------------------
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. Build and opt in:
+keeping preprocessing and the conductor protocol. A Linux wheel that carries
+the extension also installs the binary next to ``mstar-serve``; otherwise build
+it. Then opt in:
 
 .. code-block:: bash
 
@@ -529,9 +562,14 @@ keeping preprocessing and the conductor protocol. Build and opt in:
    mstar serve qwen3_omni --rust-frontend
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
+Use it when benchmarking or tuning streaming throughput: its output path costs
+about 8 µs of API-server CPU per streamed token against 18 µs for the Python
+frontend (``benchmark/api_output_path``), so at high token rates the Python
+frontend, not the model, can be the limit.
+
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
-``$PATH`` / the in-repo build. Its knobs are listed in
-:doc:`environment_variables`.
+the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
+are listed in :doc:`environment_variables`.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):

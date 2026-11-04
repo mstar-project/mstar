@@ -1,7 +1,5 @@
-"""The encode/decode seam shared by both ZMQ transports.
-
-Kept apart from either communicator so they can both import it, and mirroring
-the Rust ``Codec`` trait::
+"""The encode/decode seam of the ZMQ control mesh, mirroring the Rust
+``Codec`` trait::
 
     pub trait Codec<M> {
         fn encode(msg: &M) -> Result<Vec<u8>, CommError>;

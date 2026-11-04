@@ -31,6 +31,7 @@ AR_KV = "slow_ar_kv"
 AR_ATTN = "slow_ar_attn"
 AR_POS = "slow_ar_pos"
 AR_SAMPLER = "semantic_sampler"
+CODEC_STATE = "codec_state"
 
 # Step-metadata keys ``process_prompt`` settles on the host for the prefill:
 # ``[prefix_len, ref_frames]``, and a clone's reference-clip digest.
@@ -131,12 +132,8 @@ class FishFastARConfig:
 class FishDACConfig:
     """Modded DAC codec architecture plus M* streaming controls.
 
-    The architecture fields mirror ``modded_dac_vq.yaml``. The stream policy
-    gives every codec window enough already-decoded frames in front of its
-    new ones that the new frames decode exactly as in one decode of the
-    whole stream: the quantizer's post transformer looks back
-    ``post_layers * (post_window - 1)`` frames and the causal conv stack
-    after it ``conv_context_frames`` more.
+    The architecture fields mirror ``modded_dac_vq.yaml``; the stream policy
+    is the chunk sizes, a ramp (``chunk_schedule``) then ``chunk_frames``.
     """
 
     sample_rate: int = 44100
@@ -163,14 +160,11 @@ class FishDACConfig:
     rope_base: float = 10000.0
     norm_eps: float = 1e-5
 
-    # Streaming (codec windows). The first windows are small so the first
+    # Streaming (codec chunks). The first chunks are small so the first
     # audio leaves a few AR steps after prefill; then ``chunk_frames`` new
-    # frames per window.
+    # frames per chunk.
     chunk_schedule: tuple[int, ...] = (4, 8, 16)
     chunk_frames: int = 32
-    # None: the exact receptive field (transformer + conv stack).
-    left_context_frames: int | None = None
-    conv_context_frames: int = 10
 
     def __post_init__(self) -> None:
         for name in (
@@ -181,12 +175,8 @@ class FishDACConfig:
             "chunk_schedule",
         ):
             setattr(self, name, tuple(int(v) for v in getattr(self, name)))
-        if self.left_context_frames is None:
-            self.left_context_frames = self.transformer_context_frames + self.conv_context_frames
         if self.chunk_frames <= 0 or any(size <= 0 for size in self.chunk_schedule):
             raise ValueError("Fish codec chunk sizes must be positive")
-        if self.left_context_frames < 0 or self.conv_context_frames < 0:
-            raise ValueError("Fish codec context frames must be non-negative")
 
     @property
     def num_codebooks(self) -> int:
@@ -198,36 +188,13 @@ class FishDACConfig:
         return math.prod(self.encoder_rates) * math.prod(self.downsample_factor)
 
     @property
-    def transformer_context_frames(self) -> int:
-        """Frames the quantizer's post transformer looks back over (8 x 127)."""
-        return self.post_layers * (self.post_window - 1)
-
-    @property
     def max_frames(self) -> int:
         """Longest stream the post transformer's RoPE table covers."""
         return self.post_block_size
 
-    @property
-    def exact_streaming(self) -> bool:
-        return self.left_context_frames >= self.transformer_context_frames + self.conv_context_frames
-
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of 44.1 kHz audio."""
         return -(-int(num_samples) // self.hop_length)
-
-    def codec_windows(self) -> list[int]:
-        """Distinct window sizes (context + new frames) the chunk schedule produces."""
-        left = self.left_context_frames
-        windows, delivered = set(), 0
-        for size in self.chunk_schedule:
-            windows.add(min(left, delivered) + size)
-            delivered += size
-        while True:
-            windows.add(min(left, delivered) + self.chunk_frames)
-            if delivered >= left:
-                break
-            delivered += self.chunk_frames
-        return sorted(windows)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FishDACConfig":

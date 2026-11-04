@@ -66,8 +66,10 @@ def test_cosmos3_vae_decode_nodes_compile_without_comprehensive_padding(vae, com
     cfg = Cosmos3Config()
     cfg.windowed_decode_warm_cache = warm
     cfg.vae_decode_channels_last = False
-    Cosmos3VAEDecoderSubmodule(vae, cfg)
+    # as Cosmos3Model builds the whole-clip node
+    Cosmos3VAEDecoderSubmodule(vae, cfg, fast=cfg.vae_decode_fast)
     Cosmos3VAEDecoderARSubmodule(vae, cfg)
-    # the stateless node, then the AR node's stateless decode and, when warm, its DecoderStep
-    assert len(compiles) == (3 if warm else 2)
+    # the whole-clip node's step for clips and its stock decode for images, then the AR node's
+    # stateless decode and, when warm, its DecoderStep
+    assert len(compiles) == (4 if warm else 3)
     assert all(_padding_off(kw) for kw in compiles)

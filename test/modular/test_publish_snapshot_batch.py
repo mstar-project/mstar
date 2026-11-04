@@ -29,6 +29,7 @@ def _runner(pubs: dict[str, Any]) -> StepRunner:
     runner._resources = pubs
     runner._publish_order = list(pubs)
     runner._node_publish_order = {}
+    runner._unpublished = {key: set() for key in pubs}
     runner._sweep = lambda node_order, order, node_name: order
     return runner
 

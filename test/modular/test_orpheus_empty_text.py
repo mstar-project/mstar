@@ -17,8 +17,6 @@ is sent.
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import queue
 import threading
 import time
@@ -27,11 +25,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import torch
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from test_request_id_reuse import _Socket, _TensorManager
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
+from mstar.communication.event import EventWakeup
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.utils.ipc_format import ConductorMessageType
@@ -57,11 +56,12 @@ class _Server:
     def __init__(self):
         self.socket = _Socket()
         self.stop = threading.Event()
+        results = EventWakeup()
         worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=queue.Queue(),
-            profile_queue=queue.Queue(),
+            out_queue=ResultQueue(results),
+            profile_queue=ResultQueue(results),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),
@@ -80,10 +80,11 @@ class _Server:
         facade.discard_tensor_queue = worker.discard_tensor_queue
         facade.output_queue = worker.out_queue
         facade.profile_queue = worker.profile_queue
+        facade.results_wakeup = results
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.api = make_test_api_server(preprocess_worker=facade, model=worker.model, model_name="orpheus")
-        self.api.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
+        self.api.communicator = StandInSocket()
         self.api.conductor_proc = None
         self.api._liveness_interval_s = 0.5
         self.api.running = True
@@ -137,16 +138,12 @@ def test_generate_without_text_is_a_400(server, field):
 
 
 @pytest.mark.parametrize("field", TEXT_FIELDS.values(), ids=TEXT_FIELDS.keys())
-def test_a_streamed_generate_without_text_ends_with_a_400_error_line(server, field):
-    """A stream's status is committed before the data worker runs, so the
-    refusal is its one line, carrying the 400 as every preprocess refusal does."""
+def test_a_streamed_generate_without_text_is_a_400(server, field):
+    """A stream waits for its first chunk, so a preprocess refusal is the status, not a 200."""
     r = _post({**field, "output_modalities": "audio", "model_kwargs": '{"voice": "tara"}'})
 
-    assert r.status_code == 200, r.text
-    (line,) = [json.loads(raw) for raw in r.text.splitlines()]
-    assert line["modality"] == "error"
-    assert line["metadata"] == {"status": 400}
-    assert REFUSAL in base64.b64decode(line["data"]).decode()
+    assert r.status_code == 400, r.text
+    assert REFUSAL in r.json()["detail"]
     assert server.new_requests() == []
 
 
