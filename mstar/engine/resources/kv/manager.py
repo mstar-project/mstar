@@ -4698,7 +4698,8 @@ class KVManager(AttentionResource):
         ``pages``, or holds an allotment of ``pages`` once it has one."""
         self._guaranteed.add(rid)
         self._cpu_pool.unreserve(rid)
-        self._cpu_pool.count_guaranteed(rid)
+        if self._decides:
+            self._cpu_pool.count_guaranteed(rid)
         allotment = self._allotments.get(rid)
         if allotment is None:
             self._asks[rid] = pages
