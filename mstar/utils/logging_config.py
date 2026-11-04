@@ -35,10 +35,8 @@ def log_off_thread() -> Callable[[], None]:
 
     A loop that logs on every request otherwise writes to stderr itself, under
     the handler's lock, and a stderr redirected to a file blocks while the
-    kernel writes back dirty pages: 0.25 to 0.4 s at a time while another
-    process writes heavily to the same disk. Call once after
-    ``logging.basicConfig`` and :func:`quiet_noisy_loggers`. Returns the
-    drain, which also runs at exit and puts the handlers back.
+    kernel writes back dirty pages. Call once after ``logging.basicConfig``.
+    Returns the drain, which also runs at exit and puts the handlers back.
     """
     root = logging.getLogger()
     handlers = root.handlers[:]

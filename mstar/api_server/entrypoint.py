@@ -2948,7 +2948,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any thread: the pools are sized from the CPUs it leaves unpinned
+    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
     try:
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
