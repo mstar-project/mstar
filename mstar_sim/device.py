@@ -205,6 +205,13 @@ SYNC_DEBUG = [0]
 _SHARED = b"mstar_sim:"
 
 
+def _share_cuda(storage):
+    """A CUDA IPC handle naming a cuda tensor's storage; another emulated process opens it
+    (``UntypedStorage._new_shared_cuda``) as a value-less storage of its size."""
+    nbytes = storage.nbytes()
+    return (0, _SHARED + f"{storage.data_ptr()}:{nbytes}".encode(), nbytes, 0, b"", 0, b"", False)
+
+
 class _FakeStorage:
     """A value-less tensor's ``untyped_storage()``: the meta storage with its fake
     address, so callers that key storages by ``data_ptr()`` see them as distinct.
@@ -223,11 +230,7 @@ class _FakeStorage:
         return len(self._storage)
 
     def _share_cuda_(self):
-        """A CUDA IPC handle naming this storage; another emulated process opens it
-        (``UntypedStorage._new_shared_cuda``) as a value-less storage of its size."""
-        nbytes = self._storage.nbytes()
-        handle = _SHARED + f"{self.data_ptr()}:{nbytes}".encode()
-        return (0, handle, nbytes, 0, b"", 0, b"", False)
+        return _share_cuda(self)
 
 
 def _unwrap(x):
@@ -1207,6 +1210,7 @@ def install() -> None:
         return new_shared(*args)
 
     torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)
+    torch.UntypedStorage._share_cuda_ = _share_cuda  # a kept tensor's storage is a plain one
     from mstar_sim import patches
 
     patches.relax_blockwise_scaled_mm_meta()
