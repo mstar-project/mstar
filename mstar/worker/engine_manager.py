@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -20,6 +20,22 @@ from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
+
+
+def _prefill_token_buckets(model_config: dict) -> Mapping:
+    """The serving config's ``prefill_token_buckets``: node -> capture walk ->
+    ladder, which each node's captures take at warmup (`apply_token_ladders`)."""
+    if "prefill_token_buckets" in (model_config.get("model_kwargs") or {}):
+        raise ValueError(
+            "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
+            "per node and capture walk: prefill_token_buckets: {<node>: {<capture walk>: [...]}}"
+        )
+    ladders = model_config.get("prefill_token_buckets") or {}
+    if not isinstance(ladders, Mapping):
+        raise ValueError(
+            f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
+        )
+    return ladders
 
 
 def _unchunkable_nodes(
@@ -325,7 +341,7 @@ class EngineManager:
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        ladders = model_config.get("prefill_token_buckets") or {}
+        ladders = _prefill_token_buckets(model_config)
         known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
         for key, setting in (
             ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),

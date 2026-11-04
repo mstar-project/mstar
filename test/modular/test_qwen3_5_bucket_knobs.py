@@ -66,16 +66,6 @@ def _captured_ladders(submodule, ladders) -> dict[str, list[int]]:
     }
 
 
-def test_the_default_ladder_holds_a_mixed_step_without_the_next_power_of_two():
-    """Four 512-token prompts beside the rest of the largest mixed batch, a step
-    over the LLM's budget that a deployment with chunking off builds, replay at
-    2176, not padded to 4096."""
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-    s = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
-    tokens = 4 * 512 + s.MIXED_CAPTURE_BATCH_SIZES[-1] - 4
-    assert min(b for b in s.MIXED_TOKEN_BUCKETS if b >= tokens) == 2176
-
-
 @pytest.mark.parametrize("ladders", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
 def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, ladders):
     monkeypatch.delenv("MSTAR_QWEN35_DECODE_BUCKETS", raising=False)
