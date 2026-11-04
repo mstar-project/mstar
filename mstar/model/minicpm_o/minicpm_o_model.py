@@ -305,6 +305,16 @@ class MiniCPMOModel(Model):
         unsupported = set(output_modalities) - {TEXT}
         if unsupported:
             raise ValueError(f"MiniCPM-o here has no {', '.join(sorted(unsupported))} output yet")
+        enable_thinking = kwargs.get("enable_thinking", False)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be true or false, got {enable_thinking!r}")
+        max_slice_nums = kwargs.get("max_slice_nums")
+        max_slice_nums = processor.MAX_SLICE_NUMS if max_slice_nums is None else max_slice_nums
+        # the checkpoint's own setting is the most: each slice is up to 1024 patches
+        if type(max_slice_nums) is not int or not 1 <= max_slice_nums <= processor.MAX_SLICE_NUMS:
+            raise ValueError(
+                f"max_slice_nums must be an integer in 1..{processor.MAX_SLICE_NUMS}, got {max_slice_nums!r}"
+            )
         tensors = tensors or {}
         parts = parts_from_modalities(
             input_modalities,
@@ -323,11 +333,9 @@ class MiniCPMOModel(Model):
         audios = [a.reshape(-1).float().cpu().numpy() for a in raw_audios]
         text = self._render(
             parts, bool(audios),
-            enable_thinking=bool(kwargs.get("enable_thinking", False)),
+            enable_thinking=enable_thinking,
             system_prompt=kwargs.get("system_prompt"),
         )
-        max_slice_nums = kwargs.get("max_slice_nums")
-        max_slice_nums = processor.MAX_SLICE_NUMS if max_slice_nums is None else max_slice_nums
         p, queries = self.config.vision.patch_size, self.config.resampler.num_queries
         sliced = [processor.slice_image(_as_pil(img), max_slice_nums, p) for img in raw_images]
         text = processor.expand_tags(

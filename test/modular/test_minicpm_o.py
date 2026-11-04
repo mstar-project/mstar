@@ -122,6 +122,15 @@ def test_prefill_token_counts_toward_the_budget(walk):
     assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
 
 
+@pytest.mark.parametrize("knob, value", [
+    ("max_slice_nums", "9"), ("max_slice_nums", 0), ("max_slice_nums", 1000), ("max_slice_nums", True),
+    ("enable_thinking", "false"),
+])
+def test_bad_request_knobs_are_refused(knob, value):
+    with pytest.raises(ValueError, match=knob):
+        a_bare_model().process_prompt("Hi.", ["text"], ["text"], **{knob: value})
+
+
 # --- with the checkpoint's config and tokenizer ---------------------------
 
 @pytest.fixture(scope="module")
