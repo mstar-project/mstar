@@ -23,6 +23,14 @@ model_kwargs:
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
   flow_shift_action: 5.0
+  # The cookbook's guidance interval: of the 4 steps only the first guides,
+  # the rest run the conditional branch alone (and the warmup compiles both).
+  guidance_interval_action: [960, 1001]
+  # The checkpoint takes DROID's gripper as 1 - gripper (NVIDIA's RoboLab server
+  # flips it): every action comes in and goes out in the robot's own values (the
+  # robot_state, a forward-dynamics action, the predicted rows), the same state
+  # a pi0.5 DROID policy takes.
+  inverted_action_dims: [7]
 node_groups:
   # No reasoner: the policy checkpoint ships no vision encoder, so the chat
   # walks are not built and the DiT runs alone.
@@ -32,9 +40,10 @@ node_groups:
     ranks: [0]
 # The first policy request of a fresh server compiles the action denoise step
 # (about 9 s); this warms it at startup with the model card's example frame as
-# the observation.
+# the observation, in the layout NVIDIA's RoboLab server sends (the robot state
+# and the 736x544 bucket; the chunk, fps and domain come from checkpoint.json).
 warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
-    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}
+    model_kwargs: {size: 736x544, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}

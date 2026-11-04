@@ -157,26 +157,11 @@ class PackedCanvas:
     flat_uncond_total: int
     items: list[CanvasItem]
 
-    def slice_logits(
-        self, logits: torch.Tensor, item: CanvasItem
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Conditional and unconditional target logits for one item.
-
-        Laid out as every item's conditional target block followed by the
-        unconditional blocks of the items that asked for CFG, which is the
-        gather order ``tgt_index`` was built in.
-
-        The unconditional half is ``None`` for an item at
-        ``guidance_scale == 0``: it has no unconditional document, because
-        scoring would discard those logits anyway.
-        """
-        start, length = item.flat_start, item.target_len
-        c_logits = logits[:, :, start : start + length, :]
-        if item.flat_u_start < 0:
-            return c_logits, None
-        u_start = self.flat_target_total + item.flat_u_start
-        u_logits = logits[:, :, u_start : u_start + length, :]
-        return c_logits, u_logits
+    def uncond_rows(self) -> list[int]:
+        """Where each item's unconditional block starts in the gathered
+        logits, or -1 for an item with CFG off: ``unmask_step``'s
+        ``uncond_rows``."""
+        return [self.flat_target_total + item.flat_u_start if item.flat_u_start >= 0 else -1 for item in self.items]
 
 
 def build_packed_canvas(items: list[CanvasItem], device: torch.device) -> PackedCanvas:
@@ -265,6 +250,15 @@ class OmniVoiceBackbone(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
+        # `encode` runs a layer's projections as F.linear over the fused weights
+        # apply_flashinfer leaves, all but the two it calls
+        self.lora_unservable = {
+            f"model.llm.layers.{i}.{part}.{name}": "fused at load by apply_flashinfer, run as F.linear over that"
+            for i, layer in enumerate(model.llm.layers)
+            for part, called in (("self_attn", "o_proj"), ("mlp", "down_proj"))
+            for name, child in getattr(layer, part).named_children()
+            if name != called and isinstance(child, nn.Linear)
+        }
 
     def encode(
         self,

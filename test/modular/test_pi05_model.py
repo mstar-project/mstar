@@ -24,9 +24,9 @@ from mstar.model.pi05.components.flow_matching import (
     euler_step,
     sincos_timestep_embedding,
 )
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
@@ -41,6 +41,7 @@ def _make_model() -> Pi05Model:
     model.cache_dir = None
     model.skip_weight_loading = True
     model.config = Pi05Config()
+    model.norm_stats = None
     model.tokenizer = None
     model._repo_dir = None
     model._submodule_cache = {}
@@ -101,6 +102,132 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
 
         assert actual.dtype == torch.float32
         assert torch.equal(actual, reference)
+
+
+def test_pi05_vision_gets_every_camera():
+    """The server hands one [C, H, W] tensor per camera; all of them reach SigLIP, in order."""
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.0, 0.5, 1.0)]
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels, torch.stack(cameras) * 2 - 1)
+
+
+class _TwoTokensPerImage(torch.nn.Module):
+    """Stands in for SigLIP + connector: two tokens per image, from its mean and its first pixel."""
+
+    def forward(self, pixels):
+        return torch.stack([pixels.mean(dim=(1, 2, 3)), pixels[:, 0, 0, 0]], dim=1).unsqueeze(-1)
+
+
+def _encode(submodule, cameras):
+    """prepare_inputs, the eager forward and postprocess for one request, as the engine runs them."""
+    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras})
+    pixels = submodule.preprocess("prefill", None, [inputs])["pixel_values"]
+    outputs = submodule.forward("prefill", None, pixels)
+    submodule.postprocess("r", None, outputs, inputs=inputs)
+    return inputs, outputs["img_emb"][0]
+
+
+@pytest.mark.parametrize("num_images", [1, 2, 3])
+def test_pi05_vision_pads_missing_cameras_and_drops_their_tokens(num_images):
+    """A request with fewer cameras than the deployment's num_cameras fills the
+    captured ViT's slots with blank frames, and only its own cameras' tokens reach
+    the LLM, as openpi's image mask leaves masked cameras out of the prefix."""
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.full((3, 4, 4), v) for v in (0.25, 0.5, 1.0)[:num_images]]
+    inputs, img_emb = _encode(submodule, cameras)
+
+    pixels = inputs.tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels[:num_images], torch.stack(cameras) * 2 - 1)
+    assert pixels[num_images:].eq(-1).all()
+    expected = torch.tensor([[v * 2 - 1] * 2 for v in (0.25, 0.5, 1.0)[:num_images]]).reshape(-1, 1)
+    assert torch.equal(img_emb, expected)
+
+
+def test_pi05_vision_batches_requests_with_different_camera_counts():
+    """Every request is padded to num_cameras, so a batch can mix camera counts and
+    each request still gets only its own cameras' tokens."""
+    submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
+    requests = {"one": [torch.full((3, 4, 4), 0.25)], "two": [torch.full((3, 4, 4), 0.5), torch.zeros(3, 4, 4)]}
+    inputs = [submodule.prepare_inputs("prefill", None, {"image_inputs": cams}) for cams in requests.values()]
+    assert submodule.can_batch(None, inputs)
+    engine_inputs = ModelInputsFromEngine(request_ids=list(requests), per_request_info={})
+    pixels = submodule.preprocess("prefill", engine_inputs, inputs)["pixel_values"]
+    outputs = submodule.forward_batched("prefill", engine_inputs, pixels)
+    for rid, request_inputs in zip(requests, inputs, strict=True):
+        submodule.postprocess(rid, None, outputs[rid], inputs=request_inputs)
+    assert torch.equal(outputs["one"]["img_emb"][0], torch.tensor([[-0.5], [-0.5]]))
+    assert torch.equal(outputs["two"]["img_emb"][0], torch.tensor([[0.0], [0.0], [-1.0], [-1.0]]))
+
+
+def test_pi05_vision_letterboxes_each_camera_at_its_own_resolution():
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
+    wide, tall = torch.full((3, 2, 4), 1.0), torch.full((3, 8, 4), 1.0)
+    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": [wide, tall]}).tensor_inputs["pixel_values"]
+    assert pixels.shape == (2, 3, 4, 4)
+    assert torch.equal(pixels[0], submodule._prepare_one(wide)[0])
+    assert torch.equal(pixels[1], submodule._prepare_one(tall)[0])
+
+
+def test_pi05_vision_postprocess_keeps_the_images_its_inputs_name():
+    """postprocess trims by the num_images prepare_inputs recorded, which the KV layout
+    was counted for, and has no fallback to keeping every slot."""
+    from mstar.model.submodule_base import NodeInputs
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
+    emb = torch.arange(6.0).reshape(6, 1)  # two tokens per camera slot
+    outputs = {"img_emb": [emb]}
+    submodule.postprocess("r", None, outputs, inputs=NodeInputs(kwargs={"num_images": 2}))
+    assert torch.equal(outputs["img_emb"][0], emb[:4])
+    with pytest.raises(KeyError):
+        submodule.postprocess("r", None, {"img_emb": [emb]}, inputs=NodeInputs())
+
+
+def test_pi05_refuses_more_images_than_cameras_before_decoding():
+    """The data worker checks file counts against max_input_files before it decodes
+    any file, so a fourth image is a 400 rather than a failed SigLIP step."""
+    from mstar.model.media_limits import check_file_counts
+
+    model = _make_model()
+    assert model.max_input_files() == {"image": model.config.num_cameras} == {"image": 3}
+    check_file_counts({"image": 3}, model.max_input_files())
+    with pytest.raises(ValueError, match="attaches 4 image files; this model takes at most 3"):
+        check_file_counts({"image": 4}, model.max_input_files())
+
+
+def test_pi05_prefix_scaling_follows_openpi():
+    """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
+    config = Pi05Config(hidden_size=16)
+    embed = torch.nn.Embedding(10, 16)
+    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
+                           torch.nn.Identity(), torch.nn.Identity(), config)
+    img = torch.randn(6, 16)
+    ids = torch.tensor([1, 4, 7])
+    with torch.no_grad():
+        prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
+        assert torch.equal(prefix[:6], img)
+        assert torch.allclose(prefix[6:], embed(ids) * 4.0)
+
+
+def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
+    """Cameras travel to the worker as uint8 and normalize to the same ViT
+    input as the base class's float [0, 1] encoding."""
+    from torchvision.io import write_png
+
+    pixels = torch.arange(3 * 6 * 10, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(3, 6, 10)
+    path = tmp_path / "cam.png"
+    write_png(pixels, str(path))
+
+    loaded = _make_model().load_image(str(path), "cpu").data
+    assert loaded.dtype == torch.uint8
+    assert torch.equal(loaded, pixels)
+
+    submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=8, num_cameras=1))
+    from_uint8 = submodule._prepare_one(loaded.unsqueeze(0))
+    from_float = submodule._prepare_one(loaded.unsqueeze(0).float() / 255.0)
+    torch.testing.assert_close(from_uint8, from_float, rtol=0, atol=1e-6)
 
 
 # ----------------------------------------------------------------------
@@ -304,6 +431,10 @@ def test_discretize_state_round_trip_within_bin():
 # ----------------------------------------------------------------------
 
 
+# what the data worker hands process_prompt for a one-camera request
+_ONE_IMAGE = {"image_inputs": [torch.zeros(3, 4, 4)]}
+
+
 class _StubTokenizer:
     """Captures the prompt string passed to encode_prompt for assertion."""
 
@@ -315,6 +446,21 @@ class _StubTokenizer:
         # Return a deterministic tensor of length 1; the test only inspects
         # last_prompt.
         return torch.tensor([0], dtype=torch.long)
+
+
+def test_pi05_refuses_to_start_without_a_tokenizer(monkeypatch):
+    """A served model that can't load a tokenizer must fail at load, not take
+    the dummy-mode path and fail every request at ingest."""
+    import transformers
+
+    def unavailable(repo, **kwargs):
+        raise OSError(f"{repo} is gated")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", unavailable)
+    model = _make_model()
+    model.skip_weight_loading = False
+    with pytest.raises(ValueError, match="google/paligemma-3b-pt-224 is gated"):
+        model._load_tokenizer()
 
 
 def test_pi05_process_prompt_formats_state_into_text():
@@ -332,6 +478,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         prompt="pick up the\nblock",
         input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
         robot_state=state,
     ).new_input_tensors
 
@@ -354,11 +501,304 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     model.tokenizer = stub
     result = model.process_prompt(
         prompt="hello world",
-        input_modalities=["text"],
+        input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)]},
     ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
+
+
+def test_discretize_state_matches_openpi_digitize():
+    """openpi's PaligemmaTokenizer: np.digitize(state, linspace(-1, 1, 257)[:-1]) - 1,
+    so -1 below the range, 255 at or above 1, and each bin edge starts its bin."""
+    import numpy as np
+
+    edges = np.linspace(-1, 1, 257)[:-1]
+    values = np.concatenate([
+        np.random.default_rng(0).uniform(-1.5, 1.5, 4096), edges, edges - 1e-12,
+        [-1.0, 1.0, -1.0000001, 0.99999, 2.0],
+    ])
+    got = discretize_state(torch.from_numpy(values), num_bins=256)
+    assert got.dtype == torch.long
+    np.testing.assert_array_equal(got.numpy(), np.digitize(values, bins=edges) - 1)
+
+
+def test_pi05_process_prompt_tokenizes_openpi_text():
+    """The task keeps its case and the space after "Action:" stays, as openpi
+    tokenizes the string it builds."""
+    from types import SimpleNamespace
+
+    from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+
+    seen = []
+
+    def hf_tokenizer(text, add_special_tokens):
+        seen.append(text)
+        return SimpleNamespace(input_ids=[2, 7, 9])
+
+    model = _make_model()
+    model.tokenizer = Pi05Tokenizer(hf_tokenizer, model.config)
+    result = model.process_prompt(
+        "Put_the Cup\naway", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.5, -1.2, 1.0],
+    )
+    assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
+    assert result.new_input_tensors["text_inputs"][0].tolist() == [2, 7, 9]
+    # the KV layout's text span counts the tokens of that text
+    assert result.metadata["kv_layout"][LLM_KV]["main"].spans[1].length == 3
+
+
+# ----------------------------------------------------------------------
+# Deployment norm stats (openpi's quantile normalization)
+# ----------------------------------------------------------------------
+
+# A 3-dim robot in openpi's norm_stats.json layout; mean/std are there but unused.
+_TINY_STATS = {
+    "norm_stats": {
+        "state": {"mean": [0.0, 0.0, 0.5], "std": [1.0, 1.0, 0.5],
+                  "q01": [-0.8, -2.7, 0.0], "q99": [0.9, -0.45, 0.99]},
+        "actions": {"mean": [0.0, 0.0], "std": [0.3, 0.3], "q01": [-0.45, 0.0], "q99": [0.44, 1.0]},
+    }
+}
+
+
+def _openpi_state_bins(raw, q01, q99):
+    """openpi: transforms.Normalize(use_quantiles=True), then PaligemmaTokenizer's np.digitize."""
+    import numpy as np
+
+    raw = np.asarray(raw, dtype=np.float64)
+    q01, q99 = np.asarray(q01)[: raw.shape[-1]], np.asarray(q99)[: raw.shape[-1]]
+    x = (raw - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+    return (np.digitize(x, bins=np.linspace(-1, 1, 257)[:-1]) - 1).tolist()
+
+
+def _model_with_stats(norm_stats):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    model = _make_model()
+    model.norm_stats = load_norm_stats(norm_stats)
+    model.tokenizer = _StubTokenizer()
+    return model
+
+
+def test_norm_stats_file_and_inline_mapping_agree(tmp_path):
+    import json
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    from_file = load_norm_stats(str(path))
+    inline = load_norm_stats({k: {"q01": v["q01"], "q99": v["q99"]} for k, v in _TINY_STATS["norm_stats"].items()})
+    for a, b in ((from_file.state, inline.state), (from_file.actions, inline.actions)):
+        assert torch.equal(a.q01, b.q01) and torch.equal(a.q99, b.q99)
+    assert from_file.state.q01.dtype == torch.float64
+    assert load_norm_stats(None) is None
+    assert load_norm_stats({"state": _TINY_STATS["norm_stats"]["state"]}).actions is None
+
+
+@pytest.mark.parametrize("bad", [
+    {}, {"states": {"q01": [0.0], "q99": [1.0]}}, {"state": {"mean": [0.0], "std": [1.0]}},
+    {"state": {"q01": [0.0, 1.0], "q99": [1.0]}}, {"actions": {"q01": [], "q99": []}},
+])
+def test_norm_stats_rejects_specs_it_cannot_apply(bad):
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    with pytest.raises(ValueError):
+        load_norm_stats(bad)
+
+
+def test_pi05_process_prompt_normalizes_raw_state_like_openpi():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    stats = _TINY_STATS["norm_stats"]["state"]
+    rng = np.random.default_rng(0)
+    for raw in ([0.1, -1.0, 0.5], [0.95, -2.9, 0.0], *rng.uniform(-3, 3, size=(32, 3)).tolist(), [0.3, -1.2]):
+        model.process_prompt("pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=raw)
+        bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+        assert [int(b) for b in bins] == _openpi_state_bins(raw, stats["q01"], stats["q99"])
+
+
+def test_pi05_process_prompt_rejects_state_wider_than_norm_stats():
+    model = _model_with_stats(_TINY_STATS)
+    with pytest.raises(ValueError, match="robot_state has 4 values"):
+        model.process_prompt(
+            "pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.0] * 4,
+        )
+
+
+def test_pi05_postprocess_unnormalizes_the_dims_the_action_stats_cover():
+    import numpy as np
+
+    model = _model_with_stats(_TINY_STATS)
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim) * 2 - 1
+    out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+    q01 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q01"])
+    q99 = np.asarray(_TINY_STATS["norm_stats"]["actions"]["q99"])
+    a = actions.numpy().astype(np.float64)
+    np.testing.assert_allclose(out[:, :2], (a[:, :2] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
+
+
+def test_pi05_without_norm_stats_bins_state_and_returns_actions_as_given():
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    model.process_prompt("pick up the cup", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.5, -0.25])
+    assert model.tokenizer.last_prompt == "Task: pick up the cup, State: 192 96;\nAction: "
+    actions = torch.rand(model.config.action_horizon, model.config.action_dim)
+    assert model.postprocess(actions, modality="action") == actions.numpy().tobytes()
+
+
+def test_pi05_norm_stats_come_from_model_kwargs(tmp_path):
+    """The serving config's model_kwargs reach Pi05Config and are parsed at startup."""
+    import json
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_TINY_STATS))
+    model = Pi05Model("unused", skip_weight_loading=True, norm_stats=str(path))
+    assert model.norm_stats.state.q01.tolist() == [-0.8, -2.7, 0.0]
+    with pytest.raises(FileNotFoundError):
+        Pi05Model("unused", skip_weight_loading=True, norm_stats=str(tmp_path / "missing.json"))
+
+
+def _openpi_padded(stats: dict, width: int = 32) -> dict:
+    """openpi's norm_stats.json pads every entry to the model width with zeros."""
+    pad = lambda v: list(v) + [0.0] * (width - len(v))  # noqa: E731
+    return {"norm_stats": {k: {q: pad(v[q]) for q in ("q01", "q99")} for k, v in stats.items()}}
+
+
+def test_norm_stats_file_padded_like_openpi_covers_only_the_robot_dims(tmp_path):
+    """openpi's own norm_stats.json has q01 == q99 == 0 past the robot's dims, so a
+    32-value padded state is refused as it is with the inline stats, and the reply's
+    padding dims pass through either way."""
+    import json
+
+    import numpy as np
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    inline = {k: {q: v[q] for q in ("q01", "q99")} for k, v in _TINY_STATS["norm_stats"].items()}
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps(_openpi_padded(inline)))
+    from_file, from_inline = load_norm_stats(str(path)), load_norm_stats(inline)
+    for a, b in ((from_file.state, from_inline.state), (from_file.actions, from_inline.actions)):
+        assert torch.equal(a.q01, b.q01) and torch.equal(a.q99, b.q99)
+
+    for spec in (str(path), inline):
+        model = _model_with_stats(spec)
+        with pytest.raises(ValueError, match="robot_state has 32 values"):
+            model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.1] * 32)
+        model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.1, -1.0, 0.5])
+        bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+        assert len(bins) == 3
+        actions = torch.rand(model.config.action_horizon, model.config.action_dim) * 2 - 1
+        out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+        np.testing.assert_array_equal(out[:, 2:], actions.numpy()[:, 2:])
+
+
+def test_norm_stats_file_with_no_robot_dims_is_refused(tmp_path):
+    import json
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": {"state": {"q01": [0.0, 0.0], "q99": [0.0, 0.0]}}}))
+    with pytest.raises(ValueError, match="q01 equals q99 in every dim"):
+        load_norm_stats(str(path))
+
+
+def test_inline_norm_stats_keep_a_joint_whose_q01_equals_q99(tmp_path):
+    """Only an openpi norm_stats.json is trimmed. Inline stats are the robot's own, so a
+    last joint with q01 == q99 still counts: the full state is not a 400, and that
+    joint's action goes through the stats."""
+    import json
+
+    import numpy as np
+
+    from mstar.model.pi05.components.normalization import load_norm_stats
+
+    stats = {"state": {"q01": [-1.0, 0.5], "q99": [1.0, 0.5]}, "actions": {"q01": [-0.5, 0.25], "q99": [0.5, 0.25]}}
+    inline = load_norm_stats(stats)
+    assert inline.state.q01.numel() == inline.actions.q01.numel() == 2
+    model = _model_with_stats(stats)
+    model.process_prompt("pick", ["image", "text"], ["action"], tensors=_ONE_IMAGE, robot_state=[0.0, 0.5])
+    bins = model.tokenizer.last_prompt.split("State: ", 1)[1].split(";", 1)[0].split()
+    assert [int(b) for b in bins] == _openpi_state_bins([0.0, 0.5], [-1.0, 0.5], [1.0, 0.5])
+    actions = torch.zeros(model.config.action_horizon, model.config.action_dim)
+    out = np.frombuffer(model.postprocess(actions, modality="action"), dtype=np.float32).reshape(actions.shape)
+    np.testing.assert_allclose(out[:, 1], 0.25, atol=1e-6)  # through the stats, not passed through as 0
+
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": stats}))
+    assert load_norm_stats(str(path)).state.q01.numel() == 1  # in a file it is openpi's padding
+
+
+def test_load_pi05_config_takes_the_action_horizon_from_lerobot_chunk_size():
+    from mstar.model.pi05.config import load_pi05_config
+
+    # the scalar keys of lerobot/pi05_droid's config.json that touch the action chunk
+    cfg = load_pi05_config({"type": "pi05", "chunk_size": 15, "n_action_steps": 15, "max_action_dim": 32,
+                            "max_state_dim": 32, "num_inference_steps": 10, "dtype": "float32"})
+    assert (cfg.action_horizon, cfg.action_dim, cfg.num_flow_steps) == (15, 32, 10)
+    assert load_pi05_config({"chunk_size": 50}).action_horizon == 50
+
+
+def _unloaded_model(model_path_hf: str, overrides: dict) -> Pi05Model:
+    model = object.__new__(Pi05Model)
+    model.model_path_hf, model.cache_dir, model.skip_weight_loading = model_path_hf, None, False
+    model._yaml_config_overrides = dict(overrides)
+    return model
+
+
+def test_pi05_droid_yaml_takes_its_horizon_from_the_checkpoint_config(tmp_path, monkeypatch):
+    """configs/pi05_droid.yaml sets no action_horizon: lerobot/pi05_droid's config.json
+    says chunk_size 15, and a config.json that cannot be read stops the server rather
+    than leaving it on the default 50 steps."""
+    import json
+
+    import huggingface_hub
+    import yaml
+
+    kwargs = yaml.safe_load((Path(CONFIG_PATH).parent / "pi05_droid.yaml").read_text())["model_kwargs"]
+    assert "action_horizon" not in kwargs
+    repo = kwargs.pop("model_path_hf")
+    config_json = tmp_path / "config.json"
+    config_json.write_text(json.dumps({"type": "pi05", "chunk_size": 15, "n_action_steps": 15}))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda repo_id, filename, cache_dir=None: str(config_json))
+    cfg = _unloaded_model(repo, kwargs)._load_config()
+    assert (cfg.action_horizon, cfg.num_cameras) == (15, 2)
+
+    def offline(repo_id, filename, cache_dir=None):
+        raise OSError("not in the cache")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
+    with pytest.raises(RuntimeError, match="config.json of lerobot/pi05_droid"):
+        _unloaded_model(repo, kwargs)._load_config()
+
+
+@pytest.mark.parametrize("num_images", [1, 2, 3])
+def test_pi05_kv_layout_counts_the_cameras_the_request_sent(num_images):
+    """The ViT drops the tokens of empty camera slots, so the prefix the KV layout
+    declares holds 256 image tokens per camera the request sent."""
+    from mstar.model.pi05.config import LLM_KV
+
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    out = model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 4, 4)] * num_images},
+    )
+    image_span, text_span = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    assert (image_span.length, image_span.advance) == (num_images * 256, num_images * 256)
+    assert text_span.length == 1
+
+
+def test_pi05_refuses_a_request_without_images():
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="at least one camera image"):
+        model.process_prompt(prompt="pick", input_modalities=["text"], output_modalities=["action"], tensors={})
 
 
 # ----------------------------------------------------------------------
@@ -416,3 +856,49 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
+
+
+@pytest.mark.parametrize("policy_saved", [False, True])
+def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy_saved):
+    """lerobot/pi05_droid is a saved PI05Policy: every key sits under ``model.`` and
+    PaliGemma's input embedding is stored next to the lm_head it is tied to.
+    It must load the same way as lerobot/pi05_base, which has neither."""
+    from safetensors.torch import save_file
+
+    lm_head = torch.randn(8, 4)
+    base = {
+        "paligemma_with_expert.paligemma.lm_head.weight": lm_head,
+        "paligemma_with_expert.paligemma.model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 4),
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.weight": torch.randn(4),
+        "paligemma_with_expert.gemma_expert.model.norm.dense.weight": torch.randn(4),
+        "action_in_proj.weight": torch.randn(4, 2),
+        "time_mlp_in.bias": torch.randn(4),
+    }
+    saved = dict(base)
+    if policy_saved:
+        saved = {"model." + k: v for k, v in base.items()}
+        saved["model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = lm_head.clone()
+    save_file(saved, str(tmp_path / "model.safetensors"))
+
+    model = Pi05Model.__new__(Pi05Model)  # bypass __init__: no config or tokenizer download
+    model._repo_dir = tmp_path
+    model._lerobot_flat = None
+    flat = model._ensure_lerobot_flat()
+
+    assert flat.keys() == base.keys()
+    assert all(torch.equal(flat[k], v) for k, v in base.items())
+    assert model._lerobot_remap("paligemma_with_expert.paligemma.lm_head.weight") == "embed_tokens.weight"
+    assert model._lerobot_remap("time_mlp_in.bias") == "time_mlp.linear_in.bias"
+
+
+def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
+    import yaml
+
+    cfg = yaml.safe_load(Path(CONFIG_PATH).with_name("pi05_droid.yaml").read_text())
+    model = Pi05Model(skip_weight_loading=True, **cfg["model_kwargs"])
+    assert model.model_path_hf == "lerobot/pi05_droid"
+    # the 15-step horizon comes from the checkpoint's config.json, which dummy mode skips
+    assert model.config.num_cameras == 2
+    # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
+    assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
+    assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8

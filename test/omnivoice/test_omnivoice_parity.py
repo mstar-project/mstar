@@ -46,21 +46,17 @@ import os
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.omnivoice.components.backbone import CanvasItem, build_packed_canvas
 from mstar.model.omnivoice.components.text import build_prefix
-from mstar.model.omnivoice.components.unmask import (
-    apply_reveal,
-    build_reveal_schedule,
-    predict_tokens_with_scoring,
-)
+from mstar.model.omnivoice.components.unmask import build_reveal_schedule, filter_top_k, unmask_step
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
     UNMASK_LOOP_NAME,
     OmniVoiceBackboneSubmodule,
 )
-from mstar.model.submodule_base import NodeInputs
 
 MODEL_PATH = os.environ.get("OMNIVOICE_PATH", "k2-fsa/OmniVoice")
 NUM_CODEBOOK = 8
@@ -96,6 +92,18 @@ def _item(prefix_len: int, target_len: int, guidance_scale: float = 2.0):
 # ---------------------------------------------------------------------------
 # packing
 # ---------------------------------------------------------------------------
+
+
+def _slice_logits(canvas, logits: torch.Tensor, item: CanvasItem) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """One item's conditional and unconditional target logits, read from the canvas
+    layout: every item's conditional block, then the unconditional blocks of the items
+    with CFG on (``None`` for an item without)."""
+    start, length = item.flat_start, item.target_len
+    c_logits = logits[:, :, start : start + length, :]
+    if item.flat_u_start < 0:
+        return c_logits, None
+    u_start = canvas.flat_target_total + item.flat_u_start
+    return c_logits, logits[:, :, u_start : u_start + length, :]
 
 
 def test_packed_layout_doc_boundaries():
@@ -142,8 +150,8 @@ def test_cfg_off_drops_the_unconditional_document():
     logits = torch.randn(
         1, NUM_CODEBOOK, mixed.flat_target_total + mixed.flat_uncond_total, 1025
     )
-    c_x, u_x = mixed.slice_logits(logits, mixed.items[0])
-    c_y, u_y = mixed.slice_logits(logits, mixed.items[1])
+    c_x, u_x = _slice_logits(mixed, logits, mixed.items[0])
+    c_y, u_y = _slice_logits(mixed, logits, mixed.items[1])
     assert c_x.shape[2] == 20 and u_x is not None and u_x.shape[2] == 20
     assert c_y.shape[2] == 30 and u_y is None
 
@@ -196,50 +204,125 @@ def test_reveal_schedule_covers_the_canvas():
             assert sum(schedule) == target_len * NUM_CODEBOOK
 
 
+def _reveal_all(canvas, logits, generator=None, class_temperature=0.0, count=None):
+    """One ``unmask_step`` over a one-item canvas, revealing ``count`` cells (all by default)."""
+    assert len(canvas.items) == 1
+    item = canvas.items[0]
+    count = NUM_CODEBOOK * item.target_len if count is None else count
+    return unmask_step(
+        logits, [item.tokens[0]], canvas.uncond_rows(), [count], [generator],
+        [item.guidance_scale], [class_temperature], [0.1], [1.0], MASK_ID,
+    )
+
+
 def test_mask_class_is_never_predicted():
     item = _item(prefix_len=10, target_len=6)
     canvas = build_packed_canvas([item], torch.device("cpu"))
     logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
-    c_logits, u_logits = canvas.slice_logits(logits, item)
-    assert c_logits.shape == (1, NUM_CODEBOOK, 6, 1025)
-
-    pred, _ = predict_tokens_with_scoring(
-        c_logits, u_logits, MASK_ID, guidance_scale=2.0, class_temperature=0.0
-    )
-    assert (pred != MASK_ID).all()
+    logits[..., MASK_ID] += 100.0  # the MASK class would win every cell's argmax
+    assert (_reveal_all(canvas, logits) != MASK_ID).all()
 
 
 def test_sampling_is_reproducible_under_a_seed():
-    """Same seed, same draw; different seed, different draw.
-
-    Both stochastic paths are covered: the token choice inside
-    ``predict_tokens_with_scoring`` and the reveal order in ``apply_reveal``.
-    """
+    """Same seed, same draw; different seed, different draw: the token
+    choice and the reveal order both come from the request's generator."""
     item = _item(prefix_len=10, target_len=6)
     canvas = build_packed_canvas([item], torch.device("cpu"))
     logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
-    c_logits, u_logits = canvas.slice_logits(logits, item)
 
     def draw(seed):
-        gen = torch.Generator().manual_seed(seed)
-        pred, scores = predict_tokens_with_scoring(
-            c_logits, u_logits, MASK_ID, guidance_scale=2.0,
-            class_temperature=1.0, generator=gen,
-        )
-        tokens = torch.full((1, NUM_CODEBOOK, 6), MASK_ID, dtype=torch.long)
-        revealed = apply_reveal(
-            tokens=tokens, pred_tokens=pred, scores=scores, reveal_count=5,
-            audio_mask_id=MASK_ID, layer_penalty_factor=0.1,
-            position_temperature=1.0, generator=gen,
-        )
-        return pred.clone(), revealed.clone()
+        return _reveal_all(canvas, logits, torch.Generator().manual_seed(seed), class_temperature=1.0, count=5)
 
-    pred_a, rev_a = draw(1234)
-    pred_b, rev_b = draw(1234)
-    pred_c, rev_c = draw(5678)
-    assert torch.equal(pred_a, pred_b)
-    assert torch.equal(rev_a, rev_b)
-    assert not (torch.equal(pred_a, pred_c) and torch.equal(rev_a, rev_c))
+    assert torch.equal(draw(1234), draw(1234))
+    assert not torch.equal(draw(1234), draw(5678))
+
+
+# ---------------------------------------------------------------------------
+# the reference's per-request scoring and reveal: the oracle for ``unmask_step``
+# ---------------------------------------------------------------------------
+
+
+def _gumbel(logits, temperature, generator=None):
+    """``logits / temperature`` plus Gumbel noise; the caller takes the argmax."""
+    scaled_logits = logits / temperature
+    u = torch.rand(scaled_logits.shape, dtype=scaled_logits.dtype, device=scaled_logits.device, generator=generator)
+    gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
+    return scaled_logits + gumbel_noise
+
+
+def _predict(c_logits, u_logits, guidance_scale, class_temperature, generator=None):
+    """The reference's ``_predict_tokens_with_scoring`` for one request:
+    ``(pred_tokens, scores)``, each ``[1, C, T]``."""
+    if guidance_scale != 0:
+        c_log_probs = F.log_softmax(c_logits, dim=-1)
+        u_log_probs = F.log_softmax(u_logits, dim=-1)
+        log_probs = torch.log_softmax(c_log_probs + guidance_scale * (c_log_probs - u_log_probs), dim=-1)
+    else:
+        log_probs = F.log_softmax(c_logits, dim=-1)
+    log_probs[..., MASK_ID] = -float("inf")
+    if class_temperature > 0.0:
+        pred_tokens = _gumbel(filter_top_k(log_probs, ratio=0.1), class_temperature, generator).argmax(dim=-1)
+    else:
+        pred_tokens = log_probs.argmax(dim=-1)
+    return pred_tokens, log_probs.max(dim=-1)[0]
+
+
+def _reveal(tokens, pred_tokens, scores, reveal_count, layer_penalty_factor, position_temperature, generator=None):
+    """The reference's reveal for one request: its ``reveal_count`` best
+    masked cells of ``tokens`` (``[1, C, T]``), written in place."""
+    if reveal_count <= 0:
+        return tokens
+    layer_ids = torch.arange(tokens.shape[1], device=tokens.device).view(1, -1, 1)
+    scores = scores - (layer_ids * layer_penalty_factor)
+    if position_temperature > 0.0:
+        scores = _gumbel(scores, position_temperature, generator)
+    scores = scores.masked_fill(tokens != MASK_ID, -float("inf"))
+    _, topk_idx = torch.topk(scores.flatten(), reveal_count)
+    flat_tokens = tokens.flatten()
+    flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+    tokens.copy_(flat_tokens.view_as(tokens))
+    return tokens
+
+
+@pytest.mark.parametrize("guidance", [(2.0, 2.0, 2.0), (2.0, 0.0, 3.0)])
+@pytest.mark.parametrize("class_temperature", [0.0, 1.0, (0.0, 1.0, 0.0)])
+def test_batched_unmask_step_matches_the_per_request_reveal(guidance, class_temperature):
+    """``unmask_step`` over a step's requests is the reference's scoring and
+    reveal per request (``_predict``, ``_reveal``), with each request's own
+    generator, cell for cell; also with CFG off for one request, and with
+    sampled tokens, for every request or only some."""
+    temperatures = class_temperature if isinstance(class_temperature, tuple) else (class_temperature,) * 3
+    gen = torch.Generator().manual_seed(0)
+    items = [_item(prefix_len=4, target_len=n, guidance_scale=g) for n, g in zip((9, 5, 12), guidance, strict=True)]
+    for item, done in zip(items, (0, 7, 30), strict=True):
+        cells = torch.randperm(NUM_CODEBOOK * item.target_len, generator=gen)[:done]
+        item.tokens.view(-1)[cells] = torch.randint(0, MASK_ID, (done,), generator=gen)
+    canvas = build_packed_canvas(items, torch.device("cpu"))
+    rows = canvas.flat_target_total + canvas.flat_uncond_total
+    logits = torch.randn(1, NUM_CODEBOOK, rows, MASK_ID + 1, generator=gen).half()
+    counts = [4, 0, 11]
+
+    def gens():
+        return [torch.Generator().manual_seed(100 + i) for i in range(len(items))]
+
+    want = []
+    for item, count, temperature, g in zip(items, counts, temperatures, gens(), strict=True):
+        c_logits, u_logits = _slice_logits(canvas, logits, item)
+        u_logits = c_logits if u_logits is None else u_logits
+        pred, scores = _predict(c_logits.float(), u_logits.float(), item.guidance_scale, temperature, g)
+        want.append(_reveal(
+            item.tokens.clone(), pred, scores, count, layer_penalty_factor=5.0, position_temperature=5.0, generator=g,
+        )[0])
+    before = [item.tokens.clone() for item in items]
+    got = unmask_step(
+        logits, [item.tokens[0] for item in items], canvas.uncond_rows(),
+        counts, gens(), [item.guidance_scale for item in items], list(temperatures), [5.0] * 3, [5.0] * 3,
+        MASK_ID,
+    )
+    assert torch.equal(got, torch.cat(want, dim=-1))
+    assert all(torch.equal(item.tokens, b) for item, b in zip(items, before, strict=True)), (
+        "the step wrote its input canvas"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -442,22 +525,19 @@ def _run_ours(backbone, config, specs, num_step=None):
             num_step=num_step, t_shift=GREEDY["t_shift"],
         ))
 
+    knobs = [[GREEDY[name]] * len(items) for name in (
+        "guidance_scale", "class_temperature", "layer_penalty_factor", "position_temperature",
+    )]
     for k in range(num_step):
         canvas = build_packed_canvas(items, torch.device("cuda"))
-        logits = _packed_logits(backbone, canvas).to(torch.float32)
-        for item, schedule in zip(items, schedules, strict=True):
-            c_logits, u_logits = canvas.slice_logits(logits, item)
-            pred, scores = predict_tokens_with_scoring(
-                c_logits, u_logits, config.audio_mask_id,
-                guidance_scale=GREEDY["guidance_scale"],
-                class_temperature=GREEDY["class_temperature"],
-            )
-            apply_reveal(
-                tokens=item.tokens, pred_tokens=pred, scores=scores,
-                reveal_count=schedule[k], audio_mask_id=config.audio_mask_id,
-                layer_penalty_factor=GREEDY["layer_penalty_factor"],
-                position_temperature=GREEDY["position_temperature"],
-            )
+        # the served step: one batched scoring and reveal over the packed logits
+        tokens = unmask_step(
+            _packed_logits(backbone, canvas), [item.tokens[0] for item in items],
+            canvas.uncond_rows(),
+            [schedule[k] for schedule in schedules], [None] * len(items), *knobs, config.audio_mask_id,
+        )
+        for item in items:
+            item.tokens = tokens[:, item.flat_start:item.flat_start + item.target_len].unsqueeze(0)
     return [item.tokens[0].cpu() for item in items]
 
 
@@ -485,7 +565,7 @@ def _step0_logits(backbone, config, specs, which=0):
         ))
     canvas = build_packed_canvas(items, torch.device("cuda"))
     logits = _packed_logits(backbone, canvas).to(torch.float32)
-    return canvas.slice_logits(logits, items[which])
+    return _slice_logits(canvas, logits, items[which])
 
 
 def _run_reference(model, specs, num_step=None):
@@ -638,7 +718,7 @@ def test_dense_agreement():
 
 
 # ---------------------------------------------------------------------------
-# preprocess / postprocess split
+# the unmask step
 # ---------------------------------------------------------------------------
 
 
@@ -652,85 +732,46 @@ def _fwd_info(request_id: str, iter_idx: int):
     return info
 
 
-def test_postprocess_reveals_without_touching_the_loop_edge():
-    """``postprocess`` owns the reveal, and the edge it reads stays intact.
+def test_unmask_step_reveals_without_touching_the_loop_edge():
+    """The forward reveals into a new canvas, and the edge it reads stays intact.
 
-    The canvas the engine routes in is the previous iteration's output edge.
-    ``apply_reveal`` writes in place, so the write has to land on a copy; if it
-    did not, the engine's own copy of that step's state would change under it.
+    The canvas the engine routes in is the previous iteration's output edge;
+    if the step wrote it in place, the engine's own copy of that step's state
+    would change under it.
     """
+    from types import SimpleNamespace
+
     target_len, vocab = 16, MASK_ID + 1
     sub = OmniVoiceBackboneSubmodule(backbone=None, config=OmniVoiceConfig())
+    sub.get_device = lambda: torch.device("cpu")
     edge = torch.full((NUM_CODEBOOK, target_len), MASK_ID, dtype=torch.long)
+    info = _fwd_info("a", 1)
+    info.step_metadata["target_len"] = target_len
+    row = sub.prepare_inputs("unmask", info, {
+        "prefix_ids": [torch.zeros(NUM_CODEBOOK, 3, dtype=torch.long)],
+        "prefix_audio_mask": [torch.zeros(3, dtype=torch.bool)],
+        "audio_tokens": [edge],
+        "step_index": [torch.ones(1, dtype=torch.int64)],
+    })
+    engine_inputs = SimpleNamespace(request_ids=[0], per_request_info={0: info})
+    pre = sub.preprocess("unmask", engine_inputs, [row])
 
     # Logits that make the argmax a fixed, non-mask token everywhere.
-    logits = torch.zeros(NUM_CODEBOOK, target_len, vocab)
+    logits = torch.zeros(1, NUM_CODEBOOK, len(pre["canvas"].tgt_index), vocab)
     logits[..., 7] = 10.0
-    outputs = {"c_logits": [logits], "u_logits": [logits.clone()]}
-    inputs = NodeInputs(tensor_inputs={
-        "audio_tokens": edge,
-        "step_index": torch.zeros(1, dtype=torch.int64),
-    }, kwargs={"step": 0})
+    sub._logits = lambda _inputs, _canvas: logits
+    outputs = sub.forward_batched("unmask", engine_inputs, **pre)[0]
 
-    sub.postprocess("a", _fwd_info("a", 0), outputs, inputs)
-
-    assert bool((edge == MASK_ID).all()), "postprocess wrote through the input edge"
-    assert "c_logits" not in outputs and "u_logits" not in outputs
+    assert bool((edge == MASK_ID).all()), "the unmask step wrote through the input edge"
     tokens = outputs["audio_tokens"][0]
     assert tokens.shape == (NUM_CODEBOOK, target_len)
-    assert int(outputs["step_index"][0].reshape(-1)[0]) == 1
+    assert int(outputs["step_index"][0].reshape(-1)[0]) == 2
+    assert set(tokens[tokens != MASK_ID].tolist()) == {7}
 
     revealed = int((tokens != MASK_ID).sum())
     expected = build_reveal_schedule(
         target_len=target_len, num_codebook=NUM_CODEBOOK,
         num_step=GREEDY["num_step"], t_shift=GREEDY["t_shift"],
-    )[0]
+    )[1]
     assert revealed == expected, f"revealed {revealed}, schedule says {expected}"
 
-
-def test_batched_step_reaches_postprocess_by_worker_handle():
-    """A packed step's outputs are keyed by the engine's row ids, which are
-    worker-local handles, not the request ids ``prepare_inputs`` sees on the
-    wire: the engine looks each row up by handle, and a row it can't find
-    fails the request."""
-    from types import SimpleNamespace
-
-    from mstar.engine.engine import Engine
-
-    cfg = OmniVoiceConfig()
-    sub = OmniVoiceBackboneSubmodule(backbone=None, config=cfg)
-    sub.get_device = lambda: torch.device("cpu")
-    handles, target_lens = [3, 7], [6, 4]
-    infos, rows = {}, []
-    for handle, wire_id, target_len in zip(handles, ["req-a", "req-b"], target_lens, strict=True):
-        info = _fwd_info(wire_id, 0)
-        info.rid_handle = handle
-        info.step_metadata["target_len"] = target_len
-        infos[handle] = info
-        rows.append(sub.prepare_inputs("speech_gen", info, {
-            "prefix_ids": [torch.zeros(cfg.num_audio_codebook, 5, dtype=torch.long)],
-            "prefix_audio_mask": [torch.zeros(5, dtype=torch.bool)],
-        }))
-
-    engine_inputs = SimpleNamespace(request_ids=handles)
-    pre = sub.preprocess("speech_gen", engine_inputs, rows)
-    width = pre["canvas"].flat_target_total + pre["canvas"].flat_uncond_total
-    # the layer stack needs weights; what is under test is the keying around it
-    sub._logits = lambda _inputs, _canvas: torch.randn(
-        1, cfg.num_audio_codebook, width, cfg.audio_vocab_size,
-    )
-    outputs = sub.forward_batched("speech_gen", engine_inputs, **pre)
-
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"backbone": SimpleNamespace(submodule=sub, piecewise_runners={})}
-    failures = {}
-    batch = SimpleNamespace(
-        node_name="backbone", request_ids=handles, inputs=rows,
-        per_request_info_wrapped=infos, failed_requests=failures,
-        register_failure=failures.__setitem__,
-    )
-    engine._postprocess_batch(batch, outputs)
-
-    assert failures == {}
-    for handle, target_len in zip(handles, target_lens, strict=True):
-        assert outputs[handle]["audio_tokens"][0].shape == (cfg.num_audio_codebook, target_len)

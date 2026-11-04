@@ -20,7 +20,7 @@ class _Runner:
         self.lease_before_step = lease_before_step
         self._accepts = accepts
 
-    def can_lease(self, inputs):
+    def can_lease(self, inputs, request_ids):
         return self._accepts
 
     def lease_slot(self, bs, total_tokens):
@@ -28,6 +28,7 @@ class _Runner:
 
 
 class _Ctx:
+    request_ids = ()
     slot_lease = None
     piecewise_leases = None
 
@@ -54,10 +55,10 @@ def test_nothing_leased_leaves_the_context_alone():
 
 def test_runner_defers_to_the_configs_predicate():
     def runner(predicate):
-        return SimpleNamespace(_config=SimpleNamespace(can_lease=predicate))
+        return SimpleNamespace(_config=SimpleNamespace(can_lease=predicate, one_row_per_step=False))
 
-    assert PiecewiseAcceleratorGraphRunner.can_lease(runner(None), [])
-    assert not PiecewiseAcceleratorGraphRunner.can_lease(runner(lambda inputs: len(inputs) < 2), [1, 2])
+    assert PiecewiseAcceleratorGraphRunner.can_lease(runner(None), [], ())
+    assert not PiecewiseAcceleratorGraphRunner.can_lease(runner(lambda inputs: len(inputs) < 2), [1, 2], ())
 
 
 def _packed_runner(one_row):
@@ -72,6 +73,7 @@ def _packed_runner(one_row):
         replay_seq_lens=lambda shape, seq_lens, real_bs: list(seq_lens),
     )
     runner._label, runner._current_slot, runner._capture_batch_sizes = "region", 0, sizes
+    runner._lora_keys = ()
     runner._graphs = {
         PiecewiseGraphKey(bs=bs, seq_len=256, slot=0): SimpleNamespace(
             bucket=(bs, 256), shape=SimpleNamespace(bs=bs), dummy_rids=list(range(bs)),

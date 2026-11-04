@@ -16,6 +16,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedPrefillWrapper,
     padded_head_dim,
 )
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
@@ -56,7 +57,7 @@ def test_accelerator_graph_flag_adapts_to_flashinfer_api(monkeypatch, wrapper_ty
     native = Mock(return_value=SimpleNamespace(plan=Mock()))
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(**{native_name: native}))
     wrapper = wrapper_type(
-        workspace_buffer=torch.empty(8, dtype=torch.uint8),
+        workspace_buffer=Workspace(torch.empty(8, dtype=torch.uint8), "test"),
         num_qo_heads=2, num_kv_heads=2, head_dim=64,
         device=torch.device("cpu"), accelerator_graph=True, **options,
     )
@@ -77,7 +78,7 @@ def test_decode_plan_stages_pinned_indices_only_for_graphs(
     )
     monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: pinned_indices)
     wrapper = FlashInferDecodeWrapper(
-        workspace_buffer=torch.empty(8, dtype=torch.uint8),
+        workspace_buffer=Workspace(torch.empty(8, dtype=torch.uint8), "test"),
         num_qo_heads=2, num_kv_heads=2, head_dim=64, page_size=16,
         batch_size=2, max_num_pages=4, device=torch.device("cpu"),
         accelerator_graph=accelerator_graph,
@@ -107,8 +108,8 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
         BatchPrefillWithPagedKVCacheWrapper=prefill,
     ))
     mixed = FlashInferMixedWrapper(
-        decode_workspace=torch.empty(8, dtype=torch.uint8),
-        prefill_workspace=torch.empty(8, dtype=torch.uint8),
+        decode_workspace=Workspace(torch.empty(8, dtype=torch.uint8), "test"),
+        prefill_workspace=Workspace(torch.empty(8, dtype=torch.uint8), "test"),
         num_qo_heads=2, num_kv_heads=2, head_dim=64, page_size=16,
         batch_size=8, max_total_tokens=64, max_num_pages=32, max_prefill_rows=2,
         device=torch.device("cpu"), use_tensor_cores=tensor_cores,
