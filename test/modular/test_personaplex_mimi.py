@@ -289,3 +289,85 @@ def test_mimi_matches_offline_interleaved_streaming(reference):
     codec = _codec(reference)
     assert torch.equal(codec.encode(run["audio"]), run["codes"])
     torch.testing.assert_close(codec.decode(run["agent_codes"]), run["pcm"], rtol=1e-6, atol=1e-6)
+
+
+# ------------------------------------------------------------------ incremental decode
+
+
+def _stream_codes(frames, rows=1, seed=0):
+    return torch.randint(0, 64, (rows, 8, frames), generator=torch.Generator().manual_seed(seed))
+
+
+def _decoder(reference):
+    from mstar.model.personaplex.components.mimi_stream import IncrementalMimiDecoder
+
+    codec = _codec(reference)
+    return codec, IncrementalMimiDecoder(codec).eval()
+
+
+# The ramp the stream uses, then its 25-frame blocks: past 125 frames the ring mask matters.
+RAMP = [4, 8, 16] + [25] * 6
+
+
+@torch.no_grad()
+def test_incremental_decode_equals_the_whole_track_past_the_ring(reference):
+    codec, decoder = _decoder(reference)
+    codes = _stream_codes(sum(RAMP))
+    want = codec.decode(codes)
+    state, pieces, start = decoder.fresh_state(1), [], 0
+    for size in RAMP:
+        pcm, state = decoder(codes[..., start : start + size], state, torch.tensor([size]))
+        pieces.append(pcm)
+        start += size
+    torch.testing.assert_close(torch.cat(pieces, -1), want, rtol=0, atol=2e-6)
+    assert int(state["steps"]) == sum(RAMP) * mimi_mod.MIMI_STEPS_PER_FRAME
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("sizes", [[1] * 12, [5, 7], [12], [3, 1, 8]])
+def test_incremental_decode_does_not_depend_on_the_grouping(reference, sizes):
+    codec, decoder = _decoder(reference)
+    codes = _stream_codes(sum(sizes), seed=1)
+    state, pieces, start = decoder.fresh_state(1), [], 0
+    for size in sizes:
+        pcm, state = decoder(codes[..., start : start + size], state, torch.tensor([size]))
+        pieces.append(pcm)
+        start += size
+    torch.testing.assert_close(torch.cat(pieces, -1), codec.decode(codes), rtol=0, atol=2e-6)
+
+
+@pytest.mark.parametrize("steps", [0, 2, 40, 248, 250, 252, 300, 1000])
+def test_incremental_visibility_is_the_reference_ring(reference, steps):
+    """Exact: on the tiny weights a ring off by one key stays under any audio tolerance."""
+    _, decoder = _decoder(reference)
+    width = 50
+    _, got = decoder.visibility(torch.tensor([[steps]]), width)
+    ring = mimi_mod.ring_attention_mask(steps + width, dtype=torch.float32)[0, 0] == 0
+    # the reference's rows for this chunk, over the keys the state holds; older ones are out of the ring
+    first = steps - decoder.cache
+    want = ring[steps:, max(first, 0) :]
+    if first < 0:
+        want = torch.cat([torch.zeros(width, -first, dtype=torch.bool), want], 1)
+    assert torch.equal(got[0, 0], want)
+    assert not ring[steps:, : max(first, 0)].any(), "no row reaches past what the state holds"
+
+
+@torch.no_grad()
+def test_incremental_rows_of_different_length_and_history_share_a_decode(reference):
+    """A row padded on the right gets its own audio and state, as if it ran alone."""
+    _, decoder = _decoder(reference)
+    first, second = _stream_codes(6, seed=2), _stream_codes(10, seed=3)
+    alone = {}
+    _, primed = decoder(first, decoder.fresh_state(1), torch.tensor([6]))  # row 0 has history, row 1 is fresh
+    next_first = _stream_codes(3, seed=4)
+    alone["first"], want_first = decoder(next_first, primed, torch.tensor([3]))
+    alone["second"], want_second = decoder(second, decoder.fresh_state(1), torch.tensor([10]))
+
+    state = {name: torch.cat([primed[name], block]) for name, block in decoder.fresh_state(1).items()}
+    padded = torch.cat([torch.nn.functional.pad(next_first, (0, 7)), second])
+    pcm, new = decoder(padded, state, torch.tensor([3, 10]))
+    torch.testing.assert_close(pcm[0:1, :, : 3 * 1920], alone["first"], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(pcm[1:2], alone["second"], rtol=1e-5, atol=1e-5)
+    for name, block in new.items():
+        torch.testing.assert_close(block[0:1], want_first[name], rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(block[1:2], want_second[name], rtol=1e-5, atol=1e-5)
