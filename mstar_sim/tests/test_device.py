@@ -151,6 +151,16 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             torch.nn.functional.embedding((ids - 50).clamp_(0, 49), table)  # a TP vocab shard's clamp
             torch.where(ids > 20, torch.arange(2, device="cuda").expand(2, 2), -1)  # an expanded operand
         g3.replay()
+        # capture runs nothing: an index that is out of range only before an in-place clamp
+        # is fine, and an op whose output shape depends on values is refused, as on CUDA
+        table_ids, wide = torch.arange(50, device="cuda"), torch.tensor([200, 10], device="cuda")
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            table_ids[(wide - 50).clamp_(0, 49)]
+            try:
+                torch.nonzero(ids)
+                raise SystemExit("nonzero was captured")
+            except RuntimeError as e:
+                assert "capturing" in str(e)
         g4, bad = torch.cuda.CUDAGraph(), torch.tensor([1, 2], device="cuda")
         with torch.cuda.graph(g4):
             torch.nn.functional.embedding(bad + 0, table)

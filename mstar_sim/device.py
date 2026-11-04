@@ -816,9 +816,11 @@ def _fast(func, args, kwargs, flat, index):
         raw = meta_call(func, uargs, ukwargs, tensors)
     else:
         if clock.capturing() is not None and func not in _VIEWS and func not in _UNINITIALIZED:
-            raw = _captured_values(func, uargs, ukwargs)
-        else:
-            raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
+            # captured: deferred to the replays per aten op, and priced there
+            with _Observe(torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None):
+                raw = func(*uargs, **ukwargs)
+            return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
+        raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
             uncomputed()
@@ -938,38 +940,45 @@ def _function_body(func, args, kwargs):
 # ---------------------------------------------------------------- graph replay
 
 
-def _written(func, args, kwargs) -> list[torch.Tensor]:
-    """The tensor operands ``func``'s schema marks as written (``self`` of an in-place op, an
-    ``out=``): only these can change, and a read-only operand may be an expanded view that
-    can't be written back (``j.expand(rows, k)``)."""
-    schema = getattr(func, "_schema", None)
-    if schema is None:  # a torch function, not an aten op: every operand that a write can reach
-        flat = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
-        return [t for t in flat if 0 not in t.stride() or t.numel() <= 1]
-    out = []
-    for i, arg in enumerate(schema.arguments):
-        if arg.alias_info is None or not arg.alias_info.is_write:
-            continue
-        value = kwargs.get(arg.name) if arg.kwarg_only or i >= len(args) else args[i]
-        out += [t for t in tree_flatten(value)[0] if isinstance(t, torch.Tensor)]
-    return out
-
-
 def _captured_values(func, args, kwargs):
-    """An op over values the emulator keeps, met while capturing: as on CUDA,
-    capture runs nothing (its arguments keep their values, its outputs are the
-    graph's buffers), and each replay runs it in place."""
-    inputs = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
-    saved = [(t, t.clone()) for t in _written(func, args, kwargs) if t.device.type == "cpu"]
-    out = func(*args, **kwargs)  # for the outputs' buffers
-    for t, before in saved:
-        t.copy_(before)
-    ids = {id(t) for t in inputs}
+    """An aten op over values the emulator keeps, met while capturing. As on CUDA, capture
+    runs nothing: its new outputs are graph buffers, shaped on meta, and each replay runs it
+    (into them, or in place). An in-place metadata op (``unsqueeze_``, ``set_``) changes
+    shapes once, at capture. An op whose output shape depends on the values (``nonzero``, a
+    mask index) is refused, as CUDA refuses the host sync it needs."""
+    if torch.Tag.inplace_view in func.tags:
+        return func(*args, **kwargs)
+    real = {}
+
+    def shaped(x):
+        if not isinstance(x, torch.Tensor) or x.device.type != "cpu":
+            return x
+        m = torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device=META)
+        real[id(m)] = x
+        return m
+
+    try:
+        out = func(*tree_map(shaped, args), **tree_map(shaped, kwargs))
+    except (NotImplementedError, RuntimeError) as e:
+        if not isinstance(e, NotImplementedError) and torch.Tag.dynamic_output_shape not in func.tags:
+            raise
+        raise gpu_error(RuntimeError(
+            "CUDA error: operation not permitted when stream is capturing (mstar_sim: "
+            f"{func.overloadpacket.__name__}'s output shape depends on its input values)")) from None
+
+    def buffer(m):
+        if not isinstance(m, torch.Tensor):
+            return m
+        if id(m) in real:
+            return real[id(m)]
+        return torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
+
+    out = tree_map(buffer, out)
 
     def rerun():
         fresh = func(*args, **kwargs)
-        for dst, src in zip(tree_flatten(out)[0], tree_flatten(fresh)[0], strict=False):
-            if isinstance(dst, torch.Tensor) and id(dst) not in ids and dst is not src:
+        for dst, src in zip(tree_flatten(out)[0], tree_flatten(fresh)[0], strict=True):
+            if isinstance(dst, torch.Tensor) and dst is not src:
                 dst.copy_(src)
 
     clock.on_replay(rerun)
