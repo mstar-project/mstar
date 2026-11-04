@@ -2,10 +2,10 @@ import tomllib
 from pathlib import Path
 
 # A checkout's rust/, beside its mstar/ package. An installed wheel has none.
-_CHECKOUT_RUST = Path(__file__).resolve().parents[3] / "rust"
+CHECKOUT_RUST = Path(__file__).resolve().parents[3] / "rust"
 
 
-def require_rust_extension(rust_dir: Path = _CHECKOUT_RUST) -> None:
+def require_rust_extension(rust_dir: Path = CHECKOUT_RUST) -> None:
     """Raise, saying how to get it, if the ``mstar_rust`` extension is missing
     or, in a checkout, was built from other sources than ``rust_dir``.
 
@@ -21,7 +21,7 @@ def require_rust_extension(rust_dir: Path = _CHECKOUT_RUST) -> None:
             "checkout, build it with `maturin develop --release -m rust/Cargo.toml` "
             "(see docs/installation.rst)."
         ) from e
-    if not _is_mstar_rust_crate(rust_dir):
+    if not is_mstar_rust_crate(rust_dir):
         return
     # Content, not mtimes: a branch switch or stash pop that rewrites a file
     # unchanged leaves the build valid.
@@ -42,7 +42,8 @@ def require_rust_extension(rust_dir: Path = _CHECKOUT_RUST) -> None:
     )
 
 
-def _is_mstar_rust_crate(rust_dir: Path) -> bool:
+def is_mstar_rust_crate(rust_dir: Path) -> bool:
+    """Whether ``rust_dir`` is this project's crate, i.e. ``mstar`` runs from a checkout."""
     try:
         with open(rust_dir / "Cargo.toml", "rb") as f:
             return tomllib.load(f).get("lib", {}).get("name") == "mstar_rust"

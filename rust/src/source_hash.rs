@@ -1,6 +1,7 @@
-// The content hash a checkout compares its mstar_rust build with. build.rs
-// `include!`s this file to embed it as BUILD_SOURCE_HASH, and the extension
-// exposes the same function as `source_hash`, so there is one implementation.
+// The content hash a checkout compares its mstar_rust and mstar-server builds
+// with. build.rs and server/build.rs `include!` this file to embed it, and the
+// extension exposes the same function as `source_hash`, so there is one
+// implementation.
 // Changing it is changing a hashed source, so a build made with older hashing
 // code is refused like any other stale build. (No `//!` here: `include!`
 // cannot take inner attributes.)

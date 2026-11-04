@@ -2932,6 +2932,11 @@ def main(argv: list[str] | None = None):
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
         )
+    if args.rust_frontend:
+        from mstar.api_server.rust_frontend import find_server_binary
+
+        # Before anything loads, so a missing or stale binary fails fast.
+        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3027,7 +3032,6 @@ def main(argv: list[str] | None = None):
 
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
-                find_server_binary,
                 launch_rust_server,
             )
 
@@ -3036,7 +3040,7 @@ def main(argv: list[str] | None = None):
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
-                find_server_binary(args.rust_frontend_bin), model_name,
+                rust_frontend_bin, model_name,
                 args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)

@@ -25,3 +25,8 @@ pub mod tensors;
 
 #[cfg(feature = "python")]
 pub use bindings::PyZmqCommunicator;
+
+/// The content hash of the sources this crate was built from (build.rs):
+/// the extension's BUILD_SOURCE_HASH, and the half of rust/server's that
+/// describes the library it links.
+pub const BUILD_SOURCE_HASH: &str = env!("MSTAR_RUST_SOURCE_HASH");

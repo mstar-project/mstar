@@ -320,7 +320,7 @@ fn source_hash(rust_dir: std::path::PathBuf) -> PyResult<String> {
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // What a checkout compares with source_hash over its own rust/.
-    m.add("BUILD_SOURCE_HASH", env!("MSTAR_RUST_SOURCE_HASH"))?;
+    m.add("BUILD_SOURCE_HASH", crate::BUILD_SOURCE_HASH)?;
     m.add_function(wrap_pyfunction!(source_hash, m)?)?;
     m.add_class::<PyZmqCommunicator>()?;
     m.add_class::<PyShmArena>()?;
