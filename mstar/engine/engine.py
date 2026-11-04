@@ -3133,15 +3133,15 @@ class Engine:
             default=Residency.RESIDENT,
         )
 
-    def drop_request(self, node_name: str, request_id: int) -> int:
+    def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
         """Discard the request's state on this node that can be recomputed from
-        its token ids, and return the pages freed."""
+        the ``tokens`` token ids its rebuild writes, and return the pages freed."""
         resources = self._submodules[node_name].resources.values()
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
         for resource in resources:
-            resource.check_drop(request_id)
-        return sum(resource.drop(request_id) for resource in resources)
+            resource.check_drop(request_id, tokens)
+        return sum(resource.drop(request_id, tokens) for resource in resources)
 
     def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> FullAdmitOutcome:
         """Tell each of the node's resources what the dropped request's rebuild row writes, and return the first

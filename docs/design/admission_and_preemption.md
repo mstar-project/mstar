@@ -178,10 +178,11 @@ Lifecycle:
 
 ```python
 class KVManager:
-    def drop(self, rid: str) -> int:
+    def drop(self, rid: str, tokens: int) -> int:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
-        evictable pages. Needs no host pool."""
+        evictable pages. Needs no host pool. tokens is what rid's rebuild
+        writes from its kept ids."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
@@ -195,6 +196,7 @@ A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
 - one not yet decoding
 - one with a host copy
 - one with a step, a KV read or a sample in flight, until that lands
+- one whose rebuild would write other than the tokens its KV holds
 
 At a drop, the other resources:
 

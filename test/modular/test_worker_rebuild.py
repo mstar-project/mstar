@@ -57,7 +57,7 @@ def _cleanup(node, rids, wgs):
 def _worker():
     eng = SimpleNamespace(dropped=[], landed=[], released=[])
     eng.residency = lambda _, rid: Residency.DROPPED if rid in eng.dropped else Residency.RESIDENT
-    eng.drop_request = lambda _, rid: eng.dropped.append(rid)
+    eng.drop_request = lambda _, rid, tokens: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     eng.release_chunk_inputs = lambda rid, node: eng.released.append(rid)
     eng.release_cached_prefix = lambda batch: None

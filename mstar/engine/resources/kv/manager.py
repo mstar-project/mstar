@@ -3542,7 +3542,7 @@ class KVManager(AttentionResource):
             return Residency.DROPPED
         return Residency.ON_HOST if self.is_offloaded(rid) else Residency.RESIDENT
 
-    def check_drop(self, rid: str) -> None:
+    def check_drop(self, rid: str, tokens: int) -> None:
         if self._world_size > 1:
             raise RuntimeError(
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
@@ -3564,18 +3564,26 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: {rid} writes more than one label, span or growth loop, which one rebuild "
                     "row can't lay out again"
                 )
+            held = self._laid_out_tokens(rid)
+            if laid_out and held != tokens:
+                raise RuntimeError(
+                    f"KV {self.name}: {rid}'s rebuild would write {tokens} tokens, but its label holds {held}"
+                )
 
-    def drop(self, rid: str) -> int:
+    def _laid_out_tokens(self, rid: str) -> int:
+        # `check_drop` allows at most one laid-out label
+        laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+        return sum(self._streams[rid][label].stored_len for label in laid_out)
+
+    def drop(self, rid: str, tokens: int) -> int:
         """Take ``rid``'s KV off the device without a host copy, and return the
         number of pages freed. Pages the index also holds stay cached, where they
         can be evicted, and the rest go back to the free list."""
         with self._lock:
-            self.check_drop(rid)
+            self.check_drop(rid, tokens)
             # under the lock, so no other step allocates between the two counts
             free = self._arena.num_free
-            # `check_drop` allows at most one laid-out label
-            laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
-            held = sum(self._streams[rid][label].stored_len for label in laid_out)
+            held = self._laid_out_tokens(rid)
             self.reset_request(rid, free=True)
             self._dropped[rid] = held
             return self._arena.num_free - free

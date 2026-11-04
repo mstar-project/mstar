@@ -1241,7 +1241,9 @@ class Worker:
             raise RuntimeError(
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step or a backlog on {node_name}"
             )
-        return self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        return self.engine_manager.get_engine(node_name).drop_request(
+            node_name, request_id, self._rebuilds.tokens(request_id, node_name),
+        )
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK

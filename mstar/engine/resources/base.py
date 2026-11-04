@@ -469,13 +469,13 @@ class Resource(ResidentHooks, ABC):
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
 
-    def check_drop(self, rid: str) -> None:
-        """Raise if ``drop`` would refuse ``rid``. Changes nothing."""
+    def check_drop(self, rid: str, tokens: int) -> None:
+        """Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""
         return
 
-    def drop(self, rid: str) -> int:
-        """Discard the request's state that can be recomputed from its token
-        ids, and keep the rest. Returns what was reclaimed."""
+    def drop(self, rid: str, tokens: int) -> int:
+        """Discard the request's state that can be recomputed from the ``tokens``
+        token ids its rebuild writes, and keep the rest. Returns what was reclaimed."""
         return 0
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> AdmitOutcome:
