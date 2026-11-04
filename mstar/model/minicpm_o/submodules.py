@@ -299,6 +299,12 @@ class LLMSubmodule(ARNodeSubmodule):
         if not request_info.step_metadata.get("audio_output", False):
             outputs.pop("tts_ids")
             outputs.pop("tts_hidden")
+            return
+        # The decode loop accumulates the spoken reply's rows until it ends. A row
+        # is a view of the batch's outputs, which would keep every row of every
+        # step alive with it.
+        for name in ("tts_ids", "tts_hidden"):
+            outputs[name] = [t.clone() for t in outputs[name]]
 
 
 class VisionEncoderSubmodule(NodeSubmodule):
