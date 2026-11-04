@@ -273,6 +273,25 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
     assert kv.residency("r") is Residency.DROPPED, "r neither dropped itself nor left v alone"
 
 
+def test_a_request_whose_kept_ids_dont_rebuild_its_kv_waits_rather_than_dropping_itself():
+    """v keeps no ids, so only r could move, and r's kept ids rebuild a token less than its KV holds. Dropping
+    itself, r would fail its own drop in the move."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w._rebuilds._kept[NODE] = {"r": _kept(5 * PAGE_SIZE - 1)}
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("r") is Residency.RESIDENT and _queue(kv) == ["r"], "r dropped itself with ids short of its KV"
+
+
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     """A dropped request asks again at its drop, so its next readiness check parks it in the queue. Once the pool
     admits it, the check starts its rebuild, and the rebuild's landing lets it run. A second path that readmitted
