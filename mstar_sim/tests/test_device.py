@@ -316,6 +316,38 @@ def test_fast_mode_skips_device_time_but_keeps_host_semantics():
     assert out.strip() == "ok"
 
 
+def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
+    """``--skipped-in``: the tests a plain CPU run's junit report skipped, in a class or in
+    a module skipped at collection, and none it ran."""
+    pkg = tmp_path / "test" / "a"
+    pkg.mkdir(parents=True)
+    (pkg / "test_classes.py").write_text(textwrap.dedent("""
+        import os, pytest
+        gpu = pytest.mark.skipif(bool(os.environ.get("PLAIN")), reason="needs a GPU")
+        class TestC:
+            @gpu
+            def test_skipped(self): pass
+            def test_ran(self): pass
+    """))
+    (pkg / "test_module.py").write_text(textwrap.dedent("""
+        import os, pytest
+        if os.environ.get("PLAIN"):
+            pytest.skip("needs a GPU", allow_module_level=True)
+        def test_one(): pass
+    """))
+
+    def pytest_run(*args, **env):
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp_path,
+                              env=dict(os.environ, PYTHONPATH=ROOT, **env), capture_output=True, text=True,
+                              check=False)
+        return proc.stdout
+
+    pytest_run("--junitxml=plain.xml", "test", PLAIN="1")
+    out = pytest_run("-p", "mstar_sim.pytest_plugin", "--skipped-in=plain.xml", "--collect-only", "-q", "test")
+    selected = {line for line in out.splitlines() if "::" in line}
+    assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_module.py::test_one"}, out
+
+
 def test_every_cuda_seam_mstar_reaches_is_emulated():
     """The contract with mstar: every CUDA entry point, kernel-library name, ctypes
     library and torch.ops namespace mstar's source reaches is a stand-in, or is

@@ -192,22 +192,28 @@ def _needs_gpu(item) -> bool:
     return False
 
 
-def _skipped_in(path: str) -> set[str]:
+def _skipped_in(path: str) -> set[tuple[str, ...]]:
+    """The tests a junit report skipped, as junitxml names them (``(classname, name)``);
+    a module skipped at collection is one case named by its module (``("", module)``)."""
     import xml.etree.ElementTree as ET
 
-    out = set()
-    for case in ET.parse(path).iter("testcase"):
-        if case.find("skipped") is not None:
-            module = case.get("classname", "").replace(".", "/")
-            out.add(f"{module}.py::{case.get('name')}")
-    return out
+    return {(case.get("classname", ""), case.get("name")) for case in ET.parse(path).iter("testcase")
+            if case.find("skipped") is not None}
+
+
+def _junit_names(item) -> set[tuple[str, ...]]:
+    """The junit names that skip ``item``: its own case, and its module's."""
+    from _pytest.junitxml import mangle_test_address
+
+    names = mangle_test_address(item.nodeid)
+    return {(".".join(names[:-1]), names[-1]), ("", names[0])}
 
 
 def pytest_collection_modifyitems(config, items):
     skipped_in = config.getoption("--skipped-in")
     if skipped_in:
         names = _skipped_in(skipped_in)
-        kept = [item for item in items if item.nodeid in names or _checks_gpu(item)]
+        kept = [item for item in items if _junit_names(item) & names or _checks_gpu(item)]
     elif config.getoption("--gpu-only"):
         kept = [item for item in items if _needs_gpu(item)]
     else:
