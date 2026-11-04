@@ -556,7 +556,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     side = torch.cuda.Stream()
     pool = HostPool(1 << 25, torch.device("cuda"))
     # the pool's copies run on ``side``, so a busy ``side`` holds them back
-    pool._stream = side
+    pool._stream = pool._in_stream = side
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool)
     rows = 1 << 22
     # room for the prompt's one id and the copy

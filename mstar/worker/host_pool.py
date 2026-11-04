@@ -35,7 +35,8 @@ class HostCopy(NamedTuple):
 
 class HostPool:
     """``nbytes`` of host memory allocated once, pinned where ``device`` takes pinned memory, and handed out
-    first fit. Copies run on a stream of the pool's own, so they never wait behind a later step."""
+    first fit. Copies run on streams of the pool's own, one each way, so a copy never waits behind a later step, and a
+    copy back to the device never waits behind copies to the host."""
 
     def __init__(self, nbytes: int, device: torch.device) -> None:
         self.device = device
@@ -43,6 +44,7 @@ class HostPool:
         # sorted by offset, with no two adjacent
         self._free = [HostSlice(0, nbytes)]
         self._stream: torch.Stream | None = None
+        self._in_stream: torch.Stream | None = None
 
     def take(self, nbytes: int) -> HostSlice | None:
         size = aligned(nbytes)
@@ -72,16 +74,16 @@ class HostPool:
         return self._memory[into.offset:into.offset + nbytes].view(dtype).view(shape)
 
     def copy_in(self, view: torch.Tensor) -> tuple[torch.Tensor, torch.Event | None]:
-        """Copy ``view``, a tensor in the pool, to the device on the pool's stream, and return the copy with the event
-        recorded once it lands. Where the device is the host, return ``view`` as it is and no event."""
+        """Copy ``view``, a tensor in the pool whose copy from the device has landed, to the device, and return the copy
+        with the event recorded once it lands. Where the device is the host, return ``view`` as it is and no event."""
         if self.device.type == "cpu":
             return view, None
-        if self._stream is None:
-            self._stream = torch.Stream(device=self.device)
-        with self._stream:
+        if self._in_stream is None:
+            self._in_stream = torch.Stream(device=self.device)
+        with self._in_stream:
             copy = view.to(self.device, non_blocking=True)
         ready = torch.Event(device=self.device)
-        ready.record(self._stream)
+        ready.record(self._in_stream)
         return copy, ready
 
     def copy_out(self, src: torch.Tensor, into: HostSlice, after: torch.Event | None) -> HostCopy:
