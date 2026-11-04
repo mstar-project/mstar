@@ -124,8 +124,8 @@ class Residency(IntEnum):
 
 
 class Rebuild(NamedTuple):
-    """What a dropped request's rebuild writes past its prompt: the ids it ``sampled`` since, but the newest,
-    which the next decode step reads."""
+    """What a dropped request's rebuild writes past its layout: the ids it ``sampled`` since the layout was laid out,
+    but the newest, which the next decode step reads."""
     sampled: Sequence[int]
 
 

@@ -61,11 +61,13 @@ class RowRecord:
 @dataclass(slots=True)
 class KeptIds:
     """A request's log on one node: the rows of its layout's prefill steps, a record of each step that has run, in
-    order, and each id sampled once the last has. ``used`` counts the bytes of its slice the records take."""
+    order, and each id sampled once the last has. ``used`` counts the bytes of its slice the records take, and
+    ``laid_out`` the samples its KV's layout already holds, which its last rebuild wrote."""
     rows: tuple[LayoutRow, ...]
     records: list[RowRecord] = field(default_factory=list)
     sampled: array = field(default_factory=lambda: array("i"))
     used: int = 0
+    laid_out: int = 0
 
 
 class QueuedCopy(NamedTuple):
@@ -496,7 +498,10 @@ class Rebuilds:
             grown = len(kept.sampled) - 1
             rows[-1] = rows[-1]._replace(total=rows[-1].total + grown, length=rows[-1].length + grown)
         self._cursors[(node, rid)] = RebuildCursor(tuple(rows), kept.sampled)
-        return None if prefilling is not None else Rebuild(kept.sampled)
+        if prefilling is not None:
+            return None
+        rebuild, kept.laid_out = Rebuild(kept.sampled[kept.laid_out:]), len(kept.sampled) - 1
+        return rebuild
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors

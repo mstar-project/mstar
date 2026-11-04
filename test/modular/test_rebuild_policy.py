@@ -15,6 +15,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import test_kv_drop as kv_drop
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -814,6 +815,45 @@ def test_every_rebuild_row_runs_under_its_own_prefill_steps_metadata_and_reads_o
     assert image_info.graph_walk == VISION and image_info.step_metadata == {"prefill_order": ("image",)}
     assert rebuilds._pool.copied_in == 1 and image["text_inputs"][0].tolist() == [4, 5, 6], (
         "the samples would follow another step's text, or the image would stay on the host"
+    )
+
+
+def test_a_request_dropped_again_after_its_rebuild_is_laid_out_past_what_that_rebuild_wrote():
+    """A request back from a drop can be dropped again where its pool returns it preemptible. Its log holds every id
+    it sampled since its prompt, but its first rebuild had already laid out the ids sampled before it, and sending
+    them all again laid the label out past what it held. This branch returns a dropped request guaranteed, so the
+    test takes it out of that set to drive the second drop."""
+    kv, rebuilds = kv_drop._manager(), Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    prompt = list(range(20))
+    assert _ingest(rebuilds, R, (PrefixSpan(20, 20, PREFILL),))
+    rebuilds.record(_ran(PREFILL, {R: {"text_inputs": [torch.tensor(prompt)]}}))
+    sampled = rebuilds._kept[NODE][R].sampled
+    kv.ingest_request(R, kv_drop._config(prompt))
+    # the prefill's sample and two decode steps, then the drop and the rebuild
+    sampled.extend([100, 101, 102])
+    kv_drop._write(kv, R, 20, 1, 1)
+    kv.drop(R)
+    kv.prepare_rebuild(R, rebuilds.start(R, NODE, None))
+    rebuilds.land_chunk(R, NODE, None)
+    kv_drop._write(kv, R, 22)
+    kv.land_rebuild(R)
+    # two more decode steps, then the second drop
+    sampled.extend([103, 104])
+    kv_drop._write(kv, R, 1, 1)
+    kv._guaranteed.discard(R)
+    kv.drop(R)
+
+    kv.prepare_rebuild(R, rebuilds.start(R, NODE, None))
+
+    assert [(row.walk, row.total) for row in rebuilds.cursor(R, NODE).rows] == [(PREFILL, 24)], (
+        "the rebuild row would leave out the ids sampled before the first drop"
+    )
+    fresh = kv_drop._manager()
+    fresh.ingest_request("f", kv_drop._config(prompt + [100, 101, 102, 103]))
+    fresh._streams["f"]["main"].chain.extend([104], kv_drop.PAGE_SIZE)
+    rebuilt, want = kv._streams[R]["main"].chain, fresh._streams["f"]["main"].chain
+    assert (rebuilt.keys, rebuilt.unkeyed) == (want.keys, want.unkeyed), (
+        "the rebuilt pages would be filed under keys another request with these ids can't match"
     )
 
 
