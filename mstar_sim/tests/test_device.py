@@ -236,6 +236,7 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             table_ids[(wide - 50).clamp_(0, 49)]
             torch.rms_norm(torch.ones(2, 4, device="cuda", dtype=torch.bfloat16), (4,))  # casts inside
             torch._assert(wide.max() < 1000, "a check torch.compile leaves out of a capture on a GPU")
+            torch.nn.functional.one_hot(table_ids, 50)  # its range is the scatter's device assert
             # so are synchronous copies from host memory: a blocking H2D copy, a tensor from host data
             for sync in (lambda: torch.nonzero(ids), lambda: ids.copy_(torch.tensor([1, 2])),
                          lambda: torch.tensor([1, 2], device="cuda"), lambda: torch.tensor([1, 2]).cuda()):

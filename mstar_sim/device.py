@@ -492,9 +492,19 @@ def _istft(input, n_fft, hop_length=None, win_length=None, window=None, center=T
     return out
 
 
+def _one_hot(tensor, num_classes=-1):
+    """one_hot as CUDA runs it: ATen's CPU path reads the range on the host, CUDA's leaves it
+    to the scatter's device assert."""
+    if num_classes < 0:
+        refuse_while_capturing("one_hot reads its class count from the values")
+    with _Observe():
+        out = torch.zeros((*tensor.shape, num_classes), dtype=torch.long, device=tensor.device)
+        return out.scatter_(-1, tensor.unsqueeze(-1), 1)
+
+
 # composite functions that read device values on the host in their CPU/meta
 # decomposition: their output shapes, computed directly
-_COMPOSITE_STAND_INS = {torch.istft: _istft, T.istft: _istft}
+_COMPOSITE_STAND_INS = {torch.istft: _istft, T.istft: _istft, _F.one_hot: _one_hot}
 
 
 # CUDA autocast's cast policy (aten/src/ATen/autocast_mode.cpp), applied by hand:
@@ -790,7 +800,7 @@ def _run(func, args, kwargs, index, flat=None):
         # (stft's window, weight_norm's g): kept floats beside a value-less one join it
         uargs, ukwargs = _join(uargs, ukwargs, ints=False)
     standin = _COMPOSITE_STAND_INS.get(func)
-    if standin is not None and any(_is_meta(t) for t in tree_flatten((uargs, ukwargs))[0]):
+    if standin is not None and (clock.capturing() is not None or any(_is_meta(t) for t in shallow)):
         return _rewrap(standin(*uargs, **ukwargs), [x for x in flat if isinstance(x, torch.Tensor)], index)
     if torch.is_autocast_enabled("cuda") and func in _AUTOCAST_COMPOSITES:
         # CUDA autocast casts these as a whole, before they decompose (sdpa's dtype check)
