@@ -30,8 +30,10 @@ def _prefill_token_buckets(model_config: dict) -> Mapping:
             "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
             "per node and capture walk: prefill_token_buckets: {<node>: {<capture walk>: [...]}}"
         )
-    ladders = model_config.get("prefill_token_buckets") or {}
-    if not isinstance(ladders, Mapping):
+    ladders = model_config.get("prefill_token_buckets")
+    if ladders is None:
+        return {}
+    if not isinstance(ladders, Mapping) or not all(isinstance(v, Mapping) for v in ladders.values()):
         raise ValueError(
             f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
         )
@@ -285,6 +287,18 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        # the per-node settings read only the config: refuse a bad one before any weights load
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        ladders = _prefill_token_buckets(model_config)
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (
+            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
+            ("prefill_token_buckets", ladders),
+        ):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
@@ -339,17 +353,6 @@ class EngineManager:
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
         )
-        budgets = model_config.get("max_batch_tokens") or {}
-        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        ladders = _prefill_token_buckets(model_config)
-        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        for key, setting in (
-            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
-            ("prefill_token_buckets", ladders),
-        ):
-            unknown = sorted(set(setting) - known)
-            if unknown:
-                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         engine.load_model(
             submodules,
             specs=specs,

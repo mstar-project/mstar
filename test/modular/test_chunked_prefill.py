@@ -787,13 +787,33 @@ def test_a_ladder_that_cannot_apply_is_refused(ladders, match):
     # the key's place before it moved, which every model's `**kwargs` would swallow
     ({"model_kwargs": {"prefill_token_buckets": [32, 64]}}, "moved to the top level"),
     ({"prefill_token_buckets": [32, 64]}, "node -> capture walk -> ladder"),
-    ({"prefill_token_buckets": 2048}, "node -> capture walk -> ladder"),
+    ({"prefill_token_buckets": {"LLM": []}}, "node -> capture walk -> ladder"),
 ])
-def test_a_serving_config_ladder_in_the_wrong_shape_or_place_is_refused(model_config, match):
-    from mstar.worker.engine_manager import _prefill_token_buckets
+def test_a_serving_config_ladder_in_the_wrong_shape_or_place_is_refused_before_loading(model_config, match):
+    """EngineManager.build refuses it from the config alone, before any node's weights load."""
+    import types
+
+    import torch
+
+    from mstar.distributed.communication import WorkerParallelGroups
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.worker.engine_manager import EngineManager
+
+    class Unloadable:
+        def get_submodule(self, *args, **kwargs):
+            raise AssertionError("loaded weights before checking the config")
+
+        def __getattr__(self, name):
+            raise AssertionError(f"read the model ({name}) before checking the config")
 
     with pytest.raises(ValueError, match=match):
-        _prefill_token_buckets(model_config)
+        EngineManager.build(
+            node_names={"LLM"}, device=torch.device("cpu"),
+            model_config={"node_groups": [{"node_names": ["LLM"], "ranks": [0]}], **model_config},
+            parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+            transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
+            model=Unloadable(), graph_runtime=types.SimpleNamespace(),
+        )
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────
