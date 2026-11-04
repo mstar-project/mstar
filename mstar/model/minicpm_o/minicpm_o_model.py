@@ -19,11 +19,12 @@ ported.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import Qwen2TokenizerFast, WhisperFeatureExtractor
+from transformers import Qwen2TokenizerFast
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
@@ -47,6 +48,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.minicpm_o import processor
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
@@ -140,7 +142,7 @@ class MiniCPMOModel(Model):
         tokenizer = Qwen2TokenizerFast.from_pretrained(self.local_dir)
         self.tokenizer = tokenizer
         # upstream's mel: Whisper's, as its own audio processor configures it
-        self._mel = WhisperFeatureExtractor(feature_size=self.config.audio.num_mel_bins)
+        self.log_mel = LogMelSpectrogram(num_mel_bins=self.config.audio.num_mel_bins)
         # A reply ends on <|im_end|> (the tokenizer's eos; config.json names
         # only that) or <|endoftext|>, as upstream's `chat` terminators; and
         # a spoken reply's text closes with <|tts_eos|> just before <|im_end|>,
@@ -336,7 +338,7 @@ class MiniCPMOModel(Model):
         if not any(p.text for p in parts if p.modality == TEXT) and not raw_images and not raw_audios:
             raise ValueError("MiniCPM-o got a request with no text and no attachments")
 
-        audios = [a.reshape(-1).float().cpu().numpy() for a in raw_audios]
+        audios = [a.reshape(-1).float().cpu() for a in raw_audios]
         text = self._render(
             parts, bool(audios),
             enable_thinking=enable_thinking,
@@ -368,18 +370,16 @@ class MiniCPMOModel(Model):
             result["image_positions"] = [image_positions]
 
         if audios:
-            mel = self._mel(
-                [piece for a in audios for piece in processor.audio_pieces(a)],
-                sampling_rate=processor.SAMPLE_RATE, padding="max_length",
-                return_attention_mask=True, return_tensors="pt",
-            )
+            all_pieces = [piece for a in audios for piece in processor.audio_pieces(a)]
+            # each piece padded to Whisper's 30 s window, then cut to its own frames
+            mel = self.log_mel(torch.stack([self.log_mel.pad_or_trim(piece) for piece in all_pieces]))
             # a piece shorter than one pooling step (a clip under ~0.1 s, or what
             # is left of a long one past its last 30 s cut) pools to no tokens
             lens = [
-                (i, n) for i, n in enumerate(mel["attention_mask"].sum(dim=1).tolist())
+                (i, n) for i, n in enumerate(math.ceil(len(piece) / HOP_LENGTH) for piece in all_pieces)
                 if self.config.audio.pooled_tokens(n) > 0
             ]
-            pieces = [mel["input_features"][i, :, :n] for i, n in lens]
+            pieces = [mel[i, :, :n] for i, n in lens]
             tokens = sum(self.config.audio.pooled_tokens(n) for _, n in lens)
             if audio_positions.numel() != tokens:
                 # upstream sizes the placeholder off the whole clip but encodes

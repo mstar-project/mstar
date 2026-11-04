@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE
 from mstar.model.minicpm_o.config import AudioConfig
 
 IMAGE_TAG = "<image>./</image>"
@@ -23,10 +24,8 @@ AUDIO_TAG = "<audio>./</audio>"
 # the 4.5 checkpoint's preprocessor_config.json
 SCALE_RESOLUTION = 448
 MAX_SLICE_NUMS = 9
-SAMPLE_RATE = 16000
 # upstream encodes a clip in pieces of at most this long
 MAX_AUDIO_SECONDS = 30
-_MEL_HOP = 160
 
 
 # ----------------------------------------------------------------------------
@@ -115,7 +114,7 @@ def slice_patches(image: Image.Image, patch_size: int) -> tuple[torch.Tensor, tu
 # ----------------------------------------------------------------------------
 
 
-def audio_pieces(audio: np.ndarray) -> list[np.ndarray]:
+def audio_pieces(audio: torch.Tensor) -> list[torch.Tensor]:
     """A clip cut into the pieces upstream encodes one by one."""
     step = MAX_AUDIO_SECONDS * SAMPLE_RATE
     return [audio[i:i + step] for i in range(0, len(audio), step)] or [audio]
@@ -123,7 +122,7 @@ def audio_pieces(audio: np.ndarray) -> list[np.ndarray]:
 
 def audio_placeholder(num_samples: int, audio: AudioConfig) -> str:
     """A clip's placeholder text, sized off the whole clip (not its pieces)."""
-    tokens = audio.pooled_tokens(math.ceil(num_samples / _MEL_HOP))
+    tokens = audio.pooled_tokens(math.ceil(num_samples / HOP_LENGTH))
     return "<|audio_start|>" + "<unk>" * tokens + "<|audio_end|>"
 
 
