@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -619,3 +620,48 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
     stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 10, False))
     assert stream.tolist() == [eos]
     assert _errors(caplog) == []
+
+
+# ── a verdict that never lands ──────────────────────────────────────────
+
+
+def _verdict_reader(monkeypatch, pending):
+    """A submodule whose eager mailbox never stages a verdict (step -1), as after a failed replay."""
+    from mstar.model.glm52 import submodules
+
+    monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2, raising=False)
+    sub = Glm52LLMSubmodule.__new__(Glm52LLMSubmodule)
+    sub.__dict__.update(
+        config=SimpleNamespace(mtp_num_draft_tokens=3), _mtp_pending=pending, _mtp_verdict={},
+        _mailboxes={None: (torch.zeros(4, 5, dtype=torch.long), torch.full((1,), -1, dtype=torch.long))})
+    return sub
+
+
+def _raised(fn, seconds=20.0):
+    """What ``fn`` raised, on a thread bounded at ``seconds``: a wait with no deadline fails here."""
+    out = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit is the point
+            out["exc"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "the verdict read is still waiting"
+    return out.get("exc")
+
+
+def test_a_verdict_that_never_lands_exits_the_process(monkeypatch):
+    """A step that failed after it was numbered: the plan thread's read exits the process at its
+    deadline instead of holding the worker forever."""
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0)})
+    exc = _raised(lambda: sub._read_verdicts(["a"]))
+    assert isinstance(exc, SystemExit) and "never staged" in str(exc)
+
+
+def test_a_read_across_two_steps_exits_the_process(monkeypatch):
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0), "b": (2, None, 1)})
+    assert isinstance(_raised(lambda: sub._read_verdicts(["a", "b"])), SystemExit)
