@@ -116,7 +116,9 @@ class Glm52Model(Model):
                 raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
             self.config.graph_compile = kwargs["graph_compile"]
         if prefill_token_buckets is not None:
-            self.config.prefill_token_buckets = [int(n) for n in prefill_token_buckets]
+            # as given: the submodule checks it as Qwen3.5's, and int() would read 64.5 as 64
+            # and "64" as [6, 4]
+            self.config.prefill_token_buckets = prefill_token_buckets
         for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
             if key in kwargs:
                 setattr(self.config, key, _capture_ladder(key, kwargs[key]))
