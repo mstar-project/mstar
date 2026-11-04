@@ -13,21 +13,14 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.linear_attn.config import (
-    LinearAttnConfig,
-    LinearAttnSpec,
-    LinearAttnVariant,
-)
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
+from mstar.engine.state import Array, Attend, Causal, CausalConv, Entry, GatedDeltaNet, KVEntry, Read, TensorType, Value
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -64,6 +57,7 @@ from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
+    CONV,
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
@@ -202,70 +196,44 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def _gdn_state_dtype(self) -> torch.dtype:
-        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones);
-        fp32 wherever the pool's decode kernels cannot take it.
-
-        ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
-        halves state traffic, but only FlashInfer's fused bf16 decode kernel
-        takes it, and that is K=V=128 only.
-        """
-        dtype = getattr(torch, self.config.mamba_ssm_dtype, None)
-        head_dims_ok = (
-            self.config.linear_key_head_dim == 128
-            and self.config.linear_value_head_dim == 128
+    def declare_state(self) -> list[Array]:
+        c = self.config
+        conv_dim = (
+            2 * c.linear_num_key_heads * c.linear_key_head_dim
+            + c.linear_num_value_heads * c.linear_value_head_dim
         )
-        if dtype is torch.bfloat16 and head_dims_ok:
-            return torch.bfloat16
-        return torch.float32
+        gdn = Entry({
+            "state": TensorType(
+                (c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim),
+                dtype=getattr(torch, c.mamba_ssm_dtype, torch.float32), shard=0,
+            ),
+            "conv": TensorType((conv_dim, c.linear_conv_kernel_dim - 1), dtype=None, shard=0),
+        })
+        return [
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=c.full_layer_indices,
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
+                max_len=c.max_position_embeddings,
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
+            ),
+            # written out because Qwen3.5 diverges silently without qk_l2norm
+            Value(
+                GDN_STATE, nodes={"LLM"}, layers=c.linear_layer_indices, entry=gdn,
+                updates={CONV: CausalConv(), LINEAR_ATTN: GatedDeltaNet(qk_l2norm=True)},
+            ),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {
+            ATTN: {"splits": (_MIXED_SPLIT,), "decode_fmha": True},
+            LINEAR_ATTN: {"splits": (_MIXED_SPLIT,)},
+        }
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        num_kv_layers = len(self.config.full_layer_indices)
-        num_gdn_layers = len(self.config.linear_layer_indices)
         return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=num_kv_layers,
-                    num_kv_heads=self.config.num_key_value_heads,
-                    head_dim=self.config.head_dim,
-                    max_seq_len=self.config.max_position_embeddings,
-                    num_qo_heads=self.config.num_attention_heads
-                )
-            ),
-            AttentionSpec(
-                resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE,
-                    splits=(_MIXED_SPLIT,),
-                    decode_fmha=True,
-                ),
-            ),
             PositionSpec(
                 resource_key=ROPE, nodes={"LLM"},
                 config=PositionConfig(kv_cache=KV_CACHE),
-            ),
-            RecurrentStateSpec(
-                resource_key=GDN_STATE, nodes={"LLM"},
-                config=RecurrentStateConfig(
-                    num_layers=num_gdn_layers,
-                    blocks=DeltaNetGeometry(
-                        num_k_heads=self.config.linear_num_key_heads,
-                        num_v_heads=self.config.linear_num_value_heads,
-                        head_k_dim=self.config.linear_key_head_dim,
-                        head_v_dim=self.config.linear_value_head_dim,
-                        conv_kernel_size=self.config.linear_conv_kernel_dim
-                    ).to_blocks(state_dtype=self._gdn_state_dtype()),
-                    kv_cache=KV_CACHE,
-                )
-            ),
-            LinearAttnSpec(
-                resource_key=LINEAR_ATTN, nodes={"LLM"},
-                config=LinearAttnConfig(
-                    recurrent_state=GDN_STATE,
-                    variant=LinearAttnVariant.GDN,
-                    splits=(_MIXED_SPLIT,),
-                ),
             ),
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"LLM"},
