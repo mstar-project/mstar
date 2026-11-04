@@ -1545,11 +1545,11 @@ the frame count, about 5 MiB in float32, in the <code class="docutils literal no
 pool. <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{codec_state:</span> <span class="pre">{max_slots:</span> <span class="pre">N}}</span></code> sizes it for N - 1
 streams (one slot is the pool’s sink); 256 streams by default. Each chunk
 width is a CUDA-graph bucket captured for batch sizes 1 to 32 (densely: the
-codec’s cost is per row, so a padding row costs as much as a real one); the
-scheduler batches each width apart, so a stream’s small first chunks are not
-padded to a full chunk’s width or queued behind a batch of them. A voice
-clone’s stream leads with the reference’s last 72 frames, decoded with the
-first chunk to warm the state on the voice and trimmed from its audio.
+codec’s cost is per row, so a padding row costs as much as a real one). A
+step takes ready chunks of any width and pads them to its widest, since a
+step of its own for each width costs more than the padding. A voice clone’s
+stream leads with the reference’s last 72 frames, decoded with the first
+chunk to warm the state on the voice and trimmed from its audio.
 The SnakeBeta activations run as one fused kernel. A deployment sets the
 ramp and the steady chunk with <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_chunk_schedule:</span> <span class="pre">[1,</span> <span class="pre">3,</span>
 <span class="pre">8,</span> <span class="pre">16],</span> <span class="pre">codec_chunk_frames:</span> <span class="pre">25}</span></code>. <code class="docutils literal notranslate"><span class="pre">configs/qwen3tts_1p7b.yaml</span></code> opens with
