@@ -7,11 +7,12 @@ live in a ring of 4 KB shared-memory pages; the host decides where each tile
 goes and before which task its TMA copies are issued, so a tile streams in
 while the CTA waits on earlier phases.
 
-Task types: projections (`linear.lin_task`), attention for one q head and 16
-rows (`attend.attend4`), and the per-row draw (`fused_draw.draw_row`) and
-embedding step. The kernel runs in clusters of two CTAs, and an O or DOWN
-tile's K loop is split across a cluster (`linear.split_task`), so the frame's
-outputs differ from `_depth_loop`'s in the last bits.
+Task types: projections (`linear.lin_task`), attention for one q head and 8
+rows (`attend.attend4`, 4 rows a call), and the per-row draw
+(`fused_draw.draw_row`) and embedding step. The kernel runs in clusters of two
+CTAs, and an O or DOWN tile's K loop is split across a cluster
+(`linear.split_task`), so the frame's outputs differ from `_depth_loop`'s in
+the last bits.
 
 Shapes are the 1.7B CodePredictor's: hidden 1024, 16 q / 8 kv heads of 128,
 intermediate 3072, vocab 2048, 5 layers, 16 positions; Talker width 2048.
@@ -24,11 +25,16 @@ from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 
 from mstar.engine.resources.sampler.fused_draw import draw_row
 from mstar.model.qwen3_tts.components.depth_frame import cluster as C
+from mstar.model.qwen3_tts.components.depth_frame import schedule
 from mstar.model.qwen3_tts.components.depth_frame.attend import attend4
 from mstar.model.qwen3_tts.components.depth_frame.linear import lin_task, split_task
 
-T_QKV, T_O, T_GATEUP, T_DOWN, T_ATTEND, T_INPROJ, T_HEAD, T_EMBED = range(8)
-ROW = 8  # packed task row, see `schedule.pack`
+# `schedule`'s task encoding, as constants a Gluon function can read
+T_QKV, T_O, T_GATEUP, T_DOWN, T_ATTEND, T_INPROJ, T_HEAD = (
+    gl.constexpr(t) for t in (schedule.T_QKV, schedule.T_O, schedule.T_GATEUP, schedule.T_DOWN, schedule.T_ATTEND,
+                              schedule.T_INPROJ, schedule.T_HEAD)
+)
+ROW = gl.constexpr(schedule.ROW)
 
 
 @gluon.jit
@@ -86,17 +92,17 @@ def _issue(e, bars, p16, wqkv_desc, wo_desc, wgu_desc, wd_desc, win_desc, whead_
     bar = bars.index((e >> 10) & 7)
     rank = (e >> 13) & 1
     row = e >> 16
-    if ty == 0:
+    if ty == T_QKV:
         _issue_tile(wqkv_desc, bar, p16, pg, row, 1, 8, 32, NPAGES, 0)
-    elif ty == 1:
+    elif ty == T_O:
         _issue_tile(wo_desc, bar, p16, pg, row, 1, 8, 16, NPAGES, rank * 8)
-    elif ty == 2:
+    elif ty == T_GATEUP:
         _issue_tile(wgu_desc, bar, p16, pg, row, 2, 4, 64, NPAGES, 0)
-    elif ty == 3:
+    elif ty == T_DOWN:
         _issue_tile(wd_desc, bar, p16, pg, row, 3, 4, 16, NPAGES, rank * 12)
-    elif ty == 5:
+    elif ty == T_INPROJ:
         _issue_tile(win_desc, bar, p16, pg, row, 2, 8, 16, NPAGES, 0)
-    else:
+    else:  # T_HEAD
         _issue_tile(whead_desc, bar, p16, pg, row, 1, 8, 16, NPAGES, 0)
 
 
@@ -176,7 +182,7 @@ def frame_kernel(
     C.cluster_init(C.smem_base(z1) + (OFF + 4096))
 
     n = gl.load(NTASKS + cta)
-    base = TASKS + cta * (MAXT * 8)
+    base = TASKS + cta * (MAXT * ROW)
     # task i's row (see `schedule.pack`) is loaded while task i - 1 runs
     c0 = gl.load(base)
     c1 = gl.load(base + 1)
@@ -186,7 +192,7 @@ def frame_kernel(
     xc = 0
     ncomb = 0  # split tiles this CTA has combined as rank 0: the combine mbarrier's phase
     for i in range(n):
-        nb = base + gl.minimum(i + 1, n - 1) * 8
+        nb = base + gl.minimum(i + 1, n - 1) * ROW
         n0 = gl.load(nb)
         n1 = gl.load(nb + 1)
         n2 = gl.load(nb + 2)
@@ -202,7 +208,7 @@ def frame_kernel(
         tile = (c0 >> 8) & 255
         pos = (c0 >> 16) & 15
         n_part = c0 >> 24
-        if ty == 4:
+        if ty == T_ATTEND:
             if pos > 0:
                 _prefetch_kv(KV + layer * s_kv_l, s_kv_b, s_kv_c, s_kv_n, s_kv_h, (tile % 8) * 8, (tile // 8) // 2, pos)
         _wait(CTRS + (c1 & 65535), c1 >> 16, 128)
@@ -210,15 +216,15 @@ def frame_kernel(
         wk = c2 >> 24
         wbar = bars.index(wk % TB)
         wph = (wk // TB) & 1
-        if ty == 0:
+        if ty == T_QKV:
             xc = lin_task(tile, 0, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, p32, p64, pg, wbar, wph,
                           QKV, X, P, M, 1024, 8, eps, n_part, 4096, 2, 0,
                           64, 64, 64, 32, 128, False, XSTAGES, NPAGES, MMA32, BLK_P, BLK_O32, BLK_1D)
-        elif ty == 2:
+        elif ty == T_GATEUP:
             xc = lin_task(tile, 0, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, p32, p64, pg, wbar, wph,
                           ACT, X, P, M, 1024, 8, eps, 64, 3072, 2, 2,
                           64, 64, 64, 32, 128, True, XSTAGES, NPAGES, MMA64, BLK_P, BLK_O32, BLK_1D)
-        elif ty == 4:
+        elif ty == T_ATTEND:
             # q head tile // 8, rows 8 * (tile % 8) ..
             h = tile // 8
             rb = (tile % 8) * 8
@@ -227,24 +233,24 @@ def frame_kernel(
                         s_kv_b, s_kv_c, s_kv_n, s_kv_h, ATT, 2048,
                         rb + 4 * r, h, M, pos, eps_q, eps_k, sm_scale,
                         16, 8, 128, 64, 16, L1, L3, K3, V3)
-        elif ty == 1:
+        elif ty == T_O:
             xc = split_task(tile, 1, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, pg, wbar, wph,
                             X, P, M, 8, OFF, ncomb & 1, 1024, 64, XSTAGES, NPAGES, MMA16, BLK_O16, BLK_1D)
             ncomb += 1 - tile % 2
-        elif ty == 3:
+        elif ty == T_DOWN:
             xc = split_task(tile, 2, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, pg, wbar, wph,
                             X, P, M, 12, OFF, ncomb & 1, 1024, 64, XSTAGES, NPAGES, MMA16, BLK_O16, BLK_1D)
             ncomb += 1 - tile % 2
-        elif ty == 5:
+        elif ty == T_INPROJ:
             xc = lin_task(tile, 3, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, p32, p64, pg, wbar, wph,
                           X, BIAS_IN, P, M, 2048, 16, eps, 0, 1024, 0, 3,
                           64, 64, 64, 16, 128, False, XSTAGES, NPAGES, MMA16, BLK_P, BLK_O16, BLK_1D)
-        elif ty == 6:
+        elif ty == T_HEAD:
             xc = lin_task(tile, 0, x_desc, att_desc, act_desc, hid_desc, x_s, xbar, xc, p16, p32, p64, pg, wbar, wph,
                           LOGITS, BIAS_IN, P, M, 1024, 8, eps, 64, 2048, 2, 0,
                           64, 64, 64, 16, 128, False, XSTAGES, NPAGES, MMA16, BLK_P, BLK_O16, BLK_1D)
         elif tile < M:
-            # row `tile`'s code for group `pos`: drawn here (SAMPLE, groups 1-15) or given, then its embedding
+            # T_EMBED: row `tile`'s code for group `pos`: drawn here (SAMPLE, groups 1-15) or given, then its embedding
             if SAMPLE:
                 if pos == 0:
                     tok = gl.load(CODES_IN + tile * s_codes_in)

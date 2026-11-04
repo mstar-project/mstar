@@ -26,12 +26,23 @@ class DepthFrame:
 
     def __init__(self, code_predictor, talker_table: torch.Tensor):
         cp, fused = code_predictor, code_predictor.fused
-        layers = len(fused.qkv)
-        hidden = fused.o[0].shape[0]
-        inter = fused.down[0].shape[1]
         attn = cp.model.layers[0].self_attn
+        layers, hidden, inter = len(fused.qkv), fused.o[0].shape[0], fused.down[0].shape[1]
         self.head_dim = attn.head_dim
         self.eps, self.eps_q, self.eps_k = fused.eps, attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon
+        self._stack_weights(cp, talker_table, layers, hidden, inter)
+        self._allocate_scratch(fused, attn, layers, hidden, inter)
+        self._schedule(torch.cuda.get_device_properties(self.X.device).multi_processor_count // 2 * 2, layers)
+        self.m16, self.bp, self.bo16, self.b1 = linear.layouts(16)
+        self.m32, _, self.bo32, _ = linear.layouts(32)
+        self.m64 = linear.layouts(64)[0]
+        self.attn_layouts = attend.layouts()
+        self._compiled: dict[bool, tuple] = {}
+        self._compile_sampled(talker_table.shape[1], attn, layers)
+
+    def _stack_weights(self, cp, talker_table: torch.Tensor, layers: int, hidden: int, inter: int) -> None:
+        """Each projection's weights for all layers in one matrix, and the TMA descriptors its tiles load through."""
+        fused = cp.fused
         # each 32-row GATEUP tile's gate rows then its up rows, so one task reads one 64-row tile
         gate_up = [torch.stack([g.view(inter // 32, 32, hidden), u.view(inter // 32, 32, hidden)], dim=1)
                    for g, u in zip(fused.gate, fused.up, strict=True)]
@@ -50,7 +61,7 @@ class DepthFrame:
         self.cemb = torch.stack([e.weight for e in cp.model.codec_embedding])
         self.tproj = torch.stack(cp.input_tables)
 
-        sl, sl4 = linear.shared_layout(), linear.shared_layout(4)
+        sl4 = linear.shared_layout(4)
 
         def tiles(w, rows, chunks):
             # [chunk, 64-column half, row, 64 columns]: one copy writes `chunks` chunks of `rows` rows (`_issue_tile`)
@@ -59,12 +70,16 @@ class DepthFrame:
 
         self.wd = [tiles(self.w["qkv"], 32, 8), tiles(self.w["o"], 16, 8), tiles(self.w["gu"], 64, 4),
                    tiles(self.w["down"], 16, 4), tiles(self.w["win"], 16, 8), tiles(self.w["head"], 16, 8)]
+
+    def _allocate_scratch(self, fused, attn, layers: int, hidden: int, inter: int) -> None:
+        """The activations tasks hand from phase to phase, and the KV cache, positions and partial sums of a frame."""
         dev, bf = self.w["qkv"].device, self.w["qkv"].dtype
         self.X = torch.zeros(MAX_ROWS, hidden, device=dev, dtype=bf)
         self.QKV = torch.zeros(MAX_ROWS, self.w["qkv"].shape[0] // layers, device=dev, dtype=bf)
         self.ATT = torch.zeros(MAX_ROWS, fused.o[0].shape[1], device=dev, dtype=bf)
         self.ACT = torch.zeros(MAX_ROWS, inter, device=dev, dtype=bf)
         self.LOGITS = torch.zeros(MAX_ROWS, fused.heads.shape[1], device=dev, dtype=bf)
+        sl = linear.shared_layout()
         self.xd = [TensorDescriptor.from_tensor(t, [MAX_ROWS, 128], sl) for t in (self.X, self.ATT, self.ACT)]
         # frame-local scratch the submodule hands back to `run`: every slot a frame reads, it wrote first
         self.kv_cache = torch.zeros(layers, MAX_ROWS, 2, GROUPS, attn.num_kv_heads, self.head_dim, device=dev, dtype=bf)
@@ -72,21 +87,19 @@ class DepthFrame:
             GROUPS, MAX_ROWS, 1).contiguous()
         self.partials = torch.zeros(MAX_ROWS, MAX_ROWS, device=dev, dtype=torch.float32)
         self.rope = attend.rope_table(GROUPS, float(attn.rope_theta), self.head_dim, dev)
-        self._schedule(torch.cuda.get_device_properties(dev).multi_processor_count // 2 * 2, layers)
-        self.m16, self.bp, self.bo16, self.b1 = linear.layouts(16)
-        self.m32, _, self.bo32, _ = linear.layouts(32)
-        self.m64 = linear.layouts(64)[0]
-        self.attn_layouts = attend.layouts()
-        self._compiled: dict[bool, tuple] = {}
-        # compiled here, before any graph capture, on tensors laid out as the submodule's
+
+    def _compile_sampled(self, talker_width: int, attn, layers: int) -> None:
+        """Compile the sampled kernel before any graph capture, on tensors laid out as the submodule's, and shrink the
+        grid if fewer clusters fit at once than the GPU has SM pairs."""
+        dev, bf = self.X.device, self.X.dtype
         z = lambda *shape, dtype=bf: torch.zeros(*shape, device=dev, dtype=dtype)  # noqa: E731
         codes, f32 = z(MAX_ROWS, dtype=torch.long), torch.float32
         draw = FusedDrawArgs(z(MAX_ROWS, dtype=f32), z(MAX_ROWS, dtype=torch.int32), z(MAX_ROWS, dtype=f32),
                              codes, codes)
-        tensors = (z(MAX_ROWS, talker_table.shape[1]), codes,
+        tensors = (z(MAX_ROWS, talker_width), codes,
                    z(layers, MAX_ROWS, 2, GROUPS, attn.num_kv_heads, self.head_dim),
                    z(GROUPS, MAX_ROWS, 1, dtype=torch.int32), z(MAX_ROWS, MAX_ROWS, dtype=f32),
-                   z(MAX_ROWS, GROUPS, dtype=torch.long), z(MAX_ROWS, talker_table.shape[1]), draw)
+                   z(MAX_ROWS, GROUPS, dtype=torch.long), z(MAX_ROWS, talker_width), draw)
         self._compiled[True] = self._compile(self._args(*tensors, MAX_ROWS, True))
         fit = self._clusters(self._compiled[True][0])
         if 2 * fit < self.grid:
