@@ -97,7 +97,11 @@ class Glm5NextModel(Model):
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
-            self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
+            k = int(kwargs["mtp_num_draft_tokens"])
+            if k < 0:
+                # the cache rows are max_seq_len * (k + 1): -1 divides by zero, less goes negative
+                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            self.config.mtp_num_draft_tokens = k
         if "prefill_graphs" in kwargs:
             self.config.prefill_graphs = bool(kwargs["prefill_graphs"])
         # overrides of the submodule's buckets, which **kwargs would otherwise swallow

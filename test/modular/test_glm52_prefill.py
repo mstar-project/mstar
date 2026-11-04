@@ -54,6 +54,20 @@ def test_a_bad_prefill_ladder_is_refused(buckets):
         _submodule(model.config)
 
 
+@pytest.mark.parametrize("kwargs", [
+    {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
+    {"prefill_capture_batch_sizes": []}, {"prefill_batched_token_buckets": [0, 256]},
+    {"prefill_batched_token_buckets": [256, 256]}, {"graph_compile": "false"},
+    {"mtp_num_draft_tokens": True}, {"mtp_num_draft_tokens": 2.5}, {"mtp_num_draft_tokens": 1023},
+])
+def test_a_bad_serving_knob_is_refused_at_load(kwargs):
+    """Each loaded before: the batch sizes failed the capture build (a ZeroDivisionError or an
+    IndexError), a 0-token bucket was captured, ``"false"`` compiled, and k=1023 refused every
+    prompt as longer than a negative limit."""
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        Glm52Model("", tokenizer_mode="byte", config_variant="reduced", **kwargs)
+
+
 def test_config_default_buckets_unchanged():
     assert Glm52ModelConfig().prefill_token_buckets is None
     assert Glm52ModelConfig().prefill_capture_batch_sizes is None
