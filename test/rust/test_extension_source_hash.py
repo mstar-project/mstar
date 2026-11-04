@@ -43,7 +43,8 @@ def test_sources_that_differ_from_the_build_are_refused(rust_copy):
     for p in _sources(rust_copy):
         os.utime(p, (1000, 1000))
     current = mstar_rust.source_hash(str(rust_copy))
-    rebuild = f"`maturin develop --release -m {rust_copy / 'Cargo.toml'}`"
+    rebuild = (f"`touch {rust_copy / 'build.rs'} && "
+               f"maturin develop --release -m {rust_copy / 'Cargo.toml'}`")
     with pytest.raises(ImportError, match=re.escape(rebuild)) as refusal:
         require_rust_extension(rust_copy)
     assert mstar_rust.BUILD_SOURCE_HASH in str(refusal.value)

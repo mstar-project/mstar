@@ -33,9 +33,12 @@ def require_rust_extension(rust_dir: Path = _CHECKOUT_RUST) -> None:
         if current == built:
             return
         problem = f"was built from sources hashing to {built}, but {rust_dir} hashes to {current}"
+    # The touch makes cargo rerun build.rs and so recompile the crate. Cargo
+    # goes by mtimes, so without it sources copied in with older ones (`cp -p`,
+    # `rsync -a`, tar) are not rebuilt and this repeats.
     raise ImportError(
         f"The mstar_rust build at {mstar_rust.__file__} {problem}. Rebuild it with "
-        f"`maturin develop --release -m {rust_dir / 'Cargo.toml'}`."
+        f"`touch {rust_dir / 'build.rs'} && maturin develop --release -m {rust_dir / 'Cargo.toml'}`."
     )
 
 
