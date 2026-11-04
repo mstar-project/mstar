@@ -51,7 +51,7 @@ def launches(monkeypatch):
 
 def _use(monkeypatch, table):
     tuning = getattr(decode, table)
-    monkeypatch.setattr(decode, "_tuning", lambda device, experts=None: tuning)
+    monkeypatch.setattr(decode, "_tuning", lambda device, shape=None: tuning)
     return tuning
 
 
@@ -72,14 +72,27 @@ def test_tuning_follows_the_gpu_name(monkeypatch):
     pick = decode._tuning.__wrapped__
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H100 80GB HBM3")
     assert pick(torch.device("cuda", 0)) is decode._H100
-    assert pick(torch.device("cuda", 0), (6144, 256, 256)) is decode._H100
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H200")
     assert pick(torch.device("cuda", 0)) is decode._H200
     assert pick(torch.device("cpu")) is decode._H200
-    # GLM-5.2's experts get their own table; any other shape keeps the H200 one
-    assert pick(torch.device("cuda", 0), (6144, 256, 256)) is decode._H200_GLM52
-    assert pick(torch.device("cuda", 0), (4096, 288, 256)) is decode._H200
-    assert pick(torch.device("cuda", 0), (6144, 128, 256)) is decode._H200
+
+
+def test_glm52_experts_have_an_h200_table_entry():
+    """GLM-5.2-FP8's experts at TP8 take the tiles swept at their shape on an H200, from the
+    kernel registry's shipped H200 table (the lookup itself is test_kernel_registry's)."""
+    import json
+
+    from mstar.kernels.table import TABLE_DIR, parse_table
+
+    path = TABLE_DIR / "moe_decode" / "NVIDIA_H200.json"
+    (entry,) = [e for e in parse_table(json.loads(path.read_text()), "moe_decode", str(path))
+                if dict(e.shape) == {"H": 6144, "E": 256, "I": 256, "K": 8}]
+    tuning = decode._from_entry(entry)
+    assert tuning.pair_max_tokens == 8 and tuning.router == decode._H200.router
+    assert decode._tiles(1, tuning) == (dict(bj=8, bk=512, bjs=32, bks=256, warps=2),
+                                        dict(bn=16, bc=256, warps=8))
+    assert decode._tiles(5, tuning) == (dict(bj=8, bk=1024, bjs=32, bks=256, warps=4),
+                                        dict(bn=32, bc=128, warps=4))
 
 
 def test_tile_tables():
@@ -149,16 +162,21 @@ def test_router_launch_follows_the_table(table, launches, monkeypatch):
     assert logits["BK"] == bk and logits["num_warps"] == tuning.router["warps"]
 
 
-def test_router_topk_op(launches):
-    w, ids = decode.router_topk(torch.randn(5, 64), torch.zeros(64), 8, 2.5, True)
+@pytest.mark.parametrize("softmax", [False, True])
+def test_router_topk_op(launches, softmax):
+    # the softmax router passes bf16 logits and no bias; the weights are fp32 either way
+    dtype, bias = (torch.bfloat16, None) if softmax else (torch.float32, torch.zeros(64))
+    w, ids = decode.router_topk(torch.randn(5, 64, dtype=dtype), bias, 8, 2.5, True, softmax)
     assert w.shape == ids.shape == (5, 8) and ids.dtype == torch.int64
     (_, grid, _, kw), = launches
-    assert grid == (5,) and kw["S"] == 1 and kw["NORM"] is True
+    assert grid == (5,) and kw["S"] == 1 and kw["NORM"] is True and kw["SOFTMAX"] is softmax
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode():
-        w, ids = decode.router_topk(torch.empty(5, 64), torch.empty(64), 8, 2.5, True)
-    assert w.shape == (5, 8) and ids.dtype == torch.int64
+        fake_bias = None if softmax else torch.empty(64)
+        w, ids = decode.router_topk(torch.empty(5, 64, dtype=dtype), fake_bias, 8, 2.5, True,
+                                    softmax)
+    assert w.shape == (5, 8) and w.dtype == torch.float32 and ids.dtype == torch.int64
 
 
 # ---------------------------------------------------------------- CUDA

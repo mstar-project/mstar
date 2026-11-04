@@ -202,6 +202,8 @@ def test_registry_yaml_and_adapter_agree(model):
     model.validate_config_yaml(deployment, str(CONFIG_PATH))
     with pytest.raises(ValueError, match="pages"):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 64}, str(CONFIG_PATH))
+    # a pool left at its declared page size
+    model.validate_config_yaml({**deployment, "resources": {"lm_kv": {"max_num_pages": 1792}}}, str(CONFIG_PATH))
     assert isinstance(adapters.get_adapter("cosyvoice3"), adapters.CosyVoice3Adapter)
 
 

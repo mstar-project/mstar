@@ -321,9 +321,12 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::graph::runtime::SpecPrepOut>()?;
     m.add_class::<crate::graph::runtime::SpecRowsOut>()?;
     m.add_class::<crate::graph::runtime::RouteOut>()?;
-    m.add_class::<crate::graph::runtime::FusedRouteOut>()?;
+    m.add_class::<crate::graph::runtime::PostprocessOut>()?;
     m.add_class::<crate::graph::runtime::SendPlan>()?;
     m.add_class::<crate::tensors::TensorBookkeeping>()?;
     m.add_class::<crate::tensors::TensorInfoOut>()?;
+    m.add_function(wrap_pyfunction!(crate::kv_plan::kv_packed_addressing, m)?)?;
+    m.add_class::<crate::page_arena::PyPageArena>()?;
+    m.add_class::<crate::page_arena::PyStreamPages>()?;
     Ok(())
 }

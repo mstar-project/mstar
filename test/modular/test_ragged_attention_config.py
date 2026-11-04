@@ -1,4 +1,5 @@
-"""CPU tests for the ragged attention resource's activation dtype.
+"""CPU tests for the ragged attention resource's config: its activation dtype
+and its deployment overrides.
 
 A cacheless attention has no KV cache to inherit a dtype from, so a node without a
 KV-backed attention (a DiT) declares it on the config; the engine's KV dtype stays the
@@ -46,3 +47,16 @@ def test_engine_kv_dtype_is_the_fallback():
 def test_no_dtype_anywhere_is_an_error():
     with pytest.raises(ValueError, match="no activation dtype"):
         RaggedAttnManager.build(_spec(None), EngineResourceInfo(device=CPU, kv_dtype=None))
+
+
+@pytest.mark.parametrize("declared, override", [
+    (64, {"max_segments_per_request": 4}),
+    (None, {"max_segments_per_request": 4, "max_segments_per_step": 64}),
+])
+def test_a_per_request_ceiling_on_a_per_step_resource_is_refused(declared, override):
+    """A resource sized per step never reads the per-request ceiling, so a
+    deployment's override of it is refused rather than ignored."""
+    spec = _spec()
+    spec.config.max_segments_per_step = declared
+    with pytest.raises(ValueError, match="max_segments_per_step"):
+        spec.apply_yaml_overrides(**override)

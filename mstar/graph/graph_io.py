@@ -87,15 +87,16 @@ class WorkerGraphIO:
         )
 
     def mark_node_complete(
-        self, node_name: str
+        self, node_name: str, loop_stride: int = 1,
     ) -> NodeCompletionOutput:
-        """Signal that a node has finished executing.
+        """Signal that a node has finished executing. ``loop_stride``: see
+        ``GraphNode.complete``.
 
         The caller must route each edge in output_edges, skipping any in filtered_signals.
         """
         prev_done_val = self.wg_state_registry.is_done
         node = self.nodes[node_name]
-        completion = node.complete()
+        completion = node.complete(loop_stride)
         # apply filtering, if needed
         completion.output_edges = [
             edge for edge in completion.output_edges \

@@ -14,33 +14,6 @@ Communication
    * - Variable
      - Default
      - Meaning
-   * - ``MSTAR_RUST_ZMQ``
-     - ``AUTO``
-     - Transport selection for the ZeroMQ control mesh (see
-       :func:`mstar.communication.communicator.make_communicator`).
-       ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
-       ``rust/`` extension imports successfully, pyzmq otherwise.
-       ``1``: the Rust communicator, raising if the extension is missing.
-       ``0``: always pyzmq. The two transports are wire-compatible, so
-       this can be set per-process while the rest of the mesh stays on
-       pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
-       worker's graph runtime on Python -- the Rust one cannot share a
-       pyzmq transport. An extension built before 0.1.1 has no
-       non-blocking ``try_send``, which the API server's preprocess thread
-       sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
-       warning and ``1`` raises, asking for a rebuild. The conductor, the
-       workers and the rest of the API server keep the Rust transport.
-   * - ``MSTAR_RUST_GRAPH``
-     - ``AUTO``
-     - Which graph runtime a worker builds (see
-       :func:`mstar.graph.runtime.utils.resolve_graph_runtime_type`).
-       ``AUTO``: Rust where the vendored ``rust/`` extension imports *and*
-       the Rust transport is in use, Python otherwise. ``1``: the Rust
-       runtime, failing at startup if the transport or the tensor bookkeeper
-       is a Python one -- it holds a share of both, so there is no degraded
-       mode to fall back to. ``0``: always the Python runtime. Resolved once
-       per process, because it also selects the tensor bookkeeper the
-       runtime and the tensor store must share.
    * - ``MSTAR_WIRE_CODEC``
      - ``msgpack``
      - How messages are encoded on every communicator edge (see
@@ -151,6 +124,19 @@ Communication
        ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
        so one process can pin more than its own arena holds. Segments
        past the budget stay unpinned: copies work, without async overlap.
+   * - ``MSTAR_SHM_ARENA_GATHER_MAX_BYTES``
+     - ``16384``
+     - Largest item (bytes) a consumer gathers with others of the same
+       shape, dtype and segment into one pinned buffer and one H2D copy,
+       instead of a copy per item (``_read_many_from_arena``). The default
+       is the crossover measured on an H200 host; ``0`` disables the
+       gather. Read in ``ArenaShmCommunicationManager.__init__``.
+   * - ``MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES``
+     - ``512``
+     - Up to this item size (bytes, 8-byte aligned) the gather indexes
+       8-byte words in one pass; larger items are copied one slice each.
+       Measured on an H200 host. Read in
+       ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
      - ``0``
      - TTL backstop for abort-orphaned slots (a request aborted after
@@ -401,6 +387,9 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
   rather than silently returned as WAV. Run the Python frontend for compressed
   containers.
+* ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
+  400: the Python frontend decodes the clip and checks its length before
+  submitting it, and the Rust frontend has no decoder to do that with.
 * ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
   request sets ``generate_sound``, Cosmos3 generates a separate audio track that
   mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
@@ -470,7 +459,7 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - config's ``tp_async_sched``, else ``0``
+     - config's ``tp_async_sched``, else ``1``
      - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
@@ -496,6 +485,101 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREAD_CORE``
+     - config's ``knobs: step_thread_core``, else ``auto``
+     - Pin each worker's main, GPU and plan threads, and the API server's
+       message thread and Rust frontend bridge on a CPU of their own. A step
+       hands work between the three worker threads several times and every
+       step's tokens pass from the message thread to the bridge; on a host
+       whose idle cores drop into deep C-states, each handoff to a sleeping
+       core waits for it to wake. ``off`` pins nothing.
+       ``always`` gives each worker ``cpus.STEP_CORES`` (3) cores, one
+       hardware thread of each, and the API server one core; no two pinned
+       threads share a core and the siblings of the CPUs taken stay unpinned.
+       ``siblings`` puts each worker's three threads on all hardware threads
+       of one core instead (two cores of one L2 cluster,
+       ``topology/cluster_cpus_list``, where a core has one CPU in the mask);
+       ``cpus._siblings`` has its numbers. On a deep-idle Xeon 6767P it beat
+       no pin and three separate cores; on two H200 hosts with SMT it lost to
+       no pin.
+       ``auto`` pins nothing and logs one line saying why for this host, since
+       no host it can tell apart has a measurement in which a layout beats no
+       pin: ``idle_hold`` is set (with the cores held awake pinning measured
+       no faster), the CPU vendor isn't Intel (``cpus.AUTO_VENDORS``, by
+       ``/proc/cpuinfo``'s ``vendor_id``), no enabled idle state of 100 µs or
+       more shows on a CPU of the process mask
+       (``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency``,
+       ``cpus.deepest_idle``, ``cpus.DEEP_IDLE_US``), or, on a deep-idle Intel
+       host, three separate cores measured no faster than no pin.
+       A number names the first worker's core (its hardware threads in the
+       mask); the next workers take the next cores up and the API server the
+       last core of the mask. A number outside the mask, or too near its top
+       for every worker, stops the server at startup.
+       ``always`` and ``siblings`` place by the GPU's rank among the host's
+       GPUs on its NUMA node (sysfs ``/sys/bus/pci/devices``: the PCI
+       functions of the GPU's vendor and class in address order,
+       ``numa_node`` and ``local_cpulist``), so servers on different GPUs take
+       different CPUs without knowing about each other: the API server the
+       core at its first worker's GPU's rank from the top of the node's cores
+       in the process mask, a worker its cores at that rank from the bottom of
+       the rest; further workers of one deployment on one GPU step by the
+       node's GPU count. A GPU whose node has no CPU in the mask picks, by its
+       rank among the host's GPUs in the same case, from the cores the
+       node-local GPUs leave. Under ``always`` the cores a GPU picks from must
+       hold four per GPU that picks from them (two under ``siblings``). A mask
+       too small for that across the host may do for the GPUs this container
+       has a device node for, since only those can share it, and those rank
+       instead (NVIDIA only; a 2-GPU slice of an 8-GPU host fits an 8-core mask
+       this way). Short of that, the GPUs this process was given
+       (``CUDA_VISIBLE_DEVICES``, which ``--gpus`` sets) rank, and the mask is
+       cut into as many core sets as it holds for them: a one-GPU server under
+       an 8-core job mask on a node of four GPUs gets three cores and an API
+       core, and the mask holds two such sets. The log line names the rule
+       that sized the plan. Short of that too, or with a mask too small to
+       leave a CPU unpinned, nothing is pinned and a warning says why.
+       Servers on one GPU (two MIG instances share its address) would take
+       the same CPUs, so the first ``always`` or ``siblings`` server holds
+       ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
+       pins nothing, with a warning. Every server that pins, a CPU number
+       included, also holds ``/tmp/mstar-core-<CPU>.lock`` for each physical
+       core it pins (named by the core's first CPU, with its pid inside): one
+       that finds a core held logs the holder's pid and takes the mask's next
+       core set, or pins nothing with a warning when none is free. The locks
+       go with the process however it exits, and a file naming a pid that has
+       exited is taken over with an info line. They only reach servers that
+       share ``/tmp``, so servers in separate containers on one GPU or under
+       one mask still take the same CPUs.
+       A split config's second worker can also take a core that a server on
+       a GPU without allowed CPUs takes under the same mask.
+       Threads and pools a pinned thread starts keep the process mask
+       (``mstar.utils.threads``), and the API server's intra-op and encode
+       pools and FFmpeg's per-decode threads
+       (``media_limits.video_decode_threads``) are sized from the CPUs the pins
+       leave (``CpuPlan`` in ``mstar.utils.cpus``). Each worker and the API
+       server log their CPUs and why. See :ref:`host-idle` for measurements.
+       Read by ``knobs.step_thread_core``; no effect where
+       ``os.sched_setaffinity`` is missing (macOS, Windows).
+   * - ``MSTAR_STEP_CORE_SET``
+     - set by the API server
+     - Which of the mask's core sets the API server locked under
+       ``step_thread_core`` (``cpus.claim_cores``), for the conductor and
+       workers it starts: they build the same plan, but only the API server
+       knows which set was free. Not meant to be set by hand. Read by
+       ``cpus.devices_plan``.
+   * - ``MSTAR_IDLE_HOLD``
+     - config's ``knobs: idle_hold``, else ``off``
+     - ``qos`` has the API server open ``/dev/cpu_dma_latency``, write a
+       10 µs latency and keep the fd open for its life, which keeps every CPU
+       of the host out of idle states slower than that (C1 and C1E stay
+       allowed). The log says what happened, and a device that is absent or
+       not writable only costs the hold: startup carries on. Containers
+       usually hide the device. The request is host-wide and holds cores awake
+       whether or not the server is busy, so it spends power on idle hosts; it
+       is off by default. ``auto`` placement stands down while it is set:
+       with every server core held awake by a ``SCHED_IDLE`` spinner (the
+       stand-in where the device is hidden), one core's hardware threads lost
+       to no pin and three separate cores were level with it. Read by
+       ``knobs.idle_hold``, applied by ``cpus.hold_idle``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
@@ -526,13 +610,6 @@ Worker scheduling
        ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
        worker starts and ``5`` is used; a negative value is raised to ``0``
        with a warning.
-   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
-     - ``32,64,128,256,512,1024,2048,4096,8192``
-     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
-       graph (one per bucket and batch size). A prompt past the top bucket
-       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
-       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
-       8192; narrow it to save graph memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
      - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
@@ -545,6 +622,16 @@ Worker scheduling
        page unindexed. The default ``1`` extends on every step: ``16``
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
+   * - ``MSTAR_WORKSPACE_BUFFER_MB``
+     - ``512``
+     - The size each FlashInfer attention workspace starts at, per (plan label, slot), read
+       by ``workspace_bytes`` (``mstar/engine/resources/attn/workspace.py``). A floor: a plan
+       at startup that asks for more grows that workspace to what it asked for. Raise it for
+       an eager step that wants more than startup's plans left it, which raises with the bytes
+       it asked for, since a captured graph holds the workspace's address by then. A ragged
+       resource that declares ``workspace_mb`` starts there instead, and this doesn't reach
+       it: LTX-2.5's twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
+       ``512`` and 24 GiB at ``2048`` if this applied.
    * - ``MSTAR_KV_PINNED_INDPTRS``
      - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
@@ -565,6 +652,19 @@ Worker scheduling
        allocating. ``50000`` removed them on Qwen3.5 0.8B at c=128 (an 8%
        shorter decode step), at the cost of holding at most that many young
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
+   * - ``MSTAR_RESIDENT_PLANNING``
+     - config's ``knobs: resident_planning``, else ``auto``
+     - ``auto`` runs a node's captured decode steps off per-request tables on
+       the device where the submodule names resident walks
+       (``NodeSubmodule.resident_walks``) and every resource of the node can
+       (``Resource.resident_refusal``); the worker log says why a node that
+       names walks stays on the host. ``off`` plans every step on the host. The
+       tables are sized at startup, not by a setting: twice the walk's largest
+       capture batch in rows, plus one, since a request that finds no row takes
+       the least recently run one's. A row has a cell per page of the KV pool's
+       ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
+       not the config's top-level key), at most the pool's pages, plus a few, 8
+       bytes each. Read by ``knobs.resident_planning``.
    * - ``MSTAR_KV_PLAN_CACHE``
      - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's
@@ -584,7 +684,7 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
        Whisper, which also keeps its timestamp rule state in the sampler's
        declared loop-back state) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
@@ -592,20 +692,33 @@ Worker scheduling
        master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured decode step builds its rotary tables inside the graph from
-       the position resource's planned positions instead of staging them.
-       Experiment knob, measured and gated on its own.
+     - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
+       inside the graph from the position resource's planned positions instead
+       of building them before the replay (``LLMSubmodule._rope_in_graph``); a
+       captured decode step always does. Experiment knob, measured and gated
+       on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``1``
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
-       postprocess wins). Padding rows then address a trash master row and
-       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
-       ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
-       cap with this on). Only with the device
-       loop-back on. An experiment knob; measure before turning it on.
+       postprocess wins). Padding rows, and the rows a step drops
+       (``SamplerStep.kept_rids``), write a trash master row. The offset and
+       last-token masters, which the captured graphs index, are allocated
+       once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
+       when the runner admits it (``SamplerResource.reserve``): past them it
+       waits, as for a recurrent state slot, until a removed request frees
+       one. Only for a node that reads its tokens back on the device
+       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
+       rank: above one, where admission doesn't decide, the masters grow and
+       the scatter runs after the replay, as with ``0``.
+   * - ``MSTAR_SAMPLER_SLOTS``
+     - config's ``knobs: sampler_slots``, else ``4096``
+     - Request rows of the sampler masters a captured graph indexes when
+       ``MSTAR_SAMPLER_INGRAPH_SCATTER`` is on (at least the node's largest
+       capture batch): the most requests admitted at once on such a node; the
+       rest wait to be admitted. Read by ``knobs.sampler_slots``.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the
@@ -643,6 +756,14 @@ Compilation
      - ``84``
      - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
        show ``hit config.recompile_limit``.
+   * - ``MSTAR_KERNEL_TABLES``
+     - unset
+     - Directories of tuned kernel-config tables (``os.pathsep``-separated),
+       searched before the package's ``mstar/kernels/tables`` (read by
+       :func:`mstar.kernels.table.table_dirs`). ``python -m benchmark.kernels.sweep
+       ... --out DIR`` writes one, so a sweep can be served and measured before it
+       is committed. Set it the same way on every node, so every rank of a lockstep
+       instance picks the same configs.
    * - ``MSTAR_COMPILE_LEVEL``
      - ``1``
      - How much a captured forward's compile tunes; ``mstar serve -O`` sets it
@@ -650,6 +771,13 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``MSTAR_COMPILE_DETERMINISTIC``
+     - config's ``knobs: compile_deterministic``, else ``0``
+     - ``1``: Qwen3.5's decode capture compiles in Inductor's deterministic
+       mode, as its prefill, mixed and vision captures always do, so greedy
+       output reproduces across server processes and the cold start shrinks,
+       at the cost of one-row decode speed. Only Qwen3.5's text walks read it
+       (``knobs.compile_deterministic``).
    * - ``TRITON_PTXAS_BLACKWELL_PATH``
      - torch's ptxas, when needed
      - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas

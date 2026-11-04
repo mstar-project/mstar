@@ -45,7 +45,7 @@ _INT_RULES = {
     **INT_KNOB_RULES,
     "max_output_tokens": (">= 1", lambda v: v >= 1),
 }
-_BOOL_KNOBS = (*BOOL_KNOBS, "do_sample")
+_BOOL_KNOBS = (*BOOL_KNOBS, "do_sample", "return_token_ids")
 
 # other names for max_output_tokens, in precedence order after it
 MAX_OUTPUT_TOKENS_ALIASES = ("max_new_tokens", "max_completion_tokens", "max_tokens")

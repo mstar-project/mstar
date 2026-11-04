@@ -25,8 +25,7 @@ class LinearAttnManager(AttentionResource):
         # the pool's own config, not a copy; `shard` is idempotent so both
         # builders can call it
         pool_config = info.dependency(spec.config.recurrent_state).config
-        if info.joint_comm_group is not None:
-            pool_config.shard(info.joint_comm_group.world_size)
+        pool_config.shard(info.head_shards)
 
         backend = spec.config.backend
         variant = spec.config.variant
@@ -67,6 +66,7 @@ class LinearAttnManager(AttentionResource):
                 state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 device=info.device,
                 speculative_tokens=DeltaNetGeometry.speculative_tokens_of(pool_config.blocks),
+                conv_dtype=pool_config.blocks["conv"].resolved_dtype(info.kv_dtype),
             )
 
         if backend is not LinearAttnBackend.FLASHINFER:

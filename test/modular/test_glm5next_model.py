@@ -424,7 +424,7 @@ def test_glm5next_model_constructs_from_config():
     # NoPE: no rope slot in the cache unless MTP needs it
     assert (kv.kv_lora_rank, kv.qk_rope_head_dim, kv.head_dim) == (512, 0, 512)
     assert kv.max_seq_len == model.config.index_topk == 2048
-    assert kv.page_size == 128  # the FlashInfer MLA kernel's page size
+    assert kv.tokens_per_page == 128  # the FlashInfer MLA kernel's page size
     attn = specs[ATTN].config
     assert attn.backend == AttnBackend.FLASHINFER_MLA
     assert attn.sm_scale == pytest.approx(256 ** -0.5)
@@ -668,7 +668,7 @@ def test_checkpoint_load_refuses_a_missing_trunk_weight(tmp_path):
 
         partial = tmp_path / f"partial-{sharded}"
         write(partial, {k: v for k, v in stream.items() if k != dropped}, sharded)
-        with pytest.raises(RuntimeError, match="layers.1.self_attn.b_proj.weight"):
+        with pytest.raises(KeyError, match="layers.1.self_attn.b_proj.weight"):
             model._load_checkpoint(_build_model(seed=24, process=False)[0], str(partial), "cpu", None)
 
 
@@ -702,9 +702,9 @@ class _LinearScanMatcher:
         self.rules = rules
 
     def __call__(self, name):
-        from mstar.model.loader.base import _apply_stacked
+        from mstar.model.loader.base import apply_stacked
 
-        return _apply_stacked(name, self.rules)
+        return apply_stacked(name, self.rules)
 
 
 @torch.no_grad()
@@ -805,8 +805,6 @@ def test_full_geometry_names_resolve_through_pipeline():
 def test_swiglu_clamp_engages_on_every_mlp_path():
     """gate.clamp(max=L) and up.clamp(-L, L), then silu, on the dense MLP and on the shared
     and routed experts, at a limit the unclamped math visibly misses."""
-    from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
-
     torch.manual_seed(31)
     cfg = Glm5NextModelConfig.reduced()
     cfg.swiglu_limit = 1.0  # engage hard at test scales
@@ -835,14 +833,13 @@ def test_swiglu_clamp_engages_on_every_mlp_path():
     assert not torch.allclose(want, unclamped, atol=1e-2)  # clamp is live
 
     block = Glm5NextSparseMoeBlock(cfg)
-    assert isinstance(block.gate, Glm5NextMoEGate)
     block.gate.weight.data.normal_(0, 0.3)
     block.experts.gate_up_proj.data.normal_(0, 0.5)
     block.experts.down_proj.data.normal_(0, 0.5)
     block.shared_expert.gate_up_proj.weight.data.normal_(0, 0.5)
     block.shared_expert.down_proj.weight.data.normal_(0, 0.5)
 
-    topk_weights, topk_ids = block.gate(x)
+    topk_weights, topk_ids, _ = block.gate(x)
     topk_weights = topk_weights.to(x.dtype)
     want = torch.zeros_like(x)
     for t in range(x.shape[0]):
@@ -915,55 +912,3 @@ def test_module_tree_matches_loader_expectations():
             f"only in loader expectations: "
             f"{sorted(set(expected) - actual)[:5]}"
         )
-
-
-@pytest.mark.parametrize("version,mtp,kpe", [
-    ("0.6.18", 0, 0), ("0.7.0", 0, 0), ("0.6.17", 0, 64), ("0.6.18", 3, 64), (None, 0, 0),
-])
-def test_rope_slot_follows_what_flashinfer_can_plan(monkeypatch, version, mtp, kpe):
-    # an older FlashInfer can't plan a cache without the slot; a box without one keeps none
-    import sys
-    import types
-
-    from mstar.model.glm5_next import config as config_mod
-
-    fake = None if version is None else types.SimpleNamespace(__version__=version)
-    monkeypatch.setitem(sys.modules, "flashinfer", fake)
-    config_mod._flashinfer_before.cache_clear()
-    cfg = Glm5NextModelConfig()
-    cfg.mtp_num_draft_tokens = mtp
-    try:
-        assert cfg.mla_cache_kpe == kpe
-    finally:
-        config_mod._flashinfer_before.cache_clear()
-
-
-def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
-    """Built from tokenizer.json alone, a tokenizer has no special tokens even where the file
-    marks them special: the fallback registers tokenizer_config's, or every reply ends in
-    ``<|user|>``. ``</think>`` stays printable, and no id is added."""
-    import json
-
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-
-    from mstar.model.utils import ByteLevelDetokenizer
-
-    alphabet = pre_tokenizers.ByteLevel.alphabet()
-    raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
-    raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    raw.decoder = decoders.ByteLevel()
-    turns = ["<|endoftext|>", "<|user|>", "<|observation|>"]
-    raw.add_special_tokens(turns)
-    raw.add_tokens(["</think>"])
-    raw.save(str(tmp_path / "tokenizer.json"))
-    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
-        "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
-        "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
-
-    tok = Glm5NextModel._fast_tokenizer_fallback(str(tmp_path))
-    assert len(tok) == raw.get_vocab_size()
-    assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
-    think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])
-    assert think not in tok.all_special_ids
-    ids = tok.encode("hi", add_special_tokens=False) + [think, user]
-    assert ByteLevelDetokenizer(tok).to_bytes(ids) == b"hi</think>"

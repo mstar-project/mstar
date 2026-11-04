@@ -127,6 +127,7 @@ class ReferenceTests(unittest.TestCase):
         from mstar.engine.resources.base import EngineResourceInfo, build_resource
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.runner import StepRunner
+        from mstar.engine.resources.spec import apply_yaml_overrides
         from mstar.engine.resources.step import StepContext
 
         group = None
@@ -143,12 +144,13 @@ class ReferenceTests(unittest.TestCase):
         (Path(directory) / "config.json").write_text(json.dumps(raw))
         model = CommandAPlusModel(directory)
         specs = {s.resource_key: s for s in model.get_node_resources()}
-        specs[KV_CACHE].config.page_size = 16
-        specs[KV_CACHE].config.max_num_pages = 16
+        # resolved as a server resolves them: 6-token full pages and 2-token pages of the local
+        # layers, so the cache keeps their 4-token window and frees what's behind it
+        apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 16}}})
         transfer = TransferEngineInfo("reference", "reference", LocalTransferEngine("localhost"))
         resources = {key: build_resource(spec, EngineResourceInfo(
             device=torch.device("cuda"), kv_dtype=torch.bfloat16,
-            transfer_engine_info=transfer,
+            transfer_engine_info=transfer, needs_remote_transfer=False,
             joint_comm_group=JointGroups(group, CommGroup.trivial()) if group else None,
             dependencies={dependency: specs[dependency] for dependency in spec.depends_on()},
         )) for key, spec in specs.items()}

@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 class Pi05ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP encoder for camera images.
 
-    Receives raw image tensors of shape ``(num_cameras, 3, H, W)`` per request
-    in ``image_inputs``. Resizes/normalizes them to the SigLIP input format,
-    runs SigLIP, and emits ``img_emb`` of shape
-    ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
+    Receives one ``(3, H, W)`` image per camera in ``image_inputs``, up to
+    ``num_cameras`` of them. Resizes/normalizes each to the SigLIP input format,
+    runs SigLIP over ``num_cameras`` slots, and emits ``img_emb`` of shape
+    ``(cameras_sent * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
     disable_autocast = True
@@ -86,9 +86,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         resolution.
 
         Accepted input encodings (auto-detected by dtype + value range):
-          * ``uint8`` in ``[0, 255]`` — typical raw decoded image
-          * ``float`` in ``[0, 1]`` — what mstar's ``data_worker`` hands over
-            after dividing decoded uint8 frames by 255
+          * ``uint8`` in ``[0, 255]`` — what ``Pi05Model.load_image`` hands over
+          * ``float`` in ``[0, 1]`` — the base ``Model.load_image`` encoding
           * ``float`` in ``[-1, 1]`` — already-normalized form used by the
             unit/integration tests that bypass the data_worker
         Anything else falls back to a simple float32 cast and assumes the
@@ -139,10 +138,8 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
-        """Batch when all requests share the same number of cameras.
-
-        If camera counts differ, fall back to sequential execution.
-        """
+        """Batch when all requests share the same number of cameras (``prepare_inputs``
+        pads every request to ``num_cameras``)."""
         if not model_inputs:
             return False
         first_num_cameras = model_inputs[0].tensor_inputs["pixel_values"].shape[0]
@@ -189,9 +186,30 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(
-            inputs["image_inputs"][0]
-        )})
+        # Each camera is letterboxed on its own, since cameras may differ in resolution.
+        # Free camera slots get blank frames whose tokens postprocess drops, the same as
+        # openpi's image mask (masked tokens get no attention and no positions). More
+        # images than slots never get here, max_input_files refuses them.
+        pixels = torch.cat([self._prepare_one(image) for image in inputs["image_inputs"]])
+        num_images, missing = pixels.shape[0], self.config.num_cameras - pixels.shape[0]
+        if missing > 0:
+            pixels = torch.cat([pixels, pixels.new_full((missing, *pixels.shape[1:]), -1.0)])
+        return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs={"num_images": num_images})
+
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
+        **kwargs,
+    ):
+        """Drop the tokens of the blank frames ``prepare_inputs`` padded the request with,
+        so the prefix holds the images the KV layout was counted for."""
+        cameras, num_images = self.config.num_cameras, inputs.kwargs["num_images"]
+        if num_images < cameras:
+            emb = outputs["img_emb"][0]
+            outputs["img_emb"] = [emb[: emb.shape[0] // cameras * num_images]]
 
     def preprocess(
         self,
@@ -286,7 +304,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         ".norm.",   # final RMSNorm / adaRMS norm
     )
 
-    # For the default image size and a simple text prompt, one request is about 400 tokens
+    # For the default image size, three cameras and a simple text prompt, one request is about 910 tokens
     PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
     ACTION_GEN_CAPTURE_BATCH_SIZES = [1, 2, 4]
@@ -309,27 +327,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self.action_out_proj = action_out_proj
         self.time_mlp = time_mlp
         self.config = config
-        # Image features and language token embeddings use DIFFERENT scaling
-        # factors in lerobot's reference, even though both end up calling it
-        # ``sqrt(hidden_size)``:
-        #
-        #   * Images: ``embed_image`` returns
-        #     ``connector(siglip_features) * sqrt(hidden_size)``  -> scale = sqrt(H).
-        #
-        #   * Text: lerobot's ``lang_embed_func`` does
-        #     ``embed_language_tokens(tokens) * sqrt(hidden_size)``, but
-        #     ``embed_language_tokens`` calls HF Gemma's
-        #     ``GemmaTextScaledWordEmbedding`` whose ``forward`` already
-        #     multiplies the raw lookup by an internal ``embed_scale =
-        #     sqrt(hidden_size)``. So the EFFECTIVE text scale is
-        #     ``sqrt(H) * sqrt(H) = H``, not ``sqrt(H)``.
-        #
-        # We use a plain ``nn.Embedding`` for ``embed_tokens`` (no internal
-        # scale), so we have to apply the full ``H`` factor manually here.
-        # Mismatching this produces a ~45x undersized text prefix and the
-        # action expert sees a wildly wrong context.
-        self._image_embed_scale = math.sqrt(config.hidden_size)
-        self._text_embed_scale = float(config.hidden_size)
+        # Prefix scaling as in openpi's and lerobot's embed_prefix: SigLIP tokens unscaled,
+        # language embeddings times sqrt(hidden_size).
+        self._text_embed_scale = math.sqrt(config.hidden_size)
 
         # Lazily allocated on first action Euler step, sized for the largest
         # captured batch. sincos_timestep_embedding fully overwrites this buffer
@@ -470,18 +470,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # been formatted as a decimal-string suffix on the language prompt
         # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
         # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
-        #
-        # IMPORTANT: lerobot's ``embed_prefix`` scales BOTH the image features
-        # (after the multi_modal_projector) and the language token embeddings
-        # by ``sqrt(hidden_size)``. We mirror that here. Without the image
-        # scaling the SigLIP tokens come in ~sqrt(2048)≈45x too small relative
-        # to the language tokens and the action expert sees a wildly wrong
-        # prefix. (The standalone test_pi05_model_loaded_via_remapper_matches_
-        # lerobot integration test missed this because it bypasses
-        # _preprocess_prefill and feeds in lerobot's pre-scaled embed_prefix
-        # output directly.)
 
-        img_emb = inputs["img_emb"][0] * self._image_embed_scale
+        img_emb = inputs["img_emb"][0]
         text_ids = inputs["text_inputs"][0]
         text_emb = self._embed_tokens_scaled(text_ids)
         prefix_emb = torch.cat([img_emb, text_emb], dim=0)

@@ -70,13 +70,16 @@ def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_ty
 
     make_stream.assert_called_once_with(device=worker.device)
     side.wait_event.assert_called_once_with(event)
+    # nothing is copied until the stop check reads a name
+    side.__enter__.assert_not_called()
+    assert copied[7]["token"] == [cpu_tensor, host_value]
+    assert copied[7]["metadata"] == "keep"
     side.__enter__.assert_called_once_with()
     side.__exit__.assert_called_once()
     runtime.Stream.assert_not_called()
     runtime.stream.assert_not_called()
     cpu_tensor.copy_.assert_called_once_with(tensor, non_blocking=True)
     side.synchronize.assert_called_once_with()
-    assert copied == {7: {"token": [cpu_tensor, host_value], "metadata": "keep"}}
     assert host_rows is None
     assert outputs.per_rid_outputs[7]["token"][0] is tensor
 
