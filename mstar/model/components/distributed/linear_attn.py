@@ -131,7 +131,6 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
         proj_bias: bool = False,
         conv_bias: bool = False,
         rms_norm_eps: float = 1e-6,
-        linear_attn_key: str = "linear_attn",
         state_key: str = "gdn_state",
         comm_group: CommGroup | None = None,
         layer: int | None = None,
@@ -159,7 +158,6 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             proj_bias=proj_bias,
             conv_bias=conv_bias,
             rms_norm_eps=rms_norm_eps,
-            linear_attn_key=linear_attn_key,
             state_key=state_key,
             layer=layer,
         )

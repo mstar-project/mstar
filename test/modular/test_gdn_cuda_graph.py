@@ -39,7 +39,9 @@ from mstar.engine.resources.recurrent import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep, CausalConv, Entry, GatedDeltaNet, TensorType, Value
+from mstar.engine.state.calls import ArrayHandle, causal_conv, gated_delta_net
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -108,10 +110,10 @@ class Stack(torch.nn.Module):
                 head_v_dim=g.head_v_dim,
                 conv_kernel_size=g.conv_kernel_size,
                 layout=GDNProjLayout.SPLIT,
-                linear_attn_key=LINEAR_ATTN,
                 state_key=GDN_STATE,
+                layer=i,
             )
-            for _ in range(depth)
+            for i in range(depth)
         )
         # gemma-style, as Qwen3.5's plain norms are
         self.norms = torch.nn.ModuleList(
@@ -133,13 +135,28 @@ class Stack(torch.nn.Module):
 
         self.to(device=device, dtype=torch.bfloat16)
         self.requires_grad_(False).eval()
+        entry = Entry({
+            "state": TensorType((g.num_v_heads, g.head_k_dim, g.head_v_dim), dtype=torch.float32),
+            "conv": TensorType((g.conv_dim, g.conv_kernel_size - 1), dtype=None),
+        })
+        self.state = ArrayHandle(
+            Value(GDN_STATE, nodes={"llm"}, layers=range(depth), entry=entry,
+                  updates={"conv": CausalConv(), LINEAR_ATTN: GatedDeltaNet()}),
+            {GDN_STATE: pool, "conv": None, LINEAR_ATTN: manager}, None,
+        )
         for layer in self.layers:
-            layer.bind_resources({GDN_STATE: pool, LINEAR_ATTN: manager})
+            layer.bind_state({GDN_STATE: self.state})
+
+    def _next_step(self) -> None:
+        """Each forward is one step to the handle, which allows one update of a field per layer."""
+        step = SubmoduleStep(segments=[Segment("r", "main", 1)], state={GDN_STATE: ArrayStep()})
+        step.set_ctx(StepContext(request_ids=["r"], graph_walk="decode", slot=0, capture=True))
+        self.state.end_step(step)
+        self.state.begin_step(step)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for i, (layer, norm) in enumerate(zip(self.layers, self.norms, strict=True)):
-            layer.mix.bind_step("main")
-            layer.mix.set_layer_idx(i)
+        self._next_step()
+        for layer, norm in zip(self.layers, self.norms, strict=True):
             x = x + layer(norm(x))
         return x
 
@@ -150,16 +167,15 @@ class Stack(torch.nn.Module):
         the conv, after the delta rule, after the residual — recorded on device
         so it survives being captured and read back after a replay.
         """
+        self._next_step()
         flags = []
         for i, (layer, norm) in enumerate(zip(self.layers, self.norms, strict=True)):
-            layer.mix.bind_step("main")
-            layer.mix.set_layer_idx(i)
             h = norm(x)
             tokens = h.shape[0]
             # one fused GEMM, split back out — see GatedDeltaNet._project_split
             qkv_proj, z, a, b = layer._project_split(h)
-            qkv = layer.mix.conv(
-                qkv_proj,
+            qkv = causal_conv(
+                self.state, i, qkv_proj,
                 weight=layer.conv1d.weight.squeeze(1),
                 bias=layer.conv1d.bias,
             )
@@ -167,7 +183,8 @@ class Stack(torch.nn.Module):
             q, k, v = torch.split(
                 qkv, [layer.key_dim, layer.key_dim, layer.value_dim], dim=-1,
             )
-            core = layer.mix(
+            core = gated_delta_net(
+                self.state, i,
                 q.reshape(tokens, layer.num_k_heads, layer.head_k_dim),
                 k.reshape(tokens, layer.num_k_heads, layer.head_k_dim),
                 v.reshape(tokens, layer.num_v_heads, layer.head_v_dim),

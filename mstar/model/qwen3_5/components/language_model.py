@@ -1,7 +1,6 @@
 """Qwen3.5's hybrid text stack: 3 gated-delta-net layers to 1 full-attention.
 
-Each layer indexes its own resource (recurrent pool or KV cache) by its
-position among its own kind; see ``Qwen3_5Config.resource_layer_index``.
+Each layer names itself to its state handle by its id in the stack.
 
 TP shards by head (q-heads for attention, k/v-heads for the delta net), and the
 engine shards the KV cache and recurrent pool to match, so
@@ -18,7 +17,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
-from mstar.model.components.decoder_layer import run_layers
+from mstar.model.components.decoder_layer import eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -38,8 +37,6 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTENTION,
-    LINEAR_ATTN,
-    ROPE,
     Qwen3_5Config,
 )
 
@@ -47,8 +44,7 @@ from mstar.model.qwen3_5.config import (
 class RopeCache:
     """This step's cos/sin, shared by every full-attention layer.
 
-    Set once per step, like the label cursor, so cos/sin need not be threaded
-    through ``DecoderLayer.forward``.
+    Set once per step, so cos/sin need not be threaded through ``DecoderLayer.forward``.
     """
 
     def __init__(self):
@@ -108,11 +104,8 @@ class Qwen3_5Attention(Attention):
             input_is_parallel=True, reduce_results=True,
         )
 
-    def _apply_rope(self, q, k, label):
-        """Interleaved 3D MRoPE over the partial rotary dim; 1D RoPE when no
-        cos/sin was set (a text-only bring-up harness)."""
-        if self.rope_cache is None or self.rope_cache.cos is None:
-            return super()._apply_rope(q, k, label)
+    def _apply_rope(self, q, k):
+        """Interleaved 3D MRoPE over the partial rotary dim."""
         return apply_partial_mrope(q, k, self.rope_cache.cos, self.rope_cache.sin)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -129,8 +122,9 @@ class Qwen3_5Attention(Attention):
         k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, self.attend.label)
-        out = self.attend(q, k, v).reshape(num_tokens, self.num_heads * self.head_dim)
+        q, k = self._apply_rope(q, k)
+        self.state.add(self.layer, k=k, v=v)
+        out = self.state.read(self.layer, q).reshape(num_tokens, self.num_heads * self.head_dim)
         if self.output_gate:
             out = out * torch.sigmoid(gate.reshape(num_tokens, -1))
         return self.o_proj(out)
@@ -152,7 +146,7 @@ def _build_mlp(config: Qwen3_5Config, comm_group: CommGroup) -> nn.Module:
 
 
 def _build_linear_attn_layer(
-    config: Qwen3_5Config, comm_group: CommGroup,
+    config: Qwen3_5Config, comm_group: CommGroup, layer: int,
 ) -> DecoderLayer:
     return DecoderLayer(
         self_attn=ParallelGatedDeltaNet(
@@ -164,9 +158,9 @@ def _build_linear_attn_layer(
             conv_kernel_size=config.linear_conv_kernel_dim,
             layout=GDNProjLayout.SPLIT,
             rms_norm_eps=config.rms_norm_eps,
-            linear_attn_key=LINEAR_ATTN,
             state_key=GDN_STATE,
             comm_group=comm_group,
+            layer=layer,
         ),
         mlp=_build_mlp(config, comm_group),
         input_layernorm=_norm(config),
@@ -175,7 +169,7 @@ def _build_linear_attn_layer(
 
 
 def _build_full_attn_layer(
-    config: Qwen3_5Config, rope_cache: RopeCache, comm_group: CommGroup,
+    config: Qwen3_5Config, rope_cache: RopeCache, comm_group: CommGroup, layer: int,
 ) -> DecoderLayer:
     return DecoderLayer(
         self_attn=Qwen3_5Attention(
@@ -187,11 +181,11 @@ def _build_full_attn_layer(
             head_dim=config.head_dim,
             qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
-            rope_theta=config.rope_theta,
             attn_key=ATTN,
             kv_key=KV_CACHE,
-            pos_key=ROPE,
+            pos_key=None,
             comm_group=comm_group,
+            layer=layer,
         ),
         mlp=_build_mlp(config, comm_group),
         input_layernorm=_norm(config),
@@ -213,10 +207,10 @@ class Qwen3_5LanguageModel(nn.Module):
         )
         self.rope_cache = RopeCache()
         self.layers = nn.ModuleList(
-            _build_linear_attn_layer(config, comm_group)
+            _build_linear_attn_layer(config, comm_group, layer)
             if kind == LINEAR_ATTENTION
-            else _build_full_attn_layer(config, self.rope_cache, comm_group)
-            for kind in config.layer_types
+            else _build_full_attn_layer(config, self.rope_cache, comm_group, layer)
+            for layer, kind in enumerate(config.layer_types)
         )
         self.register_buffer(
             "inv_freq",
@@ -224,19 +218,6 @@ class Qwen3_5LanguageModel(nn.Module):
             persistent=False,
         )
         self.norm = _norm(config)
-
-        # precomputed: which cursor each layer advances, and to what index
-        self._cursor_attr = [
-            "mix" if kind == LINEAR_ATTENTION else "attend"
-            for kind in config.layer_types
-        ]
-        self._resource_idx = [
-            config.resource_layer_index(i) for i in range(config.num_hidden_layers)
-        ]
-        # the cursors are on shared resources, so bind once per kind
-        self._bind_through = {
-            attr: self._cursor_attr.index(attr) for attr in set(self._cursor_attr)
-        }
 
         # Defer each residual add into the next norm: one fused add+norm (under
         # TP, all-reduce+add+norm) per block, so row-parallel outputs return
@@ -256,21 +237,13 @@ class Qwen3_5LanguageModel(nn.Module):
             target_dtype=dtype,
         )
 
+    @eager_frame
     def forward(
-        self, query_sequence: torch.Tensor, *, label: str,
+        self, query_sequence: torch.Tensor, *,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         self.rope_cache.set(*(cos_sin or (None, None)))
-        # bind the label once per resource kind, advance the index per layer
-        for attr, idx in self._bind_through.items():
-            getattr(self.layers[idx].self_attn, attr).bind_step(label)
-        return run_layers(self.layers, query_sequence, self.norm, self._set_cursor, self.comm_group)
-
-    @torch.compiler.disable
-    def _set_cursor(self, i: int, mixer: nn.Module) -> None:
-        """Move layer ``i``'s cursor (``attend`` or ``mix``) to the layer's index
-        in its resource."""
-        getattr(mixer, self._cursor_attr[i]).set_layer_idx(self._resource_idx[i])
+        return run_layers(self.layers, query_sequence, self.norm, no_cursor, self.comm_group)
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -293,10 +266,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
-        self, input_ids: torch.Tensor, *, label: str,
+        self, input_ids: torch.Tensor, *,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(
-            self.model.embed_tokens(input_ids), label=label, cos_sin=cos_sin,
-        )
+        hidden = self.model(self.model.embed_tokens(input_ids), cos_sin=cos_sin)
         return self.lm_head(hidden)

@@ -1903,9 +1903,9 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     stub = SimpleNamespace(
         _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
+        sampler=SimpleNamespace(resource=SimpleNamespace(loopback_tokens=lambda rids: token), rows=(1, 2)),
     )
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2])
     out = llm.preprocess(stub, "decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 

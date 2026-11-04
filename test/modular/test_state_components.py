@@ -20,7 +20,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
-from mstar.engine.resources.convenience import AttentionCallable, LinearAttnCallable
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.state import (
     Array,
     ArrayStep,
@@ -178,7 +178,7 @@ class _StubPool:
 def _gdn(**kwargs) -> ParallelGatedDeltaNet:
     layer = ParallelGatedDeltaNet(
         hidden_size=HIDDEN, num_k_heads=HEADS, num_v_heads=HEADS, head_k_dim=DIM, head_v_dim=DIM, conv_kernel_size=4,
-        linear_attn_key="linear", state_key="gdn", comm_group=CommGroup.trivial(), **kwargs,
+        state_key="gdn", comm_group=CommGroup.trivial(), **kwargs,
     )
     nn.init.normal_(layer.in_proj_fused.weight)
     return layer
@@ -202,20 +202,6 @@ def test_a_delta_net_with_a_handle_runs_both_updates_under_its_own_id():
     out = layer(torch.randn(TOKENS, HIDDEN))
     assert h._linear.calls == ["conv", "delta"] and out.shape == (TOKENS, HIDDEN)
     assert h._updated == {("conv", 2), ("state", 2)}
-
-
-def test_a_delta_net_with_no_handle_keeps_its_callable():
-    layer = _gdn()
-    linear, pool = Mock(), _StubPool()
-    linear.run_conv = Mock(side_effect=lambda x, **kwargs: x)
-    linear.run = Mock(side_effect=lambda q, k, v, a, b, **kwargs: v)
-    layer.bind_resources({"linear": linear, "gdn": pool})
-    layer.bind_state({})
-    assert isinstance(layer.mix, LinearAttnCallable) and layer.state is None
-    layer.mix._layer_idx = 0
-    layer(torch.randn(TOKENS, HIDDEN))
-    linear.run_conv.assert_called_once()
-    linear.run.assert_called_once()
 
 
 class _ViTConfig:

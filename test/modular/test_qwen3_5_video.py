@@ -370,10 +370,12 @@ def test_prompt_ids_match_processor(model, processor, layout):
 def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor):
     """An attachment prompt's one `prefill_vision` step carries tensor inputs, which the prefix
     cache never cuts, and a keyed span in that walk makes the preprocess worker refuse the request."""
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.qwen3_5.config import KV_CACHE
 
     _, out, _ = run_both(model, processor, "mixed")
-    assert out.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 0
+    layouts = kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata["keyed_spans"])
+    assert layouts[KV_CACHE]["main"].keyed_count() == 0
 
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
@@ -418,7 +420,7 @@ def _host_grids(out) -> dict:
 def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout):
     """The schedule and the LLM's `prefill_vision` row, against transformers:
     the row's token order and its 3D positions, plus where decode resumes."""
-    from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.model.qwen3_5.config import KV_CACHE
     from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -448,7 +450,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
         for (t, h, w), p in zip(step.image_grids, step.input_tensors["pixel_values"], strict=True)
     ]
     llm = LLMSubmodule(_Embed(len(model.tokenizer)), model.config, model.vision_config)
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 0))
     fwd_info = SimpleNamespace(
         request_id="r", step_metadata={"prefill_order": step.order, STEP_GRIDS_KEY: step.image_grids},
     )
@@ -470,7 +472,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     assert torch.equal(row.custom_pos_ids.long(), positions[:, 0])
     # decode resumes where transformers' rope delta puts it
     assert row.tensor_inputs["mrope_advance"] == int(positions.max()) + 1
-    spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    spans = out.metadata["state_layout"][KV_CACHE]["main"].spans
     assert sum(span.length for span in spans) == row.input_seq_len
     assert sum(span.advance for span in spans) == row.tensor_inputs["mrope_advance"]
 
@@ -513,11 +515,11 @@ def test_mp4_matches_processor(model, processor, tmp_path):
 def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
     """Many tiny frame groups fit the top patch bucket but overflow a replay's
     segment ceiling; the encoder runs them eagerly, so intake takes them."""
+    from mstar.model.qwen3_5.config import VISION_ATTN
     from mstar.model.qwen3_5.qwen3_5_model import VIDEO_GRIDS_KEY
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
-    (spec,) = model._vision_resources()
-    limit = spec.config.max_segments_per_step
+    limit = model.kernel_settings()[VISION_ATTN]["max_segments_per_step"]
     n = 2 * (limit + 1)
     video = torch.randint(0, 256, (n, 3, 32, 32), dtype=torch.uint8)
     frames, metadata = sampled(video, 2.0, model.video_processor)
@@ -542,7 +544,7 @@ def _encoder(max_segments: int):
         num_position_embeddings=16, out_hidden_size=64,
     )
     encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, (torch.zeros(1), torch.ones(1)))
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
+    encoder.vision = SimpleNamespace(reads={VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)})
     return encoder
 
 

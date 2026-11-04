@@ -29,7 +29,7 @@ def test_a_mixed_step_tracks_only_its_prefill_rows_prompt_tokens():
 
     step = llm.declare_step(LLM_MIXED, [0, 1], rows)
 
-    tracked = step.steps[SAMPLER].prefill_tracked_tokens
+    tracked = step.state[SAMPLER].prompt_tokens
     assert list(tracked) == [1] and tracked[1] is prompt
 
 

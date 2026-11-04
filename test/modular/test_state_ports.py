@@ -8,34 +8,56 @@ it, before and after a deployment's overrides.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import re
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, ".")
 
 import pytest
 import torch
 import yaml
+from test_gdn_tensor_parallel import tiny_config
+from torch import nn
 
+from mstar.distributed.communication import CommGroup
+from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnStep,
+    LinearAttnVariant,
+)
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
-from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep
+from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
-from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.engine.state import Layout, Span
-from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep, Layout, Span
+from mstar.engine.state.adapters import kv_layouts, node_handles, node_resources, sampling_configs
 from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.calls import ArrayHandle, causal_conv
 from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
     CONV,
@@ -45,15 +67,17 @@ from mstar.model.qwen3_5.config import (
     LINEAR_ATTENTION,
     LINEAR_ATTN,
     LLM_MIXED,
-    ROPE,
     SAMPLER,
     VISION_ATTN,
     Qwen3_5Config,
+    Qwen3_5VisionConfig,
 )
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, LLMSubmodule, VisionEncoderSubmodule
 from mstar.model.registry import MODEL_REGISTRY
 from mstar.model.submodule_base import ARNodeInputs, engine_step
 
+ROPE = "rope"
 _MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
 
 # The published geometries (Qwen/Qwen3.5-0.8B, -9B and -27B `config.json`), so these tests need no download.
@@ -289,15 +313,256 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_only_positions_and_the_sampler_by_hand():
+def test_qwen3_5_writes_no_spec_by_hand():
+    assert _qwen3_5(**QWEN3_5["9B"]).get_node_resources() == []
+
+
+# The tower of Qwen/Qwen3.5-9B's `config.json`
+_VISION = dict(
+    depth=27, hidden_size=1152, intermediate_size=4304, num_heads=16, in_channels=3, patch_size=16,
+    temporal_patch_size=2, spatial_merge_size=2, num_position_embeddings=576, out_hidden_size=4096,
+)
+
+
+def _qwen3_5_vision(monkeypatch) -> Qwen3_5DenseModel:
     model = _qwen3_5(**QWEN3_5["9B"])
-    assert {spec.resource_key for spec in model.get_node_resources()} == {ROPE, SAMPLER}
+    model.vision_config = Qwen3_5VisionConfig(**_VISION)
+    # the image processor's numbers, which `Qwen3_5DenseModel.image_processor` reads off the checkpoint
+    processor = SimpleNamespace(size={"shortest_edge": 65536}, patch_size=16)
+    monkeypatch.setattr(Qwen3_5DenseModel, "image_processor", processor)
+    return model
 
 
-def test_qwen3_5_keeps_its_vision_attention_by_hand(monkeypatch):
-    vision = SamplerSpec(resource_key=VISION_ATTN, nodes={"vision_encoder"}, vocab_size=1)
-    monkeypatch.setattr(Qwen3_5DenseModel, "_vision_resources", lambda self: [vision])
-    assert vision in node_resources(_qwen3_5(**QWEN3_5["9B"]))
+def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
+    vision, processor = model.vision_config, model.image_processor
+    min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
+    return RaggedAttentionSpec(
+        resource_key=VISION_ATTN, nodes={"vision_encoder"},
+        config=RaggedAttentionConfig(
+            num_qo_heads=vision.num_heads,
+            num_kv_heads=vision.num_heads,
+            head_dim=vision.head_dim,
+            max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches,
+            compile_op=True,
+        ),
+    )
+
+
+def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
+    model = _qwen3_5_vision(monkeypatch)
+    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
+    _assert_equal_per_key(node_resources(model), reference)
+    assert state_declaration_problems(model) == []
+
+
+def test_a_yaml_override_of_the_vision_ceiling_still_holds(monkeypatch):
+    model = _qwen3_5_vision(monkeypatch)
+    overrides = {"resources": {VISION_ATTN: {"max_segments_per_step": 3}}}
+    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
+    apply_yaml_overrides(reference, overrides)
+    specs = serving_resources(model, overrides)
+    _assert_equal_per_key(specs, reference)
+    assert {spec.resource_key: spec for spec in specs}[VISION_ATTN].config.max_segments_per_step == 3
+
+
+def _qwen3_5_reference_step(walk, rids, inputs, prefill_tokens, kept_rids, advance) -> SubmoduleStep:
+    return SubmoduleStep(
+        segments=[
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(rids, inputs, strict=True)
+        ],
+        steps={
+            KV_CACHE: KVStep(),
+            ATTN: AttentionStep(causal=True),
+            GDN_STATE: RecurrentStep(),
+            LINEAR_ATTN: LinearAttnStep(),
+            SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens, kept_rids=kept_rids),
+            ROPE: PositionStep(advance=advance),
+        },
+    )
+
+
+def _qwen3_5_llm(model) -> LLMSubmodule:
+    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset()))
+    return _bind(llm, model)
+
+
+def _last_prefill(*rids) -> dict:
+    return {rid: SimpleNamespace(step_metadata={"last_prefill": True}) for rid in rids}
+
+
+def test_qwen3_5_decode_step_equals_the_hand_written_one():
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    rids, inputs = [1, 2], [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)]
+    step = engine_step(llm, graph_walk="decode", request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _qwen3_5_reference_step("decode", rids, inputs, {}, None, None))
+
+
+def test_qwen3_5_prefill_text_step_equals_the_hand_written_one():
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    rids = [1, 2]
+    inputs = [ARNodeInputs(input_seq_len=n, input_ids=torch.arange(n)) for n in (5, 3)]
+    step = engine_step(
+        llm, graph_walk="prefill_text", request_ids=rids, inputs=inputs, per_request_info=_last_prefill(2),
+    )
+    tokens = {1: inputs[0].input_ids, 2: inputs[1].input_ids}
+    _assert_steps_equal(step, _qwen3_5_reference_step("prefill_text", rids, inputs, tokens, frozenset({2}), None))
+
+
+def test_qwen3_5_mixed_step_equals_the_hand_written_one():
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    rids = [1, 2, 3]
+    inputs = [
+        ARNodeInputs(input_seq_len=1, graph_walk="decode"),
+        ARNodeInputs(input_seq_len=3, input_ids=torch.arange(3), graph_walk="prefill_text"),
+        ARNodeInputs(input_seq_len=2, input_ids=torch.arange(2), graph_walk="prefill_text"),
+    ]
+    step = engine_step(llm, graph_walk=LLM_MIXED, request_ids=rids, inputs=inputs, per_request_info=_last_prefill(3))
+    tokens = {2: inputs[1].input_ids, 3: inputs[2].input_ids}
+    _assert_steps_equal(step, _qwen3_5_reference_step(LLM_MIXED, rids, inputs, tokens, frozenset({1, 3}), None))
+
+
+@_ALL_FULL_SHAPES
+def test_qwen3_5_all_full_steps_equal_the_hand_written_ones(overrides):
+    llm = _qwen3_5_llm(_qwen3_5(**{**_ALL_FULL, **overrides}))
+    rids, inputs = [1, 2], [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)]
+    step = engine_step(llm, graph_walk="decode", request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _qwen3_5_reference_step("decode", rids, inputs, {}, None, None))
+    inputs = [ARNodeInputs(input_seq_len=n, input_ids=torch.arange(n)) for n in (5, 3)]
+    step = engine_step(
+        llm, graph_walk="prefill_text", request_ids=rids, inputs=inputs, per_request_info=_last_prefill(2),
+    )
+    tokens = {1: inputs[0].input_ids, 2: inputs[1].input_ids}
+    _assert_steps_equal(step, _qwen3_5_reference_step("prefill_text", rids, inputs, tokens, frozenset({2}), None))
+
+
+@_ALL_FULL_SHAPES
+def test_a_step_opens_and_closes_an_all_full_gdn_handle_with_no_layer_to_update(overrides):
+    model = _qwen3_5(**{**_ALL_FULL, **overrides})
+    resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
+    handle = node_handles(model, "LLM", resources)[GDN_STATE]
+    step = SubmoduleStep(segments=[Segment(1, "main", 1)], state={GDN_STATE: ArrayStep()})
+    step.set_ctx(StepContext((1,), "decode", 0, False))
+    handle.begin_step(step)
+    handle.check_step(step)
+    with pytest.raises(ValueError, match=r"Array 'gdn_state': no field 'conv' on layer 0, of layers \[\]"):
+        causal_conv(handle, 0, torch.zeros(1), weight=torch.zeros(1))
+    handle.end_step(step)
+
+
+@_ALL_FULL_SHAPES
+def test_qwen3_5_all_full_layout_converts_to_the_hand_written_one(overrides):
+    model = _qwen3_5(**{**_ALL_FULL, **overrides})
+    span = Span("ids", "prefill_text", 7, 7, "text_inputs")
+    layout = Layout(spans=(span,), growth=(("decode_loop", 1),))
+    converted = kv_layouts(model.declare_state(), {KV_CACHE: {"main": layout}, GDN_STATE: {"main": Layout()}}, {})
+    reference = {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
+    assert converted == reference, "a Value with no layers should still drop from the layouts"
+
+
+def test_qwen3_5_prefill_vision_step_equals_the_hand_written_one():
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    rids = [1]
+    tokens = torch.arange(4)
+    inputs = [ARNodeInputs(input_seq_len=9, tensor_inputs={"mrope_advance": 6, "text_token_ids": tokens})]
+    step = engine_step(llm, graph_walk="prefill_vision", request_ids=rids, inputs=inputs, per_request_info={})
+    _assert_steps_equal(
+        step, _qwen3_5_reference_step("prefill_vision", rids, inputs, {1: tokens}, frozenset(), (6,)),
+    )
+
+
+def _qwen3_5_encoder(monkeypatch) -> VisionEncoderSubmodule:
+    model = _qwen3_5_vision(monkeypatch)
+    encoder = VisionEncoderSubmodule(torch.nn.Linear(1, 1), model.vision_config, (torch.zeros(1), torch.ones(1)))
+    return _bind(encoder, model, "vision_encoder")
+
+
+def test_qwen3_5_vision_step_equals_the_hand_written_one(monkeypatch):
+    encoder = _qwen3_5_encoder(monkeypatch)
+    rids = [1, 2]
+    inputs = [SimpleNamespace(tensor_inputs={"seq_lengths": lengths}) for lengths in ((4, 4), (8,))]
+    step = engine_step(encoder, graph_walk="prefill_vision", request_ids=rids, inputs=inputs)
+    reference = SubmoduleStep(
+        segments=[Segment(1, "main", 4), Segment(1, "main", 4), Segment(2, "main", 8)],
+        steps={VISION_ATTN: AttentionStep(causal=False)},
+    )
+    _assert_steps_equal(step, reference)
+
+
+def test_qwen3_5_leased_vision_step_declares_none_as_it_did(monkeypatch):
+    encoder = _qwen3_5_encoder(monkeypatch)
+    leases = {VISION_BLOCK_LOOP: object()}
+    step = engine_step(encoder, graph_walk="prefill_vision", request_ids=[1], inputs=[], piecewise_leases=leases)
+    assert step is None
+
+
+def test_qwen3_5_vision_region_steps_equal_the_hand_written_ones(monkeypatch):
+    encoder = _qwen3_5_encoder(monkeypatch)
+    config = encoder.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.bfloat16)[VISION_BLOCK_LOOP]
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._config, runner._lora_keys, runner._state_handles = config, (), encoder.state_handles
+    step = runner._region_step([7], [3, 5])
+    reference = PiecewisePackedConfig(
+        capture_fn=config.capture_fn, make_static_inputs=config.make_static_inputs, attn_key=VISION_ATTN,
+        lease_before_step=True, one_row_per_step=True, total_tokens=config.total_tokens, capture_batch_sizes=[1],
+    ).region_step([7], [3, 5])
+    _assert_steps_equal(step, reference)
+
+
+def test_qwen3_5_vision_capture_check_reads_the_ceiling_in_effect(monkeypatch):
+    encoder = _qwen3_5_encoder(monkeypatch)
+    encoder.vision.reads[VISION_ATTN].max_segments_per_step = 2
+    assert encoder._fits_replay(16, 2) and not encoder._fits_replay(16, 3), "a YAML override should hold"
+
+
+def test_qwen3_5_process_prompt_declares_the_hand_written_layout(monkeypatch):
+    model = _qwen3_5(**QWEN3_5["9B"])
+    model.vision_config = SimpleNamespace(spatial_merge_size=2)
+    model.tokenizer = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: "hello", convert_tokens_to_ids=lambda token: None, unk_token_id=0,
+    )
+    monkeypatch.setattr("mstar.model.qwen3_5.qwen3_5_model.encode_ids", lambda tokenizer, text: [1, 2, 3])
+    metadata = model.process_prompt("hello", ["text"], ["text"]).metadata
+    span = Span("ids", "prefill_text", 3, 3, "text_inputs")
+    assert metadata["state_layout"] == {
+        KV_CACHE: {"main": Layout(spans=(span,), growth=(("decode_loop", 1),))},
+        GDN_STATE: {"main": Layout()},
+    }
+    assert "keyed_spans" not in metadata, "a text prompt keys every span"
+
+
+def test_qwen3_5_text_layout_converts_to_the_hand_written_one():
+    model = _qwen3_5(**QWEN3_5["9B"])
+    span = Span("ids", "prefill_text", 7, 7, "text_inputs")
+    layout = Layout(spans=(span,), growth=(("decode_loop", 1),))
+    converted = kv_layouts(model.declare_state(), {KV_CACHE: {"main": layout}, GDN_STATE: {"main": Layout()}}, {})
+    reference = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
+    assert converted == {KV_CACHE: {"main": reference}}, "a Value's layout should drop, and the KV's convert"
+    assert converted[KV_CACHE]["main"].row() == reference.row()
+
+
+def test_qwen3_5_vision_layout_converts_to_the_hand_written_one_with_no_keyed_spans():
+    model = _qwen3_5(**QWEN3_5["9B"])
+    spans = (
+        Span("ids", "prefill_vision", 2, 2, "text_inputs"),
+        Span("digest", "prefill_vision", 6, 4, ("image", 0)),
+    )
+    layout = Layout(spans=spans, growth=(("decode_loop", 1),))
+    converted = kv_layouts(
+        model.declare_state(), {KV_CACHE: {"main": layout}, GDN_STATE: {"main": Layout()}}, {KV_CACHE: {"main": 0}},
+    )[KV_CACHE]["main"]
+    reference = LabelLayout(spans=spans, growth=(("decode_loop", 1),), keyed_spans=0)
+    assert converted == reference
+    assert converted.keyed_count() == 0, "the data worker refuses a keyed span from any walk but prefill_text"
+    assert converted.row() == reference.row(), "the one-walk check runs in row(), and the conductor reads what it gives"
+
+
+def test_qwen3_5_request_settings_equal_the_hand_written_config():
+    model = _qwen3_5(**QWEN3_5["9B"])
+    kwargs = {"temperature": 0.0, "top_p": 0.5, "top_k": 3, "repetition_penalty": 1.3, "ignore_eos": True, "seed": 9}
+    configs = sampling_configs(model.get_request_resource_configs({}, kwargs), model.declare_state())
+    reference = SamplingReqConfig(temperature=0.0, top_p=0.5, top_k=3, repetition_penalty=1.3, ignore_eos=True)
+    assert configs == {SAMPLER: reference}
 
 
 @pytest.mark.parametrize("size", QWEN3_5)
@@ -307,9 +572,177 @@ def test_qwen3_5_declarations_have_no_problems(size):
 
 def test_qwen3_5_declares_the_conv_update_beside_the_delta_net_with_no_spec_of_its_own():
     model = _qwen3_5(**QWEN3_5["9B"])
-    gdn = next(array for array in model.declare_state() if array.name == GDN_STATE)
+    gdn = next(declared for declared in model.declare_state() if declared.name == GDN_STATE)
     assert set(gdn.updates) == {CONV, LINEAR_ATTN}
     assert CONV not in {spec.resource_key for spec in node_resources(model)}
+
+
+# Qwen3.5's real stack on handles
+
+
+class _QwenKV:
+    def __init__(self, array):
+        self.pages = torch.zeros(len(array.layers), 8, 2, *array.entry.tensors["k"].shape)
+
+    def layer_view(self, i):
+        return self.pages[i]
+
+    def write_kv(self, k, v, layer_idx=None, label=None):
+        pass
+
+    def opens_label(self, rid, label):
+        return True
+
+
+class _QwenPool:
+    def __init__(self, array):
+        self.blocks = {
+            field: torch.zeros(len(array.layers), 8, *tensor.shape) for field, tensor in array.entry.tensors.items()
+        }
+
+    def block(self, field, i):
+        return self.blocks[field][i]
+
+
+class _QwenAttn:
+    requires_kv_write = True
+
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        return q.clone()
+
+
+class _QwenLinear:
+    def run_conv(self, x, conv_layer, weight, bias, label):
+        return x.clone()
+
+    def run(self, q, k, v, a, b, state_layer, a_log, dt_bias, label):
+        return v.clone()
+
+
+def _next_step(*handles) -> None:
+    step = SubmoduleStep(segments=[Segment(1, "main", 3)], state={h.name: ArrayStep() for h in handles})
+    step.set_ctx(StepContext((1,), "decode", 0, False))
+    for handle in handles:
+        handle.end_step(step)
+        handle.begin_step(step)
+
+
+def _qwen3_5_stack(blocks: int = 2):
+    """``blocks`` of three delta-net layers and one full-attention layer, so a frame reused across layers shows."""
+    layer_types = ([LINEAR_ATTENTION] * 3 + [FULL_ATTENTION]) * blocks
+    config = replace(
+        tiny_config(), num_hidden_layers=len(layer_types), layer_types=layer_types, mrope_section=[6, 5, 5],
+    )
+    model = Qwen3_5ForCausalLM(config, CommGroup(0, 0, [0])).eval()
+    generator = torch.Generator().manual_seed(0)
+    for parameter in model.parameters():  # the model's own parameters start uninitialized
+        parameter.data.normal_(0, 0.02, generator=generator)
+    declared = {d.name: d for d in Qwen3_5DenseModel.declare_state(SimpleNamespace(config=config, vision_config=None))}
+    kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
+    kv = ArrayHandle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, ROPE)
+    gdn = ArrayHandle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()}, None)
+    for module in model.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})
+    _next_step(kv, gdn)
+    return config, model, kv, gdn
+
+
+def _tables(model, ids) -> tuple[torch.Tensor, torch.Tensor]:
+    positions_3d = torch.arange(len(ids)).unsqueeze(0).expand(3, -1)
+    return model.model.build_cos_sin(positions_3d, dtype=model.model.embed_tokens.weight.dtype)
+
+
+@torch.no_grad()
+def test_each_qwen3_5_layer_names_itself_to_its_handle_by_its_id_in_the_stack():
+    config, model, kv, gdn = _qwen3_5_stack()
+    seen = []
+    kv._record_add = lambda layer, keep: seen.append(("add", layer))
+    kv._record_read = lambda layer: seen.append(("read", layer))
+    gdn._record_update = lambda field, layer: seen.append((field, layer))
+    ids = torch.tensor([1, 2, 3])
+    model(ids, cos_sin=_tables(model, ids))
+    expected = []
+    for layer, kind in enumerate(config.layer_types):
+        calls = ("conv", "state") if kind == LINEAR_ATTENTION else ("add", "read")
+        expected += [(call, layer) for call in calls]
+    assert seen == expected
+
+
+@torch.no_grad()
+def test_a_qwen3_5_stack_compiled_as_a_capture_compiles_no_frame_per_layer():
+    """A capture compiles with `dynamic=False`, where a module's int specializes per layer and hits the recompile limit,
+    and the frames then run uncompiled."""
+    torch._dynamo.reset()
+    config, model, kv, gdn = _qwen3_5_stack()
+    guards = []
+    frames = []
+
+    def backend(graph_module, inputs):
+        frames.append(graph_module)
+        return graph_module.forward
+
+    optimize = torch._dynamo.optimize(backend, dynamic=False, guard_fail_fn=lambda f: guards.append(str(f.reason)))
+    compiled = optimize(model)
+    ids = torch.tensor([1, 2, 3])
+    tables = _tables(model, ids)
+    expected = model(ids, cos_sin=tables)
+    _next_step(kv, gdn)
+    actual = compiled(ids, cos_sin=tables)
+    assert torch.allclose(actual, expected), "the compiled stack should run what the eager one does"
+    assert not [guard for guard in guards if "layer" in guard], "one frame should serve every layer"
+    first_call = len(frames)
+    _next_step(kv, gdn)
+    with torch.compiler.set_stance("fail_on_recompile"):
+        compiled(ids, cos_sin=tables)
+    assert len(frames) == first_call, "a capture's stance raises on any new compile"
+
+
+def _compiled_frames(blocks: int) -> int:
+    torch._dynamo.reset()
+    _, model, _, _ = _qwen3_5_stack(blocks)
+    frames = []
+
+    def backend(graph_module, inputs):
+        frames.append(graph_module)
+        return graph_module.forward
+
+    ids = torch.tensor([1, 2, 3])
+    torch._dynamo.optimize(backend, dynamic=False)(model)(ids, cos_sin=_tables(model, ids))
+    return len(frames)
+
+
+@torch.no_grad()
+def test_a_longer_qwen3_5_stack_compiles_no_more_frames():
+    """The loop stays eager and each layer's frame is reused, as `run_layers` needs its cursor to make them."""
+    assert _compiled_frames(blocks=4) == _compiled_frames(blocks=2) > 1
+
+
+def test_the_frame_around_qwen3_5s_stack_is_marked_for_dynamo_to_skip():
+    """It holds no tensor work, and would otherwise recompile on every shape. Read from the source, since
+    `torch._dynamo.reset` clears a mark. `test_a_frame_marked_eager_is_skipped_and_what_it_calls_compiles` shows what
+    the mark does."""
+    source = ast.parse(inspect.getsource(Qwen3_5LanguageModel))
+    forward = next(n for n in ast.walk(source) if isinstance(n, ast.FunctionDef) and n.name == "forward")
+    assert [decorator.id for decorator in forward.decorator_list] == ["eager_frame"]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("walk, last_token", [("prefill_text", True), ("decode", False)])
+def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk, last_token):
+    llm = LLMSubmodule.__new__(LLMSubmodule)
+    nn.Module.__init__(llm)
+    hidden = torch.randn(3, 4)
+    llm.model = SimpleNamespace(model=lambda embeds, cos_sin: hidden, lm_head=lambda x: x)
+    llm.model.model = Mock(return_value=hidden, embed_tokens=lambda ids: ids)
+    llm.kv, llm.sampler = object(), object()
+    monkeypatch.setattr(LLMSubmodule, "_rope_in_graph", lambda *args: False)
+    taken = []
+    monkeypatch.setattr("mstar.model.qwen3_5.submodules.at_last_token", lambda h, x: taken.append(h) or x[-1:])
+    monkeypatch.setattr("mstar.model.qwen3_5.submodules.sample", lambda s, logits: logits)
+    logits = llm._forward(walk, None, torch.ones(1), torch.ones(1), input_ids=torch.tensor([1, 2, 3]))
+    assert (taken == [llm.kv]) is last_token
+    assert logits.shape[0] == (1 if last_token else 3)
 
 
 _FIXTURE = Path("mstar/model/command_a_plus/tests/fixtures/tiny_config.json")
