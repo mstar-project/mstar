@@ -61,6 +61,7 @@ from mstar.model.minicpm_o.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
 
@@ -403,10 +404,12 @@ class MiniCPMOModel(Model):
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel(growth=(("decode", DECODE_LOOP),))}}
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == TEXT:
-            ids = [t for t in output.reshape(-1).tolist() if t not in self.config.stop_token_ids]
-            return self.tokenizer.decode(ids).encode("utf-8")
+            return super().postprocess(output, modality, request_kwargs)
         raise ValueError(f"Unsupported modality for MiniCPM-o: {modality!r}")
 
     # ------------------------------------------------------------------

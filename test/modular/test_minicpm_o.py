@@ -243,9 +243,14 @@ def test_initial_walk_feeds_every_input_its_node_reads(model, tensors, walk):
 
 
 @needs_ckpt
-def test_postprocess_drops_stop_tokens(model):
-    ids = model.tokenizer.encode("Paris.", add_special_tokens=False) + list(model.config.stop_token_ids)
-    assert model.postprocess(torch.tensor(ids), "text") == b"Paris."
+def test_text_streamed_a_token_at_a_time_reassembles(model):
+    """Each decode step's token reaches the client alone: a character split
+    across tokens must join back whole, and the stop tokens are dropped."""
+    text = "Paris 🐱猫."
+    ids = model.tokenizer.encode(text, add_special_tokens=False) + list(model.config.stop_token_ids)
+    chunks = model.postprocess_inline(ids, "text", [None] * len(ids))
+    assert b"".join(chunks).decode("utf-8") == text
+    assert model.postprocess(torch.tensor(ids), "text") == text.encode("utf-8")
 
 
 @needs_ckpt
