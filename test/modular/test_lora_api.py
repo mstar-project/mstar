@@ -577,13 +577,15 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
     d = _Deployment(paths)
     other = tmp_path / "notes.txt"
     other.write_text("not an adapter")
+    model = tmp_path / "model.safetensors"
+    save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}, str(model))
     answers = set()
-    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path)):
+    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path), str(model)):
         with pytest.raises(REFUSED) as err:
             d.load("x", path)
         assert _status(err.value) == 400 and str(tmp_path) not in _message(err.value)
         answers.add(_message(err.value))
-    # a missing file, a file of another kind and a directory read the same
+    # a missing file, a file of another kind, a directory and a model's weights read the same
     assert len(answers) == 1 and "could not be read" in answers.pop()
     # an adapter the deployment cannot serve is refused with its reason, before any worker
     wide = tmp_path / "wide.safetensors"

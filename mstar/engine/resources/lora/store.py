@@ -13,7 +13,12 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
+from mstar.engine.resources.lora.checkpoint import (
+    normalize_lora_key,
+    parse_lora_key,
+    read_lora_file,
+    refuse_non_adapter,
+)
 from mstar.engine.resources.lora.config import (
     AdapterInfo,
     LoraSpec,
@@ -165,6 +170,10 @@ def check_adapter_file(
     from the checkpoint's header; returns its digest. The digest is read once per way the
     specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.
     Raises ``ValueError`` for an adapter the deployment cannot serve."""
+    from safetensors import safe_open
+
+    with safe_open(path, "pt") as f:
+        refuse_non_adapter(f.keys())
     digests: dict = {}  # convert_keys -> the digest of the file read that way
     for each in (spec, *others):
         each.check_adapter(name, inspect_adapter(each, path))
