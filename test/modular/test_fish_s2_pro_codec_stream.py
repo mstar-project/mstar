@@ -374,6 +374,32 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
         torch.testing.assert_close(got_state[name], eager_state[name], atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled codec decode runs on CUDA")
+def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(config):
+    """The codec captures only its small batch buckets, and a larger step runs the
+    compiled decode eagerly on fresh tensors where the captures passed views of their
+    static buffers. The region's warm-up (``compile_regions``) compiles that call, as
+    the engine runs it before capturing, so a live step does not stall on a compile."""
+    submodule = CodecSubmodule(random_decoder(config).float().cuda(), config)
+    torch._dynamo.reset()
+    compiled = torch.compile(submodule.incremental, dynamic=True)
+    blocks = submodule.incremental.state_blocks()
+
+    def state(rows):
+        return {n: torch.zeros(rows, *b.shape, dtype=b.dtype, device="cuda") for n, b in blocks.items()}
+
+    with torch.no_grad():
+        for args in submodule.compile_regions()["incremental"]:
+            compiled(*args)
+        # the captures: views of one static buffer, at their bucket sizes
+        static = torch.zeros(8, config.num_codebooks, max(submodule.windows), dtype=torch.long, device="cuda")
+        for rows, width in ((1, 2), (2, 3), (4, 5)):
+            compiled(static[:rows, :, :width], state(rows), torch.full((rows,), width, device="cuda"))
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            codes = torch.zeros(6, config.num_codebooks, 3, dtype=torch.long, device="cuda")
+            compiled(codes, state(6), torch.full((6,), 3, device="cuda"))
+
+
 def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(config, decoder):
     submodule = CodecSubmodule(decoder, config)
     codes = {"a": stream_codes(23, seed=3), "b": stream_codes(77, seed=4), "c": stream_codes(5, seed=5)}

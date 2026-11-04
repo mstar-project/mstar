@@ -931,6 +931,19 @@ Fish Audio S2-Pro notes
   the earlier windowed codec, not yet on the frame-once codec. With
   ``model_kwargs: {codec_exact_fp32: true}`` it runs in fp32 with TF32 off and
   the streamed audio matches the whole-utterance decode to within one int16 step.
+- Start-up and memory. The codec captures CUDA graphs only for steps of at most
+  64 frames (batch rows times chunk width, ``CodecSubmodule.CAPTURE_MAX_FRAMES``),
+  14 of its 24 buckets; a larger step runs the compiled decode eagerly. Against
+  capturing all 24, on one H200 (three warm boots of the 64-frame cap, one of
+  everything else; throughput over two repeats of 104 short sentences):
+  start-up 150 s from cold compile caches and 84 to 88 s warm, against 278 s and
+  146 s; 52.1 GiB of GPU memory in use after start-up, against 59.7 GiB; 50.2 to
+  50.6 audio-s/s at 16 requests (2 to 3% less than 51.7) and 77.3 to 79.4 at 32
+  (77.0), with the same TTFA p50 (101 to 106 ms at 16, 122 to 127 ms at 32). A
+  128-frame cap (18 buckets) starts in 118 to 122 s warm and loses under 1% at
+  16 requests. cuDNN's algorithm search for the captured convs
+  (``capture_cudnn_benchmark``) is about 20 s of a warm start-up with every
+  bucket captured.
 
 VoxCPM2 notes
 -------------

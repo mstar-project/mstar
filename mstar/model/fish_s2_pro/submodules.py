@@ -383,6 +383,11 @@ class CodecSubmodule(ARNodeSubmodule):
     capture_cudnn_benchmark = True
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     MAX_BATCH_SIZE = CAPTURE_BATCH_SIZES[-1]
+    # Captured only up to this many frames a step (rows x chunk width), 14 of the 24 buckets:
+    # each bucket costs start-up time (cuDNN times its convs) and graph memory, and on an H200
+    # the larger steps lose little run eagerly (the Fish notes in docs/models.rst). They run
+    # the compiled decode, warmed at start-up (``compile_regions``).
+    CAPTURE_MAX_FRAMES = 64
 
     def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = False):
         super().__init__()
@@ -405,8 +410,18 @@ class CodecSubmodule(ARNodeSubmodule):
     def compile_regions(self) -> dict[str, list[tuple]]:
         """The incremental decode, compiled once for every bucket: Inductor fuses
         the time-major Snake activations, norms and adds between the convs,
-        which eagerly are most of the decode's GPU time."""
-        return {"incremental": []}
+        which eagerly are most of the decode's GPU time. Warmed on fresh tensors,
+        as an uncaptured step passes them (the captures pass views of their static
+        buffers), at two batch and chunk sizes: the second compiles the decode for
+        every size, so a live uncaptured step compiles nothing."""
+        device, blocks = self.get_device(), self.incremental.state_blocks()
+
+        def example(rows, width):
+            state = {name: torch.zeros(rows, *b.shape, dtype=b.dtype, device=device) for name, b in blocks.items()}
+            codes = torch.zeros(rows, self.config.num_codebooks, width, dtype=torch.long, device=device)
+            return codes, state, torch.full((rows,), width, dtype=torch.long, device=device)
+
+        return {"incremental": [example(2, self.windows[0]), example(3, self.windows[-1])]}
 
     def _bucket(self, frames: int) -> int:
         """Smallest captured chunk width that holds ``frames``."""
@@ -564,7 +579,8 @@ class CodecSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Every chunk width for every batch bucket, widest first."""
+        """Every chunk width, widest first, for the batch buckets of at most
+        ``CAPTURE_MAX_FRAMES`` frames."""
         del tp_world_size
         return [
             BatchedAcceleratorGraphConfig(
@@ -578,7 +594,9 @@ class CodecSubmodule(ARNodeSubmodule):
                     kwargs={"frames": width},
                 ),
                 additional_key_info=width,
-                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                capture_batch_sizes=[bs for bs in self.CAPTURE_BATCH_SIZES if bs * width <= self.CAPTURE_MAX_FRAMES],
+                # an acceleration subset: MAX_BATCH_SIZE caps the batch, eagerly past these
+                caps_eager_batch_size=False,
                 input_seq_dims={"codec_tokens": 0, "lengths": 0},
                 # the decode inside is compiled already
                 compile=False,
