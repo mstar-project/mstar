@@ -819,7 +819,9 @@ The spec types are:
        (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
        the resource its gates as it binds: with Kimi K3's full-rank output gate
        (``full_rank_output_gate``), or a forget-gate bound the fused kernels can't hold,
-       the resource runs the torch reference.
+       the resource runs the torch reference. Its prefill can't be captured
+       (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
+       bucket on it and the model leaves those buckets out.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
@@ -2677,6 +2679,9 @@ its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<o
 on a shared component gets them without code of its own: the component looks its shape up once
 per process and keeps the default config where no table has it, and the server logs the sweep
 command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
+count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
+GPU's row names one that runs there.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.

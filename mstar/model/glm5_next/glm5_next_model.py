@@ -53,6 +53,7 @@ from mstar.model.glm5_next.config import (
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
+    capture_ladder,
     check_loaded,
     load_snapshot_tokenizer,
     process_weights_after_loading,
@@ -91,17 +92,24 @@ class Glm5NextModel(Model):
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
-            k = int(kwargs["mtp_num_draft_tokens"])
-            if k < 0:
-                # the cache rows are max_seq_len * (k + 1): -1 divides by zero, less goes negative
-                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            k = kwargs["mtp_num_draft_tokens"]
+            # the cache rows are max_seq_len * (k + 1), and a prompt leaves two verify blocks of
+            # index_topk free: k must leave room for both
+            if (isinstance(k, bool) or not isinstance(k, int) or k < 0
+                    or self.config.index_topk - 2 * (k + 1) < 1):
+                raise ValueError(
+                    f"mtp_num_draft_tokens must be an integer from 0 (off) to "
+                    f"{(self.config.index_topk - 3) // 2}, got {k!r}")
             self.config.mtp_num_draft_tokens = k
         if "prefill_graphs" in kwargs:
-            self.config.prefill_graphs = bool(kwargs["prefill_graphs"])
+            # bool("false") is True
+            if not isinstance(kwargs["prefill_graphs"], bool):
+                raise ValueError(f"prefill_graphs must be true or false, got {kwargs['prefill_graphs']!r}")
+            self.config.prefill_graphs = kwargs["prefill_graphs"]
         # overrides of the submodule's buckets, which **kwargs would otherwise swallow
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
+                setattr(self.config, key, capture_ladder(key, kwargs[key]))
         long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
                            if k in kwargs)
         if long_only and not kwargs.get("dsa_long_context", False):
