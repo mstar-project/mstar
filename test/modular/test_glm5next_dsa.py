@@ -236,7 +236,8 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _engine(long_context: bool, window: int = 8192, seed: int = 0):
+def _engine(long_context: bool, window: int = 8192, seed: int = 0, pages: int | None = None):
+    """``pages``: a pool of that many 8-token pages (the sink among them)."""
     torch.manual_seed(seed)
     cfg = Glm5NextModelConfig.reduced_long_context(max_seq_len=1024)
     cfg = dataclasses.replace(cfg, dsa_long_context=long_context, prefill_window_tokens=window)
@@ -250,9 +251,13 @@ def _engine(long_context: bool, window: int = 8192, seed: int = 0):
     process_weights_after_loading(lm, torch.device("cpu"))
     lm.eval()
     sub = Glm5NextLLMSubmodule(lm, cfg)
+    specs = model.get_node_resources()
+    if pages is not None:
+        next(s for s in specs if s.resource_key == KV_CACHE).config.apply_yaml_overrides(
+            page_size=8, max_num_pages=pages)
     engine = Engine(None)
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -433,3 +438,38 @@ def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatc
         submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
         resources={"dsa": resource})
     assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
+
+
+def _admits(engine, rid, token, it) -> bool:
+    """Whether one decode step of ``rid`` alone admits."""
+    info = CurrentForwardPassInfo(
+        request_id=f"wire-{rid}", rid_handle=rid, graph_walk="decode", fwd_index=0, random_seed=0,
+        max_tokens=4096, resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
+        dynamic_loop_iter_counts={"decode_loop": it})
+    batch = ExecutingBatch(
+        node_name="LLM", per_request_info={rid: info},
+        per_request_input_tensors={rid: {"text_inputs": [torch.tensor([token])]}},
+        per_request_input_metadata={rid: InputMetadata(dynamic_loop_iter_counts={"decode_loop": it})},
+        step_context=StepContext(request_ids=(rid,), graph_walk="decode", slot=0, capture=False),
+    )
+    engine.prepare_inputs(batch)
+    engine.exec_and_postprocess(batch)
+    engine.finalize_batch(batch)
+    return batch.admit_error is None
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "aux planes rule out cpu_offload_pages, so a full pool has no victim: once the live "
+    "contexts outgrow it, every decoding request waits on pages none of them frees; follow-up"))
+def test_a_full_pool_still_lets_a_decoding_request_finish():
+    """Two requests that together outgrow the pool: one must still decode on, or neither ever
+    frees its pages (the long-context yamls admit 64 requests to about one window's pages)."""
+    engine, _, _ = _engine(long_context=True, pages=8)  # 7 request pages beside the sink
+    for rid in "ab":
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    tokens = _step(engine, "prefill", {rid: torch.randint(0, 250, (20,)) for rid in "ab"})
+    live, it = set("ab"), 0
+    while live and it < 40:  # each takes a page every 8 tokens until none is left
+        live = {rid for rid in sorted(live) if _admits(engine, rid, tokens[rid], it)}
+        it += 1
+    assert any(_admits(engine, rid, tokens[rid], it) for rid in "ab")
