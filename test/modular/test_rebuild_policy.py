@@ -395,6 +395,24 @@ def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     assert allowance.left == 24 - 8, "the cached pages' writes would get less than the copies left them"
 
 
+def test_an_empty_input_queues_no_copy_and_holds_back_none_behind_it():
+    """`flush` took a copy off the queue only once it spent some of the step's allowance. A row that read an empty
+    tensor queued a copy that spent nothing, so it stayed at the head of the queue and no copy behind it ever
+    started."""
+    rebuilds = _copying(R)
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.zeros(0, 2), torch.ones(2, 2)]
+
+    rebuilds.keep_copies(step)
+    rebuilds.flush()
+
+    copies = rebuilds._kept[NODE][R].copies
+    assert copies.ready(), "the request's image would never land, so it could never be dropped"
+    assert [view.shape for view in copies.inputs["embeds"]] == [(0, 2), (2, 2)], (
+        "the rebuild row would read other inputs than its prefill row"
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_media_copy_split_across_two_steps_lands_whole():
     pool = HostPool(1 << 22, torch.device("cuda"))

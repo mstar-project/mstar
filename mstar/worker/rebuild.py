@@ -344,6 +344,9 @@ class Rebuilds:
             for name, tensor in tensors:
                 into = HostSlice(piece.offset + used, tensor.nbytes)
                 kept.copies.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
+                if not tensor.nbytes:
+                    # an empty copy spends no allowance, so `flush` would never take it off the queue
+                    continue
                 src = tensor.reshape(-1).view(torch.uint8)
                 self._queued.append(QueuedCopy(src, into, node_batch.completion_event, kept.copies))
                 kept.copies.queued += 1
