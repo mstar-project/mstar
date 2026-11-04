@@ -210,6 +210,19 @@ def test_the_voice_clip_takes_the_request_clips_mel(tmp_path):
     assert mel.shape[:2] == (1, model.config.audio.num_mel_bins) and torch.isfinite(mel).all()
 
 
+@pytest.mark.parametrize("as_turn", [False, True])
+def test_a_spoken_requests_own_system_prompt_is_refused(tmp_path, as_turn):
+    """A spoken reply's system message is its voice prompt, so a request's own (the kwarg
+    or a system turn) is refused, not dropped."""
+    from mstar.model.multimodal import PromptPart
+
+    parts, kwargs = [PromptPart("text", "Say hello.")], {"system_prompt": "Be brief."}
+    if as_turn:
+        parts, kwargs = [PromptPart("text", "Be brief.", role="system"), *parts], {}
+    with pytest.raises(ValueError, match="voice_prompt"):
+        a_model(tmp_path).process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, **kwargs)
+
+
 @pytest.mark.parametrize("size, grid, slices, placeholder", [
     # (width, height) -> the (cols, rows) grid, each slice's (h, w) in patches
     # (the source, then the crops) and the placeholder text, worked by hand
@@ -360,12 +373,6 @@ def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
     assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
     with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
-    # the voice prompt is the system message, so a request's own is refused, not dropped
-    with pytest.raises(ValueError, match="voice_prompt"):
-        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, system_prompt="Be brief.")
-    with pytest.raises(ValueError, match="voice_prompt"):
-        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=[
-            PromptPart("text", "Be brief.", role="system"), *parts])
 
 
 @needs_ckpt
