@@ -1991,7 +1991,7 @@ implementation on H100 GPUs:
   default and math SDPA kernels, both first flipping at the same frame.
   Batching changes rounding the same way.
 - Cancellation, recovery and malformed inputs (rejected with 400) are checked
-  on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
+  on a live server; a 20-minute mixed-load soak kept
   GPU memory flat.
 - The LM's generate step runs from CUDA graphs captured at batch sizes up to
   ``max_batch_size`` (conditioning frames run eagerly). On one H100 over HTTP

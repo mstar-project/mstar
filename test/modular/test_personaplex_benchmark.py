@@ -290,7 +290,6 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
     from mstar.communication.arena import ArenaShmCommunicationManager
     from mstar.communication.tensors import TensorCommunicationManager
     from mstar.engine.engine import Engine
-    from mstar.graph.runtime.python import PythonGraphRuntime
 
     class StubRustRuntime:
         def add_request(self, request_id, *args, **kwargs):
@@ -306,8 +305,6 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
     for cls, name in (
         (TensorCommunicationManager, "cleanup_collectable"),
         (TensorCommunicationManager, "force_cleanup_request"),
-        (PythonGraphRuntime, "cleanup_consumed_inputs"),
-        (PythonGraphRuntime, "add_request"),
         (Engine, "remove_request"),
         (APIServer, "submit_request"),
     ):
@@ -317,7 +314,6 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
                         lambda self, collectable, registered: arena_calls.append(collectable))
     monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_OBSERVE", "1")
     monkeypatch.setenv("PERSONAPLEX_OWNERSHIP_ROOT", str(tmp_path))
-    monkeypatch.setenv("PERSONAPLEX_LIVE_BACKEND", "rust")
     runpy.run_path(str(Path("benchmark/personaplex/observe/sitecustomize.py")))
 
     store = types.SimpleNamespace(

@@ -449,33 +449,30 @@ def main():
                 120,
             )
         )
-    for backend in ["rust"] if smoke else ["python", "rust"]:
-        name = "lifecycle-" + backend
-        scenarios.append(
-            (
-                name,
-                [
-                    sys.executable,
-                    "-m",
-                    "benchmark.personaplex.serving",
-                    "--settings",
-                    str(root / "settings.json"),
-                    "--output",
-                    str(root / name),
-                    "--manifest",
-                    str(root / "lifecycle-inputs.json"),
-                    "--backend",
-                    backend,
-                    "--mode",
-                    "smoke" if smoke else "lifecycle",
-                    # One request a step, so concurrent outputs must equal isolated ones exactly.
-                    "--max-batch-size",
-                    "1",
-                ],
-                1800,
-                180 if smoke else 360,
-            )
+    name = "lifecycle-rust"
+    scenarios.append(
+        (
+            name,
+            [
+                sys.executable,
+                "-m",
+                "benchmark.personaplex.serving",
+                "--settings",
+                str(root / "settings.json"),
+                "--output",
+                str(root / name),
+                "--manifest",
+                str(root / "lifecycle-inputs.json"),
+                "--mode",
+                "smoke" if smoke else "lifecycle",
+                # One request a step, so concurrent outputs must equal isolated ones exactly.
+                "--max-batch-size",
+                "1",
+            ],
+            1800,
+            180 if smoke else 360,
         )
+    )
     if not smoke:
         name = "soak-rust"
         scenarios.append(
@@ -491,8 +488,6 @@ def main():
                     str(root / name),
                     "--manifest",
                     str(root / "lifecycle-inputs.json"),
-                    "--backend",
-                    "rust",
                     "--mode",
                     "soak",
                 ],

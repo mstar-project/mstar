@@ -22,11 +22,9 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     import torch
 
     from mstar.communication.tensors import TensorCommunicationManager
-    from mstar.graph.runtime.python import PythonGraphRuntime
 
     root = Path(os.environ["PERSONAPLEX_OWNERSHIP_ROOT"])
     wire_ids = {}
-    track_request_ids(PythonGraphRuntime, wire_ids)
 
     from mstar.api_server.entrypoint import APIServer
 
@@ -75,54 +73,42 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
         with (root / ("ownership-events-" + str(os.getpid()) + ".jsonl")).open("a") as out:
             out.write(json.dumps(row) + "\n")
 
-    original_clean = PythonGraphRuntime.cleanup_consumed_inputs
+    from mstar.graph.runtime.rust import RustGraphRuntime
 
-    def consumed(self, node_name, rids, wg_ids):
-        result = original_clean(self, node_name, rids, wg_ids)
+    track_request_ids(RustGraphRuntime, wire_ids)
+    pending_decoder_rids = set()
+    rust_consumed = RustGraphRuntime.cleanup_consumed_inputs
+
+    def rust_cleanup(self, node_name, rids, wg_ids):
+        freed = rust_consumed(self, node_name, rids, wg_ids)
         if node_name == "MimiDecoder":
+            # Arena/Rust bookkeeping may already remove UUID->rid entries.
+            # The caller immediately passes these frees to cleanup_collectable
+            # (worker.py); retain the known request IDs across that boundary.
+            pending_decoder_rids.update(rids)
+        return freed
+
+    RustGraphRuntime.cleanup_consumed_inputs = rust_cleanup
+
+    def observe_collectable(cls):
+        original_collect = cls.__dict__["cleanup_collectable"]
+
+        def collected(self, collectable, registered):
+            result = original_collect(self, collectable, registered)
+            rids = set(pending_decoder_rids)
+            pending_decoder_rids.clear()
             for rid in rids:
-                snapshot(self._tensor_manager, "after_decoder_inputs_consumed", rid)
-        return result
+                snapshot(self, "after_decoder_inputs_consumed", rid)
+            return result
 
-    PythonGraphRuntime.cleanup_consumed_inputs = consumed
+        cls.cleanup_collectable = collected
 
-    if os.environ.get("PERSONAPLEX_LIVE_BACKEND") == "rust":
-        from mstar.graph.runtime.rust import RustGraphRuntime
+    # The SHM arena manager overrides cleanup_collectable without calling
+    # super(), so wrapping only the base class never fires under the arena.
+    from mstar.communication.arena import ArenaShmCommunicationManager
 
-        track_request_ids(RustGraphRuntime, wire_ids)
-        pending_decoder_rids = set()
-        rust_consumed = RustGraphRuntime.cleanup_consumed_inputs
-
-        def rust_cleanup(self, node_name, rids, wg_ids):
-            freed = rust_consumed(self, node_name, rids, wg_ids)
-            if node_name == "MimiDecoder":
-                # Arena/Rust bookkeeping may already remove UUID->rid entries.
-                # The caller immediately passes these frees to cleanup_collectable
-                # (worker.py); retain the known request IDs across that boundary.
-                pending_decoder_rids.update(rids)
-            return freed
-
-        RustGraphRuntime.cleanup_consumed_inputs = rust_cleanup
-
-        def observe_collectable(cls):
-            original_collect = cls.__dict__["cleanup_collectable"]
-
-            def collected(self, collectable, registered):
-                result = original_collect(self, collectable, registered)
-                rids = set(pending_decoder_rids)
-                pending_decoder_rids.clear()
-                for rid in rids:
-                    snapshot(self, "after_decoder_inputs_consumed", rid)
-                return result
-
-            cls.cleanup_collectable = collected
-
-        # The SHM arena manager overrides cleanup_collectable without calling
-        # super(), so wrapping only the base class never fires under the arena.
-        from mstar.communication.arena import ArenaShmCommunicationManager
-
-        for cls in (TensorCommunicationManager, ArenaShmCommunicationManager):
-            observe_collectable(cls)
+    for cls in (TensorCommunicationManager, ArenaShmCommunicationManager):
+        observe_collectable(cls)
 
     original_force = TensorCommunicationManager.force_cleanup_request
 

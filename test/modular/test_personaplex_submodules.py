@@ -16,7 +16,7 @@ import pytest
 import torch
 from personaplex_fixture_utils import load_binary_fixture
 
-from mstar.engine.engine import Engine
+from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
 from mstar.model.personaplex.components.temporal import DenseTemporalCache, apply_rope_adjacent
@@ -713,13 +713,10 @@ def test_sampler_adapter_rejects_malformed_tokens():
 
 def test_bf16_kv_hint_does_not_autocast_lm_or_mimi():
     model = PersonaPlexModel(skip_weight_loading=True)
-    # This checks autocast policy, independently of graph-runtime construction.
-    engine = Engine.__new__(Engine)
-    engine._autocast_dtype = model.get_autocast_dtype()
     assert model.get_autocast_dtype() is torch.bfloat16
     assert LMSubmodule.disable_autocast and MimiEncoderSubmodule.disable_autocast
     assert MimiDecoderSubmodule.disable_autocast
-    assert engine._autocast_dtype_for(_tiny_submodule()) is None
+    assert resolve_node_dtype(_tiny_submodule(), model.get_autocast_dtype()) is None
 
 
 def test_declare_step_declares_samplers_only_on_generate_walks():

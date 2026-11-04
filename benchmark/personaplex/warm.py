@@ -29,7 +29,7 @@ def main():
         for concurrency in [1] if args.smoke else [1, 2, 4]:
             cells.append({"clip": entry["id"], "concurrency": concurrency, "status": "NOT RUN"})
     write_json(args.output / "cells.json", cells)
-    with Server(settings, args.output, "rust", False) as server:
+    with Server(settings, args.output, False) as server:
         for entry in entries:
             for concurrency in [1] if args.smoke else [1, 2, 4]:
                 cell = next(c for c in cells if c["clip"] == entry["id"] and c["concurrency"] == concurrency)

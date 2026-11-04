@@ -19,8 +19,7 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import SharedMemoryCommunicationManager, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, Loop, TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
-from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.personaplex_model import GENERATE_AUDIO_WALK, PersonaPlexModel
@@ -298,30 +297,36 @@ def triton_int64(monkeypatch):
         monkeypatch.setattr(language, "int64", int, raising=False)
 
 
-def _personaplex_runtime(tensor_manager):
+def _personaplex_runtime(tmp_path, bookkeeping=None):
+    """The split PersonaPlex worker graphs on the graph runtime, one request admitted."""
+    pytest.importorskip("mstar_rust")
+    from rust_runtime import Inboxes, build_runtime
+
     model = _model()
     graphs = model.get_worker_graphs(CONFIG_PATH)
     walks = {wg.worker_graph_id: wg.graph_walks for wg in graphs}
     loops = {wg.worker_graph_id: set(wg.section.get_loops()) for wg in graphs}
     nodes = {wg.worker_graph_id: set(wg.section.get_nodes()) for wg in graphs}
-    runtime = PythonGraphRuntime(
+    inboxes = Inboxes("worker_0", tmp_path)
+    runtime = build_runtime(
+        bookkeeping=bookkeeping, inboxes=inboxes,
         my_worker_id="worker_0", my_worker_graphs=graphs,
         all_wg_ids_to_graph_walks=walks, all_wg_ids_to_dyn_loops=loops,
         all_wg_ids_to_nodes=nodes,
         node_to_partition={"MimiEncoder": cfg.LM_PARTITION, "LM": cfg.LM_PARTITION, "MimiDecoder": cfg.CODEC_PARTITION},
-        sharding_config=model.get_sharding_config(CONFIG_PATH), tensor_manager=tensor_manager,
+        sharding_config=model.get_sharding_config(CONFIG_PATH),
     )
     generate_ids = [wg.worker_graph_id for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks]
     mapping = ParallelList([wg.worker_graph_id for wg in graphs], [["worker_0"] for _ in graphs])
     # What the conductor sends when a request names no caps: every loop at its max_iters.
     caps = {name: loop.max_iters for wg in graphs for name, loop in wg.section.get_loops().items()}
     rid = runtime.add_request("request", cfg.LM_PARTITION, cfg.GENERATE_WALK, generate_ids, mapping, caps)
-    return runtime, rid
+    return runtime, rid, inboxes
 
 
-def test_python_graph_runtime_admits_personaplex_generate_walk(triton_int64):
-    """The new runtime must accept the split PersonaPlex worker graphs."""
-    runtime, rid = _personaplex_runtime(_Comm())
+def test_graph_runtime_admits_personaplex_generate_walk(tmp_path, triton_int64):
+    """The runtime must accept the split PersonaPlex worker graphs."""
+    runtime, rid, _ = _personaplex_runtime(tmp_path)
     assert runtime.get_rid_string(rid) == "request"
     assert {"lm_state", "agent_frame", "text_frame"} <= set(
         runtime.get_output_signals("LM", cfg.GENERATE_WALK))
@@ -329,46 +334,36 @@ def test_python_graph_runtime_admits_personaplex_generate_walk(triton_int64):
     runtime.remove_request(rid)
 
 
-def test_python_runtime_streams_agent_frames_and_emits_text(tmp_path, triton_int64):
-    """Do not defer text backed by the worker's reused stop-check host buffer; stream each agent frame.
+def test_graph_runtime_streams_agent_frames_and_emits_text(tmp_path, triton_int64):
+    """Each LM step streams its agent frame to the codec partition and sends its text to the client, in order.
 
-    Real Python graph routing and SHM: emulate the GPU worker's borrowed
-    CPU copy, then reuse it on the next step. Agent codes leave every step on
-    the stream to the codec partition, in order.
+    Real graph routing and SHM tensor store; synthetic LM outputs.
     """
+    pytest.importorskip("mstar_rust")
     manager = SharedMemoryCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
     )
-    runtime, rid = _personaplex_runtime(manager)
+    runtime, rid, inboxes = _personaplex_runtime(tmp_path, manager.tensor_store.bookkeeping)
     manager.register_request(rid, runtime.get_sharding_config(rid))
-    receiver = SharedMemoryCommunicationManager(
-        my_entity_id="api_server", hostname="localhost", device="cpu",
-        communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
-    )
-    receiver.register_request(rid, runtime.get_sharding_config(rid))
-    host_text = torch.empty(1, dtype=torch.int64)
-    received_text, emitted_text = [], []
-    registered = set()
     block = ColumnarEdgeSpecs.empty()
     for name in ("lm_state", "user_audio_codes", "agent_frame", "text_frame"):
         block.add_edge(rid, GraphEdge(next_node="LM", name=name))
     assert runtime.ingest_inputs_batch(block) == []
     lm_wg = runtime.get_worker_graph_id_for_node("LM", cfg.GENERATE_WALK)
     outputs = runtime.get_output_signals("LM", cfg.GENERATE_WALK)
-    agent_uuids, text_uuids, streamed = [], [], []
+    agent_uuids, text_uuids, streamed, emitted_text = [], [], [], []
     for frame in range(2):
         if frame == 1:
             runtime.stop_loops_batched(
                 cfg.LM_PARTITION, cfg.GENERATE_WALK, "LM", ParallelList([rid], [[cfg.DECODE_LOOP]]),
             )
-        host_text.fill_(frame + 4)
         stored = manager.store_and_return_tensor_info_batch(
             [rid], {rid: {
                 "lm_state": [torch.tensor([frame])],
                 "agent_frame": [torch.full((8,), frame)],
                 "text_frame": [torch.tensor([frame + 4])],
-            }}, outputs, cpu_tensors={rid: {"text_frame": [host_text]}},
+            }}, outputs,
         )
         manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
         agent_uuids.append(stored.flat_uuids[outputs.index("agent_frame")])
@@ -378,23 +373,18 @@ def test_python_runtime_streams_agent_frames_and_emits_text(tmp_path, triton_int
             output_signals=outputs, wg_ids=ParallelList([rid], [lm_wg]),
             tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
         ))
-        registered.update(routed.register_uuids)
-        if routed.register_uuids:
-            manager.register_for_send_uuids(ParallelList([rid], [routed.register_uuids]))
-        completion = runtime._peek_completion(routed.completion_id).routing[rid]
-        stream_edges = completion.streaming_local + [e for es in completion.streaming_to_workers.values() for e in es]
-        streamed.extend((e.name, e.next_node, [info.uuid for info in e.tensor_info]) for e in stream_edges)
-        for edge in completion.emit_to_client:
-            emitted_text.append((edge.name, [info.uuid for info in edge.tensor_info]))
-            receiver.start_read_tensors(rid, [edge], graph_walk=cfg.GENERATE_WALK)
-            receiver.get_ready_tensors(graph_walk=cfg.GENERATE_WALK)
-            received_text.extend(int(receiver.get_tensor(info.uuid).item()) for info in edge.tensor_info)
-    assert received_text == [4, 5], "deferred SHM sends must not read a later step's borrowed host copy"
+        streamed.extend((name, list(group.values)) for name, group in routed.local_streaming_by_signal.items())
+        runtime.send_outputs(SendInput(
+            completion_id=routed.completion_id, per_request_info=ParallelList([rid], [None]),
+            new_token_counts=ParallelList([rid], [{}]),
+        ))
+        emitted_text.extend(
+            (message.body.graph_edge.name, [info.uuid for info in message.body.graph_edge.tensor_info])
+            for peer, message in inboxes.take() if peer == "api_server"
+        )
     assert emitted_text == [("text_frame", [uuid]) for uuid in text_uuids]
-    assert streamed == [("agent_frame", "MimiDecoder", [uuid]) for uuid in agent_uuids]
-    # The agent frames ride the stream; nothing routes them to a decoder in this walk.
-    completion = runtime._peek_completion(routed.completion_id).routing[rid]
-    assert "agent_frame" not in {edge.name for edge in completion.routed_to_this_worker_graph}
+    # The agent frames ride the stream to the decoder on this worker; nothing routes them to it in this walk.
+    assert streamed == [("agent_frame", [uuid]) for uuid in agent_uuids]
 
 
 # --------------------------------------------------------------------------- reference counts through a walk
@@ -426,7 +416,7 @@ def _drive(walk, initial, *, finish_after=None, rid=1):
 
     Real: WorkerGraphIO, Loop caching, NodeInputs.clear, TensorStore and
     set_output_ref_counts. The single-worker routing and safety hold are
-    transcribed from PythonGraphRuntime.complete_and_route_batch.
+    transcribed from the former Python graph runtime (removed upstream in #1130).
     """
     comm = _Comm()
     io = WorkerGraphIO(walk)

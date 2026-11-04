@@ -128,8 +128,8 @@ def server_config(settings, root, max_batch_size):
 
 
 class Server:
-    def __init__(self, settings, root, backend, observe, max_batch_size=None):
-        self.settings, self.root, self.backend, self.observe = settings, root, backend, observe
+    def __init__(self, settings, root, observe, max_batch_size=None):
+        self.settings, self.root, self.observe = settings, root, observe
         self.max_batch_size = max_batch_size
         self.port = settings.get("port", 8000)
         self.process = None
@@ -145,15 +145,11 @@ class Server:
         with socket.socket() as sock:
             if sock.connect_ex(("127.0.0.1", self.port)) == 0:
                 raise RuntimeError("Port occupied; existing process left untouched")
-        flag = "1" if self.backend == "rust" else "0"
         env = dict(
             os.environ,
             MSTAR_SHM_ARENA="1",
-            MSTAR_RUST_GRAPH=flag,
-            MSTAR_RUST_ZMQ=flag,
             PERSONAPLEX_OWNERSHIP_OBSERVE="1" if self.observe else "0",
             PERSONAPLEX_OWNERSHIP_ROOT=str(self.root),
-            PERSONAPLEX_LIVE_BACKEND=self.backend,
         )
         paths = [str(Path(__file__).parent / "observe"), self.settings.get("extension"), str(Path.cwd()),
                  env.get("PYTHONPATH")]
@@ -176,7 +172,6 @@ class Server:
             self.root / "launch.json",
             {
                 "command": command,
-                "backend": self.backend,
                 "max_batch_size": self.max_batch_size,
                 "instrumented": self.observe,
                 "MSTAR_SHM_ARENA": "1",
@@ -487,17 +482,16 @@ def main():
     parser.add_argument("--settings", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--backend", choices=["python", "rust"], default="rust")
     parser.add_argument("--mode", choices=["smoke", "lifecycle", "soak"], default="lifecycle")
     parser.add_argument("--max-batch-size", type=int, help="override the YAML's model_kwargs.max_batch_size")
     args = parser.parse_args()
     settings = json.loads(args.settings.read_text())
     args.output.mkdir(parents=True, exist_ok=False)
     exact = args.max_batch_size == 1
-    outcome = {"status": "FAIL", "mode": args.mode, "backend": args.backend, "max_batch_size": args.max_batch_size,
+    outcome = {"status": "FAIL", "mode": args.mode, "max_batch_size": args.max_batch_size,
                "outputs_compared_exactly": exact}
     try:
-        with Server(settings, args.output, args.backend, True, args.max_batch_size) as server:
+        with Server(settings, args.output, True, args.max_batch_size) as server:
             run = Lifecycle(server, read_manifest(args.manifest), exact)
             run.run(smoke=args.mode != "lifecycle")
             if args.mode == "soak":
