@@ -205,6 +205,18 @@ def test_a_skipped_rebuild_row_fails_its_request():
     assert R in w.failed and not eng.landed, "the request would wait on a rebuild that never runs"
 
 
+def test_a_rebuild_row_the_prefix_cache_served_whole_lands():
+    w, eng, batch, node_batch = _rebuilding()
+    # as the engine leaves a row whose walk the prefix cache holds whole: it runs no forward
+    node_batch.request_ids = []
+    node_batch.skipped_rids.add(R)
+    node_batch.cached_rids.add(R)
+
+    w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", PREFILL, Future()), BatchedModelOutput())
+
+    assert R not in w.failed and eng.landed == [R], "a rebuild the cache served would fail its request"
+
+
 @pytest.mark.parametrize("site", ["push back", "in flight", "settle", "spec target", "unsubmitted speculation"])
 def test_the_graph_runtime_never_sees_a_rebuild_row(site):
     w, _ = _worker()
