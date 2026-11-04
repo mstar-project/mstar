@@ -149,7 +149,7 @@ class Tape:
     """What a captured graph launches, in order. Each node is ``(cost, effect)``: a
     kernel's cost in seconds, or a callable pricing it at replay time (a kernel whose
     cost depends on the values in its arguments, such as attention over the latest
-    plan), or None; and the work it does on values the emulator keeps (small ints, host
+    plan), or None; and the work it does on values the emulator keeps (small tensors, host
     copies to and from them), re-run at each replay, or None. A replay runs the nodes in
     order, so a cost reads the values the nodes before it left."""
 

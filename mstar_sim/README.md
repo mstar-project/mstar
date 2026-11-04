@@ -52,7 +52,7 @@ attention features), Maya (one interposed process per device, symmetric collecti
 
 ## Fast mode, for bug repros
 
-`--fast` (`MSTAR_SIM_FAST=1`) keeps everything a repro of host control flow depends on: the scheduler, admission, KV and lease bookkeeping, TP agreement, CUDA-graph capture and replay, refusal of host reads during capture, and small-int values. It drops all timing: no kernel is priced or queued, and no host read waits. The clock is the real, monotonic one, so mstar's own timeouts still fire. Timed runs are unchanged without the flag.
+`--fast` (`MSTAR_SIM_FAST=1`) keeps everything a repro of host control flow depends on: the scheduler, admission, KV and lease bookkeeping, TP agreement, CUDA-graph capture and replay, refusal of host reads during capture, and small tensors' values. It drops all timing: no kernel is priced or queued, and no host read waits. The clock is the real, monotonic one, so mstar's own timeouts still fire. Timed runs are unchanged without the flag.
 
 Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-capture-tokens N` drops large token buckets. `--max-capture-batch N` does the same for batch buckets, but it also caps the served batch at N (mstar caps eager batches at the largest captured one).
 
@@ -124,7 +124,9 @@ the roofline.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
   room, so admission paths that depend on it only run with graphs on.
 - A value that was never computed reads as zeros: data-dependent control flow on device values
-  (beyond small integer tensors) takes the zero branch.
+  (beyond small tensors) takes the zero branch. A small tensor counts as never computed while
+  it is unwritten, once a stand-in wrote it (a Triton launch: any tensor it was handed), and
+  after an op reads such a value; a real write over any part of it clears that.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
   ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
   here are not validated and not accurate (see the top of this file).

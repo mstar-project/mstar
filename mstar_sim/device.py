@@ -356,7 +356,7 @@ def _check_devices(func, args, kwargs, flat=None) -> int:
 
 
 class _Observe(TorchDispatchMode):
-    """Runs each aten op of a call on shapes (or, over small ints, values) and
+    """Runs each aten op of a call on shapes (or, over kept values, for real) and
     charges it, or records its cost while a graph is captured. ``autocast``:
     the CUDA autocast dtype in force at the call (inside the handler autocast
     reads as off)."""
@@ -772,7 +772,7 @@ def _fast(func, args, kwargs, flat, index):
             with _Observe(torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None):
                 raw = func(*uargs, **ukwargs)
             return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
-        raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
+        raw = func(*uargs, **ukwargs)  # kept values: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
             set_never_computed(raw)
@@ -1190,7 +1190,7 @@ def _create(func, args, kwargs, device):
     if target is CPU and func in _UNINITIALIZED:
         out.zero_()  # a never-computed value reads as zeros, not as the host heap's garbage
         set_never_computed(out)
-    if func in (torch.tensor, torch.as_tensor, torch.from_numpy) and isinstance(out, T):
+    if from_host and isinstance(out, T):
         clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
     return tree_map(
         lambda x: SimTensor(x, index) if isinstance(x, T) and not isinstance(x, SimTensor) else x, out)

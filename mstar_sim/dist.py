@@ -2,7 +2,7 @@
 
 Every emulated GPU is its own process, as on a real node. Process groups that
 would be NCCL are gloo (the control traffic mstar sends over CPU groups is
-real). A collective over simulated-GPU tensors that hold values (small ints:
+real). A collective over simulated-GPU tensors that hold values (small ones:
 a vote, lengths) runs over gloo on them; one over value-less tensors moves no
 data (they have none). Either is charged its NCCL time (:func:`mstar_sim.cost.collective_seconds`,
 measured tables where they exist) on the current stream, on every rank alike,
@@ -63,7 +63,7 @@ def _collective(name: str, op: str, group_pos: int | None):
         if not clock.FAST:
             clock.charge(cost.collective_seconds(op, n, nbytes, graph=clock.capturing() is not None))
         if clock.capturing() is None and all(t._data.device.type != "meta" for t in tensors):
-            # every tensor holds values (small ints: a vote, lengths): send them for real, so
+            # every tensor holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
             return real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
         return _Done() if kwargs.get("async_op") else None
