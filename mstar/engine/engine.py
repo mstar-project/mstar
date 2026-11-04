@@ -3312,8 +3312,9 @@ class Engine:
     ) -> None:
         wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta
         # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
-        # `check_ready` where a second KV cache on the node keeps the request not ready
-        if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
+        # `check_ready` where a second KV cache on the node keeps the request not ready. One that gave the host's
+        # room back is replayed, since the room was set aside before the RESERVE.
+        if kind == MoveKind.UNRESERVE and not count and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
             return
         wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
         journal.add(kind, wire_rid, pool, count, wire_victims, node)

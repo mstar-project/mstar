@@ -1544,23 +1544,23 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
 
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
-    """Rank 0 asks the host to set room aside at a request's first ask, and a follower asks for the request only
-    as it replays its reservation. Here x asks first and takes the host's room, and b, older, then reserves first.
-    A follower asking its own host for b would find x's room still free and keep b preemptible, where rank 0
-    guaranteed it."""
+    """Rank 0 sets host room aside for a request that can move only there as it admits the request, and guarantees
+    the request when the host has none left. A follower takes in the request only as it replays its reservation, by
+    when other moves can have changed its own host's room. Here b takes the host's one page, and x, admitted next,
+    finds none."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
     for kv in (leader, follower):
-        kv._cpu_pool = host._HostPool(8)
+        kv._cpu_pool = host._HostPool(1)
     _ingest((leader, follower), "b", 1, arrival=1, rebuildable=False)
     _ingest((leader, follower), "x", 1, arrival=2, rebuildable=False)
-    assert leader.ask("x", NODE, "prefill") is not None
-    assert _admits(leader, "b")
-    assert "b" in leader._guaranteed and "x" in leader._cpu_pool.reserved, "the host had room for both"
+    assert _admits(leader, "b") and _admits(leader, "x")
+    assert "x" in leader._guaranteed and leader._cpu_pool.reserved == {"b": 1}, "the host had room for both"
 
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower set other host room aside"
     assert follower._guaranteed == leader._guaranteed, "a request rank 0 never preempts is preemptible here"
+    assert _counts(follower) == _counts(leader), "x's allotment here isn't the footprint rank 0 allotted it"
 
 
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):

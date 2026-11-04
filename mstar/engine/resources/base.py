@@ -152,6 +152,8 @@ class MoveKind(IntEnum):
     DROP = 5
     SET_ASIDE = 6
     LAND = 7
+    GUARANTEE = 8
+    ALLOT = 9
 
 
 class Resource(ResidentHooks, ABC):

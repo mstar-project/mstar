@@ -4658,8 +4658,7 @@ class KVManager(AttentionResource):
                 rid not in self._allotments and not self._overrides[rid].rebuildable and rid not in self._guaranteed
                 and rid not in self._cpu_pool.reserved and not self._sets_aside(rid, self._asks[rid])
             ):
-                self._guarantee(rid)
-                self._asks[rid] = self._footprint(rid)
+                self._guarantee(rid, self._footprint(rid))
                 pages = self._need(rid, node_name, graph_walk, published)
                 if pages > room:
                     return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
@@ -4685,22 +4684,36 @@ class KVManager(AttentionResource):
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
             # a request that holds nothing waits in the queue with no room set aside on the host
-            if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
+            gives_back = (
+                self._cpu_pool is not None and rid in self._cpu_pool.reserved and self._unwritten(rid)
+                and not self._on_host(rid)
+            )
+            if gives_back:
                 self._cpu_pool.unreserve(rid)
             if self.journal is not None:
-                self.journal(MoveKind.UNRESERVE, rid, 0)
+                self.journal(MoveKind.UNRESERVE, rid, int(gives_back))
 
-    def _guarantee(self, rid: str) -> None:
-        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
+    def _guarantee(self, rid: str, pages: int) -> None:
+        """Make ``rid`` guaranteed, since the host has no room to set aside for its move. It then asks for
+        ``pages``, or holds an allotment of ``pages`` once it has one."""
         self._guaranteed.add(rid)
         self._cpu_pool.unreserve(rid)
         self._cpu_pool.count_guaranteed(rid)
+        allotment = self._allotments.get(rid)
+        if allotment is None:
+            self._asks[rid] = pages
+        else:
+            allotment.pages = pages
+            self._recount(rid)
+        if self.journal is not None:
+            self.journal(MoveKind.GUARANTEE, rid, pages)
 
     def _cover_move(self, rid: str, n: int) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
         when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
         nothing."""
-        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
+        # rank 0 decides, and the other ranks replay its SET_ASIDE and GUARANTEE
+        reserved = None if self._cpu_pool is None or not self._decides else self._cpu_pool.reserved.get(rid)
         if reserved is None:
             return 0
         # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
@@ -4708,16 +4721,14 @@ class KVManager(AttentionResource):
             len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
             for stream in self._streams[rid].values()
         )
-        if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
+        if held + n <= reserved or self._sets_aside(rid, held + n):
             return 0
         allotment = self._allotments[rid]
         grows = max(0, self._footprint(rid) - held)
         short = grows - allotment.remaining - self._room()
         if short > 0:
             return short
-        self._guarantee(rid)
-        allotment.pages = self._held(rid) + grows
-        self._recount(rid)
+        self._guarantee(rid, self._held(rid) + grows)
         return 0
 
     def grew_since(self, mark: RoomMark) -> bool:
@@ -4807,7 +4818,7 @@ class KVManager(AttentionResource):
             if rid in self._earmarks or rid in self._victims:
                 return Victims([], [], [])
             if pages_short <= 0:
-                self._allot(rid, claim)
+                self._claim(rid, claim)
                 return Victims([], [], [])
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
             left, hosted, asking, moving = on_host, set(), set(), False
@@ -4851,7 +4862,7 @@ class KVManager(AttentionResource):
                 rest = [other for other in victims if other != victim]
                 if self._frees(rest) == freed:
                     victims = rest
-            self._allot(rid, claim)
+            self._claim(rid, claim)
             to_ask = self._earmark(rid, short.pages - claim, victims)
             self._host(rid, [victim for victim in victims if victim in hosted])
             return Victims(
@@ -4859,6 +4870,12 @@ class KVManager(AttentionResource):
                 [victim for victim in victims if victim not in hosted and victim not in to_ask],
                 to_ask,
             )
+
+    def _claim(self, rid: str, pages: int) -> None:
+        """Add the ``pages`` of room a short grant counted to ``rid``'s allotment."""
+        self._allot(rid, pages)
+        if self.journal is not None and pages:
+            self.journal(MoveKind.ALLOT, rid, pages)
 
     def _earmark(self, rid: str, pages: int, victims: list[str]) -> list[str]:
         """Earmark ``pages`` for ``rid`` on ``victims``, and return the victims that hold no page of their own,
@@ -5005,6 +5022,10 @@ class KVManager(AttentionResource):
                 self.unreserve(rid)
             elif kind == MoveKind.SET_ASIDE:
                 self._cpu_pool.reserved[rid] = count
+            elif kind == MoveKind.GUARANTEE:
+                self._guarantee(rid, count)
+            elif kind == MoveKind.ALLOT:
+                self._claim(rid, count)
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
