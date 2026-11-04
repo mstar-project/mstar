@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from mstar.api_server import auth, entrypoint  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 KEY = "s3cret-key"
 GOOD = {"Authorization": f"Bearer {KEY}"}
@@ -103,9 +104,11 @@ class _GlmServer:
     whole reply, and the prompt counts 3 tokens."""
 
     model_name = "glm52"
+    lora_kwargs = entrypoint.APIServer.lora_kwargs
 
     def __init__(self, upload_dir):
         self.upload_dir = upload_dir
+        self.served_models = ServedModels.of(self.model_name, None)
         self.model = types.SimpleNamespace(
             get_output_sample_rate=lambda modality="audio": 24000,
             process_prompt=lambda *a, **kw: {"text_inputs": [types.SimpleNamespace(numel=lambda: 3)]})

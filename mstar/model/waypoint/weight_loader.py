@@ -19,9 +19,9 @@ from pathlib import Path
 import torch
 from torch import nn
 
-# _apply_stacked is imported rather than reimplemented: the remapper has to
+# apply_stacked is imported rather than reimplemented: the remapper has to
 # resolve a key to the same target load_weights_into will.
-from mstar.model.loader.base import StackedParamRule, _apply_stacked, load_weights_into
+from mstar.model.loader.base import StackedParamRule, apply_stacked, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.components.layers import CondHead
@@ -645,7 +645,7 @@ def build_waypoint_dit(
         mapped = remap_checkpoint_key(name)
         if mapped is None:
             return None  # Expected drop, not an unexpected key.
-        target, shard_id = _apply_stacked(mapped, WAYPOINT_STACKED_PARAMS)
+        target, shard_id = apply_stacked(mapped, WAYPOINT_STACKED_PARAMS)
         if target not in params:
             unexpected.append(name)
             return None

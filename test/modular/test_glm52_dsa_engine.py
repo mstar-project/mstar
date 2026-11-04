@@ -54,7 +54,6 @@ from mstar.model.glm52.config import (  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
 def _ctx(needs_selection: bool) -> DSAContext:
@@ -79,7 +78,7 @@ def test_cleanup_request_drops_per_request_state():
     sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
     sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
 
-    sub.request_state("r0").add_all(token_budget=20, ended_at_prefill=True)
+    sub.request_state("r0").add("token_budget", 20)
     sub.cleanup_request("r0")
     assert sub._prefix_hits == set()
     assert sub.request_states == {}
@@ -107,7 +106,7 @@ class _FakeKV:
     def __init__(self, config, page_size=8):
         # what the DSA resource reads off its cache's config
         self.config = SimpleNamespace(
-            page_size=page_size, max_seq_len=config.max_seq_len,
+            page_size=page_size, tokens_per_page=page_size, max_seq_len=config.max_seq_len,
             num_qo_heads=config.num_attention_heads, kv_lora_rank=config.kv_lora_rank,
             qk_rope_head_dim=config.qk_rope_head_dim)
 
@@ -130,7 +129,6 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub._prefix_hits = set()
-    sub._index_stager = PinnedStager(torch.long)
     return sub
 
 

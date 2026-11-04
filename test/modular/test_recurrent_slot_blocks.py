@@ -38,7 +38,8 @@ def build_pool() -> RecurrentStatePool:
 def run(pool: RecurrentStatePool, step: RecurrentStep, rids) -> None:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False)
     for rid in rids:
-        pool.ingest_request(rid)
+        if rid not in pool._slots:  # once per request, as the worker does (#725)
+            pool.ingest_request(rid)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
     pool.commit(step, ctx)
@@ -77,7 +78,7 @@ def test_a_per_slot_block_takes_no_layer():
     ctx = StepContext(request_ids=("a", "b"), graph_walk="prefill", slot=0, capture=False)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
-    pool.scatter_("count", torch.tensor([[3], [5]]), None)
+    pool.scatter_("count", torch.tensor([[3], [5]], dtype=torch.int32), None)
     assert int(pool.block("count")[slot_of(pool, "a")]) == 3
     assert int(pool.block("count")[slot_of(pool, "b")]) == 5
     pool.scatter_("state", torch.ones(2, 2, 4), layer_idx=1)

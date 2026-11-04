@@ -1,0 +1,15 @@
+model: "cosmos3"
+# See cosmos3_nano.yaml. Two GPUs, throughput-oriented: every node is
+# replicated on both and each request runs end to end on one of them (the
+# conductor sends it to the replica serving fewer requests). For one request's
+# latency, cosmos3_nano_sp2.yaml splits the DiT over both GPUs instead.
+max_seq_len: 8192
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  accelerator_graph: true
+  graph_max_latent_area: 2000
+node_groups:
+  - node_names: ["dit", "vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0, 1]

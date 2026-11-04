@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.resident_hooks import ResidentHooks
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -60,6 +62,9 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # the dtype this resource's nodes compute in (their autocast dtype); None when they
+    # disagree or run outside autocast
+    compute_dtype: torch.dtype | None = None
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
     # this resource's local nodes
@@ -73,6 +78,17 @@ class EngineResourceInfo:
     max_rows_in_combined: "Mapping[str, int | None]" = field(
         default_factory=dict
     )
+    # the prefix caches this engine opens (`opening_prefix_caches`), decided
+    # before any resource is built, for one that sizes itself by its own
+    prefix_caches: frozenset[str] = frozenset()
+
+    @property
+    def head_shards(self) -> int:
+        """How many ways the node's ranks split its attention heads, which each
+        builder sizes head counts by: all its TP × SP ranks. A ragged resource
+        declaring ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        group = self.joint_comm_group
+        return 1 if group is None else group.world_size
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -102,7 +118,7 @@ class KeyedWalks(NamedTuple):
     growth: tuple[str, ...] = ()
 
 
-class Resource(ABC):
+class Resource(ResidentHooks, ABC):
     @classmethod
     @abstractmethod
     def build(
@@ -119,13 +135,14 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened."""
-        return False
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
+        """Open whatever this resource keeps across requests, under ``root``. The
+        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""
+        return
 
     def close_prefix_cache(self) -> None:
-        """Undo `enable_prefix_cache`. Called before any request."""
+        """Keep nothing across requests. The engine calls it, before any
+        request, on every other resource."""
         return
 
     def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
@@ -203,6 +220,17 @@ class Resource(ABC):
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
 
+    @classmethod
+    def journals_resident_moves(cls) -> bool:
+        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
+        instance outside the step that uses it (eviction, prefix leases, page trails). They
+        replay each decision with the next step of the node it was journaled under, so
+        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
+        the class a spec's ``resource_class`` names, so the hooks live there, not only on
+        a subclass its ``build`` returns."""
+        return any(getattr(cls, hook) is not getattr(Resource, hook)
+                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
@@ -215,9 +243,8 @@ class Resource(ABC):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
-        """Must be idempotent: the conductor sends one NewRequest per partition,
-        so a worker serving several partitions of a request ingests it once
-        for each, possibly after a node has already run a step for it."""
+        """Open the request's state. The worker calls this once per request, on
+        its first NewRequest, though one comes per partition it serves."""
         return
 
     def ingest_capture_row(self, rid: str):
@@ -292,6 +319,11 @@ class Resource(ABC):
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
         return
+
+    def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """Row-addressed tensors of the step just run, copied to the host with
+        the stop buffers. Read right after the forward and not cloned."""
+        return {}
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
@@ -460,6 +492,16 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def seal_capture_buffers(self) -> None:
+        """Every bucket on the device has been sized and none captured yet: from here on,
+        what a captured graph reads keeps its address. Called once, by the engine."""
+        # A no-op is safe for a resource that never reallocates what a graph reads once it
+        # is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first
+        # plan during sizing). The one kind a plan grows is a FlashInfer workspace:
+        # `AttentionResource` seals the pools they come from, and the dense backend's own,
+        # outside a pool, is never captured.
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
@@ -488,6 +530,10 @@ class AttentionResource(Resource):
 
     _default_label: str = "main"
     _default_layer_idx: int | None = None
+    # FlashInfer's float workspaces, on a resource that plans FlashInfer. Kept here so the
+    # seal is too: a workspace grows at a plan that overflows it, which past capture would
+    # free memory a graph reads.
+    _workspaces: WorkspacePool | None = None
 
     @property
     def default_label(self) -> str:
@@ -504,6 +550,10 @@ class AttentionResource(Resource):
     def reset_default_cursors(self) -> None:
         self._default_label = "main"
         self._default_layer_idx = None
+
+    def seal_capture_buffers(self) -> None:
+        if self._workspaces is not None:
+            self._workspaces.seal()
 
 
 class PublishedInfo(ABC):

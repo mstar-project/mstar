@@ -2,8 +2,7 @@
 
 The fanout used to read ``dims[0]`` of every tensor before asking whether
 the signal is sharded at all, so a replicated 0-dim tensor raised
-``IndexError`` on every routed edge (the Python graph runtime and the
-conductor's input split both go through it). The row size was taken as
+``IndexError`` on every routed edge of the conductor's input split. The row size was taken as
 ``nbytes // prod(dims)``, which divides by zero for a sharded tensor with an
 empty trailing dim, and the same-worker re-slice divided by the byte size of
 a row. The Rust fanout handles all of these; ``test/rust`` checks the two

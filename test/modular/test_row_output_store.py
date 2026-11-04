@@ -50,6 +50,23 @@ def _batch(rids):
     return outputs, host_rows, cpu_per_rid
 
 
+def test_a_withheld_output_stays_out_of_the_row_store(tmp_path):
+    """The worker pops a withheld output (``StopCheck.withheld``) from the row's
+    outputs before storing; the row store must read those outputs, not the row
+    views, or a Talker's EOS frame would reach its codec."""
+    rids = [3, 5]
+    outputs, host_rows, _ = _batch(rids)
+    outputs.per_rid_outputs[5].pop("new_token")
+    mgr = _columnar(_manager(tmp_path))
+    stored = mgr.store_row_outputs_batch(
+        rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
+        node_name="text", graph_walk="decode", host_rows=host_rows,
+    )
+    assert stored is not None
+    # request-major, SIGNALS order: rid 5's new_token is the last slot
+    assert stored.num_tensors == [1, 1, 1, 0]
+
+
 def test_row_store_matches_the_general_path(tmp_path):
     rids = [3, 5, 8, 13]
     outputs, host_rows, cpu_per_rid = _batch(rids)
@@ -75,8 +92,8 @@ def test_row_store_matches_the_general_path(tmp_path):
         assert (info_f.dims, info_f.stride, info_f.nbytes, info_f.dtype, info_f.address) == (
             info_s.dims, info_s.stride, info_s.nbytes, info_s.dtype, info_s.address
         )
-        cf = fast_mgr.tensor_store._tensors_cpu.get(uf)
-        cs = slow_mgr.tensor_store._tensors_cpu.get(us)
+        cf = fast_mgr.tensor_store.get_cpu_tensor(uf)
+        cs = slow_mgr.tensor_store.get_cpu_tensor(us)
         assert cf is not None and cs is not None
         assert torch.equal(cf, cs) and cf.data_ptr() == cs.data_ptr()
     for rid in rids:
@@ -127,4 +144,4 @@ def test_row_store_without_host_rows_stores_no_host_copy(tmp_path):
         rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
     )
     assert fast is not None and len(fast.flat_uuids) == 4
-    assert not mgr.tensor_store._tensors_cpu
+    assert all(mgr.tensor_store.get_cpu_tensor(u) is None for u in fast.flat_uuids)

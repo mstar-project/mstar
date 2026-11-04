@@ -57,8 +57,8 @@ class _Request:
 class BoundedKVManager(Resource):
     @classmethod
     def build(cls, spec: BoundedKVSpec, info: EngineResourceInfo) -> "BoundedKVManager":
-        if info.joint_comm_group is not None and info.joint_comm_group.world_size > 1:
-            raise NotImplementedError("bounded KV does not shard across ranks yet")
+        if info.head_shards > 1:
+            raise NotImplementedError("bounded KV does not shard heads across ranks yet")
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(spec.config, info.device, info.kv_dtype)
 
