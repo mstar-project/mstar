@@ -4698,7 +4698,7 @@ class KVManager(AttentionResource):
             else:
                 pages = self._host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if not moving and (to_host or droppable(rid)) and self._frees([rid]) > 0:
+                if not moving and self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
