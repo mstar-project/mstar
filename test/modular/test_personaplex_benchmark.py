@@ -7,6 +7,7 @@ import json
 import socket
 import subprocess
 import sys
+import time
 import wave
 from pathlib import Path
 
@@ -902,3 +903,145 @@ def test_a_session_records_its_first_text_event_even_when_empty(monkeypatch):
     assert "error" not in out
     assert 0 <= out["first_text_s"] <= out["arrivals"][0][0]
     assert out["arrivals"][0][1] == 1920
+
+
+def _clip(path, frames=1):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(np.zeros(1920 * frames, dtype="<i2").tobytes())
+    return path
+
+
+@pytest.mark.parametrize(("kv", "pages"), [
+    ({"page_size": 128}, 7), ({"page_size": None}, 7), ({}, 7), ({"page_size": 64}, 13),
+])
+def test_sweep_sizes_the_pool_for_any_page_size(tmp_path, kv, pages):
+    import yaml
+
+    from benchmark.personaplex.sweep import sweep_config
+
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump({"resources": {"lm_kv": kv}, "max_concurrent_requests": 5}))
+    config = yaml.safe_load(Path(sweep_config(str(base), 2, 222, tmp_path / "out.yaml")).read_text())
+    assert config["resources"]["lm_kv"]["max_num_pages"] == pages  # 1 sink + 2 x ceil(350 / page)
+
+
+def test_sweep_page_default_is_the_engines():
+    from benchmark.personaplex.sweep import DEFAULT_PAGE_SIZE
+    from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE as ENGINE_PAGE_SIZE
+
+    assert DEFAULT_PAGE_SIZE == ENGINE_PAGE_SIZE
+
+
+def _run_sweep(monkeypatch, tmp_path, audio, *extra, sessions=("1",)):
+    from benchmark.personaplex import sweep
+
+    settings = tmp_path / "settings.json"
+    if not settings.exists():
+        settings.write_text(json.dumps({"server_config": "configs/personaplex.yaml"}))
+    ran = []
+
+    def fake_cell(settings, args, concurrency, clip_frames):
+        ran.append(concurrency)
+        return sweep.aggregate(concurrency, 1.0, [_wave()])
+
+    monkeypatch.setattr(sweep, "run_concurrency", fake_cell)
+    monkeypatch.setattr(sys, "argv", ["sweep", "--settings", str(settings), "--audio", str(audio), "--sessions",
+                                      *sessions, "--boot-rounds", "0", "--output", str(tmp_path / "out"), *extra])
+    return sweep.main(), ran
+
+
+def test_sweep_resume_keeps_cells_of_the_same_experiment_only(tmp_path, monkeypatch, capsys):
+    first, second = _clip(tmp_path / "first.wav", 1), _clip(tmp_path / "second.wav", 2)
+    assert _run_sweep(monkeypatch, tmp_path, first) == (0, [1])
+    assert _run_sweep(monkeypatch, tmp_path, first, "--resume", sessions=("1", "2")) == (0, [2])
+    code, ran = _run_sweep(monkeypatch, tmp_path, second, "--resume")
+    assert (code, ran) == (2, []), "another clip must not reuse the first clip's cells"
+    assert "['audio', 'speech_end']" in capsys.readouterr().err
+    code, ran = _run_sweep(monkeypatch, tmp_path, first, "--resume", "--ttfa-limit", "0.5")
+    assert (code, ran) == (2, [])
+
+
+def test_sweep_wer_against_one_session_needs_a_real_one(tmp_path, monkeypatch):
+    import types
+
+    from benchmark.personaplex import sweep
+
+    replies = iter(["a b", "a c"])
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+        pipeline=lambda *a, **k: lambda *a2, **k2: {"text": next(replies)}))
+    for concurrency in (4, 8):
+        (tmp_path / f"c{concurrency}").mkdir()
+        _clip(tmp_path / f"c{concurrency}" / "session.wav")
+    args = types.SimpleNamespace(asr_model="m", reference_wav=None, output=tmp_path)
+    results = {"cells": [{"concurrency": 4}, {"concurrency": 8}]}
+    sweep.transcribe_cells(args, results)
+    assert [c["transcript"] for c in results["cells"]] == ["a b", "a c"]
+    assert all("wer_vs_c1" not in c for c in results["cells"])
+
+    (tmp_path / "c1").mkdir()
+    _clip(tmp_path / "c1" / "session.wav")
+    replies = iter(["a c", "a b"])
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+        pipeline=lambda *a, **k: lambda *a2, **k2: {"text": next(replies)}))
+    results = {"cells": [{"concurrency": 1}, {"concurrency": 4}]}
+    sweep.transcribe_cells(args, results)
+    assert [c["wer_vs_c1"] for c in results["cells"]] == [0.0, 0.5]
+
+
+class _FakeClient:
+    def __init__(self, alive=False, exitcode=1):
+        self.alive, self.exitcode, self.stopped = alive, exitcode, []
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        self.stopped.append("terminate")
+        self.alive = False
+
+    def kill(self):
+        self.stopped.append("kill")
+        self.alive = False
+
+
+def _fake_clients(monkeypatch, clients):
+    import queue
+    import types
+
+    from benchmark.personaplex import sessions
+
+    pending = iter(clients)
+    never = queue.Queue()
+    never.close = lambda: None
+    monkeypatch.setattr(sessions.multiprocessing, "get_context", lambda method: types.SimpleNamespace(
+        Barrier=lambda parties: types.SimpleNamespace(wait=lambda timeout=None: 0),
+        Queue=lambda: never, Process=lambda target, args: next(pending)))
+    monkeypatch.setattr(sessions, "CLIENT_STOP_S", 0)
+    return sessions
+
+
+def test_a_client_that_dies_without_reporting_fails_the_cell_at_once(monkeypatch):
+    clients = [_FakeClient(), _FakeClient()]
+    sessions = _fake_clients(monkeypatch, clients)
+    began = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"exited with \[1, 1\]"):
+        sessions.run_sessions("http://x", "clip.wav", "NATF2", 600, 2, client_procs=2)
+    assert time.monotonic() - began < 30, "must not wait out the session timeout"
+
+
+def test_a_stuck_client_is_stopped_when_its_cell_times_out(monkeypatch):
+    clients = [_FakeClient(alive=True), _FakeClient(alive=True)]
+    sessions = _fake_clients(monkeypatch, clients)
+    monkeypatch.setattr(sessions, "CLIENT_GRACE_S", 0)
+    with pytest.raises(TimeoutError, match="2 client processes"):
+        sessions.run_sessions("http://x", "clip.wav", "NATF2", 0, 2, client_procs=2)
+    assert all(client.stopped == ["terminate"] for client in clients)

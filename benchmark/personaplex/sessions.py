@@ -47,6 +47,7 @@ measures the streamed delivery that ``runner`` does not.
 import argparse
 import json
 import multiprocessing
+import queue as queue_module
 import sys
 import threading
 import time
@@ -62,6 +63,9 @@ VOICE_THRESHOLD = 0.02  # window RMS, full scale 1.0
 MIN_VOICED_S = 0.1
 STALL_LIMIT_S = 0.010
 TTFA_LIMIT_S = 0.200
+# How long past its session timeout a client process may take to report, and to stop once told.
+CLIENT_GRACE_S = 120
+CLIENT_STOP_S = 10
 
 
 def speech_segments(pcm: np.ndarray, rate: int = SAMPLE_RATE, window_s: float = 0.02,
@@ -213,16 +217,45 @@ def run_sessions(url: str, audio: str, voice: str, timeout: float, sessions: int
     barrier, queue = context.Barrier(len(counts) + 1), context.Queue()
     processes = [context.Process(target=_client_process, args=(url, audio, voice, timeout, count, barrier, queue))
                  for count in counts]
+    try:
+        for process in processes:
+            process.start()
+        barrier.wait(timeout=300)
+        began = time.monotonic()
+        results = _collect(processes, queue, began + timeout + CLIENT_GRACE_S)
+        return results, time.monotonic() - began
+    finally:
+        _stop(processes)
+        queue.close()
+
+
+def _collect(processes: list, queue, deadline: float) -> list[dict]:
+    """Every client's rows. Read before joining: a child blocks on exit until its results are off the queue."""
+    results, reported = [], 0
+    while reported < len(processes):
+        try:
+            results.extend(queue.get(timeout=1))
+            reported += 1
+        except queue_module.Empty:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{len(processes) - reported} client processes did not report in time") from None
+            if not any(process.is_alive() for process in processes) and queue.empty():
+                codes = [process.exitcode for process in processes]
+                raise RuntimeError(f"client processes exited with {codes} before reporting") from None
+    return results
+
+
+def _stop(processes: list) -> None:
+    """No client outlives its cell, whatever ended it: a stuck session would keep the command from exiting."""
+    deadline = time.monotonic() + CLIENT_STOP_S
     for process in processes:
-        process.start()
-    barrier.wait(timeout=300)
-    began = time.monotonic()
-    # Read before joining: a child blocks on exit until its results are off the queue.
-    results = [row for _ in processes for row in queue.get(timeout=timeout + 120)]
-    wall = time.monotonic() - began
-    for process in processes:
-        process.join()
-    return results, wall
+        process.join(max(deadline - time.monotonic(), 0))
+    for stop in ("terminate", "kill"):
+        for process in processes:
+            if process.is_alive():
+                getattr(process, stop)()
+        for process in processes:
+            process.join(CLIENT_STOP_S)
 
 
 def write_wav(path: Path, pcm: np.ndarray, rate: int = SAMPLE_RATE) -> None:

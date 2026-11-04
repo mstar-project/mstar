@@ -33,11 +33,13 @@ out; the rest are reported NOT RUN. Results are written after every cell, and
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import time
 import wave
@@ -53,6 +55,7 @@ from benchmark.personaplex.sessions import (
     split_values,
 )
 
+DEFAULT_PAGE_SIZE = 128  # PagedKVConfig's, read in a test: importing it here would pull in the engine
 DEFAULT_SESSIONS = [1, 2, 4, 8, 16, 32, 64, 96, 128]
 # More than a default request's conditioning (voice, silence and persona frames).
 CONDITIONING_FORWARDS = 128
@@ -70,10 +73,22 @@ def sweep_config(base_path: str, concurrency: int, clip_frames: int, output: Pat
     config.setdefault("model_kwargs", {})["max_batch_size"] = concurrency
     config.pop("max_concurrent_requests", None)
     kv = config.setdefault("resources", {}).setdefault("lm_kv", {})
-    page_size = kv.get("page_size", 128)
+    # None derives a default page, as PagedKVConfig does; PersonaPlex's window-free KV gets DEFAULT_PAGE_SIZE.
+    page_size = kv.get("page_size") or DEFAULT_PAGE_SIZE
     kv["max_num_pages"] = 1 + concurrency * math.ceil((clip_frames + CONDITIONING_FORWARDS) / page_size)
     output.write_text(yaml.safe_dump(config, sort_keys=False))
     return str(output)
+
+
+def fingerprint(args, settings: dict) -> dict:
+    """What a cell's numbers depend on. ``--resume`` keeps earlier cells only if all of it still holds."""
+    def digest(path) -> str:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+    return {"commit": head, "audio": digest(args.audio), "server_config": digest(settings["server_config"]),
+            "speech_end": args.speech_end, "rounds": args.rounds, "warmup": args.warmup, "voice": args.voice,
+            "buffer": args.buffer, "stall_limit": args.stall_limit, "ttfa_limit": args.ttfa_limit}
 
 
 def aggregate(concurrency: int, boot_s: float, waves: list[dict]) -> dict:
@@ -195,14 +210,17 @@ def transcribe_cells(args, results: dict) -> None:
 
     nvidia = transcript(args.reference_wav) if args.reference_wav else None
     results["reference_transcript"] = nvidia
-    first = None
     for cell in results["cells"]:
         path = args.output / f"c{cell['concurrency']}" / "session.wav"
-        if not path.is_file():
+        if path.is_file():
+            cell["transcript"] = transcript(path)
+    alone = next((c["transcript"] for c in results["cells"] if c["concurrency"] == 1 and "transcript" in c), None)
+    for cell in results["cells"]:
+        if "transcript" not in cell:
             continue
-        cell["transcript"] = transcript(path)
-        first = cell["transcript"] if first is None else first
-        cell["wer_vs_c1"] = word_error_rate(first, cell["transcript"])
+        # Only against a real N=1 reply: without one the comparison does not exist.
+        if alone is not None:
+            cell["wer_vs_c1"] = word_error_rate(alone, cell["transcript"])
         if nvidia is not None:
             cell["wer_vs_nvidia"] = word_error_rate(nvidia, cell["transcript"])
 
@@ -236,10 +254,17 @@ def main() -> int:
     clip_frames = math.ceil(samples / FRAME_SAMPLES)
     args.output.mkdir(parents=True, exist_ok=args.resume)
     path = args.output / "sweep.json"
+    measured = fingerprint(args, settings)
     results = {"status": "RUNNING", "audio": args.audio, "clip_frames": clip_frames, "boot": [], "cells": [],
-               "stall_limit_s": args.stall_limit, "ttfa_limit_s": args.ttfa_limit}
+               "stall_limit_s": args.stall_limit, "ttfa_limit_s": args.ttfa_limit, "fingerprint": measured}
     if args.resume and path.exists():
-        results = json.loads(path.read_text())
+        earlier = json.loads(path.read_text())
+        if earlier.get("fingerprint") != measured:
+            saved = earlier.get("fingerprint") or {}
+            changed = sorted(k for k in measured if saved.get(k) != measured[k])
+            print(f"Refusing to resume {path}: its cells were measured under a different {changed}", file=sys.stderr)
+            return 2
+        results = earlier
         results["cells"] = [cell for cell in results["cells"] if cell["status"] == "PASS"]
     if args.boot_rounds and not results["boot"]:
         config = sweep_config(settings["server_config"], args.boot_concurrency, clip_frames,
