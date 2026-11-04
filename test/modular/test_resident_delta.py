@@ -29,14 +29,21 @@ sys.path.insert(0, ".")
 
 import test_kv_host_index as host
 from test_kv_preemption import _step
-from test_kv_prefix_lease import NODE, PAGE_SIZE, _StubTransfer
+from test_kv_prefix_lease import NODE, PAGE_SIZE, _ctx, _StubTransfer
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Rebuild, Residency
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    RetentionPolicy,
+    StreamLayout,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext, SubmoduleStep
@@ -1422,6 +1429,28 @@ def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
         scheduler.settle_tp_follow_delta(None, caught_up=True)
+
+
+def test_under_debug_asserts_a_commit_moves_nothing_a_page_trail_carries(monkeypatch):
+    """Rank 0 sends the next step's page trail before its step in flight commits, and a follower can check it after
+    its own has. Here the commit releases the pages a window no longer reads, so r holds fewer pages than it was
+    allotted. A trail that carried the allotted pages not yet used then stopped a follower whose counts agreed."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    leader, lead = _pool_rank(monkeypatch, 0)
+    window = RetentionPolicy(PAGE_SIZE)
+    layout = StreamLayout((PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, "prefill"),), (("decode", 1),), retention=window)
+    config = KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": PAGE_SIZE})
+    lead._runner.ingest_request("r", {"kv": config}, 1)
+    assert _admits(leader, "r")
+    step = KVStep(segments=(Segment("r", "main", 3 * PAGE_SIZE),), retention={("r", "main"): window})
+    assert leader.admit(step, _ctx("r")).ok
+    leader.plan(step, _ctx("r"))
+    trail = leader.page_trail()
+
+    leader.commit(step, _ctx("r"))
+
+    assert len(leader._streams["r"]["main"].pages()) < 3, "the window released nothing, so the test checks nothing"
+    assert leader.page_trail() == trail, "the counts a follower checks moved with rank 0's commit"
 
 
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
