@@ -478,6 +478,9 @@ def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
         def test_checks_for_a_gpu(): pass
         @pytest.mark.skipif(os.name == "nt", reason="posix only")
         def test_other_skipif(): pass
+        requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="")
+        @requires_cuda
+        def test_named_gpu_skipif(): pass
     """))
     (pkg / "test_module.py").write_text(textwrap.dedent("""
         import os, pytest
@@ -487,11 +490,12 @@ def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
     """))
 
     run_pytest(tmp_path, "--junitxml=plain.xml", "test", PLAIN="1")
-    out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "--skipped-in=plain.xml", "--collect-only", "-q",
-                     "test")
-    selected = {line for line in out.splitlines() if "::" in line}
-    assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_classes.py::test_checks_for_a_gpu",
-                        "test/a/test_module.py::test_one"}, out
+    for selection in ("--skipped-in=plain.xml", "--gpu-only"):  # the same tests, from the run or the source
+        out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", selection, "--collect-only", "-q", "test")
+        selected = {line for line in out.splitlines() if "::" in line}
+        assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_module.py::test_one",
+                            "test/a/test_classes.py::test_checks_for_a_gpu",
+                            "test/a/test_classes.py::test_named_gpu_skipif"}, (selection, out)
 
 
 def test_every_cuda_seam_mstar_reaches_is_emulated():

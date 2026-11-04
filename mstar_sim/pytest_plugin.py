@@ -162,23 +162,40 @@ def _checks_gpu(item) -> bool:
         if _CHECKS_GPU.search(source):
             return True
         todo.extend(getattr(module, n, None) for n in set(re.findall(r"\b(\w+)\(", source)))
-    # a skipif on the function is in its source, scanned above; one on its class or module:
-    return any(node is not item and _SKIPIF_GPU.search(_marks_source(node.obj))
+    return any(_SKIPIF_GPU.search(_marks_source(node.obj, module))
                for node, _ in item.iter_markers_with_node("skipif"))
 
 
 @functools.cache
-def _marks_source(obj) -> str:
-    """The marks a test class or module sets on its tests: its decorators and ``pytestmark``."""
-    try:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
-    except (OSError, TypeError, SyntaxError):
+def _marks_source(obj, module) -> str:
+    """The marks a test function, class or module sets: its decorators and ``pytestmark``,
+    with the module-level marks they name (``requires_cuda = pytest.mark.skipif(...)``)."""
+    tree = _parse(obj)
+    if tree is None:
         return ""
-    scope = tree.body[0] if isinstance(obj, type) else tree
-    marks = [*getattr(scope, "decorator_list", ()), *(
-        s for s in scope.body if isinstance(s, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in s.targets))]
+    scope = tree if inspect.ismodule(obj) else tree.body[0]
+    marks = [*getattr(scope, "decorator_list", ()), *_assigns(scope).get("pytestmark", ())]
+    named = _assigns(_parse(module)) if module is not None else {}
+    marks += [a for m in marks for n in ast.walk(m) if isinstance(n, ast.Name) for a in named.get(n.id, ())]
     return "\n".join(ast.unparse(m) for m in marks)
+
+
+@functools.cache
+def _parse(obj) -> ast.Module | None:
+    try:
+        return ast.parse(textwrap.dedent(inspect.getsource(obj)))
+    except (OSError, TypeError, SyntaxError):
+        return None
+
+
+def _assigns(scope) -> dict[str, list[ast.Assign]]:
+    out: dict[str, list[ast.Assign]] = {}
+    for s in getattr(scope, "body", ()):
+        if isinstance(s, ast.Assign):
+            for t in s.targets:
+                if isinstance(t, ast.Name):
+                    out.setdefault(t.id, []).append(s)
+    return out
 
 
 def _needs_gpu(item) -> bool:
