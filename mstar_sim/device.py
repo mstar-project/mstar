@@ -294,17 +294,32 @@ def _track(wrapper, data: torch.Tensor) -> None:
     with _track_lock:
         entry = _STORAGES.get(key)
         if entry is None:
-            nbytes = storage.nbytes()
-            into = None if getattr(storage, "_sim_imported", False) else _allocate(wrapper.device.index, nbytes)
-            entry = _STORAGES[key] = [nbytes, 0, _fake_range(nbytes), into]
-            if into is not None:
-                into.live += nbytes
-                used = ALLOCATED.setdefault(into.device, [0, 0])
-                used[0] += nbytes
-                used[1] = max(used[1], used[0])
+            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes()), None]
+            if not getattr(storage, "_sim_imported", False) and not clock.in_kernel():
+                _count(entry, wrapper.device.index)
         entry[1] += 1
     data._sim_tracked = True
     weakref.finalize(data, _release, key)
+
+
+def _count(entry: list, index: int) -> None:
+    into = entry[3] = _allocate(index, entry[0])
+    into.live += entry[0]
+    used = ALLOCATED.setdefault(into.device, [0, 0])
+    used[0] += entry[0]
+    used[1] = max(used[1], used[0])
+
+
+def count_storages(out) -> None:
+    """A stand-in kernel's outputs are its allocations; the tensors it made them with
+    inside (``clock.in_kernel``) are not counted, as the real kernel has none."""
+    for t in tree_flatten(out)[0]:
+        if isinstance(t, SimTensor):
+            storage = t._data.untyped_storage()
+            with _track_lock:
+                entry = _STORAGES.get(storage._cdata)
+                if entry is not None and entry[3] is None and not getattr(storage, "_sim_imported", False):
+                    _count(entry, t.device.index)
 
 
 # Value-less storages get addresses in [2^60, 2^62): unique per storage, never

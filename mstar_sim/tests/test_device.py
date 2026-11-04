@@ -308,6 +308,17 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
         torch.cuda.empty_cache()
         assert torch.cuda.memory_reserved() == before
 
+        # a stand-in kernel allocates its outputs only, not what the emulator makes them with
+        import flashinfer
+        rows, k = 8192, 2048
+        scores, table = torch.empty(rows, 4096, device="cuda"), torch.empty(rows, 64, dtype=torch.int32, device="cuda")
+        lengths = torch.full((rows,), 4096, device="cuda")
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        slots = flashinfer.top_k_page_table_transform(scores, table, lengths, k, page_size=64)
+        assert torch.cuda.max_memory_allocated() - base == slots.numel() * 4, torch.cuda.max_memory_allocated() - base
+        del slots
+
         total = torch.cuda.get_device_properties().total_memory
         big = torch.empty(total // 6, device="cuda")  # two thirds of the card
         del big

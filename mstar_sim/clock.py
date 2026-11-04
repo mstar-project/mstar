@@ -178,10 +178,12 @@ def set_capturing(tape: Tape | None) -> Tape | None:
 
 def _flag_values(out, written):
     """A stand-in's value-holding outputs (small ints: a sampled token) hold no
-    kernel's values; nor do value-holding tensors it was handed to write."""
+    kernel's values; nor do value-holding tensors it was handed to write. Its
+    outputs are the kernel's allocations (what it used to make them is not)."""
     from mstar_sim import device
 
     device.KERNELS_RUN[0] += 1
+    device.count_storages(out)
     if any(isinstance(t, device.SimTensor) and t._data.device.type != "meta"
            for t in device.tree_flatten((out, written))[0]):
         device.uncomputed()
@@ -194,7 +196,7 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
 
     The decorated function computes nothing: it returns what the kernel would
     (its ``out`` arguments, or empty tensors of the right shape), and the
-    tensor ops it uses for that are not charged.
+    tensor ops it uses for that are not charged, nor count as allocations.
     Captured, those ops on kept values run at each replay, like any others. ``cost`` (same arguments)
     returns ``(flops, bytes)``, or ``(flops, bytes, features)`` with the
     geometry a measured table needs (:func:`mstar_sim.cost.kernel_seconds`),
