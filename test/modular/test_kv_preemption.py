@@ -317,6 +317,40 @@ def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fi
     assert _admitted(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r wasn't admitted once its shortage fit"
 
 
+def test_a_waiting_request_asks_for_the_room_its_grant_counted_too():
+    """A grant two pages past its allotment, with one page free, is one page short. Asking for that page alone, the
+    request was let go at once into the free page, and its next grant failed the same way."""
+    kv = _pool()
+    _running(kv, "a", 4, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits
+    _runner(kv).readmit("r", NODE)
+
+    assert not _admitted(kv, "r"), "r was let go into the one free page, though its grant needs two"
+
+
+@pytest.mark.parametrize("cover", ["a victim's move", "room freed since"])
+def test_the_room_a_short_grant_counted_is_set_aside_for_it(cover):
+    """A grant two pages past its allotment, with one page free, is one page short. Setting aside only the page a
+    move freed, or nothing once the room had grown to cover the grant, left the free page to another request's
+    growth, and the grant failed again."""
+    kv = _pool()
+    _running(kv, "a", 3, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 1, arrival=2)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    if cover == "room freed since":
+        _remove(kv, "v")
+    victims = _preempt(kv, "r", short, droppable=lambda rid: True)
+    if cover == "a victim's move":
+        assert victims.to_drop == ["v"]
+        _drop(kv, "v")
+    _step(kv, "a", PAGE_SIZE)
+
+    assert _step(kv, "r", PAGE_SIZE + 1).ok, "a grew into the room r's grant counted, and r's grant failed again"
+
+
 @pytest.mark.parametrize("state", ["pending victim", "dropped", "rebuilding", "earmark's request"])
 def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
