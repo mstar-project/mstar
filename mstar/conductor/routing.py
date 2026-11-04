@@ -14,10 +14,12 @@ the request there:
   replica, such as a paged KV cache's predicted prefix hit. The rows of every
   mirror on the set add up before they are priced.
 
-Every cost is in request-equivalents. The cheapest replica wins, ties at
-random. Groups whose replicas sit on the same ranks, replica for replica, pick
-one index together, so a request's walks stay on one set of workers. A
-prediction never changes outputs: a wrong one makes a request slower.
+Every cost is in request-equivalents. The cheapest replica wins, ties to the
+one picked longest ago (among never-picked ones, at random), so requests that
+never overlap still take turns over the replicas. Groups whose replicas sit on
+the same ranks, replica for replica, pick one index together, so a request's
+walks stay on one set of workers. A prediction never changes outputs: a wrong
+one makes a request slower.
 """
 
 import logging
@@ -163,6 +165,9 @@ class ReplicaRouter:
         }
         # live requests per (unit index, replica)
         self._load: Counter[tuple[int, int]] = Counter()
+        # when each (unit index, replica) was last recorded, in requests added: 0 for never
+        self._last_pick: Counter[tuple[int, int]] = Counter()
+        self._picks = 0
         self.predicted_saving = MetricCounter(catalog.ROUTING_PREDICTED_SAVING)
 
     def groups_run(self, partitions: Iterable[str]) -> frozenset[int]:
@@ -189,7 +194,9 @@ class ReplicaRouter:
                     for i in range(len(unit.instances))
                 ]
                 least = min(cost)
-                choice = random.choice([i for i, c in enumerate(cost) if c == least])
+                tied = [i for i, c in enumerate(cost) if c == least]
+                oldest = min(self._last_pick[(u, i)] for i in tied)
+                choice = random.choice([i for i in tied if self._last_pick[(u, i)] == oldest])
                 if row is not None:
                     picked[u] = row[choice]
             for group in unit.groups:
@@ -221,6 +228,9 @@ class ReplicaRouter:
                     self.predicted_saving.inc((term,), saving)
         handle = RoutingHandle(tuple(load), tuple(handles))
         self._load.update(handle.load)
+        self._picks += 1
+        for key in handle.load:
+            self._last_pick[key] = self._picks
         return handle
 
     def remove(self, handle: RoutingHandle, ran: Iterable[str]) -> None:
