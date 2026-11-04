@@ -821,8 +821,9 @@ The spec types are:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
        (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
        the resource its gates as it binds: with Kimi K3's full-rank output gate
-       (``full_rank_output_gate``), or a forget-gate bound the fused kernels can't hold,
-       the resource runs the torch reference. Its prefill can't be captured
+       (``full_rank_output_gate``) the resource runs the torch reference. Where the fused
+       kernels run, activations other than bf16 or a forget-gate bound below -5 are a
+       ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
    * - ``LoraSpec`` (built by ``module_lora_spec``)

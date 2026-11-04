@@ -41,7 +41,7 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -475,19 +475,18 @@ class TestCheckStop:
         infos = {
             "eos": _info("eos"), "mid": _info("mid"),
             "budget": _info("budget", max_tokens=8, decode_iters=6),
-            "ignored": _info("ignored", ignore_eos=True), "ended": _info("ended"),
+            "ignored": _info("ignored", ignore_eos=True), "first": _info("first", walk="prefill"),
             "absent": _info("absent"),
         }
-        sub.request_state("ended").add("ended_at_prefill", True)
-        rows = ("eos", "mid", "budget", "ignored", "ended")
-        tokens = torch.tensor([eos, word, word, eos, word, 0])  # a padding row last
+        rows = ("eos", "mid", "budget", "ignored", "first")
+        tokens = torch.tensor([eos, word, word, eos, eos, 0])  # a padding row last
         batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
         per_request = {
             rid: loops for rid, token in zip(rows, tokens, strict=False)
             if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
         }
         assert batched == per_request == {
-            "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
+            "eos": {"decode_loop"}, "budget": {"decode_loop"}, "first": {END_PARTITION},
         }
 
 
