@@ -261,14 +261,15 @@ def _allocate(index: int, nbytes: int) -> Pool:
     tape = clock.capturing()
     into = pool(*tape.pool) if tape is not None and tape.pool is not None and tape.pool[0] == index \
         else pool(index)
-    grow = into.live + nbytes - into.reserved
-    if grow > 0:
+    if into.live + nbytes > into.reserved:
         from mstar_sim import cuda
 
+        grow = _segment(nbytes)
         limit = cuda.memory_limit(index)
         if reserved(index) + grow > limit:
             release_cached(index)
-            grow = into.live + nbytes - into.reserved
+            if into.live + nbytes <= into.reserved:
+                return into
             if reserved(index) + grow > limit:
                 held = ", ".join(f"{'default' if p.handle == DEFAULT_POOL else p.handle}: {p.reserved / 2**20:.0f}"
                                  for p in POOLS.values() if p.device == index and p.reserved)
@@ -279,6 +280,17 @@ def _allocate(index: int, nbytes: int) -> Pool:
         into.reserved += grow
         RESERVED_PEAK[index] = max(RESERVED_PEAK.get(index, 0), reserved(index))
     return into
+
+
+def _segment(nbytes: int) -> int:
+    """The segment torch's caching allocator reserves from the card for a block it has no room
+    for (``CUDACachingAllocator``'s ``get_allocation_size``): 2 MiB for a small block (up to
+    1 MiB), 20 MiB up to 10 MiB, else the block rounded up to 2 MiB."""
+    if nbytes <= 1 << 20:
+        return 2 << 20
+    if nbytes < 10 << 20:
+        return 20 << 20
+    return -(-nbytes // (2 << 20)) * (2 << 20)
 
 
 def _track(wrapper, data: torch.Tensor) -> None:
@@ -292,7 +304,9 @@ def _track(wrapper, data: torch.Tensor) -> None:
     with _track_lock:
         entry = _STORAGES.get(key)
         if entry is None:
-            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes()), None]
+            # a block is a multiple of 512 bytes, as the caching allocator rounds it
+            nbytes = -(-storage.nbytes() // 512) * 512
+            entry = _STORAGES[key] = [nbytes, 0, _fake_range(nbytes), None]
             if not getattr(storage, "_sim_imported", False) and not clock.in_kernel():
                 _count(entry, wrapper.device.index)
         entry[1] += 1
