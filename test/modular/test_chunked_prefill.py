@@ -216,6 +216,41 @@ def test_the_head_cut_over_its_budget_takes_a_multiple_of_the_alignment():
     assert take == {"p": 256}
 
 
+@pytest.mark.parametrize("floor, align, budget, short", [
+    (128, 256, 512, 128),  # a KV page_size of 256 under the default floor
+    (64, 128, 2048, 62),
+    (200, 128, 2048, 100),
+])
+def test_short_prompts_cannot_starve_the_oldest_prompt_under_an_alignment(floor, align, budget, short):
+    """The oldest prompt mid-prefill keeps the floor out of the finishing pass. A floor between
+    two multiples of the alignment leaves it too little to cut, every step that short prompts
+    take the rest, so the floor rounds up to one."""
+    from mstar.engine.chunking import ChunkingManagement
+
+    chunking = ChunkingManagement({})
+    chunking.set_budgets({}, set(), min_chunk_tokens=floor)
+    min_chunk = chunking.min_chunk_tokens(budget, align)
+    shorts = {f"s{i}": short for i in range(2 * budget // short)}
+    take, dropped = fill_token_budget_in_start_order(
+        [*shorts, "old"], shorts | {"old": 20000}, set(shorts) | {"old"}, budget, min_chunk, {"old": 0}, align,
+    )
+    assert "old" not in dropped
+    assert take["old"] >= floor and take["old"] % align == 0
+
+
+def test_the_floor_rounds_up_to_the_alignment_within_the_budget():
+    from mstar.engine.chunking import ChunkingManagement
+
+    chunking = ChunkingManagement({})
+    assert chunking.min_chunk_tokens(2048, 128) == 128
+    assert chunking.min_chunk_tokens(512, 256) == 256
+    chunking.set_budgets({}, set(), min_chunk_tokens=200)
+    assert chunking.min_chunk_tokens(2048, 128) == 256
+    # never past the budget's whole multiples, which a cut could not reach
+    assert chunking.min_chunk_tokens(250, 128) == 128
+    assert chunking.min_chunk_tokens(2048) == 200, "a node that declares no alignment keeps its floor"
+
+
 # ── engine: prepare once, cut per chunk ─────────────────────────────────
 
 
@@ -563,7 +598,8 @@ def test_a_continuing_decode_row_is_estimated_at_one_token():
 # ── engine: the serving config's max_batch_tokens ──────────────────────
 
 
-def _budgeted_engine():
+def _budgeted_engine(align: int = 1):
+    """An engine whose LLM node carries a resource declaring ``align`` (`Resource.chunk_alignment`)."""
     from types import SimpleNamespace
 
     from mstar.engine.chunking import ChunkingManagement
@@ -571,7 +607,10 @@ def _budgeted_engine():
     from mstar.model.submodule_base import ChunkingPolicy
 
     engine = Engine.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(submodule=SimpleNamespace())}
+    engine._submodules = {"LLM": SimpleNamespace(
+        submodule=SimpleNamespace(), resources={"state": SimpleNamespace(chunk_alignment=align)},
+    )}
+    engine._chunk_alignment = {}
     engine._chunking = ChunkingManagement(engine._submodules)
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
@@ -651,11 +690,11 @@ COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}
 WALKS = {"prefill", "decode"}
 
 
-def _mixed_engine():
+def _mixed_engine(align: int = 1):
 
     from mstar.model.submodule_base import ChunkingPolicy
 
-    engine = _budgeted_engine()
+    engine = _budgeted_engine(align)
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=512),
@@ -709,6 +748,29 @@ def test_with_the_flag_a_null_walk_budget_turns_its_chunking_off():
 
     assert not engine.supports_chunked_prefill("LLM", "prefill")
     assert engine.walk_token_caps("LLM", "mixed") is None
+
+
+def test_a_budget_under_the_chunk_alignment_is_refused_and_one_under_three_is_warned(caplog):
+    """A cut chunk is a whole number of alignments: under one, every cut would run past the
+    budget, and under three, up to an alignment of each step can go unused."""
+    engine = _mixed_engine(align=128)
+    with pytest.raises(ValueError, match="LLM/mixed: 64 is under the 128-token chunk alignment"):
+        engine.set_token_budgets({"LLM": {"mixed": 64}}, WALKS, COMBINED)
+
+    with caplog.at_level("WARNING", logger="mstar.engine.engine"):
+        engine.set_token_budgets({"LLM": {"mixed": 300}}, WALKS, COMBINED)
+    assert [r.getMessage().split(":")[0] for r in caplog.records] == ["max_batch_tokens for LLM/mixed"]
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="mstar.engine.engine"):
+        _mixed_engine(align=128).set_token_budgets({}, WALKS, COMBINED)
+    assert not caplog.records
+
+
+def test_a_budget_the_scheduler_never_cuts_by_is_not_held_to_the_alignment():
+    engine = _budgeted_engine(align=128)
+    engine.set_token_budgets({"LLM": 64}, {"prefill", "vision"})
+    assert engine.get_max_batch_tokens("LLM", "prefill") == 64
 
 
 def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(caplog):

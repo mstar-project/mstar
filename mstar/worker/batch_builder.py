@@ -100,7 +100,8 @@ class BatchBuildRequest:
     # budget; ``max_batch_tokens`` above is what is left of that budget).
     min_chunk_tokens: int = 1
     # A cut row takes a multiple of this, the alignment the node's resources
-    # declare (`Engine.chunk_alignment`), so its next chunk starts on it.
+    # declare (`Engine.chunk_alignment`), so its next chunk starts on it;
+    # ``min_chunk_tokens`` is one too.
     chunk_alignment: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
@@ -500,9 +501,10 @@ def _cap_walks(
         rids = [rid for rid in batch.request_to_worker_graph if rid in take and batch.walk_of(rid) == walk]
         if sum(take[rid] for rid in rids) <= cap:
             continue
+        # the floor stays a multiple of ``align`` under a cap that isn't one
         walk_take, walk_dropped = share(
-            rids, {rid: take[rid] for rid in rids}, chunkable, cap, min(min_chunk, cap),
-            start_order or {}, align,
+            rids, {rid: take[rid] for rid in rids}, chunkable, cap,
+            min(min_chunk, max(cap - cap % align, align)), start_order or {}, align,
         )
         for rid in rids:
             del take[rid]

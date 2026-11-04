@@ -88,8 +88,12 @@ def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True)
     return pool
 
 
-def _ctx(rid: str) -> StepContext:
-    return StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
+def _ctx(rid: str, after: int = 0) -> StepContext:
+    """``after`` tokens of the row's prompt run after this step, as for a chunk mid-prefill."""
+    return StepContext(
+        request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+        chunk_tokens_after={rid: after} if after else {},
+    )
 
 
 def _step(rid: str, span: int) -> RecurrentStep:
@@ -588,8 +592,10 @@ def _chunks(pool: RecurrentStatePool, rid: str, tokens: list[int], spans: list[i
     pool.ingest_request(rid)
     pool._kv.add(rid, tokens)
     pool.resolve_cached_prefix(rid, NODE, WALK, None)
+    left = sum(spans)
     for span in spans:
-        step, ctx = _step(rid, span), _ctx(rid)
+        left -= span
+        step, ctx = _step(rid, span), _ctx(rid, left)
         assert pool.admit(step, ctx).ok
         pool.plan(step, ctx)
         pool.commit(step, ctx)
@@ -614,6 +620,30 @@ def test_a_later_chunk_makes_the_earlier_chunks_snapshot_the_first_to_evict():
         _chunks(pool, rid, tokens, spans)
         pool.remove_request(rid)
     assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+
+
+def test_an_earlier_chunks_snapshot_still_serves_a_prompt_that_shares_only_that_chunk():
+    """A later chunk makes the earlier chunk's snapshot the first to evict once it files, not as it
+    reserves: with every slot a prompt's, the earlier one would be the only candidate, and a prompt
+    sharing just the first chunk (a long system prompt) would restore nothing."""
+    pool = _pool(prefix_slots=3)
+    for rid, tokens in {"p": range(100, 119), "q": range(200, 219), "r": range(300, 319)}.items():
+        _chunks(pool, rid, list(tokens), [19])
+        pool.remove_request(rid)
+    _chunks(pool, "x", A[:19], [8, 11])
+    pool.remove_request("x")
+    assert _probe(pool, "b", A[:12] + [99] * 7, hit=12).tokens == 8
+
+
+def test_a_chunk_of_one_page_keeps_its_end_so_a_budget_of_a_page_still_keeps_snapshots():
+    """A chunk with more of its prompt to come keeps the boundary at its end; the page before
+    its last token, which a resend of the whole prompt runs again, is what a prompt's last chunk keeps."""
+    pool = _pool(prefix_slots=4)
+    _chunks(pool, "a", A[:19], [PAGE] * 4 + [3])
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+    assert [reply for _, reply in pool._snap_meta.values()] == [True, True, True, False], (
+        "each chunk's snapshot should make the one before it the first to evict"
+    )
 
 
 def test_a_chunk_that_starts_off_the_page_grid_keeps_no_boundary():

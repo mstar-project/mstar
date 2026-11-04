@@ -256,7 +256,7 @@ class RecurrentStatePool(Resource):
         # `_decode` holds each stream's newest decode snapshot, and `_unkeyed`
         # those whose page the KV chain doesn't key yet.
         # `_chunk_ends` holds each stream's last filed row-end snapshot (slot, key),
-        # which the stream's next chunk supersedes.
+        # which the stream's next chunk supersedes; purged by `reset_request`.
         self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
@@ -369,8 +369,6 @@ class RecurrentStatePool(Resource):
                     self._unkeyed.discard(key)
                     self._snap_free.append(decode.slot)
             self._keyed -= {k for k in self._keyed if k[0] == rid}
-            for key in [k for k in self._chunk_ends if k[0] == rid]:
-                del self._chunk_ends[key]
             self._forget_prefix_admit(lambda key: key[0] == rid)
             self._version += 1
 
@@ -510,7 +508,10 @@ class RecurrentStatePool(Resource):
                         every[label] = self._checkpoint_every(
                             [seg for seg in step.segments if seg.label == label], ctx,
                         )
-                    self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
+                    self._admit_prefix(
+                        segment.request_id, label, segment.span, every[label], ctx.is_preplan,
+                        segment.request_id in ctx.chunk_tokens_after,
+                    )
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -835,15 +836,19 @@ class RecurrentStatePool(Resource):
             every += page
         return every
 
-    def _admit_prefix(self, rid: str, label: str, span: int, every: int, preplan: bool) -> None:
+    def _admit_prefix(
+        self, rid: str, label: str, span: int, every: int, preplan: bool, mid_prefill: bool = False,
+    ) -> None:
         """Turn a hit's lease into a restore for plan to copy in, and reserve
         snapshot slots for the boundaries a prefill row keeps: the row's last
         boundary, and the KV hit's last boundary when the hit runs past the
         restored length, both on the step's checkpoint interval ``every``. A
         later chunk of a prompt keeps its last boundary too, when it starts on a
-        page (`chunk_alignment`); a decode row keeps none here. A pre-plan
-        stages only an unprepared speculative step, which takes neither, and
-        `clear_preplan` gives nothing back."""
+        page (`chunk_alignment`); a decode row keeps none here. A prompt's last
+        boundary is before its last token, which a resend of it runs again; a
+        chunk with more of its prompt to come (``mid_prefill``) keeps its own end.
+        A pre-plan stages only an unprepared speculative step, which takes
+        neither, and `clear_preplan` gives nothing back."""
         page = self._kv.config.tokens_per_page
         with self._lock:
             start = hit = 0
@@ -863,7 +868,7 @@ class RecurrentStatePool(Resource):
                     return
             if span < page or (rid, label) not in self._keyed:
                 return
-            end = start + (span - 1) // every * every
+            end = start + (span if mid_prefill else span - 1) // every * every
             for boundary in sorted({end, start + (hit - start) // every * every}):
                 if start < boundary <= start + span:
                     assert not preplan, "a pre-plan reserved a snapshot write"
