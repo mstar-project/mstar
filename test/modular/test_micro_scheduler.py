@@ -161,6 +161,10 @@ class _Runtime:
             walk_output_signals=signals,
         )
 
+    def get_output_signals(self, node_name, graph_walk):
+        del node_name
+        return [f"out_{graph_walk}"]
+
     def get_nodes(self, node_name, rids, wg_ids):
         del wg_ids
         return [SimpleNamespace(name=node_name) for _ in rids]
