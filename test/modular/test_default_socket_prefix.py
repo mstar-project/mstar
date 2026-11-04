@@ -93,6 +93,8 @@ def _dynamo_prefix(monkeypatch, *argv) -> dict:
         raise _StopError
 
     monkeypatch.setattr(worker, "build_server", fake_build_server)
+    # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr("mstar.utils.logging_config.log_off_thread", lambda: None)
     with pytest.raises(_StopError):
         worker.main(["--config", "c.yaml", "--model-path", "/m", *argv])
     return seen
