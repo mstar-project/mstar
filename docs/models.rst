@@ -471,13 +471,16 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
-step's decode rows and batches a few tokens over; a mixed step keeps only the
-powers of two past 2176); a step pads to its bucket and a longer one runs
-eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
-deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
-and 2176 for a mixed step, since the LLM's 2048-token step budget
+ladder ``32 ... 8192`` (powers of two, plus 2176 as slack for a step a few
+tokens over the 2048-token step budget); a step pads to its bucket and a longer
+one runs eagerly. A text-prefill step, one with no decode rows beside it, also
+has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn't
+pad to 2048; a mixed step captures only the ladder's powers of two and 2176, on
+a deployment's own ladder too, so a ladder needs at least one of those.
+``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own ladder
+(distinct positive token counts, checked when the worker loads):
+``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048,
+1152-1792, and 2176 as slack, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
 reached. Each bucket adds captures and startup time.
 
