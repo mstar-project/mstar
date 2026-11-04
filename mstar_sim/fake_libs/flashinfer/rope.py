@@ -20,6 +20,14 @@ def apply_rope_pos_ids_inplace(
     return None
 
 
+@clock.kernel_fn("flashinfer.apply_rope_pos_ids", static=True, cost=lambda q, k, *a, **kw: _cost(q, k))
+def apply_rope_pos_ids(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor, rotary_dim: int | None = None,
+    interleave: bool = False, rope_scale: float = 1, rope_theta: float = 1e4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
+
+
 @clock.kernel_fn("flashinfer.apply_llama31_rope_pos_ids", static=True,
                  cost=lambda q, k, *a, **kw: _cost(q, k))
 def apply_llama31_rope_pos_ids_inplace(

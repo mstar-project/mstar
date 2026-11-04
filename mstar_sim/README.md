@@ -60,6 +60,7 @@ Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-c
 - **`-- script.py` with multiprocessing.** The script needs an `if __name__ == "__main__":` guard. Spawned children re-import it, and without the guard the conductor dies ("is not going to be frozen") and the launcher hangs.
 - **A small `/dev/shm`.** `--shm-mb N` makes mstar's tmpfs sizing see an N MiB `/dev/shm` (`statvfs`). Free space is N less what `mstar_*` files there hold, a dead run's leftovers included. Writes past N still succeed.
 - **Serving a config.** It's `python -m mstar_sim … serve <model> --config <yaml>`; the CLI takes a model name, not a YAML path.
+- **Assets the model `torch.load`s** (a vocoder's `hift.pt`): the checkpoint keeps them shape-only, a few KB each, after downloading each one once. Large non-torch assets (`.onnx`) are skipped, so a model that runs them needs the real file next to the checkpoint.
 - **Small pools.** A config with a small cross-attention or KV pool can fail capture planning, because each bucket's plan needs room for its whole batch. Cap the buckets (`--max-capture-batch 8`) rather than shrinking the pool below that.
 
 ## Measured kernel times

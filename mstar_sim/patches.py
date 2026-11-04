@@ -114,9 +114,11 @@ def kv_scatter() -> None:
 
     cache = importlib.import_module("mstar.engine.resources.kv.cache")
 
+    # (layer, k, v, page_idx, cache_idx); older trees put the cache and a layer index first:
+    # either way k is the fourth from last
     @clock.kernel_fn("triton._kv_scatter_nhd_kernel", static=True,
-                     cost=lambda layer, k, v, *a: (0.0, 4.0 * k.numel() * k.element_size()))
-    def scatter_nhd(layer, k, v, page_idx, cache_idx):
+                     cost=lambda *a: (0.0, 4.0 * a[-4].numel() * a[-4].element_size()))
+    def scatter_nhd(*args):
         return None  # in place
 
     _replace(cache, "_kv_scatter_nhd_eager", scatter_nhd)
@@ -281,6 +283,8 @@ def header_only_weights() -> None:
     iterators = importlib.import_module("mstar.model.loader.iterators")
     _replace(iterators, "safe_open", _MetaSafeOpen)
 
+    if not hasattr(iterators, "_read_tensor"):
+        return  # an older loader reads through safe_open, patched above
     real_read = iterators._read_tensor
 
     def read_tensor(fd, rd):

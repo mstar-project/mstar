@@ -102,11 +102,38 @@ def _write_sparse(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> int:
     return sum(math.prod(shape) for _, shape in tensors.values())
 
 
+def _weight_copy(rel: str) -> bool:
+    """A weight format beside the safetensors (``pytorch_model.bin``), not an asset."""
+    name = os.path.basename(rel)
+    return name.startswith(("pytorch_model", "diffusion_pytorch_model", "model.", "consolidated")) or any(
+        fnmatch.fnmatch(name, pat) for pat in ("*.h5", "*.msgpack", "*.gguf", "*.bin.index.json"))
+
+
+def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
+    """A ``torch.load``-able asset (a vocoder's ``hift.pt``) saved again with every
+    tensor value-less: a few KB, and ``torch.load`` gives back the same structure."""
+    import torch
+
+    try:
+        obj = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    except Exception:  # noqa: BLE001 - not a plain tensor file: keep nothing, say so
+        return False
+    from torch.utils._pytree import tree_map
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tree_map(lambda x: torch.empty_like(x, device="meta") if isinstance(x, torch.Tensor) else x, obj),
+               dest)
+    return True
+
+
 def _build(src, out: Path) -> dict:
     params, notes = 0, []
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(out / rel, src.header(rel))
+        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin")) and not _weight_copy(rel):
+            if not _shapes_only_torch_file(src.fetch(rel), out / rel):
+                notes.append(f"skipped {rel}: not a plain tensor file")
         elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
                 fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS)):
             notes.append(f"skipped {rel} ({size / 2**20:.0f} MB)")
