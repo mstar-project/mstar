@@ -227,12 +227,12 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
 
             launched = vnow()
             _tls.in_kernel = getattr(_tls, "in_kernel", 0) + 1
-            try:
-                with contextlib.nullcontext() if FAST else computing():
+            with contextlib.nullcontext() if FAST else computing():
+                try:
                     out = fn(*args, **kwargs)
-            finally:
-                _tls.in_kernel -= 1
-            out = _flag_values(out, args if writes_args else ())
+                finally:
+                    _tls.in_kernel -= 1
+                out = _flag_values(out, args if writes_args else ())
             if FAST:
                 return out
             tape = capturing()

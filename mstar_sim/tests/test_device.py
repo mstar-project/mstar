@@ -197,6 +197,13 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             a @ a
         took = timed(g5.replay, queued=0.0)  # idle: a late launch would show
         assert took < 0.1, took
+        # nor is what it does around a stand-in kernel
+        from mstar_sim import device
+        count_storages, device.count_storages = device.count_storages, lambda out: time.sleep(0.2)
+        before = clock.vnow()
+        clock.kernel_fn("test.idle")(lambda: None)()
+        assert clock.vnow() - before < 0.1, clock.vnow() - before
+        device.count_storages = count_storages
         try:
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
                 lens.sum().item()
