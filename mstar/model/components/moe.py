@@ -173,7 +173,7 @@ class TopKRouter(nn.Module):
         if (
             fused and _HAS_FUSED and align_w1 is not None and self.norm_topk_prob
             and tokens * self.top_k <= ROUTE_ALIGN_MAX_SLOTS
-            and not runs_per_pair(hidden_states, align_w1)
+            and not runs_per_pair(hidden_states, align_w1, self.top_k)
         ):
             router_logits = F.linear(hidden_states, self.weight)
             # int: the kernel's block sizes are constants, and a compile that keeps the
