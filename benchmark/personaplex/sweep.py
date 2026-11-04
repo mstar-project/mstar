@@ -50,6 +50,7 @@ from benchmark.personaplex.sessions import (
     TTFA_LIMIT_S,
     percentiles,
     run_cell,
+    split_values,
 )
 
 DEFAULT_SESSIONS = [1, 2, 4, 8, 16, 32, 64, 96, 128]
@@ -92,6 +93,8 @@ def aggregate(concurrency: int, boot_s: float, waves: list[dict]) -> dict:
             "met_slo": sum(w["met_slo"] for w in waves), "met_stall": sum(w["met_stall"] for w in waves),
             "met_ttfa": sum(w["met_ttfa"] for w in waves),
             "ttfa_s": percentiles([row["time_to_first_audio_s"] for row in rows]),
+            "setup_s": percentiles(split_values(rows, "setup_s")),
+            "first_audio_after_setup_s": percentiles(split_values(rows, "first_audio_after_setup_s")),
             "stall_s": percentiles([row["stall_s"] for row in rows]), "waves": waves}
 
 
@@ -115,14 +118,19 @@ def write_results(output: Path, results: dict) -> None:
     write_json(output / "sweep.json", results)
     columns = ["concurrency", "status", "boot_s", "audio_s_per_s", "requests_per_s", "goodput_audio_s_per_s",
                "stall_only_goodput_audio_s_per_s", "met_slo", "met_stall", "met_ttfa", "sessions", "ttfa_p50_s",
-               "ttfa_p95_s", "ttfa_p99_s", "stall_p50_s", "stall_p95_s", "stall_max_s", "wer_vs_c1", "wer_vs_nvidia"]
+               "ttfa_p95_s", "ttfa_p99_s", "setup_p50_s", "first_audio_after_setup_p50_s",
+               "first_audio_after_setup_p95_s", "stall_p50_s", "stall_p95_s", "stall_max_s",
+               "wer_vs_c1", "wer_vs_nvidia"]
     with (output / "sweep.csv").open("w", newline="") as table:
         writer = csv.DictWriter(table, columns, extrasaction="ignore")
         writer.writeheader()
         for cell in results["cells"]:
             ttfa, stall = cell.get("ttfa_s") or {}, cell.get("stall_s") or {}
+            setup, after = cell.get("setup_s") or {}, cell.get("first_audio_after_setup_s") or {}
             writer.writerow({**cell, "ttfa_p50_s": ttfa.get("p50"), "ttfa_p95_s": ttfa.get("p95"),
-                             "ttfa_p99_s": ttfa.get("p99"), "stall_p50_s": stall.get("p50"),
+                             "ttfa_p99_s": ttfa.get("p99"), "setup_p50_s": setup.get("p50"),
+                             "first_audio_after_setup_p50_s": after.get("p50"),
+                             "first_audio_after_setup_p95_s": after.get("p95"), "stall_p50_s": stall.get("p50"),
                              "stall_p95_s": stall.get("p95"), "stall_max_s": stall.get("max")})
 
 

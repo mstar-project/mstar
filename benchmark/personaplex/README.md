@@ -115,7 +115,12 @@ server keeps ahead of playback, not that it takes live input. It measures
 streamed delivery; `benchmark.runner` remains the throughput harness. It also
 reports goodput: sessions/s and audio-s/s counting only sessions under the SLO
 (`--stall-limit` 10 ms total stall, `--ttfa-limit` 200 ms to first audio), and the
-counts meeting each limit alone.
+counts meeting each limit alone. Time to first audio is also split at the first text
+event, which the first generate frame emits: setup (upload, Mimi encode, conditioning,
+that frame) and the wait for the first audio block after it. A live server does that
+setup at call open, before its first-audio clock starts, so only the second part
+compares with a live server's number. The split is empty for a session whose first
+text event came after its first audio.
 
 `python -m benchmark.personaplex.sweep` runs those cells across concurrency, by
 default 1 to 128, each on a fresh server with `max_batch_size` N. It reports time

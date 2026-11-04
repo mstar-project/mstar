@@ -2014,7 +2014,9 @@ implementation on H100 and GH200 GPUs:
   second); from 16 sessions none did. Throughput levelled off at 18 to 22 seconds
   of audio per second from 32 to 128 sessions. Time to first audio was 2.8 s at
   one session and 30 s at 128, since conditioning runs before the first frame, so
-  no session met a 200 ms limit.
+  no session met a 200 ms limit. On an 18 s clip, one wave per N, setup took 2.6,
+  4.3 and 9.1 s at 1, 8 and 32 sessions, and the first audio came 63, 190 and
+  510 ms after the first generated frame.
 - Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge. Listening to matched

@@ -4,7 +4,12 @@ Replays one user clip (speech, then trailing silence for the reply) on N
 concurrent streamed ``/generate`` requests, as fast as the server goes, and
 reports per session, from timestamped chunk arrivals (monotonic clock):
 
-* time to first audio: request start -> the first audio chunk arrives;
+* time to first audio: request start -> the first audio chunk arrives, split at the
+  first text event. Every generate frame emits one, even a padding token's empty
+  one, and conditioning emits none, so setup (upload, Mimi encode, conditioning and
+  the first frame) ends there, and what remains is the wait for the first audio
+  block. A live server's call open does this setup before its first-audio clock
+  starts, so only the second part compares with one;
 * response onset on the audio timeline: the start of the first agent speech
   segment beginning at or after ``speech_end - window``, as signed seconds
   from the user's speech end (negative = the agent began first). An agent
@@ -116,6 +121,13 @@ def percentiles(values: list[float]) -> dict:
     return {"p50": p50, "p95": p95, "p99": p99, "max": max(values)}
 
 
+def ttfa_split(first_audio: float | None, first_text: float | None) -> dict:
+    """Time to first audio as setup + the wait after it; both None unless text came first."""
+    if first_audio is None or first_text is None or first_text > first_audio:
+        return {"setup_s": None, "first_audio_after_setup_s": None}
+    return {"setup_s": first_text, "first_audio_after_setup_s": first_audio - first_text}
+
+
 def slo_summary(rows: list[dict], wall: float, stall_limit_s: float = STALL_LIMIT_S,
                 ttfa_limit_s: float = TTFA_LIMIT_S) -> dict:
     """Goodput over a cell's sessions. A session that did not complete meets neither limit."""
@@ -129,18 +141,24 @@ def slo_summary(rows: list[dict], wall: float, stall_limit_s: float = STALL_LIMI
 
     return {"stall_limit_s": stall_limit_s, "ttfa_limit_s": ttfa_limit_s,
             "ttfa_s": percentiles([row["time_to_first_audio_s"] for row in done]),
+            "setup_s": percentiles(split_values(done, "setup_s")),
+            "first_audio_after_setup_s": percentiles(split_values(done, "first_audio_after_setup_s")),
             "stall_s": percentiles([row["stall_s"] for row in done]),
             "met_stall": len(met_stall), "met_ttfa": len(met_ttfa), "met_slo": len(met_slo),
             "goodput_sessions_per_s": len(met_slo) / wall, "goodput_audio_s_per_s": audio_rate(met_slo),
             "stall_only_goodput_audio_s_per_s": audio_rate(met_stall)}
 
 
+def split_values(rows: list[dict], key: str) -> list[float]:
+    return [row[key] for row in rows if row.get(key) is not None]
+
+
 def run_session(url: str, audio: str, voice: str, timeout: float, out: dict) -> None:
     from mstar.client.client import MStarClient
-    from mstar.client.types import AudioChunk
+    from mstar.client.types import AudioChunk, TextChunk
 
     start = time.monotonic()
-    arrivals, pcm = [], []
+    arrivals, pcm, first_text = [], [], None
     try:
         client = MStarClient(url, timeout=timeout)
         for event in client.generate(audio=audio, input_modalities=("audio",), output_modalities=("audio", "text"),
@@ -149,11 +167,13 @@ def run_session(url: str, audio: str, voice: str, timeout: float, out: dict) -> 
                 samples = np.frombuffer(event.pcm, dtype="<i2")
                 arrivals.append((time.monotonic() - start, len(samples)))
                 pcm.append(samples)
+            elif isinstance(event, TextChunk) and first_text is None:
+                first_text = time.monotonic() - start
             if time.monotonic() - start > timeout:
                 raise TimeoutError(f"session ran past {timeout} s")
     except Exception as exc:  # noqa: BLE001 - recorded; the cell is invalid
         out["error"] = repr(exc)
-    out.update(wall_s=time.monotonic() - start, arrivals=arrivals,
+    out.update(wall_s=time.monotonic() - start, arrivals=arrivals, first_text_s=first_text,
                pcm=np.concatenate(pcm).astype(np.float32) / 32768 if pcm else np.zeros(0, np.float32))
 
 
@@ -231,6 +251,7 @@ def run_cell(url: str, audio: str, sessions: int, speech_end: float, voice: str,
         rows.append({
             "complete": complete, "error": r.get("error"), "samples": samples,
             "time_to_first_audio_s": r["arrivals"][0][0] if r["arrivals"] else None,
+            **ttfa_split(r["arrivals"][0][0] if r["arrivals"] else None, r.get("first_text_s")),
             "rtf": r["wall_s"] / (input_samples / SAMPLE_RATE),
             **playback(r["arrivals"], buffer_s=buffer_s),
             **response_onset(speech_segments(r["pcm"], threshold=voice_threshold, min_voiced_s=min_voiced_s),

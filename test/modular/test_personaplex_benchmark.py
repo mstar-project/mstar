@@ -871,3 +871,34 @@ def test_sweep_stops_at_a_failed_cell_and_exits_nonzero(tmp_path, monkeypatch):
     assert [(c["concurrency"], c["status"]) for c in cells] == [(1, "PASS"), (4, "FAIL"), (8, "NOT RUN")]
     assert "Server exited 1" in cells[1]["error"]
     assert "concurrency" in (tmp_path / "out" / "sweep.csv").read_text()
+
+
+def test_time_to_first_audio_splits_at_the_first_text_event():
+    from benchmark.personaplex.sessions import ttfa_split
+
+    assert ttfa_split(2.5, 2.0) == {"setup_s": 2.0, "first_audio_after_setup_s": 0.5}
+    # No claim where the marker is missing or came after the audio.
+    none = {"setup_s": None, "first_audio_after_setup_s": None}
+    assert ttfa_split(2.0, 2.5) == none and ttfa_split(2.0, None) == none and ttfa_split(None, 1.0) == none
+
+
+def test_a_session_records_its_first_text_event_even_when_empty(monkeypatch):
+    from benchmark.personaplex import sessions
+    from mstar.client import client as client_module
+    from mstar.client.types import AudioChunk, TextChunk
+
+    class FakeClient:
+        def __init__(self, url, timeout):
+            pass
+
+        def generate(self, **kwargs):
+            yield TextChunk("", {})  # a padding token's frame
+            yield TextChunk("hi", {})
+            yield AudioChunk(np.zeros(1920, dtype="<i2").tobytes())
+
+    monkeypatch.setattr(client_module, "MStarClient", FakeClient)
+    out = {}
+    sessions.run_session("http://x", "clip.wav", "NATF2", 60, out)
+    assert "error" not in out
+    assert 0 <= out["first_text_s"] <= out["arrivals"][0][0]
+    assert out["arrivals"][0][1] == 1920
