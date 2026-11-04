@@ -45,8 +45,12 @@ class KVConfig(ABC):
     num_qo_heads: int | None = None
 
     def __post_init__(self):
+        if self.num_layers < 1:
+            raise ValueError(f"a KV cache must declare a layer; got num_layers={self.num_layers}")
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
+        if self.num_kv_heads < 1 or self.num_qo_heads % self.num_kv_heads:
+            raise ValueError(f"num_qo_heads={self.num_qo_heads} must be a multiple of num_kv_heads={self.num_kv_heads}")
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
 
