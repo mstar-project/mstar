@@ -983,13 +983,14 @@ def replay(tape: clock.Tape) -> None:
 
     check_fault()
     clock.STATS["replays"] += 1
-    for effect in tape.effects:
-        if FAULT[0]:
-            break  # the device faulted: nothing after it runs
-        effect()
+    launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
+    with contextlib.nullcontext() if clock.FAST else clock.computing():
+        for effect in tape.effects:
+            if FAULT[0]:
+                break  # the device faulted: nothing after it runs
+            effect()
     if clock.FAST:
         return
-    launched = clock.vnow()
     with clock.computing():
         total, nodes = 0.0, 0
         for entry in tape.entries:
