@@ -525,6 +525,66 @@ def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_frames(tmp_path
     assert calls[-1] == (0 if world > 3 else 1) and all(calls[:3]), calls  # one tile per clip
 
 
+def _sp_cfg():
+    from dataclasses import replace
+
+    from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG
+
+    return replace(CFG, num_attention_heads=8)  # Ulysses splits the heads over the ranks
+
+
+def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
+    import torch.distributed as dist
+
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.minimax_h3 import weight_loader
+    from mstar.model.minimax_h3.components.transformer import H3Inputs
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    try:
+        torch.set_num_threads(1)
+        group = CommGroup(rank, rank, list(range(world)))
+        group.device_group, group.initialized = dist.group.WORLD, True
+        config = H3Config(transformer=_sp_cfg())
+        # 31 + 12 keyframe rows: no world here divides the 43 rows
+        layout = H3Layout(text_len=5, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4,
+                          anchors=("first", "last"))
+        g = torch.Generator().manual_seed(1)
+        cfg = config.transformer
+        video = torch.randn(1, layout.num_condition_rows + layout.num_video_rows, cfg.patch_dim, generator=g)
+        audio = torch.randn(1, layout.num_audio_rows, cfg.audio_latents_dim, generator=g)
+        text = torch.randn(1, layout.text_len, cfg.hidden_size, generator=g)
+        inputs = H3Inputs(video=video, audio=audio, text=text, timesteps=torch.tensor([[0.3, 0.6, 0.999]]))
+        for name, sp in (("sp", group), ("one", None)):
+            if sp is None and rank:
+                break
+            dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
+            node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+            with torch.no_grad():
+                torch.save(dit(inputs, node.build_layout(layout, "cpu"), sdpa_attention), f"{out}.{name}.{rank}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_path, world):
+    """``narrow``, ``rope.rows``, the Ulysses exchange and ``gather_sequence`` through ``H3DiT``,
+    over rows no rank count divides, against the DiT on one rank."""
+    import torch.multiprocessing as mp
+    from safetensors.torch import save_file
+
+    from mstar.model.minimax_h3.tests.tiny_checkpoint import random_checkpoint
+
+    (tmp_path / "FL2VA" / "transformer").mkdir(parents=True)
+    save_file(random_checkpoint(_sp_cfg()), str(tmp_path / "FL2VA" / "transformer" / "model.safetensors"))
+    out = str(tmp_path / "v")
+    mp.spawn(_sp_dit, args=(world, str(tmp_path / "store"), str(tmp_path), out), nprocs=world)
+    want = torch.load(f"{out}.one.0")
+    for rank in range(world):
+        for got, ref in zip(torch.load(f"{out}.sp.{rank}"), want, strict=True):
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):
     import builtins
 
