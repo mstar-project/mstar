@@ -388,7 +388,7 @@ def test_plan_windows_cuts_only_bounded_models(tmp_path):
 
 
 def test_higgs_audio_windows_an_upload_its_transcript_cap_would_cut(tmp_path):
-    """Higgs-Audio stops at 1,024 tokens; a long upload was cut off silently, with a 200."""
+    """Higgs-Audio drops or repeats text on long audio; a long upload was sent whole, with a 200."""
     sf = pytest.importorskip("soundfile")
     import numpy as np
 

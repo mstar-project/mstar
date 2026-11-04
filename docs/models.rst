@@ -272,8 +272,8 @@ Higgs Audio notes
   to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
-- A transcript stops at 1,024 tokens (about 5 minutes of speech), so
-  ``/v1/audio/transcriptions`` cuts a longer upload into 120 s windows run in parallel.
+- The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
+  cuts an upload longer than 30 s into 30 s windows run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
 - Decode keeps each request's last token in the sampler's slot master and
