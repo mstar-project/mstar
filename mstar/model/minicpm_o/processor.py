@@ -134,8 +134,12 @@ def audio_placeholder(num_samples: int, audio: AudioConfig) -> str:
 
 def expand_tags(text: str, image_placeholders: list[str], audio_placeholders: list[str]) -> str:
     """``text`` with each attachment tag replaced by its placeholder, in order."""
-    images, audios = iter(image_placeholders), iter(audio_placeholders)
     chunks = re.split(f"({re.escape(IMAGE_TAG)}|{re.escape(AUDIO_TAG)})", text)
+    # a tag typed into the prompt or system prompt leaves a tag with no attachment
+    for tag, placeholders in ((IMAGE_TAG, image_placeholders), (AUDIO_TAG, audio_placeholders)):
+        if (n := chunks.count(tag)) != len(placeholders):
+            raise ValueError(f"the prompt contains {n} {tag} attachment tags for {len(placeholders)} attachments")
+    images, audios = iter(image_placeholders), iter(audio_placeholders)
     return "".join(
         next(images) if chunk == IMAGE_TAG else next(audios) if chunk == AUDIO_TAG else chunk
         for chunk in chunks

@@ -140,6 +140,13 @@ def test_min_p_is_served():
     model.get_request_resource_configs({}, {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
 
 
+def test_an_attachment_tag_in_the_users_text_is_refused():
+    from mstar.model.minicpm_o import processor
+
+    with pytest.raises(ValueError, match="attachment tags"):
+        processor.expand_tags(f"{processor.IMAGE_TAG} {processor.IMAGE_TAG}", ["<image>"], [])
+
+
 # --- with the checkpoint's config and tokenizer ---------------------------
 
 @pytest.fixture(scope="module")
