@@ -31,7 +31,7 @@ def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
 
 def test_cuda_semantics():
     out = run_sim("""
-        import torch
+        import subprocess, sys, torch
         assert torch.cuda.is_available() and torch.cuda.get_device_name().startswith("NVIDIA H100")
         m = torch.nn.Linear(8, 4, device="meta").to_empty(device="cuda")
         x = torch.randn(3, 8, device="cuda")
@@ -94,7 +94,12 @@ def test_cuda_semantics():
             assert t.is_cuda
             return t + 1
         assert torch.ops.mstar_sim_test.plus_one(torch.ones(2, device="cuda")).tolist() == [2.0, 2.0]
-        assert torch.ones(2, device="cuda").untyped_storage()._share_cuda_()[2] == 8
+        shared = torch.ones(2, device="cuda")
+        share = shared.untyped_storage()._share_cuda_()
+        code = (f"import torch; s = torch.UntypedStorage._new_shared_cuda(*{share!r}); "
+                "t = torch.empty(0).set_(s, 0, (2,), (1,)); t[1] = 5")
+        subprocess.run([sys.executable, "-c", code], check=True)
+        assert shared.tolist() == [1, 5]
         torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
         assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
         torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)
@@ -522,7 +527,9 @@ def run_pytest(cwd, *args, emulated: bool = False, **env: str) -> str:
 def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps(tmp_path):
     """What the emulator raises as CUDA would (a host read during capture) is mstar's
     failure; a name an emulated object lacks is the emulator's gap; mstar's own error
-    stays its own, whatever library it names."""
+    stays its own, whatever library it names. An assert is a value check, the one failure
+    the plugin expects, only once a never-computed value has been read: not for making a
+    scratch buffer, or exporting a storage."""
     (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
         import torch
         def test_host_read_in_capture():
@@ -533,13 +540,24 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             torch.cuda.Stream().no_such_method()
         def test_own_error_names_a_library():
             raise AttributeError("the flashinfer wrapper has no plan")
+        def test_filled_scratch_buffer():
+            buf = torch.empty(4, device="cuda")
+            buf.fill_(1.0)
+            assert buf.tolist() == [2.0] * 4
+        def test_exported_storage():
+            t = torch.arange(4, device="cuda")
+            t.untyped_storage()._share_cuda_()
+            assert t.sum().item() == 7
+        def test_unwritten_scratch_buffer():
+            assert (torch.empty(4, device="cuda") + 1).tolist() == [2.0] * 4
     """))
     out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfx", "test_cases.py", emulated=True,
                      MSTAR_SIM_FAST="1")
     outcomes = {line.split()[1].split("::")[1]: line.split()[0] for line in out.splitlines()
                 if line.startswith(("FAILED", "XFAIL"))}
     assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
-                        "test_own_error_names_a_library": "FAILED"}, out
+                        "test_own_error_names_a_library": "FAILED", "test_filled_scratch_buffer": "FAILED",
+                        "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL"}, out
 
 
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):

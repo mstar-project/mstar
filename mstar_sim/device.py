@@ -105,15 +105,26 @@ def _is_meta(x) -> bool:
     return isinstance(x, torch.Tensor) and x.device.type == "meta"
 
 
-# never-computed values so far: host reads of value-less tensors (zeros were
-# returned), and value-holding tensors that stand in for a kernel's output (a
-# zero-filled empty, a stand-in's or a Triton launch's small ints). A check on
-# values after one is a check the emulator can't answer (``mstar_sim.pytest_plugin``)
+# host reads of a never-computed value so far: an assert after one is a check the emulator
+# can't answer (``mstar_sim.pytest_plugin``)
 VALUELESS_READS = [0]
 
 
 def uncomputed() -> None:
     VALUELESS_READS[0] += 1
+
+
+def never_computed(t: torch.Tensor) -> bool:
+    """Whether no kernel computed payload ``t``'s values: it is value-less, or it holds
+    values only stand in for some (see :func:`set_never_computed`)."""
+    return t.device.type == "meta" or getattr(t.untyped_storage(), "_sim_never_computed", False)
+
+
+def set_never_computed(t: torch.Tensor, value: bool = True) -> None:
+    """Record that kept payload ``t`` (its whole storage: views alias it) holds a value no
+    kernel computed: it was allocated and not written yet, a stand-in wrote it, or an op
+    that read such a value did. It holds zeros, or what is left of the real values."""
+    t.untyped_storage()._sim_never_computed = value
 
 
 # stand-in kernels run so far: a test that expected a kernel's own error check
@@ -124,12 +135,16 @@ KERNELS_RUN = [0]
 VALUE_SHAPES = [0]
 
 
+def _zeros(x):
+    """What a value-less tensor's values read as."""
+    return torch.zeros(x.shape, dtype=x.dtype) if _is_meta(x) else x
+
+
 def host_value(t: torch.Tensor) -> torch.Tensor:
-    """``t``'s values for a host read: zeros for one that was never computed."""
-    if t.device.type != "meta":
-        return t
-    VALUELESS_READS[0] += 1
-    return torch.zeros(t.shape, dtype=t.dtype)
+    """``t``'s values for a host read: zeros for a value-less one."""
+    if never_computed(t):
+        uncomputed()
+    return _zeros(t)
 
 
 def to_device_storage(x: torch.Tensor) -> torch.Tensor:
@@ -202,15 +217,17 @@ def count_storages(out) -> None:
 
 # torch.cuda.set_sync_debug_mode: 0 default, 1 warn, 2 error
 SYNC_DEBUG = [0]
-_SHARED = b"mstar_sim:"
+_SHARED = b"mstar_sim"
 
 
 def _share_cuda(storage):
-    """A CUDA IPC handle naming a cuda tensor's storage; another emulated process opens it
-    (``UntypedStorage._new_shared_cuda``) as a value-less storage of its size."""
-    uncomputed()  # no values cross: what the reader reports back was never computed
+    """A CUDA IPC handle naming a cuda tensor's storage. Another emulated process opens it
+    (``UntypedStorage._new_shared_cuda``) as the same memory, for a storage with values
+    (moved into shared memory, in place), else as a value-less storage of its size."""
     nbytes = storage.nbytes()
-    return (0, _SHARED + f"{storage.data_ptr()}:{nbytes}".encode(), nbytes, 0, b"", 0, b"", False)
+    shared = storage._share_filename_cpu_()[:2] if storage.device.type == "cpu" else (b"", b"")
+    return (0, b"|".join((_SHARED, str(storage.data_ptr()).encode(), *shared, str(nbytes).encode())),
+            nbytes, 0, b"", 0, b"", False)
 
 
 class _FakeStorage:
@@ -356,10 +373,11 @@ class _Observe(TorchDispatchMode):
                 # an allocation, not a kernel (a graph doesn't re-run it): undefined values read
                 # as zeros, never as the host's leftover bytes
                 out = func(*args, **kwargs).zero_()
+                set_never_computed(out)
             elif clock.capturing() is not None and not func.is_view:
                 out = _captured_values(func, args, kwargs)
             else:
-                out = func(*args, **kwargs)
+                out = _kept_op(func, args, kwargs)
         if clock.FAST or func.is_view or clock.in_kernel():
             return out  # unpriced, or inside a stand-in (its own cost is charged)
         from mstar_sim import cost
@@ -536,12 +554,45 @@ def _join(args, kwargs, ints: bool = True):
             if kept is None:
                 return t
             kept.zero_()
-            uncomputed()
+            set_never_computed(kept)
             return kept
 
         return tree_map(back, out) if copies else out
 
     return tree_map(join, (args, kwargs)), land
+
+
+_WRITES: dict = {}
+# aten ops that don't read what they write: only their other operands decide its values
+_OVERWRITES = {"copy_", "fill_", "zero_", "normal_", "uniform_", "random_", "exponential_", "bernoulli_",
+               "index_copy_", "index_put_", "_index_put_impl_", "scatter_", "index_fill_", "masked_fill_",
+               "masked_scatter_"}
+
+
+def _written(func, args, kwargs) -> list:
+    """The tensors an aten op writes, as its schema says."""
+    places = _WRITES.get(func)
+    if places is None:
+        places = _WRITES[func] = [(i, a.name) for i, a in enumerate(func._schema.arguments)
+                                  if a.alias_info is not None and a.alias_info.is_write]
+    return tree_flatten([args[i] if i < len(args) else kwargs.get(name) for i, name in places])[0]
+
+
+def _reads_never_computed(func, args, kwargs) -> bool:
+    overwrites = func.overloadpacket.__name__ in _OVERWRITES or func._schema.overload_name == "out"
+    written = _written(func, args, kwargs) if overwrites else ()
+    return any(never_computed(t) for t in _shallow(args, kwargs) if not any(t is w for w in written))
+
+
+def _kept_op(func, args, kwargs):
+    """Run an aten op on kept values: what it writes is computed only if all it read was."""
+    never = _reads_never_computed(func, args, kwargs)
+    out = func(*args, **kwargs)
+    if not func.is_view:  # a view is its base's storage
+        for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
+            if isinstance(t, torch.Tensor) and t.device.type == "cpu":
+                set_never_computed(t, never)
+    return out
 
 
 def _writes(func, kwargs) -> bool:
@@ -652,11 +703,13 @@ def _on_zeros(func, uargs, ukwargs):
         raise NotImplementedError(f"mstar_sim: {func} has no shape-only kernel and its inputs are too "
                                   "large to run on zeros")
     VALUE_SHAPES[0] += 1
-    raw = func(*tree_map(_host_arg, uargs), **tree_map(_host_arg, ukwargs))
+    raw = func(*tree_map(_zeros, uargs), **tree_map(_zeros, ukwargs))
 
     def back(x):
-        if isinstance(x, torch.Tensor) and x.device.type == "cpu" and (_floating(x) or x.numel() > SMALL_INT):
-            return x.to(META)  # derived from never-computed values: only a shape's ints are kept
+        if isinstance(x, torch.Tensor) and x.device.type == "cpu":
+            if _floating(x) or x.numel() > SMALL_INT:
+                return x.to(META)  # derived from never-computed values: only a shape's ints are kept
+            set_never_computed(x)
         return x
 
     return tree_map(back, raw)
@@ -707,15 +760,17 @@ def _fast(func, args, kwargs, flat, index):
         if _writes(func, kwargs):
             raw = land(raw)
     else:
-        if clock.capturing() is not None and func not in _VIEWS and func not in _UNINITIALIZED:
-            # captured: deferred to the replays per aten op, and priced there
+        if func not in _UNINITIALIZED and (
+                (clock.capturing() is not None and func not in _VIEWS) or any(never_computed(t) for t in tensors)):
+            # captured: deferred to the replays per aten op, and priced there; a never-computed
+            # operand: per aten op, which says what each one reads and writes
             with _Observe(torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None):
                 raw = func(*uargs, **ukwargs)
             return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
         raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
-            uncomputed()
+            set_never_computed(raw)
     view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
     if not view and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
@@ -869,15 +924,18 @@ def _captured_values(func, args, kwargs):
             return m
         if id(m) in real:
             return real[id(m)]
-        return torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
+        made = torch.empty_strided(m.size(), m.stride(), dtype=m.dtype).zero_()
+        set_never_computed(made)
+        return made
 
     out = tree_map(buffer, out)
 
     def rerun():
-        fresh = func(*args, **kwargs)
+        fresh = _kept_op(func, args, kwargs)
         for dst, src in zip(tree_flatten(out)[0], tree_flatten(fresh)[0], strict=True):
             if isinstance(dst, torch.Tensor) and dst is not src:
                 dst.copy_(src)
+                set_never_computed(dst, never_computed(src))
 
     clock.on_replay(rerun)
     return out
@@ -996,10 +1054,15 @@ def _copy_(self, src, non_blocking=False):
             clock.charge(_copy_seconds(src.numel() * src.element_size(), "h2d"))
             if not _is_meta(self._data) and not _is_meta(src):
                 dst = self._data
-                if clock.capturing() is None:
+
+                def land():
                     dst.copy_(src, non_blocking=non_blocking)
+                    set_never_computed(dst, False)
+
+                if clock.capturing() is None:
+                    land()
                 else:  # captured: reads its host buffer at each replay, not now
-                    clock.on_replay(lambda: dst.copy_(src))
+                    clock.on_replay(land)
             return self
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
@@ -1108,7 +1171,7 @@ def _create(func, args, kwargs, device):
         out = func(*args, **dict(kwargs, device=target))
     if target is CPU and func in _UNINITIALIZED:
         out.zero_()  # a never-computed value reads as zeros, not as the host heap's garbage
-        uncomputed()
+        set_never_computed(out)
     if func in (torch.tensor, torch.as_tensor, torch.from_numpy) and isinstance(out, T):
         clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
     return tree_map(
@@ -1207,7 +1270,9 @@ def install() -> None:
     def _new_shared_cuda(*args):
         handle = args[1] if len(args) > 1 else b""
         if isinstance(handle, bytes) and handle.startswith(_SHARED):
-            storage = torch.UntypedStorage(int(handle.split(b":")[-1]), device=META)
+            _, _, manager, name, nbytes = handle.split(b"|")
+            storage = (torch.UntypedStorage._new_shared_filename_cpu(manager, name, int(nbytes)) if name
+                       else torch.UntypedStorage(int(nbytes), device=META))
             storage._sim_imported = True  # the exporter's memory, not this process's
             return storage
         return new_shared(*args)

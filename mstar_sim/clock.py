@@ -175,16 +175,24 @@ def set_capturing(tape: Tape | None) -> Tape | None:
 
 
 def _flag_values(out, written):
-    """A stand-in's value-holding outputs (small ints: a sampled token) hold no
-    kernel's values; nor do value-holding tensors it was handed to write. Its
-    outputs are the kernel's allocations (what it used to make them is not)."""
+    """No kernel computed a stand-in's kept outputs, or the kept tensors it was handed to
+    write (at each replay, if captured). Its outputs are the kernel's allocations (what it
+    used to make them is not)."""
     from mstar_sim import device
 
     device.KERNELS_RUN[0] += 1
     device.count_storages(out)
-    if any(isinstance(t, device.SimTensor) and t._data.device.type != "meta"
-           for t in device.tree_flatten((out, written))[0]):
-        device.uncomputed()
+    kept = [t._data for t in device.tree_flatten((out, written))[0]
+            if isinstance(t, device.SimTensor) and t._data.device.type != "meta"]
+
+    def flag():
+        for t in kept:
+            device.set_never_computed(t)
+
+    if capturing() is None:
+        flag()
+    elif kept:
+        on_replay(flag)
     return out
 
 
