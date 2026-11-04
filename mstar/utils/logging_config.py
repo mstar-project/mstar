@@ -58,12 +58,13 @@ def log_off_thread() -> Callable[[], None]:
     writer.start()
 
     def drain() -> None:
-        records.put(None)
-        writer.join()
-        # whatever logs later in the exit writes for itself
+        # the handlers go back first, so what's logged while the queue drains
+        # writes for itself instead of landing behind the stop
         root.removeHandler(to_writer)
         for handler in handlers:
             root.addHandler(handler)
+        records.put(None)
+        writer.join()
 
     atexit.register(drain)
     return drain
