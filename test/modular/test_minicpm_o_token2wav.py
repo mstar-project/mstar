@@ -29,6 +29,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     stream_windows,
     window_frames,
     window_samples,
+    window_tokens,
 )
 from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_path
 
@@ -449,8 +450,8 @@ def test_served_windows_are_upstreams(n):
             assert got is not None or not started
             if got is not None and got.tensor_inputs["codes"].numel():
                 served.append((got.tensor_inputs["codes"][0].tolist(), got.kwargs["last"]))
-                # as the forward does
-                node.request_state(0).add("started", True)
+                # each window's caches hold what the windows before it wrote
+                assert node.request_state(0)["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
                 started = True
     assert served == list(stream_windows(codes))
 

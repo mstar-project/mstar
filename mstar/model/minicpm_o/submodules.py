@@ -54,7 +54,6 @@ from mstar.model.minicpm_o.components.token2wav import (
     VoiceBank,
     WindowCaches,
     window_frames,
-    window_tokens,
 )
 from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
@@ -739,8 +738,8 @@ class Token2WavSubmodule(NodeSubmodule):
     the first window gets the silence prepended here. A request's attention caches
     are on the ``T2W_KV`` bounded KV resources, which start from its voice's
     prepared caches; its conv caches and HiFT tails are its slot of ``T2W_STATE``
-    (``RecurrentStatePool``). Its stream position (tokens written) rides in the
-    request's state.
+    (``RecurrentStatePool``). Its stream position is the chunk's offset in the
+    stream (``prepare_inputs``).
 
     Float32. Each window runs in two stages (``forward_batched``), each a piecewise
     capture bucketed by batch size: the flow (``t2w/<voice>/flow28``), for windows
@@ -842,10 +841,14 @@ class Token2WavSubmodule(NodeSubmodule):
             return NodeInputs(tensor_inputs={"codes": codes[None, :0]}, kwargs={"last": True})
         # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
-        if not state.get("started", False):
+        first = chunk.start_offset == 0
+        if first:
             codes = torch.cat([self._lead_silence, codes])
             state.add("voice", fwd_info.step_metadata.get("voice"))
-        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last})
+        # Window k starts 25k codes into the silence-led stream (its look-back
+        # included), which is what its caches hold before it (``_cache_steps``).
+        state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -980,7 +983,10 @@ class Token2WavSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        return {"rows": [(inp.tensor_inputs["codes"].to(device), inp.kwargs["last"]) for inp in inputs]}
+        return {"rows": [
+            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs.get("first", False))
+            for inp in inputs
+        ]}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list | None = None, **kwargs,
@@ -989,14 +995,13 @@ class Token2WavSubmodule(NodeSubmodule):
         whatever its voice and position, then HiFT, batched over rows that are all or none
         their request's first window."""
         runners = engine_inputs.piecewise_runners
-        out, first, num_tokens, flows = {}, {}, {}, {}
-        for rid, (codes, last) in zip(engine_inputs.request_ids, rows, strict=True):
+        out, first, flows = {}, {}, {}
+        for rid, (codes, last, is_first) in zip(engine_inputs.request_ids, rows, strict=True):
             if not codes.shape[1]:
                 # past its last window (``prepare_inputs``)
                 out[rid] = {}
                 continue
-            first[rid] = not self.request_state(rid).get("started", False)
-            num_tokens[rid] = codes.shape[1]
+            first[rid] = is_first
             flows.setdefault((codes.shape[1], last), []).append((rid, codes))
 
         mels, hifts = {}, {}
@@ -1017,10 +1022,6 @@ class Token2WavSubmodule(NodeSubmodule):
                 mel = torch.stack([mels[rid] for rid in chunk])
                 wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last)
                 for i, rid in enumerate(chunk):
-                    req = self.request_state(rid)
-                    # the attention caches' stream position (``_cache_steps``)
-                    req.add("written", req.get("written", 0) + window_tokens(num_tokens[rid], last))
-                    req.add("started", True)
                     out[rid] = {"audio_chunk": [wav[i]]}
         return out
 
