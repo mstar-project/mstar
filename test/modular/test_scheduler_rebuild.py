@@ -18,8 +18,9 @@ sys.path.insert(0, ".")
 
 import pytest
 from test_rebuild_policy import POLICY, _graphs, _kept, _record
-from test_scheduler_room import NODE, _rids, _Runtime
+from test_scheduler_room import NODE, _rids
 from test_scheduler_room import _Engine as _RoomEngine
+from test_scheduler_room import _Runtime as _RoomRuntime
 from test_scheduler_room import _State as _RoomState
 
 from mstar.engine.chunking import ChunkRange
@@ -30,6 +31,17 @@ from mstar.worker.rebuild import PlannedRow, RebuildCursor, Rebuilds
 
 (PREFILL,), DECODE, MIXED = POLICY.walks, "decode", "mixed"
 R = "r"
+SIGNALS = ("new_token",)
+
+
+class _Runtime(_RoomRuntime):
+    """Pops that report the walk's output signals, as the graph runtime's do."""
+
+    def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
+        return super().pop_rids(node_name, graph_walk, request_ids, check_ready)._replace(output_signals=SIGNALS)
+
+    def get_output_signals(self, node_name, graph_walk):
+        return list(SIGNALS)
 
 
 class _State(_RoomState):
@@ -229,6 +241,26 @@ def test_a_rebuild_left_out_of_a_full_step_stays_in_the_log():
         "a backlog would hold a row no queue gave it"
     )
     assert _rids(sched.get_next_batch(state)) == [R], "the rebuild would never run"
+
+
+@pytest.mark.parametrize("step", ["its_own", "parked_behind_it", "a_chains"])
+def test_a_prompt_popped_beside_a_rebuild_row_routes_its_walks_outputs(step):
+    parked = step == "parked_behind_it"
+    sched, _, state, _ = _scheduler({R: DECODE, "p0": PREFILL}, max_bs=1 if parked else 8)
+    sched.note_arrival(R)
+    sched.note_arrival("p0")
+    _rebuilding(sched)
+
+    if step == "a_chains":
+        batch = sched.take_chain_step(state, sched.pick_chain_step(state, (NODE, PREFILL), []))
+    else:
+        batch = sched.get_next_batch(state)
+    if parked:
+        sched.rebuilds.land_chunk(R, NODE, None)
+        batch = sched.get_next_batch(state)
+
+    assert _rids(batch) == (["p0"] if parked else [R, "p0"])
+    assert batch.output_signals == list(SIGNALS), "the prompt's first token would reach its decode row as no tensor"
 
 
 def test_a_mixing_chain_takes_a_waiting_rebuild_row():
