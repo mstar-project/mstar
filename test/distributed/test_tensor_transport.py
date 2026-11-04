@@ -25,6 +25,7 @@ from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
 from mstar.utils.ipc_format import NewRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -260,6 +261,7 @@ def _receiving_worker(manager, sharding_config: ShardingConfig) -> Worker:
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}), add_request=lambda rid, configs, info: None,
     )
+    w._rebuilds, w._kv_writes = Rebuilds({}, {}), {}
     w.streams = StreamBufferManager(w.request_state, manager, [])
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     return w
