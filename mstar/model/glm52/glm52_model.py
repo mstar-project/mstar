@@ -53,6 +53,15 @@ _RETIRED_KWARGS = (
     "prefill_last_layer_rows")
 
 
+def _capture_ladder(key: str, value) -> list[int]:
+    """A capture ladder from model_kwargs: a 0 or a negative entry would fail the capture
+    build, and an empty one would quietly mean the default."""
+    if (not isinstance(value, (list, tuple)) or not value or len(set(value)) != len(value)
+            or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
+        raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
+    return list(value)
+
+
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
@@ -102,16 +111,19 @@ class Glm52Model(Model):
                 raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
             self.config.kernels = kwargs["kernels"]
         if "graph_compile" in kwargs:
-            self.config.graph_compile = bool(kwargs["graph_compile"])
+            # bool("false") is True
+            if not isinstance(kwargs["graph_compile"], bool):
+                raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
+            self.config.graph_compile = kwargs["graph_compile"]
         if prefill_token_buckets is not None:
             self.config.prefill_token_buckets = [int(n) for n in prefill_token_buckets]
         for key in ("prefill_batched_token_buckets", "prefill_capture_batch_sizes"):
             if key in kwargs:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
+                setattr(self.config, key, _capture_ladder(key, kwargs[key]))
         if "mtp_num_draft_tokens" in kwargs:
-            k = int(kwargs["mtp_num_draft_tokens"])
-            if k < 0:
-                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            k = kwargs["mtp_num_draft_tokens"]
+            if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+                raise ValueError(f"mtp_num_draft_tokens must be an integer, 0 (off) or more, got {k!r}")
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
             self._check_mtp(kwargs)
@@ -143,6 +155,12 @@ class Glm52Model(Model):
             raise ValueError(
                 "mtp_num_draft_tokens needs the checkpoint's own trunk depth; "
                 "with num_hidden_layers set, trunk layers would load as the MTP layer"
+            )
+        if self.config.max_prompt_tokens < 1:
+            # two verify blocks of k + 1 rows stay free under the context limit
+            raise ValueError(
+                f"mtp_num_draft_tokens={self.config.mtp_num_draft_tokens} leaves no room for a "
+                f"prompt in the {self.context_limit()}-token context"
             )
 
     def _checkpoint_config(self) -> Glm52ModelConfig:
