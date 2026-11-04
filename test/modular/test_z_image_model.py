@@ -214,3 +214,28 @@ def test_blank_prompts_are_rejected():
     for bad in (None, "", "   "):
         with pytest.raises(ValueError, match="text prompt"):
             model.process_prompt(bad, ["text"], ["image"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_qk_norm_rope_matches_the_eager_modules():
+    """The compiled forward's fused q/k norm + rotary rounds where the eager modules do: at most a
+    bf16 ulp on a handful of elements (fp32 sum order of the variance)."""
+    from mstar.model.z_image.components.qk_norm_rope import fits, qk_norm_rope
+    from mstar.model.z_image.components.transformer import ScaledRMSNorm, ZImageRoPE, apply_rotary_complex
+
+    torch.manual_seed(0)
+    seq, heads = 300, 4
+    q, k, _ = (t.unflatten(-1, (-1, 128)) for t in
+               (torch.randn(2, seq, 3 * heads * 128, device="cuda") * 2).to(torch.bfloat16).chunk(3, dim=-1))
+    norms = [ScaledRMSNorm(128, 1e-5) for _ in range(2)]
+    for norm in norms:
+        norm.weight.data = (1 + 0.2 * torch.randn(128)).to(device="cuda", dtype=torch.bfloat16)
+    rope = ZImageRoPE(256.0, (32, 48, 48), (1024, 512, 512))
+    freqs = rope(torch.stack([torch.arange(seq), torch.arange(seq) % 17, torch.arange(seq) // 17], -1)).cuda()
+    assert fits(q, k, norms[0].weight, freqs) and not fits(q, k, norms[0].weight, freqs[1:])
+    got = qk_norm_rope(q, k, norms[0].weight, norms[1].weight, freqs, 1e-5)
+    with torch.no_grad():
+        for x, norm, out in zip((q, k), norms, got, strict=True):
+            diff = (apply_rotary_complex(norm(x), freqs).float() - out.float()).abs()
+            assert out.is_contiguous() and (diff > 0).float().mean() < 1e-4
+            assert diff.max() <= 2 ** -6 * apply_rotary_complex(norm(x), freqs).float().abs().max()

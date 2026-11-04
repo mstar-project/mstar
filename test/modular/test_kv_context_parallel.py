@@ -24,6 +24,7 @@ from test_kv_prefix_lease import _StubTransfer
 from test_kv_prefix_tp import WALKS, _ctx, _follow, _ingest, _send, _step, _tokens
 from test_startup_graph_validation import _qwen3_5
 
+from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
@@ -32,6 +33,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import merge
 from mstar.engine.resources.kv import manager as manager_mod
@@ -544,11 +546,12 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False)
     else:
         sys.modules["flashinfer"] = _reference_flashinfer()
     calls = []
-    for name in ("all_to_all_single", "all_gather_into_tensor"):
-        def record(*args, _name=name, _call=getattr(dist, name), **kwargs):
+    # `CommGroup.all_gather` calls the into-tensor gather it picked at import
+    for owner, name in ((dist, "all_to_all_single"), (communication, "_all_gather_into_tensor")):
+        def record(*args, _name=name, _call=getattr(owner, name), **kwargs):
             calls.append((_name, tuple(args[0].shape), tuple(args[1].shape), *(str(a) for a in args[2:])))
             return _call(*args, **kwargs)
-        setattr(dist, name, record)
+        setattr(owner, name, record)
     group = CommGroup(rank, rank, list(range(world)))
     group.device_group, group.initialized = dist.group.WORLD, True
     graph = None
@@ -583,26 +586,14 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 out = run()
-            own = next(iter(attn._cg_plan_states.values())).new
-            if pad:
-                # whatever the own-token part's buffers hold past the step's plan (the capture
-                # step's rows; NaN here): only plan's reset keeps the padding finite through the merge
-                own._out_buf.fill_(math.nan)
-                own._lse_buf.fill_(math.nan)
             _plan(attn, case, bucket=bucket)
             for into, step in zip(inputs, case.inputs(placement, heads, pad=pad, pages=inputs[-1].shape[0]),
                                   strict=True):
                 into.copy_(step)
-            # what the checks read is the replay's, the own-token part's real rows included
+            # what the checks read is the replay's
             out.fill_(math.nan)
-            if pad:
-                own._out_buf[:n].fill_(math.nan)
-                own._lse_buf[:n].fill_(math.nan)
             graph.replay()
             torch.cuda.synchronize()
-            if pad:
-                # the replayed kernel wrote the real rows into the part's own buffers
-                assert torch.isfinite(own._out_buf[:n]).all() and torch.isfinite(own._lse_buf[:n]).all()
         assert torch.isfinite(out).all()
         torch.testing.assert_close(out[:n].float(), case.want()[:, heads], **tol)
         if rows == PREFILL_ROWS and not captured:
@@ -688,17 +679,15 @@ def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, capture
 
 def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypatch):
     """The own-token part of a bucket larger than its step: the kernel writes only the planned rows,
-    and the padding's context partials are masked (out 0, lse -inf). So only the part's own reset of
-    the rest in ``plan`` keeps the padding finite (``_over_ranks`` captures this on GPU). The
+    and the padding's context partials are masked (out 0, lse -inf). So only the part's own out 0
+    and lse -inf past the plan keep the padding finite (``_over_ranks`` captures this on GPU). The
     padding's keys are whatever the model's layers left in those rows, NaN included, and the kernel
     reads past the plan (FA3), so only zeroing them keeps the real rows right."""
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
     own = FlashInferRaggedPrefillWrapper(
-        torch.empty(8, dtype=torch.uint8), Q_HEADS, 1, HEAD_DIM, max_num_segments=2, max_total_tokens=16,
-        device=CPU, accelerator_graph=True, q_data_type=torch.float32, owns_padding=True,
+        Workspace(torch.empty(8, dtype=torch.uint8), "own"), Q_HEADS, 1, HEAD_DIM, max_num_segments=2,
+        max_total_tokens=16, device=CPU, accelerator_graph=True, q_data_type=torch.float32, owns_padding=True,
     )
-    own._out_buf.fill_(math.nan)
-    own._lse_buf.fill_(math.nan)
     own.plan(torch.tensor([0, 3, 5], dtype=torch.int32), causal=True)
     gen = torch.Generator().manual_seed(0)
     q, k, v = (torch.randn(16, h, HEAD_DIM, generator=gen) for h in (Q_HEADS, 1, 1))

@@ -20,11 +20,11 @@ import torch
 from mstar.engine.resources.attn.base import (
     AttentionManager,
     EagerSlotKey,
-    WorkspacePool,
     captured_page_capacity,
     one_token_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import ContextParallel
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
@@ -108,7 +108,7 @@ class FlashInferMLAWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -144,6 +144,7 @@ class FlashInferMLAWrapper:
             return
         import flashinfer
 
+        self._workspace = workspace_buffer
         if use_cuda_graph:
             assert batch_size is not None and max_num_pages is not None
             self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
@@ -154,14 +155,14 @@ class FlashInferMLAWrapper:
             )
             self._kv_len_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
             self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                workspace_buffer, use_cuda_graph=True,
+                self._workspace.tensor, use_cuda_graph=True,
                 qo_indptr=self._qo_indptr_buf, kv_indptr=self._kv_indptr_buf,
                 kv_indices=self._kv_indices_buf, kv_len_arr=self._kv_len_buf,
                 backend=backend,
             )
         else:
             self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                workspace_buffer, backend=backend,
+                self._workspace.tensor, backend=backend,
             )
 
     def plan(
@@ -193,7 +194,8 @@ class FlashInferMLAWrapper:
                 kv_len_arr.tolist(), bool(causal),
             )
             return
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr.to(torch.int32),
             kv_indptr=paged_kv_indptr.to(torch.int32),
             kv_indices=paged_kv_indices.to(torch.int32),
@@ -263,7 +265,7 @@ class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
     with no copy: the MLA kernel over pages of one slot, page ``i`` the step's token ``i``, so each
     row's keys are its own queries' tokens."""
 
-    def __init__(self, workspace_buffer: torch.Tensor, dtype: torch.dtype, **kwargs):
+    def __init__(self, workspace_buffer: Workspace, dtype: torch.dtype, **kwargs):
         super().__init__(workspace_buffer, page_size=1, **kwargs)
         self._plan_dtype = dtype
         self._out_buf = self._lse_buf = None
@@ -344,7 +346,7 @@ class FlashInferMLAManager(AttentionManager):
             device=device,
             backend=backend,
         )
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
         # over a placed pool on the FA planner (the kernel in use), the device's SMs, for its work-item cap
         self._fa_sm_count: int | None = None
 
@@ -577,10 +579,6 @@ class FlashInferMLAManager(AttentionManager):
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         wrapper = self._current_plan_states.get(label)
         return None if wrapper is None else wrapper._qo_indptr_buf
-
-    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
-        last = (self.qo_indptr_buf(label)[1:] - 1).long()
-        return hidden.index_select(0, last)
 
     def run(
         self, q: torch.Tensor, label: str | None = None,

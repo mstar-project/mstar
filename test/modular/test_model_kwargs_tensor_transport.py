@@ -64,6 +64,15 @@ def _case(name, convert):
         model = Pi05Model("unused", skip_weight_loading=True)
         model.tokenizer = _Tokenizer()
         return model, {"robot_state": convert(np.linspace(-1, 1, 32).tolist())}, {}
+    if name == "cosmos_policy":
+        # DROID's state, with the policy's 1 - gripper applied on the way to the DiT
+        model = Cosmos3Model("unused", skip_weight_loading=True)
+        model.config.inverted_action_dims = (7,)
+        state = [0.1 * i for i in range(8)]
+        return model, {
+            "robot_state": convert(state), "action_mode": "policy", "domain_name": "droid_lerobot",
+            "action_chunk_size": 3, "guidance_scale": 1.0, "height": 64, "width": 64,
+        }, {"action_inputs": torch.tensor([state[:7] + [1 - state[7]]])}
     if name == "cosmos":
         model = Cosmos3Model("unused", skip_weight_loading=True)
         action = convert([[0.1 * i] * 7 for i in range(2)])
@@ -89,7 +98,11 @@ def _case(name, convert):
     return model, kwargs, tensors
 
 
-@pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos"])
+# What each case asks for; the rest ask for video.
+_OUTPUTS = {"cosmos_policy": ["action"]}
+
+
+@pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos", "cosmos_policy"])
 @pytest.mark.parametrize("representation", [
     "cpu", "cuda", "noncontiguous-cpu", "noncontiguous-cuda", "list", "numpy",
 ])
@@ -109,6 +122,13 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
     }[representation]
     model, kwargs, expected_tensors = _case(case, convert)
     original_kwargs = dict(kwargs)
+    file_paths = None
+    if case == "pi05":
+        # a pi0.5 request needs a camera image
+        from PIL import Image
+
+        Image.new("RGB", (8, 8)).save(tmp_path / "camera.png")
+        file_paths = {"image": [str(tmp_path / "camera.png")]}
     communicator = _Communicator()
     sender = _manager(tmp_path, "api_server", device, communicator)
     receiver = _manager(tmp_path, "worker_0", device, communicator)
@@ -119,7 +139,8 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         communicator=communicator, tensor_manager=sender, model=model,
     )
     try:
-        worker._process_input(PreprocessInput("r", "Pick up the cup", None, [], ["video"], kwargs))
+        outputs = _OUTPUTS.get(case, ["video"])
+        worker._process_input(PreprocessInput("r", "Pick up the cup", file_paths, [], outputs, kwargs))
         request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
         for name, value in original_kwargs.items():
             assert kwargs[name] is value
@@ -134,6 +155,17 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
             )
             assert args.step_metadata["raw_action_dim"] == 7
             assert "action" not in args.step_metadata
+            action_edge = next(e for e in args.inputs if e.name == "action_inputs")
+            assert action_edge.tensor_info == request.initial_signals["action_inputs"]
+            _assert_prefill_ready(model, args)
+        if case == "cosmos_policy":
+            # Only the state's width reaches the conductor; the values ride the edge.
+            assert request.model_kwargs["robot_state_dim"] == 8
+            args = model.get_initial_forward_pass_args(
+                "p0", ["text"], outputs, request.initial_signals, request.model_kwargs,
+            )
+            assert args.step_metadata["raw_action_dim"] == 8 and args.step_metadata["action_state_rows"] == 1
+            assert args.step_metadata["action_chunk_size"] == 3 and args.step_metadata["num_frames"] == 4
             action_edge = next(e for e in args.inputs if e.name == "action_inputs")
             assert action_edge.tensor_info == request.initial_signals["action_inputs"]
             _assert_prefill_ready(model, args)

@@ -121,6 +121,11 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # the node's `ResidentPlanner` when this step's capture reads the resident
+    # tables: a resource then stages nothing per row (see `resources/resident.py`)
+    resident: Any = None
+    # what that planner staged for this step
+    resident_plan: Any = None
     # rid -> input tokens a chunked row runs after this step
     chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
     # the rows whose walk grows its state by those tokens, so a resource may
@@ -147,6 +152,16 @@ class StepContext:
         if real is None:
             real = self._real_rids = frozenset(self.request_ids)
         return rid in real
+
+    def real_rows(self) -> frozenset | None:
+        """``request_ids`` as a set when the step has padding rows, else None
+        (no row is padding)."""
+        if self._padded_request_ids is None:
+            return None
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
 
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.

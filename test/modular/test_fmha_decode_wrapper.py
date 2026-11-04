@@ -11,6 +11,7 @@ from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn import wrappers as wrappers_mod
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import FmhaDecodeWrapper, fmha_decode_applies
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.step import BucketKey, SlotLease
@@ -45,7 +46,7 @@ def _cpu_wrapper(monkeypatch, batch_size=3, max_seq_len=1024, page_size=128):
         lambda *args: torch.zeros(4, dtype=torch.uint8),
     )
     return FmhaDecodeWrapper(
-        workspace_buffer=torch.zeros(4, dtype=torch.uint8),
+        workspace_buffer=Workspace(torch.zeros(4, dtype=torch.uint8), "test"),
         num_qo_heads=16, num_kv_heads=4, head_dim=256, page_size=page_size,
         batch_size=batch_size, max_seq_len=max_seq_len, device=torch.device("cpu"),
     )
@@ -140,7 +141,7 @@ def _manager(monkeypatch, decode_fmha, has_kernel=True, applies=True, dtype=torc
         decode_fmha=decode_fmha,
         sliding_window=window,
     )
-    monkeypatch.setattr(manager, "_workspaces", SimpleNamespace(get=lambda *a: torch.zeros(1)))
+    monkeypatch.setattr(manager, "_workspaces", SimpleNamespace(get=lambda *a: Workspace(torch.zeros(1), "test")))
     return manager, built
 
 
@@ -201,7 +202,7 @@ def test_fmha_matches_the_paged_kernel(batch):
     indices = torch.randperm(per_row * batch).to(torch.int32)
     last = torch.full((batch,), length - (per_row - 1) * page, dtype=torch.int32)
     lens = torch.full((batch,), length, dtype=torch.int32)
-    workspace = torch.zeros(128 << 20, dtype=torch.uint8, device=_CUDA)
+    workspace = Workspace(torch.zeros(128 << 20, dtype=torch.uint8, device=_CUDA), "test")
     fmha = FmhaDecodeWrapper(
         workspace_buffer=workspace, num_qo_heads=heads, num_kv_heads=kv_heads, head_dim=dim,
         page_size=page, batch_size=batch, max_seq_len=32768, device=_CUDA,
@@ -209,7 +210,7 @@ def test_fmha_matches_the_paged_kernel(batch):
     assert fmha.has_kernel(dim, heads)
     fmha.plan(indptr, indices, last, kv_lens=lens)
     paged = FlashInferDecodeWrapper(
-        workspace_buffer=torch.zeros(128 << 20, dtype=torch.uint8, device=_CUDA),
+        workspace_buffer=Workspace(torch.zeros(128 << 20, dtype=torch.uint8, device=_CUDA), "test"),
         num_qo_heads=heads, num_kv_heads=kv_heads, head_dim=dim, page_size=page,
         batch_size=batch, max_num_pages=per_row * batch + 4, accelerator_graph=True, device=_CUDA,
     )

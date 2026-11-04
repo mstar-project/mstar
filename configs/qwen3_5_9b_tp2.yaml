@@ -1,5 +1,15 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
+# Raise the gen-0 GC threshold: at CPython's 700 a 128-row decode step
+# collects almost every step and runs a full collection every few hundred.
+knobs:
+  gc_gen0_threshold: 50000
+# Captured text-prefill ladder (see docs/models.rst): the powers of two to
+# 2048, and 2176 for a mixed step's decode rows beside four prompts. The LLM's
+# 2048-token step budget caps prefill and mixed steps, so no bucket past 2176
+# is reached.
+model_kwargs:
+  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176]
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
