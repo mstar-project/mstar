@@ -1040,6 +1040,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">sysconfig</span>
@@ -1051,6 +1052,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">MsgpackCodec</span><span class="p">,</span>
     <span class="n">RustZMQCommunicator</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">CHECKOUT_RUST</span><span class="p">,</span> <span class="n">is_mstar_rust_crate</span><span class="p">,</span> <span class="n">require_rust_extension</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">client_error_text</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPool</span>
@@ -1083,27 +1085,69 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="find_server_binary">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.find_server_binary">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">find_server_binary</span><span class="p">(</span><span class="n">explicit</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">find_server_binary</span><span class="p">(</span><span class="n">explicit</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">rust_dir</span><span class="p">:</span> <span class="n">Path</span> <span class="o">=</span> <span class="n">CHECKOUT_RUST</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,</span>
 <span class="sd">    the running environment's scripts directory (where a Linux wheel installs</span>
 <span class="sd">    it, also when the venv is not activated), ``$PATH``, then the in-repo</span>
 <span class="sd">    release build. The scripts directory goes before ``$PATH`` so another</span>
-<span class="sd">    environment's older binary never serves this one's bridge."""</span>
-    <span class="k">for</span> <span class="n">candidate</span> <span class="ow">in</span> <span class="p">(</span>
-        <span class="n">explicit</span><span class="p">,</span>
-        <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SERVER_BIN"</span><span class="p">),</span>
-        <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">sysconfig</span><span class="o">.</span><span class="n">get_path</span><span class="p">(</span><span class="s2">"scripts"</span><span class="p">))</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span>
-        <span class="n">shutil</span><span class="o">.</span><span class="n">which</span><span class="p">(</span><span class="s2">"mstar-server"</span><span class="p">),</span>
-        <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">parents</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
-            <span class="o">/</span> <span class="s2">"rust"</span> <span class="o">/</span> <span class="s2">"server"</span> <span class="o">/</span> <span class="s2">"target"</span> <span class="o">/</span> <span class="s2">"release"</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span>
+<span class="sd">    environment's older binary never serves this one's bridge.</span>
+
+<span class="sd">    In a checkout, a binary built from other sources than ``rust_dir`` is</span>
+<span class="sd">    skipped, or used with a warning when named by the arg or the variable.</span>
+<span class="sd">    Raises FileNotFoundError when there is none, RuntimeError when all are</span>
+<span class="sd">    stale."""</span>
+    <span class="n">checkout</span> <span class="o">=</span> <span class="n">is_mstar_rust_crate</span><span class="p">(</span><span class="n">rust_dir</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">checkout</span><span class="p">:</span>
+        <span class="n">require_rust_extension</span><span class="p">()</span>  <span class="c1"># its source_hash is what binaries are compared with</span>
+    <span class="n">stale</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">candidate</span><span class="p">,</span> <span class="n">named</span> <span class="ow">in</span> <span class="p">(</span>
+        <span class="p">(</span><span class="n">explicit</span><span class="p">,</span> <span class="kc">True</span><span class="p">),</span>
+        <span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SERVER_BIN"</span><span class="p">),</span> <span class="kc">True</span><span class="p">),</span>
+        <span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">sysconfig</span><span class="o">.</span><span class="n">get_path</span><span class="p">(</span><span class="s2">"scripts"</span><span class="p">))</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span> <span class="kc">False</span><span class="p">),</span>
+        <span class="p">(</span><span class="n">shutil</span><span class="o">.</span><span class="n">which</span><span class="p">(</span><span class="s2">"mstar-server"</span><span class="p">),</span> <span class="kc">False</span><span class="p">),</span>
+        <span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">rust_dir</span> <span class="o">/</span> <span class="s2">"server"</span> <span class="o">/</span> <span class="s2">"target"</span> <span class="o">/</span> <span class="s2">"release"</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span> <span class="kc">False</span><span class="p">),</span>
     <span class="p">):</span>
-        <span class="k">if</span> <span class="n">candidate</span> <span class="ow">and</span> <span class="n">Path</span><span class="p">(</span><span class="n">candidate</span><span class="p">)</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">candidate</span> <span class="ow">and</span> <span class="n">Path</span><span class="p">(</span><span class="n">candidate</span><span class="p">)</span><span class="o">.</span><span class="n">is_file</span><span class="p">()):</span>
+            <span class="k">continue</span>
+        <span class="n">problem</span> <span class="o">=</span> <span class="n">_stale_server</span><span class="p">(</span><span class="n">candidate</span><span class="p">,</span> <span class="n">rust_dir</span><span class="p">)</span> <span class="k">if</span> <span class="n">checkout</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">problem</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">candidate</span>
+        <span class="k">if</span> <span class="n">named</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Using mstar-server </span><span class="si">%s</span><span class="s2">, which </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">candidate</span><span class="p">,</span> <span class="n">problem</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">candidate</span>
+        <span class="n">stale</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">candidate</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">problem</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">stale</span><span class="p">:</span>
+        <span class="c1"># Both touches, for the reason in require_rust_extension.</span>
+        <span class="n">server</span> <span class="o">=</span> <span class="n">rust_dir</span> <span class="o">/</span> <span class="s2">"server"</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"No mstar-server built from </span><span class="si">{</span><span class="n">rust_dir</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="s1">'; '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">stale</span><span class="p">)</span><span class="si">}</span><span class="s2">. Rebuild it with "</span>
+            <span class="sa">f</span><span class="s2">"`touch </span><span class="si">{</span><span class="n">rust_dir</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="s1">'build.rs'</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">server</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="s1">'build.rs'</span><span class="si">}</span><span class="s2"> &amp;&amp; "</span>
+            <span class="sa">f</span><span class="s2">"cargo build --release --manifest-path </span><span class="si">{</span><span class="n">server</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="s1">'Cargo.toml'</span><span class="si">}</span><span class="s2">`."</span><span class="p">)</span>
     <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span>
         <span class="s2">"mstar-server binary not found: build it with "</span>
         <span class="s2">"`cargo build --release` in rust/server/, put it on $PATH, or set "</span>
         <span class="s2">"MSTAR_SERVER_BIN"</span><span class="p">)</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_stale_server</span><span class="p">(</span><span class="n">binary</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rust_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why ``binary`` was not built from the sources in ``rust_dir``, or None."""</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">mstar_rust</span>
+
+    <span class="c1"># No arguments, which every mstar-server exits on (an older one would</span>
+    <span class="c1"># serve `--source-hash` as a model name); a newer one prints its sources.</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">ran</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="n">binary</span><span class="p">],</span> <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s2">"replace"</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">30</span><span class="p">,</span> <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">OSError</span><span class="p">,</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">TimeoutExpired</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"could not be run (</span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">)"</span>
+    <span class="n">built</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">"built from sources ([0-9a-f]</span><span class="si">{16}</span><span class="s2">) ([0-9a-f]</span><span class="si">{16}</span><span class="s2">)"</span><span class="p">,</span> <span class="n">ran</span><span class="o">.</span><span class="n">stdout</span> <span class="o">+</span> <span class="n">ran</span><span class="o">.</span><span class="n">stderr</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">built</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">"predates the source check"</span>
+    <span class="n">current</span> <span class="o">=</span> <span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">source_hash</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">rust_dir</span><span class="p">)),</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="n">source_hash</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">rust_dir</span> <span class="o">/</span> <span class="s2">"server"</span><span class="p">)))</span>
+    <span class="k">if</span> <span class="n">built</span><span class="o">.</span><span class="n">groups</span><span class="p">()</span> <span class="o">==</span> <span class="n">current</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"was built from sources hashing to </span><span class="si">{</span><span class="s1">' '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">built</span><span class="o">.</span><span class="n">groups</span><span class="p">())</span><span class="si">}</span><span class="s2">, "</span>
+            <span class="sa">f</span><span class="s2">"but </span><span class="si">{</span><span class="n">rust_dir</span><span class="si">}</span><span class="s2"> and its server/ hash to </span><span class="si">{</span><span class="s1">' '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">current</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="launch_rust_server">

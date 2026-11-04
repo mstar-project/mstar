@@ -1205,6 +1205,11 @@ in <code class="docutils literal notranslate"><span class="pre">rust-toolchain.t
 maturin<span class="w"> </span>develop<span class="w"> </span>--release<span class="w"> </span>-m<span class="w"> </span>rust/Cargo.toml
 </pre></div>
 </div>
+<p>Rebuild whenever <code class="docutils literal notranslate"><span class="pre">rust/</span></code> changes, pulled or your own: in a checkout, the
+conductor and each worker refuse an extension built from other <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
+sources (compared by content, <code class="docutils literal notranslate"><span class="pre">mstar_rust.BUILD_SOURCE_HASH</span></code>), which would
+otherwise import fine and fail mid-request. An installed wheel has no <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
+beside <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and is not checked.</p>
 <p>The CPU test suites build a graph runtime too, so contributors need it as well,
 Mac contributors included: install <code class="docutils literal notranslate"><span class="pre">cargo</span></code> through rustup and run the same
 command. Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s
@@ -1250,7 +1255,11 @@ frontend (<code class="docutils literal notranslate"><span class="pre">benchmark
 frontend, not the model, can be the limit.</p>
 <p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
 the environment’s scripts directory / <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs
-are listed in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>
+are listed in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>. From a checkout, a binary built from
+other <code class="docutils literal notranslate"><span class="pre">rust/</span></code> or <code class="docutils literal notranslate"><span class="pre">rust/server/</span></code> sources is skipped, and if none is left the
+error gives the command that rebuilds it; one named by the flag or the variable
+is used with a warning. <code class="docutils literal notranslate"><span class="pre">mstar-server</span> <span class="pre">--source-hash</span></code> prints the hashes of the
+sources a build was made from.</p>
 <p>The OpenAI routes take the model’s adapter from the same registry as the Python
 frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>):
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> ports adapter classes, not model names, so every model of a
