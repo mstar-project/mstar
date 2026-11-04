@@ -98,7 +98,8 @@ class ScheduledBatch:
     input_edges: ColumnarEdgeSpecs = field(
         default_factory=ColumnarEdgeSpecs.empty
     )
-    # The node's output edge names, recorded by the POP. Structural, so it is
+    # The node's output edge names, recorded by the POP, or asked of the
+    # runtime for rows no pop took (``_mid_prefill_rows``). Structural, so it is
     # the same for every rid and survives a split. Carried here so completion
     # never has to ask the runtime again -- and so the names come from the
     # GRAPH rather than from whatever tensors the model happened to return.
@@ -1363,12 +1364,20 @@ class MicroScheduler:
         rows = [row for row in rows if row.start < row.total]
         if not rows:
             return None, {}
+        # Without the output edge names, popped rows that join this batch get no tensors on those edges at
+        # completion.
+        signals = {
+            walk: list(self.runtime.get_output_signals(node, walk))
+            for walk in dict.fromkeys(row.graph_walk for row in rows)
+        }
         batch = ScheduledBatch(
             node_name=node, graph_walk=node_walk[1],
             request_to_worker_graph={row.request_id: row.worker_graph_id for row in rows},
+            output_signals=next(iter(signals.values())),
         )
         if node_walk in self._walks_of_key:
             batch.request_walks = {row.request_id: row.graph_walk for row in rows}
+            batch.walk_output_signals = signals
         resumed = {}
         for row in rows:
             rid = row.request_id
