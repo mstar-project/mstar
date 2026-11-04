@@ -126,8 +126,9 @@ def set_never_computed(t: torch.Tensor, value: bool = True) -> None:
 # stand-in kernels run so far: a test that expected a kernel's own error check
 # (pytest.raises around a launch) can't see it from a stand-in
 KERNELS_RUN = [0]
-# ops whose output shape depends on values never computed: an assert or torch's own error
-# after one can't be told from the shape being wrong (mstar_sim.pytest_plugin)
+# ops whose output shape depends on values never computed, or that refused such values
+# (``multinomial`` of zeros): an assert or torch's own error after one can't be told from
+# what those values did (mstar_sim.pytest_plugin)
 VALUE_SHAPES = [0]
 
 
@@ -604,12 +605,28 @@ def _shaped_by_never_computed(func, args) -> bool:
     return torch.Tag.dynamic_output_shape in func.tags
 
 
+def _passes_on_shapes(func, args, kwargs) -> bool:
+    """Whether what an aten op refused was its operands' values, not their shapes."""
+    args, kwargs = tree_map(lambda x: x.to(META) if isinstance(x, torch.Tensor) else x, (args, kwargs))
+    try:
+        func(*args, **kwargs)
+    except NotImplementedError:
+        return True  # it has no shape-only check to fail
+    except RuntimeError:
+        return False
+    return True
+
+
 def _kept_op(func, args, kwargs):
     """Run an aten op on kept values: what it writes is computed only if all it read was."""
     never = _reads_never_computed(func, args, kwargs)
     if never and _shaped_by_never_computed(func, args):
         VALUE_SHAPES[0] += 1
-    out = func(*args, **kwargs)
+    try:
+        out = func(*args, **kwargs)
+    except RuntimeError:
+        VALUE_SHAPES[0] += never and _passes_on_shapes(func, args, kwargs)  # torch judged no kernel's values
+        raise
     for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
         if isinstance(t, torch.Tensor) and t.device.type == "cpu":
             set_never_computed(t, never)

@@ -16,9 +16,10 @@ an error bound) can't be answered. A test is reported as an expected failure whe
 
 - its own code (directly, or through ``torch.testing``) read a never-computed value,
   and it then passes or fails an ``assert``: such a check can't answer;
-- an ``assert`` or torch's own error fails it after an op whose output shape depends on
-  never-computed values (``nonzero`` of a mask, run on zeros, or a mask that holds such
-  values, as a table a Triton launch was handed does).
+- an ``assert`` or torch's own error fails it at or after an op whose output shape depends
+  on never-computed values (``nonzero`` of a mask, run on zeros, or a mask that holds such
+  values, as a table a Triton launch was handed does), or that refused them (``multinomial``
+  of zeros).
 
 A value is never computed when no kernel computed it (``device.never_computed``): a
 large tensor's, one a stand-in wrote, and what kept ops derive from those, until a real
@@ -130,12 +131,14 @@ _INTERPOSERS = ("/mstar_sim/device.py",)  # what runs torch's ops for mstar's co
 def _torchs_verdict(excinfo) -> bool:
     """A torch error on an op's operands, which a GPU's op raises too (a shape, an index):
     torch raised it, not a ``raise`` of this tree's, and not about what the emulator made of
-    them (no shape-only kernel, a meta payload, a device mix among payloads: one CUDA refuses
-    is the emulator's own check, and tagged)."""
+    them (no shape-only kernel, a meta payload, a limit of torch's CPU kernels, a device mix
+    among payloads: one CUDA refuses is the emulator's own check, and tagged). A bug in the
+    emulator that raises a plain error from an interposer reads as torch's: the loud side."""
     raised_in = str(excinfo.traceback[-1].path)
     return (excinfo.errisinstance((RuntimeError, IndexError)) and not excinfo.errisinstance(NotImplementedError)
             and (_library(raised_in) or raised_in.endswith(_INTERPOSERS))
-            and not re.search("meta|mstar_sim|two devices", str(excinfo.value)))
+            and not re.search("meta|mstar_sim|two devices|Unsupported dtype|not implemented for",
+                              str(excinfo.value)))
 
 
 def _raised_in_emulator(excinfo) -> str | None:
@@ -193,7 +196,7 @@ def pytest_runtest_makereport(item, call):
     if device.VALUE_SHAPES[0] and (call.excinfo.errisinstance(AssertionError) or _torchs_verdict(call.excinfo)):
         report.outcome = "skipped"
         report.wasxfail = (f"mstar_sim: failed after {device.VALUE_SHAPES[0]} op(s) whose output shape "
-                           "depends on never-computed values")
+                           "depends on, or that refused, never-computed values")
     elif call.excinfo.errisinstance(AssertionError) and TEST_READS[0]:
         report.outcome = "skipped"
         report.wasxfail = f"mstar_sim: a value check after it read {TEST_READS[0]} never-computed value(s)"
