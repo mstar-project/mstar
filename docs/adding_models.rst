@@ -2444,7 +2444,7 @@ whatever ``decode_tensor_cores`` says). Any other step attends its stored contex
 and its own tokens from the ``k`` and ``v`` the layer passes ``run`` (MLA's latents as ``k``), so
 a layer that calls ``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention``
 do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first and rotates it
-when the step attends it (``Qwen3Attention``).
+when the step attends it (``AttentionCallable.norm_rope_attend``).
 
 MLA plans on FA3 (Hopper) or FA2 and refuses a ``context_only`` step. That planner caps a plan's
 work items, which TP mode reaches ``P`` times sooner, and counts each rank's own KV lengths, so
