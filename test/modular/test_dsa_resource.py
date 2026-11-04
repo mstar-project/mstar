@@ -153,6 +153,19 @@ def test_use_opens_a_context_for_the_block_and_restores_the_one_before():
     assert dsa.ctx is None
 
 
+def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
+    """A replay reads its slot's sparse plan, which preprocess re-plans through FlashInfer's
+    pinned staging: the node keeps two capture slots and fences their reuse even when no
+    pre-plan asks for them."""
+    from mstar.engine import engine as engine_mod
+
+    monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
+    mgmt = engine_mod.SubmoduleManagement(
+        submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
+        resources={"dsa": _manager()})
+    assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
+
+
 # ---------------------------------------------------------------------------
 # move_rows: an MTP verify block at its true rows (glm5_next's mtp_trims)
 # ---------------------------------------------------------------------------
