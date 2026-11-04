@@ -133,7 +133,7 @@ def test_mps_that_is_not_a_bool_is_refused(tmp_path):
 def test_unpausable_outputs_that_are_not_a_list_are_refused(tmp_path):
     _refused(
         _Model(), _cfg(tmp_path, unpausable_outputs="audio"),
-        r"unpausable_outputs must be a list of output modalities, got 'audio'",
+        r"unpausable_outputs must be a list of output modalities from \[.*\], got 'audio'",
     )
 
 
