@@ -118,8 +118,33 @@ def test_prefill_token_counts_toward_the_budget(walk):
     assert stop(3, 1) == {END_PARTITION}
     assert stop(3, 8) == set()
     model = a_bare_model()
-    assert model.get_loop_caps(max_output_tokens=8) == {DECODE_LOOP: 7}
-    assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
+    assert model.get_loop_caps(max_output_tokens=8)[DECODE_LOOP] == 7
+    assert model.get_loop_caps(max_output_tokens=1)[DECODE_LOOP] == 1
+
+
+def test_tts_code_budget_is_its_loop_cap():
+    """The TTS prefill samples the first code, so its decode loop runs one fewer than
+    upstream's max_new_tokens: a reply's codes stop there, or at the EOS code."""
+    from mstar.model.minicpm_o.components.tts import TTSConfig
+    from mstar.model.minicpm_o.config import TTS_SAMPLER, TTSSampling
+    from mstar.model.minicpm_o.minicpm_o_model import TTS_DECODE, TTS_DECODE_LOOP
+    from mstar.model.minicpm_o.submodules import TTSSubmodule
+
+    sampling = TTSSampling()
+    assert a_bare_model().get_loop_caps()[TTS_DECODE_LOOP] == sampling.max_new_tokens - 1
+    tts_config = TTSConfig()
+    tts = TTSSubmodule(SimpleNamespace(config=tts_config), a_config(), sampling)
+
+    def stop(code, iters):
+        info = SimpleNamespace(
+            graph_walk=TTS_DECODE, max_tokens=8, step_metadata={},
+            dynamic_loop_iter_counts={TTS_DECODE_LOOP: iters},
+            resource_configs={TTS_SAMPLER: SimpleNamespace(ignore_eos=False)},
+        )
+        return tts.check_stop("r", info, {"tts_code": [torch.tensor([code])]})
+
+    assert stop(5, sampling.max_new_tokens - 2) == set()
+    assert stop(tts_config.eos_code, 3) == {TTS_DECODE_LOOP}
 
 
 @pytest.mark.parametrize("knob, value", [

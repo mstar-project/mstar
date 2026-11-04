@@ -666,8 +666,11 @@ class MiniCPMOModel(Model):
         return min(cap, model_kwargs.get(SPEECH_TEXT_TOKENS, cap))
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill samples the first of max_output_tokens, so the loop runs one fewer
-        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        # each prefill samples the first token or code, so its loop runs one fewer
+        return {
+            DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            TTS_DECODE_LOOP: TTS_SAMPLING.max_new_tokens - 1,
+        }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {

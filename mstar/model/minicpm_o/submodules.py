@@ -85,7 +85,6 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
-    HostRows,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -586,6 +585,12 @@ class TTSSubmodule(ARNodeSubmodule):
         self.config = config
         self.config_tts = model.config
         self.sampling = sampling
+        # A decode row's EOS code ends the loop; the code budget is the loop's
+        # cap. The prefill's code is never EOS: the sampler bars it for 50 codes.
+        self.token_stop = TokenStop(
+            loop=TTS_DECODE_LOOP, buffer="tts_code", stop_ids=frozenset({model.config.eos_code}),
+            sampler=TTS_SAMPLER, walk=TTS_DECODE,
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -688,45 +693,6 @@ class TTSSubmodule(ARNodeSubmodule):
     def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> BatchedModelOutput:
         out = self._forward(graph_walk, engine_inputs, **kwargs)
         return BatchedModelOutput(row_outputs=out, check_stop_buffers={"tts_code": out["tts_code"]})
-
-    # ------------------------------------------------------------------
-    # Post-step
-    # ------------------------------------------------------------------
-
-    def _stops(self, code: int, info: CurrentForwardPassInfo) -> bool:
-        generated = info.dynamic_loop_iter_counts.get(TTS_DECODE_LOOP, 0) + 2
-        return code == self.model.config.eos_code or generated >= self.sampling.max_new_tokens
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if request_info.graph_walk != TTS_DECODE or "tts_code" not in outputs:
-            return set()
-        return {TTS_DECODE_LOOP} if self._stops(outputs["tts_code"][0].item(), request_info) else set()
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-    ) -> dict[str, set[str]] | None:
-        codes = host_rows.buffers.get("tts_code")
-        if not torch.is_tensor(codes) or codes.dim() == 0:
-            return None
-        values = codes.reshape(codes.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            info = request_infos[rid]
-            if i is None or i >= len(values) or info.graph_walk != TTS_DECODE:
-                continue
-            if self._stops(values[i], info):
-                stops[rid] = {TTS_DECODE_LOOP}
-        return stops
 
 
 class Token2WavSubmodule(NodeSubmodule):
