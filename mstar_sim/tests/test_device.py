@@ -690,6 +690,11 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
         def test_index_into_what_a_never_computed_mask_selected():
             import flashinfer
             flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1).gt(0.5).nonzero()[0]
+        def test_mstars_own_raise_after_a_never_computed_mask():
+            import flashinfer
+            rows = flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
+            rows[rows >= 0]
+            raise RuntimeError("mstar's own lifecycle error")
         def test_assert_after_an_integer_index_of_a_never_computed_value():
             import flashinfer
             rows = flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
@@ -716,6 +721,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_shape_mistake_on_cuda_tensors": "FAILED",
                         "test_shape_mistake_inside_a_stand_in": "XFAIL",
                         "test_index_into_what_a_never_computed_mask_selected": "XFAIL",
+                        "test_mstars_own_raise_after_a_never_computed_mask": "FAILED",
                         "test_assert_after_an_integer_index_of_a_never_computed_value": "FAILED",
                         "test_passing_value_check": "PASSED"}, out
 

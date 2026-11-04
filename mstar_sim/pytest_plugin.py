@@ -16,8 +16,9 @@ an error bound) can't be answered. A test is reported as an expected failure whe
 
 - its own code (directly, or through ``torch.testing``) read a never-computed value,
   and it then passes or fails an ``assert``: such a check can't answer;
-- it fails in any way after an op whose output shape depends on never-computed values
-  (``nonzero`` of a mask, run on zeros).
+- an ``assert`` or torch's own error fails it after an op whose output shape depends on
+  never-computed values (``nonzero`` of a mask, run on zeros, or a mask that holds such
+  values, as a table a Triton launch was handed does).
 
 A value is never computed when no kernel computed it (``device.never_computed``): a
 large tensor's, one a stand-in wrote, and what kept ops derive from those, until a real
@@ -29,9 +30,9 @@ cross ranks), or whether a real value could show what the test is for (a race, w
 land at launch). The fact is per storage, so a real value beside a never-computed one reads
 as never computed, until a whole write.
 
-Every other failure stays a failure: an exception from mstar's own code (a lifecycle
-or planning error, an API that moved, a crash), or an assertion made before any such
-read. A failure raised inside the emulator's own code, or in a test listed in
+Every other failure stays a failure: an exception mstar's own code raised (a lifecycle
+or planning error, an API that moved, a crash), whatever ran before it, or an assertion
+made before any such read. A failure raised inside the emulator's own code, or in a test listed in
 ``_STAND_IN_LACKS``, is an emulator gap: reported as an expected failure and listed at
 the end of the run, so a gap never reads as a fault of mstar's. A ``pytest.raises`` that
 saw nothing after a stand-in kernel ran expected the kernel's own error check, which a
@@ -123,11 +124,17 @@ def _missing_from_stand_in(excinfo) -> str | None:
 _EMULATOR = "/mstar_sim/"
 
 
+_INTERPOSERS = ("/mstar_sim/device.py",)  # what runs torch's ops for mstar's code
+
+
 def _torchs_verdict(excinfo) -> bool:
     """A torch error on an op's operands, which a GPU's op raises too (a shape, an index):
-    not one about what the emulator made of them (no shape-only kernel, a meta payload, a
-    device mix among payloads: one CUDA refuses is the emulator's own check, and tagged)."""
+    torch raised it, not a ``raise`` of this tree's, and not about what the emulator made of
+    them (no shape-only kernel, a meta payload, a device mix among payloads: one CUDA refuses
+    is the emulator's own check, and tagged)."""
+    raised_in = str(excinfo.traceback[-1].path)
     return (excinfo.errisinstance((RuntimeError, IndexError)) and not excinfo.errisinstance(NotImplementedError)
+            and (_library(raised_in) or raised_in.endswith(_INTERPOSERS))
             and not re.search("meta|mstar_sim|two devices", str(excinfo.value)))
 
 
@@ -146,7 +153,7 @@ def _raised_in_emulator(excinfo) -> str | None:
             continue
         if _EMULATOR not in path or "/mstar_sim/tests/" in path:
             return None
-        if not (verdict and path.endswith("/mstar_sim/device.py")):  # the interposer: its caller decides
+        if not (verdict and path.endswith(_INTERPOSERS)):  # its caller decides
             return f"{path.rsplit(_EMULATOR, maxsplit=1)[-1]}:{entry.lineno + 1}"
     return None
 
@@ -183,7 +190,7 @@ def pytest_runtest_makereport(item, call):
         report.outcome = "skipped"
         report.wasxfail = "mstar_sim: expected a kernel's own error, which a stand-in doesn't check"
         return
-    if device.VALUE_SHAPES[0]:
+    if device.VALUE_SHAPES[0] and (call.excinfo.errisinstance(AssertionError) or _torchs_verdict(call.excinfo)):
         report.outcome = "skipped"
         report.wasxfail = (f"mstar_sim: failed after {device.VALUE_SHAPES[0]} op(s) whose output shape "
                            "depends on never-computed values")

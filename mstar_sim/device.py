@@ -126,8 +126,8 @@ def set_never_computed(t: torch.Tensor, value: bool = True) -> None:
 # stand-in kernels run so far: a test that expected a kernel's own error check
 # (pytest.raises around a launch) can't see it from a stand-in
 KERNELS_RUN = [0]
-# ops whose output shape depends on values never computed, so was shaped by zeros:
-# any failure after one is the emulator's, not mstar's
+# ops whose output shape depends on values never computed: an assert or torch's own error
+# after one can't be told from the shape being wrong (mstar_sim.pytest_plugin)
 VALUE_SHAPES = [0]
 
 
