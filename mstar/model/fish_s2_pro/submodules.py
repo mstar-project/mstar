@@ -410,18 +410,32 @@ class CodecSubmodule(ARNodeSubmodule):
     def compile_regions(self) -> dict[str, list[tuple]]:
         """The incremental decode, compiled once for every bucket: Inductor fuses
         the time-major Snake activations, norms and adds between the convs,
-        which eagerly are most of the decode's GPU time. Warmed on fresh tensors,
-        as an uncaptured step passes them (the captures pass views of their static
-        buffers), at two batch and chunk sizes: the second compiles the decode for
-        every size, so a live uncaptured step compiles nothing."""
+        which eagerly are most of the decode's GPU time.
+
+        Warmed as a step runs it eagerly (past the captures, or with a bucket's
+        slots taken): on fresh tensors, where the captures pass views of their
+        static buffers, as one graph for every chunk width and every batch size
+        past 1, and one for a single row. The sizes are declared dynamic with
+        their bounds, so a guard that would split them into ranges (a conv's
+        backend choice, say) fails this warm-up instead of compiling on a live
+        step. Warmed at the largest such step: Inductor picks its kernels' tiles
+        by the sizes it compiled at, and the large steps are the ones whose time
+        counts."""
         device, blocks = self.get_device(), self.incremental.state_blocks()
 
-        def example(rows, width):
+        def example(rows):
+            width = self.windows[-1]
             state = {name: torch.zeros(rows, *b.shape, dtype=b.dtype, device=device) for name, b in blocks.items()}
             codes = torch.zeros(rows, self.config.num_codebooks, width, dtype=torch.long, device=device)
-            return codes, state, torch.full((rows,), width, dtype=torch.long, device=device)
+            lengths = torch.full((rows,), width, dtype=torch.long, device=device)
+            if rows > 1:
+                for tensor in (codes, lengths, *state.values()):
+                    torch._dynamo.mark_dynamic(tensor, 0, min=2, max=self.MAX_BATCH_SIZE)
+            if len(self.windows) > 1:
+                torch._dynamo.mark_dynamic(codes, 2, min=self.windows[0], max=self.windows[-1])
+            return codes, state, lengths
 
-        return {"incremental": [example(2, self.windows[0]), example(3, self.windows[-1])]}
+        return {"incremental": [example(1), example(self.MAX_BATCH_SIZE)]}
 
     def _bucket(self, frames: int) -> int:
         """Smallest captured chunk width that holds ``frames``."""

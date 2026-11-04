@@ -376,10 +376,11 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled codec decode runs on CUDA")
 def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(config):
-    """The codec captures only its small batch buckets, and a larger step runs the
-    compiled decode eagerly on fresh tensors where the captures passed views of their
-    static buffers. The region's warm-up (``compile_regions``) compiles that call, as
-    the engine runs it before capturing, so a live step does not stall on a compile."""
+    """The codec captures only its small batch buckets, and any other step runs the
+    compiled decode eagerly, on fresh tensors where the captures passed views of their
+    static buffers. The region's warm-up (``compile_regions``), which the engine runs
+    before capturing, compiles every such step, so none stalls on a compile live: at
+    any batch size up to ``MAX_BATCH_SIZE`` and any chunk width."""
     submodule = CodecSubmodule(random_decoder(config).float().cuda(), config)
     torch._dynamo.reset()
     compiled = torch.compile(submodule.incremental, dynamic=True)
@@ -396,8 +397,10 @@ def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(config):
         for rows, width in ((1, 2), (2, 3), (4, 5)):
             compiled(static[:rows, :, :width], state(rows), torch.full((rows,), width, device="cuda"))
         with torch._dynamo.config.patch(error_on_recompile=True):
-            codes = torch.zeros(6, config.num_codebooks, 3, dtype=torch.long, device="cuda")
-            compiled(codes, state(6), torch.full((6,), 3, device="cuda"))
+            for width in submodule.windows:
+                for rows in range(1, submodule.MAX_BATCH_SIZE + 1):
+                    codes = torch.zeros(rows, config.num_codebooks, width, dtype=torch.long, device="cuda")
+                    compiled(codes, state(rows), torch.randint(1, width + 1, (rows,), device="cuda"))
 
 
 def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(config, decoder):
