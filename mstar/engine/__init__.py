@@ -64,7 +64,8 @@ def with_recompile_limit(fn, submodule):
 
     From torch 2.12 dynamo's config is per thread. Before it the patch is process-wide while
     the call runs, so other nodes keep the engine's limit only because a worker runs one
-    compiled call at a time (capture before its loop, then its one GPU thread)."""
+    compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and
+    plan threads set the engine's config before the loop (``Worker._engine_thread_pool``)."""
     from mstar.model.submodule_base import NodeSubmodule
 
     hook = getattr(type(submodule), "dynamo_recompile_limit", None)

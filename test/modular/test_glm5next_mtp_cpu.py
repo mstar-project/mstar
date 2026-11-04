@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import types
 
 import pytest
@@ -433,11 +434,14 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
 # -- a stop on the prefill walk -----------------------------------------------
 
 
-def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False) -> list[int]:
-    """The tokens one request sends the client, its stops going through the graph runtime."""
+def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False, walks=None) -> list[int]:
+    """The tokens one request sends the client, its stops going through the graph runtime;
+    ``walks`` collects the walk of each step it ran."""
     engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)})
 
     def step(walk, inputs, iteration):
+        if walks is not None:
+            walks.append(walk)
         out, stops = _step(engine, walk, {"r": inputs["text_inputs"][0]}, max_tokens, iteration,
                            ignore_eos=ignore_eos)
         return out.get("r", {}), stops.get("r", set())
@@ -455,7 +459,7 @@ def _errors(caplog) -> list[str]:
 
 @pytest.mark.parametrize("k", [0, 3])
 def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
-    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    # the prefill walk has no decode_loop: its stop ends the partition, and no decode step runs
     engine, _, cfg = _build_engine(k)
     eos = cfg.eos_token_ids[1]
     greedy = engine._resources[SAMPLER]
@@ -465,7 +469,9 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
         return torch.full((logits.shape[0],), eos, dtype=torch.long)
 
     greedy.sample = eos_once
-    assert _serve(engine, PROMPTS["a"], MAX_TOKENS) == [eos]
+    walks = []
+    assert _serve(engine, PROMPTS["a"], MAX_TOKENS, walks=walks) == [eos]
+    assert walks == ["prefill"]
     assert _errors(caplog) == []
 
 
@@ -475,3 +481,49 @@ def test_short_budgets_are_exact_and_name_no_missing_loop(k, max_tokens, caplog)
     engine, _, _ = _build_engine(k)
     assert len(_serve(engine, PROMPTS["a"], max_tokens, ignore_eos=True)) == max_tokens
     assert _errors(caplog) == []
+
+
+# -- a verdict that never lands -------------------------------------------------
+
+
+def _verdict_reader(monkeypatch, pending: dict):
+    """A submodule whose eager mailbox never stages a verdict (step -1), as after a failed replay."""
+    from mstar.model.glm5_next import submodules
+
+    monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2, raising=False)
+    sub = Glm5NextLLMSubmodule.__new__(Glm5NextLLMSubmodule)
+    sub.__dict__.update(mtp_k=3, request_states={}, _mailboxes={
+        None: (torch.zeros(4, 5, dtype=torch.long), torch.full((1,), -1, dtype=torch.long))})
+    for rid, p in pending.items():
+        sub.request_state(rid).add("mtp_pending", p)
+    return sub
+
+
+def _raised(fn, seconds: float = 20.0):
+    """What ``fn`` raised, on a thread bounded at ``seconds``: a wait with no deadline fails here."""
+    out = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit is the point
+            out["exc"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "the verdict read is still waiting"
+    return out.get("exc")
+
+
+def test_a_verdict_that_never_lands_exits_the_process(monkeypatch):
+    """A step that failed after it was numbered: the read exits the process at its deadline
+    instead of holding the worker forever."""
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0)})
+    exc = _raised(lambda: sub._read_verdicts(["a"]))
+    assert isinstance(exc, SystemExit) and "never staged" in str(exc)
+
+
+def test_a_read_across_two_steps_exits_the_process(monkeypatch):
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0), "b": (2, None, 1)})
+    assert isinstance(_raised(lambda: sub._read_verdicts(["a", "b"])), SystemExit)
