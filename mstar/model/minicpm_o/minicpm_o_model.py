@@ -59,6 +59,7 @@ from mstar.model.minicpm_o.config import (
     LLM_KV,
     LLM_POS,
     LLM_SAMPLER,
+    PREFILL_WALKS,
     RESAMPLER_ATTN,
     VISION_ATTN,
     MiniCPMOConfig,
@@ -93,6 +94,8 @@ _WALK_INPUTS: dict[str, dict[str, tuple[str, ...]]] = {
         LLM: ("text_inputs", "image_positions", "audio_positions"),
     },
 }
+# TokenStop ends a reply on a stop sampled in PREFILL_WALKS, so each prefill walk is there
+assert set(_WALK_INPUTS) == PREFILL_WALKS
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
