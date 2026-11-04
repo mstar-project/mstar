@@ -792,9 +792,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # Leased, the captured block loop plans its own attention per replay. A node
-        # serving adapters still declares its frames, so the engine adds their LoRA
-        # rows (`lora_rows`) for the patch embed and merger outside the loop.
+        # Leased, the captured block loop plans its own attention per replay. No row of a
+        # leased step runs a vision adapter (the base-only loop refuses them in
+        # `can_lease`), but a node serving adapters still declares its frames: the engine
+        # adds their LoRA rows (`lora_rows`), so the bound patch embed and merger outside
+        # the loop have a planned step to run base-only against.
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
         if leased and not self.lora_keys:
             return None
