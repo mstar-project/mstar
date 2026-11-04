@@ -49,6 +49,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerStatus,
 )
 from mstar.worker import worker_metrics  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
 
@@ -130,12 +131,12 @@ def _prepare(eng: Engine, walk: str, **lengths) -> ExecutingBatch:
     return batch
 
 
-def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=True) -> WorkerMetrics:
+def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=True, rebuilds=None) -> WorkerMetrics:
     """``counting``: as after the API server's warmup requests."""
     if scheduler is None:
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     m = WorkerMetrics(
-        "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler,
+        "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler, rebuilds or Rebuilds({}, {}),
         send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
     )
     if counting:
@@ -358,7 +359,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
 
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
-                               SimpleNamespace(pending_rows=dict), send=sent.append,
+                               SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
                                enable_transfers=lambda: EdgeTransfers("SHM"))
     w._metrics.start_counting()
     return w, sent, postprocessed, iteration
@@ -712,7 +713,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     clock = _Clock()
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
-        SimpleNamespace(pending_rows=lambda: {NODE: pending}), send=None,
+        SimpleNamespace(pending_rows=lambda: {NODE: pending}), Rebuilds({}, {}), send=None,
         enable_transfers=lambda: EdgeTransfers("SHM"),
     )
     with pytest.MonkeyPatch.context() as mp:

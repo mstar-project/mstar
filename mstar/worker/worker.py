@@ -890,7 +890,7 @@ class Worker:
         leads and the tensors every rank reads."""
         return WorkerMetrics(
             self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
-            self.engine_manager.engine, self.scheduler,
+            self.engine_manager.engine, self.scheduler, self._rebuilds,
             send=lambda status: self.communicator.send("conductor", ConductorMessage(
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),

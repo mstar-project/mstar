@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from collections.abc import Collection, ItemsView, Mapping, MutableMapping
+from collections.abc import Collection, ItemsView, KeysView, Mapping, MutableMapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -75,6 +75,15 @@ class Rebuilds:
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         # nodes that have logged a prompt the pool couldn't hold
         self._logged_full: set[str] = set()
+
+    @property
+    def pool(self) -> HostPool | None:
+        return self._pool
+
+    @property
+    def nodes(self) -> KeysView[str]:
+        """The nodes that declare a `RebuildPolicy`."""
+        return self._policies.keys()
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
         """Copy the prompt of each row of the policy's walk whose request keeps no ids yet to the host, once
