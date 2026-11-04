@@ -31,6 +31,13 @@ T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
 # the LLM's decode loop, which the KV layout and loop caps name
 DECODE_LOOP = "decode_loop"
+# Its walks: a text reply's, whose token loops back on the device, and a spoken
+# reply's, which also hands the TTS each step's input token and hidden. Their rows
+# share a step as DECODE_MIXED.
+DECODE = "decode"
+DECODE_SPOKEN = "decode_spoken"
+DECODE_MIXED = "decode_mixed"
+DECODE_WALKS = frozenset({DECODE, DECODE_SPOKEN, DECODE_MIXED})
 # a spoken reply's TTS walks and its decode loop
 TTS_PREFILL = "tts_prefill"
 TTS_DECODE = "tts_decode"

@@ -62,7 +62,11 @@ from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     AUDIO_FEATURE_LENS,
+    DECODE,
     DECODE_LOOP,
+    DECODE_MIXED,
+    DECODE_SPOKEN,
+    DECODE_WALKS,
     IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
@@ -100,8 +104,6 @@ from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
-DECODE = "decode"
-
 # encoder output name -> the prompt positions it fills
 _MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_positions"}
 
@@ -123,10 +125,10 @@ class LLMSubmodule(ARNodeSubmodule):
         # by the graph runtime, and its budget is the loop's cap.
         self.token_stop = TokenStop(
             loop=DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=LLM_SAMPLER, walk=DECODE, prefill_walks=PREFILL_WALKS, runtime_check=True,
+            sampler=LLM_SAMPLER, walk=DECODE_WALKS, prefill_walks=PREFILL_WALKS, runtime_check=True,
         )
-        # decode reads its last token off the sampler's slot masters, and its
-        # client token rides inline
+        # a text reply's decode reads its last token off the sampler's slot
+        # masters, and its client token rides inline
         self.device_loopback = DeviceLoopback(
             walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
@@ -142,6 +144,8 @@ class LLMSubmodule(ARNodeSubmodule):
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=DECODE,
+                # the capture emits the TTS's pair too, which a text row's walk leaves unrouted
+                replay_graph_walks=[DECODE, DECODE_SPOKEN, DECODE_MIXED],
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
@@ -189,7 +193,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # `preprocess`; the routed signal is empty here
             return row
         ids = inputs["text_inputs"][0]
-        if graph_walk == DECODE or not any(name in inputs for name in _MM_FILLS):
+        if graph_walk in DECODE_WALKS or not any(name in inputs for name in _MM_FILLS):
             return ARNodeInputs(input_seq_len=ids.shape[0], input_ids=ids)
         embeds = self._prompt_embeds(inputs)
         return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
@@ -201,10 +205,10 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        if graph_walk == DECODE:
+        if graph_walk in DECODE_WALKS:
             # A spoken reply's TTS reads each row's input token, so the ids
-            # ride to the forward. With device loop-back every row is its
-            # request's last sampled token, read by slot.
+            # ride to the forward. A text row that looped back brings none:
+            # its token is read by slot, beside the rows that bring theirs.
             if any(inp.input_ids is None for inp in inputs):
                 ids = self.loopback_inputs(engine_inputs, inputs)["input_ids"]
             else:
@@ -250,12 +254,12 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor]:
         """``new_token``, and on decode the (``tts_ids``, ``tts_hidden``) pair:
         each row's input token and its post-norm hidden, which a spoken
-        reply's TTS reads."""
+        reply's TTS reads (a text reply's walk has no edge for them)."""
         attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
         sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
         hidden = self.model(input_embeds, label="main")
         out = {}
-        if graph_walk == DECODE:
+        if graph_walk in DECODE_WALKS:
             out["tts_ids"] = input_ids
             out["tts_hidden"] = hidden
         else:

@@ -81,7 +81,10 @@ from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     AUDIO_FEATURE_LENS,
+    DECODE,
     DECODE_LOOP,
+    DECODE_MIXED,
+    DECODE_SPOKEN,
     IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
@@ -435,29 +438,29 @@ class MiniCPMOModel(Model):
             name=AUDIO, input_names=["audio_features"],
             outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
         )
-        decode = Loop(
-            name=DECODE_LOOP,
-            section=GraphNode(
-                name=LLM,
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(next_node=LLM, name="text_inputs"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
-                    # per-step (input token, its hidden) of a spoken reply, for
-                    # the accumulation below; nothing reads them per step
-                    GraphEdge(next_node=EMPTY_DESTINATION, name="tts_ids"),
-                    GraphEdge(next_node=EMPTY_DESTINATION, name="tts_hidden"),
-                ],
-            ),
-            # a safety bound; the per-request budget is `get_loop_caps`'
-            max_iters=self.max_seq_len,
-            outputs=[],
-            # the reply's TTS condition, handed over whole when it ends
-            accumulated_outputs=[
-                GraphEdge(next_node=EMPTY_DESTINATION, name="tts_ids", persist=True),
-                GraphEdge(next_node=EMPTY_DESTINATION, name="tts_hidden", persist=True),
-            ],
-        )
+        def decode(spoken: bool) -> Loop:
+            # A text reply's only output is its token, which the LLM keeps on the
+            # device: its steps loop back. A spoken reply's also hands the TTS its
+            # per-step (input token, its hidden), for the accumulation below;
+            # nothing reads them per step.
+            tts = ("tts_ids", "tts_hidden") if spoken else ()
+            return Loop(
+                name=DECODE_LOOP,
+                section=GraphNode(
+                    name=LLM,
+                    input_names=["text_inputs"],
+                    outputs=[
+                        GraphEdge(next_node=LLM, name="text_inputs"),
+                        GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+                        *(GraphEdge(next_node=EMPTY_DESTINATION, name=name) for name in tts),
+                    ],
+                ),
+                # a safety bound; the per-request budget is `get_loop_caps`'
+                max_iters=self.max_seq_len,
+                outputs=[],
+                # the reply's TTS condition, handed over whole when it ends
+                accumulated_outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True) for name in tts],
+            )
         tts_outputs = [
             StreamingGraphEdge(next_node=TOKEN2WAV, name="tts_code", target_partition=TOKEN2WAV),
         ]
@@ -487,7 +490,8 @@ class MiniCPMOModel(Model):
                 Parallel([vision, audio]),
                 llm(["text_inputs", "vision_embeds", "image_positions", "audio_embeds", "audio_positions"]),
             ]),
-            "decode": decode,
+            DECODE: decode(spoken=False),
+            DECODE_SPOKEN: decode(spoken=True),
             TTS_PREFILL: tts_prefill,
             TTS_DECODE: tts_decode,
             T2W_CHUNK: GraphNode(
@@ -495,6 +499,10 @@ class MiniCPMOModel(Model):
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
             ),
         }
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        # text and spoken replies decode in one step; a text row still loops back
+        return {LLM: {DECODE_MIXED: {DECODE, DECODE_SPOKEN}}}
 
     def get_partitions(self) -> list[PartitionDefinition]:
         main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK}
@@ -703,7 +711,7 @@ class MiniCPMOModel(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {
-            LLM_KV: {"main": KVLabel(growth=(("decode", DECODE_LOOP),))},
+            LLM_KV: {"main": KVLabel(growth=((DECODE, DECODE_LOOP), (DECODE_SPOKEN, DECODE_LOOP)))},
             TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))},
         }
 
@@ -837,7 +845,8 @@ class MiniCPMOModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        """prefill -> decode -> (spoken reply) tts_prefill -> tts_decode -> done.
+        """prefill -> decode -> done, or for a spoken reply prefill -> decode_spoken
+        -> tts_prefill -> tts_decode -> done.
 
         The loops stop in their submodules' ``check_stop``; arriving here after
         one means it finished."""
@@ -853,10 +862,10 @@ class MiniCPMOModel(Model):
         speech = metadata.kwargs["audio_output"]
         if metadata.is_prefill:
             metadata.is_prefill = False
-            metadata.graph_walk = "decode"
+            metadata.graph_walk = DECODE_SPOKEN if speech else DECODE
             inputs = self._carry(LLM, ("new_token",), persist_signals)
             inputs[0].name = "text_inputs"
-        elif walk == "decode" and speech:
+        elif walk == DECODE_SPOKEN:
             metadata.graph_walk = TTS_PREFILL
             inputs = self._carry(TTS, ("tts_ids", "tts_hidden"), persist_signals)
         elif walk == TTS_PREFILL:

@@ -137,6 +137,29 @@ def test_prefill_token_counts_toward_the_budget(walk):
     assert model.get_loop_caps(max_output_tokens=1)[DECODE_LOOP] == 1
 
 
+@pytest.mark.parametrize("speech", [False, True])
+def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
+    """A text reply's decode outputs only its token, which the LLM keeps on the device,
+    so its steps run rows-only (device loop-back). A spoken reply's decode also hands
+    the TTS its condition, which goes through the host."""
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.model.minicpm_o.minicpm_o_model import MAIN
+    from mstar.model.minicpm_o.submodules import LLMSubmodule
+
+    model = a_model(tmp_path)
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text", "audio"] if speech else ["text"],
+        graph_walk="prefill_text", is_prefill=True, kwargs={"audio_output": speech},
+    )
+    model.get_partition_forward_pass_args(MAIN, metadata, {"new_token": []})
+    walk = metadata.graph_walk
+    signals = {edge.name for edge in model.get_graph_walk_graphs()[walk].section.outputs}
+    llm = LLMSubmodule(torch.nn.Identity(), a_config())
+    llm.node_resources = {LLM_SAMPLER: SimpleNamespace(has_slot_masters=True)}
+    # the worker's test for a rows-only step (``Worker._all_on_device``)
+    assert (signals <= llm.device_loopback_signals(walk)) == (not speech)
+
+
 def test_tts_code_budget_is_its_loop_cap():
     """The TTS prefill samples the first code, so its decode loop runs one fewer than
     upstream's max_new_tokens: a reply's codes stop there, or at the EOS code."""
