@@ -5,8 +5,9 @@ layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resol
 The math is a kernel bundle's, which the resource picks from the pool and its layers' gates:
 ``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
 elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
-None), ``run_paged`` and, for a speculative step, ``run_verify``. The plan stages the
-layout into buffers that stay put under capture.
+None), ``run_paged`` and, for a speculative step, ``run_verify``, and says whether its
+prefill can be captured (``prefill_capturable``; the resource refuses one it can't). The plan
+stages the layout into buffers that stay put under capture.
 """
 
 from __future__ import annotations
@@ -272,6 +273,13 @@ class KDAManager(LinearAttnManager):
                         "would leave each verify step's count unsettled"
                     )
         elif not is_decode and self.kernels is not None:
+            if lease is not None and not self.kernels.prefill_capturable:
+                # its prefill slices the spans on the host, so a replay would run the capture's
+                raise RuntimeError(
+                    f"kda: {type(self.kernels).__name__} can't run a captured prefill "
+                    f"({lease.bucket}); leave the node's prefill buckets out where "
+                    "KDAManager.prefill_capturable is False"
+                )
             host = self.kernels.layout(spans, num_tokens, lease is not None)
             if host is not None:
                 plan.layout = self._stage_layout(host, label, ctx)
