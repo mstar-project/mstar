@@ -33,7 +33,7 @@ from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.side_steps import SIDE_LANE
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import PendingBatch, Speculation, Worker
+from mstar.worker.worker import PendingBatch, Speculation, Worker, _make_rebuilds
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
@@ -63,7 +63,7 @@ def _cleanup(node, rids, wgs):
 def _worker():
     eng = SimpleNamespace(dropped=[], landed=[], released=[])
     eng.residency = lambda _, rid: Residency.DROPPED if rid in eng.dropped else Residency.RESIDENT
-    eng.drop_request = lambda _, rid: eng.dropped.append(rid)
+    eng.drop_request = lambda _, rid, tokens: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     eng.release_chunk_inputs = lambda rid, node: eng.released.append(rid)
     eng.release_cached_prefix = lambda batch: None
@@ -175,6 +175,33 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     with pytest.raises(RuntimeError):
         w._preemption._drop(R, NODE)
     assert not eng.dropped, "the request would lose pages a step still reads, or come back as nothing or wrongly keyed"
+
+
+def test_a_request_whose_kept_ids_dont_rebuild_what_its_kv_holds_is_never_dropped():
+    from test_kv_drop import _engine, _manager, _prefill
+
+    w, _ = _worker()
+    kv = _manager()
+    _prefill(kv, R, 4)
+    w._preemption._engine_manager = SimpleNamespace(get_engine=lambda node: _engine({"kv": kv}))
+    w._rebuilds._kept[NODE][R] = _kept(5, prompt=(1, 2, 3))  # one prompt id short of what the KV holds
+
+    with pytest.raises(RuntimeError, match="holds 4"):
+        w._preemption._drop(R, NODE)
+    assert kv.residency(R) is Residency.RESIDENT and kv._streams[R]["main"].page_indices, (
+        "the request would lose its KV, and its rebuild would write one token less than it held"
+    )
+
+
+def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+
+    my_walks = {(NODE, PREFILL), (NODE, DECODE)}
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"))
+
+    assert rebuilds.pool is None and NODE not in rebuilds.nodes, (
+        "every rank would copy each prompt to pinned memory for a drop its KV refuses"
+    )
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():

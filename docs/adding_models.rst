@@ -1871,6 +1871,15 @@ buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
 
+A kernel in the forward can draw its rows' tokens itself, as Qwen3-TTS's depth-loop kernel
+does for fifteen draws a step. ``sampler.fused_draw_args()`` returns the step's per-row
+temperature, top-k, top-p, seed and offset, in the forward's row order, and the kernel draws
+each row with ``mstar.engine.resources.sampler.fused_draw.draw_row``, which picks the token
+``fused_sample`` would. After the launch, ``sampler.advance_offsets(draws)`` moves the offsets
+as that many ``sample`` calls would. ``fused_draw_args()`` returns None when ``sample`` would
+do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
+TP); the model then calls ``sample``.
+
 .. warning::
 
    Where the callable is passed into a traced function, create one ``AttentionCallable``

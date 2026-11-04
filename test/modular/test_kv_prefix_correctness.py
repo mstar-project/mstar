@@ -266,8 +266,8 @@ def test_a_prompt_dropped_between_chunks_and_run_again_to_where_it_stood_attends
     node.step("r", 37)
     node.step("r", 61)
     _schedule_b(node, "other", PROMPT)
-    node.kv.drop("r")
-    node.rope.drop("r")
+    node.kv.drop("r", 98)
+    node.rope.drop("r", 98)
 
     start = node.resolve("r")
     assert start == 96, "the rebuild would start past where the prompt stood, or recompute what the cache holds"

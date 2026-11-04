@@ -20,6 +20,8 @@ sys.path.insert(0, ".")
 import pytest
 import test_kv_host_index as host
 from test_kv_admission import _remove, _runner
+from test_kv_prefix_layout_lease import IMAGE, IMAGE_WALK, RID, TAIL, TEXT, TEXT_WALK
+from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
 
@@ -78,7 +80,7 @@ def _ready(kv, rid: str) -> bool:
 
 
 def _drop(kv, rid: str) -> int:
-    freed = kv.drop(rid)
+    freed = kv.drop(rid, kv._laid_out_tokens(rid))
     _runner(kv).readmit(rid, NODE)
     return freed
 
@@ -128,7 +130,7 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
     _remove(kv, "x")
     assert _ready(kv, "a") and _ready(kv, "b") and not _ready(kv, "c")
     assert _step(kv, "a", 3 * PAGE_SIZE).ok and _step(kv, "b", 2 * PAGE_SIZE).ok
-    kv.drop("b")
+    kv.drop("b", 2 * PAGE_SIZE)
     assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
     _runner(kv).readmit("b", NODE)
 
@@ -196,7 +198,7 @@ def test_a_victim_still_to_move_is_chosen_for_no_other_request():
     assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
 
     waits = _preempt(kv, "r2", _short(kv, "r2"), droppable=lambda rid: True)
-    assert waits == Victims([], [], [], waits=True), "r2 took r1's victim or moved itself"
+    assert waits == Victims([], [], [], waits=1), "r2 took r1's victim or moved itself"
     _runner(kv).readmit("r2", NODE)
     assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], [], []), "r1 chose again"
     _drop(kv, "v")
@@ -231,14 +233,72 @@ def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
     assert "v" not in victims.to_host + victims.to_drop, f"v was chosen with its {flight}, so its move would be refused"
 
 
+def test_a_dropped_request_admitted_again_isnt_chosen_before_its_rebuild_lands():
+    """A dropped request admitted again holds an allotment and no page until its rebuild writes. Asked to give the
+    allotment back, it would leave its rebuild row running on none, and the worker would keep offering that row."""
+    kv = _pool()
+    _running(kv, "o", 4, arrival=0)
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "v", 2, arrival=2)
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    assert _step(kv, "r", 1).ok
+    _remove(kv, "o")
+    assert _admitted(kv, "v")
+    short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
+
+    victims = _preempt(kv, "r", short, droppable=lambda rid: True)
+
+    assert "v" not in victims.to_ask, "v gave back the allotment its rebuild runs on"
+
+
+def test_a_request_holding_a_served_walk_in_its_lease_isnt_chosen():
+    """A walk the cache serves whole never admits, so its KV lives only in the stream's lease. A newer request with
+    that lease and no page, asked to give back its allotment, would release the lease, and once eviction took those
+    pages its next walks would write from slot 0."""
+    node = _LayoutNode()
+    kv = node.kv
+    _request(kv, "o", 1, arrival=0)
+    assert _ready(kv, "o") and _ready(kv, RID)
+    answers = [node.walk(TEXT_WALK, len(TEXT))]
+    node.runner.remove_request("seed")
+
+    kv.preempt("o", 1, [RID], droppable=lambda rid: False)
+    # the older request's growth evicts the pages only the index holds
+    kv._evict(len(kv._index.evictable()))
+    answers += [node.walk(IMAGE_WALK, IMAGE), node.walk(TEXT_WALK, len(TAIL))]
+
+    assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], "a move released the served walk's KV"
+
+
+def test_a_request_holding_a_served_walk_in_its_lease_doesnt_move_itself():
+    """With nothing newer to move, a request that ran short goes to the host itself, and the move releases its
+    leases. A page on another label made it look movable while its lease held a served walk's KV."""
+    node = _LayoutNode()
+    kv = node.kv
+    kv._cpu_pool = host._HostPool(64)
+    assert _ready(kv, RID)
+    node.walk(TEXT_WALK, len(TEXT))
+    step, ctx = KVStep(segments=(Segment(RID, "other", PAGE_SIZE),)), _ctx(RID)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+    victims = kv.preempt(RID, 1, [], droppable=lambda rid: False)
+
+    assert RID not in victims.to_host, "r1 moved itself to the host, releasing the served walk's KV"
+
+
 def test_a_victim_whose_move_fails_comes_off_the_earmark():
     kv = _pool()
-    kv._cpu_pool = host._HostPool(16)
+    kv._cpu_pool = host._HostPool(4)
+    _running(kv, "x", 2, arrival=0)
     _running(kv, "r", 5, arrival=1)
-    _running(kv, "v", 5, arrival=2)
+    _running(kv, "v", 3, arrival=2)
     assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
-    # the host fills before v moves
-    kv._cpu_pool.arena.acquire(kv._cpu_pool.arena.num_free)
+    # an offload no victim chose fills the host before v moves
+    assert kv.offload("x") == 2
 
     assert _offload(kv, "v") == 0
     assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
@@ -253,7 +313,9 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
     drops = then == "drops itself"
-    assert victims == Victims([], ["r"] if drops else [], [], waits=not drops), "r waits only when it can't drop itself"
+    assert victims == Victims([], ["r"] if drops else [], [], waits=0 if drops else 1), (
+        "r waits only when it can't drop itself"
+    )
     assert not kv._earmarks, "nothing newer frees a page"
     if not drops:
         _runner(kv).readmit("r", NODE)
@@ -282,6 +344,40 @@ def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fi
     assert not _admitted(kv, "r"), f"r was let go once one page freed, though it was short by {short}"
     _remove(kv, "b")
     assert _admitted(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r wasn't admitted once its shortage fit"
+
+
+def test_a_waiting_request_asks_for_the_room_its_grant_counted_too():
+    """A grant two pages past its allotment, with one page free, is one page short. Asking for that page alone, the
+    request was let go at once into the free page, and its next grant failed the same way."""
+    kv = _pool()
+    _running(kv, "a", 4, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits == 2, "r asked for less than its grant needs"
+    _runner(kv).readmit("r", NODE)
+
+    assert not _admitted(kv, "r"), "r was let go into the one free page, though its grant needs two"
+
+
+@pytest.mark.parametrize("cover", ["a victim's move", "room freed since"])
+def test_the_room_a_short_grant_counted_is_set_aside_for_it(cover):
+    """A grant two pages past its allotment, with one page free, is one page short. Setting aside only the page a
+    move freed, or nothing once the room had grown to cover the grant, left the free page to another request's
+    growth, and the grant failed again."""
+    kv = _pool()
+    _running(kv, "a", 3, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 1, arrival=2)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    if cover == "room freed since":
+        _remove(kv, "v")
+    victims = _preempt(kv, "r", short, droppable=lambda rid: True)
+    if cover == "a victim's move":
+        assert victims.to_drop == ["v"]
+        _drop(kv, "v")
+    _step(kv, "a", PAGE_SIZE)
+
+    assert _step(kv, "r", PAGE_SIZE + 1).ok, "a grew into the room r's grant counted, and r's grant failed again"
 
 
 @pytest.mark.parametrize("state", ["pending victim", "dropped", "rebuilding", "earmark's request"])
@@ -317,7 +413,7 @@ def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_pro
     _request(kv, "v", 5, arrival=1)
     assert _ready(kv, "v") and _step(kv, "v", 2 * PAGE_SIZE).ok
 
-    kv.drop("v")
+    kv.drop("v", 2 * PAGE_SIZE)
 
     assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
 
@@ -443,7 +539,7 @@ def test_a_guaranteed_request_that_wrote_nothing_keeps_its_allotment_when_an_old
     assert _ready(kv, "g")
     short = _step(kv, "o", 2 * PAGE_SIZE).reason.pages_short
 
-    assert _preempt(kv, "o", short, droppable=lambda rid: False) == Victims([], [], [], waits=True), (
+    assert _preempt(kv, "o", short, droppable=lambda rid: False) == Victims([], [], [], waits=2), (
         "a guaranteed request gave back its allotment for an older request's shortage"
     )
     assert "g" in kv._allotments
@@ -552,7 +648,7 @@ def test_a_request_back_from_the_host_waits_for_its_shortage_rather_than_moving_
     kv = _pool()
     short = _back_from_the_host_and_short(kv)
 
-    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims([], [], [], waits=True), (
+    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims([], [], [], waits=1), (
         "z moved to the host again for its own page"
     )
 
@@ -582,6 +678,8 @@ def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     _request(kv, "a", 2, arrival=1)
     _remove(kv, "o")
     assert _ready(kv, "a") and _admitted(kv, "v")
+    assert _step(kv, "v", 2 * PAGE_SIZE).ok
+    kv.land_rebuild("v")
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 

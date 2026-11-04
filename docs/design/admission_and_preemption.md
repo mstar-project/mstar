@@ -142,9 +142,9 @@ Say request R's grant is short by `pages_short` pages, one for a decode row. A r
 
 Then:
 
-1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
+1. If the victims free enough, the worker earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
 2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued. A request that came back from a drop or the host does so only when an older request waits in the queue.
-3. Otherwise, R keeps its reservation and asks the pool for its shortage. It waits in the queue at its arrival, parked as a new prompt is, until the room covers the shortage.
+3. Otherwise, R keeps its reservation and asks the pool for every page its grant needed past it. It waits in the queue at its arrival, parked as a new prompt is, until the room covers them.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
@@ -167,11 +167,11 @@ Why this shape:
 @dataclass
 class Earmark:
     rid: str            # R, the request whose grant failed
-    pages: int          # what R was short
-    victims: set[str]   # the victims whose moves cover it
+    pages: int          # what R's grant needed past its reservation
+    victims: set[str]   # the victims whose moves cover the rest
 ```
 
-As each victim's move lands, what it frees joins R's reservation, up to `pages_short`, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+The room R's grant counted joins R's reservation at once. As each victim's move lands, what it frees joins too, up to what the grant needed past the reservation, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
 Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
@@ -187,10 +187,11 @@ Lifecycle:
 
 ```python
 class KVManager:
-    def drop(self, rid: str) -> int:
+    def drop(self, rid: str, tokens: int) -> int:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
-        evictable pages. Needs no host pool."""
+        evictable pages. Needs no host pool. tokens is what rid's rebuild
+        writes: its kept ids but the last, or the chunks its prompt ran."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
@@ -204,6 +205,7 @@ A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
 - one not yet decoding
 - one with a host copy
 - one with a step, a KV read or a sample in flight, until that lands
+- one whose rebuild would write other than the tokens its KV holds
 
 At a drop, the other resources:
 
@@ -286,7 +288,7 @@ The rebuild prefills the kept ids minus the last, under the policy's walk, as ro
 
 A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
+The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied in the dtype the walk reads them in (int64, 8 B a token) to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
 
 Why this shape:
 
@@ -366,7 +368,7 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again each time an older request runs short.
 - **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
-- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 128 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 
