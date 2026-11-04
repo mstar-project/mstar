@@ -141,7 +141,8 @@ def test_prefill_token_counts_toward_the_budget(walk):
 def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
     """A text reply's decode outputs only its token, which the LLM keeps on the device,
     so its steps run rows-only (device loop-back). A spoken reply's decode also hands
-    the TTS its condition, which goes through the host."""
+    the TTS its condition, which goes through the host. Either way the client's token
+    rides inline."""
     from mstar.conductor.request_info import CurrentForwardConductorMetadata
     from mstar.model.minicpm_o.minicpm_o_model import MAIN
     from mstar.model.minicpm_o.submodules import LLMSubmodule
@@ -158,6 +159,7 @@ def test_a_text_replys_decode_steps_loop_back(tmp_path, speech):
     llm.node_resources = {LLM_SAMPLER: SimpleNamespace(has_slot_masters=True)}
     # the worker's test for a rows-only step (``Worker._all_on_device``)
     assert (signals <= llm.device_loopback_signals(walk)) == (not speech)
+    assert llm.inline_client_signals(walk) == {"text_inputs": "new_token"}
 
 
 def test_tts_code_budget_is_its_loop_cap():

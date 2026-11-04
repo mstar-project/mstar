@@ -133,6 +133,12 @@ class LLMSubmodule(ARNodeSubmodule):
             walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
 
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # a spoken reply's client token rides inline too; its other outputs go through the host
+        if graph_walk == DECODE_SPOKEN:
+            return {self.device_loopback.signal: self.device_loopback.buffer}
+        return super().inline_client_signals(graph_walk)
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
