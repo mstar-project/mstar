@@ -768,11 +768,11 @@ Qwen3-TTS notes
   pool. ``resources: {codec_state: {max_slots: N}}`` sizes it for N - 1
   streams (one slot is the pool's sink); 256 streams by default. Each chunk
   width is a CUDA-graph bucket captured for batch sizes 1 to 32 (densely: the
-  codec's cost is per row, so a padding row costs as much as a real one); the
-  scheduler batches each width apart, so a stream's small first chunks are not
-  padded to a full chunk's width or queued behind a batch of them. A voice
-  clone's stream leads with the reference's last 72 frames, decoded with the
-  first chunk to warm the state on the voice and trimmed from its audio.
+  codec's cost is per row, so a padding row costs as much as a real one). A
+  step takes ready chunks of any width and pads them to its widest, since a
+  step of its own for each width costs more than the padding. A voice clone's
+  stream leads with the reference's last 72 frames, decoded with the first
+  chunk to warm the state on the voice and trimmed from its audio.
   The SnakeBeta activations run as one fused kernel. A deployment sets the
   ramp and the steady chunk with ``model_kwargs: {codec_chunk_schedule: [1, 3,
   8, 16], codec_chunk_frames: 25}``. ``configs/qwen3tts_1p7b.yaml`` opens with
