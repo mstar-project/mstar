@@ -268,6 +268,11 @@ def test_vae_tile_plan_covers_the_canvas():
     assert vae.split_tiles(128) == ([0], [128], [])
 
 
+# a 1 x 1 PNG
+PNG_URL = ("data:image/png;base64,"
+           "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+
+
 def test_openai_adapter(tmp_path):
     """``image`` is the first frame and ``last_image`` (an ``extra_body`` field) the last."""
     from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
@@ -280,17 +285,30 @@ def test_openai_adapter(tmp_path):
     assert args.output_modalities == ["video", "audio"]
     assert {k: args.model_kwargs[k] for k in ("width", "height", "seed", "num_frames")} == {
         "width": 1344, "height": 768, "seed": 3, "num_frames": 124}
-    # a 1 x 1 PNG
-    url = ("data:image/png;base64,"
-           "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+    url = PNG_URL
     args = adapter.video_to_request(VideoGenerationRequest(prompt="a dog", image=url, last_image=url), tmp_path)
     assert args.input_modalities == ["image", "text"] and len(args.file_paths["image"]) == 2
     assert args.model_kwargs["keyframe_anchors"] == ["first", "last"] and "last_image" not in args.model_kwargs
     last_only = adapter.video_to_request(VideoGenerationRequest(prompt="a dog", last_image=url), tmp_path)
     assert last_only.model_kwargs["keyframe_anchors"] == ["last"]
-    for bad in (VideoGenerationRequest(prompt="a dog", fps=30), VideoGenerationRequest(prompt="a dog", video=url)):
+    for bad in (VideoGenerationRequest(prompt="a dog", fps=30), VideoGenerationRequest(prompt="a dog", video=url),
+                VideoGenerationRequest(prompt="a dog", n=2), VideoGenerationRequest(prompt="a dog", audio="false")):
         with pytest.raises(ValueError):
             adapter.video_to_request(bad, tmp_path)
+
+
+def test_a_refused_keyframe_leaves_no_upload(tmp_path, monkeypatch):
+    """A request refused at its last keyframe removes the first one's saved upload: it is
+    never submitted, so no deferred cleanup would. A non-string reference is a 400."""
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+
+    monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
+    adapter = ADAPTER_REGISTRY["minimax_h3"]
+    for last in ("/etc/hostname", "file:///etc/hostname", "https://example.com/a.png", 123, ["x"]):
+        with pytest.raises(ValueError):
+            adapter.video_to_request(VideoGenerationRequest(prompt="a dog", image=PNG_URL, last_image=last), tmp_path)
+        assert list(tmp_path.iterdir()) == [], last
 
 
 def test_keyframes_onto_the_canvas():
