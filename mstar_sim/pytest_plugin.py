@@ -46,7 +46,7 @@ def pytest_runtest_setup(item):
     device.VALUE_SHAPES[0] = 0
     device.KERNELS_RUN[0] = 0
     # a device-side assert poisons the process, as on CUDA; each test reports its own
-    device.FAULT[0] = ""
+    device.FAULT[:] = ["", 0.0]
 
 
 def _needs_the_hub(excinfo) -> bool:

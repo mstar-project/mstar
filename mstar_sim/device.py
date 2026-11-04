@@ -429,6 +429,7 @@ def host_wait() -> None:
             "(mstar_sim: a host read of a cuda tensor during graph capture)"
         ))
     clock.wait_until(clock.current_timeline().free_at)
+    check_fault()
 
 
 def _check_devices(func, args, kwargs, flat=None) -> int:
@@ -469,12 +470,12 @@ class _Observe(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         launched = clock.vnow()  # the kernel is launched now; the emulator's time is not device time
-        _check_bounds(func, args)
+        in_bounds = _check_bounds(func, args)
         with contextlib.nullcontext() if clock.FAST else clock.computing():
             if self.autocast is not None:
                 args, kwargs = _autocast(func, args, kwargs, self.autocast)
-            if any(t.device.type == "meta" for t in _shallow(args, kwargs)):
-                # a value-less operand: the op runs on shapes only
+            if not in_bounds or FAULT[0] or any(t.device.type == "meta" for t in _shallow(args, kwargs)):
+                # a value-less operand (or a faulted device): the op runs on shapes only
                 args, kwargs = tree_map(_as_meta, (args, kwargs))
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
             elif func in _ALLOCATES:
@@ -498,17 +499,25 @@ class _Observe(TorchDispatchMode):
         return out
 
 
-# A device-side assert: an index out of bounds in a kernel. As on CUDA, it is sticky:
-# every later device call fails, so a server that ran one doesn't serve on.
-FAULT = [""]
+# A device-side assert: an index out of bounds in a kernel. As on CUDA it is asynchronous
+# and sticky: the launch returns, the faulting kernel and every later one compute nothing,
+# and once the device has got there (its stream's time at the launch) every call fails, a
+# sync or host read first among them. So a server that ran one doesn't serve on.
+FAULT: list = ["", 0.0]  # what faulted, and the device time it did
+
+
+def check_fault() -> None:
+    """Raise the device's fault, once the caller's time has reached it."""
+    if FAULT[0] and clock.vnow() >= FAULT[1]:
+        raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})"))
 _TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_", "take", "index_fill", "index_fill_"}
 
 
-def _check_bounds(func, args) -> None:
-    """An index a kernel reads (a value the emulator keeps) must fall inside the
-    tensor it indexes, as the CUDA kernel asserts. Captured, the kernel runs at
-    each replay, on that step's indices (an in-place ``clamp_`` before it has
-    re-run by then): the check goes into the graph."""
+def _check_bounds(func, args) -> bool:
+    """Whether the indices a kernel reads (values the emulator keeps) fall inside the
+    tensor they index, as the CUDA kernel asserts; one that doesn't faults the device.
+    Captured, the kernel runs at each replay, on that step's indices (an in-place
+    ``clamp_`` before it has re-run by then): the check goes into the graph."""
     name = func.overloadpacket.__name__
     pairs = []
     if name == "embedding":
@@ -531,20 +540,23 @@ def _check_bounds(func, args) -> None:
     pairs = [(ix, size) for ix, size in pairs if isinstance(ix, torch.Tensor) and ix.device.type == "cpu"
              and ix.numel() and ix.dtype != torch.bool and not ix.is_floating_point()]
     if not pairs:
-        return
+        return True
     if clock.capturing() is not None:
-        clock.on_replay(lambda: _assert_in_bounds(name, pairs))
-    else:
-        _assert_in_bounds(name, pairs)
+        clock.on_replay(lambda: _in_bounds(name, pairs))
+        return True
+    return _in_bounds(name, pairs)
 
 
-def _assert_in_bounds(name: str, pairs) -> None:
+def _in_bounds(name: str, pairs) -> bool:
     for ix, size in pairs:
         low = -size if name in _TAKES_NEGATIVE else 0
         bad = (ix < low) | (ix >= size)
         if bool(bad.any()):
-            FAULT[0] = f"{name}: index {int(ix[bad][0])} is out of bounds for size {size}"
-            raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})"))
+            if not FAULT[0]:
+                FAULT[:] = [f"{name}: index {int(ix[bad][0])} is out of bounds for size {size}",
+                            clock.current_timeline().free_at]
+            return False
+    return True
 
 
 # torch functions with an index operand, priced per aten op when an index holds values
@@ -797,7 +809,7 @@ def _fast(func, args, kwargs, flat, index):
     """``func`` as one kernel (or none): run on shapes, price by its traffic."""
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
     tensors = [t for t in _shallow(uargs, ukwargs)]
-    if any(t.device.type == "meta" for t in tensors):
+    if any(t.device.type == "meta" for t in tensors) or (FAULT[0] and func not in _VIEWS):
         if any(t.device.type == "cpu" for t in tensors):
             uargs, ukwargs = tree_map(_as_meta, (uargs, ukwargs))
             tensors = [t for t in _shallow(uargs, ukwargs)]
@@ -874,8 +886,7 @@ def _custom_impl(func):
 
 
 def _function(func, args, kwargs):
-    if FAULT[0] and func not in _METADATA:
-        raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: earlier, {FAULT[0]})"))
+    check_fault()
     if clock.FAST:
         return _function_body(func, args, kwargs)
     # the interposer's own time is not the host's: the device stamps exclude it
@@ -970,8 +981,11 @@ def replay(tape: clock.Tape) -> None:
     charging its kernels' time back to back."""
     from mstar_sim import cost
 
+    check_fault()
     clock.STATS["replays"] += 1
     for effect in tape.effects:
+        if FAULT[0]:
+            break  # the device faulted: nothing after it runs
         effect()
     if clock.FAST:
         return
@@ -1157,6 +1171,7 @@ def _plain(func, args, kwargs):
 
 def _emulated(fn, args, kwargs):
     """Emulator work: the host's own time stops at this call."""
+    check_fault()
     if clock.FAST:
         return fn(*args, **kwargs)
     depth = clock.compute_begin()

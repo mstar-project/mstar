@@ -254,10 +254,12 @@ class Stream:
         return event
 
     def query(self) -> bool:
+        _check_fault()
         return time.perf_counter() >= self.timeline.free_at
 
     def synchronize(self) -> None:
         clock.wait_until(self.timeline.free_at)
+        _check_fault()
 
     def __enter__(self):
         # as torch's THPStream_enter: the saved context lives on the stream object,
@@ -333,6 +335,7 @@ class Event:
         self.device = torch.device("cuda", current_device())
 
     def record(self, stream: Stream | None = None) -> None:
+        _check_fault()
         s = stream if stream is not None else current_stream()
         # complete once the stream drains past it: on an idle stream that is now, for
         # every thread (the recording thread's own virtual time would skew a waiter on
@@ -344,11 +347,13 @@ class Event:
         (stream if stream is not None else current_stream()).wait_event(self)
 
     def query(self) -> bool:
+        _check_fault()
         return self.t is None or time.perf_counter() >= self.t
 
     def synchronize(self) -> None:
         if self.t is not None:
             clock.wait_until(self.t)
+        _check_fault()
 
     def elapsed_time(self, end: Event) -> float:
         return (end.stamp - self.stamp) * 1000.0
@@ -357,6 +362,14 @@ class Event:
 def synchronize(device=None) -> None:
     streams = [s.timeline.free_at for s in _all_streams()]
     clock.wait_until(max([clock.DEFAULT.free_at, *streams]))
+    _check_fault()
+
+
+def _check_fault() -> None:
+    """A device-side assert the device has reached fails every CUDA call after it."""
+    from mstar_sim import device
+
+    device.check_fault()
 
 
 

@@ -148,8 +148,9 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         with torch.cuda.graph(g4):
             torch.nn.functional.embedding(bad + 0, table)
         bad.copy_(torch.tensor([3, 77]))
+        g4.replay()  # asynchronous, as on CUDA: the next sync reports it
         try:
-            g4.replay()
+            torch.cuda.synchronize()
             raise SystemExit("an index past the table replayed")
         except RuntimeError as e:
             assert "device-side assert" in str(e)
@@ -212,6 +213,29 @@ def test_timing_only_holds_shapes_not_values():
         other = torch.empty(2**20, device="cuda:1")  # each device counts its own
         assert torch.cuda.memory_allocated(1) == 4 * 2**20 and torch.cuda.memory_allocated(0) == on0
         assert torch.cuda.mem_get_info(1)[0] == total - 4 * 2**20
+        print("ok")
+    """)
+    assert out.strip() == "ok"
+
+
+def test_device_side_assert_surfaces_once_the_device_reaches_it_and_stays():
+    """An out-of-bounds index faults the device, not the launch: the host, ahead of the
+    device, launches on; the next sync raises, and so does every later CUDA call."""
+    out = run_sim("""
+        import torch
+        a = torch.empty(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        table, ids = torch.empty(50, 8, device="cuda"), torch.tensor([3, 77], device="cuda")
+        torch.cuda.synchronize()
+        for _ in range(5):
+            a @ a  # milliseconds of device work queued ahead of the bad index
+        torch.nn.functional.embedding(ids, table)
+        (ids + 1)  # launched before the device got to the fault
+        for call in (torch.cuda.synchronize, lambda: torch.empty(1, device="cuda")):
+            try:
+                call()
+                raise SystemExit("a CUDA call after the fault succeeded")
+            except RuntimeError as e:
+                assert "device-side assert" in str(e), e
         print("ok")
     """)
     assert out.strip() == "ok"
