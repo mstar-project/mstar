@@ -6,8 +6,9 @@
 ``test/integration``, and any test whose skip (a ``skipif`` marker, a
 module-level ``pytest.skip``, or one in its body) names CUDA, a GPU, Triton or
 FlashInfer, or that checks for one itself (``torch.cuda.is_available()`` in its
-body, a fixture or same-module helper it calls, or its skipif). The rest already run in CPU Core. ``--skipped-in`` keeps
-those a plain run skipped, plus the ones that check for a GPU in their body
+body, a fixture or a same-module helper it reaches, or its skipif). The rest
+already run in CPU Core. ``--skipped-in`` keeps those a plain run skipped, plus
+the ones that check for a GPU in their body
 (on a CPU they ``print`` and ``return``, and pass).
 
 Nothing is computed on the emulated GPU, so a test that checks values (parity,
@@ -138,23 +139,24 @@ _SKIPIF_GPU = re.compile(r"skipif\(\s*[^,)]*cuda\.(?:is_available|device_count)\
 
 
 def _checks_gpu(item) -> bool:
-    """The test, a fixture it takes or a helper of its module it calls checks for a GPU."""
+    """The test, a fixture it takes or a same-module helper it reaches (through any
+    number of calls) checks for a GPU."""
     module = getattr(item, "module", None)
-    try:
-        body = inspect.getsource(item.function)
-    except (OSError, TypeError):
-        body = ""
-    names = set(re.findall(r"\b(\w+)\(", body)) | set(getattr(item, "fixturenames", ()))
-    helpers = [getattr(module, n, None) for n in sorted(names)]
-    for fn in [item.function, *helpers]:
+    todo, seen = [item.function, *(getattr(module, n, None) for n in getattr(item, "fixturenames", ()))], set()
+    while todo:
+        fn = todo.pop()
         fn = getattr(fn, "__wrapped__", fn)  # a fixture's own function
-        if not inspect.isfunction(fn) or (fn is not item.function and fn.__module__ != module.__name__):
+        if not inspect.isfunction(fn) or fn in seen or (
+                fn is not item.function and fn.__module__ != getattr(module, "__name__", None)):
             continue
+        seen.add(fn)
         try:
-            if _CHECKS_GPU.search(inspect.getsource(fn)):
-                return True
+            source = inspect.getsource(fn)
         except (OSError, TypeError):
-            pass
+            continue
+        if _CHECKS_GPU.search(source):
+            return True
+        todo.extend(getattr(module, n, None) for n in set(re.findall(r"\b(\w+)\(", source)))
     if any(item.iter_markers("skipif")) and getattr(module, "__file__", None):
         with open(module.__file__) as f:
             return bool(_SKIPIF_GPU.search(f.read()))
