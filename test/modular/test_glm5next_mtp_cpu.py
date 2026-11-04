@@ -572,6 +572,100 @@ def test_long_context_decode_stops_while_the_next_block_fits():
     engine.remove_request("r")
 
 
+def _serve_joining(engine, sub, prompts, arrivals, max_tokens):
+    """Requests served as a worker does: each prefills alone before decode step ``arrivals``
+    names, joins the decode batch and leaves at its own stop, its KDA slot free for a later
+    one. Checks after each verify step that ``MTP_LEN`` is the rows the device holds."""
+    pool = engine._resources[KDA_STATE]
+    seqs, nxt, iters, live, slots, step = {}, {}, {}, [], {}, 0
+
+    def run(walk, inputs):
+        rids = list(inputs)
+        batch = _batch(
+            node_name="LLM",
+            per_request_info={rid: _info(rid, walk, max_tokens[rid], iters.get(rid, 0))
+                              for rid in rids},
+            per_request_input_tensors={rid: {"text_inputs": [t]} for rid, t in inputs.items()},
+            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0,
+                                     capture=False),
+        )
+        engine.prepare_inputs(batch)
+        assert not batch.failed_requests, batch.failed_requests
+        outputs = engine.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        engine.finalize_batch(batch)
+        return outputs.per_rid_outputs, engine.check_stop_for_batch(batch, outputs)
+
+    while live or any(s >= step for s in arrivals):
+        for rid in arrivals.get(step, []):
+            engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+            out, _ = run("prefill", {rid: prompts[rid]})
+            seqs[rid], nxt[rid], iters[rid] = out[rid]["new_token"][0].tolist(), out[rid]["text_inputs"][0], 0
+            slots[rid] = pool._slots[rid]["main"].index
+            live.append(rid)
+        if live:
+            out, stops = run("decode", {rid: nxt[rid] for rid in live})
+            for rid in live:
+                seqs[rid] += out[rid]["new_token"][0].tolist()
+                nxt[rid] = out[rid]["text_inputs"][0]
+                iters[rid] += 1
+                if sub.mtp_k and not stops.get(rid):  # the prompt and every token but the next input
+                    held = int(pool.block(MTP_LEN)[slots[rid], 0])
+                    assert held == len(prompts[rid]) + len(seqs[rid]) - 1, (rid, step, held)
+            for rid in [rid for rid in live if stops.get(rid)]:
+                engine.remove_request(rid)
+                live.remove(rid)
+        step += 1
+    assert pool.num_free_slots == pool.config.usable_slots
+    return seqs, slots
+
+
+def _ids(n, a, b):
+    return (torch.arange(n) * a + b) % 240
+
+
+# past index_topk (64), on it, crossing it mid-decode, and short; "e" and "f" arrive after
+# "a" has left, "e" into its slot (4 slots)
+SERVE_PROMPTS = {"a": _ids(100, 37, 11), "b": _ids(75, 53, 5), "c": _ids(58, 29, 3),
+                 "d": _ids(64, 41, 7), "e": _ids(130, 31, 17), "f": _ids(3, 19, 2)}
+SERVE_ARRIVALS = {0: ["a", "b"], 1: ["c", "d"], 6: ["e"], 14: ["f"]}
+SERVE_MAX_TOKENS = {"a": 5, "b": 23, "c": 12, "d": 11, "e": 21, "f": 8}
+
+
+@pytest.fixture
+def served_reference():
+    engine, sub, _ = _build_engine(0, long_context=True, page_size=8)
+    seqs, slots = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert slots["e"] == slots["a"]
+    assert {rid: len(s) for rid, s in seqs.items()} == SERVE_MAX_TOKENS, seqs
+    return seqs
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_long_context_mtp_serves_arrivals_and_departures_as_greedy(served_reference, k, drafts):
+    """Requests joining and leaving the decode batch, one into a freed slot, on 8-token pages:
+    each one's tokens are greedy's, and its MTP_LEN its true rows after every step."""
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    assert cfg.mtp_trims
+    if drafts != "mtp":
+        _oracle(sub, served_reference, wrong_every=2 if drafts == "oracle_partial" else None)
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs == served_reference
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_long_context_mtp_stops_at_a_stop_token_among_accepted_drafts(served_reference, k):
+    """A stop token inside a step's accepted drafts ends the reply there, as greedy's does."""
+    stop = served_reference["b"][9]
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    cfg.eos_token_ids = (stop,)
+    if k:
+        _oracle(sub, served_reference, wrong_every=None)  # every draft accepted
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs["b"] == served_reference["b"][:served_reference["b"].index(stop) + 1]
+
+
 # -- a stop on the prefill walk -----------------------------------------------
 
 
