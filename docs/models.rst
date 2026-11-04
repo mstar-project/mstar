@@ -1968,7 +1968,8 @@ used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
   whose RNG stream differs; parity is defined on greedy and forced paths. M*
   also stops the depformer after the last codebook it samples (8 of 16 steps
   per frame, since the user's codebooks are given), which leaves greedy output
-  unchanged but draws fewer random numbers than NVIDIA does.
+  unchanged but draws fewer random numbers than NVIDIA does. A request served alone
+  repeated its own output byte for byte with the same ``seed``.
 
 Uploads longer than 2999 × 80 ms (239.9 s) are rejected from the file header,
 or after at most that much decoding, before the exact budget below is checked.
