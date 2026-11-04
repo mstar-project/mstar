@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 04, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1502,6 +1502,11 @@ rest of the flow and the HiFT vocoder stay float32 (HiFT’s F0 predictor
 float64).
 <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{flow_estimator_dtype:</span> <span class="pre">float32}</span></code> in the deployment YAML runs
 the estimator at the reference’s precision instead, at lower throughput.</p></li>
+<li><p>The flow’s Euler solve is captured at startup as CUDA graphs, one per frame
+bucket and batch size (<code class="docutils literal notranslate"><span class="pre">flow_capture_frame_buckets</span></code>,
+<code class="docutils literal notranslate"><span class="pre">flow_capture_batch_sizes</span></code>, <code class="docutils literal notranslate"><span class="pre">flow_capture_batch_frames</span></code>), which takes GPU
+memory and startup time. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{flow_capture_frame_buckets:</span> <span class="pre">[]}</span></code>
+captures none, and every solve runs eagerly.</p></li>
 </ul>
 </section>
 <section id="qwen3-tts-notes">
@@ -2799,7 +2804,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 03, 2026.
+  Last updated on Nov 04, 2026.
   <br/>
 </p>
   </div>
