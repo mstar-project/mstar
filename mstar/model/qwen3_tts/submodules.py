@@ -957,9 +957,10 @@ class CodecSubmodule(ARNodeSubmodule):
     (``IncrementalDecoder``): it lives in the ``CODEC_STATE`` recurrent pool,
     each step gathering its rows' state and scattering the new state back.
 
-    Each distinct chunk width is a CUDA-graph bucket; a shorter chunk (the
-    terminal flush, a clone's first) is zero-padded to the next bucket and its
-    real length rides with it.
+    Each distinct chunk width is a CUDA-graph bucket. A step takes ready
+    chunks of any width and pads them to its widest, and each chunk's real
+    length rides with it. A padded ramp chunk costs less than the step it
+    would otherwise take on its own.
     """
 
     # the decoder runs in its own dtype (``codec_dtype``), and only the
@@ -1246,17 +1247,6 @@ class CodecSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
         return self.MAX_BATCH_SIZE
-
-    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
-        """Batch each chunk width apart.
-
-        A mixed batch pads every row to its widest chunk, and the codec's cost
-        is per padded frame: a ramp chunk batched with a full one decodes
-        ``chunk_frames`` frames instead of a few. Kept apart, the small ramp
-        chunks, a stream's first audio among them, also do not wait behind a
-        batch of full chunks.
-        """
-        return graph_walk == "codec_chunk"
 
     def cg_key_info(
         self,
