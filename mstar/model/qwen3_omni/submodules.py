@@ -75,6 +75,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_TEXT_DECODE,
     VISION_ATTN,
     Qwen3OmniModelConfig,
 )
@@ -83,6 +84,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     InputMetadata,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -91,32 +93,36 @@ from mstar.model.submodule_base import (
     StopCheck,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
 # The vision tower's block loop, as a piecewise capture region
 VISION_BLOCK_LOOP = "vision_block_loop"
 
+THINKER_DECODE_WALKS = frozenset({"thinker_decode", THINKER_TEXT_DECODE})
+
 
 def talker_text_mask(input_ids: torch.Tensor, config: Qwen3OmniModelConfig) -> torch.Tensor:
     """
-    Cut system prompt and previous assistant parts out of the talker input
-    """
-    im_start_indexes = (
-        input_ids == config.im_start_token_id
-    ).nonzero(as_tuple=True)[0]
-    mask = torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+    Cut system prompt and previous assistant parts out of the talker input.
 
-    for i in range(len(im_start_indexes) - 1):
-        im_start_index = im_start_indexes[i]
-        segment_end_index = im_start_indexes[i + 1]
-        role_token = input_ids[im_start_index + 1]
-        # Talker should ignore thinker system prompt
-        if role_token == config.system_token_id:
-            mask[im_start_index:segment_end_index] = 0
-        elif role_token == config.assistant_token_id:
-            mask[im_start_index:segment_end_index] = 0
-    return mask
+    Each ``<|im_start|>`` opens a turn whose role is the token after it. A system or
+    assistant turn is cut up to the next ``<|im_start|>``; the span's last turn is
+    kept whatever its role. Device ops only, so a prefill on the GPU thread never
+    waits for the host.
+    """
+    if input_ids.numel() == 0:
+        return torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+    is_start = input_ids == config.im_start_token_id
+    turn = torch.cumsum(is_start, 0)  # 0 before the first turn
+    # each turn's role token, scattered to its turn number (the wrapped-around last
+    # entry can only be the last turn's, which is kept anyway)
+    roles = torch.zeros(input_ids.shape[0] + 1, dtype=input_ids.dtype, device=input_ids.device)
+    roles.scatter_reduce_(0, turn * is_start, torch.roll(input_ids, -1) * is_start, "amax")
+    role = roles[turn]
+    cut = (role == config.system_token_id) | (role == config.assistant_token_id)
+    return ~(cut & (turn > 0) & (turn < turn[-1]))
 
 
 # ===================================================================
@@ -194,16 +200,18 @@ class VisionEncoderSubmodule(NodeSubmodule):
             for g in inputs["image_grid_thw"]
             for t, h, w in g.reshape(-1, 3).tolist()
         ]
-        # Built here, not in the forward, so the tower reads nothing off the host.
-        indices, weights = vision_interpolation(grid, vision.num_grid_per_side, merge, device)
+        # Built here, not in the forward, so the tower reads nothing off the host;
+        # and built on the host, as Qwen3.5's encoder does: on the device, the
+        # grid upload and the per-patch index maths each block on the stream.
+        indices, weights = vision_interpolation(grid, vision.num_grid_per_side, merge)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
             input_seq_len=sum(t * h * w for t, h, w in grid),
             tensor_inputs={
                 "pixel_values": torch.cat(list(inputs["pixel_values"]), dim=0),
-                "indices": indices,
-                "weights": weights,
-                "position_ids": vision_grid_position_ids(grid, merge, device),
+                "indices": to_device_nonblocking(indices, device),
+                "weights": to_device_nonblocking(weights, device),
+                "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
                 # not a forward arg: `declare_step` makes a segment of each
                 "seq_lengths": vision_seq_lengths(grid),
             },
@@ -374,11 +382,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         them, fill KV cache
       - prefill_vision: the same for vision embeddings
       - thinker_decode: embed previous token, single-step decode
+      - thinker_text_decode: the same with no audio output: the token loops
+        back on the device and nothing goes to the Talker
 
-    All walks produce ``thinker_states`` that stream to the Talker partition:
-    the layer-0 + layer-N concat at prefill (postprocess picks per token), the
-    layer-0 row at decode, whose token is text.  ``thinker_decode``
-    additionally produces ``logits`` for text token sampling.
+    All walks but the last produce ``thinker_states`` that stream to the Talker
+    partition: the layer-0 + layer-N concat at prefill (postprocess picks per
+    token), the layer-0 row at ``thinker_decode``, whose token is text.  The
+    decode walks additionally produce ``logits`` for text token sampling.
     """
 
     cuts_tensor_inputs = True
@@ -390,14 +400,19 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self,
         thinker_model: nn.Module,
         config: Qwen3OmniModelConfig,
+        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__()
+        super().__init__(prefill_token_buckets)
         self.model = thinker_model  # Qwen3OmniThinkerModel
         self.config = config
         # only a decode row's token ends the loop; a prefill is not in it yet
         self.token_stop = TokenStop(
             loop="thinker_decode_loop", buffer="new_token", stop_ids=frozenset({config.im_end_token_id}),
-            sampler=THINKER_SAMPLER, walk="thinker_decode",
+            sampler=THINKER_SAMPLER, walk=THINKER_DECODE_WALKS,
+        )
+        # thinker_text_decode reads its input ids off the sampler's slot masters
+        self.device_loopback = DeviceLoopback(
+            walk=THINKER_TEXT_DECODE, signal="text_inputs", sampler=THINKER_SAMPLER, buffer="new_token",
         )
 
         # Pre-compute inverse frequencies for 3D MRoPE
@@ -471,7 +486,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
-        if graph_walk == "thinker_decode":
+        if graph_walk in THINKER_DECODE_WALKS:
             return InputSeqLenInfo(1)
         if graph_walk == "prefill_text" and "text_inputs" in inputs:
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
@@ -487,44 +502,33 @@ class ThinkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
-        start_pos = self.node_resources[THINKER_POS].position(
-            rid=fwd_info.rid_handle, label="main"
-        )
-        if graph_walk == "thinker_decode":
-            # Get previous token ID from text_inputs
-            token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
-            if token_id.dim() == 0:
-                token_id = token_id.unsqueeze(0)
-            embeds = self.model.model.embed_tokens(token_id)
-
-            # Next MRoPE position for all 3 components: read from the
-            # stream's position counter (advanced by the runner's commit
-            # of each declared step).
-            # Fill kernel, not ``torch.tensor(..., device=cuda)``: a pageable H2D
-            # syncs the stream, stalling prepare(N+1) until step N drains.
-            pos_ids = torch.full(
-                (3, 1), float(start_pos), dtype=torch.float, device=device,
-            )  # (3, 1)
-
+        if graph_walk in THINKER_DECODE_WALKS:
+            if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+                # read off the sampler's slot master in `preprocess`
+                return row
+            # The previous token, embedded in the graph, or with the step's
+            # other decode rows in `preprocess`; its MRoPE position (the same
+            # for all 3 components) is the plan's, as a text row's.
+            token_id = inputs["text_inputs"][0].to(device).reshape(1)
             return ARNodeInputs(
                 input_seq_len=1,
-                input_embeds=embeds,
-                custom_pos_ids=pos_ids,
+                input_ids=token_id,
             )
 
         if graph_walk == "prefill_text":
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
+            # A text row leaves its positions to the plan, which starts from the
+            # counter a cache hit has already moved.
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 talker_text_mask(text_ids, self.config) # text inclusion
             ])
-            # A text row leaves its positions to the plan, which starts from the
-            # counter a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
@@ -534,13 +538,19 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+        # an audio or vision row's own positions start from the stream's counter
+        start_pos = self.node_resources[THINKER_POS].position(
+            rid=fwd_info.rid_handle, label="main"
+        )
         if graph_walk == "prefill_audio":
             before, after = self._text_around(fwd_info, inputs)
             audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
             audio_len = audio_embeds.shape[0]
 
             mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
+            # scalar writes: a list index uploads from pageable memory, a host sync
+            mm_mask[0] = False
+            mm_mask[-1] = False
 
             wrapped_embeds = self._wrap_audio_input(audio_embeds)
             seq_len = audio_len + 2
@@ -571,7 +581,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_len = vision_embeds.shape[0]
 
             mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
+            # scalar writes: a list index uploads from pageable memory, a host sync
+            mm_mask[0] = False
+            mm_mask[-1] = False
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)
             # Vision tokens use spatial 3D positions (temporal constant,
@@ -615,11 +627,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
             row = self._spliced_row(
                 before, after, wrapped_embeds, pos_ids, mm_mask, start_pos, int(end_pos_base + 1 - media_pos),
             )
+            # the vision rows sit after the text before and the BOS; a slice, not
+            # a boolean mask, which would sync on the mask's count
+            start = before.shape[0] + 1
             deepstack = []
-            multimodal = row.tensor_inputs["masks_for_talker"][0]
             for deepstack_inp in inputs["deepstack"]:
                 full_deepstack = torch.zeros_like(row.input_embeds)
-                full_deepstack[multimodal, :] = deepstack_inp
+                full_deepstack[start:start + vision_len] = deepstack_inp
                 deepstack.append(full_deepstack)
             row.tensor_inputs["deepstack"] = deepstack
             return row
@@ -705,12 +719,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> SubmoduleStep:
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         kept_rids = None
-        if graph_walk != "thinker_decode":
+        if graph_walk not in THINKER_DECODE_WALKS:
             # decode rows, and the last prefill, keep their token through `postprocess`
             info = per_request_info or {}
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)
-                if walk == "thinker_decode" or (
+                if walk in THINKER_DECODE_WALKS or (
                     rid in info and info[rid].step_metadata.get("is_last_prefill", False)
                 )
             )
@@ -721,7 +735,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
+        if graph_walk not in THINKER_DECODE_WALKS and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
             # A vision row's 3D-grid MRoPE span differs from its token count, and
             # a cut row moves past its whole walk, so each advances the counter
             # by its own `mrope_pos_advance`. That value is the WHOLE row's, and
@@ -766,10 +780,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
-        # Concatenate across requests
-        input_embeds = torch.cat([
-            inp.input_embeds for inp in inputs
-        ], dim=0)
+        if graph_walk in THINKER_DECODE_WALKS:
+            return self._preprocess_decode(engine_inputs, inputs)
+        # Concatenate across requests. A decode row carries only its token: the
+        # step's decode tokens embed in one call rather than a kernel a row
+        # ahead of the step's graph, and like a text row it takes the plan's
+        # position.
+        decode = [i for i, inp in enumerate(inputs) if inp.input_embeds is None]
+        if len(decode) == len(inputs):
+            input_embeds = self.model.model.embed_tokens(self._decode_tokens(engine_inputs, inputs, decode))
+        else:
+            decode_rows = iter(())
+            if decode:
+                decode_rows = iter(self.model.model.embed_tokens(self._decode_tokens(engine_inputs, inputs, decode)))
+            input_embeds = torch.cat([
+                next(decode_rows).unsqueeze(0) if inp.input_embeds is None else inp.input_embeds for inp in inputs
+            ], dim=0)
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
@@ -795,15 +821,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # ``forward_batched``/``forward`` reassemble the list from kwargs.
             extra_inputs = self._deepstack_inputs(inputs, input_embeds.dtype, device)
 
-        if self.model.mask_padding:
-            # Real rows lead the bucket; the captured MoE skips the rest.
-            # A fill kernel, so no H2D copy.
-            num_valid = engine_inputs.real_seq_len
-            if num_valid is None:
-                num_valid = input_embeds.shape[0]
-            extra_inputs["num_valid_tokens"] = torch.full(
-                (1,), num_valid, dtype=torch.int64, device=device,
-            )
+        extra_inputs.update(self._num_valid_tokens(engine_inputs, input_embeds.shape[0]))
 
         return {
             "input_embeds": input_embeds,
@@ -818,8 +836,81 @@ class ThinkerSubmodule(ARNodeSubmodule):
             **extra_inputs
         }
 
+    def _num_valid_tokens(self, engine_inputs: ModelInputsFromEngine, rows: int) -> dict[str, torch.Tensor]:
+        if not self.model.mask_padding:
+            return {}
+        # Real rows lead the bucket; the captured MoE skips the rest.
+        # A fill kernel, so no H2D copy.
+        num_valid = engine_inputs.real_seq_len
+        if num_valid is None:
+            num_valid = rows
+        return {"num_valid_tokens": torch.full(
+            (1,), num_valid, dtype=torch.int64, device=self.get_device(),
+        )}
+
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(self.node_resources[THINKER_POS].pos_ids("main"), inputs)
+
+    def _decode_tokens(
+        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs], decode: list[int],
+    ) -> torch.Tensor:
+        """The tokens of a mixed step's decode rows, routed or on the sampler's
+        slot master."""
+        masters = None
+        if any(inputs[i].input_ids is None for i in decode):
+            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
+            masters = sampler.loopback_tokens(engine_inputs.request_ids)
+        return torch.cat([
+            masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
+        ])
+
+    def _preprocess_decode(
+        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor]:
+        if any(inp.input_ids is None for inp in inputs):
+            out = self.loopback_inputs(engine_inputs, inputs)
+        else:
+            out = {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
+        out.update(self._num_valid_tokens(engine_inputs, out["input_ids"].shape[0]))
+        if engine_inputs.captured:
+            # the captured forward builds the rotary tables itself
+            return out
+        out["cos_3d"], out["sin_3d"] = compute_3d_cos_sin(
+            self._position_ids_3d(inputs), self._get_inv_freq(self.get_device()),
+            mrope_section=self.MROPE_SECTION, target_dtype=self.model.model.embed_tokens.weight.dtype,
+        )
+        return out
+
+    def _decode(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        cos_3d: torch.Tensor | None,
+        sin_3d: torch.Tensor | None,
+        num_valid_tokens: torch.Tensor | None,
+        keep_states: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One decode step: the sampled tokens and, with ``keep_states``, the
+        layer-0 rows the Talker reads."""
+        embeds = self.model.model.embed_tokens(input_ids)
+        if cos_3d is None:
+            # one token per row, at the position resource's planned positions
+            pos = self.node_resources[THINKER_POS].pos_ids("main")[:input_ids.shape[0]]
+            cos_3d, sin_3d = compute_3d_cos_sin(
+                pos.unsqueeze(0).expand(3, -1), self._get_inv_freq(embeds.device),
+                mrope_section=self.MROPE_SECTION, target_dtype=embeds.dtype,
+            )
+        hidden, layer_0_embed, _ = self.model(
+            input_embeds=embeds,
+            cos_sin_3d=(cos_3d, sin_3d),
+            mrope_section=self.MROPE_SECTION,
+            label="main",
+            num_valid_tokens=num_valid_tokens,
+            keep_states=keep_states,
+        )
+        return engine_inputs.resources[THINKER_SAMPLER].sample(
+            engine_inputs.request_ids, logits=self.model.lm_head(hidden),
+        ), layer_0_embed
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -861,9 +952,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         back together before invoking ``Qwen3OmniThinkerModel.forward``.
 
         Returns None when no ``deepstack_*`` keys are present (e.g. for
-        prefill_text / prefill_audio / thinker_decode), so the inner model
-        receives ``deepstack_visual_embeds=None`` and skips the deepstack
-        splice entirely.
+        prefill_text / prefill_audio), so the inner model receives
+        ``deepstack_visual_embeds=None`` and skips the deepstack splice entirely.
         """
         num_deepstack = len(self.config.vision.deepstack_visual_indexes)
         if not any(f"deepstack_{i}" in kwargs for i in range(num_deepstack)):
@@ -898,6 +988,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``deepstack`` (used by prefill_vision) is reassembled from per-layer
         ``deepstack_<i>`` kwargs — see ``_collect_deepstack_kwargs``.
         """
+        if graph_walk in THINKER_DECODE_WALKS:
+            new_token, layer_0_embed = self._decode(
+                engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
+                keep_states=graph_walk == "thinker_decode",
+            )
+            if layer_0_embed is None:
+                return {"new_token": [new_token]}
+            # a decode token is text: its layer-0 row and ``[False]``, fresh
+            # each step, as ``forward_batched`` emits them
+            return {
+                "new_token": [new_token],
+                "thinker_states": [layer_0_embed],
+                "thinker_mask": [torch.zeros(1, dtype=torch.bool, device=layer_0_embed.device)],
+            }
         deepstack = self._collect_deepstack_kwargs(kwargs)
         request_info: CurrentForwardPassInfo = engine_inputs.single_request_info
         audio_output = request_info.step_metadata.get(
@@ -917,8 +1021,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         result: NameToTensorList = {}
 
-        # Decode: produce logits for text token sampling
-        if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
+        # The last prefill samples the first token
+        if request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -927,12 +1031,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
         # avoid sending hidden states the Talker will never consume.
-        if audio_output and graph_walk == "thinker_decode":
-            # a decode token is text: its layer-0 row and ``[False]``, fresh
-            # each step, as ``forward_batched`` emits them
-            result["thinker_states"] = [layer_0_embed]
-            result["thinker_mask"] = [torch.zeros(1, dtype=torch.bool, device=hidden.device)]
-        elif audio_output:
+        if audio_output:
             # Concatenate layer-0 embeddings and layer-N hidden states along
             # last dim -> (tokens, 2 * hidden_size)
             if layer_n_hidden is not None:
@@ -954,6 +1053,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len(model_inputs) > 1
 
+    # A deployment sets its own with `model_kwargs.prefill_token_buckets`.
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     # past 4 for thinker_mixed, whose decode rows ride in these captures
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -970,36 +1070,26 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         vision_input = functools.partial(self._vision_capture_input, device)
         return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="thinker_decode",
+            *(BatchedAcceleratorGraphConfig(
+                capture_graph_walk=walk,
+                # a text row, as a decode row is, so padded steps keep the broadcast positions
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=1,
-                    input_embeds=torch.zeros(
-                        (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16
-                    ),
-                    custom_pos_ids=torch.tensor(
-                        [[0], [0], [0]],
-                        dtype=torch.float,
-                        device=device,
-                    ),
+                    input_ids=torch.zeros((1,), dtype=torch.long, device=device),
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
-            ),
+            ) for walk in (THINKER_TEXT_DECODE, "thinker_decode")),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text", "prefill_audio", THINKER_MIXED],
+                # text rows, so padded text and mixed steps keep the broadcast
+                # positions; an audio row brings its own
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_ids=torch.zeros((n,), dtype=torch.long, device=device),
                     input_embeds=torch.zeros(
                         (n, self.config.thinker_hidden_size),
                         device=device, dtype=torch.bfloat16
-                    ),
-                    custom_pos_ids=torch.zeros(
-                        (3, n),
-                        dtype=torch.float,
-                        device=device,
                     ),
                     tensor_inputs={
                         "masks_for_talker": torch.zeros(
@@ -1081,15 +1171,37 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """Batched Thinker forward shared between ``thinker_decode`` and the prefill walks.
 
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
-        always emits ``thinker_states`` and ``thinker_mask`` as row outputs so
-        the captured CUDA graph's outputs are fixed whatever the request
-        metadata; ``postprocess`` drops them for a text-only request.
-        Prefill packs ``thinker_states`` for ``unpack_packed_outputs``.
+        ``thinker_decode`` runs for audio output only, so every row's
+        ``thinker_states`` + ``thinker_mask`` go to the Talker. Prefill packs
+        ``thinker_states`` for ``unpack_packed_outputs`` to cut and filter per
+        request.
         """
-
-        is_prefill = graph_walk in (
-            "prefill_text", "prefill_audio", "prefill_vision", THINKER_MIXED,
-        )
+        if graph_walk in THINKER_DECODE_WALKS:
+            new_tokens, layer_0_embed = self._decode(
+                engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
+                keep_states=graph_walk == "thinker_decode",
+            )
+            if layer_0_embed is None:
+                # Row i is request i: one clone and one D2H copy per step. The
+                # prefix cache keys a reply from this host copy, under `text_inputs`.
+                return BatchedModelOutput(
+                    row_outputs={"new_token": new_tokens},
+                    check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+                )
+            # Row i is request i: one host copy of the tokens per step. A decode
+            # token is text, so the Talker takes its layer-0 row as is and its
+            # Talker mask is ``[False]``; a row view of the step's embeds, never
+            # one tensor shared by every row, which the RDMA/TCP store would
+            # register once per row at the same address. postprocess leaves
+            # both rows as they are, for the row-output store.
+            return BatchedModelOutput(
+                row_outputs={
+                    "thinker_states": layer_0_embed,
+                    "new_token": new_tokens,
+                    "thinker_mask": torch.zeros_like(new_tokens, dtype=torch.bool),
+                },
+                check_stop_buffers={"new_token": new_tokens},
+            )
 
         # prefill_vision: reassemble per-layer deepstack tensors from
         # ``deepstack_<i>`` kwargs into the list shape ``model.forward``
@@ -1110,45 +1222,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
         request_ids = engine_inputs.request_ids
         sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
 
-        if is_prefill:
-            last_hidden = attn_manager.select_last_hidden(hidden)
-            logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-            new_tokens = sampler.sample(request_ids, logits)
-            if layer_n_hidden is not None:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_n_hidden], dim=-1,
-                )  # (total_tokens, 2*hidden)
-            else:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_0_embed], dim=-1,
-                )
-
-            return {
-                "__batched_thinker_states__": thinker_states,
-                **{
-                    rid: {
-                        "new_token": [new_tokens[i:i + 1]]
-                    } for i, rid in enumerate(request_ids)
-                }
-            }
-
-        # thinker_decode (existing behavior)
-        logits = self.model.lm_head(hidden)  # (batch, vocab)
+        last_hidden = attn_manager.select_last_hidden(hidden)
+        logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
         new_tokens = sampler.sample(request_ids, logits)
+        if layer_n_hidden is not None:
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_n_hidden], dim=-1,
+            )  # (total_tokens, 2*hidden)
+        else:
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_0_embed], dim=-1,
+            )
 
-        # Row i is request i: one clone per output and one host copy of the
-        # tokens per step. A decode token is text, so the Talker takes its
-        # layer-0 row as is and its Talker mask is ``[False]``; a row view of
-        # the step's clone, never one tensor shared by every row, which the
-        # RDMA/TCP store would register once per row at the same address.
-        # postprocess leaves both rows as they are, for the row-output store.
         return BatchedModelOutput(
-            row_outputs={
-                "thinker_states": layer_0_embed,
-                "new_token": new_tokens,
-                "thinker_mask": torch.zeros_like(new_tokens, dtype=torch.bool),
-            },
-            check_stop_buffers={"new_token": new_tokens},
+            packed_outputs={"__batched_thinker_states__": thinker_states},
+            row_outputs={"new_token": new_tokens},
+            # a mixed step's text-decode rows take the stop check and the
+            # inline emit off these, as in a step of their own walk
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
         )
 
     def unpack_packed_outputs(
@@ -1166,7 +1257,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         reattach the per-request talker masks, which live on the original
         ARNodeInputs (the captured graph never saw them — masks vary in
         shape with text content). Drops per-rid emission for requests with
-        ``audio_output=False``, as postprocess does for the decode path.
+        ``audio_output=False``, which have no Talker to send them to.
         """
         packed_states = static_output.get("__batched_thinker_states__")
         if packed_states is None:
@@ -1207,7 +1298,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or (
+        return_token = request_info.graph_walk in THINKER_DECODE_WALKS or (
             request_info.step_metadata.get("is_last_prefill", False)
         )
         if not return_token:
@@ -1255,6 +1346,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # decode rows are one token each, like the template, and declare nothing else
+        return graph_walk in THINKER_DECODE_WALKS
 
 
 # ===================================================================
@@ -1706,22 +1801,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
-        """Stop on codec_eos or the frame limit. The codec_eos frame stays out
-        of the Code2Wav stream: it is not a codebook index, and only this host
-        copy tells it from audio."""
+        """Stop on codec_eos. The frame budget is the loop's cap
+        (``Qwen3OmniModel.get_loop_caps``), which the graph runtime enforces.
+        The codec_eos frame stays out of the Code2Wav stream: it is not a
+        codebook index, and only this host copy tells it from audio."""
         if "layer0_codes" not in outputs:
             return set()
         token = outputs["layer0_codes"][0].item()
         eos_token_id = self.config.talker.codec_eos_token_id
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
-        is_eos = eos_token_id is not None and eos_token_id == token
-        stops = set()
-        if is_eos or \
-                (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
-            stops = {"talker_decode_loop"}
-        return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
+        if eos_token_id is None or eos_token_id != token:
+            return set()
+        return StopCheck({"talker_decode_loop"}, withheld=("codec_tokens",))
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""

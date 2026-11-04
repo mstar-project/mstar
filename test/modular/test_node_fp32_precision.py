@@ -222,7 +222,7 @@ def test_capture_runs_under_the_node_precision(monkeypatch):
     monkeypatch.setattr(engine_module.AcceleratorGraphRunner, "warmup_and_capture", record)
     monkeypatch.setattr(
         Engine, "_build_piecewise_runners",
-        lambda self, node, mgmt: {"blocks": _Region(node)},
+        lambda self, node, mgmt, capture_stream=None: {"blocks": _Region(node)},
     )
     engine = _engine({"a": _Recorder(matmul="highest", cudnn=False), "b": _Recorder()})
     engine.warmup()
@@ -378,7 +378,7 @@ def _runtime_kwargs(communicator, bookkeeping):
     )
 
 
-def test_the_setting_holds_under_the_graph_runtime(monkeypatch):
+def test_the_setting_holds_under_the_graph_runtime():
     """The setting is on the submodule and the engine applies it; the graph
     runtime never sees it."""
     from mstar.communication.codec import WireCodec
@@ -387,7 +387,6 @@ def test_the_setting_holds_under_the_graph_runtime(monkeypatch):
     from mstar.graph.runtime.rust import RustGraphRuntime
     from mstar.worker.worker import _make_graph_runtime
 
-    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
     comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
     comm.codec = WireCodec
     graph_runtime = _make_graph_runtime(**_runtime_kwargs(comm, RustTensorBookkeeping()))

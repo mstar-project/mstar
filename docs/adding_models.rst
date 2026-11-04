@@ -201,8 +201,9 @@ You must implement these abstract methods:
    value that ``process_prompt`` moves onto a tensor edge must not travel there
    too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
    originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
-   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
-   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   lists ``robot_state``, and Cosmos3 lists ``action`` and ``robot_state`` (it passes
+   only their sizes on, as ``action_shape`` and ``robot_state_dim`` metadata). A tensor
+   left in ``model_kwargs`` fails at send
    with an error that names the kwarg.
 
 .. note::
@@ -450,7 +451,8 @@ overrides** in :doc:`serving`.
 
    The keys cover the label's first ``keyed_spans`` spans. An ids span is keyed by its
    token ids, a digest span by its file. Each span is its own step unless it sets
-   ``opens_step=False``, which puts it in one row with the span before it: a match cuts the
+   ``opens_step=False``, which puts it in one row with the span before it, of the same walk
+   (``LabelLayout.row()`` fails a layout where it isn't): a match cuts the
    row, and the row keeps placing its own positions, so its walk declares the advance of the
    whole row whatever the cut left (Qwen3-Omni's prefill of text around an attachment).
 
@@ -728,9 +730,10 @@ The spec types are:
        ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
        each sequence-parallel rank runs whole over its own tokens (one over a
        replicated stream, or a cross-attention from the rank's query shard).
-       ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
-       ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less,
-       since a ragged prefill only uses it for split-KV partials. ``compile_op``,
+       ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
+       ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
+       asks for more at startup grows it. A node with many labels can declare less, since a
+       ragged prefill only uses it for split-KV partials. ``compile_op``,
        ``shard_over_sp`` and ``workspace_mb`` are the model's declaration; the serving
        config's ``resources:`` overrides take only the backends and the ceilings. See
        `Cacheless attention (encoder towers)`_ for ``compile_op``.
@@ -1507,6 +1510,11 @@ methods are:
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
    row whose token is a stop id (the Qwen3-TTS Talker).
+   Only an output that leaves by a streaming edge can be withheld (any other consumer
+   would wait for an item that never comes), and not one that a node this worker
+   speculates into reads, nor the loop-back signal. Startup refuses a
+   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
+   checked.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
@@ -1636,6 +1644,21 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
+A walk named in ``resident_walks()`` runs its captured steps off per-request tables on the
+device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``). The
+walk must declare, for each resource, one stream that takes one token per row, or one
+it only reads at span 0 (a cross-attention context), with no forks, retention or sink,
+and its ``preprocess`` must read no planned position or KV location, because the
+captured graph fills those in first. Each KV pool of the node keeps its own block table
+and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
+turns it on only if every resource of the node can (``Resource.resident_refusal``) and
+the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
+otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+stale, so the first resident step after them writes it. The sampler takes part on its
+own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
+of the row, so a resident step stages none of them, while the RNG offset, the last token
+and the repetition-penalty mask stay by the sampler's own row of each request.
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 
@@ -1730,8 +1753,9 @@ handled as special cases. BAGEL uses all of them, in
 rather than through ``write_kv``, asks the KV resource where the step's tokens go:
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
-Tokens past that number are the plan's padding and must not be written. Qwen3-ASR's
-fused q/k norm, RoPE and KV-write kernel (``Qwen3Attention``) is the example.
+Tokens past that number are the plan's padding and must not be written. The fused q/k
+norm, RoPE and KV-write kernels that Qwen3-ASR and Qwen3-Omni's Thinker call through
+``AttentionCallable.norm_rope_attend`` and ``norm_rope_table_attend`` are the example.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/vjepa2/fake_resources.py`` shows how to stub
@@ -1947,6 +1971,21 @@ which is what the engine reads, and resources of one node must agree on a walk's
 rows last, so the kernels read the decode rows as the step's first tokens, in place. Every
 other walk of the combined walk must be one token per row.
 
+**Steps beside the chain.** A worker's main loop runs one chain of steps, and any step on it
+costs a pass of the loop and holds the next one behind its kernels. A node that shares a
+worker with a heavier one can set ``side_stream_walks`` on its submodule to the walks that
+may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
+on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
+makes it yield, runs on a second stream, and the windows that come ready while it runs
+batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
+walk that nothing on the chain reads, such as a codec. Where the config asks,
+``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
+speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+alone on its worker, a device without streams, a node with chain walks or resources, and a
+side walk that is not the node's alone, sits in a combined walk, or has output spans or a
+stop check. A config without the field keeps the node on the chain, whatever it declares.
+
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
@@ -2047,6 +2086,12 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
            ),
        ]
+
+An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
+replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
+deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Qwen3-Omni
+and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
+submodule raises ``ValueError`` when it is built.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
@@ -2332,7 +2377,9 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
+     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
+       ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
+       slot for a request is refused at startup.
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
@@ -2448,8 +2495,10 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    model: "qwen3_omni"
    preprocess_workers: 2
 
-The pool only helps work that releases the GIL, so measure each stage first. A model with
-client streams always prepares inline, since an append has to follow its request.
+The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni and
+V-JEPA2 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8 and 4, the
+sizes measured for their video decode). A model with client streams always prepares inline,
+since an append has to follow its request.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
@@ -2578,6 +2627,21 @@ To support it in a model:
 
 The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
 a node built from it stays TP-only.
+
+Tuned kernel configs
+~~~~~~~~~~~~~~~~~~~~
+
+Launch configs that depend on the GPU and the shapes, such as the fused MoE's tiles, are data,
+not code. Each kernel op (``mstar/kernels``) names the dimensions its configs are keyed by, and
+its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<op>/``. A model
+on a shared component gets them without code of its own: the component looks its shape up once
+per process and keeps the default config where no table has it, and the server logs the sweep
+command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+
+``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
+each against a reference output, and writes the winners with where they were measured.
+``--out DIR`` with ``MSTAR_KERNEL_TABLES=DIR`` serves a sweep before it is committed;
+``benchmark/kernels/README.md`` has the workflow and how to add an op.
 
 Worked example: Orpheus
 -----------------------

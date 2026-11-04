@@ -52,7 +52,7 @@ To work on the code, install from source in editable mode:
 
    uv pip install --torch-backend=auto -e .
 
-This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
+This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
 console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
 extension (see `Rust extension`_).
 
@@ -150,7 +150,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
+       comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
+       Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
@@ -477,15 +479,17 @@ Rust extension
 --------------
 
 Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
-runtime is Rust, and the conductor refuses to start without it. Importing ``mstar``
-does not need it. The extension carries (see :doc:`environment_variables` for
-the flags):
+runtime is Rust and every process sends on its ZeroMQ transport, so the
+conductor refuses to start without it. Importing ``mstar`` does not need it.
+The extension carries (see :doc:`environment_variables` for the flags):
 
 * **Graph runtime**: graph state, scheduling, routing and speculation, and the
   frames a worker sends. It holds a share of the Rust transport and of the Rust
   tensor bookkeeper, and needs the msgpack codec.
-* **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
-  format as pyzmq.
+* **ZeroMQ control mesh**: the transport every process sends its control
+  messages on. Each process logs it at startup (``control mesh transport:
+  rust <version> from <path>``) and refuses an extension of another version
+  than the one its ``mstar`` expects.
 * **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship

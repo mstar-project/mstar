@@ -714,7 +714,8 @@ def _cross_attention(parallel: bool) -> nn.Module:
 ANNOTATED = {
     "cross_attention_context": (lambda: _cross_attention(False), {"k_proj", "v_proj"}),
     "parallel_cross_attention_context": (lambda: _cross_attention(True), {"k_proj", "v_proj"}),
-    "code_predictor_heads": (_code_predictor, {"lm_head.0", "lm_head.1"}),
+    "code_predictor_folded": (_code_predictor, {"lm_head.0", "lm_head.1", *(f"model.layers.0.{p}" for p in (
+        "self_attn.qkv_proj", "self_attn.o_proj", "mlp.gate_up_proj", "mlp.down_proj"))}),
     "fastconformer_positions": (lambda: _fastconformer("attention"), {"relative_k_proj"}),
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
     "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
