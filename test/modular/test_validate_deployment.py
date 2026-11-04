@@ -652,7 +652,7 @@ def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_l
     )
     assert _problems(model, cfg) == [
         refusal,
-        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
+        "Resource spec kv nodes ['a', 'b'] must use the same parallel shape across replicas",
     ]
 
 
