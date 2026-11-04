@@ -163,6 +163,22 @@ def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
 
 
 @needs_ckpt
+def test_chat_turns_keep_their_roles(model):
+    """A multi-turn chat renders as upstream's template renders its messages."""
+    from mstar.model.multimodal import PromptPart
+
+    turns = [("system", "Be brief."), ("user", "Hi."), ("assistant", "Hello."), ("user", "Name a colour.")]
+    out = model.process_prompt(
+        None, ["text"] * len(turns), ["text"], prompt_parts=[PromptPart("text", t, role=r) for r, t in turns],
+    ).new_input_tensors
+    want = model.tokenizer.apply_chat_template(
+        [{"role": r, "content": t} for r, t in turns], tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    assert out["text_inputs"][0].tolist() == model.tokenizer.encode(want)
+
+
+@needs_ckpt
 def test_audio_placeholders_line_up_with_pooled_tokens(model):
     from mstar.model.multimodal import PromptPart
 

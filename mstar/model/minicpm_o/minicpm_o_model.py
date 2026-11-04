@@ -61,7 +61,7 @@ from mstar.model.minicpm_o.config import (
     VISION_ATTN,
     MiniCPMOConfig,
 )
-from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
+from mstar.model.multimodal import TEXT, PromptPart, check_attachments, messages_from_parts, parts_from_modalities
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextOutput
 
@@ -274,19 +274,15 @@ class MiniCPMOModel(Model):
         enable_thinking: bool,
         system_prompt: str | None,
     ) -> str:
-        """The chat string as upstream's `chat` renders it, with a tag per attachment."""
-        msgs: list[dict] = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        user: list[str] = []
-        for part in parts:
-            if part.modality == TEXT:
-                user.append(part.text or "")
-            elif part.modality == "image":
-                user.append(processor.IMAGE_TAG)
-            elif part.modality == "audio":
-                user.append(processor.AUDIO_TAG)
-        msgs.append({"role": "user", "content": "\n".join(user)})
+        """The chat string as upstream's `chat` renders it: a message per turn,
+        its items joined by newlines, with a tag per attachment."""
+        tags = {"image": processor.IMAGE_TAG, "audio": processor.AUDIO_TAG}
+        msgs = [
+            {"role": m["role"], "content": m["content"] if isinstance(m["content"], str) else "\n".join(
+                item["text"] if item["type"] == TEXT else tags[item["type"]] for item in m["content"]
+            )}
+            for m in messages_from_parts(parts, default_system=system_prompt or None)
+        ]
         return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
@@ -313,6 +309,7 @@ class MiniCPMOModel(Model):
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+            roles=[p.role for p in prompt_parts] if prompt_parts is not None else None,
         )
         bad = {p.modality for p in parts} - {TEXT, "image", "audio"}
         if bad:
