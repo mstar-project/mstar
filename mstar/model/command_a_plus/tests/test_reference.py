@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.state.adapters import node_resources
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
 from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER, CommandAPlusConfig
@@ -143,7 +144,7 @@ class ReferenceTests(unittest.TestCase):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         (Path(directory) / "config.json").write_text(json.dumps(raw))
         model = CommandAPlusModel(directory)
-        specs = {s.resource_key: s for s in model.get_node_resources()}
+        specs = {s.resource_key: s for s in node_resources(model)}
         # resolved as a server resolves them: 6-token full pages and 2-token pages of the local
         # layers, so the cache keeps their 4-token window and frees what's behind it
         apply_yaml_overrides(list(specs.values()), {"resources": {KV_CACHE: {"page_size": 6, "max_num_pages": 16}}})
