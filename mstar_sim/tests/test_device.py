@@ -1,0 +1,188 @@
+"""The emulated GPU keeps the CUDA behaviours mstar's code depends on.
+
+Each case runs in a fresh interpreter with the emulator installed, as
+``python -m mstar_sim`` would start one.
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def run_sim(code: str, gpu: str = "h100") -> str:
+    env = dict(os.environ, MSTAR_SIM="1", MSTAR_SIM_GPU=gpu,
+               PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT,
+                                           os.environ.get("PYTHONPATH", "")]))
+    with tempfile.TemporaryDirectory() as tmp:  # a file, so spawned ranks can import it
+        script = os.path.join(tmp, "case.py")
+        with open(script, "w") as f:
+            f.write(textwrap.dedent(code))
+        proc = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True,
+                              timeout=300, check=False)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    return proc.stdout
+
+
+def test_cuda_semantics():
+    out = run_sim("""
+        import torch
+        assert torch.cuda.is_available() and torch.cuda.get_device_name().startswith("NVIDIA H100")
+        m = torch.nn.Linear(8, 4, device="meta").to_empty(device="cuda")
+        x = torch.randn(3, 8, device="cuda")
+        assert m(x).is_cuda and m.weight.device == torch.device("cuda", 0)
+        assert isinstance(m.weight, torch.nn.Parameter)
+        m.register_buffer("table", torch.arange(4.0), persistent=False)
+        m = m.to(device="cuda:0", dtype=torch.bfloat16)  # kwargs form, as mstar's engine calls it
+        assert m.table.is_cuda and m.table.dtype == torch.bfloat16
+        emb, head = torch.nn.Embedding(10, 4), torch.nn.Linear(4, 10, bias=False)
+        head.weight = emb.weight  # tied, as a model ties its lm_head
+        tied = torch.nn.ModuleList([emb, head]).to("cuda")
+        assert tied[1].weight is tied[0].weight  # a loader's write to the embedding reaches the head
+        host = torch.arange(3)
+        dev = host.to(device="cuda", dtype=torch.int32, copy=True)
+        assert dev.is_cuda and dev.dtype == torch.int32 and dev.tolist() == [0, 1, 2]
+        staged = torch.zeros_like(dev, device="cpu", pin_memory=True)  # a host staging buffer
+        assert type(staged) is torch.Tensor and staged.device.type == "cpu"
+        try:
+            x + torch.ones(3, 8)
+            raise SystemExit("a cuda/cpu mix was accepted")
+        except RuntimeError as e:
+            assert "same device" in str(e)
+        assert (x + torch.tensor(1.0)).is_cuda          # CPU scalars are fine
+        assert x[torch.tensor([0, 2])].shape == (2, 8)  # so is a CPU index
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            assert m(x).dtype == torch.bfloat16
+        print("ok")
+    """)
+    assert out.strip() == "ok"
+
+
+def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
+    """A replay costs what its kernels cost eagerly; a kernel priced from the
+    values in its arguments (attention over the latest plan) is priced again
+    on every replay; a host read during capture raises, as on CUDA."""
+    out = run_sim("""
+        import torch
+        from mstar_sim import clock
+
+        # priced from the lengths in `lens` (small ints keep values), as attention is
+        @clock.kernel_fn("test.rows", cost=lambda lens, out: (0.0, 1e9 * float(lens._data.sum())))
+        def rows(lens, out):
+            return out
+
+        def timed(fn):
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record(); fn(); end.record(); end.synchronize()
+            return start.elapsed_time(end) / 1000
+
+        a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        lens = torch.ones(2, dtype=torch.int32, device="cuda")
+        buf = torch.empty(4, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            c = a @ a
+            rows(lens, buf)
+        eager = timed(lambda: (a @ a, rows(lens, buf)))
+        short = timed(g.replay)
+        assert 0.9 < short / eager < 1.05, (short, eager)  # the graph saves only launch gaps
+        lens.copy_(torch.tensor([3, 5], dtype=torch.int32))
+        long = timed(g.replay)
+        gemm = timed(lambda: a @ a)
+        assert 3.5 < (long - gemm) / (short - gemm) < 4.5, (long, short, gemm)
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                lens.sum().item()
+            raise SystemExit("a host read during capture was accepted")
+        except RuntimeError as e:
+            assert "capturing" in str(e)
+        print("ok")
+    """)
+    assert out.strip() == "ok"
+
+
+@pytest.mark.parametrize("gpu", ["h100", "b200"])
+def test_device_time_follows_the_cost_model_not_the_host(gpu):
+    """A big GEMM takes its simulated time on the device, while the host that
+    launched it waits only at a sync."""
+    out = run_sim("""
+        import os, time, torch
+        from mstar_sim import clock, cost
+        a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        t0 = time.perf_counter()
+        outs = [a @ a for _ in range(20)]  # kept: freeing them is host time too
+        end.record()
+        launched = time.perf_counter() - t0
+        end.synchronize()
+        print(start.elapsed_time(end) / 1000, launched)
+    """, gpu)
+    device_s, _ = map(float, out.split())
+    flops = 20 * 2 * 4096**3
+    # the device time is the roofline estimate's order of magnitude for this card
+    peak = {"h100": 989e12, "b200": 2250e12}[gpu]
+    assert flops / peak < device_s < 20 * flops / peak
+
+
+def test_timing_only_holds_shapes_not_values():
+    """Nothing is computed: a 40 GB tensor costs no host memory
+    but counts against the card; small integer tensors (what mstar plans with)
+    keep their values; a value that was never computed reads as zeros."""
+    out = run_sim("""
+        import torch
+        free0, total = torch.cuda.mem_get_info()
+        big = torch.empty(10 * 2**30, dtype=torch.float32, device="cuda")
+        free1, _ = torch.cuda.mem_get_info()
+        assert total == torch.cuda.get_device_properties().total_memory
+        assert free0 - free1 == 40 * 2**30
+        pos = torch.arange(5, device="cuda") + 1
+        assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
+        logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
+        assert logits.argmax(-1).tolist() == [0, 0, 0, 0]  # never computed
+        before = torch.cuda.mem_get_info()[0]
+        del big
+        assert torch.cuda.mem_get_info()[0] - before == 40 * 2**30
+        print("ok")
+    """)
+    assert out.strip() == "ok"
+
+
+def test_memory_tracking_lock_is_reentrant():
+    """A tensor freed by a garbage collection that runs while the tracker holds
+    its lock releases its storage on the same thread: a plain lock deadlocks."""
+    from mstar_sim import device
+
+    with device._track_lock:
+        assert device._track_lock.acquire(blocking=False)
+        device._track_lock.release()
+
+
+def test_tensor_parallel_collectives_are_timed_not_sent():
+    """Two ranks ask for NCCL, as mstar does: they get gloo, and an all-reduce of
+    a value-less GPU tensor moves nothing but costs its NCCL time."""
+    out = run_sim("""
+        import os, torch, torch.distributed as dist, torch.multiprocessing as mp
+
+        def rank(r):
+            dist.init_process_group("nccl", init_method="tcp://127.0.0.1:29573", rank=r,
+                                    world_size=2, device_id=torch.device("cuda", r))
+            torch.cuda.set_device(r)
+            x = torch.empty(2**30, dtype=torch.bfloat16, device="cuda")  # 2 GiB, no data
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record(); dist.all_reduce(x); end.record(); end.synchronize()
+            assert dist.get_backend() == "gloo" and start.elapsed_time(end) > 1.0, start.elapsed_time(end)
+            dist.destroy_process_group()
+
+        if __name__ == "__main__":
+            mp.spawn(rank, nprocs=2)
+            print("ok")
+    """)
+    assert out.strip().endswith("ok")
