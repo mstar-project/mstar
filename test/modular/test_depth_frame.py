@@ -3,8 +3,8 @@
 The task lists put the two halves of a split O or DOWN tile on the two CTAs of one cluster, which
 add their partial sums through each other's shared memory; a half dealt to any other CTA adds the
 wrong rows or never arrives. On a Hopper GPU, the frame with given codes has to write the loop's
-codes and embedding sums, and its KV cache and logits up to the last bits the split changes; its
-draws have to be ``fused_sample``'s.
+codes and embedding sums, and a KV cache and logits within twice what the loop's own choice of
+tiles moves them. Its draws have to be ``fused_sample``'s.
 """
 from collections import defaultdict
 
@@ -191,8 +191,10 @@ def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
         runs.append((all_codes, embed_sum, frame.kv_cache[:, :bs].clone(), frame.LOGITS[:bs].clone()))
     all_codes, embed_sum, kv, logits = runs[0]
     assert torch.equal(all_codes, codes_want) and torch.equal(embed_sum, sum_want), "given codes summed differently"
-    torch.testing.assert_close(kv, kv_want, rtol=0, atol=0.05 * kv_want.abs().max().item())
-    torch.testing.assert_close(logits, logits_want, rtol=0, atol=0.02 * logits_want.abs().max().item())
+    # The loop itself moves by up to 1.1% of the largest KV value and 0.8% of the largest logit between a step of
+    # these rows alone and a 64-row step, where `cp_linear` picks other tiles. The frame is held to under twice that.
+    torch.testing.assert_close(kv, kv_want, rtol=0, atol=0.02 * kv_want.abs().max().item())
+    torch.testing.assert_close(logits, logits_want, rtol=0, atol=0.015 * logits_want.abs().max().item())
     assert all(torch.equal(a, b) for a, b in zip(runs[0], runs[1], strict=True)), "the frame does not repeat itself"
 
 
