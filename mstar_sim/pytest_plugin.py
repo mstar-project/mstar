@@ -115,7 +115,10 @@ _SKIP_CALL = re.compile(r"pytest\.skip\(\s*(?:f?[\"'])([^\"']*)")
 
 def pytest_addoption(parser):
     parser.addoption("--gpu-only", action="store_true",
-                     help="mstar_sim: run only the tests a CPU box skips for want of a GPU")
+                     help="mstar_sim: run only the tests a CPU box skips for want of a GPU, by "
+                          "their skip reasons (or exactly those a plain run skipped: --skipped-in)")
+    parser.addoption("--skipped-in", default=None, metavar="JUNIT_XML",
+                     help="mstar_sim: run only the tests this plain CPU run's junit report skipped")
 
 
 def _needs_gpu(item) -> bool:
@@ -141,10 +144,26 @@ def _needs_gpu(item) -> bool:
     return False
 
 
+def _skipped_in(path: str) -> set[str]:
+    import xml.etree.ElementTree as ET
+
+    out = set()
+    for case in ET.parse(path).iter("testcase"):
+        if case.find("skipped") is not None:
+            module = case.get("classname", "").replace(".", "/")
+            out.add(f"{module}.py::{case.get('name')}")
+    return out
+
+
 def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--gpu-only"):
+    skipped_in = config.getoption("--skipped-in")
+    if skipped_in:
+        names = _skipped_in(skipped_in)
+        kept = [item for item in items if item.nodeid in names]
+    elif config.getoption("--gpu-only"):
+        kept = [item for item in items if _needs_gpu(item)]
+    else:
         return
-    kept = [item for item in items if _needs_gpu(item)]
     config.hook.pytest_deselected(items=[item for item in items if item not in set(kept)])
     items[:] = kept
 

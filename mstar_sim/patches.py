@@ -203,6 +203,13 @@ def _meta(info: dict) -> torch.Tensor:
     return torch.empty(info["shape"], dtype=_DTYPES.get(info["dtype"], torch.uint8), device="meta")
 
 
+def _on(tensor: torch.Tensor, device) -> torch.Tensor:
+    """Where safetensors would put it: a cuda device takes it (and its memory) there."""
+    if device is None or str(device) == "cpu":
+        return tensor
+    return tensor.to(device if not isinstance(device, int) else f"cuda:{device}")
+
+
 def _read(path, name):
     with _real_safe_open(path, framework="pt") as f:
         return f.get_tensor(name)
@@ -228,9 +235,10 @@ class _MetaSlice:
 class _MetaSafeOpen:
     """``safetensors.safe_open`` over a file's header only: tensors are meta."""
 
-    def __init__(self, path, framework="pt", device="cpu"):
+    def __init__(self, path, framework="pt", device="cpu", **_):  # transformers 5.22 passes backend=
         self._path = path
         self._header = _header(path)
+        self._device = device
 
     def __enter__(self):
         return self
@@ -249,7 +257,7 @@ class _MetaSafeOpen:
 
     def get_tensor(self, name):
         info = self._header[name]
-        return _read(self._path, name) if _small(info) else _meta(info)
+        return _on(_read(self._path, name) if _small(info) else _meta(info), self._device)
 
     def get_slice(self, name):
         return _MetaSlice(self._header[name])
@@ -268,7 +276,7 @@ def header_only_weights() -> None:
     safetensors.safe_open = _MetaSafeOpen
     safetensors.torch.safe_open = _MetaSafeOpen
     safetensors.torch.load_file = lambda path, device="cpu": {
-        k: _read(path, k) if _small(v) else _meta(v) for k, v in _header(path).items()
+        k: _on(_read(path, k) if _small(v) else _meta(v), device) for k, v in _header(path).items()
     }
     iterators = importlib.import_module("mstar.model.loader.iterators")
     _replace(iterators, "safe_open", _MetaSafeOpen)

@@ -138,9 +138,20 @@ def _children(pid: int) -> list[int]:
 
 
 def _no_compile(torch) -> None:
-    """torch.compile can't trace the emulated tensors; run eagerly (graph capture still emulated)."""
+    """torch.compile can't trace the emulated tensors; run eagerly (graph capture still
+    emulated). Its arguments are still checked against the real signature, so a keyword
+    this torch doesn't take fails as it would on a GPU."""
+    import inspect
+
+    signature = inspect.signature(torch.compile)
+
+    real = torch.compile
 
     def compile(model=None, **kwargs):  # noqa: A001
+        signature.bind(model, **kwargs)
+        if callable(kwargs.get("backend")):
+            # a test's own backend (a frame counter, over CPU tensors) compiles for real
+            return real(model, **kwargs) if model is not None else real(**kwargs)
         if model is None:
             return lambda fn: fn
         return model

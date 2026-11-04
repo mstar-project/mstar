@@ -34,6 +34,8 @@ VERSION = 2
 MAX_ASSET_BYTES = 50 * 2**20
 # weight formats that duplicate the safetensors; never copied next to them
 _DUPLICATE_WEIGHTS = ("*.bin", "*.h5", "*.msgpack", "*.gguf", "*.pt", "*.pth")
+# a weight-format file this small is an asset (Chatterbox's conds.pt), not a weight copy
+SMALL_WEIGHT_FILE = 8 * 2**20
 _ITEMSIZE = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "BF16": 2, "F16": 2,
              "I16": 2, "U16": 2, "I8": 1, "U8": 1, "BOOL": 1, "F8_E4M3": 1, "F8_E5M2": 1}
 
@@ -105,9 +107,8 @@ def _build(src, out: Path) -> dict:
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(out / rel, src.header(rel))
-        elif any(fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS):
-            continue
-        elif size > MAX_ASSET_BYTES:
+        elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
+                fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS)):
             notes.append(f"skipped {rel} ({size / 2**20:.0f} MB)")
         else:
             (out / rel).parent.mkdir(parents=True, exist_ok=True)

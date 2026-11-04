@@ -14,7 +14,9 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
     src.mkdir()
     (src / "config.json").write_text('{"num_hidden_layers": 2}')
     (src / "tokenizer.json").write_text('{"fake": true}')
-    (src / "pytorch_model.bin").write_bytes(b"duplicate weights")
+    with open(src / "pytorch_model.bin", "wb") as f:  # a duplicate of the weights: skipped
+        f.truncate(16 * 2**20)
+    (src / "conds.pt").write_bytes(b"a small asset with no safetensors twin")
     shards = {
         "model-00001-of-00002.safetensors": {"embed.weight": torch.zeros(4096, 1024, dtype=torch.bfloat16)},
         "model-00002-of-00002.safetensors": {"layers.0.q.weight": torch.zeros(1024, 1024, dtype=torch.float8_e4m3fn),
@@ -37,6 +39,7 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
     for name in ("config.json", "tokenizer.json", "model.safetensors.index.json"):
         assert (out / name).read_text() == (src / name).read_text()
     assert not (out / "pytorch_model.bin").exists()
+    assert (out / "conds.pt").read_bytes() == (src / "conds.pt").read_bytes()
 
     stamp = (out / "config.json").stat().st_mtime_ns
     synthesize(str(src), out)  # the same source: reused

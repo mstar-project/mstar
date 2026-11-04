@@ -91,9 +91,16 @@ WORKER = False
 CPU_META_FLOATS = 1 << 16
 
 
-def keeps_values(dtype: torch.dtype, numel: int) -> bool:
-    """Whether a cuda tensor of this kind holds real values."""
+def keeps_values(dtype: torch.dtype, numel: int, from_host: bool = False) -> bool:
+    """Whether a cuda tensor of this kind holds real values: small ints, and small
+    tensors of any dtype that come from the host's own data (a frame rate, a scale)."""
+    if from_host and numel <= SMALL_HOST:
+        return True
     return not (dtype.is_floating_point or dtype.is_complex) and numel <= SMALL_INT
+
+
+# host data up to this many elements keeps its values on the device, any dtype
+SMALL_HOST = 1 << 12
 
 
 def _is_meta(x) -> bool:
@@ -129,7 +136,7 @@ def host_value(t: torch.Tensor) -> torch.Tensor:
 
 def to_device_storage(x: torch.Tensor) -> torch.Tensor:
     """What a cuda copy of CPU (or meta) tensor ``x`` stores."""
-    if x.device.type == "meta" or not keeps_values(x.dtype, x.numel()):
+    if x.device.type == "meta" or not keeps_values(x.dtype, x.numel(), from_host=True):
         return torch.empty_like(x, device=META)
     return x.clone()
 
@@ -376,6 +383,7 @@ class _Observe(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         launched = clock.vnow()  # the kernel is launched now; the emulator's time is not device time
+        _check_bounds(func, args)
         with contextlib.nullcontext() if clock.FAST else clock.computing():
             if self.autocast is not None:
                 args, kwargs = _autocast(func, args, kwargs, self.autocast)
@@ -398,6 +406,77 @@ class _Observe(TorchDispatchMode):
         elif seconds:
             clock.charge(seconds, launched)
         return out
+
+
+# A device-side assert: an index out of bounds in a kernel. As on CUDA, it is sticky:
+# every later device call fails, so a server that ran one doesn't serve on.
+FAULT = [""]
+_TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_"}
+
+
+def _check_bounds(func, args) -> None:
+    """An index a kernel reads (a value the emulator keeps) must fall inside the
+    tensor it indexes, as the CUDA kernel asserts."""
+    name = func.overloadpacket.__name__
+    pairs = []
+    if name == "embedding":
+        pairs = [(args[1], args[0].shape[0])]
+    elif name in ("index_select", "gather", "scatter", "scatter_", "scatter_add", "scatter_add_",
+                  "index_copy", "index_copy_", "index_add", "index_add_", "index_fill", "index_fill_"):
+        dim = args[1] if len(args) > 1 and isinstance(args[1], int) else 0
+        pairs = [(args[2], args[0].shape[dim])] if len(args) > 2 and args[0].dim() else []
+    elif name == "take":
+        pairs = [(args[1], args[0].numel())]
+    elif name in _TAKES_NEGATIVE and len(args) > 1 and isinstance(args[1], (list, tuple)):
+        pairs = [(ix, args[0].shape[i]) for i, ix in enumerate(args[1]) if i < args[0].dim()]
+    for ix, size in pairs:
+        if (not isinstance(ix, torch.Tensor) or ix.device.type != "cpu" or ix.numel() == 0
+                or ix.dtype == torch.bool or ix.is_floating_point()):
+            continue
+        low = -size if name in _TAKES_NEGATIVE else 0
+        bad = (ix < low) | (ix >= size)
+        if bool(bad.any()):
+            FAULT[0] = f"{name}: index {int(ix[bad][0])} is out of bounds for size {size}"
+            raise RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})")
+
+
+# torch functions with an index operand, priced per aten op when an index holds values
+# (so each is bounds-checked)
+_INDEXING = {T.index_select, torch.index_select, T.gather, torch.gather, T.index_copy_, T.index_put_,
+             T.scatter_, T.scatter, T.__getitem__, T.__setitem__, T.index_fill_}
+
+
+def _real_index(flat) -> bool:
+    return any(type(x) is SimTensor and not x.is_floating_point() and x._data.device.type == "cpu"
+               and x._data.dim() > 0 for x in flat) or any(
+        type(x) is torch.Tensor and x.device.type == "cpu" and not x.is_floating_point() and x.dim() > 0
+        for x in flat)
+
+
+# composite ops CUDA autocast casts whole, before they decompose
+_F = torch.nn.functional
+_AUTOCAST_COMPOSITES = {_F.scaled_dot_product_attention, torch.matmul, torch.einsum, _F.linear, _F.conv1d,
+                        _F.conv2d, _F.conv3d, _F.conv_transpose1d, _F.conv_transpose2d, _F.conv_transpose3d}
+
+
+def _istft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, normalized=False,
+           onesided=None, length=None, return_complex=False):
+    """istft's output shape: ATen's own reads its window envelope on the host."""
+    frames = input.shape[-1]
+    hop = hop_length or n_fft // 4
+    n = length if length is not None else n_fft + hop * (frames - 1) - (2 * (n_fft // 2) if center else 0)
+    dtype = input.dtype if return_complex else (input.real.dtype if input.is_complex() else input.dtype)
+    out = torch.empty((*input.shape[:-2], n), dtype=dtype, device=META)
+    from mstar_sim import cost
+
+    clock.charge(cost.kernel_seconds("torch.istft", flops=0.0,
+                                     bytes=float(input.numel() * input.element_size() * 2)))
+    return out
+
+
+# composite functions that read device values on the host in their CPU/meta
+# decomposition: their output shapes, computed directly
+_COMPOSITE_STAND_INS = {torch.istft: _istft, T.istft: _istft}
 
 
 # CUDA autocast's cast policy (aten/src/ATen/autocast_mode.cpp), applied by hand:
@@ -626,9 +705,18 @@ def _run(func, args, kwargs, index, flat=None):
     if flat is None:
         flat = tree_flatten((args, kwargs))[0]
     if ((func in _ONE_KERNEL or func in _VIEWS) and not clock.in_kernel()
-            and not (func in _AUTOCAST_FN and torch.is_autocast_enabled("cuda"))):
+            and not (func in _AUTOCAST_FN and torch.is_autocast_enabled("cuda"))
+            and not (func in _INDEXING and _real_index(flat))):
         return _fast(func, args, kwargs, flat, index)
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
+    standin = _COMPOSITE_STAND_INS.get(func)
+    if standin is not None and any(_is_meta(t) for t in tree_flatten((uargs, ukwargs))[0]):
+        return _rewrap(standin(*uargs, **ukwargs), [x for x in flat if isinstance(x, torch.Tensor)], index)
+    if torch.is_autocast_enabled("cuda") and func in _AUTOCAST_COMPOSITES:
+        # CUDA autocast casts these as a whole, before they decompose (sdpa's dtype check)
+        low = torch.get_autocast_dtype("cuda")
+        uargs, ukwargs = tree_map(lambda x: x.to(low) if isinstance(x, torch.Tensor) and x.dtype == torch.float32
+                                  else x, (uargs, ukwargs))
     if isinstance(func, torch._ops.HigherOrderOperator):
         # (flex_attention) its own dispatch runs it on the payloads; a dispatch mode
         # would need a rule per operator, so its inner ops go unpriced
@@ -657,6 +745,8 @@ def _custom_impl(func):
 
 
 def _function(func, args, kwargs):
+    if FAULT[0] and func not in _METADATA:
+        raise RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: earlier, {FAULT[0]})")
     if clock.FAST:
         return _function_body(func, args, kwargs)
     # the interposer's own time is not the host's: the device stamps exclude it
@@ -788,6 +878,9 @@ def _to(self, *args, **kwargs):
         data = to_device_storage(src)
         clock.charge(_copy_seconds(data.numel() * data.element_size(), "h2d"))
         return SimTensor(data, _index(device))
+    if _is_meta(self) and (device is None or device.type in ("cpu", "meta")):
+        # a header-only weight cast or moved on the host stays value-less
+        return torch.empty_like(self, dtype=dtype or self.dtype, device=META)
     with torch._C.DisableTorchFunctionSubclass():
         return T.to(self, *args, copy=copy, **kwargs)
 
@@ -932,7 +1025,8 @@ def _create(func, args, kwargs, device):
     index = _index(device)
     target = CPU
     shape = func(*args, **dict(kwargs, device=META))
-    if isinstance(shape, T) and not keeps_values(shape.dtype, shape.numel()):
+    from_host = func in (torch.tensor, torch.as_tensor, torch.from_numpy)
+    if isinstance(shape, T) and not keeps_values(shape.dtype, shape.numel(), from_host):
         target = META
     with _Observe():
         out = func(*args, **dict(kwargs, device=target))
@@ -1021,6 +1115,32 @@ ABSENT_MODULES = {
 }
 
 
+def _swap_or_assign() -> None:
+    """Moving a module swaps its parameters in place (so tied weights stay tied), but a
+    swap refuses a tensor something else holds (weight_norm's hooks): that module's move
+    or load then assigns fresh parameters instead, as torch does without the swap."""
+    from torch import nn
+
+    apply, load = nn.Module._apply, nn.Module.load_state_dict
+
+    def without_swap(call, failed: str):
+        def retry(self, *args, **kwargs):
+            try:
+                return call(self, *args, **kwargs)
+            except RuntimeError as e:
+                if failed not in str(e):
+                    raise
+                torch.__future__.set_swap_module_params_on_conversion(False)
+                try:
+                    return call(self, *args, **kwargs)
+                finally:
+                    torch.__future__.set_swap_module_params_on_conversion(True)
+        return retry
+
+    nn.Module._apply = without_swap(apply, "Couldn't swap")
+    nn.Module.load_state_dict = without_swap(load, "While swapping")
+
+
 def _relax_blockwise_scaled_mm_meta() -> None:
     """torch 2.10's meta check for block-scaled fp8 GEMMs (``_scaled_mm_v2``, 1x128 x 128x128
     blocks) floors ``N / 128``, so a weight whose last 128-row block is partial (GLM-5.2's
@@ -1074,6 +1194,7 @@ def install() -> None:
     # CPU and a CUDA tensor share an impl type and torch sets `.data`): tied
     # weights stay tied and references taken before the move stay live.
     torch.__future__.set_swap_module_params_on_conversion(True)
+    _swap_or_assign()
     SimMode().__enter__()
     bootstrap = threading.Thread._bootstrap_inner
 
