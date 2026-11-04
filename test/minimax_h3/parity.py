@@ -4,7 +4,8 @@ The port's modules, built from the checkpoint without a server and run on SDPA (
 reference's kernel), against each recorded stage: token ids, the packed layout, the
 seeded noise, Qwen3-VL's layer 50, the text conditioner, every DiT step teacher-forced,
 the free-running loop and the decodes. An FL2VA recording adds the keyframes' pixels,
-latents and step-0 noising. Exits nonzero when a stage misses its bound.
+latents and step-0 noising. Exits nonzero when a stage misses its bound (``check_bounds``);
+with ``--exact``, also when any compared tensor is not bit-identical (the docs' claim).
 
     PYTHONPATH=<tree> python test/minimax_h3/parity.py --snapshot <MiniMax-H3> \
         --oracle /tmp/h3_oracle/oracle.pt --device cuda:1 --out /tmp/h3_parity.json
@@ -37,9 +38,6 @@ def _hide_broken_torchaudio() -> None:
         sys.modules["torchaudio"] = None
 
 
-_hide_broken_torchaudio()
-
-
 def stats(ours: torch.Tensor, ref: torch.Tensor) -> dict:
     ours, ref = ours.detach().float().cpu(), ref.detach().float().cpu()
     if ours.shape != ref.shape:
@@ -59,6 +57,7 @@ def psnr(ours: torch.Tensor, ref: torch.Tensor, peak: float = 1.0) -> float:
 
 def main():
     """Runs the stages; the report is written (and the exit code set) whatever stage fails."""
+    _hide_broken_torchaudio()
     report: dict = {}
     failures: list[str] = []
     args = parse_args()
@@ -69,6 +68,7 @@ def main():
 
         report["crash"] = traceback.format_exc()
         failures.append("crash")
+    failures += check_bounds(report, args)
     report["failures"] = failures
     text = json.dumps(report, indent=1, default=str)
     print(text)
@@ -85,7 +85,52 @@ def parse_args():
     p.add_argument("--out", type=Path)
     p.add_argument("--stages", default="layout,noise,vae_encode,text,dit,loop,vae,audio")
     p.add_argument("--max-step-rel", type=float, default=2e-2, help="bound on a teacher-forced step's rel L2")
+    p.add_argument("--max-latent-rel", type=float, default=1e-2, help="bound on the keyframe latents' rel L2")
+    p.add_argument("--max-loop-rel", type=float, default=5e-2,
+                   help="bound on the free-running loop's final latents' rel L2, each mode")
+    p.add_argument("--min-psnr", type=float, default=40.0, help="dB, the video decode of the reference's latents")
+    p.add_argument("--min-snr", type=float, default=40.0, help="dB, the audio decode of the reference's latents")
+    p.add_argument("--exact", action="store_true", help="also fail on any compared tensor that is not bit-identical")
     return p.parse_args()
+
+
+def check_bounds(report: dict, args) -> list[str]:
+    """The stages ``run`` records without judging them: the keyframe latents, the
+    free-running loop, and the decodes of the reference's own latents (the decodes of the
+    port's latents follow the loop's). A stage that didn't run is not checked; one that
+    crashed already failed."""
+    failures = []
+
+    def rel(entry):
+        return entry.get("rel_l2", float("inf")) if isinstance(entry, dict) else float("inf")
+
+    if "keyframe_latents" in report and rel(report["keyframe_latents"]) > args.max_latent_rel:
+        failures.append("vae_encode")
+    for mode in ("serving", "reference_shapes"):
+        keys = [f"loop_{kind}_latents_{mode}" for kind in ("video", "audio")]
+        if any(key in report for key in keys) and max(rel(report.get(key)) for key in keys) > args.max_loop_rel:
+            failures.append(f"loop_{mode}")
+    video = report.get("video_decode", {}).get("oracle_latents")
+    if video is not None and not video["psnr_db"] >= args.min_psnr:
+        failures.append("video_decode")
+    audio = report.get("audio_decode", {}).get("oracle_latents")
+    if audio is not None and not audio["snr_db"] >= args.min_snr:
+        failures.append("audio_decode")
+    if args.exact:
+        failures += [f"not_bitexact:{key}" for key in _inexact(report)]
+    return failures
+
+
+def _inexact(entry, key: str = "") -> list[str]:
+    """Every compared tensor in the report that isn't bit-identical, by its path."""
+    if isinstance(entry, list):
+        return [k for i, item in enumerate(entry) for k in _inexact(item, f"{key}[{i}]")]
+    if not isinstance(entry, dict):
+        return []
+    own = []
+    if entry.get("bitexact") is False or "shape_mismatch" in entry or entry.get("equal_frac", 1.0) < 1.0:
+        own = [key]
+    return own + [k for name, item in entry.items() for k in _inexact(item, f"{key}.{name}" if key else name)]
 
 
 def run(args, report: dict, failures: list[str]) -> None:
