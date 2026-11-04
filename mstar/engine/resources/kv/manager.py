@@ -4718,6 +4718,11 @@ class KVManager(AttentionResource):
             return f"the {self.kv_cache.layout.value} layout has no resident write path"
         if self._needs_remote_transfer:
             return "a pool read across nodes takes pages a resident row doesn't track"
+        if self.placement is not None:
+            return (
+                "a context-parallel pool writes each token on one rank, at that rank's slot of the page "
+                "(ContextParallel.write_slots), which the resident write path doesn't address"
+            )
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
