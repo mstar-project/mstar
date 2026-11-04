@@ -24,6 +24,8 @@ AUDIO_ATTN = "audio_attn"
 
 # the LLM's decode loop, which the KV layout and loop caps name
 DECODE_LOOP = "decode_loop"
+# the walks that prefill the prompt and sample the reply's first token
+PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "prefill_omni"})
 
 # ragged span labels
 PATCHES = "patches"

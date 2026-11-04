@@ -252,7 +252,7 @@ class MiniCPMOModel(Model):
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
-            # a safety bound; the per-request budget is `check_stop`'s
+            # a safety bound; the per-request budget is `get_loop_caps`'
             max_iters=self.config.llm.max_position_embeddings,
             outputs=[],
         )
@@ -397,7 +397,8 @@ class MiniCPMOModel(Model):
         return ProcessPromptOutput(result, {"kv_layout": {LLM_KV: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill samples the first of max_output_tokens, so the loop runs one fewer
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel(growth=(("decode", DECODE_LOOP),))}}
@@ -465,7 +466,7 @@ class MiniCPMOModel(Model):
     ) -> ForwardPassArgs:
         metadata = partition_metadata
         if not metadata.is_prefill:
-            # the decode loop stops in `check_stop`; back here, the reply is done
+            # the decode loop has stopped; back here, the reply is done
             return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
         metadata.is_prefill = False
         metadata.graph_walk = "decode"

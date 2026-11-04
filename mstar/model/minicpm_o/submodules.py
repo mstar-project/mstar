@@ -38,6 +38,7 @@ from mstar.model.minicpm_o.config import (
     LLM_POS,
     LLM_SAMPLER,
     PATCHES,
+    PREFILL_WALKS,
     QUERIES,
     RESAMPLER_ATTN,
     VISION_ATTN,
@@ -47,10 +48,11 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
+    DeviceLoopback,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,18 @@ class LLMSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = model
         self.config = config
+        # A prefill samples the reply's first token, so a stop id there (or a
+        # one-token budget) ends the partition; decode's stop ids are checked
+        # by the graph runtime, and its budget is the loop's cap.
+        self.token_stop = TokenStop(
+            loop=DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
+            sampler=LLM_SAMPLER, walk=DECODE, prefill_walks=PREFILL_WALKS, runtime_check=True,
+        )
+        # decode reads its last token off the sampler's slot masters, and its
+        # client token rides inline
+        self.device_loopback = DeviceLoopback(
+            walk=DECODE, signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
+        )
 
     # ------------------------------------------------------------------
     # Inputs
@@ -94,8 +108,13 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty here
+            return row
         ids = inputs["text_inputs"][0]
         if graph_walk == DECODE or not any(name in inputs for name in _MM_FILLS):
             return ARNodeInputs(input_seq_len=ids.shape[0], input_ids=ids)
@@ -109,6 +128,9 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
+        if graph_walk == DECODE and any(inp.input_ids is None for inp in inputs):
+            # device loop-back: every row is its request's last sampled token, read by slot
+            return {"input_embeds": self.model.embed(self.loopback_inputs(engine_inputs, inputs)["input_ids"])}
         if inputs[0].input_ids is not None:
             ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
             return {"input_embeds": self.model.embed(ids)}
@@ -178,48 +200,9 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
-        # tested in `check_stop`, off the GPU thread.
+        # Rebind, not copy: the decode loop routes on `text_inputs`.
         if "new_token" in outputs:
             outputs["text_inputs"] = outputs["new_token"]
-
-    def _stops(self, token: int, info: CurrentForwardPassInfo) -> bool:
-        hit_eos = (
-            not info.resource_configs[LLM_SAMPLER].ignore_eos
-            and token in self.config.stop_token_ids
-        )
-        out_of_budget = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1 >= info.max_tokens
-        return hit_eos or out_of_budget
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        return {DECODE_LOOP} if self._stops(outputs["new_token"][0].item(), request_info) else set()
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-    ) -> dict[str, set[str]] | None:
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue
-            if self._stops(values[i], request_infos[rid]):
-                stops[rid] = {DECODE_LOOP}
-        return stops
 
 
 class VisionEncoderSubmodule(NodeSubmodule):

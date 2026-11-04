@@ -9,13 +9,23 @@ MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from mstar.model.components.qwen3_lm import Qwen3LMConfig
 from mstar.model.minicpm_o.components.vision import Resampler, navit_position_ids, slice_layout
-from mstar.model.minicpm_o.config import ResamplerConfig, VisionConfig
+from mstar.model.minicpm_o.config import (
+    DECODE_LOOP,
+    LLM_SAMPLER,
+    PREFILL_WALKS,
+    AudioConfig,
+    MiniCPMOConfig,
+    ResamplerConfig,
+    VisionConfig,
+)
 
 CKPT = os.environ.get("MINICPM_O_CKPT")
 needs_ckpt = pytest.mark.skipif(not CKPT, reason="set MINICPM_O_CKPT to a MiniCPM-o 4.5 snapshot")
@@ -69,6 +79,47 @@ def test_slice_layout_concatenates_slices_in_order():
     assert layout.seq_lengths == (6, 2)
     assert layout.grid_coords.tolist()[:6] == [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]
     assert layout.grid_coords.tolist()[6:] == [[0, 0], [0, 1]]
+
+
+def a_config(**kwargs) -> MiniCPMOConfig:
+    return MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(), **kwargs,
+    )
+
+
+def a_bare_model(**attrs):
+    """A MiniCPMOModel without its checkpoint: what reads only ``config``."""
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    model = object.__new__(MiniCPMOModel)
+    model.config = a_config()
+    for name, value in attrs.items():
+        setattr(model, name, value)
+    return model
+
+
+@pytest.mark.parametrize("walk", sorted(PREFILL_WALKS))
+def test_prefill_token_counts_toward_the_budget(walk):
+    """The prefill samples the reply's first token: a stop id there, or a
+    one-token budget, ends the reply, and decode runs one step fewer."""
+    from mstar.model.minicpm_o.submodules import LLMSubmodule
+    from mstar.model.submodule_base import END_PARTITION
+
+    llm = LLMSubmodule(torch.nn.Identity(), a_config(stop_token_ids=(7,)))
+
+    def stop(token, max_tokens):
+        info = SimpleNamespace(
+            graph_walk=walk, max_tokens=max_tokens, step_metadata={}, dynamic_loop_iter_counts={},
+            resource_configs={LLM_SAMPLER: SimpleNamespace(ignore_eos=False)},
+        )
+        return llm.check_stop("r", info, {"new_token": [torch.tensor([token])]})
+
+    assert stop(7, 8) == {END_PARTITION}
+    assert stop(3, 1) == {END_PARTITION}
+    assert stop(3, 8) == set()
+    model = a_bare_model()
+    assert model.get_loop_caps(max_output_tokens=8) == {DECODE_LOOP: 7}
+    assert model.get_loop_caps(max_output_tokens=1) == {DECODE_LOOP: 1}
 
 
 # --- with the checkpoint's tokenizer and processor -------------------------
@@ -153,7 +204,7 @@ def test_audio_placeholders_line_up_for_any_clips(model, seconds):
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     """The LLM's layout: one span over every prompt row (placeholders included),
     written by the prefill walk the request takes, then a row per decode step."""
-    from mstar.model.minicpm_o.config import DECODE_LOOP, LLM_KV
+    from mstar.model.minicpm_o.config import LLM_KV
     from mstar.model.multimodal import PromptPart
 
     out = model.process_prompt(
@@ -165,7 +216,6 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     rows = out.new_input_tensors["text_inputs"][0].numel()
     assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
     assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
-    assert model.get_loop_caps(max_output_tokens=7) == {DECODE_LOOP: 7}
     assert set(model.kv_labels()) == {LLM_KV}
 
 
