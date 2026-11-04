@@ -892,3 +892,20 @@ def test_a_victim_the_host_took_only_part_of_keeps_its_allotment():
     _remove(kv, "o")
 
     assert _ready(kv, "v"), "v, still holding b's pages, never came back even alone"
+
+
+def test_a_request_short_of_its_guarantee_asks_for_every_page_it_grows_into():
+    """The host has no room to grow what it set aside for r, so r runs short of its guarantee: 4 pages past its
+    allotment, of which the room covers 1. Counted as short of its grant's one page, r had s moved to the host for a
+    page, and ran short of its guarantee again on its next step."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=0, rebuildable=False)
+    _running(kv, "s", 1, arrival=1, rebuildable=False)
+    _running(kv, "x", 6, arrival=2)
+    outcome = _step(kv, "r", PAGE_SIZE)
+    kv._streams["r"]["main"].step_in_flight = True
+
+    victims = _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: False)
+
+    assert victims == Victims([], [], [], waits=4), "r asked for its grant's page, not the 4 pages it grows into"
