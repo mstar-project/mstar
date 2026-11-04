@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from typing import NamedTuple
 
 import torch
@@ -257,17 +258,28 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
     float32_matmul_precision = "highest"
 
     def __init__(self, transformer: nn.Module, config: H3Config, *, loop_name: str, attn_resource_key: str | None,
-                 max_batch_size: int = 1, compile_blocks: bool = False):
+                 max_batch_size: int = 1, compile_blocks: bool = False, row_bucket: int = 1):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
+        if int(row_bucket) < 1:
+            raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
         super().__init__(loop_name=loop_name, max_batch_size=1, attn_resource_key=attn_resource_key)
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
+        sp_group = getattr(transformer, "sp_group", None)
+        # The packed rows pad up to a multiple of this, as a tail segment of their own: the
+        # compiled blocks see one shape per bucket rather than per prompt length, and the rows
+        # split evenly over the SP ranks, which keeps the exchanges on their copy-free path.
+        self.row_multiple = math.lcm(int(row_bucket), sp_group.world_size if sp_group is not None else 1)
+        # SDPA within each segment where no ragged resource is bound; out of the compiled graph,
+        # so the segment lengths are no guard
+        self._sdpa = FrameSDPA()
+        self._sdpa_run = torch.compiler.disable(self._sdpa.run)
         if compile_blocks and transformer is not None:
-            # around the attention and the exchanges, static per row count: each new count
-            # compiles once (~8 s), and a step then runs the same kernels, at static speed, whatever
+            # around the attention and the exchanges, static per row bucket: each new bucket
+            # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
             # was served before it (dynamic-shape kernels ran 14-19% slower per step)
             compile_blocks_(transformer.blocks, dynamic=False)
 
@@ -306,8 +318,15 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
 
+    def padded_rows(self, bucket_key: H3Layout) -> int:
+        return -(-bucket_key.total_rows // self.row_multiple) * self.row_multiple
+
     def num_tokens(self, bucket_key: H3Layout) -> int:
-        return bucket_key.total_rows
+        return self.padded_rows(bucket_key)
+
+    def attention_segments(self, bucket_key: H3Layout) -> tuple[tuple[str, int], ...]:
+        rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
+        return ((self.MAIN_SPAN, rows),) + (((self.MAIN_SPAN, pad),) if pad else ())
 
     def capture_request_inputs(self, bucket_key: H3Layout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer
@@ -323,20 +342,32 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         }
 
     def build_layout(self, bucket_key: H3Layout, device) -> H3StepLayout:
+        pad = self.padded_rows(bucket_key) - bucket_key.total_rows
+
+        def padded(rows: torch.Tensor) -> torch.Tensor:
+            # a padding row sits at position 0 (rope cos 1, sin 0) on AdaLN table row 0
+            return torch.cat([rows, rows.new_zeros((pad, *rows.shape[1:]))])
+
         # the positions travel to the device in fp64 and round to fp32 there, as the reference's do
-        pos = position_ids(bucket_key).to(device)
+        pos = padded(position_ids(bucket_key)).to(device)
         cfg = self.config.transformer
         rope = rope_table(pos, rope_inv_freq(cfg), self.transformer.dtype, cfg.attention_head_dim)
-        classes, tags = timestep_classes(bucket_key), modality_tags(bucket_key)
+        classes, tags = padded(timestep_classes(bucket_key)), padded(modality_tags(bucket_key))
         return H3StepLayout(
             rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),
             no_class=torch.zeros_like(classes).to(device), tags=tags.to(device), text_len=bucket_key.text_len,
             num_condition_rows=bucket_key.num_condition_rows, num_audio_rows=bucket_key.num_audio_rows,
+            num_pad_rows=pad,
         )
 
-    def _attend(self):
+    def attend(self, layout: H3StepLayout):
+        """The step's attention within ``layout.segments``: the ragged resource's plan of
+        ``attention_segments``, or SDPA over each segment."""
         ragged = self.ragged_for(self.MAIN_SPAN)
-        return sdpa_attention if ragged is None else functools.partial(joint_attention, ragged=ragged)
+        if ragged is None:
+            self._sdpa.lengths = list(layout.segments)
+            ragged = self._sdpa_run
+        return functools.partial(joint_attention, ragged=ragged)
 
     def denoise(
         self, engine_inputs, bucket_key: H3Layout, latents, timestep, sigma, sigma_next,
@@ -354,12 +385,12 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         if first and not n and not self.compiled:
             # video and audio both at t = 0: one timestep, as the reference embeds it. Compiled
             # (not bit-exact anyway) step 0 keeps the three-entry table, the same values, so a
-            # row count compiles one graph rather than a second for step 0
+            # row bucket compiles one graph rather than a second for step 0
             timesteps = timestep.view(-1, 1).float()
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout, self._attend())
+        video_v, audio_v = self.transformer(inputs, layout, self.attend(layout))
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,

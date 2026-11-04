@@ -1776,9 +1776,13 @@ returns one mp4 with the audio as AAC (``image`` is the first frame,
 Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_batch: 28`` and
 ``vae_compile``):
 
-- ``compile``: the DiT's blocks, static per packed row count. The prompt length is part of
-  the count, so nearly every new prompt length compiles (~8 s) mid-request; past the
-  engine's recompile limit (``MSTAR_RECOMPILE_LIMIT``, 84) new counts run eager.
+- ``compile``: the DiT's blocks, static per row bucket: each new bucket compiles (5-8 s)
+  mid-request; after about 56 buckets (measured on H200, at ``MSTAR_RECOMPILE_LIMIT``'s
+  default of 84) new buckets run eager.
+- ``row_bucket``: the DiT's packed rows pad up to a multiple of this and of the SP size, as
+  a tail segment that attends only to itself and reaches no output. Default 256 with
+  ``compile`` (one graph per 256 prompt tokens per canvas, at most 0.7% more rows at
+  768p), else 1.
 - ``vae_tile_batch``: 256-px tiles per decoder call (28 is one 768p clip).
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s

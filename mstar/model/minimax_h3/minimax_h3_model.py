@@ -171,6 +171,7 @@ class H3Model(Model):
         max_prompt_tokens: int | None = None,
         async_scheduling: bool = True,
         compile: bool = False,
+        row_bucket: int | None = None,
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
     ):
@@ -192,6 +193,11 @@ class H3Model(Model):
         self.max_prompt_tokens = None if max_prompt_tokens is None else int(max_prompt_tokens)
         self.async_scheduling = bool(async_scheduling)
         self.compile = bool(compile)  # the DiT's blocks
+        # the DiT's packed rows pad to a multiple of this (and of the SP size): one compiled
+        # graph per 256 prompt tokens, not per prompt length
+        self.row_bucket = (256 if self.compile else 1) if row_bucket is None else int(row_bucket)
+        if self.row_bucket < 1:
+            raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
         self._snapshot = None
@@ -228,17 +234,18 @@ class H3Model(Model):
             return []
         cfg = self.config.transformer
 
-        def spec(key, node, shard_over_sp):
+        def spec(key, node, shard_over_sp, segments):
             return RaggedAttentionSpec(
                 resource_key=key, nodes={node},
                 config=RaggedAttentionConfig(
                     num_qo_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_attention_heads,
-                    head_dim=cfg.attention_head_dim, max_segments_per_request=1, dtype=torch.bfloat16,
+                    head_dim=cfg.attention_head_dim, max_segments_per_request=segments, dtype=torch.bfloat16,
                     shard_over_sp=shard_over_sp, workspace_mb=128,
                 ),
             )
 
-        return [spec(DIT_ATTN, DIT_NODE, True), spec(REFINER_ATTN, TEXT_ENCODER_NODE, False)]
+        # the DiT's padding rows are a second segment of each request
+        return [spec(DIT_ATTN, DIT_NODE, True, 2), spec(REFINER_ATTN, TEXT_ENCODER_NODE, False, 1)]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:
@@ -673,7 +680,7 @@ class H3Model(Model):
             return H3DenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
                 config, loop_name=DENOISE_LOOP, attn_resource_key=DIT_ATTN if ragged else None,
-                max_batch_size=1, compile_blocks=self.compile,
+                max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,

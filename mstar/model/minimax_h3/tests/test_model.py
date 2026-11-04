@@ -560,8 +560,9 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
                 break
             dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
             node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
+            step_layout = node.build_layout(layout, "cpu")
             with torch.no_grad():
-                torch.save(dit(inputs, node.build_layout(layout, "cpu"), sdpa_attention), f"{out}.{name}.{rank}")
+                torch.save(dit(inputs, step_layout, node.attend(step_layout)), f"{out}.{name}.{rank}")
     finally:
         dist.destroy_process_group()
 
@@ -569,7 +570,7 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
 @pytest.mark.parametrize("world", [2, 4, 8])
 def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_path, world):
     """``narrow``, ``rope.rows``, the Ulysses exchange and ``gather_sequence`` through ``H3DiT``,
-    over rows no rank count divides, against the DiT on one rank."""
+    over rows no rank count divides (padded to one it does), against the unpadded DiT on one rank."""
     import torch.multiprocessing as mp
     from safetensors.torch import save_file
 
@@ -583,6 +584,112 @@ def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_p
     for rank in range(world):
         for got, ref in zip(torch.load(f"{out}.sp.{rank}"), want, strict=True):
             torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+class _SPStub:
+    """What ``H3DenoiseSubmodule`` reads off a transformer to lay rows out."""
+
+    dtype = torch.float32
+    blocks = ()
+
+    def __init__(self, world: int):
+        from mstar.distributed.communication import CommGroup
+
+        self.sp_group = CommGroup(0, 0, list(range(world)))
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+@pytest.mark.parametrize("row_bucket", [1, 256])
+def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(world, row_bucket):
+    import math
+
+    from mstar.model.components.distributed.sequence_parallel import sp_seq_split
+
+    node = H3DenoiseSubmodule(_SPStub(world), H3Config(), loop_name=DENOISE_LOOP, attn_resource_key=None,
+                              row_bucket=row_bucket)
+    multiple = math.lcm(row_bucket, world)
+    for text_len in range(1, 600):
+        layout = H3Layout(text_len=text_len, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,
+                          anchors=("first",) if text_len % 2 else ())
+        rows, padded = layout.total_rows, node.num_tokens(layout)
+        assert padded % multiple == 0 and rows <= padded < rows + multiple
+        assert len(set(sp_seq_split(padded, world))) == 1
+        segments = node.attention_segments(layout)
+        assert segments == (("main", rows), ("main", padded - rows))[:1 + (padded > rows)]
+        if text_len % 97 == 0:
+            step_layout = node.build_layout(layout, "cpu")
+            assert step_layout.num_rows == padded and step_layout.segments == tuple(span for _, span in segments)
+
+
+def _padding_case():
+    from dataclasses import replace
+
+    from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
+    from mstar.model.minimax_h3.tests.tiny_checkpoint import CFG
+
+    torch.manual_seed(0)
+    dit = H3DiT(CFG).eval()
+    with torch.no_grad():
+        for param in dit.parameters():
+            param.normal_(0, 0.2)
+    config = replace(H3Config(), transformer=CFG)
+    layout = H3Layout(text_len=5, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4,
+                      anchors=("first",))
+    g = torch.Generator().manual_seed(1)
+    inputs = H3Inputs(
+        video=torch.randn(1, layout.num_condition_rows + layout.num_video_rows, CFG.patch_dim, generator=g),
+        audio=torch.randn(1, layout.num_audio_rows, CFG.audio_latents_dim, generator=g),
+        text=torch.randn(1, layout.text_len, CFG.hidden_size, generator=g),
+        timesteps=torch.tensor([[0.3, 0.6, 0.999]]),
+    )
+    return dit, config, layout, inputs
+
+
+def test_padding_rows_change_no_output():
+    dit, config, layout, inputs = _padding_case()
+    want = None
+    for row_bucket in (1, 16, 64):  # 37 rows
+        node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None, row_bucket=row_bucket)
+        step_layout = node.build_layout(layout, "cpu")
+        assert (step_layout.num_pad_rows > 0) == (row_bucket > 1)
+        with torch.no_grad():
+            got = dit(inputs, step_layout, node.attend(step_layout))
+        if want is None:
+            want = got
+        for a, b in zip(got, want, strict=True):
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
+
+def test_padding_rows_stay_finite_and_never_reach_the_request():
+    """Zeros in, the padding rows stay finite through every block; made NaN before the first
+    block, they still leave every output as it was: attention keeps them in their own segment
+    and no output reads them."""
+    dit, config, layout, inputs = _padding_case()
+    node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None, row_bucket=64)
+    step_layout = node.build_layout(layout, "cpu")
+    real = step_layout.num_rows - step_layout.num_pad_rows
+    seen = []
+    hooks = [block.register_forward_hook(lambda m, args, out: seen.append(out[:, real:])) for block in dit.blocks]
+    hooks.append(dit.final_layer.register_forward_hook(lambda m, args, out: seen.append(out[:, real:])))
+    with torch.no_grad():
+        want = dit(inputs, step_layout, node.attend(step_layout))
+    for hook in hooks:
+        hook.remove()
+    assert len(seen) == len(dit.blocks) + 1 and all(torch.isfinite(rows).all() for rows in seen)
+
+    def poison(module, args):
+        x = args[0].clone()
+        x[:, real:] = float("nan")
+        return (x, *args[1:])
+
+    hook = dit.blocks[0].register_forward_pre_hook(poison)
+    try:
+        with torch.no_grad():
+            got = dit(inputs, step_layout, node.attend(step_layout))
+    finally:
+        hook.remove()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a, b)
 
 
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):

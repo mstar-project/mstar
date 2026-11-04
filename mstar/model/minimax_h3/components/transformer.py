@@ -286,7 +286,9 @@ class H3Inputs(NamedTuple):
 
 
 class H3StepLayout(NamedTuple):
-    """One bucket's per-row tensors on the device, built once per layout."""
+    """One bucket's per-row tensors on the device, built once per layout. ``S`` counts the
+    ``num_pad_rows`` padding rows at the tail: an attention segment of their own, zeros
+    in, and read by no output."""
 
     rope: RopeTable           # [S, head_dim]
     row_index: torch.Tensor   # [S] AdaLN table row: timestep class * 3 + modality tag
@@ -296,6 +298,18 @@ class H3StepLayout(NamedTuple):
     text_len: int
     num_condition_rows: int   # keyframe rows, leading the video rows
     num_audio_rows: int
+    num_pad_rows: int = 0
+
+    @property
+    def num_rows(self) -> int:
+        """``S``: the packed rows, padding included."""
+        return self.row_index.shape[0]
+
+    @property
+    def segments(self) -> tuple[int, ...]:
+        """The rows of each attention segment: the request's, then the padding's."""
+        pad = self.num_pad_rows
+        return (self.num_rows - pad, pad) if pad else (self.num_rows,)
 
 
 class H3DiT(nn.Module):
@@ -336,15 +350,20 @@ class H3DiT(nn.Module):
         """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
         are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
         differently from three. ``row_class`` (tests) indexes timesteps laid out as the
-        reference's distinct values."""
-        # [text | keyframe rows | audio | generated video], in the prompt's dtype
+        reference's distinct values. ``attend`` attends within ``layout.segments``, so no
+        request row sees a padding row."""
+        # [text | keyframe rows | audio | generated video | padding], in the prompt's dtype
         dtype = inputs.text.dtype
-        cond = layout.num_condition_rows
+        cond, pad = layout.num_condition_rows, layout.num_pad_rows
         video = self.video_patch_proj(inputs.video.to(self.video_patch_proj.weight.dtype)).to(dtype)
         audio = self.audio_patch_proj(inputs.audio.to(self.audio_patch_proj.weight.dtype)).to(dtype)
-        x = torch.cat([inputs.text, video[:, :cond], audio, video[:, cond:]], dim=1)
+        rows = [inputs.text, video[:, :cond], audio, video[:, cond:]]
+        if pad:
+            rows.append(inputs.text.new_zeros(inputs.text.shape[0], pad, inputs.text.shape[2]))
+        x = torch.cat(rows, dim=1)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:
+            row_class = torch.cat([row_class, row_class.new_zeros(pad)])
             row_index = row_class * NUM_MODALITIES + layout.tags
         elif inputs.timesteps.shape[1] == 1:
             row_class, row_index = layout.no_class, layout.tags
@@ -365,10 +384,10 @@ class H3DiT(nn.Module):
         out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
         if sp is not None:
             out = gather_sequence(sp.group, out, sp.sizes, dim=1)
-        text, audio_rows = layout.text_len, layout.num_audio_rows
+        text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
         video_v = torch.cat(
-            [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:, :patch_dim]], dim=1,
+            [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
         )
         audio_v = out[:, text + cond:text + cond + audio_rows, patch_dim:]
         return video_v, audio_v
