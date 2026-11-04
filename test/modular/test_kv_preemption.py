@@ -18,6 +18,8 @@ sys.path.insert(0, ".")
 import pytest
 import test_kv_host_index as host
 from test_kv_admission import _remove, _runner
+from test_kv_prefix_layout_lease import IMAGE, IMAGE_WALK, RID, TAIL, TEXT, TEXT_WALK
+from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
 
@@ -241,6 +243,25 @@ def test_a_dropped_request_admitted_again_isnt_chosen_before_its_rebuild_lands()
     victims = _preempt(kv, "r", short, droppable=lambda rid: True)
 
     assert "v" not in victims.to_ask, "v gave back the allotment its rebuild runs on"
+
+
+def test_a_request_holding_a_served_walk_in_its_lease_isnt_chosen():
+    """A walk the cache serves whole never admits, so its KV lives only in the stream's lease. A newer request with
+    that lease and no page, asked to give back its allotment, would release the lease, and once eviction took those
+    pages its next walks would write from slot 0."""
+    node = _LayoutNode()
+    kv = node.kv
+    _request(kv, "o", 1, arrival=0)
+    assert _ready(kv, "o") and _ready(kv, RID)
+    answers = [node.walk(TEXT_WALK, len(TEXT))]
+    node.runner.remove_request("seed")
+
+    kv.preempt("o", 1, [RID], droppable=lambda rid: False)
+    # the older request's growth evicts the pages only the index holds
+    kv._evict(len(kv._index.evictable()))
+    answers += [node.walk(IMAGE_WALK, IMAGE), node.walk(TEXT_WALK, len(TAIL))]
+
+    assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], "a move released the served walk's KV"
 
 
 def test_a_victim_whose_move_fails_comes_off_the_earmark():
