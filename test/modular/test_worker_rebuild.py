@@ -131,6 +131,22 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     assert not eng.dropped, "the request would lose pages a step still reads, or come back as nothing or wrongly keyed"
 
 
+def test_a_request_whose_kept_ids_dont_rebuild_what_its_kv_holds_is_never_dropped():
+    from test_kv_drop import _engine, _manager, _prefill
+
+    w, _ = _worker()
+    kv = _manager()
+    _prefill(kv, R, 4)
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: _engine({"kv": kv}))
+    w._rebuilds._kept[NODE][R] = _kept(5, prompt=(1, 2, 3))  # one prompt id short of what the KV holds
+
+    with pytest.raises(RuntimeError, match="holds 4"):
+        w._drop(R, NODE)
+    assert kv.residency(R) is Residency.RESIDENT and kv._streams[R]["main"].page_indices, (
+        "the request would lose its KV, and its rebuild would write one token less than it held"
+    )
+
+
 def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 

@@ -112,7 +112,7 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host"])
+@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host", "fewer ids", "more ids"])
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE, kind=refusal if refusal in ("digest", "rows") else "ids")
@@ -123,7 +123,7 @@ def test_a_refused_drop_changes_nothing(refusal):
     pages = list(kv._streams["r"]["main"].page_indices)
 
     with pytest.raises(RuntimeError):
-        kv.drop("r", PAGE_SIZE)
+        kv.drop("r", PAGE_SIZE + {"fewer ids": -1, "more ids": 1}.get(refusal, 0))
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
