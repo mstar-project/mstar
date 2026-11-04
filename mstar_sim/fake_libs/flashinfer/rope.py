@@ -12,7 +12,7 @@ def _cost(q: torch.Tensor, k: torch.Tensor):
     return 3.0 * (q.numel() + k.numel()), nbytes
 
 
-@clock.kernel_fn("flashinfer.apply_rope_pos_ids", cost=lambda q, k, *a, **kw: _cost(q, k))
+@clock.kernel_fn("flashinfer.apply_rope_pos_ids_inplace", cost=lambda q, k, *a, **kw: _cost(q, k))
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor, rotary_dim: int | None = None,
     interleave: bool = False, rope_scale: float = 1, rope_theta: float = 1e4,
@@ -28,7 +28,7 @@ def apply_rope_pos_ids(
     return torch.empty_like(q), torch.empty_like(k)
 
 
-@clock.kernel_fn("flashinfer.apply_llama31_rope_pos_ids",
+@clock.kernel_fn("flashinfer.apply_llama31_rope_pos_ids_inplace",
                  cost=lambda q, k, *a, **kw: _cost(q, k))
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor, rotary_dim: int | None = None,
