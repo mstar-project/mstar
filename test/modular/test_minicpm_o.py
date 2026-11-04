@@ -126,8 +126,7 @@ def test_tts_code_budget_is_its_loop_cap():
     """The TTS prefill samples the first code, so its decode loop runs one fewer than
     upstream's max_new_tokens: a reply's codes stop there, or at the EOS code."""
     from mstar.model.minicpm_o.components.tts import TTSConfig
-    from mstar.model.minicpm_o.config import TTS_SAMPLER, TTSSampling
-    from mstar.model.minicpm_o.minicpm_o_model import TTS_DECODE, TTS_DECODE_LOOP
+    from mstar.model.minicpm_o.config import TTS_DECODE, TTS_DECODE_LOOP, TTS_SAMPLER, TTSSampling
     from mstar.model.minicpm_o.submodules import TTSSubmodule
 
     sampling = TTSSampling()

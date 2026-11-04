@@ -499,6 +499,8 @@ class MiniCPMO45(Model):
             # raw 24 kHz int16 chunks, which RequestMetrics' duration maths assumes
             kwargs["audio"] = {"format": "pcm"}
         return kwargs
+
+
 class _FastConformerAsr(Model):
     """NVIDIA's FastConformer speech recognizers: audio in, a transcript out, greedy."""
 

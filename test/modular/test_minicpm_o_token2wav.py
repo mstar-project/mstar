@@ -303,7 +303,7 @@ def _assert_same_frames(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-2) -> 
     "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
 ])
 def test_batched_windows_on_pool(random_token2wav, device):
-    """Every window of an utterance batched on pool slots, the DiT ring wrapping several
+    """Every window of an utterance batched on pool slots, the DiT cache wrapping several
     times: one row matches ``stream`` (samples; the slot against the reference state after
     every window, the DiT caches as a multiset since only that enters attention), to the
     summation order of attending the same keys in another order; two rows agree with it to

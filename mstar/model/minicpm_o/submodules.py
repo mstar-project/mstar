@@ -1,4 +1,5 @@
-"""MiniCPM-o's node submodules: the Qwen3 LLM and the two encoders.
+"""MiniCPM-o's node submodules: the Qwen3 LLM, the two encoders, and a spoken
+reply's TTS and vocoder (token2wav).
 
 The LLM's prompt is the whole rendered chat, placeholders included; a
 multimodal prefill embeds it and overwrites each placeholder row with the
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
@@ -73,8 +74,11 @@ from mstar.model.minicpm_o.config import (
     T2W_KV,
     T2W_STATE,
     TTS_ATTN,
+    TTS_DECODE,
+    TTS_DECODE_LOOP,
     TTS_KV,
     TTS_POS,
+    TTS_PREFILL,
     TTS_SAMPLER,
     VISION_ATTN,
     MiniCPMOConfig,
@@ -92,9 +96,6 @@ from mstar.model.submodule_base import (
     TokenStop,
 )
 from mstar.utils.h2d import to_device_nonblocking
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -554,11 +555,6 @@ class AudioEncoderSubmodule(NodeSubmodule):
             rid: {"audio_embeds": [out]}
             for rid, out in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)
         }
-
-
-TTS_PREFILL = "tts_prefill"
-TTS_DECODE = "tts_decode"
-TTS_DECODE_LOOP = "tts_decode_loop"
 
 
 class TTSSubmodule(ARNodeSubmodule):

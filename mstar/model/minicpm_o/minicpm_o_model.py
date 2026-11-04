@@ -91,8 +91,11 @@ from mstar.model.minicpm_o.config import (
     T2W_KV,
     T2W_STATE,
     TTS_ATTN,
+    TTS_DECODE,
+    TTS_DECODE_LOOP,
     TTS_KV,
     TTS_POS,
+    TTS_PREFILL,
     TTS_SAMPLER,
     VISION_ATTN,
     MiniCPMOConfig,
@@ -124,9 +127,6 @@ TOKEN2WAV = "Token2Wav"
 MAIN = "main"
 T2W_CHUNK = "t2w_chunk"
 
-TTS_PREFILL = "tts_prefill"
-TTS_DECODE = "tts_decode"
-TTS_DECODE_LOOP = "tts_decode_loop"
 TTS_SAMPLING = TTSSampling()
 
 # Voices shipped in the checkpoint's assets, by the name a request picks.

@@ -187,9 +187,9 @@ def _mlp(mlp, h: torch.Tensor) -> torch.Tensor:
 
 
 def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch.Tensor:
-    """``DiT.forward`` over ``RingKV`` caches on CUDA: the same blocks, with each residual
+    """``DiT.forward`` over bounded KV caches on CUDA: the same blocks, with each residual
     add fused into the next adaLN (the MLP's into the next block's), the attention over the
-    ring, channels-last causal convs, and bias + GELU in the fc1 GEMM's epilogue."""
+    cache, channels-last causal convs, and bias + GELU in the fc1 GEMM's epilogue."""
     t = x.shape[-1]
     h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1)
     x = dit.in_proj(h.transpose(1, 2)).contiguous()
