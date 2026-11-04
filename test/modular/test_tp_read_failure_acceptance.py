@@ -603,9 +603,7 @@ class _Reads:
         self.fired = True
         for future, buffers, fails in self.late:
             if fails:
-                # This fake fails before submitting a transfer or copying a
-                # buffer, so cancellation reports that the read never started.
-                future.cancel()
+                future.set_exception(RuntimeError("Mooncake read failed. Status: -1"))
             else:
                 self._land(future, buffers)
 

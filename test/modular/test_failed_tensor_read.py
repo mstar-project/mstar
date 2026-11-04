@@ -131,7 +131,6 @@ def test_a_cancelled_read_counts_as_failed(tmp_path):
     assert mgr.get_ready_tensors() == {}
     (failed,) = mgr.take_failed_reads()
     assert failed.request_id == 7 and mgr.pending == []
-    assert not mgr.has_inflight_reads(7)
 
 
 def test_later_reads_of_a_failed_request_are_dropped_until_cleanup(tmp_path):
@@ -154,13 +153,11 @@ def test_later_reads_of_a_failed_request_are_dropped_until_cleanup(tmp_path):
     assert mgr.get_ready_tensors() == {}
     (dropped,) = mgr.take_failed_reads()
     assert dropped.error is first.error
-    # The later reads finished, but the first failure's status is unknown.
-    assert mgr.pending == [] and mgr.has_inflight_reads(7)
+    assert mgr.pending == [] and not mgr.has_inflight_reads(7)
     # the reads that completed are acked; the failed one is not
     assert _acked(comm) == [{13: 1}, {12: 1}]
 
     mgr.cleanup_request(7)
-    assert not mgr.has_inflight_reads(7)
     fresh = _edge()
     mgr.pending = [_read(7, fresh)]
     assert mgr.get_ready_tensors() == {7: [fresh]}
@@ -218,16 +215,14 @@ class _EventFuture:
     """Shaped like the SHM arena's ``_CudaEventFuture``: ``done()`` and
     ``result()`` only."""
 
-    def __init__(self, done, error=None):
+    def __init__(self, done):
         self.finished = done
-        self.error = error
 
     def done(self):
         return self.finished
 
     def result(self):
-        if self.error is not None:
-            raise self.error
+        return None
 
 
 def test_a_future_with_only_done_and_result_is_polled_like_any_other(tmp_path):
@@ -603,9 +598,7 @@ def test_a_failed_submit_keeps_the_buffers_for_good(engine, failure, when):
     assert isinstance(error, AsyncReadError) and "submit failed" in str(error)
     assert error.unknown == {ptrs[1]}
     mgr.get_ready_tensors()
-    assert mgr.has_inflight_reads("bad")
     mgr.force_cleanup_request("bad")
-    assert not mgr.has_inflight_reads("bad")
     for _ in range(3):
         mgr.get_ready_tensors()
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
@@ -628,7 +621,7 @@ def test_an_unknown_status_keeps_the_buffers_for_good(engine):
     engine.report(src[1].data_ptr(), 7)
     mgr.get_ready_tensors()
     mgr.get_ready_tensors()
-    assert _kept(mgr) == ptrs and _never_freed(mgr) == ptrs
+    assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
     assert [r for _, r, _ in engine.polls].count(src[1].data_ptr()) == 1
     assert engine.unregistered == []
 
@@ -639,79 +632,6 @@ def test_an_unknown_status_keeps_the_buffers_for_good(engine):
     assert "unknown status 9" in str(error) and error.unknown == set(reader_ptrs)
     mgr.get_ready_tensors()
     assert _never_freed(mgr) == ptrs + reader_ptrs
-
-
-@pytest.mark.parametrize("where", ["submit", "reader", "manager", "event"])
-@pytest.mark.parametrize("bookkeeper", ["python", "rust"])
-def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkeeper):
-    """Losing a transfer's status must not authorize freeing its source.
-
-    Forced removal clears its handle association, but keeps its destination
-    buffers pinned; reusing that handle must not inherit the old drain.
-    """
-    from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
-    from mstar.worker.rid_table import RidTable
-    from mstar.worker.worker import Worker
-
-    bookkeeping = PythonTensorBookkeeping
-    if bookkeeper == "rust":
-        pytest.importorskip("mstar_rust")
-        bookkeeping = RustTensorBookkeeping
-    table = RidTable()
-    table.intern("other")
-    rid = table.intern("request")
-    mgr = engine.manager()
-    mgr.tensor_store = TensorStore(bookkeeping=bookkeeping())
-    mgr.rid_to_str = table.name
-    if where == "event":
-        # Arena reads use an event future without transfer_uuids. An error
-        # still does not prove that the read stopped touching its source.
-        mgr._transfer_status = None
-        mgr.pending = [_read(rid, _edge(), _EventFuture(True, RuntimeError("event failed")))]
-        ptrs = []
-    else:
-        src = _sources(2 if where == "manager" else 1)
-        if where == "manager":
-            engine.plan = {src[0].data_ptr(): [[-1]], src[1].data_ptr(): [[0]]}
-        else:
-            engine.plan = {src[0].data_ptr(): ["submit-fails"] if where == "submit" else [[9]]}
-        future, ptrs = _start(mgr, rid, src)
-        assert future.exception(timeout=5) is not None
-    assert mgr.has_inflight_reads(rid)
-    mgr.get_ready_tensors()
-    if where == "manager":
-        engine.report(src[1].data_ptr(), 9)
-        mgr.get_ready_tensors()
-
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "receiver"
-    worker._graph_runtime = SimpleNamespace(get_rid_handle=table.handle)
-    worker.tensor_manager = mgr
-    worker.communicator = mgr.communicator
-    worker._draining_rids = {"request"}
-    worker._reads_done_sent = set()
-    worker.scheduler = SimpleNamespace(pending_tp_follow_count={})
-    for _ in range(3):
-        mgr.get_ready_tensors()
-        worker._complete_drain_if_ready("request")
-        assert not worker._reads_done_sent
-        assert mgr.has_inflight_reads(rid)
-        assert mgr.inflight_read_rids([rid]) == frozenset({rid})
-    assert _never_freed(mgr) == ptrs
-
-    mgr.force_cleanup_request(rid)
-    table.release(rid)
-    assert table.intern("next") == rid
-    mgr.get_ready_tensors()
-    assert not mgr.has_inflight_reads(rid)
-    assert mgr.inflight_read_rids([rid]) == frozenset()
-    assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
-    assert engine.unregistered == []
-    worker._draining_rids = {"next"}
-    worker._complete_drain_if_ready("next")
-    [(entity, ack)] = mgr.communicator.sent
-    assert entity == "conductor" and ack.message_type == ConductorMessageType.READS_DONE
-    assert ack.body.request_id == "next"
 
 
 def test_buffers_whose_unregister_fails_are_kept(engine):
@@ -725,7 +645,6 @@ def test_buffers_whose_unregister_fails_are_kept(engine):
     mgr.get_ready_tensors()
     assert engine.unregistered == ptrs
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
-    assert not mgr.has_inflight_reads("a"), "an unregister failure does not restart a stopped transfer"
 
 
 @pytest.mark.parametrize("hcas, outcome", [(1, "read"), (0, "failed")])

@@ -45,9 +45,3 @@ The fixed cost dominates small tensors and the bandwidth large ones, so the fit 
 ## Related
 
 The `*-pool` copy and zero-copy modes and the GPU-resident buffers follow a cross-node Mooncake throughput test that runs between two nodes in copy, zero-copy and GPUDirect modes. This tool adds per-size latency fitting, the inline crossover and control-channel interference for M\*'s own paths.
-
-## Request cleanup
-
-`python -m benchmark.transport.request_cleanup --workers 2 --concurrency 1 32 64 --json cleanup.json` measures successful completion reporting and teardown with real conductor/worker handlers and ZMQ sockets. The workers have no reads outstanding; `--other-reads 64` adds pending reads for unrelated requests to measure scanning costs. Use `MSTAR_RUST_ZMQ=0` or `1` to select the mesh, and run the same script with `PYTHONPATH` pointing to each revision for an A/B.
-
-The JSON records median wall time and CPU time per request, source hashes, and the selected transport and codec. `total_cpu_us` is the median of each wave's combined conductor and worker CPU time, rather than the sum of their separate medians. It includes completion message encoding and decoding, read reporting where supported, and the drain barrier. It does not run the graph runtime, inference, or GPU transfers; model throughput still needs the serving benchmarks.

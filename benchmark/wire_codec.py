@@ -87,7 +87,6 @@ def _graphs_done(n_edges: int) -> ConductorMessage:
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="req-0", worker_graph_ids=[0], is_first_tp_rank=True,
-            worker_id="worker_0",
             persist_signals={
                 f"sig{i}": [_tensor_info(i)] for i in range(n_edges)
             },
