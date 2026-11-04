@@ -573,6 +573,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             torch.cuda.Stream().no_such_method()
         def test_own_error_names_a_library():
             raise AttributeError("the flashinfer wrapper has no plan")
+        def test_tensor_lacks_an_attribute():
+            torch.ones(2, device="cuda").no_such_attribute
         def test_filled_scratch_buffer():
             buf = torch.empty(4, device="cuda")
             buf.fill_(1.0)
@@ -593,7 +595,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
     outcomes = {line.split()[1].split("::")[1]: line.split()[0] for line in out.splitlines()
                 if line.startswith(("FAILED", "XFAIL"))}
     assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
-                        "test_own_error_names_a_library": "FAILED", "test_filled_scratch_buffer": "FAILED",
+                        "test_own_error_names_a_library": "FAILED", "test_tensor_lacks_an_attribute": "FAILED",
+                        "test_filled_scratch_buffer": "FAILED",
                         "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL",
                         "test_never_computed_write": "XFAIL"}, out
 

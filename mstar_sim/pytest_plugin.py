@@ -62,6 +62,8 @@ def _missing_from_stand_in(excinfo) -> str | None:
     error = excinfo.value
     if isinstance(error, AttributeError):
         owner = getattr(error, "obj", None)  # what lacked the attribute
+        if isinstance(owner, device.SimTensor):
+            return None  # it has all a tensor has: the name is mstar's mistake
         module = owner if inspect.ismodule(owner) else sys.modules.get(
             getattr(owner if isinstance(owner, type) else type(owner), "__module__", None) or "")
     elif isinstance(error, ImportError):
