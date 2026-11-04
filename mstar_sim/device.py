@@ -376,8 +376,10 @@ class _Observe(TorchDispatchMode):
                 args, kwargs = _autocast(func, args, kwargs, self.autocast)
             value_less = any(t.device.type == "meta" for t in _shallow(args, kwargs))
             if not in_bounds or FAULT[0] or (value_less and all(_is_meta(t) for t in _written(func, args, kwargs))):
-                # a value-less operand (or a faulted device): the op runs on shapes only
-                args, kwargs = _join(args, kwargs)
+                # a value-less operand (or a faulted device): the op runs on shapes only, but for
+                # a computed index, whose values say how many rows it selects
+                args, kwargs = _join(args, kwargs, ints=func is not torch.ops.aten.index.Tensor
+                                     or _shaped_by_never_computed(func, args))
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
             elif value_less or func not in _ALLOCATES:
                 if value_less:  # a kept tensor written with one: it reads as zeros, and is what lands
@@ -710,10 +712,12 @@ def meta_call(func, uargs, ukwargs, tensors):
     Ops whose output aliases an input are not cached: a view rebuilt from the
     cache would be a new storage (counted again, a different address), and an
     in-place view op (``transpose_``, inside ``stft``) changes its argument's
-    own shape, which a cache hit would skip. On meta tensors they are cheap."""
+    own shape, which a cache hit would skip. On meta tensors they are cheap. Nor are ops with
+    a kept index."""
     aliases = (getattr(func, "is_view", False) or func in _VIEWS
                or torch.Tag.inplace_view in getattr(func, "tags", ()))
-    key = None if aliases else _signature(func, uargs, ukwargs, tensors)
+    valued = any(t.device.type == "cpu" and t.dim() for t in tensors)  # its shape can hang on them
+    key = None if aliases or valued else _signature(func, uargs, ukwargs, tensors)
     if key is not None:
         desc = _SHAPES.get(key)
         if desc is not None:
