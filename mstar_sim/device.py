@@ -596,10 +596,18 @@ def _reads_never_computed(func, args, kwargs) -> bool:
     return any(never_computed(t) for t in _shallow(args, kwargs) if not any(t is w for w in written))
 
 
+def _shaped_by_never_computed(func, args) -> bool:
+    """Whether a never-computed value shapes an aten op's output, as its tag says; ``index``
+    has the tag for its masks, and an integer index shapes nothing."""
+    if func.overloadpacket.__name__ == "index":
+        return any(ix is not None and ix.dtype in (torch.bool, torch.uint8) and never_computed(ix) for ix in args[1])
+    return torch.Tag.dynamic_output_shape in func.tags
+
+
 def _kept_op(func, args, kwargs):
     """Run an aten op on kept values: what it writes is computed only if all it read was."""
     never = _reads_never_computed(func, args, kwargs)
-    if never and torch.Tag.dynamic_output_shape in func.tags:
+    if never and _shaped_by_never_computed(func, args):
         VALUE_SHAPES[0] += 1
     out = func(*args, **kwargs)
     for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):

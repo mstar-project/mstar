@@ -125,9 +125,10 @@ _EMULATOR = "/mstar_sim/"
 
 def _torchs_verdict(excinfo) -> bool:
     """A torch error on an op's operands, which a GPU's op raises too (a shape, an index):
-    not one about what the emulator made of them (no shape-only kernel, a meta payload)."""
+    not one about what the emulator made of them (no shape-only kernel, a meta payload, a
+    device mix among payloads: one CUDA refuses is the emulator's own check, and tagged)."""
     return (excinfo.errisinstance((RuntimeError, IndexError)) and not excinfo.errisinstance(NotImplementedError)
-            and not re.search("meta|mstar_sim", str(excinfo.value)))
+            and not re.search("meta|mstar_sim|two devices", str(excinfo.value)))
 
 
 def _raised_in_emulator(excinfo) -> str | None:
