@@ -1163,10 +1163,11 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``
-        and ``LENGTH_KWARGS``, including the ones an OpenAI adapter maps onto it.
-        A request carrying any other key is served, and the key logged as
-        ignored. None (the default) declares nothing, so nothing is logged.
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
+        nothing is logged.
         """
         return None
 
