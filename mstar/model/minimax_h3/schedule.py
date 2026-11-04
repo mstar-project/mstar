@@ -19,10 +19,14 @@ def shifted_sigmas(num_points: int, shift: float) -> torch.Tensor:
     """``MiniMaxH3Scheduler.set_timesteps``'s sigma grid, fp32 on the CPU."""
     if num_points < 2:
         raise ValueError(f"num_inference_steps must be >= 2, got {num_points}")
-    if shift <= 0:
+    if not shift > 0:
         raise ValueError(f"the sigma shift must be positive, got {shift}")
     base = torch.linspace(1.0, 0.0, int(num_points), dtype=torch.float32)
-    return torch.unique_consecutive(shift * base / (1 + (shift - 1) * base))
+    sigmas = torch.unique_consecutive(shift * base / (1 + (shift - 1) * base))
+    if not torch.isfinite(sigmas).all():
+        # a shift past fp32's range (or one that underflows) gives inf / inf
+        raise ValueError(f"the sigma shift {shift} gives a non-finite grid in fp32")
+    return sigmas
 
 
 @dataclass(frozen=True)

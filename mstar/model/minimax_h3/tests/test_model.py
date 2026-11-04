@@ -132,9 +132,22 @@ def test_request_defaults_and_validation():
         {"num_inference_steps": 1},
         {"flow_shift": 0},
         {"height": "tall", "width": 1344},
+        # non-finite, truncated or overflowing numbers: a 400, never NaN sigmas or a 500
+        {"flow_shift": float("inf")},
+        {"audio_flow_shift": float("nan")},
+        {"flow_shift": 1e39},                     # finite, but inf in fp32
+        {"flow_shift": True},
+        {"num_inference_steps": float("inf")},
+        {"num_frames": 1e999},
+        {"height": 768.5, "width": 1344},
+        {"num_inference_steps": 2.7},
     ):
         with pytest.raises(ValueError):
             model.resolve_request(bad)
+    assert model.resolve_request({"height": 768.0, "width": "1344"})["width"] == 1344
+    for anchors in (5, [["first"]], [None], {"first": 1}):
+        with pytest.raises(ValueError, match="keyframe_anchors"):
+            model.keyframe_anchors({"keyframe_anchors": anchors}, 1)
 
 
 def _keyframe(height: int = 64, width: int = 96) -> torch.Tensor:
@@ -166,6 +179,37 @@ def test_prompts_refused_before_any_work(monkeypatch):
     for size in ({"height": 40000, "width": 40000}, {"height": 768}, {"width": "wide", "height": 768}):
         with pytest.raises(ValueError):
             model.process_prompt("a dog", ["text", "image"], ["video", "audio"], image, **size)
+
+
+def _data_worker(model):
+    """The data worker's media and prompt stage, without its threads or sockets."""
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+
+    worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.model, worker.device, worker._keyed_labels = model, "cpu", None
+    return worker
+
+
+def _png(path, size=(96, 64)):
+    from PIL import Image
+
+    Image.new("RGB", size, (90, 120, 30)).save(path)
+    return str(path)
+
+
+def test_files_the_model_cannot_take_are_refused_before_decoding(tmp_path, monkeypatch):
+    model = _model()
+
+    def decoded(*args, **kwargs):
+        raise AssertionError("decoded before the file count was checked")
+
+    for modality in ("image", "audio", "video"):
+        monkeypatch.setattr(model, f"load_{modality}", decoded)
+    worker = _data_worker(model)
+    image = _png(tmp_path / "k.png")
+    for files in ({"image": [image] * 3}, {"video": [image]}, {"audio": [image]}):
+        with pytest.raises(ValueError, match="at most"):
+            worker._load_media(files)
 
 
 def test_the_row_cap_counts_every_packed_row():
@@ -309,6 +353,27 @@ def test_a_refused_keyframe_leaves_no_upload(tmp_path, monkeypatch):
         with pytest.raises(ValueError):
             adapter.video_to_request(VideoGenerationRequest(prompt="a dog", image=PNG_URL, last_image=last), tmp_path)
         assert list(tmp_path.iterdir()) == [], last
+
+
+def test_a_keyframe_is_never_scaled_far_past_the_canvas(monkeypatch):
+    """The last keyframe is scaled to cover the canvas, then cropped; a sliver would be
+    scaled by its aspect ratio (2x400 px to 1344x268800, ~1 GB) and is refused instead."""
+    from PIL import Image
+
+    real = Image.Image.resize
+
+    def resize(self, size, *args, **kwargs):
+        assert size[0] * size[1] <= 32 * 768 * 1344, f"resized to {size}"
+        return real(self, size, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", resize)
+    first = Image.new("RGB", (1344, 768))
+    for sliver in ((2, 400), (400, 2)):
+        with pytest.raises(ValueError, match="aspect"):
+            fit_keyframes(first, Image.new("RGB", sliver))
+    # 4:1 onto 1:4, the most the aspect range allows: 16x the canvas before the crop
+    fitted = fit_keyframes(Image.new("RGB", (2048, 512)), Image.new("RGB", (512, 2048)))
+    assert fitted.images[1].size == (fitted.width, fitted.height)
 
 
 def test_keyframes_onto_the_canvas():

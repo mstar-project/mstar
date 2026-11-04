@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import io
 import logging
+import math
 from fractions import Fraction
 from typing import NamedTuple
 
@@ -103,7 +104,10 @@ def _positive_int(model_kwargs: dict, name: str, default: int | None) -> int | N
         return default
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+        # a bool, or a float int() would truncate (768.5, inf), is not an integer
+        if isinstance(raw, bool) or (isinstance(raw, float) and raw != value):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"MiniMax-H3 {name} must be an integer; got {raw!r}") from None
     if value <= 0:
         raise ValueError(f"MiniMax-H3 {name} must be positive; got {value}")
@@ -113,11 +117,13 @@ def _positive_int(model_kwargs: dict, name: str, default: int | None) -> int | N
 def _positive_float(model_kwargs: dict, name: str, default: float) -> float:
     raw = model_kwargs.get(name)
     try:
+        if isinstance(raw, bool):
+            raise ValueError
         value = float(default if raw is None else raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"MiniMax-H3 {name} must be a number; got {raw!r}") from None
-    if not value > 0:
-        raise ValueError(f"MiniMax-H3 {name} must be positive; got {raw!r}")
+    if not (math.isfinite(value) and value > 0):
+        raise ValueError(f"MiniMax-H3 {name} must be positive and finite; got {raw!r}")
     return value
 
 
@@ -339,6 +345,10 @@ class H3Model(Model):
         except RuntimeError as exc:
             raise ValueError(f"{config_path}: {exc}") from exc
 
+    def max_input_files(self) -> dict[str, int]:
+        # refused before the data worker decodes anything; process_prompt takes only these
+        return {"image": MAX_KEYFRAMES, "audio": 0, "video": 0}
+
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """A keyframe as decoded RGB, uint8 ``[3, H, W]``: ``process_prompt`` puts it on the
         canvas with PIL, as the reference does, so no resampling happens here."""
@@ -434,7 +444,10 @@ class H3Model(Model):
         anchors = model_kwargs.get("keyframe_anchors")
         if anchors is None:
             anchors = ANCHORS[:count]
-        anchors = (anchors,) if isinstance(anchors, str) else tuple(anchors)
+        anchors = (anchors,) if isinstance(anchors, str) else anchors
+        if not isinstance(anchors, (list, tuple)) or not all(isinstance(a, str) for a in anchors):
+            raise ValueError(f"MiniMax-H3 keyframe_anchors must be a list of {ANCHORS}; got {anchors!r}")
+        anchors = tuple(anchors)
         if len(anchors) != count or len(set(anchors)) != count or not set(anchors) <= set(ANCHORS):
             raise ValueError(
                 f"MiniMax-H3 keyframe_anchors must name {count} distinct of {ANCHORS} for {count} image(s); "

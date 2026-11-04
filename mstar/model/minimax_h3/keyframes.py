@@ -10,7 +10,13 @@ from typing import NamedTuple
 
 from PIL import Image
 
-from mstar.model.minimax_h3.config import TEXT_TAG, VIDEO_TAG, resolve_canvas_size
+from mstar.model.minimax_h3.config import (
+    MAX_ASPECT_RATIO,
+    MIN_ASPECT_RATIO,
+    TEXT_TAG,
+    VIDEO_TAG,
+    resolve_canvas_size,
+)
 
 ANCHORS = ("first", "last")
 
@@ -44,6 +50,11 @@ def fit_keyframes(
             # not VaeImageProcessor's "crop" mode: that floors and centres differently, which
             # moves the conditioning latents off the released model's by a pixel on about
             # half of aspect ratios
+            if not MIN_ASPECT_RATIO <= image.size[0] / image.size[1] <= MAX_ASPECT_RATIO:
+                # it is scaled to cover the canvas before the crop: a sliver would be
+                # scaled past the canvas by its aspect ratio (2x400 px to 1344x268800)
+                raise ValueError(f"MiniMax-H3 keyframes need aspect ratios from 1:4 to 4:1; got "
+                                 f"{image.size[0]}x{image.size[1]}")
             scale = max(width / image.size[0], height / image.size[1])
             size = (max(width, round(image.size[0] * scale)), max(height, round(image.size[1] * scale)))
             left, top = max(0, (size[0] - width) // 2), max(0, (size[1] - height) // 2)
