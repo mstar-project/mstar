@@ -25,6 +25,7 @@ class Segment(NamedTuple):
     label: str
     span: int
 
+
 @dataclass(frozen=True)
 class ResourceStep:
     # Work for one resource, for one step
@@ -181,7 +182,8 @@ class StepContext:
 
 @dataclass(frozen=True)
 class SubmoduleStep:
-    steps: dict[str, ResourceStep] # resource key -> step within cumulative
+    # resource key -> step within cumulative
+    steps: dict[str, ResourceStep] = field(default_factory=dict)
 
     # used for convenience only: if a ResourceStep does not specify segments,
     # it gets this list
@@ -191,6 +193,10 @@ class SubmoduleStep:
     cg_key_info: Any | None = None
 
     _ctx: StepContext = None # set by the engine
+
+    # declared array or sampler -> what this step does to it, which the engine
+    # expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)
+    state: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.segments is None:

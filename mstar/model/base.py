@@ -18,7 +18,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy, Span
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -169,32 +169,6 @@ class ClientChunk(NamedTuple):
     # this append's model_kwargs, and the opening message's
     model_kwargs: dict
     request_kwargs: dict
-
-
-class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
-
-    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
-    the span before it then writes it too, in the same row, as text around an attachment is.
-    That span is of the same walk, since a step runs one.
-
-    ``length`` is how many KV slots the write fills, and ``advance`` is how far
-    it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
-    ``scratch`` is the most a non-committing step writes before the span
-    commits into those slots, as a denoised window does.
-    """
-    kind: str
-    walk: str
-    length: int
-    advance: int
-    source: str | tuple[str, int]
-    params: tuple = ()
-    scratch: int = 0
-    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
