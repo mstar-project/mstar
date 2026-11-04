@@ -5,13 +5,20 @@ Graph:
     prefill_image  vision_encoder -> LLM
     prefill_audio  audio_encoder -> LLM
     prefill_omni   (vision_encoder || audio_encoder) -> LLM
-    decode         LLM, looped
+    decode         LLM, looped (a text reply)
+    decode_spoken  LLM, looped, accumulating the TTS's input (a spoken reply)
+    tts_prefill    TTS -> Token2Wav, streamed
+    tts_decode     TTS, looped -> Token2Wav, streamed
+    t2w_chunk      Token2Wav (its own partition) -> client audio
 
 A request runs one prefill walk over its whole rendered prompt, picked by
-which attachments it carries, then decodes. The prompt keeps upstream's
-placeholder tokens; the LLM overwrites their embeddings with the encoders'
-outputs at positions ``process_prompt`` reads off the prompt (see
-``submodules``).
+which attachments it carries, then decodes; a spoken reply's TTS then turns
+the decode's tokens and hiddens into codes, which Token2Wav vocodes window by
+window. Text and spoken replies decode in one step as ``decode_mixed``.
+
+The prompt keeps upstream's placeholder tokens; the LLM overwrites their
+embeddings with the encoders' outputs at positions ``process_prompt`` reads
+off the prompt (see ``submodules``).
 
 Half-duplex chat only: the duplex/streaming-session machinery upstream is not
 ported.
