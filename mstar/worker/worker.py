@@ -3981,7 +3981,8 @@ class Worker:
         if not rebuild:
             return
         node = batch_N.node_name
-        skipped = rebuild & node_batch.skipped_rids
+        # the engine also skips a row the prefix cache served whole, whose rebuild is done (below)
+        skipped = (rebuild & node_batch.skipped_rids) - node_batch.cached_rids
         if skipped:
             self._fail_requests({
                 rid: f"Error in worker: {node} skipped the rebuild row of {self._rid_str(rid)}, whose inputs come "
