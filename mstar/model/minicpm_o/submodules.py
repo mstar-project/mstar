@@ -412,18 +412,9 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     # 50 frames a second: 5 s up to two full 30 s pieces
     BLOCK_LOOP_FRAME_BUCKETS = [256, 512, 1024, 1536, 3072]
-    # The captured loop's attention plan holds this many pieces (the resource's
-    # max_segments_per_request): a spoken reply's voice clip and two 30 s pieces,
-    # say. A request with more runs eagerly. The lease is settled from frames
-    # alone, so the node checks the count itself.
-    BLOCK_LOOP_MAX_PIECES = 4
 
     # Every clip has its own length, which a compiled forward would recompile
     # for; the captured block loop is what makes it fast.
-    disable_torch_compile = True
-
-    # Every clip has its own length, which a compiled forward would recompile
-    # for; it runs once a request.
     disable_torch_compile = True
 
     def __init__(self, model: MiniCPMOAudio, config: MiniCPMOConfig):
@@ -456,8 +447,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP) and self._fits_block_loop(
-                [n for inp in inputs for n in inp.kwargs["frames"]]):
+        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP):
             return None
         return SubmoduleStep(
             segments=[
@@ -496,23 +486,26 @@ class AudioEncoderSubmodule(NodeSubmodule):
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
                 lease_before_step=True,
+                can_lease=self._fits_block_loop,
                 total_tokens=self.BLOCK_LOOP_FRAME_BUCKETS,
                 capture_batch_sizes=[1],
             )
         }
 
-    def _fits_block_loop(self, frames: list[int]) -> bool:
-        return len(frames) <= self.BLOCK_LOOP_MAX_PIECES
+    def _fits_block_loop(self, inputs: list[NodeInputs]) -> bool:
+        """Whether the request's pieces fit a replay's attention plan: the
+        resource's per-request ceiling, read from it so a YAML override holds."""
+        per_request = self.node_resources[AUDIO_ATTN].max_segments_per_request
+        return sum(len(inp.kwargs["frames"]) for inp in inputs) <= per_request * len(inputs)
 
     @torch.compiler.disable
     def _replay_block_loop(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, frames: list[int],
     ) -> torch.Tensor | None:
-        runner = engine_inputs.piecewise_runners.get(AUDIO_BLOCK_LOOP)
-        if (runner is None or not self._fits_block_loop(frames)
-                or not runner.can_run(len(engine_inputs.request_ids), int(hidden.shape[0]))):
+        """The block loop replayed for the step's one request, or None if not leased."""
+        if AUDIO_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
-        return runner.run(
+        return engine_inputs.piecewise_runners[AUDIO_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden},
             request_ids=[engine_inputs.request_ids[0]],
             seq_lens=list(frames),

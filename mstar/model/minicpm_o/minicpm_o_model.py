@@ -281,7 +281,10 @@ class MiniCPMOModel(Model):
                     num_qo_heads=audio.encoder_attention_heads,
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
-                    max_segments_per_request=AudioEncoderSubmodule.BLOCK_LOOP_MAX_PIECES,
+                    # the pieces a captured block loop's plan holds (a spoken reply's
+                    # voice clip and two 30 s pieces, say); a request with more
+                    # runs eagerly
+                    max_segments_per_request=4,
                 ),
             ),
             *self._tts_resources(),

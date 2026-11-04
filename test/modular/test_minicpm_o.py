@@ -415,3 +415,22 @@ def test_every_node_gets_only_its_resources(model):
         "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
         "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }
+
+
+def test_audio_block_loop_leases_within_the_resources_segment_limit():
+    """The captured block loop's plan holds the attention resource's
+    ``max_segments_per_request`` pieces, as configured (a YAML override
+    included): a request with more gets no lease and runs eagerly."""
+    from mstar.model.minicpm_o.config import AUDIO_ATTN
+    from mstar.model.minicpm_o.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    audio = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
+    audio.bind_node_resources({AUDIO_ATTN: SimpleNamespace(max_segments_per_request=2)})
+    region = audio.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
+
+    def request(pieces):
+        return [NodeInputs(input_seq_len=100 * pieces, kwargs={"frames": [100] * pieces})]
+
+    assert region.can_lease(request(2))
+    assert not region.can_lease(request(3))
