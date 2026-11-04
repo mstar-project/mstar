@@ -1,13 +1,14 @@
 """MiniCPM-o: prompt layout, walk selection and step declarations, without weights.
 
-The resampler's sincos keys and the navit position buckets are checked
-against upstream's own formulas on the CPU. Everything else needs the
-checkpoint's config and tokenizer (not its weights), so it skips unless
+The resampler's sincos keys, the navit position buckets and the image
+slicing are checked against upstream's own formulas on the CPU. What needs
+the checkpoint's real tokenizer (not its weights) skips unless
 MINICPM_O_CKPT points at a MiniCPM-o 4.5 snapshot.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 
@@ -145,6 +146,56 @@ def test_an_attachment_tag_in_the_users_text_is_refused():
 
     with pytest.raises(ValueError, match="attachment tags"):
         processor.expand_tags(f"{processor.IMAGE_TAG} {processor.IMAGE_TAG}", ["<image>"], [])
+
+
+def test_max_seq_len_sizes_the_kv_and_the_decode_loop(tmp_path):
+    from test_trust_remote_code import MINICPM_O_CONFIG, _tokenizer_dir
+
+    from mstar.engine.resources import KVSpec
+    from mstar.model.minicpm_o.config import LLM_KV
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+
+    _tokenizer_dir(tmp_path, {}, {"config.json": json.dumps(MINICPM_O_CONFIG)})
+    model = MiniCPMOModel(str(tmp_path), max_seq_len=4096)
+    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
+    assert kv.config.max_seq_len == 4096
+    assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
+    with pytest.raises(ValueError, match="max_seq_len"):
+        MiniCPMOModel(str(tmp_path), max_seq_len=model.config.llm.max_position_embeddings + 1)
+
+
+@pytest.mark.parametrize("size, grid, slices, placeholder", [
+    # (width, height) -> the (cols, rows) grid, each slice's (h, w) in patches
+    # (the source, then the crops) and the placeholder text, worked by hand
+    # from upstream's get_sliced_grid, find_best_resize and get_refine_size
+    # tall: the source is 316x633 px, rounded to 322x630
+    ((500, 1000), (1, 2), [(45, 23), (32, 32), (32, 32)], "{h}<slice>{u}</slice>\n<slice>{u}</slice>"),
+    # 1x2 and 2x1 tie; the first found wins. Each crop is 600x300 px, sized to 632x316, then 630x322
+    ((600, 600), (1, 2), [(32, 32), (23, 45), (23, 45)], "{h}<slice>{u}</slice>\n<slice>{u}</slice>"),
+    ((896, 896), (2, 2), [(32, 32)] * 5, (
+        "{h}<slice>{u}</slice><slice>{u}</slice>\n<slice>{u}</slice><slice>{u}</slice>"
+    )),
+    # small: whole, upscaled to 547x365 px, rounded to 546x364
+    ((300, 200), None, [(26, 39)], "{h}"),
+])
+def test_image_slicing_matches_upstream(size, grid, slices, placeholder):
+    from PIL import Image
+
+    from mstar.model.minicpm_o import processor
+
+    # red rises left to right and green top to bottom, so a crop's colour says where it came from
+    w, h = size
+    ramp = np.zeros((h, w, 3), dtype=np.uint8)
+    ramp[..., 0], ramp[..., 1] = np.linspace(0, 255, w)[None, :], np.linspace(0, 255, h)[:, None]
+    images, got = processor.slice_image(Image.fromarray(ramp), processor.MAX_SLICE_NUMS, 14)
+    assert got == grid
+    assert [processor.slice_patches(image, 14)[1] for image in images] == slices
+    # the crops go row by row, as upstream's split_to_patches
+    where = [np.asarray(image, dtype=float).mean(axis=(0, 1))[[1, 0]].tolist() for image in images[1:]]
+    assert where == sorted(where)
+    u = "<unk>" * 64
+    want = placeholder.format(h=f"<image_id>3</image_id><image>{u}</image>", u=u)
+    assert processor.image_placeholder(3, grid, 64) == want
 
 
 # --- with the checkpoint's config and tokenizer ---------------------------
@@ -286,20 +337,6 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
     assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
     assert set(model.kv_labels()) == {LLM_KV}
-
-
-@needs_ckpt
-def test_max_seq_len_sizes_the_kv_and_the_decode_loop():
-    from mstar.engine.resources import KVSpec
-    from mstar.model.minicpm_o.config import LLM_KV
-    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
-
-    model = MiniCPMOModel(CKPT, max_seq_len=4096)
-    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
-    assert kv.config.max_seq_len == 4096
-    assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
-    with pytest.raises(ValueError, match="max_seq_len"):
-        MiniCPMOModel(CKPT, max_seq_len=model.config.llm.max_position_embeddings + 1)
 
 
 @needs_ckpt
