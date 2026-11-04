@@ -323,6 +323,14 @@ def test_a_number_json_does_not_have_is_an_anthropic_400(client_and_stub, number
     assert "not JSON" in r.json()["error"]["message"] and stub.last_submit is None
 
 
+@pytest.mark.xfail(strict=True, reason="stop_sequences has no cap, and the event loop matches every stop on "
+                   "each token (10,000 of 100 chars: ~14 ms a token, which every request waits out); follow-up")
+def test_a_stop_sequence_list_past_a_cap_is_a_400(client_and_stub):
+    client, stub = client_and_stub
+    r = client.post("/v1/messages", json=_body(stop_sequences=[f"stop {i}" for i in range(10_000)]))
+    assert r.status_code == 400 and stub.last_submit is None
+
+
 def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
     client, stub = client_and_stub
     stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9), stop=True)
@@ -430,6 +438,21 @@ def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_
     r = client.post("/v1/messages/count_tokens", json=body)
     assert r.status_code == 200, r.text
     assert r.json() == {"input_tokens": out.new_input_tensors["text_inputs"][0].numel()}
+
+
+@pytest.mark.xfail(strict=True, reason="count_tokens runs process_prompt, which refuses a prompt past the "
+                   "context limit as a 400 instead of counting it; follow-up")
+def test_count_tokens_counts_a_prompt_past_the_context_limit(client_and_stub):
+    """A client counts to learn whether a conversation still fits, so the count is the answer."""
+    from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
+
+    client, stub = client_and_stub
+    stub.model_name = "glm5_next"
+    stub.model = Glm5NextModel(model_path_hf="", tokenizer_mode="byte")
+    text = "x" * (stub.model.config.context_limit + 1)
+    r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": text}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["input_tokens"] >= len(text)
 
 
 def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
