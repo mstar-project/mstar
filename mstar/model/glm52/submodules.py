@@ -30,6 +30,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.model.glm52.config import (
@@ -179,7 +180,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         kv = resources[KV_RESOURCE].config
         # the manager holds one page back as its sink
         if (kv.max_num_pages - 1) * kv.tokens_per_page < cfg.max_seq_len:
-            logger.warning("%s: %d usable pages of %d hold less than max_seq_len=%d: a "
+            logger.warning("%s: %d usable pages of %d tokens hold less than max_seq_len=%d: a "
                            "request that long waits for pages until it times out", KV_RESOURCE,
                            kv.max_num_pages - 1, kv.tokens_per_page, cfg.max_seq_len)
         if kv.tokens_per_page & (kv.tokens_per_page - 1):
@@ -329,14 +330,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         batched = self.config.prefill_batched_token_buckets
         if self.config.dsa_long_context:
             # a captured prefill plans dense attention, which a step past
-            # prefill_chunk_tokens leaves unplanned (declare_step)
-            chunk = self.config.prefill_chunk_tokens
-            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > chunk})
+            # prefill_chunk_tokens leaves unplanned (declare_step), and its sparse attention in
+            # one plan, which FlashInfer takes up to sparse_mla.MAX_ROWS rows
+            cap = min(self.config.prefill_chunk_tokens, sparse_mla.MAX_ROWS)
+            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > cap})
             if past:
-                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass prefill_chunk_tokens="
-                               "%d and run eager, in row chunks", past, chunk)
-                prefill_buckets = [n for n in prefill_buckets if n <= chunk]
-                batched = [n for n in batched or () if n <= chunk]
+                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass %d tokens "
+                               "(prefill_chunk_tokens or sparse_mla.MAX_ROWS) and run eager",
+                               past, cap)
+                prefill_buckets = [n for n in prefill_buckets if n <= cap]
+                batched = [n for n in batched or () if n <= cap]
         groups = [(prefill_buckets, prefill_batch_sizes)]
         if batched:
             # one request's buckets and a batch's apart, so each can be fine or coarse

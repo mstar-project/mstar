@@ -30,8 +30,6 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.paged import attn_lens_device
-from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next.config import (
@@ -117,9 +115,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step verifies the last token and k drafts per request
         self.mtp_k = config.mtp_num_draft_tokens
         self._mtp_seq = 0
-        # mtp_trims: the sink page's last row, masked, that a row's spare sparse entries attend
-        self._pad_slot: int | None = None
-        self._pad_kpe: torch.Tensor | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
@@ -156,12 +151,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             raise ValueError(f"dsa_long_context captures prefill buckets up to "
                              f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
-        if self.config.mtp_trims and KV_CACHE in resources:
-            kv, size = resources[KV_CACHE], resources[KV_CACHE].kv_cache.page_size
-            # nothing writes the sink page's last row in a decode step: padding rows take
-            # its first k + 1
-            self._pad_slot = SINK_PAGE * size + size - 1
-            self._pad_kpe = kv.kv_cache.tensor[:, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
@@ -561,14 +550,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             last_hidden = torch.stack(hidden)
             new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
             if nxt is not None:
-                seeds = []
-                for i, r in enumerate(last):  # its MTP row again, now with the sampled token
-                    self._dsa.ctx = ctx.rows(r, r + 1)
-                    with kv.token_window(r, r + 1, LABEL):
-                        embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
-                        seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
-                stored = ctx.pos.index_select(0, _upload(self._long_stager, last, ctx.pos.device)) + 1
-                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
+                # each request's last MTP row again, now with its sampled token: one pass
+                rows = _upload(self._long_stager, last, input_ids.device)
+                self._dsa.ctx = ctx.pick(last)
+                with kv.token_rows(rows, LABEL):
+                    embeds = lm.model.embed_tokens(new_tokens) * mtp_keep.index_select(0, rows)[:, None]
+                    seeds = lm.mtp(embeds, last_hidden)
+                self._mtp_seed(engine_inputs, seeds, new_tokens, ctx.pos.index_select(0, rows) + 1)
         finally:
             self._dsa.ctx = ctx
         return new_tokens
@@ -613,27 +601,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             pool.scatter_(MTP_LEN, ends.long()[:, None], None)
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        """mtp_trims: point this verify step's rows (their positions, and the cache slots their
-        latents and index keys go to) at each request's true rows, ``MTP_LEN`` on. The host's
-        plan, the same on every rank whatever was accepted, stays as made: a captured step masks
-        each row's spare entries, an eager one replans exact rows. Returns each ``MTP_LEN``."""
-        ctx, kv = self._dsa_ctx, engine_inputs.resources[KV_CACHE]
+        """mtp_trims: this verify step's rows start at each request's true rows (``MTP_LEN``),
+        not where the host's plan put them; that plan, the same on every rank whatever was
+        accepted, stays as made, and the DSA resource moves the rows. Spare sparse entries
+        attend a row masked as the holes are. Returns each ``MTP_LEN``."""
         # a padding request reads 0 (the sink holds no state): the sink page's first rows,
         # as planned
         base = engine_inputs.resources[KDA_STATE].gather(MTP_LEN, None)[:, 0]
         pos = (base[:, None] + torch.arange(self.mtp_block, device=base.device)).view(-1)
-        size = ctx.page_size
-        pages, offsets = kv.write_slots(LABEL)
-        page = ctx.pages[(ctx.page_start[ctx.row_req.long()] + pos // size).long()]
-        pages.copy_(page.to(pages.dtype))
-        offsets.copy_((pos % size).to(offsets.dtype))
-        ctx.pos = pos.to(ctx.pos.dtype)
-        if engine_inputs.captured:
-            ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
-            ctx.pad_slot = self._pad_slot
-            self._pad_kpe.fill_(HOLE_KPE)
-        else:
-            ctx.host_pos = pos.tolist()
+        self._dsa.move_rows(self._dsa_ctx, engine_inputs.resources[KV_CACHE], pos,
+                            engine_inputs.captured, HOLE_KPE, LABEL)
         return base
 
     def _mtp_prefill(self, engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep) -> None:

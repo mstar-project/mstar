@@ -4882,6 +4882,16 @@ class KVManager(AttentionResource):
             cache_idx=plan_state.token_to_cache[:n],
         )
 
+    def spare_row(self) -> tuple[int, torch.Tensor]:
+        """A cache row no request holds, for entries a kernel must address and the caller
+        masks: its flat slot (``page * tokens_per_page + offset``) and its row in every layer,
+        ``[num_layers, width]`` (a view). SINK_PAGE's last row; a padding row writes the sink
+        from its first row and may reach it, so the caller refills it before each use. MLA only."""
+        if self.kv_cache.layout != KVLayout.MLA:
+            raise NotImplementedError(f"spare_row is not implemented for layout {self.kv_cache.layout}")
+        size = self.kv_cache.page_size
+        return SINK_PAGE * size + size - 1, self.kv_cache.tensor[:, SINK_PAGE, size - 1]
+
     @torch.compiler.disable
     def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as

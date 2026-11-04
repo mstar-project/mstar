@@ -1,7 +1,8 @@
 model: "glm52"
 # glm52_tp8_longctx.yaml with glm52_tp8_mtp.yaml's drafting (greedy requests only). A verify
-# step takes its rejected rows back, latents and index keys alike, before the next step plans;
-# the draft module selects with its own indexer. MTP's prefill over DSA runs eager.
+# step takes its rejected rows back, latents and index keys alike, before the next step plans.
+# The draft module's seed pass selects with its own indexer; its draft passes attend densely.
+# MTP's prefill over DSA runs eager.
 #
 # KV per token per rank: 79 MLA layers x (512 + 64) x 2 B + 22 index layers x 128 x 2 B
 # ~= 96 KB, so the pools below hold about one full window, as glm52_tp8_longctx.yaml's.

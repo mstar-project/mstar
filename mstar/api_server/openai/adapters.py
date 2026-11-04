@@ -1574,11 +1574,13 @@ class TextChatAdapter(OpenAIAdapter):
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         if not self.serves_tool_calls:
             _refuse_tool_calls(req)
-        text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
+        text, file_paths, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
         other = sorted(set(modalities) - {"text"})
         if other:
+            # nothing submits or cleans up after a refused chat's uploads
+            media_io.remove_uploads(file_paths, upload_dir)
             raise ValueError(f"this model takes text only; the messages carry {other}")
         if not text:
             raise ValueError("messages carry no text content")
