@@ -561,8 +561,11 @@ def _sp_dit(rank: int, world: int, store: str, snapshot: str, out: str) -> None:
             dit = weight_loader.build_transformer(config, snapshot, "cpu", sp_group=sp, dtype=torch.float32)
             node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, attn_resource_key=None)
             step_layout = node.build_layout(layout, "cpu")
+            projected = []
+            dit.video_patch_proj.register_forward_hook(lambda m, args, y, seen=projected: seen.append(args[0].shape[1]))
             with torch.no_grad():
                 torch.save(dit(inputs, step_layout, node.attend(step_layout)), f"{out}.{name}.{rank}")
+            torch.save(sum(projected), f"{out}.{name}.{rank}.projected")
     finally:
         dist.destroy_process_group()
 
@@ -584,6 +587,8 @@ def test_the_sequence_parallel_dit_gives_every_rank_the_one_ranks_velocity(tmp_p
     for rank in range(world):
         for got, ref in zip(torch.load(f"{out}.sp.{rank}"), want, strict=True):
             torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+    # each of the 12 keyframe and 18 generated rows through the patch projection on one rank only
+    assert sum(torch.load(f"{out}.sp.{rank}.projected") for rank in range(world)) == 12 + 18
 
 
 class _SPStub:

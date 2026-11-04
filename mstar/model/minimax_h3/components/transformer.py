@@ -344,6 +344,36 @@ class H3DiT(nn.Module):
         """``[B, n]`` -> ``[B * n, time_embed_dim]`` fp32."""
         return self.time_embedder(timesteps.reshape(-1))
 
+    def packed_rows(self, inputs: H3Inputs, layout: H3StepLayout, start: int, count: int) -> torch.Tensor:
+        """Rows ``[start, start + count)`` of ``[text | keyframe rows | audio | generated video |
+        padding]`` in the prompt's dtype, each modality projected over its rows there alone."""
+        dtype, cond = inputs.text.dtype, layout.num_condition_rows
+        sizes = (layout.text_len, cond, layout.num_audio_rows, inputs.video.shape[1] - cond, layout.num_pad_rows)
+        spans, first = [], 0
+        for size in sizes:
+            # the range's part of this piece, counted from the piece's first row
+            spans.append((min(max(start - first, 0), size), min(max(start + count - first, 0), size)))
+            first += size
+        (t0, t1), (c0, c1), (a0, a1), (g0, g1), (p0, p1) = spans
+
+        def project(linear: nn.Module, rows: torch.Tensor) -> torch.Tensor:
+            return linear(rows.to(linear.weight.dtype)).to(dtype)
+
+        # keyframe and generated rows are one tensor, and a range holding both holds the end of
+        # one and the start of the other: one projection over the video rows it holds
+        v0, v1 = (c0 if c1 > c0 else cond + g0), (cond + g1 if g1 > g0 else c1)
+        video = project(self.video_patch_proj, inputs.video[:, v0:v1]) if v1 > v0 else None
+        pieces = [inputs.text[:, t0:t1]] if t1 > t0 else []
+        if c1 > c0:
+            pieces.append(video[:, :c1 - c0])
+        if a1 > a0:
+            pieces.append(project(self.audio_patch_proj, inputs.audio[:, a0:a1]))
+        if g1 > g0:
+            pieces.append(video[:, c1 - c0:])
+        if p1 > p0:
+            pieces.append(inputs.text.new_zeros(inputs.text.shape[0], p1 - p0, inputs.text.shape[2]))
+        return torch.cat(pieces, dim=1)
+
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, attend: Attend, row_class: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -352,15 +382,12 @@ class H3DiT(nn.Module):
         differently from three. ``row_class`` (tests) indexes timesteps laid out as the
         reference's distinct values. ``attend`` attends within ``layout.segments``, so no
         request row sees a padding row."""
-        # [text | keyframe rows | audio | generated video | padding], in the prompt's dtype
-        dtype = inputs.text.dtype
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
-        video = self.video_patch_proj(inputs.video.to(self.video_patch_proj.weight.dtype)).to(dtype)
-        audio = self.audio_patch_proj(inputs.audio.to(self.audio_patch_proj.weight.dtype)).to(dtype)
-        rows = [inputs.text, video[:, :cond], audio, video[:, cond:]]
-        if pad:
-            rows.append(inputs.text.new_zeros(inputs.text.shape[0], pad, inputs.text.shape[2]))
-        x = torch.cat(rows, dim=1)
+        sp, start, count = None, 0, layout.num_rows
+        if self.sp_group.world_size > 1:
+            sp = SeqParallel(self.sp_group, sp_seq_split(layout.num_rows, self.sp_group.world_size))
+            start, count = sp.start, sp.count
+        x = self.packed_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:
             row_class = torch.cat([row_class, row_class.new_zeros(pad)])
@@ -369,13 +396,10 @@ class H3DiT(nn.Module):
             row_class, row_index = layout.no_class, layout.tags
         else:
             row_class = layout.row_class
-        sp = None
-        if self.sp_group.world_size > 1:
-            sp = SeqParallel(self.sp_group, sp_seq_split(x.shape[1], self.sp_group.world_size))
-            x = x.narrow(1, sp.start, sp.count)
-            rope = rope.rows(sp.start, sp.count)
-            row_index = row_index.narrow(0, sp.start, sp.count)
-            row_class = row_class.narrow(0, sp.start, sp.count)
+        if sp is not None:
+            rope = rope.rows(start, count)
+            row_index = row_index.narrow(0, start, count)
+            row_class = row_class.narrow(0, start, count)
         temb = self.time_embedding(inputs.timesteps)
         for block in self.blocks:
             x = block(x, temb, row_index, rope, attend, sp)
