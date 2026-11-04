@@ -21,7 +21,6 @@ from test_kv_admission import _remove, _runner
 from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
     _ctx,
-    _drop,
     _offload,
     _pool,
     _queue,
@@ -70,8 +69,13 @@ def _kept(tokens: int) -> KeptIds:
 
 def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
+    def drop_request(node, rid, tokens):
+        freed = kv.drop(rid, tokens)
+        _runner(kv).readmit(rid, node)
+        return freed
+
     engine = _Engine(
-        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: _drop(kv, rid),
+        drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
@@ -130,7 +134,7 @@ def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ())
     elif case == "a node where no request keeps ids":
         w._rebuilds._kept[NODE] = {}
     elif case == "nothing to drop":
-        w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid: "refused"
+        w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid, tokens: "refused"
     rows = dict.fromkeys(("r", *in_flight), 0)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph=rows)
     node_batch = SimpleNamespace(

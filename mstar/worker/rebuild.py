@@ -206,8 +206,11 @@ class Rebuilds:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def tokens(self, rid: int, node: str) -> int:
-        """How many tokens ``rid``'s rebuild on ``node`` writes: its kept prompt and every sample but the last."""
+    def tokens(self, rid: int, node: str, prefilling: Prefilling | None) -> int:
+        """How many tokens ``rid``'s rebuild on ``node`` writes: the chunks its prompt was ``prefilling`` ran, or
+        else its kept prompt and every sample but the last."""
+        if prefilling is not None:
+            return prefilling.done
         kept = self._kept[node][rid]
         return kept.prompt.view.numel() + len(kept.sampled) - 1
 
