@@ -292,15 +292,20 @@ class Rebuilds:
                 self._pool.give(piece)
         return rebuildable
 
-    def record(self, node_batch: ExecutingBatch) -> None:
+    def record(
+        self, node_batch: ExecutingBatch, cached_infos: Mapping[int, CurrentForwardPassInfo] = MappingProxyType({}),
+    ) -> None:
         """Record each row of the step that runs the next prefill step of a request still prefilling here, on the
         row's first chunk, which carries the step's whole input: its ids into the request's slice once the step
         completes, its other inputs queued to follow them (`flush`), and its step metadata. Once the last step is
         recorded the request keeps its samples, and the slice's unused tail goes back to the pool.
 
+        A row the prefix cache served whole ran no forward, but a rebuild may find its pages evicted, so it is
+        recorded from its inputs and its info in ``cached_infos``, which the engine takes out of the step.
+
         A step other than the one the request's layout says comes next, by walk or by length, or one missing an input
         the node reads, as a row the prefix cache served past its encoder, leaves the request with no log, so it is
-        never dropped. So does a step the prefix cache served whole, which never ran."""
+        never dropped."""
         node = node_batch.node_name
         prefilling = self._prefilling.get(node)
         if not prefilling:
@@ -310,11 +315,9 @@ class Rebuilds:
         if ctx.graph_walk not in walks and walks.keys().isdisjoint(ctx.request_walks.values()):
             return
         ids_input = self._policies[node].ids_input
-        for rid in [rid for rid in node_batch.cached_rids if rid in prefilling and ctx.walk_of(rid) in walks]:
-            self._forget(node, rid)
-        # The rows that ran: the engine takes a row it skipped or failed out of the step's rows and their infos,
-        # but not out of its inputs.
-        for rid in node_batch.request_ids:
+        # The rows that ran or that the cache served: the engine takes a row it skipped or failed out of the step's
+        # rows and their infos, but not out of its inputs.
+        for rid in (*node_batch.request_ids, *node_batch.cached_rids):
             if rid not in prefilling or rid in ctx.rebuild_rids:
                 continue
             inputs = node_batch.per_request_input_tensors.get(rid)
@@ -340,7 +343,8 @@ class Rebuilds:
             assert kept.used + nbytes <= piece.nbytes, (
                 f"{node} read more in {walk!r} than its rebuild policy's copy_width says"
             )
-            record = RowRecord({name: [] for name in names}, dict(node_batch.per_request_info[rid].step_metadata))
+            info = cached_infos[rid] if rid in node_batch.cached_rids else node_batch.per_request_info[rid]
+            record = RowRecord({name: [] for name in names}, dict(info.step_metadata))
             for name, tensor in tensors:
                 into = HostSlice(piece.offset + kept.used, tensor.nbytes)
                 # The ids are few, so they go now. The copies of the other inputs share the step's host-write allowance.

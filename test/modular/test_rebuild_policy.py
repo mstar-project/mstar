@@ -270,19 +270,33 @@ def test_only_the_rows_that_ran_are_recorded():
     """The engine takes a row it skipped or failed out of the step's rows and their infos, but not out of its
     inputs."""
     rebuilds = _rebuilds()
-    step = _ran(PREFILL, _rows(R, A, B))
-    step.cached_rids.add(B)  # the prefix cache served B's step whole
-    for rid in (A, B):
-        step.request_ids.remove(rid)
-        del step.per_request_info[rid]
+    step = _ran(PREFILL, _rows(R, A))
+    step.request_ids.remove(A)
+    del step.per_request_info[A]
 
     rebuilds.record(step)
 
     kept = rebuilds._kept[NODE]
     assert len(kept[R].records) == 1 and not kept[A].records, "a row that never ran would be recorded"
-    assert "keeps no log" in rebuilds.refusal(B, NODE, DECODE, {}, None), (
-        "a request whose step the cache served would be rebuilt from a log missing that step"
-    )
+
+
+def test_a_step_the_prefix_cache_served_whole_is_recorded():
+    """Three Bagel requests with the same image and question lost their logs, since the cache served their step
+    whole, and the pool still counted on dropping them. Once it ran short nothing could be dropped, and nothing
+    moved."""
+    rebuilds = _rebuilds()
+    step = _ran(PREFILL, _rows(R, B))
+    # the engine takes a row the cache served out of the step's rows and their infos
+    step.cached_rids.add(B)
+    step.request_ids.remove(B)
+    info = step.per_request_info.pop(B)
+
+    rebuilds.record(step, {B: info})
+    rebuilds.keep_samples(_batch((B,)), {B: {"new_token": [torch.tensor([9])]}}, None)
+
+    [record] = rebuilds._kept[NODE][B].records
+    assert record.inputs["text_inputs"][0].tolist() == [9, 10, 11], "the rebuild would prefill other ids"
+    assert rebuilds.refusal(B, NODE, DECODE, {}, None) is None, "a request the pool counts on dropping can't be dropped"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
