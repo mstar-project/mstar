@@ -38,7 +38,6 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.submodule_base import (
-    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -856,16 +855,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         but a verify step emits up to k+1 tokens per iteration."""
         if tokens is None:
             return set()
-        stop = self.token_stop
-        # in-step truncation leaves a stop id only as the LAST element
-        is_eos = (tokens[-1] in stop.stop_ids
-                  and not request_info.resource_configs[stop.sampler].ignore_eos)
         # the prompt-aware cap from the prefill's preprocess, else the request's own
         budget = self.request_state(request_id).get("token_budget", request_info.max_tokens)
         generated = self._mtp_checked.get(request_id, 0) + len(tokens)
         self._mtp_checked[request_id] = generated
-        if not (is_eos or generated >= budget):
-            return set()
-        # the prefill has no decode_loop to stop yet: a stop token or a one-token budget
-        # ends the partition, as token_stop does
-        return {END_PARTITION} if request_info.graph_walk in stop.prefill_walks else {stop.loop}
+        # in-step truncation leaves a stop id only as the LAST element
+        if generated >= budget or self._token_stops(request_id, tokens[-1], request_info):
+            return self._stop_names(request_info)
+        return set()
