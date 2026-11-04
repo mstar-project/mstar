@@ -580,7 +580,8 @@ class CodecSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
         """Every chunk width, widest first, for the batch buckets of at most
-        ``CAPTURE_MAX_FRAMES`` frames."""
+        ``CAPTURE_MAX_FRAMES`` frames, and one row at a wider width: a width
+        with no buckets would take the runner's default ladder instead."""
         del tp_world_size
         return [
             BatchedAcceleratorGraphConfig(
@@ -594,7 +595,9 @@ class CodecSubmodule(ARNodeSubmodule):
                     kwargs={"frames": width},
                 ),
                 additional_key_info=width,
-                capture_batch_sizes=[bs for bs in self.CAPTURE_BATCH_SIZES if bs * width <= self.CAPTURE_MAX_FRAMES],
+                capture_batch_sizes=[
+                    bs for bs in self.CAPTURE_BATCH_SIZES if bs == 1 or bs * width <= self.CAPTURE_MAX_FRAMES
+                ],
                 # an acceleration subset: MAX_BATCH_SIZE caps the batch, eagerly past these
                 caps_eager_batch_size=False,
                 input_seq_dims={"codec_tokens": 0, "lengths": 0},
