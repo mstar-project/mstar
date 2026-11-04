@@ -630,9 +630,10 @@ The spec types are:
        worker's pool admits requests on its own.
        ``correct_len(rid, label, delta)`` moves a stream's length between steps, never
        between a step's admit and commit. A speculative verify step commits its whole block,
-       and its rejected tail is taken back (``delta < 0``) before the next step is declared;
-       the position resource's ``correct_len`` moves the position with it. GLM-5.2's MTP
-       is the user.
+       and the next ``declare_step`` takes its rejected tail back (``delta < 0``) before
+       admit. The caller also calls the position resource's ``correct_len``, which doesn't
+       move by itself. A cache with KV groups refuses it. GLM-5.2's MTP is the user, and
+       this is interim until draft-verify is an engine resource (#1195).
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
