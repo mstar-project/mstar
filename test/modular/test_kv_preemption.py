@@ -670,3 +670,35 @@ def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
     victims = _preempt(kv, "o", outcome.reason.pages_short, droppable=lambda rid: False)
 
     assert victims == Victims(["r"], [], []) and _offload(kv, "r"), "r had no way off the device once the host was full"
+
+
+class _StubHostRefusingB(host._HostPool):
+    """Refuses stream ``b``, as a host whose room runs out partway through a move does."""
+
+    def place(self, rid, label, *args, **kwargs):
+        return None if label == "b" else super().place(rid, label, *args, **kwargs)
+
+
+def test_a_victim_the_host_took_only_part_of_keeps_its_allotment():
+    """A victim whose second stream the host refused was still vacated, so it asked again for its footprint on top
+    of the pages that stream held, and never came back even alone."""
+    kv = _pool()
+    kv._cpu_pool = _StubHostRefusingB(64)
+    _running(kv, "o", 3, arrival=0)
+    layout = StreamLayout(spans=(PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, WALK),), growth=(("decode", 1),))
+    _runner(kv).ingest_request("v", {"kv": KVReqConfig(
+        kv_layout={"main": layout, "b": StreamLayout(spans=(PrefixSpan(2 * PAGE_SIZE, 2 * PAGE_SIZE, WALK),))},
+        needed_labels_per_node_walk={(NODE, WALK): ["main", "b"]}, loop_caps={"decode": 4 * PAGE_SIZE},
+    )}, 1)
+    assert _ready(kv, "v")
+    step, ctx = KVStep(segments=(Segment("v", "main", 3 * PAGE_SIZE), Segment("v", "b", 2 * PAGE_SIZE))), _ctx("v")
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["v"], [], [])
+    assert _offload(kv, "v") and kv._streams["v"]["b"].pages()
+
+    _remove(kv, "o")
+
+    assert _ready(kv, "v"), "v, still holding b's pages, never came back even alone"
