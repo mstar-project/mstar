@@ -321,6 +321,20 @@ def test_timing_only_holds_shapes_not_values():
         assert buf.item() == 0.5
         buf.mul_(logits[0, :1])
         assert buf.item() == 0.0
+        # such a write lands on the elements it writes, whatever it is; captured, at each replay
+        ids, one = torch.arange(4, device="cuda"), torch.tensor([1], device="cuda")
+        ids[:1] = logits[:1, 0].long()
+        ids.index_copy_(0, one, logits[:1, 0].long())
+        assert ids.tolist() == [0, 0, 2, 3]
+        host_cast = torch.ones(2, device="cuda")
+        host_cast.copy_(torch.empty(2, device="meta"))  # a header-only weight
+        assert host_cast.tolist() == [0, 0]
+        staged, g = torch.ones(2, device="cuda"), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            staged.mul_(logits[0, :2])
+        assert staged.tolist() == [1, 1]
+        g.replay()
+        assert staged.tolist() == [0, 0]
         torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         del big
@@ -550,6 +564,10 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             assert t.sum().item() == 7
         def test_unwritten_scratch_buffer():
             assert (torch.empty(4, device="cuda") + 1).tolist() == [2.0] * 4
+        def test_never_computed_write():
+            kept = torch.arange(4, device="cuda")
+            kept[:2] = torch.empty(1 << 14, dtype=torch.long, device="cuda")[:2]
+            assert kept.tolist() == [5, 6, 2, 3]
     """))
     out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfx", "test_cases.py", emulated=True,
                      MSTAR_SIM_FAST="1")
@@ -557,7 +575,8 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                 if line.startswith(("FAILED", "XFAIL"))}
     assert outcomes == {"test_host_read_in_capture": "FAILED", "test_stand_in_lacks_a_name": "XFAIL",
                         "test_own_error_names_a_library": "FAILED", "test_filled_scratch_buffer": "FAILED",
-                        "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL"}, out
+                        "test_exported_storage": "FAILED", "test_unwritten_scratch_buffer": "XFAIL",
+                        "test_never_computed_write": "XFAIL"}, out
 
 
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):

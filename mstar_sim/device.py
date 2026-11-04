@@ -137,7 +137,11 @@ VALUE_SHAPES = [0]
 
 def _zeros(x):
     """What a value-less tensor's values read as."""
-    return torch.zeros(x.shape, dtype=x.dtype) if _is_meta(x) else x
+    if not _is_meta(x):
+        return x
+    zeros = torch.zeros(x.shape, dtype=x.dtype)
+    set_never_computed(zeros)
+    return zeros
 
 
 def host_value(t: torch.Tensor) -> torch.Tensor:
@@ -365,19 +369,23 @@ class _Observe(TorchDispatchMode):
         with contextlib.nullcontext() if clock.FAST else clock.computing():
             if self.autocast is not None:
                 args, kwargs = _autocast(func, args, kwargs, self.autocast)
-            if not in_bounds or FAULT[0] or any(t.device.type == "meta" for t in _shallow(args, kwargs)):
+            value_less = any(t.device.type == "meta" for t in _shallow(args, kwargs))
+            if not in_bounds or FAULT[0] or (value_less and all(_is_meta(t) for t in _written(func, args, kwargs))):
                 # a value-less operand (or a faulted device): the op runs on shapes only
-                (args, kwargs), land = _join(args, kwargs)
-                out = land(meta_call(func, args, kwargs, list(_shallow(args, kwargs))))
-            elif func in _ALLOCATES:
+                args, kwargs = _join(args, kwargs)
+                out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
+            elif value_less or func not in _ALLOCATES:
+                if value_less:  # a kept tensor written with one: it reads as zeros, and is what lands
+                    args, kwargs = tree_map(_zeros, (args, kwargs))
+                if clock.capturing() is not None and not func.is_view:
+                    out = _captured_values(func, args, kwargs)
+                else:
+                    out = _kept_op(func, args, kwargs)
+            else:
                 # an allocation, not a kernel (a graph doesn't re-run it): undefined values read
                 # as zeros, never as the host's leftover bytes
                 out = func(*args, **kwargs).zero_()
                 set_never_computed(out)
-            elif clock.capturing() is not None and not func.is_view:
-                out = _captured_values(func, args, kwargs)
-            else:
-                out = _kept_op(func, args, kwargs)
         if clock.FAST or func.is_view or clock.in_kernel():
             return out  # unpriced, or inside a stand-in (its own cost is charged)
         from mstar_sim import cost
@@ -535,31 +543,14 @@ def _join(args, kwargs, ints: bool = True):
     """Kept values beside a value-less operand join it: the op runs on shapes, and its
     result has no values. 0-dim integer and bool tensors stay (a size, a count or a mask a
     shape depends on), as do integer operands when not ``ints`` (a composite's indices,
-    checked at the aten op). Returns the joined arguments and ``land(out)``: a kept tensor
-    the op wrote (in place, or as ``out=``) holds never-computed values now, zeros, and is
-    what the op returns in place of its copy."""
-    copies = {}
-
+    checked at the aten op)."""
     def join(x):
         if isinstance(x, torch.Tensor) and x.device.type == "cpu" and (
                 _floating(x) or (ints and x.dim() > 0)):
-            copy = x.to(META)
-            copies[id(copy)] = x
-            return copy
+            return x.to(META)
         return x
 
-    def land(out):
-        def back(t):
-            kept = copies.get(id(t)) if isinstance(t, torch.Tensor) else None
-            if kept is None:
-                return t
-            kept.zero_()
-            set_never_computed(kept)
-            return kept
-
-        return tree_map(back, out) if copies else out
-
-    return tree_map(join, (args, kwargs)), land
+    return tree_map(join, (args, kwargs))
 
 
 _WRITES: dict = {}
@@ -596,8 +587,8 @@ def _kept_op(func, args, kwargs):
 
 
 def _writes(func, kwargs) -> bool:
-    """Whether a torch function writes its first operand or an ``out=`` (by its name, as
-    torch names in-place methods); at the aten level, an output that is an operand is one."""
+    """Whether a torch function writes its first operand or an ``out=``, by its name, as
+    torch names in-place methods."""
     name = getattr(func, "__name__", "")
     return "out" in kwargs or name == "__setitem__" or name.startswith("__i") or (
         name.endswith("_") and not name.endswith("__"))
@@ -753,12 +744,10 @@ def _fast(func, args, kwargs, flat, index):
     """``func`` as one kernel (or none): run on shapes, price by its traffic."""
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
     tensors = [t for t in _shallow(uargs, ukwargs)]
-    if any(t.device.type == "meta" for t in tensors) or (FAULT[0] and func not in _VIEWS):
-        (uargs, ukwargs), land = _join(uargs, ukwargs)
+    if (FAULT[0] and func not in _VIEWS) or (tensors and all(t.device.type == "meta" for t in tensors)):
+        uargs, ukwargs = _join(uargs, ukwargs)
         tensors = [t for t in _shallow(uargs, ukwargs)]
         raw = meta_call(func, uargs, ukwargs, tensors)
-        if _writes(func, kwargs):
-            raw = land(raw)
     else:
         if func not in _UNINITIALIZED and (
                 (clock.capturing() is not None and func not in _VIEWS) or any(never_computed(t) for t in tensors)):
@@ -795,12 +784,11 @@ def _run(func, args, kwargs, index, flat=None):
         return _fast(func, args, kwargs, flat, index)
     uargs, ukwargs = tree_map(_unwrap, args), tree_map(_unwrap, kwargs)
     shallow = list(_shallow(uargs, ukwargs))
-    land = None
-    if any(t.device.type == "meta" for t in shallow) and any(t.device.type == "cpu" for t in shallow):
+    if (any(t.device.type == "meta" for t in shallow) and any(t.device.type == "cpu" for t in shallow)
+            and not _writes(func, kwargs)):
         # a composite checks its operands share a device before it decomposes
         # (stft's window, weight_norm's g): kept floats beside a value-less one join it
-        (uargs, ukwargs), land = _join(uargs, ukwargs, ints=False)
-        land = land if _writes(func, kwargs) else None
+        uargs, ukwargs = _join(uargs, ukwargs, ints=False)
     standin = _COMPOSITE_STAND_INS.get(func)
     if standin is not None and any(_is_meta(t) for t in tree_flatten((uargs, ukwargs))[0]):
         return _rewrap(standin(*uargs, **ukwargs), [x for x in flat if isinstance(x, torch.Tensor)], index)
@@ -817,7 +805,7 @@ def _run(func, args, kwargs, index, flat=None):
     autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
     with _Observe(autocast):
         raw = func(*uargs, **ukwargs)
-    return _rewrap(land(raw) if land else raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
+    return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
 
 
 def _is_custom_op(func) -> bool:
@@ -1052,17 +1040,17 @@ def _copy_(self, src, non_blocking=False):
             if not non_blocking:
                 refuse_while_capturing("a blocking host-to-device copy")
             clock.charge(_copy_seconds(src.numel() * src.element_size(), "h2d"))
-            if not _is_meta(self._data) and not _is_meta(src):
-                dst = self._data
+            if not _is_meta(self._data):
+                dst, host = self._data, _zeros(src)
 
-                def land():
-                    dst.copy_(src, non_blocking=non_blocking)
-                    set_never_computed(dst, False)
+                def write():
+                    dst.copy_(host, non_blocking=non_blocking)
+                    set_never_computed(dst, never_computed(host))
 
                 if clock.capturing() is None:
-                    land()
+                    write()
                 else:  # captured: reads its host buffer at each replay, not now
-                    clock.on_replay(land)
+                    clock.on_replay(write)
             return self
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
