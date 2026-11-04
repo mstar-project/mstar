@@ -271,7 +271,7 @@ A rebuild is a reload whose transfer is computed. The readiness check reads the 
 
 The rebuild prefills the kept ids minus the last, under the policy's walk, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied as int32 to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
+The worker keeps a request's prompt ids from the policy's input the first time a step runs the policy's walk, copied in the dtype the walk reads them in (int64, 8 B a token) to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. It keeps them per node and per handle, and lists them in `rid_table.py`.
 
 Why this shape:
 
@@ -351,7 +351,7 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - **Drops cost a rebuild.** Once nothing can be offloaded, every victim is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
 - **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
-- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 128 KB for a 32K-token request. A request the pool can't hold is never dropped on that node.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can't hold is never dropped on that node.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

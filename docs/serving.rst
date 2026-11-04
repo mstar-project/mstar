@@ -339,7 +339,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        chunked walk. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
        which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
        keeps no ids, so it is never dropped on that node, though it can still move to the host
        with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
