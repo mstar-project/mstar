@@ -282,7 +282,7 @@ def _log(kept):
 
     return SimpleNamespace(
         kept=lambda rid, node: rid if rid in kept else None, start=start,
-        rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items,
+        rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items, nodes=frozenset({NODE}),
     )
 
 

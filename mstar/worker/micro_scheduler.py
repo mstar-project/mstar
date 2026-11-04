@@ -859,7 +859,7 @@ class MicroScheduler:
         except Exception as exc:
             raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
-    def settle_tp_follow_delta(self, caught_up: bool) -> bool:
+    def settle_tp_follow_delta(self, request_state: RequestStateManager, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
 
         The one seam both consumers of this FIFO go through — the serial path
@@ -875,6 +875,7 @@ class MicroScheduler:
             return True
         if not self._apply_delta_from_message(head):
             return False
+        self._start_follow_rebuilds(request_state, head)
         if not head.prefix_hits and not head.page_trails:
             return True
         engine = self.engine_manager.get_engine(head.node_name)
@@ -993,7 +994,7 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk. No step of the node is in flight on this path.
-        if not self.settle_tp_follow_delta(caught_up=True):
+        if not self.settle_tp_follow_delta(request_state, caught_up=True):
             return # every pending move has to land before the step is built
         if not first_tp_node.request_ids:
             # a step with no rows, so pop it rather than build an empty batch
@@ -1003,7 +1004,7 @@ class MicroScheduler:
         # before anything is popped: lists that do not match the rows raise
         chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
-        rebuild = self.follow_rebuilds(request_state, first_tp_node.node_name, rids)
+        rebuild = self.follow_rebuilds(first_tp_node.node_name, rids)
         unpopped = unread | rebuild
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
@@ -1042,22 +1043,28 @@ class MicroScheduler:
         self.cap_chunk_loops(batch)
         return batch
 
-    def follow_rebuilds(
-        self, request_state: RequestStateManager, node_name: str, rids: Iterable[int],
-    ) -> frozenset[int]:
-        """The rows of rank 0's step that rebuild a request dropped on ``node_name``. This rank knows them from
-        its own KV, which replayed rank 0's drop, and starts each rebuild at its first row, from the same source
-        as rank 0, since the request's chunk Loop is lockstep."""
+    def follow_rebuilds(self, node_name: str, rids: Iterable[int]) -> frozenset[int]:
+        """The rows of rank 0's step that rebuild a request dropped on ``node_name``, which
+        `_start_follow_rebuilds` started when the step settled."""
+        return frozenset(rid for rid in rids if self.rebuilds.rebuilding(rid, node_name))
+
+    def _start_follow_rebuilds(self, request_state: RequestStateManager, head: ScheduleTPNode) -> None:
+        """Start the rebuild of each request of ``head`` dropped on its node, from the same source as rank 0's,
+        since the request's chunk Loop is lockstep. Rank 0 started it before it sent the step, so rank 0 leased the
+        request's cached prefix under the keys the rebuild lays out, and this rank starts it before it takes that
+        lease."""
+        node_name = head.node_name
+        if node_name not in self.rebuilds.nodes:
+            return
         engine = self.engine_manager.get_engine(node_name)
-        rebuild = set()
-        for rid in rids:
-            if self.rebuilds.rebuilding(rid, node_name):
-                rebuild.add(rid)
-            elif engine.residency(node_name, rid) is Residency.DROPPED:
-                info = request_state.get_fwd_info(rid, request_state.get_partition_for_node(node_name))
-                self._start_rebuild(node_name, rid, info.graph_walk)
-                rebuild.add(rid)
-        return frozenset(rebuild)
+        partition = request_state.get_partition_for_node(node_name)
+        for rid in self.tp_rids(head):
+            # A row a step in flight holds is resident or rebuilding already, since a drop waits for the row's step.
+            if (
+                rid != REMOVED_RID and rid not in self.in_flight_rids and not self.rebuilds.rebuilding(rid, node_name)
+                and engine.residency(node_name, rid) is Residency.DROPPED
+            ):
+                self._start_rebuild(node_name, rid, request_state.get_fwd_info(rid, partition).graph_walk)
 
     def _start_rebuild(self, node_name: str, rid: int, graph_walk: str) -> None:
         rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, graph_walk))
@@ -2292,9 +2299,9 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            # A follower starts a rebuild only at its first row in rank 0's step, in `follow_rebuilds`. The request
-            # stays dropped here from the rebuild's last chunk until this rank replays the rebuild landing on rank 0,
-            # and starting a rebuild then would run it a second time on this rank alone.
+            # A follower starts a rebuild only at its first row in rank 0's step, in `_start_follow_rebuilds`. The
+            # request stays dropped here from the rebuild's last chunk until this rank replays the rebuild landing on
+            # rank 0, and starting a rebuild then would run it a second time on this rank alone.
             leads = self.parallel_leader_nodes
             if leads is None or node_name in leads:
                 self._start_rebuild(node_name, rid, fwd_info.graph_walk)

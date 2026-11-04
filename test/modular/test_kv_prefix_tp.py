@@ -139,7 +139,7 @@ def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -
         engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
     )
     scheduler.register_tp_follow(head)
-    return scheduler.settle_tp_follow_delta(caught_up)
+    return scheduler.settle_tp_follow_delta(None, caught_up)
 
 
 def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
@@ -161,6 +161,7 @@ def _follower_worker(follower: KVManager) -> Worker:
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker.scheduler = MicroScheduler(engine_manager=worker.engine_manager, parallel_leader_nodes=set())
     worker._tp_nospec = set()
+    worker.request_state = None   # read only for a dropped row
     return worker
 
 
@@ -228,7 +229,7 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
     worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
+    assert worker.scheduler.settle_tp_follow_delta(None, caught_up=False)
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "b")
 
@@ -257,7 +258,7 @@ def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_pa
         kv.commit(steps[kv][1], _ctx("z"))
     worker = _follower_worker(follower)
     worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=True)
+    assert worker.scheduler.settle_tp_follow_delta(None, caught_up=True)
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "h")
     for kv in ranks:

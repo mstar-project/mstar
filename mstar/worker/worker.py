@@ -3465,6 +3465,7 @@ class Worker:
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
         if not self.scheduler.settle_tp_follow_delta(
+            self.request_state,
             # Of the steps before the head, only N may still index a page of the head's hit
             caught_up=pending.node_batch.commit_done.is_set(),
         ):
@@ -3482,7 +3483,7 @@ class Worker:
         # rebuild rows, which the graph runtime holds no node of, so they are never popped. A rebuild whose chunk ran
         # in N is one of N's rows mid-prefill, which rank 0 stamps a rebuild row from its log too.
         rebuild = self.scheduler.follow_rebuilds(
-            self.request_state, head.node_name, [r for r in head_rids if r not in in_batch or r in held],
+            head.node_name, [r for r in head_rids if r not in in_batch or r in held],
         )
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N

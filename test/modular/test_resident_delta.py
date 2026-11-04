@@ -1399,14 +1399,14 @@ def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_
 
     assert _admits(leader, "r")
     send(0)
-    assert scheduler.settle_tp_follow_delta(caught_up=True), "the follower stopped on counts that agree"
+    assert scheduler.settle_tp_follow_delta(None, caught_up=True), "the follower stopped on counts that agree"
     scheduler.pop_tp_follow_head()
     assert _admits(leader, "s")
     lead.take_resident_delta()
     send(1)
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
 
 
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
@@ -1430,7 +1430,7 @@ def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(m
 
     assert _returns(leader, "v")
     assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
-    # as `MicroScheduler.follow_rebuilds` starts the follower's rebuild at its first row
+    # as `MicroScheduler._start_follow_rebuilds` starts the follower's rebuild at its first row
     for engine in (lead, follow):
         engine.prepare_rebuild(NODE, "v", _REBUILD)
 
@@ -1539,13 +1539,13 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
     scheduler.register_tp_follow(head)
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
 
 
 def _follower_of(follow) -> MicroScheduler:
     """A follower's scheduler over ``follow``, whose log keeps v's ids and runs no rebuild."""
     scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
-    scheduler.rebuilds = SimpleNamespace(kept_count=_kept, rebuilding=_rebuilds_none)
+    scheduler.rebuilds = SimpleNamespace(kept_count=_kept, rebuilding=_rebuilds_none, nodes=frozenset())
     return scheduler
 
 
@@ -1556,7 +1556,7 @@ def _send(scheduler, lead, seq: int) -> None:
 
 
 def _follow_next(scheduler) -> None:
-    assert scheduler.settle_tp_follow_delta(caught_up=True)
+    assert scheduler.settle_tp_follow_delta(None, caught_up=True)
     scheduler.pop_tp_follow_head()
 
 
@@ -1593,4 +1593,4 @@ def test_a_follower_whose_rebuild_still_runs_when_rank_0_lands_it_stops(monkeypa
     _send(scheduler, lead, 1)
 
     with pytest.raises(SystemExit, match="rank 0 landed v's rebuild on LLM, and this rank's is still running"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)

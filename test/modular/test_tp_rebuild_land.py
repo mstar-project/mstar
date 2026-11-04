@@ -116,7 +116,7 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
 
     # the step after the refusal carries v's drop
     sched.register_tp_follow(_head(lead, 0))
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     sched.pop_tp_follow_head()
 
     # N: rank 0's log starts v's rebuild and offers its first chunk. The follower knows v from its own KV.
@@ -141,6 +141,6 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
     one.post_process(n_1)
     sched.register_tp_follow(_head(lead, 3))
 
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
     assert not one.rebuilds.rebuilding("v", NODE), "the follower would take v's decode row for a rebuild row"
