@@ -107,6 +107,14 @@ class Glm5NextModel(Model):
         if long_only and not kwargs.get("dsa_long_context", False):
             # they size and split the long-context path only; without it they would be dropped
             raise ValueError(f"{long_only} apply only with dsa_long_context")
+        for key in ("dsa_long_context", "dsa_shard_prefill"):
+            # bool("false") is True
+            if key in kwargs and not isinstance(kwargs[key], bool):
+                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+        for key in ("max_seq_len", "prefill_window_tokens"):
+            # int() would take True as 1 and 2.5 as 2
+            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
             # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
