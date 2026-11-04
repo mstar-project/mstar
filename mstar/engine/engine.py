@@ -1,5 +1,6 @@
 
 
+import dataclasses
 import logging
 import os
 import threading
@@ -1701,6 +1702,7 @@ class Engine:
             if batch.admit_error is None:
                 self._record_loopback(batch)
                 batch.outputs.loopback_rids = batch.loopback_rids
+                batch.outputs.repeats = batch.step_context.repeats
             batch.outputs_ready.set()
             laps.lap("record_loopback")
             return batch.outputs
@@ -2168,7 +2170,7 @@ class Engine:
             with fp32_precision_scope(submodule_mgmt.fp32_precision):
                 raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
-                    lease, running_batched, request_ids, release_event,
+                    lease, running_batched, request_ids, release_event, step,
                 )
         finally:
             phase_end("engine.forward", t0)
@@ -2201,6 +2203,7 @@ class Engine:
         running_batched: bool,
         request_ids: list[str],
         release_event: "threading.Event | None" = None,
+        step: SubmoduleStep | None = None,
     ) -> BatchedModelOutput:
         """Replay the leased slot, or run the eager forward.
 
@@ -2211,11 +2214,17 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            return cg_runner.run_forward(
+            out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
+            if ctx.repeats > 1:
+                carry = submodule_mgmt.submodule.repeat_carry(graph_walk)
+                out = dataclasses.replace(out, check_stop_buffers=cg_runner.repeat(
+                    lease, carry, ctx.repeats, partial(self._runner.next_replay, step),
+                ))
+            return out
         if release_event is not None:
             release_event.set()
         if running_batched:
@@ -2819,6 +2828,15 @@ class Engine:
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
+
+    def can_repeat(self, node_name: str, graph_walk: str) -> bool:
+        """Whether a step of this walk can replay with no host work between:
+        its node runs on resident tables and says what carries a replay on."""
+        mgmt = self._submodules.get(node_name)
+        return (
+            mgmt is not None and mgmt.resident is not None and graph_walk in mgmt.resident.walks
+            and mgmt.submodule.repeat_carry(graph_walk) is not None
+        )
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)

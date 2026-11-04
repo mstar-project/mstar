@@ -37,6 +37,7 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         ),
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
+    fake._stamp_repeats = lambda *args: None
     return fake, peeked, excluded
 
 

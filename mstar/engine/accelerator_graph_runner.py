@@ -1597,6 +1597,30 @@ class AcceleratorGraphRunner:
             profiler.range_pop()
         return slot.static_outputs
 
+    def repeat(
+        self, lease: SlotLease, carry: tuple[str, str], repeats: int, next_replay: Callable[[], None],
+    ) -> dict[str, torch.Tensor]:
+        """The rest of a step that repeats, after its first replay: each replay
+        takes ``carry``'s stop buffer as its static input. Returns the stop
+        buffers with a column per replay: a replay overwrites what the last one
+        left, so each is copied out on the stream before the next one."""
+        slot = self.slot_for(lease)
+        buffers = slot.static_outputs.check_stop_buffers
+        out, name = carry
+        target = slot.static_inputs[name]
+        columns: dict[int, torch.Tensor] = {}
+        for tensor in buffers.values():
+            if id(tensor) not in columns:
+                columns[id(tensor)] = tensor.new_empty(tensor.shape[0], repeats)
+        for i in range(repeats):
+            if i:
+                target.copy_(buffers[out].reshape(target.shape))
+                next_replay()
+                slot.graph.replay()
+            for tensor in {id(t): t for t in buffers.values()}.values():
+                columns[id(tensor)][:, i].copy_(tensor.reshape(-1))
+        return {key: columns[id(tensor)] for key, tensor in buffers.items()}
+
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
         plan_done_event: Any | None = None,

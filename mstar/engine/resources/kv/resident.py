@@ -57,8 +57,9 @@ class KVResidentTables:
         if len(pages) > self.block_table.width:
             raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         page = self.page_size
-        # a stream that appends holds the page its next token goes to, too
-        cols = -(-stored_len // page) if writes.streams[self.key].reads else stored_len // page + 1
+        # a stream that appends holds the pages its next tokens go to, too
+        reads = writes.streams[self.key].reads
+        cols = -(-stored_len // page) if reads else (stored_len + writes.repeats - 1) // page + 1
         row[self.kv_len.col] = stored_len
         writes.kv_len[self.key] = stored_len
         if cols:
@@ -67,8 +68,9 @@ class KVResidentTables:
         self.host_cols[slot] = cols
 
     def refresh_len(self, stored_len: int, slot: int, writes: ResidentWrites) -> None:
-        """A row a host-planned step advanced; its columns stay until `stage_step`."""
-        writes.put(self.kv_len.cell(slot), stored_len)
+        """A row a host-planned step advanced; its columns stay until `stage_step`.
+        Written once, ahead of the replays: `cells` replay with the graph."""
+        writes.run(slot, self.kv_len.col, [stored_len])
         self.host_len[slot] = stored_len
 
     def stage_step(self, plan: ResidentPlan, stream_len, stream_pages, rewrite) -> None:
@@ -91,7 +93,7 @@ class KVResidentTables:
             return
         slots = plan.slots
         cols = self.host_cols[slots]
-        need = self.host_len[slots] // self.page_size + 1
+        need = (self.host_len[slots] + plan.repeats - 1) // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return
@@ -109,7 +111,7 @@ class KVResidentTables:
     def advance(self, plan: ResidentPlan) -> None:
         if plan.writes.streams[self.key].reads:
             return
-        self.host_len[plan.slots] += 1
+        self.host_len[plan.slots] += plan.repeats
         crossed = plan.crossed.get(self.key)
         if crossed is not None:
             rows, need = crossed

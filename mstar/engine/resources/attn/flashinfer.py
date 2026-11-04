@@ -24,6 +24,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
@@ -97,6 +98,26 @@ class FlashInferManager(AttentionManager):
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def max_repeats(self, step, ctx) -> int:
+        """A kernel that reads the tables sees each replay's lengths. So does one
+        planned for the step's last replay, whose lengths move in `next_replay`."""
+        if ctx.resident is None:
+            return 1
+        lease = ctx.slot_lease
+        if lease.bucket in ctx.resident.host_plan_free:
+            return ANY_REPEATS
+        wrappers = [
+            wrapper for key, wrapper in self._cg_plan_states.items()
+            if key.bucket == lease.bucket and key.slot == lease.slot
+        ]
+        planned_ahead = wrappers and all(isinstance(w, FlashInferDecodeWrapper) and w.lengths_move for w in wrappers)
+        return ANY_REPEATS if planned_ahead else 1
+
+    def next_replay(self, step, ctx) -> None:
+        for wrapper in self._current_plan_states.values():
+            if isinstance(wrapper, FlashInferDecodeWrapper):
+                wrapper.next_replay()
 
     def resident_refusal(self) -> str | None:
         if self._window_left >= 0:
@@ -295,6 +316,10 @@ class FlashInferManager(AttentionManager):
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
             kwargs = indptrs.to_kwargs_dict()
+            if ctx.repeats > 1 and isinstance(wrapper, FlashInferDecodeWrapper):
+                kwargs["paged_kv_last_page_len"] = wrapper.first_replay(
+                    kwargs["paged_kv_last_page_len"], len(ctx.request_ids), ctx.repeats,
+                )
             laps.lap("wrapper")
             # TODO: cache the latest plan state
             wrapper.plan(

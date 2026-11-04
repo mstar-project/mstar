@@ -326,6 +326,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        pays no scheduling gap between chunks; other ready work still goes first after
        every prompt step. Off, the next chunk waits for the current one to land. Naming
        a node or walk the model does not chunk fails loading.
+   * - ``max_step_repeats``
+     - *(optional, default 1)* The most iterations of a decode Loop one step may stand for.
+       The host plans once, the captured graph replays that many times, and stops are read
+       when the step lands, so a row that stopped inside it costs the replays past its stop.
+       Applies where a step's resources allow it (``Resource.max_repeats``): a walk on
+       resident tables, with a declared token stop, that keeps its outputs on the device, on
+       a GPU whose decode attention reads its lengths on the device. Elsewhere steps stay at 1.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

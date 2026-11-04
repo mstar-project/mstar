@@ -141,9 +141,10 @@ class ResidentWrites:
     ride the graph's own scatter. ``streams`` is each resource's stream, by
     resource key."""
 
-    __slots__ = ("streams", "rows", "cells", "values", "kv_len")
+    __slots__ = ("streams", "rows", "cells", "values", "kv_len", "repeats")
 
-    def __init__(self, streams: Mapping[str, ResidentStream]):
+    def __init__(self, streams: Mapping[str, ResidentStream], repeats: int = 1):
+        self.repeats = repeats
         self.streams = streams
         self.rows: list[tuple[int, int, list[int]]] = []
         self.cells: list[int] = []
@@ -198,6 +199,8 @@ class ResidentPlan:
     moved: set[int]
     # each KV pool's (rows, pages after the step) of its crossings, for `resident_advance`
     crossed: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    # how many replays the step runs (`StepContext.repeats`)
+    repeats: int = 1
 
 
 @dataclass(slots=True)
@@ -487,7 +490,10 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
-        plan = ResidentPlan(key, rids, slots, seq, self._commits, ResidentWrites(streams), taken, refreshed)
+        plan = ResidentPlan(
+            key, rids, slots, seq, self._commits, ResidentWrites(streams, ctx.repeats), taken, refreshed,
+            repeats=ctx.repeats,
+        )
         laps.lap("rows")
         try:
             for rid, slot in rows:

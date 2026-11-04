@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
@@ -44,6 +45,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.step_repeats import StepRepeats  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
@@ -111,13 +113,15 @@ def _host_step(res, rids, spans, walk="prefill", advance=None):
     return SubmoduleStep(steps={"kv": kv}, segments=list(segments)), ctx
 
 
-def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True):
+def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True, repeats=1):
     """One decode step on a bucket of ``bs`` rows. With a planner, the replay of a
-    resident capture; without one, the host plan of the same step."""
+    resident capture, ``repeats`` times; without one, the host plan of the same step."""
     padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
     bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
     lease = SlotLease(slot=slot, bucket=bucket)
-    ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
+    ctx = StepContext(
+        request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease, repeats=repeats,
+    )
     ctx.set_padded_rids(padded)
     segments = tuple(Segment(r, "main", 1) for r in padded)
     kv, pool, rope = KVStep(segments=segments), RecurrentStep(segments=segments), PositionStep(segments=segments)
@@ -164,15 +168,21 @@ def _replay(res, planner, s, promote=True):
         if promote:
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
-        planner.gather(s.captured)
     state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
-    s.pages = state.token_to_page[: bucket.bs].tolist()
-    s.offsets = state.token_to_cache[: bucket.bs].tolist()
-    s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
-    s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
-    if planner is not None:
-        planner.commit_in_graph(s.captured)
+    s.replays = []
+    for _ in range(ctx.repeats):
+        if planner is not None:
+            planner.gather(s.captured)
+        s.pages = state.token_to_page[: bucket.bs].tolist()
+        s.offsets = state.token_to_cache[: bucket.bs].tolist()
+        s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
+        s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
+        s.replays.append(SimpleNamespace(
+            pages=s.pages, offsets=s.offsets, positions=s.positions, pool_slots=s.pool_slots,
+        ))
+        if planner is not None:
+            planner.commit_in_graph(s.captured)
     res["kv"].commit(s.kv, ctx)
     res["pool"].commit(s.pool, ctx)
     res["rope"].commit(s.rope, ctx)
@@ -242,6 +252,82 @@ def test_steps_with_crossings_match_the_host_plan_and_the_host_lengths():
         assert tables.host_cols[slot] == live["kv"]._streams[rid]["main"].stored_len // PAGE + (
             1 if live["kv"]._streams[rid]["main"].stored_len % PAGE else 0
         )
+
+
+@pytest.mark.parametrize("repeats", [2, 3, PAGE], ids=lambda n: f"{n}_replays")
+def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
+    """Every replay of a step that repeats writes and attends where a host plan
+    of that iteration would, page crossings included, with no host work between
+    replays; the host's mirrors then stand where the stream does."""
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    rids = [1, 2, 3]
+    for t in range(6):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, repeats=repeats)
+        for i, replay in enumerate(a.replays):
+            b = _captured_step(ref, None, rids, slot=(t + i) % 2, bs=4)
+            assert (replay.offsets[:3], replay.positions[:3]) == (b.offsets[:3], b.positions[:3])
+            # a run reserves ahead, so its page numbers aren't the host's: each is the row's own
+            for row, rid in enumerate(rids):
+                page = live["kv"]._streams[rid]["main"].page_indices[replay.positions[row] // PAGE]
+                assert replay.pages[row] == page
+    tables = live["kv"]._resident
+    for rid in rids:
+        _assert_row(planner, live, rid)
+        assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
+
+
+def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_replay():
+    """A replay overwrites its stop buffers and reads its static input, so a step
+    that repeats hands each replay the token before it and keeps every one."""
+    tokens = torch.tensor([5, 7])
+    ids = torch.zeros(2, 1, dtype=torch.long)
+
+    class Graph:
+        def replay(self):
+            tokens.copy_(ids.reshape(-1) + 1)
+
+    slot = SimpleNamespace(
+        graph=Graph(), static_inputs={"input_ids": ids},
+        static_outputs=SimpleNamespace(check_stop_buffers={"new_token": tokens, "text_inputs": tokens}),
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: slot
+    wide = runner.repeat(None, ("new_token", "input_ids"), 3, lambda: None)
+    assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
+    assert wide["text_inputs"] is wide["new_token"]
+
+
+@pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
+    (1, 0, True, 100, 8),
+    (0, 0, True, 100, 1),  # other ready work hasn't had its look in
+    (1, 1, True, 100, 1),  # a fresh row needs a plan of its own
+    (1, 0, False, 100, 1),
+    (1, 0, True, 3, 3),  # a row's cap ends the run, never passes it
+], ids=["steady", "chain_start", "fresh_row", "other_node", "near_cap"])
+def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_node, room, want):
+    rows = dict.fromkeys(range(2 + fresh), 0)
+    speculation = SimpleNamespace(
+        scheduled_batch=SimpleNamespace(
+            node_name="n", graph_walk=WALK, request_to_worker_graph=rows, chunk_ranges={},
+        ),
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
+    )
+    assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: True, lambda: room) == want
+
+
+def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
+    """A one-token host step leaves a row's length to be refreshed. A run after
+    it refreshes it once, not at the head of every replay."""
+    live, ref, planner = _setup({1: 5})
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    _captured_step(ref, None, [1], slot=0, bs=1)
+    step, ctx = _host_step(live, [1], [1], walk=WALK)
+    planner.commit(step, ctx)
+    _host_step(ref, [1], [1], walk=WALK)
+    a = _captured_step(live, planner, [1], slot=1, bs=1, repeats=3)
+    for i, replay in enumerate(a.replays):
+        b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
+        assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
 
 
 def test_a_steady_batch_keeps_its_row():
@@ -955,7 +1041,7 @@ def test_a_stream_wider_than_a_row_raises():
     with pytest.raises(ValueError, match="fit a block table row"):
         tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols, writes)
     plan = SimpleNamespace(
-        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
+        repeats=1, slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
     )
     tables.host_len[1], tables.host_cols[1] = 8, 2
     with pytest.raises(ValueError, match="fit a block table row"):

@@ -294,6 +294,9 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
+    # How many times the step's capture replayed (`StepContext.repeats`): each
+    # stop buffer then holds one column per replay.
+    repeats: int = 1
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
@@ -1106,6 +1109,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
+        """What carries a replay of this walk's capture to the next, as (stop
+        buffer, static input); None when the walk's step can't repeat."""
+        del graph_walk
+        return None
+
     def resident_walks(self) -> frozenset[str]:
         """Walks whose captured steps may read their rows off the resident
         tables (`mstar.engine.resources.resident`). A walk here runs, for each
@@ -1551,6 +1560,9 @@ class ARNodeSubmodule(NodeSubmodule):
         if self._reads_loopback(graph_walk):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
+
+    def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
+        return (self.device_loopback.buffer, "input_ids") if self._loops_back(graph_walk) else None
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the client's copy of the token the stop check already has on the host

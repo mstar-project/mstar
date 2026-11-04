@@ -13,10 +13,26 @@ if TYPE_CHECKING:
     )
 
 
+# `max_repeats` for a resource that has no limit of its own
+ANY_REPEATS = 1 << 30
+
+
 class ResidentHooks:
     """A captured decode step reads per-request state off tables on the device;
     each owner of that state keeps its own table. A resource overrides these
     only once it has one."""
+
+    def max_repeats(self, step, ctx) -> int:
+        """How many times this step may replay with no host work between
+        replays, for a resource the step declares. One means it needs the host
+        each time, which is what a resource says until it knows better:
+        whatever it stages per step would go stale."""
+        return 1
+
+    def next_replay(self, step, ctx) -> None:
+        """Queue, on the step's stream, what the next replay of a step that
+        repeats reads and its capture doesn't advance itself."""
+        return
 
     def resident_refusal(self) -> str | None:
         """Why a node holding this resource can't run on resident tables, or None if it can."""

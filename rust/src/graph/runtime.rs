@@ -1253,6 +1253,9 @@ pub struct RouteArg {
     /// the plain route input.
     inline_signal: Option<String>,
     inline_values: Vec<i64>,
+    /// A repeated step's values after each row's first, in `rids` order, or
+    /// empty for a step that ran once.
+    inline_tails: Vec<Vec<i64>>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -1290,6 +1293,7 @@ impl<'py> FromPyObject<'py> for RouteArg {
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+            inline_tails: Vec::new(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
@@ -1382,6 +1386,8 @@ pub struct Completion {
     /// Per rid: (signal, modality, value) of the emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
     pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
+    /// Per rid: the values after `emit_inline`'s of a repeated step.
+    pub emit_inline_tails: FxHashMap<u32, Vec<i64>>,
     /// Per rid: the log-prob its client emits carry (`RouteArg::logprobs`).
     pub logprobs: FxHashMap<u32, f64>,
 }
@@ -2032,6 +2038,20 @@ impl GraphRuntime {
     }
 
     /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.
+    /// How many more iterations of `loop_name` the rows can all take, after
+    /// the `stride` each has in flight: a repeated step never passes a cap.
+    fn loop_room(
+        &self, node_name: &str, graph_walk: &str, loop_name: &str, rids: Vec<u32>, stride: u32,
+    ) -> u32 {
+        let Some((wg, lid)) = self.loop_of(node_name, graph_walk, loop_name) else { return 0 };
+        rids.iter()
+            .map(|&rid| self.state(wg, rid).map_or(0, |state| {
+                state.loop_max_iters(lid).saturating_sub(state.loop_iter(lid).saturating_add(stride))
+            }))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn loop_progress(
         &self, node_name: &str, rids: Vec<u32>, graph_walks: Vec<String>,
         loop_names: Vec<String>,
@@ -2710,6 +2730,7 @@ impl GraphRuntime {
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
+        let mut emit_inline_tails: FxHashMap<u32, Vec<i64>> = FxHashMap::default();
         let logprobs: FxHashMap<u32, f64> = input
             .rids
             .iter()
@@ -3089,6 +3110,9 @@ impl GraphRuntime {
                     emit_inline.insert(
                         rid, (e.name, e.modality, input.inline_values[i]),
                     );
+                    if let Some(tail) = input.inline_tails.get(i).filter(|t| !t.is_empty()) {
+                        emit_inline_tails.insert(rid, tail.clone());
+                    }
                 }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
@@ -3292,6 +3316,7 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
+                emit_inline_tails,
                 logprobs,
             },
         );
@@ -3369,7 +3394,8 @@ impl GraphRuntime {
         row_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
         let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
-        self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)
+        let found = self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)?;
+        Ok((found.rids, found.rules, found.missing))
     }
 
 
@@ -3385,7 +3411,7 @@ impl GraphRuntime {
         stop_rids, stop_loops, runtime_stops,
         token_ptr, token_rows, token_stride, token_dtype, row_rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        partition_done, python_send, loop_strides = None,
+        partition_done, python_send, loop_strides = None, token_width = 1,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn begin_postprocess(
@@ -3398,11 +3424,13 @@ impl GraphRuntime {
         inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
         inline_stride: usize, inline_dtype: &str,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
+        token_width: usize,
     ) -> PyResult<postprocess::PostprocessOut> {
-        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
+            .map(|col| col.wide(token_width));
         let inline = inline_signal.and_then(|signal| {
             postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
-                .map(|col| (signal, col))
+                .map(|col| (signal, col.wide(token_width)))
         });
         let pp = postprocess::Postprocess::new(
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
@@ -3428,7 +3456,7 @@ impl GraphRuntime {
         inline_signal: Option<String>, inline_values: Vec<i64>, logprobs: Vec<Option<f64>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
-            tensors, num_tensors, inline_signal, inline_values, logprobs,
+            tensors, num_tensors, inline_signal, inline_values, inline_tails: Vec::new(), logprobs,
         };
         self.pp_resume_store(py, stored)
     }
@@ -3637,6 +3665,7 @@ impl GraphRuntime {
         // The graph is resolved per walk in the loop below: a completion that
         // spans a combined walk has no single `c.wg`.
         let emit_inline = std::mem::take(&mut c.emit_inline);
+        let mut emit_inline_tails = std::mem::take(&mut c.emit_inline_tails);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             nested: c.nested.clone(),
@@ -3691,6 +3720,15 @@ impl GraphRuntime {
                                 self.interner.name(modality).to_string(),
                                 value,
                             ));
+                            // one row of the frame per iteration, in order
+                            for tail in emit_inline_tails.remove(&rid).unwrap_or_default() {
+                                plan.emit_inline.push((
+                                    rid,
+                                    name.clone(),
+                                    self.interner.name(modality).to_string(),
+                                    tail,
+                                ));
+                            }
                         }
                         _ => plan.emit.push((
                             rid,

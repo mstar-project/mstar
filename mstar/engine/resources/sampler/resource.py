@@ -7,6 +7,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
     LoopbackState,
@@ -401,6 +402,18 @@ class SamplerResource(Resource):
 
     # Resident planning: the scalars as cells of the planner's rows, by its
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
+
+    def max_repeats(self, step, ctx) -> int:
+        """Replays need the offset and the last token to move in the graph, and
+        no per-step state outside it."""
+        bufs = self._cg_buffers
+        if (
+            bufs is None or not bufs.ingraph_scatter or self._penalty_live
+            or self._history is not None or step.loopback_writes
+            or self._logprob_rids or self._kept_rids_of(step, ctx) is not None
+        ):
+            return 1
+        return ANY_REPEATS
 
     def resident_refusal(self) -> str | None:
         # never holds a node back: without a planner it stages its rows on the host

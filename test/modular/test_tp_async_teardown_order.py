@@ -55,7 +55,7 @@ class _Stop(BaseException):
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
     scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, repeats=1,
         request_to_worker_graph={rid: 0 for rid in rids},
         chunk_ranges={}, incomplete_node_rids=set(),
         rids_by_walk=lambda: {WALK: list(rids)},

@@ -127,6 +127,7 @@ from mstar.worker.speculation import (
     SpeculationContext,
     SpeculationPreparer,
 )
+from mstar.worker.step_repeats import StepRepeats
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -620,6 +621,7 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
+        self._step_repeats = StepRepeats((model_config or {}).get("max_step_repeats", 1))
         self.chunk_loops = ChunkLoops.from_graphs(
             my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
             model.chunking_policy_of() if model is not None else {},
@@ -2882,6 +2884,30 @@ class Worker:
             for walk in batch.rids_by_walk()
         )
 
+    def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
+        """Ask for as many iterations as the step can have; its resources narrow it."""
+        batch = speculation.scheduled_batch
+        repeats = self._step_repeats.ceiling(
+            speculation, in_chain, self._walk_can_repeat,
+            lambda: self._graph_runtime.loop_room(
+                batch.node_name, batch.graph_walk, speculation.loop_name,
+                list(speculation.continuing_rids), pending.batch.repeats,
+            ),
+        )
+        batch.repeats = speculation.node_batch.step_context.repeats = repeats
+
+    def _walk_can_repeat(self, node_name: str, graph_walk: str) -> bool:
+        """A walk's token stop runs in the runtime and all it routes stays on the
+        device: nothing about a step's rows has to reach the host per iteration."""
+        engine = self.engine_manager.get_engine(node_name)
+        return (
+            self._stop_token_signal.get((node_name, graph_walk)) is not None
+            and self._all_on_device(
+                engine, node_name, graph_walk, self._graph_runtime.get_output_signals(node_name, graph_walk),
+            )
+            and engine.can_repeat(node_name, graph_walk)
+        )
+
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
             return False
@@ -3829,6 +3855,8 @@ class Worker:
             # routes without stopping for it
             checked = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine).stops
             _pp_stage("check_stop")
+        # what the step's resources let it run, which only it knows
+        batch_N.batch.repeats = outputs.repeats
         request = self._get_postprocess_request(
             batch_N, host_rows, engine, runtime_stops, tokens, checked,
         )
@@ -3999,6 +4027,7 @@ class Worker:
             partition_done=list(batch_N.node_batch.partition_done_rids),
             python_send=self.enable_prof,
             loop_strides=batch.loop_strides(rids),
+            token_width=batch.repeats,
         )
 
     def _check_stops(
@@ -4937,6 +4966,8 @@ class Worker:
                     range_push("worker.speculate", synchronize=False)
                 _t0 = _time.perf_counter() if self._phase_period else 0.0
                 speculation = self._try_speculate_next(pending, target)
+                if speculation is not None and not speculation.is_yield_away:
+                    self._stamp_repeats(speculation, pending, consecutive)
                 if self._phase_period:
                     self._phase_record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
@@ -5478,7 +5509,7 @@ class Worker:
                     if speculation.is_yield_away and not speculation.gave_way:
                         consecutive_spec_steps = 0
                     else:
-                        consecutive_spec_steps += 1
+                        consecutive_spec_steps += spec_pending.batch.repeats
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
                         _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)

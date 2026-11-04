@@ -546,6 +546,24 @@ class StepRunner:
         """A step off the chain, which leaves the chain's stage alone."""
         return bool(self._on_lane) and bool(step.keys()) and self._on_lane.keys() >= step.keys()
 
+    def _settle_repeats(self, step: SubmoduleStep) -> None:
+        """Narrow the step's replays to what its resources allow, before any
+        of them reserves for it. Every resource the step declares answers, not
+        only the pre-planning ones."""
+        ctx = step.ctx
+        if ctx.repeats == 1:
+            return
+        if ctx.resident is None:
+            ctx.repeats = 1
+            return
+        ctx.repeats = max(1, min(
+            ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
+        ))
+
+    def next_replay(self, step: SubmoduleStep) -> None:
+        for key in self._keys_for(step):
+            self._resources[key].next_replay(step.get(key), step.ctx)
+
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved.
@@ -562,6 +580,8 @@ class StepRunner:
         if pre is not None and staged_key is not None and pre[0] == staged_key:
             covered = self._preplan_keys_for(step)
             ready = pre[1]
+        else:
+            self._settle_repeats(step)
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -638,6 +658,7 @@ class StepRunner:
 
         Unwound on refusal exactly as ``admit`` is.
         """
+        self._settle_repeats(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):
