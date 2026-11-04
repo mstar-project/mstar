@@ -123,9 +123,12 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         def rows(lens, out):
             return out
 
-        def timed(fn):
+        def timed(fn, queued=0.1):
+            # device time of fn's launches, queued behind other work: on an idle stream the
+            # events also time a host stalled by load, as they would on a GPU
             torch.cuda.synchronize()
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            clock.charge(queued)
             start.record(); fn(); end.record(); end.synchronize()
             return start.elapsed_time(end) / 1000
 
@@ -178,9 +181,10 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         import time
         g5 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g5):
-            clock.on_replay(lambda: time.sleep(0.05))
+            clock.on_replay(lambda: time.sleep(0.2))
             a @ a
-        assert timed(g5.replay) < 0.02, timed(g5.replay)
+        took = timed(g5.replay, queued=0.0)  # idle: a late launch would show
+        assert took < 0.1, took
         try:
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
                 lens.sum().item()
@@ -268,13 +272,13 @@ def test_an_event_on_an_idle_stream_holds_no_thread_back():
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()
         with clock.computing():
-            time.sleep(0.05)
+            time.sleep(0.2)
         recorder = threading.Thread(target=event.record)
         recorder.start(); recorder.join()
         with torch.cuda.stream(stream):
             start.record(); stream.wait_event(event); torch.empty(8, device="cuda").add_(1); end.record()
         end.synchronize()
-        assert start.elapsed_time(end) < 25, start.elapsed_time(end)
+        assert start.elapsed_time(end) < 100, start.elapsed_time(end)
         print("ok")
     """)
     assert out.strip() == "ok"
@@ -329,11 +333,10 @@ def test_device_side_assert_surfaces_once_the_device_reaches_it_and_stays():
     device, launches on; the next sync raises, and so does every later CUDA call."""
     out = run_sim("""
         import torch
-        a = torch.empty(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        from mstar_sim import clock
         table, ids = torch.empty(50, 8, device="cuda"), torch.tensor([3, 77], device="cuda")
         torch.cuda.synchronize()
-        for _ in range(5):
-            a @ a  # milliseconds of device work queued ahead of the bad index
+        clock.charge(0.5)  # device work queued ahead of the bad index
         torch.nn.functional.embedding(ids, table)
         (ids + 1)  # launched before the device got to the fault
         for call in (torch.cuda.synchronize, lambda: torch.empty(1, device="cuda")):
