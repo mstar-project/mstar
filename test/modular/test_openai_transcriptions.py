@@ -473,6 +473,21 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
 
 
 @requires_audio_duration
+def test_sequential_long_form_keeps_higgs_audios_instruction(client_and_stub):
+    """Higgs-Audio takes no previous text: the transcript so far replaced its instruction."""
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+
+    client, stub = client_and_stub
+    stub.model_name = "higgs_audio"
+    stub.model = object.__new__(HiggsAudioModel)
+    stub.queued_chunks = [_text(" one"), _text(" two"), _text(" three")]
+    r = _post(client, {"model": "higgs_audio", "long_form": "sequential", "prompt": "Q"},
+              filename="long.wav", content=_wav_bytes(65))
+    assert r.json() == {"text": "one two three"}
+    assert [s["text"] for s in stub.submits] == ["Q", "Q", "Q"]
+
+
+@requires_audio_duration
 def test_parallel_long_form_submits_everything_up_front(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text(" one"), _text(" two"), _text(" three")]
