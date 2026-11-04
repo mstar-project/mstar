@@ -478,9 +478,10 @@ class Resource(ResidentHooks, ABC):
         ids, and keep the rest. Returns what was reclaimed."""
         return 0
 
-    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
-        return
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> AdmitOutcome:
+        """Take in what the dropped request's rebuild writes, before its first chunk runs. A refusal is terminal,
+        since nothing else can bring the dropped state back."""
+        return ADMIT_OK
 
     def land_rebuild(self, rid: str) -> None:
         """The dropped request's rebuild has run its last chunk."""

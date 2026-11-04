@@ -50,6 +50,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
+    FULL_ADMIT_OK,
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
@@ -3142,10 +3143,14 @@ class Engine:
             resource.check_drop(request_id)
         return sum(resource.drop(request_id) for resource in resources)
 
-    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
-        """Tell each of the node's resources what the dropped request's rebuild row writes."""
-        for resource in self._submodules[node_name].resources.values():
-            resource.prepare_rebuild(request_id, rebuild)
+    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> FullAdmitOutcome:
+        """Tell each of the node's resources what the dropped request's rebuild row writes, and return the first
+        refusal, which fails the request."""
+        for key, resource in self._submodules[node_name].resources.items():
+            outcome = resource.prepare_rebuild(request_id, rebuild)
+            if not outcome.ok:
+                return FullAdmitOutcome(outcome, key)
+        return FULL_ADMIT_OK
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
         """Make the dropped request resident again, once its rebuild row has run."""

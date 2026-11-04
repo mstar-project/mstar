@@ -93,7 +93,7 @@ def _rebuilding(fresh: dict[int, int] | None = None):
     # A's prompt row carries no inputs here, so its ids count as kept already
     w._rebuilds._kept[NODE].update({R: _kept(4), A: _kept()})
     eng.dropped.append(R)
-    w._rebuilds.start(R, NODE)
+    w._rebuilds.start(R, NODE, w._rebuilds.rebuild_of(R, NODE))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0, **(fresh or {})}, rebuild_rids=frozenset({R}))
     return w, eng, batch, w._build_executing_batch(batch)
 
@@ -146,7 +146,7 @@ def test_a_chunk_short_of_the_prompts_end_advances_the_rebuild_and_lands_nothing
     w, eng = _worker()
     w._rebuilds._kept[NODE][R] = _kept(4, 5)
     eng.dropped.append(R)
-    w._rebuilds.start(R, NODE)
+    w._rebuilds.start(R, NODE, w._rebuilds.rebuild_of(R, NODE))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
     batch.chunk_ranges[R] = ChunkRange(0, 2, 4, 2)
     node_batch = w._build_executing_batch(batch)
@@ -164,7 +164,7 @@ def test_a_rebuild_rows_ids_go_to_the_device_on_its_first_chunk_only(chunk):
     w, eng = _worker()
     w._rebuilds._kept[NODE][R] = _kept(4, 5)
     eng.dropped.append(R)
-    w._rebuilds.start(R, NODE)
+    w._rebuilds.start(R, NODE, w._rebuilds.rebuild_of(R, NODE))
     batch = ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R}))
     if chunk is not None:
         batch.chunk_ranges[R] = chunk

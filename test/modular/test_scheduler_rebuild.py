@@ -75,6 +75,7 @@ class _Engine(_RoomEngine):
 
     def prepare_rebuild(self, node_name, rid, rebuild):
         self.prepared.append((rid, list(rebuild.ids)))
+        return FULL_ADMIT_OK
 
     def admit_waiting(self, published_of):
         return []

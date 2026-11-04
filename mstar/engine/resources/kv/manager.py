@@ -3580,9 +3580,10 @@ class KVManager(AttentionResource):
             self._dropped[rid] = held
             return self._arena.num_free - free
 
-    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> AdmitOutcome:
         """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
-        one, keyed as a prompt of those ids would be.
+        one, keyed as a prompt of those ids would be. Refused when that span isn't as long as what the
+        label held.
 
         The growth loop's cap drops by the iterations the span now covers, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
@@ -3591,15 +3592,15 @@ class KVManager(AttentionResource):
         overrides = self._overrides[rid]
         laid_out = [label for label, layout in (overrides.kv_layout or {}).items() if layout.spans]
         if not laid_out:
-            return
+            return ADMIT_OK
         (label,) = laid_out
         ids, walk = rebuild.ids, rebuild.walk
         prompt, page_size = ids[:-1], self.config.tokens_per_page
         length = len(prompt)
         if length != self._dropped[rid]:
-            raise RuntimeError(
+            return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
                 f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its label held {self._dropped[rid]}"
-            )
+            ))
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
@@ -3629,6 +3630,7 @@ class KVManager(AttentionResource):
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
                 stream.chain.extend([ids[-1]], page_size)
+        return ADMIT_OK
 
     def land_rebuild(self, rid: str) -> None:
         self._dropped.pop(rid, None)
