@@ -53,6 +53,9 @@ from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
+# How long a read waits for a verify step's verdict before the process exits
+_VERDICT_DEADLINE_S = 300.0
+
 # Captured prefill shapes when the config names none. They start above the MoE decode path's
 # 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
 # request's 2048, then 256 apart to 4096 for steps of several prompts.
@@ -626,25 +629,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         states = [self.request_state(rid) for rid in request_ids]
         pending = [st.get("mtp_pending") for st in states]
         seq, key, _ = pending[0]
-        assert all(p[:2] == (seq, key) for p in pending), pending
+        if any(p[:2] != (seq, key) for p in pending):
+            raise SystemExit(f"one MTP verdict read spans several steps: {pending}")
         # read once, then kept: a later step may reuse the mailbox before a second read
         cached = [st.get("mtp_verdict") for st in states]
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        # No timeout, as with a collective: every read follows the step's launch (a pre-plan
-        # waits on its commit), so only a hung device or peer delays the verdict, and a rank
-        # giving up alone would leave the others in the next all-reduce.
+        # A step that failed after it was numbered never stages its verdict. Failing this rank's
+        # batch alone would leave the other ranks in its collective, so a missed deadline exits
+        # the process: the instance goes down where everyone sees it, rather than hanging.
+        deadline = time.monotonic() + _VERDICT_DEADLINE_S
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                # a broken invariant, not a request's failure: failing this rank's batch alone
-                # would leave the other ranks in its collective
                 raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it "
                     "was read")
+            if time.monotonic() > deadline:
+                raise SystemExit(
+                    f"MTP step {seq} never staged its verdict in {_VERDICT_DEADLINE_S:.0f} s")
             time.sleep(0)
         table = verdicts[:max(p[2] for p in pending) + 1].tolist()
         k1 = self.mtp_block
