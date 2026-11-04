@@ -2803,9 +2803,10 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's.
+    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
+    # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
-        app, host=host, port=port, access_log=False,
+        app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
     )
 
