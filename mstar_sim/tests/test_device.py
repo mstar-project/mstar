@@ -397,6 +397,22 @@ def test_timing_only_holds_shapes_not_values():
         for make in (torch.zeros_like, torch.ones_like, lambda t: torch.full_like(t, 2.0), lambda t: t.new_zeros(2),
                      lambda t: t.new_ones(2), lambda t: t.new_full((2,), 2.0)):
             assert not never_computed(make(stand_in())._data), make
+        # a stand-in's write in place flags what it writes, and only that
+        import types
+        from flashinfer import comm
+        from mstar_sim import kernels
+        q, k, state, weight, residual, normed, summed = (torch.empty(2, 8, device="cuda") for _ in range(7))
+        flashinfer.fused_add_rmsnorm(q, k, weight[0])
+        assert never_computed(q._data) and never_computed(k._data) and not never_computed(weight._data)
+        q, k = torch.empty(2, 1, 8, device="cuda"), torch.empty(2, 1, 8, device="cuda")
+        flashinfer.apply_rope_pos_ids_inplace(q, k, torch.arange(2, device="cuda"))
+        assert never_computed(q._data) and never_computed(k._data)
+        kernels.causal_conv1d_update(weight.clone(), state, weight)
+        assert never_computed(state._data)
+        ws = types.SimpleNamespace(world_size=2)
+        comm.allreduce_fusion(weight, ws, residual_in=weight, residual_out=residual, norm_out=normed)
+        comm.allreduce_fusion(input=weight, workspace=ws, pattern=comm.AllReduceFusionPattern.kAllReduce, output=summed)
+        assert all(never_computed(t._data) for t in (residual, normed, summed)) and not never_computed(weight._data)
         torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         del big

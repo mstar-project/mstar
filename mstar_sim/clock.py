@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import os
 import threading
 import time
@@ -197,7 +198,7 @@ def _flag_values(out, written):
 
 
 def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None = None, dtype=None,
-              writes_args: bool = False):
+              writes_args: bool | tuple[str, ...] = False):
     """Make a stand-in one kernel of the simulated GPU.
 
     The decorated function computes nothing: it returns what the kernel would
@@ -209,10 +210,17 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
     priced once; or a callable returning that, for a cost that depends on the
     values its kernel reads (a plan's lengths), priced at every replay of a
     graph that captured it. The callable is all a graph keeps of the call, so
-    it should hold what it reads, not the kernel's tensors. ``writes_args``: it
-    writes its arguments in place, with no telling which (a Triton launch)."""
+    it should hold what it reads, not the kernel's tensors. ``writes_args``: the
+    arguments it writes in place, by name, or True for any of them, with no telling
+    which (a Triton launch)."""
 
     def decorate(fn):
+        def written(args, kwargs) -> tuple:
+            if isinstance(writes_args, bool):
+                return args if writes_args else ()
+            bound = inspect.signature(fn).bind(*args, **kwargs).arguments
+            return tuple(bound.get(name) for name in writes_args)
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             from mstar_sim import cost as cost_model
@@ -232,7 +240,7 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
                     out = fn(*args, **kwargs)
                 finally:
                     _tls.in_kernel -= 1
-                out = _flag_values(out, args if writes_args else ())
+                out = _flag_values(out, written(args, kwargs))
             if FAST:
                 return out
             tape = capturing()

@@ -53,7 +53,7 @@ def _conv_cost(a: dict) -> tuple:
             2 * _nbytes(x) + _nbytes(a["weight"]) + 2 * rows * _per_row(pool), features)
 
 
-def _kernel(name: str, cost):
+def _kernel(name: str, cost, writes_args: tuple[str, ...] = ()):
     """``kernel_fn`` with ``cost`` given the call's arguments by name."""
 
     def decorate(fn):
@@ -63,12 +63,12 @@ def _kernel(name: str, cost):
         def by_name(*args, **kwargs):
             return cost(sig.bind(*args, **kwargs).arguments)
 
-        return clock.kernel_fn(name, cost=by_name)(fn)
+        return clock.kernel_fn(name, cost=by_name, writes_args=writes_args)(fn)
 
     return decorate
 
 
-@_kernel("flashinfer.gdn_prefill", _gdn_cost)
+@_kernel("flashinfer.gdn_prefill", _gdn_cost, writes_args=("output_state", "state_checkpoints"))
 def chunk_gated_delta_rule(
     q, k, v, g=None, beta=None, scale=None, initial_state=None, output_final_state=False,
     cu_seqlens=None, use_qk_l2norm_in_kernel=False, output=None, output_state=None,
@@ -98,7 +98,7 @@ def gated_delta_rule_decode_pretranspose(
     return out, initial_state if state is None else state
 
 
-@_kernel("triton.causal_conv1d_fn", _conv_cost)
+@_kernel("triton.causal_conv1d_fn", _conv_cost, writes_args=("conv_states",))
 def causal_conv1d_fn(
     x, weight, bias, conv_states, query_start_loc, cache_indices=None, has_initial_state=None,
     activation="silu", pad_slot_id=-1, null_block_id=0, block_idx_first_scheduled_token=None,
@@ -109,7 +109,7 @@ def causal_conv1d_fn(
     return torch.empty_like(x)
 
 
-@_kernel("triton.causal_conv1d_update", _conv_cost)
+@_kernel("triton.causal_conv1d_update", _conv_cost, writes_args=("conv_state",))
 def causal_conv1d_update(
     x, conv_state, weight, bias=None, activation=None, conv_state_indices=None,
     num_accepted_tokens=None, query_start_loc=None, max_query_len=-1, null_block_id=0,

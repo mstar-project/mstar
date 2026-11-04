@@ -31,13 +31,13 @@ def gemma_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
     return torch.empty_like(input) if out is None else out
 
 
-@clock.kernel_fn("flashinfer.fused_add_rmsnorm", cost=_fused_cost)
+@clock.kernel_fn("flashinfer.fused_add_rmsnorm", cost=_fused_cost, writes_args=("input", "residual"))
 def fused_add_rmsnorm(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
                       eps: float = 1e-6, enable_pdl: bool | None = None) -> None:
-    return None  # in place
+    return None
 
 
-@clock.kernel_fn("flashinfer.gemma_fused_add_rmsnorm", cost=_fused_cost)
+@clock.kernel_fn("flashinfer.gemma_fused_add_rmsnorm", cost=_fused_cost, writes_args=("input", "residual"))
 def gemma_fused_add_rmsnorm(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
                             eps: float = 1e-6, enable_pdl: bool | None = None) -> None:
-    return None  # in place
+    return None

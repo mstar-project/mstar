@@ -52,13 +52,14 @@ def _norm_cost(input, *args, **kwargs):
     return 5.0 * input.numel(), 4.0 * input.numel() * input.element_size()
 
 
-@clock.kernel_fn("flashinfer.allreduce_fusion_norm", cost=_norm_cost)
-def _norm(input, residual_out, norm_out):
-    return None  # writes residual_out and norm_out in place
+@clock.kernel_fn("flashinfer.allreduce_fusion_norm", cost=_norm_cost,
+                 writes_args=("residual_out", "norm_out", "output"))
+def _norm(input, residual_out, norm_out, output):
+    return None
 
 
 def allreduce_fusion(input, workspace, pattern=AllReduceFusionPattern.kARResidualRMSNorm, *, residual_in=None,
-                     residual_out=None, norm_out=None, rms_gamma=None, rms_eps=1e-6, **kwargs):
+                     residual_out=None, norm_out=None, output=None, rms_gamma=None, rms_eps=1e-6, **kwargs):
     if pattern not in (AllReduceFusionPattern.kAllReduce, AllReduceFusionPattern.kARResidualRMSNorm):
         _missing(f"allreduce_fusion(pattern={pattern!r})")
     from mstar_sim import cost
@@ -67,5 +68,5 @@ def allreduce_fusion(input, workspace, pattern=AllReduceFusionPattern.kARResidua
         clock.charge(cost.collective_seconds("all_reduce", workspace.world_size,
                                              input.numel() * input.element_size(),
                                              graph=clock.capturing() is not None))
-    _norm(input, residual_out, norm_out)
+    _norm(input, residual_out, norm_out, output)
     return norm_out if norm_out is not None else input
