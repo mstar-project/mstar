@@ -156,6 +156,10 @@ def sweep(op_name: str, shape: dict[str, int], dtype: torch.dtype, buckets, quic
     cls = _sweeper(op_name)
     device = torch.device("cuda", torch.cuda.current_device())
     dev = device_key(device)
+    command = op.sweep_command(dtype, shape)
+    if command is None:
+        raise SystemExit(f"{op_name}'s sweep times {', '.join(op.sweep_dtypes)} only; measure a "
+                         f"{dtype_name(dtype)} entry end to end (benchmark/kernels/README.md)")
     reasons = op.unavailable(op.target(dtype, shape, device))
     if len(reasons) == len(op.impls):
         raise SystemExit(f"{op_name} can't run {dtype_name(dtype)} {shape} here: {reasons}")
@@ -188,7 +192,6 @@ def sweep(op_name: str, shape: dict[str, int], dtype: torch.dtype, buckets, quic
     if not chosen:
         print("# no rows: nothing to write", flush=True)
         return True
-    command = op.sweep_command(dtype, shape)
     if buckets != tuple(cls.default_buckets):
         command += f" --buckets {','.join(map(str, buckets))}"
     try:

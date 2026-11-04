@@ -74,6 +74,8 @@ MOE_DECODE = register(KernelOp(
     doc="the small-batch MoE's launch tiles (fused_moe.decode): fp8 experts with a shared expert, or "
         "bf16 / fp16 ones (routed_experts); hidden H, E experts of per-rank intermediate I, top-K; "
         "per-pair rows by token count, then the grouped '*' row",
+    # the sweep times the fp8 kernels; a bf16 / fp16 entry is measured end to end
+    sweep_dtypes=("float8_e4m3fn",),
 ))
 
 

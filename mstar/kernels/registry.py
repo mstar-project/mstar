@@ -113,14 +113,16 @@ def row_bounds(rows: Rows) -> tuple[int, ...]:
 @dataclass(frozen=True)
 class KernelOp:
     """A stable kernel signature: the static dimensions that key its tuned configs (``shape``),
-    the dynamic one its rows are keyed by (``bucket``, None for one row per shape), and the
-    implementations its rows may name."""
+    the dynamic one its rows are keyed by (``bucket``, None for one row per shape), the
+    implementations its rows may name, and the dtypes its sweep times (``sweep_dtypes``, None
+    for every one; an entry of another dtype is measured end to end)."""
 
     name: str
     shape: tuple[str, ...]
     bucket: str | None
     impls: tuple[Impl, ...]
     doc: str = ""
+    sweep_dtypes: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         names = [impl.name for impl in self.impls]
@@ -143,7 +145,10 @@ class KernelOp:
         """``E=128,N=1536,K=2048,top_k=8``: in declaration order, as the sweep takes it."""
         return ",".join(f"{name}={int(shape[name])}" for name in self.shape)
 
-    def sweep_command(self, dtype: torch.dtype | str, shape: Mapping[str, int]) -> str:
+    def sweep_command(self, dtype: torch.dtype | str, shape: Mapping[str, int]) -> str | None:
+        """The sweep that tunes (dtype, shape); None for a dtype the sweep doesn't time."""
+        if self.sweep_dtypes is not None and dtype_name(dtype) not in self.sweep_dtypes:
+            return None
         return (f"python -m benchmark.kernels.sweep {self.name} --dtype {dtype_name(dtype)} "
                 f"--shape {self.format_shape(shape)}")
 
@@ -200,8 +205,10 @@ class KernelOp:
         what = f"{self.name} {dtype} {self.format_shape(shape)}"
         entry = next(iter(find_entries(self.name, dev, dtype, self.shape_key(shape))), None)
         if entry is None:
-            logger.info("kernel table: no %s entry for %s; built-in configs. To tune it: %s",
-                        what, dev.name, self.sweep_command(dtype, shape))
+            command = self.sweep_command(dtype, shape)
+            logger.info("kernel table: no %s entry for %s; built-in configs. To tune it: %s", what, dev.name,
+                        command or "the sweep doesn't time this dtype; measure an entry end to end "
+                        "(benchmark/kernels/README.md)")
             return None
         self.check_rows(entry.rows, entry.source)
         logger.info("kernel table: %s on %s: %s (from %s, swept on %s, %s)", what, dev.name,
