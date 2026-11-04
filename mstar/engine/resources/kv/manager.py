@@ -4719,9 +4719,11 @@ class KVManager(AttentionResource):
     def _movable(self, rid: str) -> bool:
         """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, no step or read is in
         flight on its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its
-        allotment."""
+        allotment. A move releases ``rid``'s leases, and a walk the cache served keeps its KV only in the lease, so
+        ``rid`` also stays until a later walk's admit takes the lease over."""
         return rid not in self._earmarks and rid not in self._dropped and not any(
-            stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
+            stream.step_in_flight or stream.read_pending or (stream.lease is not None and stream.span_cursor.done)
+            for stream in self._streams[rid].values()
         )
 
     def _unwritten(self, rid: str) -> bool:
