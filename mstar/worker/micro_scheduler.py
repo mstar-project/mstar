@@ -845,9 +845,7 @@ class MicroScheduler:
         if not len(delta):
             return True
 
-        return self.engine_manager.get_engine(node_name).apply_resident_delta(
-            delta, self.rebuilds.kept_count, self.rebuilds.rebuilding,
-        )
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self.rebuilds.rebuilding)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
         new_delta = None

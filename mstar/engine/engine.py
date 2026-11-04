@@ -3336,14 +3336,11 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(
-        self, delta: OffloadDelta, kept_count: Callable[[int, str], int], rebuilding: Callable[[int, str], bool],
-    ) -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilding: Callable[[int, str], bool]) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``kept_count(rid, node)`` is how many ids this rank keeps of a request on a node, and ``rebuilding(rid,
-        node)`` whether this rank's rebuild of it is still running.
+        ``rebuilding(rid, node)`` is whether this rank's rebuild of a request on a node is still running.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3372,11 +3369,7 @@ class Engine:
                              wire_rid, kind.name, node_name, len(delta))
                 return False
             elif kind == MoveKind.DROP:
-                kept = kept_count(rid, node_name)
-                if kept != move.count:
-                    raise RuntimeError(
-                        f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps {kept}"
-                    )
+                # with the tokens rank 0's rebuild writes, which this rank's KV refuses unless it holds as many
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)

@@ -41,9 +41,6 @@ class KeptIds:
     prompt: HostCopy
     sampled: array
 
-    def __len__(self) -> int:
-        return self.prompt.view.numel() + len(self.sampled)
-
 
 class Prefilling(NamedTuple):
     """A prompt mid-prefill on a node: the walk it prefills in, the tokens its chunks have run, and its length."""
@@ -143,12 +140,6 @@ class Rebuilds:
 
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
-
-    def kept_count(self, rid: int, node: str) -> int:
-        """How many ids ``rid`` keeps on ``node``, which rank 0 journals with a drop for each follower to check.
-        A request dropped mid-prefill can keep none."""
-        kept = self.kept(rid, node)
-        return 0 if kept is None else len(kept)
 
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,
