@@ -938,15 +938,21 @@ Fish Audio S2-Pro notes
   the streamed audio matches the whole-utterance decode to within one int16 step.
 - Start-up and memory. The codec captures CUDA graphs only for steps of at most
   64 frames (batch rows times chunk width, ``CodecSubmodule.CAPTURE_MAX_FRAMES``),
-  14 of its 24 buckets; a larger step runs the compiled decode eagerly. Against
-  capturing all 24, on one H200 (three warm boots of the 64-frame cap, one of
-  everything else; throughput over two repeats of 104 short sentences):
-  start-up 150 s from cold compile caches and 84 to 88 s warm, against 278 s and
-  146 s; 52.1 GiB of GPU memory in use after start-up, against 59.7 GiB; 50.2 to
-  50.6 audio-s/s at 16 requests (2 to 3% less than 51.7) and 77.3 to 79.4 at 32
-  (77.0), with the same TTFA p50 (101 to 106 ms at 16, 122 to 127 ms at 32). A
-  128-frame cap (18 buckets) starts in 118 to 122 s warm and loses under 1% at
-  16 requests. cuDNN's algorithm search for the captured convs
+  and one row at every width: 14 of its 24 buckets. Any other step runs the
+  compiled decode eagerly, as one graph warmed at start-up for every batch size
+  and width. Against capturing all 24, on one H200 (two warm boots per arm,
+  interleaved, main in the round just before; throughput over two repeats of
+  104 short sentences): start-up 102 to 106 s warm and 172 s from cold compile
+  caches, against 146 to 148 s and 278 s; 51.1 GiB of GPU memory in use after
+  start-up, against 58.3 GiB; 79.6 to 80.2 audio-s/s at 32 requests, as with
+  every bucket (79.7 to 81.0), and 49.8 to 49.9 at 16, 3% less than 51.6
+  (interleaved with main, a codec warmed at two fixed sizes lost 1.4 to 2.5%
+  there); the same TTFA p50 (102 to 104 ms at 16 requests, 121 to 124 ms at
+  32, against 104 and 120 to 126). The eager graph's warm-up is 15 to 20 s of
+  that start-up: warming two fixed sizes instead starts in 86 to 88 s, but
+  compiles a live step at a size it missed. A 128-frame cap (18 buckets) loses
+  0.6 to 1.1% at 16 requests and starts in 118 to 122 s (one boot each, not
+  interleaved). cuDNN's algorithm search for the captured convs
   (``capture_cudnn_benchmark``) is about 20 s of a warm start-up with every
   bucket captured.
 
