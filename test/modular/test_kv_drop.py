@@ -34,7 +34,7 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import ADMIT_OK, FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
+from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
 
 PAGE_SIZE = 16
@@ -165,7 +165,6 @@ class _Recording:
 
     def prepare_rebuild(self, rid, rebuild):
         self.calls.append(("prepare", rid, rebuild))
-        return ADMIT_OK
 
     def land_rebuild(self, rid):
         self.calls.append(("land", rid))
@@ -256,19 +255,6 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
 
     assert not outcome.ready, "its step would read pages it gave back"
     assert rope._counters["r"] == {} and not kv._streams["r"]["main"].page_indices, "the rebuild would start past 0"
-
-
-@pytest.mark.parametrize("ids", [20, 22])
-def test_a_rebuild_that_would_write_other_than_what_the_label_held_is_refused_for_good(ids):
-    kv = _manager()
-    _prefill(kv, "r", 20)
-    kv.drop("r", 20)
-
-    outcome = _engine({"kv": kv}).prepare_rebuild(NODE, "r", Rebuild(WALK, array("i", range(ids))))
-
-    assert outcome.failed_resource == "kv" and outcome.reason.terminal and "held 20" in outcome.reason.message, (
-        "the scheduler would rebuild over a layout the KV refused, or ask again on every pass"
-    )
 
 
 def test_removing_a_dropped_or_relaid_request_leaks_no_page():

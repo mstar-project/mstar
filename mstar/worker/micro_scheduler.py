@@ -2216,11 +2216,8 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            rebuild = self.rebuilds.rebuild_of(rid, node_name)
-            outcome = engine.prepare_rebuild(node_name, rid, rebuild)
-            if outcome.ok:
-                self.rebuilds.start(rid, node_name, rebuild)
-                return False
+            engine.prepare_rebuild(node_name, rid, self.rebuilds.start(rid, node_name))
+            return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",

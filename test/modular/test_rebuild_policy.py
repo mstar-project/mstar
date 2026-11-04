@@ -227,8 +227,7 @@ def test_a_rebuild_writes_the_prompt_and_samples_and_its_row_reads_all_but_the_l
     rebuilds = _rebuilds()
     rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
 
-    rebuild = rebuilds.rebuild_of(R, NODE)
-    rebuilds.start(R, NODE, rebuild)
+    rebuild = rebuilds.start(R, NODE)
     inputs, infos = {R: {}}, {R: CurrentForwardPassInfo(str(R), DECODE, 0, 0, 8)}
     rebuilds.fill(NODE, {R}, {}, inputs, infos)
 

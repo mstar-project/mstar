@@ -179,17 +179,14 @@ class Rebuilds:
         kept = self._kept[node][rid]
         return kept.prompt.view.numel() + len(kept.sampled) - 1
 
-    def rebuild_of(self, rid: int, node: str) -> Rebuild:
-        """What ``rid``'s rebuild on ``node`` writes, from its kept ids."""
-        kept = self._kept[node][rid]
+    def start(self, rid: int, node: str) -> Rebuild:
+        """Open ``rid``'s rebuild on ``node``, and return what it writes."""
+        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        kept, walk = self._kept[node][rid], self._policies[node].walk
         ids = array("i", kept.prompt.view.to(torch.int32).numpy().tobytes())
         ids.extend(kept.sampled)
-        return Rebuild(self._policies[node].walk, ids)
-
-    def start(self, rid: int, node: str, rebuild: Rebuild) -> None:
-        """Open ``rid``'s rebuild on ``node``, once the node's resources have taken in ``rebuild``."""
-        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
-        self._cursors[(node, rid)] = RebuildCursor(rebuild.walk, rebuild.ids, self._kept[node][rid].prompt.view.dtype)
+        self._cursors[(node, rid)] = RebuildCursor(walk, ids, kept.prompt.view.dtype)
+        return Rebuild(walk, ids)
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors
