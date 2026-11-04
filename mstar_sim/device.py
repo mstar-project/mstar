@@ -100,9 +100,17 @@ def _is_meta(x) -> bool:
     return isinstance(x, torch.Tensor) and x.device.type == "meta"
 
 
+# host reads of never-computed values so far (zeros were returned): a check on
+# values after one is a check the emulator can't answer (``mstar_sim.pytest_plugin``)
+VALUELESS_READS = [0]
+
+
 def host_value(t: torch.Tensor) -> torch.Tensor:
     """``t``'s values for a host read: zeros for one that was never computed."""
-    return torch.zeros(t.shape, dtype=t.dtype) if t.device.type == "meta" else t
+    if t.device.type != "meta":
+        return t
+    VALUELESS_READS[0] += 1
+    return torch.zeros(t.shape, dtype=t.dtype)
 
 
 def to_device_storage(x: torch.Tensor) -> torch.Tensor:
@@ -906,7 +914,9 @@ def install() -> None:
     _installed = True
     import faulthandler
 
-    faulthandler.enable()  # a read through a fake address prints the Python stack
+    # a read through a fake address prints its thread's Python stack (all threads'
+    # from inside a signal handler is not safe while they run: install.thread_dumps)
+    faulthandler.enable(all_threads=False)
     # Moving a module to cuda keeps each Parameter object, as on a GPU (where a
     # CPU and a CUDA tensor share an impl type and torch sets `.data`): tied
     # weights stay tied and references taken before the move stay live.

@@ -14,6 +14,13 @@ def install() -> None:
     if _done:
         return
     _done = True
+    import signal
+    import threading
+
+    if threading.current_thread() is threading.main_thread():
+        # before torch starts its native threads: they inherit the mask, so the
+        # signal can only reach thread_dumps' waiter
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
     # Triton launches go through the interpreter's entry point, which triton_launch prices
     os.environ.setdefault("TRITON_INTERPRET", "1")
     # stand-ins for CUDA-only kernel libraries (flashinfer, ...) shadow the real ones
@@ -41,6 +48,33 @@ def install() -> None:
     from mstar_sim import patches
 
     patches.install()
+    thread_dumps()
+
+
+def thread_dumps() -> None:
+    """``kill -USR1 <pid>`` prints every thread's Python stack to stderr: for a
+    hung repro. A thread of its own waits for the signal (blocked everywhere
+    else, and inherited blocked by every thread started after), so the dump runs
+    even while the main thread sits in a C call."""
+    import signal
+    import threading
+    import traceback
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def wait():
+        while True:
+            signal.sigwait({signal.SIGUSR1})
+            names = {t.ident: t.name for t in threading.enumerate()}
+            lines = [f"mstar_sim: thread dump of pid {os.getpid()}\n"]
+            for ident, frame in sys._current_frames().items():
+                lines.append(f"--- thread {names.get(ident, ident)}\n")
+                lines.extend(traceback.format_stack(frame))
+            sys.stderr.write("".join(lines))
+            sys.stderr.flush()
+
+    threading.Thread(target=wait, name="mstar_sim-thread-dump", daemon=True).start()
 
 
 def _no_compile(torch) -> None:
