@@ -134,6 +134,7 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
         linear_attn_key: str = "linear_attn",
         state_key: str = "gdn_state",
         comm_group: CommGroup | None = None,
+        layer: int | None = None,
     ):
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -160,6 +161,7 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             rms_norm_eps=rms_norm_eps,
             linear_attn_key=linear_attn_key,
             state_key=state_key,
+            layer=layer,
         )
         self.comm_group = comm_group
         # Totals describe the checkpoint, which the loaders slice.

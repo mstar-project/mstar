@@ -25,6 +25,7 @@ import torch
 from torch import nn
 
 from mstar.engine.resources.convenience import LinearAttnCallable
+from mstar.engine.state import causal_conv, gated_delta_net
 from mstar.model.components.norm import RMSNormGated
 
 
@@ -78,6 +79,7 @@ class GatedDeltaNet(nn.Module):
         rms_norm_eps: float = 1e-6,
         linear_attn_key: str = "linear_attn",
         state_key: str = "gdn_state",
+        layer: int | None = None,
     ):
         super().__init__()
         # resource labels this layer calls; see components/attention.py
@@ -85,6 +87,8 @@ class GatedDeltaNet(nn.Module):
         self._state_key = state_key
         self.attn = None
         self.pool = None
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
 
         self.hidden_size = hidden_size
         self.layout = layout
@@ -186,6 +190,10 @@ class GatedDeltaNet(nn.Module):
         # see Attention.bind_resources
         self.mix = LinearAttnCallable(pool=self.pool, attn=self.attn)
 
+    def bind_state(self, handles: dict) -> None:
+        """See ``Attention.bind_state``."""
+        self.state = handles.get(self._state_key)
+
     def _project_split(self, x: torch.Tensor):
         """Qwen3.5: one GEMM over [q|k|v|z|a|pad|b], then split.
 
@@ -261,11 +269,11 @@ class GatedDeltaNet(nn.Module):
         qkv, z, a, b = project(hidden_states)
 
         # [conv_dim, 1, width] -> [conv_dim, width] for the kernel
-        qkv = self.mix.conv(
-            qkv,
-            weight=self.conv1d.weight.squeeze(1),
-            bias=self.conv1d.bias,
-        )
+        weight = self.conv1d.weight.squeeze(1)
+        if self.state is not None:
+            qkv = causal_conv(self.state, self.layer, qkv, weight=weight, bias=self.conv1d.bias)
+        else:
+            qkv = self.mix.conv(qkv, weight=weight, bias=self.conv1d.bias)
         q, k, v = torch.split(
             qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
@@ -273,6 +281,9 @@ class GatedDeltaNet(nn.Module):
         k = k.view(num_tokens, self.num_k_heads, self.head_k_dim)
         v = v.view(num_tokens, self.num_v_heads, self.head_v_dim)
 
-        core = self.mix(q, k, v, a, b, self.A_log, self.dt_bias)
+        if self.state is not None:
+            core = gated_delta_net(self.state, self.layer, q, k, v, a, b, self.A_log, self.dt_bias)
+        else:
+            core = self.mix(q, k, v, a, b, self.A_log, self.dt_bias)
         core = self.norm(core, z)
         return self.out_proj(core.reshape(num_tokens, self.value_dim))

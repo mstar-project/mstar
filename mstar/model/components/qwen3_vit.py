@@ -233,7 +233,7 @@ class VisionAttention(nn.Module):
     (``CantSplit``) to codegen packed runs of three or more images.
     """
 
-    def __init__(self, config: ViTConfig, attn_key: str):
+    def __init__(self, config: ViTConfig, attn_key: str, array: str | None = None, layer: int | None = None):
         super().__init__()
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
@@ -241,11 +241,18 @@ class VisionAttention(nn.Module):
         self.proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.attn_key = attn_key
         self.ragged_attn = None
+        self.array = array
+        self.layer = layer
+        self.state = None
 
     def bind_resources(self, resources: dict) -> None:
         """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
         that never builds the vision node binds nothing here."""
         self.ragged_attn = resources.get(self.attn_key)
+
+    def bind_state(self, handles: dict) -> None:
+        """See ``Attention.bind_state``."""
+        self.state = handles.get(self.array)
 
     def forward(
         self,
@@ -253,7 +260,7 @@ class VisionAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.ragged_attn is None:
+        if self.ragged_attn is None and self.state is None:
             raise RuntimeError(
                 "the vision tower has no ragged attention resource; declare a "
                 f"RaggedAttentionSpec under {self.attn_key!r} for its node"
@@ -273,16 +280,20 @@ class VisionAttention(nn.Module):
         q = ((qf * c) + (_rotate_half(qf) * s)).to(dtype)
         k = ((kf * c) + (_rotate_half(kf) * s)).to(dtype)
 
-        out = self.ragged_attn.run(q, k, v)
+        if self.state is not None:
+            self.state.add(self.layer, k=k, v=v)
+            out = self.state.read(self.layer, q)
+        else:
+            out = self.ragged_attn.run(q, k, v)
         return self.proj(out.reshape(seq_len, -1).contiguous())
 
 
 class VisionBlock(nn.Module):
-    def __init__(self, config: ViTConfig, attn_key: str):
+    def __init__(self, config: ViTConfig, attn_key: str, array: str | None = None, layer: int | None = None):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = VisionAttention(config, attn_key)
+        self.attn = VisionAttention(config, attn_key, array, layer)
         self.mlp = VisionMLP(config)
 
     def forward(
