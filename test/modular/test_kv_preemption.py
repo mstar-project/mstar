@@ -530,6 +530,66 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     assert _ready(kv, "b") and not _queue(kv)
 
 
+def _back_from_the_host_and_short(kv) -> int:
+    """z moves to the host for x, comes back beside y once x finishes, and grows until the pool is full. Returns how
+    many pages z is short."""
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "x", 3, arrival=0)
+    _running(kv, "y", 5, arrival=1)
+    _running(kv, "z", 2, arrival=3)
+    assert _preempt(kv, "x", _short(kv, "x"), droppable=lambda rid: False) == Victims(["z"], [], [])
+    _offload(kv, "z")
+    _remove(kv, "x")
+    assert _ready(kv, "z"), "z didn't come back once its pages and a page fit"
+    while (outcome := _step(kv, "z", PAGE_SIZE)).ok:
+        pass
+    return outcome.reason.pages_short
+
+
+def test_a_request_back_from_the_host_waits_for_its_shortage_rather_than_moving_itself_again():
+    """A request came back from the host once its pages and one more page fit. On its next page the pool had no
+    room, so the request, the newest holding pages, moved to the host again, and again for every page after."""
+    kv = _pool()
+    short = _back_from_the_host_and_short(kv)
+
+    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims([], [], [], waits=True), (
+        "z moved to the host again for its own page"
+    )
+
+
+def test_a_request_back_moves_itself_again_for_an_older_request_waiting_in_the_queue():
+    """A request that came back waited for its shortage holding its pages, while an older request waited in the
+    queue for room those pages would make. The queue admits the older request first, so neither was admitted."""
+    kv = _pool()
+    short = _back_from_the_host_and_short(kv)
+    _request(kv, "p", 3, arrival=2)
+    assert not _ready(kv, "p")
+
+    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims(["z"], [], []), (
+        "z waited for its shortage behind p, which waits for z's pages"
+    )
+    _offload(kv, "z")
+    assert _ready(kv, "p"), "p didn't get the room z made"
+
+
+def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
+    kv = _pool()
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "v", 2, arrival=2)
+    assert _step(kv, "o", 5 * PAGE_SIZE).ok
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    _request(kv, "a", 2, arrival=1)
+    _remove(kv, "o")
+    assert _ready(kv, "a") and _admitted(kv, "v")
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
+
+    assert "v" in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v held back pages an older request needed"
+
+
 def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():
     """`Engine.reload_request` undoes a partial reload by offloading what it reloaded, which the KV's offload must not
     refuse for a request that came back from the host."""
