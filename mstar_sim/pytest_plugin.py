@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 import pathlib
 import re
+import sys
 
 import pytest
 
@@ -53,6 +54,13 @@ def _missing_from_stand_in(excinfo) -> str | None:
     if not excinfo.errisinstance((AttributeError, ImportError)):
         return None
     text = excinfo.exconly()
+    owner = getattr(excinfo.value, "obj", None)  # what lacked the attribute
+    if owner is not None:
+        source = getattr(owner if isinstance(owner, type) or inspect.ismodule(owner) else type(owner),
+                         "__module__", None) or getattr(owner, "__name__", "")
+        module = sys.modules.get(source) if isinstance(source, str) else None
+        if "fake_libs" in str(getattr(module, "__file__", "") or getattr(owner, "__file__", "") or ""):
+            return f"fake_libs: {text[:160]}"
     stand_ins = {path.name for path in _FAKE_LIBS.iterdir()} if _FAKE_LIBS.is_dir() else set()
     if any(re.search(rf"\b{re.escape(name)}\b", text) for name in stand_ins) or "fake_libs" in text:
         return f"fake_libs: {text[:160]}"
