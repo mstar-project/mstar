@@ -268,6 +268,9 @@ def test_timing_only_holds_shapes_not_values():
         other = torch.empty(2**20, device="cuda:1")  # each device counts its own
         assert torch.cuda.memory_allocated(1) == 4 * 2**20 and torch.cuda.memory_allocated(0) == on0
         assert torch.cuda.mem_get_info(1)[0] == total - 20 * 2**20  # the allocator's segment for a 4 MiB block
+        torch.cuda.set_device(1)  # a bare "cuda" names the current device
+        assert torch.cuda.memory_allocated(torch.device("cuda")) == torch.cuda.memory_allocated(1)
+        torch.cuda.set_device(0)
         print("ok")
     """)
     assert out.strip() == "ok"

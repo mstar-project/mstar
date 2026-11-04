@@ -65,9 +65,7 @@ def current_device() -> int:
 
 
 def set_device(device) -> None:
-    if isinstance(device, (str, torch.device)):
-        device = torch.device(device).index or 0
-    _tls.device = int(device)
+    _tls.device = _as_index(device)
 
 
 class device:  # noqa: N801  (torch.cuda.device)
@@ -85,11 +83,13 @@ class device:  # noqa: N801  (torch.cuda.device)
 
 
 def _as_index(device) -> int:
+    """A device argument's index: a bare ``"cuda"`` (or None) names the current device."""
     if device is None:
         return current_device()
     if isinstance(device, int):
         return device
-    return torch.device(device).index or 0
+    index = torch.device(device).index
+    return current_device() if index is None else index
 
 
 def get_device_name(device=None) -> str:
