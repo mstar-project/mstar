@@ -130,9 +130,10 @@ def track(wrapper, data: torch.Tensor) -> None:
         if entry is None:
             # a block is a multiple of 512 bytes, as the caching allocator rounds it
             nbytes = -(-storage.nbytes() // 512) * 512
-            entry = _STORAGES[key] = [nbytes, 0, _fake_range(nbytes), None]
+            entry = [nbytes, 0, _fake_range(nbytes), None]
             if not getattr(storage, "_sim_imported", False) and not clock.in_kernel():
-                _count(entry, wrapper.device.index)
+                _count(entry, wrapper.device.index)  # out of memory: no storage to remember
+            _STORAGES[key] = entry
         entry[1] += 1
     data._sim_tracked = True
     weakref.finalize(data, _release, key)

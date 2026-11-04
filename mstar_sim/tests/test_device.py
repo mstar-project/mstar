@@ -422,11 +422,12 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
         big = torch.empty(total // 6, device="cuda")  # two thirds of the card
         del big
         again = torch.empty(total // 6, device="cuda")  # reuses the cached block
-        try:
-            torch.empty(total // 6, device="cuda")
-            raise SystemExit("an allocation past the card succeeded")
-        except torch.cuda.OutOfMemoryError as e:
-            assert "Tried to allocate" in str(e)
+        for _ in range(20):  # a retry after out of memory, as mstar's workspace growth does
+            try:
+                torch.empty(total // 6, device="cuda")
+                raise SystemExit("an allocation past the card succeeded")
+            except torch.cuda.OutOfMemoryError as e:
+                assert "Tried to allocate" in str(e)
         print("ok")
     """, MSTAR_SIM_MEMORY_GB="80")
     assert out.strip() == "ok"
