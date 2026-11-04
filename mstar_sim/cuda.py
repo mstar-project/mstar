@@ -178,7 +178,9 @@ def memory_stats(device=None) -> dict:
     return collections.defaultdict(int, {"allocated_bytes.all.current": memory_allocated(device),
                                          "allocated_bytes.all.peak": max_memory_allocated(device),
                                          "reserved_bytes.all.current": memory_reserved(device),
-                                         "reserved_bytes.all.peak": max_memory_reserved(device)})
+                                         "reserved_bytes.all.peak": max_memory_reserved(device),
+                                         # memory_summary formats these two by key
+                                         "num_alloc_retries": 0, "num_ooms": 0})
 
 
 def memory_snapshot(*_, **__) -> list[dict]:
