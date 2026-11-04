@@ -76,6 +76,10 @@ def main(argv: list[str] | None = None) -> None:
     args, rest = parser.parse_known_args(argv)
     if rest and rest[0] == "--":
         command = rest[1:]
+        isolated = {"-I", "-E"} & set(command[: command.index("-m")] if "-m" in command else command[:1])
+        if isolated:
+            parser.error(f"{' '.join(sorted(isolated))} makes Python ignore PYTHONPATH, so the emulator "
+                         "would never install (and the installed mstar, not this tree's, would load)")
     elif rest and rest[0] in MSTAR_COMMANDS:
         command = ["-m", "mstar.cli.main", *rest]
     else:

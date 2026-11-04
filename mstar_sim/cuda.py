@@ -190,11 +190,16 @@ class Stream:
         clock.wait_until(self.timeline.free_at)
 
     def __enter__(self):
+        # as torch's THPStream_enter: the saved context lives on the stream object,
+        # so a second enter (nested, or from another thread) raises
+        if getattr(self, "_ctx", None) is not None:
+            raise RuntimeError("Stream's context should not be initialized.")
         self._ctx = stream(self)
         return self._ctx.__enter__()
 
     def __exit__(self, *exc):
-        return self._ctx.__exit__(*exc)
+        ctx, self._ctx = self._ctx, None
+        return ctx.__exit__(*exc)
 
     def __repr__(self):
         return f"<mstar_sim Stream {self.stream_id} on {self.device}>"

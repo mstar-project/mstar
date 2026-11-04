@@ -95,12 +95,19 @@ class LibCuda:
 
 
 def install() -> None:
-    real = ctypes.CDLL
+    """``libcuda`` is this stand-in. ``libcudart`` refuses to load, as on a box
+    without the runtime: mstar's raw ``cudaMemcpyAsync`` paths (``h2d``, the KV
+    page copier) then take the torch copy, which the emulator prices."""
+    for name in ("CDLL", "PyDLL"):
+        real = getattr(ctypes, name)
 
-    class CDLL(real):
-        def __new__(cls, name, *args, **kwargs):
-            if isinstance(name, str) and "libcuda.so" in name:
-                return LibCuda()
-            return super().__new__(cls)
+        class Loader(real):
+            def __new__(cls, lib, *args, **kwargs):
+                if isinstance(lib, str) and "libcuda.so" in lib:
+                    return LibCuda()
+                if isinstance(lib, str) and "libcudart" in lib:
+                    raise OSError(f"mstar_sim: {lib}: no CUDA runtime on the emulated GPU")
+                return super().__new__(cls)
 
-    ctypes.CDLL = CDLL
+        Loader.__name__ = Loader.__qualname__ = name
+        setattr(ctypes, name, Loader)

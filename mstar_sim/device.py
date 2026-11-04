@@ -480,6 +480,8 @@ def _fast(func, args, kwargs, flat, index):
         raw = meta_call(func, uargs, ukwargs, tensors)
     else:
         raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
+        if func in _UNINITIALIZED:
+            raw.zero_()
     view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
     if not view:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
@@ -725,6 +727,8 @@ def _create(func, args, kwargs, device):
         target = META
     with _Observe():
         out = func(*args, **dict(kwargs, device=target))
+    if target is CPU and func in _UNINITIALIZED:
+        out.zero_()  # a never-computed value reads as zeros, not as the host heap's garbage
     if func in (torch.tensor, torch.as_tensor, torch.from_numpy) and isinstance(out, T):
         clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
     return tree_map(
@@ -772,6 +776,8 @@ _METADATA = {
 _PASSTHROUGH = {torch._C._nn._parse_to}
 _FACTORIES = {torch.empty, torch.zeros, torch.ones, torch.full, torch.arange, torch.tensor,
               torch.randn, torch.rand, torch.randint, torch.empty_strided, torch.as_tensor}
+# allocations whose values are undefined: on the emulated GPU they read as zeros
+_UNINITIALIZED = {torch.empty, torch.empty_strided, torch.empty_like, T.new_empty, T.new_empty_strided}
 # fill-only allocations (no host data in them), which a worker may leave value-less
 _ALLOCATORS = {torch.empty, torch.zeros, torch.ones, torch.full, torch.randn, torch.rand,
                torch.empty_strided}
