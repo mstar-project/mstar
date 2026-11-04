@@ -147,9 +147,19 @@ def charge(seconds: float, launched: float | None = None) -> float:
 class Tape:
     """What a captured graph launches, in order: each kernel's cost in seconds,
     or a callable pricing it at replay time (a kernel whose cost depends on
-    the values in its arguments, such as attention over the latest plan)."""
+    the values in its arguments, such as attention over the latest plan); and
+    ``effects``, the work on values the emulator keeps (small ints, host copies
+    to and from them), re-run in order at each replay as the graph would."""
 
     entries: list[float | Callable[[], float]] = field(default_factory=list)
+    effects: list[Callable[[], None]] = field(default_factory=list)
+
+
+def on_replay(effect: Callable[[], None]) -> None:
+    """While capturing, re-run ``effect`` at each replay of the graph."""
+    tape = capturing()
+    if tape is not None:
+        tape.effects.append(effect)
 
 
 def capturing() -> Tape | None:

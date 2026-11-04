@@ -383,6 +383,8 @@ class _Observe(TorchDispatchMode):
                 # a value-less operand: the op runs on shapes only
                 args, kwargs = tree_map(_as_meta, (args, kwargs))
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
+            elif clock.capturing() is not None and not func.is_view and not clock.in_kernel():
+                out = _captured_values(func, args, kwargs)
             else:
                 out = func(*args, **kwargs)
         if clock.FAST or func.is_view or func in _FREE or clock.in_kernel():
@@ -598,7 +600,10 @@ def _fast(func, args, kwargs, flat, index):
             tensors = [t for t in _shallow(uargs, ukwargs)]
         raw = meta_call(func, uargs, ukwargs, tensors)
     else:
-        raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
+        if clock.capturing() is not None and func not in _VIEWS and func not in _UNINITIALIZED:
+            raw = _captured_values(func, uargs, ukwargs)
+        else:
+            raw = func(*uargs, **ukwargs)  # small ints: real, and cheap
         if func in _UNINITIALIZED:
             raw.zero_()
             uncomputed()
@@ -666,6 +671,14 @@ def _function_body(func, args, kwargs):
     handler = _METHODS.get(func)
     if handler is not None:
         return handler(*args, **kwargs)
+    if (getattr(func, "__name__", "") == "__set__" and getattr(func, "__self__", None) is _DATA_DESCRIPTOR
+            and isinstance(args[0], SimTensor) and isinstance(args[1], SimTensor)):
+        # `param.data = other`: the payload moves too, so the old storage is freed and the
+        # parameter reads (and aliases) the new one, as on a GPU
+        with torch._C.DisableTorchFunctionSubclass():
+            func(*args, **kwargs)
+        args[0]._data = args[1]._data
+        return None
     if getattr(func, "__name__", "") == "__get__":
         # attribute getters (device, shape, dtype, data, ...) read the wrapper itself
         with torch._C.DisableTorchFunctionSubclass():
@@ -695,11 +708,35 @@ def _function_body(func, args, kwargs):
 # ---------------------------------------------------------------- graph replay
 
 
+def _captured_values(func, args, kwargs):
+    """An op over values the emulator keeps, met while capturing: as on CUDA,
+    capture runs nothing (its arguments keep their values, its outputs are the
+    graph's buffers), and each replay runs it in place."""
+    inputs = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
+    saved = [(t, t.clone()) for t in inputs if t.device.type == "cpu"]
+    out = func(*args, **kwargs)  # for the outputs' buffers
+    for t, before in saved:
+        t.copy_(before)
+    ids = {id(t) for t in inputs}
+
+    def rerun():
+        fresh = func(*args, **kwargs)
+        for dst, src in zip(tree_flatten(out)[0], tree_flatten(fresh)[0], strict=False):
+            if isinstance(dst, torch.Tensor) and id(dst) not in ids and dst is not src:
+                dst.copy_(src)
+
+    clock.on_replay(rerun)
+    return out
+
+
 def replay(tape: clock.Tape) -> None:
-    """Run a captured graph: one launch charging its kernels' time back to back."""
+    """Run a captured graph: its work on kept values in order, then one launch
+    charging its kernels' time back to back."""
     from mstar_sim import cost
 
     clock.STATS["replays"] += 1
+    for effect in tape.effects:
+        effect()
     if clock.FAST:
         return
     launched = clock.vnow()
@@ -792,7 +829,11 @@ def _copy_(self, src, non_blocking=False):
         if not isinstance(src, SimTensor):
             clock.charge(_copy_seconds(src.numel() * src.element_size(), "h2d"))
             if not _is_meta(self._data) and not _is_meta(src):
-                self._data.copy_(src, non_blocking=non_blocking)
+                dst = self._data
+                if clock.capturing() is None:
+                    dst.copy_(src, non_blocking=non_blocking)
+                else:  # captured: reads its host buffer at each replay, not now
+                    clock.on_replay(lambda: dst.copy_(src))
             return self
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
@@ -800,7 +841,11 @@ def _copy_(self, src, non_blocking=False):
     if not non_blocking:
         host_wait()
     if not _is_meta(self):
-        self.copy_(host_value(src._data))
+        if clock.capturing() is None:
+            self.copy_(host_value(src._data))
+        elif not _is_meta(src._data):  # captured: lands at each replay (a host mailbox), not now
+            dst, data = self, src._data
+            clock.on_replay(lambda: dst.copy_(data))
     return self
 
 
@@ -828,6 +873,7 @@ _METHODS = {
     torch._has_compatible_shallow_copy_type: lambda a, b: type(a) is type(b),
 }
 _HOST_READS = {torch.equal}
+_DATA_DESCRIPTOR = torch._C.TensorBase.__dict__["data"]
 # functions that answer the host with a Python value: computed on the host values
 # (zeros for what was never computed), since a meta tensor has none
 _HOST_VALUED = {torch.equal, T.equal, torch.allclose, T.allclose}
@@ -975,6 +1021,29 @@ ABSENT_MODULES = {
 }
 
 
+def _relax_blockwise_scaled_mm_meta() -> None:
+    """torch 2.10's meta check for block-scaled fp8 GEMMs (``_scaled_mm_v2``, 1x128 x 128x128
+    blocks) floors ``N / 128``, so a weight whose last 128-row block is partial (GLM-5.2's
+    fused q_a + kv_a) fails it, though the CUDA kernel takes it. Here the check only
+    decides the output's shape: ``[M, N]``."""
+    import torch._meta_registrations as mr
+
+    check = getattr(mr, "_check_scaled_mm_sizes_v2", None)
+    if check is None or getattr(check, "_mstar_sim", False):
+        return
+
+    def relaxed(self, mat2, *args, out_dtype=None, **kwargs):
+        try:
+            return check(self, mat2, *args, out_dtype=out_dtype, **kwargs)
+        except RuntimeError as e:
+            if "blockwise scaling" not in str(e):
+                raise
+            return torch.empty(self.shape[0], mat2.shape[1], dtype=out_dtype or self.dtype, device=self.device)
+
+    relaxed._mstar_sim = True
+    mr._check_scaled_mm_sizes_v2 = relaxed
+
+
 # --------------------------------------------------------------- installation
 
 _installed = False
@@ -995,6 +1064,7 @@ def install() -> None:
         return new_shared(*args)
 
     torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)
+    _relax_blockwise_scaled_mm_meta()
     import faulthandler
 
     # a read through a fake address prints its thread's Python stack (all threads'

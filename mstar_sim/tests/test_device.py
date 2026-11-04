@@ -96,6 +96,19 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         long = timed(g.replay)
         gemm = timed(lambda: a @ a)
         assert 3.5 < (long - gemm) / (short - gemm) < 4.5, (long, short, gemm)
+        # values the emulator keeps (small ints) run at replay, not at capture, as on CUDA:
+        # an in-graph counter, a staged H2D and a D2H into a host mailbox
+        step = torch.zeros(1, dtype=torch.int64, device="cuda")
+        staged, mailbox = torch.tensor([7]), torch.zeros(1, dtype=torch.int64)
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2):
+            lens2 = torch.zeros(1, dtype=torch.int64, device="cuda")
+            lens2.copy_(staged, non_blocking=True)
+            step += 1
+            mailbox.copy_(lens2 + step, non_blocking=True)
+        assert step.item() == 0 and mailbox.tolist() == [0]
+        staged.fill_(10); g2.replay(); g2.replay(); torch.cuda.synchronize()
+        assert step.item() == 2 and mailbox.tolist() == [12], (step.item(), mailbox.tolist())
         try:
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
                 lens.sum().item()

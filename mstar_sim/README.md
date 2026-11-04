@@ -59,6 +59,7 @@ Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-c
 - **Modules loaded by file** (`spec_from_file_location`, as Qwen3-TTS loads `qwen_tts`) bypass import hooks. Patch the dependency's own module instead (e.g. `transformers.models.mimi`).
 - **`-- script.py` with multiprocessing.** The script needs an `if __name__ == "__main__":` guard. Spawned children re-import it, and without the guard the conductor dies ("is not going to be frozen") and the launcher hangs.
 - **A small `/dev/shm`.** `--shm-mb N` makes mstar's tmpfs sizing see an N MiB `/dev/shm` (`statvfs`). Free space is N less what `mstar_*` files there hold, a dead run's leftovers included. Writes past N still succeed.
+- **Serving a config.** It's `python -m mstar_sim … serve <model> --config <yaml>`; the CLI takes a model name, not a YAML path.
 - **Small pools.** A config with a small cross-attention or KV pool can fail capture planning, because each bucket's plan needs room for its whole batch. Cap the buckets (`--max-capture-batch 8`) rather than shrinking the pool below that.
 
 ## Measured kernel times
