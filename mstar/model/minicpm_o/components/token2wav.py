@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.bounded import SinkWindow
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
+from mstar.model.cosyvoice3.components.onnx_weights import load_campplus, load_speech_tokenizer
 from mstar.model.minicpm_o.components.token2wav_flow import (
     DIT_DEPTH,
     DIT_HEAD_DIM,
@@ -52,13 +53,7 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     FlowKV,
     Token2WavFlow,
 )
-from mstar.model.minicpm_o.components.voice_prompt import (
-    VoicePrompt,
-    VoicePromptEncoder,
-    campplus_state,
-    read_onnx_parameters,
-    tokenizer_state,
-)
+from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, VoicePromptEncoder
 
 SAMPLE_RATE = 24000
 SILENCE_CODE = 4218
@@ -761,10 +756,10 @@ def load_token2wav(asset_dir: str, device: torch.device | str = "cuda", noise: t
     hift = torch.load(f"{asset_dir}/hift.pt", map_location="cpu", weights_only=True)
     hift = {k.removeprefix("generator."): v for k, v in hift.items()}
     _load_exact(model.hift, _fold_weight_norm_on(hift, device), "hift.pt")
-    tok = read_onnx_parameters(f"{asset_dir}/speech_tokenizer_v2_25hz.onnx")
-    _load_exact(model.voice_encoder.tokenizer, tokenizer_state(tok), "speech_tokenizer_v2_25hz.onnx")
-    spk = read_onnx_parameters(f"{asset_dir}/campplus.onnx")
-    _load_exact(model.voice_encoder.speaker, campplus_state(spk, model.voice_encoder.speaker), "campplus.onnx")
+    # both readers run their module once to match its layers to the graph's, so in eval mode
+    model.eval()
+    load_speech_tokenizer(model.voice_encoder.tokenizer, f"{asset_dir}/speech_tokenizer_v2_25hz.onnx")
+    load_campplus(model.voice_encoder.speaker, f"{asset_dir}/campplus.onnx")
     if noise is None:
         noise = torch.randn(model.flow.decoder.rand_noise.shape, generator=torch.Generator().manual_seed(0))
     model.flow.decoder.rand_noise.copy_(noise)

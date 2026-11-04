@@ -542,8 +542,7 @@ false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
 reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
 ``max_slots`` cap concurrent spoken replies. ``t2w_state`` has one more than each of the
-three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The ``minicpm_o`` extra installs ``onnx``, used
-only to read the voice encoders' weights.
+three ``t2w_*_kv`` (its sink); startup refuses counts that disagree.
 
 Command A+ (``command_a_plus``)
 -------------------------------

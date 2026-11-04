@@ -31,7 +31,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     window_samples,
     window_tokens,
 )
-from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_path
+from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt
 
 
 class _CacheSteps:
@@ -380,12 +380,6 @@ def test_batched_windows_on_pool(random_token2wav, device):
         commit()
         for i, (_, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
-
-
-def test_onnx_scope_paths():
-    assert _module_path("/head/layer1/layer1.0/conv1/Conv") == "head.layer1.0.conv1"
-    assert _module_path("/blocks.3/mlp/mlp.2/MatMul") == "blocks.3.mlp.2"
-    assert _module_path("/xvector/block2/tdnnd7/cam_layer/linear1/Conv") == "xvector.block2.tdnnd7.cam_layer.linear1"
 
 
 @needs_ckpt
