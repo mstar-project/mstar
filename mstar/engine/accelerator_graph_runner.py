@@ -2171,10 +2171,11 @@ class PiecewiseAcceleratorGraphRunner:
 
     def _declare(
         self, request_ids: list[int], seq_lens: list[int],
-        bucket: BucketKey, capture: bool, slot: int,
+        bucket: BucketKey | None, capture: bool, slot: int,
         real_bs: int | None = None,
     ):
-        """The region's step over the padded batch, addressed at its slot.
+        """The region's step over the padded batch, addressed at its slot; with
+        no ``bucket``, over the real rows of an eager run.
 
         The declaration covers every row, but the context reports only the real
         head as ``request_ids`` and the padding tail on `set_padded_rids`, as
@@ -2191,7 +2192,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph_walk=PIECEWISE_WALK,
             slot=slot,
             capture=capture,
-            slot_lease=SlotLease(slot=slot, bucket=bucket),
+            slot_lease=None if bucket is None else SlotLease(slot=slot, bucket=bucket),
             force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
         )
         ctx.set_padded_rids(tuple(request_ids))
@@ -2222,22 +2223,22 @@ class PiecewiseAcceleratorGraphRunner:
         real_bs: int,
         real_total_tokens: int | None,
     ) -> PiecewiseOutput:
-        """The region's callable run eagerly, through the same step lifecycle as a
-        replay, so its resources hold a plan for exactly these rows."""
+        """The region's callable run eagerly, through the same step a replay
+        declares (``_declare``), so its resources hold a plan for exactly these rows."""
+        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
         step = None
-        if request_ids is not None and self._config.declare_step is not None:
-            step = self._config.declare_step(
+        if request_ids is not None:
+            if seq_lens is None and is_packed:
+                raise ValueError(f"piecewise {self._label!r}: an eager run of a packed region needs seq_lens")
+            step = self._declare(
                 list(request_ids), list(seq_lens) if seq_lens is not None else [self._config.seq_len] * real_bs,
+                None, capture=False, slot=self._current_slot,
             )
-            if step is not None:
-                step.set_ctx(StepContext(
-                    request_ids=tuple(request_ids), graph_walk=PIECEWISE_WALK,
-                    slot=self._current_slot, capture=False,
-                ))
-                outcome = self._step_runner.admit(step)
-                if not outcome.ok:
-                    raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
-                self._step_runner.plan(step)
+        if step is not None:
+            outcome = self._step_runner.admit(step)
+            if not outcome.ok:
+                raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
+            self._step_runner.plan(step)
         ids = list(request_ids) if request_ids is not None else []
         out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
             static_inputs=static_inputs,
@@ -2249,7 +2250,6 @@ class PiecewiseAcceleratorGraphRunner:
         )))
         if step is not None:
             self._step_runner.commit(step)
-        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
         return PiecewiseOutput(out, real_total_tokens if is_packed else real_bs)
 
     @staticmethod

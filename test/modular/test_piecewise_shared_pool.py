@@ -120,3 +120,29 @@ def test_run_without_a_graph_raises_unless_the_region_falls_back():
     )
     with pytest.raises(RuntimeError, match="no captured graph"):
         runner.run(static_inputs={}, request_ids=[1])
+
+
+def test_run_without_a_graph_declares_the_step_a_replay_does():
+    """The eager run declares the region's step as a replay would: a packed region
+    with ``attn_key`` (no ``declare_step``) gets its one segment per row, in a
+    prefill context."""
+    from unittest import mock
+
+    from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+    from mstar.engine.resources.step import ADMIT_OK
+
+    step_runner = mock.Mock()
+    step_runner.admit.return_value = ADMIT_OK
+    runner = PiecewiseAcceleratorGraphRunner(
+        label="r", config=PiecewisePackedConfig(
+            capture_fn=lambda call: {"y": call.static_inputs["x"]}, make_static_inputs=lambda shape: {},
+            attn_key="a", total_tokens=[16], capture_batch_sizes=[], eager_fallback=True,
+        ),
+        resources={}, step_runner=step_runner, device=torch.device("cpu"), autocast_dtype=None, num_slots=1,
+    )
+    runner.run(static_inputs={"x": torch.ones(8, 4)}, request_ids=[7, 8], seq_lens=[3, 5])
+    step = step_runner.admit.call_args.args[0]
+    assert [(s.request_id, s.span) for s in step.segments] == [(7, 3), (8, 5)]
+    assert set(step.steps) == {"a"}
+    assert step.ctx.force_prefill and step.ctx.slot_lease is None and tuple(step.ctx.request_ids) == (7, 8)
+    assert step_runner.plan.called and step_runner.commit.called
