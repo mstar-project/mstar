@@ -313,7 +313,7 @@ pi05 = [
 
 personaplex = [
     # Only what mstar/model/personaplex imports: no moshi, pyloudnorm or einops.
-    # transformers backs Mimi; GPU-checked on 4.57.3, 5.20.2 and 5.21.0.
+    # transformers backs Mimi; GPU-checked on 4.57.3, 5.20.2, 5.21.0 and 5.22.1.
     # sentencepiece tokenizes the persona prompt.
     "flashinfer-python==0.7.2",
     "huggingface-hub",

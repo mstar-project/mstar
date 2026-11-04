@@ -1979,7 +1979,7 @@ trimmed to the input's sample count and lags it by one frame, as in NVIDIA's
 ignored. Text frames that are padding or special tokens produce empty chunks.
 
 Status, checked with the released checkpoint against NVIDIA's reference
-implementation on H100 GPUs:
+implementation on H100 and GH200 GPUs:
 
 - With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
   audio to within 5.1e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
@@ -2008,6 +2008,13 @@ implementation on H100 GPUs:
   concurrency. In streamed playback (the whole clip uploaded at
   once, not live input; a 320 ms client buffer), 8 concurrent sessions played
   without underruns; at 16, 17 of 48 sessions had at least one.
+- ``python -m benchmark.personaplex.sweep`` measures goodput: on one GH200, with
+  N simultaneous sessions of a 17.7 s clip and ``max_batch_size`` N, every session
+  stayed under 10 ms of total stall up to 8 sessions (11.5 seconds of audio per
+  second); from 16 sessions none did. Throughput levelled off at 18 to 22 seconds
+  of audio per second from 32 to 128 sessions. Time to first audio was 2.8 s at
+  one session and 30 s at 128, since conditioning runs before the first frame, so
+  no session met a 200 ms limit.
 - Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge. Listening to matched
