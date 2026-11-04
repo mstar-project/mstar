@@ -114,10 +114,13 @@ class CPUPagePool:
         return pages
 
     def reserve(self, rid: str, pages: int) -> bool:
-        """Set ``pages`` aside for ``rid``'s move here, or return False when the room isn't there."""
+        """Set ``pages`` aside for ``rid``'s move here, or return False when the room isn't there. The cached pages
+        the room counts are evicted now, since a host fetch could hold them by the time ``rid`` moves."""
         if pages > self.room():
             return False
         self.reserved[rid] = pages
+        if (kept := self._set_aside(None)) > self.arena.num_free:
+            self.index.evict(kept - self.arena.num_free)
         return True
 
     def unreserve(self, rid: str) -> None:
