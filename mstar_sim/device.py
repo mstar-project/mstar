@@ -1,8 +1,8 @@
 """A CUDA device emulated on the CPU, for GPU-time simulation.
 
-Nothing is computed. A cuda tensor keeps real values only when it is a small
-integer tensor (positions, page tables, lengths: what mstar plans with); every
-other one is a ``meta`` tensor, shape and dtype only. Each kernel is still
+Nothing is computed. A cuda tensor keeps real values only when it is small
+(:func:`keeps_values`: positions, page tables, lengths, what mstar plans with);
+every other one is a ``meta`` tensor, shape and dtype only. Each kernel is still
 launched on the simulated stream and charged its predicted time, so the
 scheduler, worker and engine run against a GPU's timing without its math. A
 host read of a value that was never computed (a sampled token, say) reads
@@ -27,21 +27,21 @@ Behaviour a real GPU has, kept on purpose:
   the current stream;
 - doing so while a graph is being captured raises, as CUDA does;
 - an op mixing a cuda tensor with a non-scalar CPU tensor raises, as CUDA does
-  (except copies and indexing, which CUDA allows).
+  (except copies and indexing, which CUDA allows);
+- an index out of bounds faults the device, reported at a later call (:data:`FAULT`).
 """
 
 from __future__ import annotations
 
 import contextlib
 import threading
-import weakref
 
 import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from mstar_sim import clock
+from mstar_sim import clock, memory
 
 
 def tree_flatten(obj):
@@ -172,7 +172,7 @@ class SimTensor(torch.Tensor):
             requires_grad=data.requires_grad,
         )
         out._data = data
-        _track(out, data)
+        memory.track(out, data)
         return out
 
     def __repr__(self, *, tensor_contents=None):
@@ -192,175 +192,12 @@ class SimTensor(torch.Tensor):
         return _run(func, args, kwargs or {}, index)
 
 
-# Simulated device memory, as torch's caching allocator accounts it. Each device has a
-# default pool and the private pools graphs capture into. A pool's ``live`` bytes are
-# its tensors' storages; ``reserved`` is what it holds from the card: its high-water
-# mark, until the cache is emptied (a freed block is reused within its pool, never
-# by another). ``graphs`` counts the graphs using a private pool; one no graph uses
-# gives its free bytes back on ``empty_cache``, and goes once nothing in it lives.
-# ``recording``: the thread whose allocations on its device go to the pool (a capture's,
-# or a ``_cuda_beginAllocateToPool`` caller's), or None.
-DEFAULT_POOL = (0, 0)
-
-
-class Pool:
-    __slots__ = ("device", "handle", "live", "reserved", "graphs", "recording")
-
-    def __init__(self, device: int, handle: tuple):
-        self.device, self.handle = device, handle
-        self.live = self.reserved = self.graphs = 0
-        self.recording: int | None = None
-
-
-POOLS: dict[tuple[int, tuple], Pool] = {}
-_STORAGES: dict[int, list] = {}  # storage key: [bytes, references, fake address range, pool or None]
-ALLOCATED: dict[int, list[int]] = {}  # device index: [current, peak] bytes in tensors
-RESERVED_PEAK: dict[int, int] = {}
-# reentrant: a finalizer can run (garbage collection) while this thread holds it
-_track_lock = threading.RLock()
-
-
-def pool(index: int, handle=DEFAULT_POOL) -> Pool:
-    key = (index, tuple(handle))
-    with _track_lock:
-        found = POOLS.get(key)
-        if found is None:
-            found = POOLS[key] = Pool(*key)
-        return found
-
-
-def reserved(index: int) -> int:
-    with _track_lock:
-        return sum(p.reserved for p in POOLS.values() if p.device == index)
-
-
-def release_cached(index: int) -> None:
-    """``empty_cache``: the default pool, and private pools no graph uses, give back
-    what their tensors don't hold."""
-    with _track_lock:
-        for key, p in list(POOLS.items()):
-            if p.device == index and (p.handle == DEFAULT_POOL or p.graphs == 0):
-                p.reserved = p.live
-                if p.handle != DEFAULT_POOL and p.live == 0 and p.recording is None:
-                    del POOLS[key]
-
-
-def _release(key: int) -> None:
-    with _track_lock:
-        entry = _STORAGES.get(key)
-        if entry is not None:
-            entry[1] -= 1
-            if entry[1] == 0:
-                del _STORAGES[key]
-                if entry[3] is not None:
-                    entry[3].live -= entry[0]
-                    ALLOCATED[entry[3].device][0] -= entry[0]
-
-
-def _allocate(index: int, nbytes: int) -> Pool:
-    """The pool a new storage of ``nbytes`` on device ``index`` comes from: the one this
-    thread records into on that device, else the default. Growing a pool past the card
-    (its memory fraction) raises out of memory, after emptying the cache once, as torch's
-    allocator retries."""
-    thread = threading.get_ident()
-    into = next((p for p in POOLS.values() if p.recording == thread and p.device == index), None) or pool(index)
-    if into.live + nbytes > into.reserved:
-        from mstar_sim import cuda
-
-        grow = _segment(nbytes)
-        limit = cuda.memory_limit(index)
-        if reserved(index) + grow > limit:
-            release_cached(index)
-            if into.live + nbytes <= into.reserved:
-                return into
-            if reserved(index) + grow > limit:
-                held = ", ".join(f"{'default' if p.handle == DEFAULT_POOL else p.handle}: {p.reserved / 2**20:.0f}"
-                                 for p in POOLS.values() if p.device == index and p.reserved)
-                raise gpu_error(torch.cuda.OutOfMemoryError(
-                    f"CUDA out of memory. Tried to allocate {nbytes / 2**20:.2f} MiB. GPU {index} has a total "
-                    f"capacity of {limit / 2**30:.2f} GiB, of which {(limit - reserved(index)) / 2**20:.2f} MiB "
-                    f"is free (mstar_sim: MiB reserved per pool: {held})"))
-        into.reserved += grow
-        RESERVED_PEAK[index] = max(RESERVED_PEAK.get(index, 0), reserved(index))
-    return into
-
-
-def _segment(nbytes: int) -> int:
-    """The segment torch's caching allocator reserves from the card for a block it has no room
-    for (``CUDACachingAllocator``'s ``get_allocation_size``): 2 MiB for a small block (up to
-    1 MiB), 20 MiB up to 10 MiB, else the block rounded up to 2 MiB."""
-    if nbytes <= 1 << 20:
-        return 2 << 20
-    if nbytes < 10 << 20:
-        return 20 << 20
-    return -(-nbytes // (2 << 20)) * (2 << 20)
-
-
-def _track(wrapper, data: torch.Tensor) -> None:
-    """Count ``data``'s storage while it lives. The finalizer hangs on the payload,
-    not the wrapper: module moves swap wrappers, and a swap refuses weakrefs. A
-    storage opened from another process (CUDA IPC) is that process's memory."""
-    if data._base is not None or getattr(data, "_sim_tracked", False):
-        return  # a view: its base holds (and counts) the storage
-    storage = data.untyped_storage()
-    key = storage._cdata
-    with _track_lock:
-        entry = _STORAGES.get(key)
-        if entry is None:
-            # a block is a multiple of 512 bytes, as the caching allocator rounds it
-            nbytes = -(-storage.nbytes() // 512) * 512
-            entry = _STORAGES[key] = [nbytes, 0, _fake_range(nbytes), None]
-            if not getattr(storage, "_sim_imported", False) and not clock.in_kernel():
-                _count(entry, wrapper.device.index)
-        entry[1] += 1
-    data._sim_tracked = True
-    weakref.finalize(data, _release, key)
-
-
-def _count(entry: list, index: int) -> None:
-    into = entry[3] = _allocate(index, entry[0])
-    into.live += entry[0]
-    used = ALLOCATED.setdefault(into.device, [0, 0])
-    used[0] += entry[0]
-    used[1] = max(used[1], used[0])
-
-
 def count_storages(out) -> None:
     """A stand-in kernel's outputs are its allocations; the tensors it made them with
-    inside (``clock.in_kernel``) are not counted, as the real kernel has none."""
+    inside are not counted, as the real kernel has none."""
     for t in tree_flatten(out)[0]:
         if isinstance(t, SimTensor):
-            storage = t._data.untyped_storage()
-            with _track_lock:
-                entry = _STORAGES.get(storage._cdata)
-                if entry is not None and entry[3] is None and not getattr(storage, "_sim_imported", False):
-                    _count(entry, t.device.index)
-
-
-# Value-less storages get addresses in [2^60, 2^62): unique per storage, never
-# reused, and non-canonical on x86-64 and arm64, so code that compares or offsets
-# pointers sees distinct storages, and code that reads through one faults loudly
-# (``faulthandler`` prints the Python stack) instead of reading host memory.
-_FAKE_NEXT = [1 << 60]
-_FAKE_UNTRACKED: dict[int, int] = {}
-
-
-def _fake_range(nbytes: int) -> int:
-    with _track_lock:
-        base = _FAKE_NEXT[0]
-        _FAKE_NEXT[0] += -(-max(nbytes, 1) // 512) * 512 + 512
-    return base
-
-
-def fake_base(storage) -> int:
-    """The fake address of a value-less storage."""
-    entry = _STORAGES.get(storage._cdata)
-    if entry is not None:
-        return entry[2]
-    base = _FAKE_UNTRACKED.get(storage._cdata)
-    if base is None:
-        base = _FAKE_UNTRACKED[storage._cdata] = _fake_range(storage.nbytes())
-    return base
+            memory.count_storage(t._data, t.device.index)
 
 
 # torch.cuda.set_sync_debug_mode: 0 default, 1 warn, 2 error
@@ -377,7 +214,7 @@ class _FakeStorage:
         self._storage = storage
 
     def data_ptr(self) -> int:
-        return fake_base(self._storage)
+        return memory.fake_base(self._storage)
 
     def __getattr__(self, name):
         return getattr(self._storage, name)
@@ -1138,7 +975,7 @@ def _data_ptr(self) -> int:
     data = self._data
     if data.device.type != "meta":
         return data.data_ptr()
-    return fake_base(data.untyped_storage()) + data.storage_offset() * data.element_size()
+    return memory.fake_base(data.untyped_storage()) + data.storage_offset() * data.element_size()
 
 
 def _copy_(self, src, non_blocking=False):
@@ -1344,76 +1181,6 @@ ABSENT_MODULES = {
 }
 
 
-def _swap_or_assign() -> None:
-    """Moving a module swaps its parameters in place (so tied weights stay tied), but a
-    swap refuses a tensor something else holds (weight_norm's hooks): that module alone
-    is then moved or loaded by assignment, as torch does without the swap, on its thread
-    alone (the swap setting reads per thread)."""
-    from torch import nn
-
-    future, assigning = torch.__future__, threading.local()
-    swaps = future.get_swap_module_params_on_conversion
-    future.get_swap_module_params_on_conversion = lambda: swaps() and not getattr(assigning, "on", False)
-
-    def by_assignment(call, *args):
-        assigning.on = True
-        try:
-            return call(*args)
-        finally:
-            assigning.on = False
-
-    apply, load = nn.Module._apply, nn.Module._load_from_state_dict
-
-    def apply_one(self, fn, recurse=True):
-        try:
-            return apply(self, fn, recurse)
-        except RuntimeError as e:  # its own parameters (a child retries its own)
-            if not str(e).startswith("_apply(): Couldn't swap"):
-                raise
-            return by_assignment(apply, self, fn, False)
-
-    def load_one(self, state_dict, prefix, metadata, strict, missing, unexpected, errors):
-        marks = len(missing), len(unexpected), len(errors)
-        load(self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
-        if any(e.startswith("While swapping") for e in errors[marks[2]:]):
-            for found, mark in zip((missing, unexpected, errors), marks, strict=True):
-                del found[mark:]
-            by_assignment(load, self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
-
-    nn.Module._apply = apply_one
-    nn.Module._load_from_state_dict = load_one
-
-
-def _relax_blockwise_scaled_mm_meta() -> None:
-    """torch 2.10's meta check for block-scaled fp8 GEMMs (``_scaled_mm_v2``, 1x128 x 128x128
-    blocks) floors ``N / 128``, so a weight whose last 128-row block is partial (GLM-5.2's
-    fused q_a + kv_a) fails it, though the CUDA kernel takes it with ceil-div scales. Such a
-    weight is checked as if its last block were whole: every other check still applies."""
-    import torch._meta_registrations as mr
-
-    check = getattr(mr, "_check_scaled_mm_sizes_v2", None)
-    if check is None or getattr(check, "_mstar_sim", False):
-        return
-
-    def relaxed(self, mat2, *args, out_dtype=None, **kwargs):
-        try:
-            return check(self, mat2, *args, out_dtype=out_dtype, **kwargs)
-        except RuntimeError as refused:
-            n = mat2.shape[1]
-            if n % 128 == 0:
-                raise
-            whole = torch.empty_strided((mat2.shape[0], -(-n // 128) * 128), mat2.stride(), dtype=mat2.dtype,
-                                        device=mat2.device)
-            try:
-                check(self, whole, *args, out_dtype=out_dtype, **kwargs)
-            except RuntimeError:
-                raise refused from None
-            return torch.empty(self.shape[0], n, dtype=out_dtype or self.dtype, device=self.device)
-
-    relaxed._mstar_sim = True
-    mr._check_scaled_mm_sizes_v2 = relaxed
-
-
 # --------------------------------------------------------------- installation
 
 _installed = False
@@ -1436,7 +1203,9 @@ def install() -> None:
         return new_shared(*args)
 
     torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)
-    _relax_blockwise_scaled_mm_meta()
+    from mstar_sim import patches
+
+    patches.relax_blockwise_scaled_mm_meta()
     import faulthandler
 
     # a read through a fake address prints its thread's Python stack (all threads'
@@ -1446,7 +1215,7 @@ def install() -> None:
     # CPU and a CUDA tensor share an impl type and torch sets `.data`): tied
     # weights stay tied and references taken before the move stay live.
     torch.__future__.set_swap_module_params_on_conversion(True)
-    _swap_or_assign()
+    patches.swap_or_assign()
     SimMode().__enter__()
     bootstrap = threading.Thread._bootstrap_inner
 

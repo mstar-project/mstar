@@ -1,4 +1,5 @@
-"""The few places where mstar is adjusted for the emulated GPU, all from outside.
+"""The few places where mstar, and torch itself, are adjusted for the emulated GPU, all
+from outside.
 
 - ``cap_captures``: capture buckets above ``MSTAR_SIM_MAX_CAPTURE_TOKENS`` /
   ``MSTAR_SIM_MAX_CAPTURE_BATCH`` are dropped, as if the model had declared a
@@ -11,6 +12,8 @@
   work and table shape (a launch's traffic would count the whole state pool).
 - ``header_only_weights``: weights are read from safetensors headers only.
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
+- ``swap_or_assign``, ``relax_blockwise_scaled_mm_meta``: torch's own (every process, mstar
+  or not; ``mstar_sim.device.install`` applies them).
 
 Each patch checks every mstar name it relies on at install, whether or not its
 option is on (:func:`_require`). One whose target is missing is skipped with a
@@ -26,6 +29,7 @@ import functools
 import importlib
 import os
 import sys
+import threading
 
 import torch
 
@@ -317,6 +321,76 @@ def worker_process_target(*args, **kwargs):
     conductor = importlib.import_module("mstar.conductor.conductor")
     impl = _worker_target_impl or conductor._worker_process_target
     return impl(*args, **kwargs)
+
+
+def swap_or_assign() -> None:
+    """Moving a module swaps its parameters in place (so tied weights stay tied), but a
+    swap refuses a tensor something else holds (weight_norm's hooks): that module alone
+    is then moved or loaded by assignment, as torch does without the swap, on its thread
+    alone (the swap setting reads per thread)."""
+    from torch import nn
+
+    future, assigning = torch.__future__, threading.local()
+    swaps = future.get_swap_module_params_on_conversion
+    future.get_swap_module_params_on_conversion = lambda: swaps() and not getattr(assigning, "on", False)
+
+    def by_assignment(call, *args):
+        assigning.on = True
+        try:
+            return call(*args)
+        finally:
+            assigning.on = False
+
+    apply, load = nn.Module._apply, nn.Module._load_from_state_dict
+
+    def apply_one(self, fn, recurse=True):
+        try:
+            return apply(self, fn, recurse)
+        except RuntimeError as e:  # its own parameters (a child retries its own)
+            if not str(e).startswith("_apply(): Couldn't swap"):
+                raise
+            return by_assignment(apply, self, fn, False)
+
+    def load_one(self, state_dict, prefix, metadata, strict, missing, unexpected, errors):
+        marks = len(missing), len(unexpected), len(errors)
+        load(self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
+        if any(e.startswith("While swapping") for e in errors[marks[2]:]):
+            for found, mark in zip((missing, unexpected, errors), marks, strict=True):
+                del found[mark:]
+            by_assignment(load, self, state_dict, prefix, metadata, strict, missing, unexpected, errors)
+
+    nn.Module._apply = apply_one
+    nn.Module._load_from_state_dict = load_one
+
+
+def relax_blockwise_scaled_mm_meta() -> None:
+    """torch 2.10's meta check for block-scaled fp8 GEMMs (``_scaled_mm_v2``, 1x128 x 128x128
+    blocks) floors ``N / 128``, so a weight whose last 128-row block is partial (GLM-5.2's
+    fused q_a + kv_a) fails it, though the CUDA kernel takes it with ceil-div scales. Such a
+    weight is checked as if its last block were whole: every other check still applies."""
+    import torch._meta_registrations as mr
+
+    check = getattr(mr, "_check_scaled_mm_sizes_v2", None)
+    if check is None or getattr(check, "_mstar_sim", False):
+        return
+
+    def relaxed(self, mat2, *args, out_dtype=None, **kwargs):
+        try:
+            return check(self, mat2, *args, out_dtype=out_dtype, **kwargs)
+        except RuntimeError as refused:
+            n = mat2.shape[1]
+            if n % 128 == 0:
+                raise
+            whole = torch.empty_strided((mat2.shape[0], -(-n // 128) * 128), mat2.stride(), dtype=mat2.dtype,
+                                        device=mat2.device)
+            try:
+                check(self, whole, *args, out_dtype=out_dtype, **kwargs)
+            except RuntimeError:
+                raise refused from None
+            return torch.empty(self.shape[0], n, dtype=out_dtype or self.dtype, device=self.device)
+
+    relaxed._mstar_sim = True
+    mr._check_scaled_mm_sizes_v2 = relaxed
 
 
 def install() -> None:

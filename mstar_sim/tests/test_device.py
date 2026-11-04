@@ -432,11 +432,11 @@ def test_small_dev_shm_answers_every_statvfs_form():
 def test_memory_tracking_lock_is_reentrant():
     """A tensor freed by a garbage collection that runs while the tracker holds
     its lock releases its storage on the same thread: a plain lock deadlocks."""
-    from mstar_sim import device
+    from mstar_sim import memory
 
-    with device._track_lock:
-        assert device._track_lock.acquire(blocking=False)
-        device._track_lock.release()
+    with memory._track_lock:
+        assert memory._track_lock.acquire(blocking=False)
+        memory._track_lock.release()
 
 
 def test_tensor_parallel_collectives_are_timed_not_sent():

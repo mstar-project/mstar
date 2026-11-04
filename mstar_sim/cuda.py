@@ -3,7 +3,7 @@
 Streams and events run on :mod:`mstar_sim.clock`; graphs record a
 :class:`~mstar_sim.clock.Tape` and replay it through
 :func:`mstar_sim.device.replay`. Memory figures are the caching allocator's
-accounting of the simulated tensors' storages (``mstar_sim.device.Pool``) against
+accounting of the simulated tensors' storages (``mstar_sim.memory.Pool``) against
 the card's capacity (``MSTAR_SIM_MEMORY_GB``, by default the card's).
 """
 
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar_sim import clock
+from mstar_sim import clock, memory
 
 _tls = threading.local()
 _ids = itertools.count(1)
@@ -118,9 +118,7 @@ def get_device_properties(device=None):
 
 def _used(device) -> list[int]:
     """``[current, peak]`` bytes of a simulated device's live tensors (their storages)."""
-    from mstar_sim import device as dev
-
-    return dev.ALLOCATED.setdefault(_as_index(device), [0, 0])
+    return memory.ALLOCATED.setdefault(_as_index(device), [0, 0])
 
 
 def memory_allocated(device=None) -> int:
@@ -133,31 +131,23 @@ def max_memory_allocated(device=None) -> int:
 
 def memory_reserved(device=None) -> int:
     """What the caching allocator holds from the card: every pool's high-water mark
-    (``mstar_sim.device.Pool``)."""
-    from mstar_sim import device as dev
-
-    return dev.reserved(_as_index(device))
+    (``mstar_sim.memory.Pool``)."""
+    return memory.reserved(_as_index(device))
 
 
 def max_memory_reserved(device=None) -> int:
-    from mstar_sim import device as dev
-
-    return dev.RESERVED_PEAK.get(_as_index(device), 0)
+    return memory.RESERVED_PEAK.get(_as_index(device), 0)
 
 
 def reset_peak_memory_stats(device=None) -> None:
-    from mstar_sim import device as dev
-
     used = _used(device)
     used[1] = used[0]
-    dev.RESERVED_PEAK[_as_index(device)] = memory_reserved(device)
+    memory.RESERVED_PEAK[_as_index(device)] = memory_reserved(device)
 
 
 def empty_cache() -> None:
-    from mstar_sim import device as dev
-
     for index in range(device_count()):
-        dev.release_cached(index)
+        memory.release_cached(index)
 
 
 def mem_get_info(device=None) -> tuple[int, int]:
@@ -192,12 +182,10 @@ def memory_stats(device=None) -> dict:
 
 def memory_snapshot(*_, **__) -> list[dict]:
     """One segment per pool (no blocks): what reads a pool's size off the snapshot sees it."""
-    from mstar_sim import device as dev
-
     return [{"device": p.device, "segment_pool_id": p.handle, "total_size": p.reserved,
              "allocated_size": p.live, "active_size": p.live, "requested_size": p.live,
              "stream": 0, "segment_type": "large", "address": 0, "blocks": []}
-            for p in list(dev.POOLS.values()) if p.reserved]
+            for p in list(memory.POOLS.values()) if p.reserved]
 
 
 # graph pools, as the caching allocator's (torch._C._cuda_*AllocateToPool, _cuda_releasePool)
@@ -206,29 +194,25 @@ def memory_snapshot(*_, **__) -> list[dict]:
 def _begin_allocate_to_pool(device, mempool_id, *_) -> None:
     """This thread's allocations on ``device`` go to the pool (a capture's stream filter, here
     its thread), until it ends."""
-    from mstar_sim import device as dev
-
-    with dev._track_lock:
-        p = dev.pool(_as_index(device), mempool_id)
+    with memory._track_lock:
+        p = memory.pool(_as_index(device), mempool_id)
         p.graphs += 1
         p.recording = threading.get_ident()
 
 
 def _end_allocate_to_pool(device, mempool_id) -> None:
-    from mstar_sim import device as dev
+    from mstar_sim.device import gpu_error
 
-    with dev._track_lock:
-        p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+    with memory._track_lock:
+        p = memory.POOLS.get((_as_index(device), tuple(mempool_id)))
         if p is None or p.recording is None:
-            raise dev.gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
+            raise gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
         p.recording = None
 
 
 def _release_pool(device, mempool_id) -> None:
-    from mstar_sim import device as dev
-
-    with dev._track_lock:
-        p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+    with memory._track_lock:
+        p = memory.POOLS.get((_as_index(device), tuple(mempool_id)))
         if p is not None:
             p.graphs -= 1
 
