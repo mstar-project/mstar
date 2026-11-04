@@ -1,9 +1,10 @@
 """H3's per-head q/k RMSNorm and partial rope in one pass over q and k, for the compiled DiT.
 
-Inductor runs the two as a looped reduction that reads every head twice and writes the
-roped heads at ~1.4 TB/s; this kernel reads each head once and rounds like the eager ops
-(the norm's output to bf16, then ``x * cos`` and ``partner * sin`` to bf16, then their
-sum). Eager steps keep the torch ops, so they stay bit-exact with the reference."""
+Inductor runs the two as a looped reduction over each head and writes the roped heads at
+~1.4 TB/s. This kernel loads each head twice too, as ``x`` and in its rotate-half order,
+from the same row (the second load is probably a cache hit; not measured), and rounds like
+the eager ops (the norm's output to bf16, then ``x * cos`` and ``partner * sin`` to bf16,
+then their sum). Eager steps keep the torch ops, so they stay bit-exact with the reference."""
 
 from __future__ import annotations
 
@@ -46,6 +47,10 @@ def qk_norm_rope(qkv: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, si
     rows, d = qkv.shape[0], weights.shape[1]
     out = qkv.new_empty(rows, 2 * heads, d)
     block = 8
+    # a program's heads must all be q or all k, or it norms some with the other's weight
+    # (28 local heads under TP2 would)
+    if heads % block:
+        raise ValueError(f"qk_norm_rope needs a multiple of {block} heads, got {heads}")
     _qk_norm_rope_kernel[(rows, 2 * heads // block)](
         qkv, weights, cos, sin, out, eps, qkv.stride(0), cos.stride(0),
         H=heads, D=d, HALF=rotary_dim // 2, ROT=rotary_dim, HB=block, num_warps=4, enable_fp_fusion=False,

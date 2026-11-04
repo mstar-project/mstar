@@ -3,9 +3,19 @@
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="a Triton kernel")
+
+def test_a_head_count_the_block_does_not_divide_is_refused():
+    """A program norms ``HB`` heads with one weight, so they must be all q or all k."""
+    pytest.importorskip("triton")
+    from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
+
+    rows, heads, d = 4, 28, 128
+    qkv = torch.zeros(rows, 3 * heads * d, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 8 heads"):
+        qk_norm_rope(qkv, torch.ones(2, d), torch.ones(rows, d), torch.zeros(rows, d), 1e-5, heads, 96)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a Triton kernel")
 def test_the_kernel_matches_the_eager_norms_and_rope():
     from mstar.model.minimax_h3.components.layout import H3Layout, position_ids
     from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope

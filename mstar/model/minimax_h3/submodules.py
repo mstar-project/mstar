@@ -429,7 +429,9 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         self.vae = vae
         self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
         if compile_blocks and vae is not None:
-            # every call decodes tile_batch same-size tiles, so the blocks compile static
+            # static per tile count: a rank's tiles (its clips' times the canvas's) go
+            # tile_batch at a time, so a count tile_batch doesn't divide, e.g. 2 x 16 at
+            # 768x768 in calls of 28, compiles its remainder too
             compile_blocks_(vae.decoder.transformer_blocks)
         self.ends = _VideoFrames(config)
         self._max_batch_size = max_batch_size
