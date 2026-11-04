@@ -27,6 +27,7 @@ def _runner(resources):
     runner = StepRunner.__new__(StepRunner)
     runner._resources = {r.name: r for r in resources}
     runner._order = [r.name for r in resources]
+    runner._on_lane = {}
     return runner
 
 

@@ -4,10 +4,12 @@ import logging
 import os
 import threading
 import time
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import repeat
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
@@ -540,6 +542,11 @@ class ExecutingBatch:
 
 
 class Engine:
+    # node -> its lane, for nodes off the chain, and each such lane's stream;
+    # set at construction and load, empty for an engine with no lanes
+    _node_lanes: Mapping[str, int] = MappingProxyType({})
+    _lane_streams: Mapping[int, Any] = MappingProxyType({})
+
     @property
     def device_capability(self) -> DeviceCapability:
         capability = getattr(self, "_device_capability", None)
@@ -554,15 +561,15 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
-        side_stream_nodes: Collection[str] = (),
+        node_lanes: Mapping[str, int] | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
-        # nodes whose steps run beside the worker's chain (``EngineManager.build``)
-        self._side_stream_nodes = frozenset(side_stream_nodes)
+        # the lanes off the chain, as ``EngineManager.build`` placed them
+        self._node_lanes = dict(node_lanes or {})
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -666,6 +673,10 @@ class Engine:
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
         self._loopback_steps: dict[int, tuple[str, str]] = {}
+        # one stream per lane off the chain, made once; everything a lane issues goes on it (``on_lane``)
+        self._lane_streams = {
+            lane: self.device_capability.graph_backend.new_stream() for lane in sorted(set(self._node_lanes.values()))
+        }
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
@@ -673,8 +684,7 @@ class Engine:
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
             declared_by=declared_by,
-            # a side node's own: ``EngineManager.build`` lets no other node declare them
-            side_resources={key for node in self._side_stream_nodes for key in node_to_resources.get(node, ())},
+            on_lane=self._lane_contexts(node_names, declared_by, prefix_caches),
         )
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
@@ -1012,27 +1022,95 @@ class Engine:
             took / 2**20, plan.predicted[pool] / 2**20,
         )
 
-    def set_side_stream(self, node_name: str, stream: Any) -> None:
-        """Run a side node's resource teardowns on ``stream``, the one its
-        steps run on. A pool zeroes a slot when a request releases it, and the
-        next request to take the slot writes it from the lane: on the main
-        stream that zero could land after the write, behind the chain's queued
-        steps."""
-        self._runner.set_side_stream(self._submodules[node_name].resources, stream)
+    def on_lane(self, lane: int) -> AbstractContextManager:
+        """Make ``lane``'s stream this thread's current one, for everything
+        issued on the lane: its steps, the collate of their inputs, and the
+        teardown of what its nodes hold (a slot zeroed on another stream could
+        land after the next request's first write to it). The device runtime's
+        per-call context, never the stream object's own, so two threads can be
+        on one lane at once. The chain (lane 0) stays on the current stream."""
+        stream = self._lane_streams.get(lane)
+        if stream is None:
+            return nullcontext()
+        return self.device_capability.graph_backend.stream_context(stream)
+
+    def _lane_contexts(
+        self, node_names: Collection[str], declared_by: Mapping[str, frozenset[str]],
+        prefix_caches: Collection[str],
+    ) -> dict[str, Callable[[], AbstractContextManager]]:
+        """Give every resource a lane off the chain holds the context its work
+        runs under there: its lane's stream (``on_lane``).
+
+        A lane's steps admit, plan and commit inline on the GPU thread, between
+        two chain steps, while the plan thread stages the chain's next step and
+        the main thread ingests, readies and tears down other rows. So a
+        resource on a lane off the chain is that lane's alone: declared only by
+        this worker's nodes on it, with every resource it depends on there too.
+        The runner puts each call into it from outside the step on the lane's
+        stream too (``StepRunner._on_lane_of``). What only the chain does stays
+        on the chain: a prefix cache, state the main thread moves outside the
+        step (``Resource.journals_resident_moves``: eviction, prefix leases,
+        page trails), and host rows, which stage through a ring the chain's next
+        steps reuse before a step off it lands.
+
+        Nothing fences a lane's admit and plan against the main thread, so a
+        resource a lane holds must keep them safe against its ingest, readiness
+        and teardown of other rows, as the recurrent pool's lock does."""
+        if not self._lane_streams:
+            return {}
+        backend = self.device_capability.graph_backend
+
+        def lane_of(key: str) -> set[int]:
+            return {self._node_lanes.get(node, 0) for node in declared_by[key]}
+
+        contexts = {}
+        for key, resource in self._resources.items():
+            # one not built here is the runner's ``topo_sort`` to refuse, by name
+            deps = [dep for dep in resource.depends_on() if dep in declared_by]
+            holds = lane_of(key)
+            if holds == {0} and all(lane_of(dep) == {0} for dep in deps):
+                continue
+
+            def refuse(reason: str, key=key, holds=holds) -> ValueError:
+                return ValueError(f"resource {key!r}, declared by {sorted(declared_by[key])} on lanes "
+                                  f"{sorted(holds)}, can't be placed there: {reason}")
+
+            # first for one off the chain: a node on another worker is on no lane here, so it reads as the
+            # chain's; one on the chain may be declared there too (BAGEL's CFG replicas), so its deps decide
+            if holds != {0} and not declared_by[key] <= set(node_names):
+                raise refuse("a node on another worker declares it too")
+            if len(holds) > 1:
+                raise refuse("nodes on two lanes declare it, and a step on one could change it while "
+                             "another's reads it")
+            crossed = sorted(dep for dep in deps if lane_of(dep) != holds)
+            if crossed:
+                raise refuse(f"it depends on {crossed}, which another lane holds")
+            if key in prefix_caches:
+                raise refuse("it keeps a prefix cache")
+            if type(resource).journals_resident_moves():
+                raise refuse("the main thread moves its state outside the step (eviction, prefix leases or "
+                             "page trails)")
+            if type(resource).step_host_rows is not Resource.step_host_rows:
+                raise refuse("its host rows stage through a ring the chain's next steps reuse before a step "
+                             "off it lands")
+            (lane,) = holds
+            contexts[key] = partial(backend.stream_context, self._lane_streams[lane])
+        return contexts
 
     def _capture_stream_for(self, node_name: str) -> Any:
-        """The stream a node captures on; None for the backend's shared one.
+        """The stream a node captures on: its lane's, or None for the
+        backend's shared one on the chain.
 
         Graphs captured on one stream share what the capture ties to it, so two
-        of them must never run at once. On the chain they can't, but a node
-        whose steps run beside it can overlap any graph of any other node, and
-        with a shared capture stream that silently changes the other graph's
-        result.
+        of them must never run at once. On one lane they can't, with one step
+        in flight each, but a step off the chain can overlap any graph of any
+        other lane, and with a shared capture stream that silently changes the
+        other graph's result.
         """
         backend = self.device_capability.graph_backend
-        if node_name not in self._side_stream_nodes or backend is None or not backend.is_available():
+        if backend is None or not backend.is_available():
             return None
-        return backend.new_stream()
+        return self._lane_streams.get(self._node_lanes.get(node_name))
 
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
@@ -3364,8 +3442,9 @@ class Engine:
         }
         self._runner.remove_request(request_id)
         self._chunking.forget_request(request_id)
-        for submodule_mgmt in self._submodules.values():
-            submodule_mgmt.submodule.cleanup_request(request_id)
+        for node_name, submodule_mgmt in self._submodules.items():
+            with self.on_lane(self._node_lanes.get(node_name, 0)):
+                submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.resident is not None:
                 submodule_mgmt.resident.release(request_id)
         return freed

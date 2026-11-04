@@ -201,7 +201,7 @@ def test_runner_dispatch_falls_back_per_request():
             calls.append(("rid", rid, outputs))
 
     runner = StepRunner.__new__(StepRunner)
-    runner._resources = {"a": _Batch(), "b": _PerRid()}
+    runner._resources, runner._on_lane = {"a": _Batch(), "b": _PerRid()}, {}
     outputs = {"r0": {"x": 1}, "r1": None}
     runner.extend_prefix_chains_batch(
         ["r0", "r1"], "n", lambda _r: "w", HostRows((), {}), outputs, keys=["a", "b"],
@@ -220,7 +220,7 @@ def test_runner_dispatch_keys_each_row_under_its_own_walk():
             seen.append((rid, walk))
 
     runner = StepRunner.__new__(StepRunner)
-    runner._resources = {"b": _PerRid()}
+    runner._resources, runner._on_lane = {"b": _PerRid()}, {}
     walks = {"r0": "prefill_text", "r1": "decode"}
     runner.extend_prefix_chains_batch(
         ["r0", "r1"], "n", walks.__getitem__, HostRows((), {}),

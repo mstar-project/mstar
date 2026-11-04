@@ -968,9 +968,8 @@ class CodecSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
     # Nothing in the Talker reads the audio, so its decode steps need not queue
-    # behind a window; the serving config's ``side_stream`` turns it on. The
-    # lane admits and plans the windows' ``codec_state`` rows itself.
-    side_stream_walks = frozenset({"codec_chunk"})
+    # behind a window: the colocated configs put the Codec on a lane of its own
+    # (``lane: 1``), which admits and plans the windows' ``codec_state`` rows.
 
     # The codec's cost is linear in rows, so every padding row of a bucket
     # costs a real row's decode: the buckets are dense.

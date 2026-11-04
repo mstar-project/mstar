@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from mstar.engine.resources.admission import Admission
@@ -23,6 +24,9 @@ from mstar.engine.resources.step import (
 from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+# where a call into a chain resource runs: the current stream (``StepRunner._on_lane_of``)
+_ON_CHAIN = nullcontext()
 
 
 def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
@@ -66,7 +70,7 @@ class StepRunner:
         node_resources: Mapping[str, Collection[str]] | None = None,
         enable_nvtx: bool = False,
         declared_by: Mapping[str, Collection[str]] | None = None,
-        side_resources: Collection[str] = (),
+        on_lane: Mapping[str, Callable[[], AbstractContextManager]] | None = None,
     ):
         # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
         # was slow; these say WHICH resource ate it. Gated because range_push
@@ -143,14 +147,23 @@ class StepRunner:
         self._staged: tuple | None = None
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
-        # Resources only a side lane's steps declare (``mstar.worker.side_steps``),
-        # and the lane's stream for each, once it has one. Such a step runs
-        # between a chain step and its staged successor, on the GPU thread while
-        # the plan thread may still be staging that successor; its resources are
-        # never staged, so it neither promotes nor drops the stage
-        # (``_beside_stage``).
-        self._side_resources = frozenset(side_resources)
-        self._side_streams: dict[str, Any] = {}
+        # Resources a lane off the chain holds (``mstar.worker.lanes``), each with
+        # the context that puts work on its lane's stream (``Engine.on_lane``).
+        # Such a lane's step runs between a chain step and its staged successor,
+        # on the GPU thread while the plan thread may still be staging that
+        # successor; its resources are never staged, so it neither promotes nor
+        # drops the stage (``_beside_stage``). Every call into one from outside
+        # the step goes on its lane's stream too (``_on_lane_of``).
+        self._on_lane = dict(on_lane or {})
+        self._chain_keys = [key for key in self._order if key not in self._on_lane]
+
+    def _on_lane_of(self, key: str) -> AbstractContextManager:
+        """What a call into ``key`` from outside its step runs under: its lane's
+        stream for a resource a lane off the chain holds, the current one for
+        the chain's. Inside the step (admit, plan, commit, publish) the lane
+        has already put the thread there (``Lane.execute``)."""
+        on_lane = self._on_lane.get(key)
+        return _ON_CHAIN if on_lane is None else on_lane()
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -240,9 +253,10 @@ class StepRunner:
         if keys is None:
             keys = self._sweep(self._node_order, self._order, node_name)
         for key in keys:
-            self._resources[key].extend_prefix_chain(
-                rid, node_name, graph_walk, outputs,
-            )
+            with self._on_lane_of(key):
+                self._resources[key].extend_prefix_chain(
+                    rid, node_name, graph_walk, outputs,
+                )
 
     def extend_prefix_chains_batch(
         self, request_ids: list[str], node_name: str,
@@ -258,21 +272,23 @@ class StepRunner:
         for key in keys:
             resource = self._resources[key]
             batched = getattr(resource, "extend_prefix_chains_batch", None)
-            if batched is not None:
-                batched(request_ids, node_name, walk_of, host_rows)
-                continue
-            for rid in request_ids:
-                per_rid = outputs.get(rid)
-                if isinstance(per_rid, Mapping):
-                    resource.extend_prefix_chain(
-                        rid, node_name,
-                        walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
-                    )
+            with self._on_lane_of(key):
+                if batched is not None:
+                    batched(request_ids, node_name, walk_of, host_rows)
+                    continue
+                for rid in request_ids:
+                    per_rid = outputs.get(rid)
+                    if isinstance(per_rid, Mapping):
+                        resource.extend_prefix_chain(
+                            rid, node_name,
+                            walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
+                        )
 
     def after_output_copy(self, step: SubmoduleStep) -> None:
         for key in self._keys_for(step):
             if key in self._after_output_copy_keys:
-                self._resources[key].after_output_copy(step.get(key))
+                with self._on_lane_of(key):
+                    self._resources[key].after_output_copy(step.get(key))
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""
@@ -360,14 +376,16 @@ class StepRunner:
         nothing: a resource that raises leaves the request on none of them."""
         for i, key in enumerate(self._order):
             try:
-                self._resources[key].ingest_request(
-                    rid, None if overrides is None else overrides.get(key)
-                )
+                with self._on_lane_of(key):
+                    self._resources[key].ingest_request(
+                        rid, None if overrides is None else overrides.get(key)
+                    )
             except Exception:
                 # the raising resource may have taken part of it too
                 for done in self._order[:i + 1]:
                     try:
-                        self._resources[done].remove_request(rid)
+                        with self._on_lane_of(done):
+                            self._resources[done].remove_request(rid)
                     except Exception:
                         logger.exception(
                             "rolling back request %s on resource %s failed", rid, done,
@@ -379,18 +397,10 @@ class StepRunner:
         for key in self._order:
             self._resources[key].ingest_capture_row(rid)
 
-    def set_side_stream(self, keys: Collection[str], stream: Any) -> None:
-        """Tear ``keys`` down on ``stream``, the side lane's stream their steps run on."""
-        self._side_streams.update(dict.fromkeys(keys, stream))
-
     def remove_request(self, rid: str) -> None:
         self._admission.remove_request(rid)
         for key in self._order:
-            stream = self._side_streams.get(key)
-            if stream is None:
-                self._resources[key].remove_request(rid)
-                continue
-            with stream:
+            with self._on_lane_of(key):
                 self._resources[key].remove_request(rid)
         for rids in self._unpublished.values():
             rids.discard(rid)
@@ -450,10 +460,14 @@ class StepRunner:
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
         ):
-            outcome = self._resources[key].admit_retrieve(
-                rid, node_name, graph_walk,
-                None if published is None else published.get(key),
-            )
+            resource, on_lane = self._resources[key], self._on_lane.get(key)
+            info = None if published is None else published.get(key)
+            # the hottest sweep: a chain resource's call pays no context
+            if on_lane is None:
+                outcome = resource.admit_retrieve(rid, node_name, graph_walk, info)
+            else:
+                with on_lane():
+                    outcome = resource.admit_retrieve(rid, node_name, graph_walk, info)
             if not outcome.ok:
                 logger.warning(
                     "Admit + retrieve for resource %s failed with error: %s",
@@ -520,15 +534,17 @@ class StepRunner:
         return self._staged is not None
 
     def clear_preplan(self) -> None:
-        """Drop the staged pre-plan on every resource, and the record of it."""
+        """Drop the staged pre-plan on every chain resource, and the record of
+        it; a lane's resources, which a step may be planning meanwhile, stage
+        nothing."""
         self._staged = None
         self._pre_admitted = None
-        for key in self._order:
+        for key in self._chain_keys:
             self._resources[key].clear_preplan()
 
     def _beside_stage(self, step: SubmoduleStep) -> bool:
-        """A side lane's step, which leaves the stage alone."""
-        return bool(self._side_resources) and bool(step.keys()) and self._side_resources.issuperset(step.keys())
+        """A step off the chain, which leaves the chain's stage alone."""
+        return bool(self._on_lane) and bool(step.keys()) and self._on_lane.keys() >= step.keys()
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
@@ -774,20 +790,24 @@ class StepRunner:
     ) -> dict[str, dict[str, PublishedInfo]]:
         """The published info of ``request_ids`` from their snapshots, each
         under its own walk (see ``publish_snapshot``)."""
-        out: dict[str, dict[str, PublishedInfo]] = {}
-        for rid in request_ids:
-            snaps = snapshots.get(rid)
-            if not snaps:
-                continue
-            walk = request_walks.get(rid, graph_walk) if request_walks else graph_walk
-            per_key: dict[str, PublishedInfo] = {}
-            for key, snap in snaps.items():
-                info = self._resources[key].publish_from_snapshot(
-                    rid, snap, node_name=node_name, graph_walk=walk,
-                )
-                if info is not None:
-                    per_key[key] = info
-            out[rid] = per_key
+        out: dict[str, dict[str, PublishedInfo]] = {
+            rid: {} for rid in request_ids if snapshots.get(rid)
+        }
+        # a resource at a time in publish order, under its lane's context
+        present = {key for rid in out for key in snapshots[rid]}
+        for key in (key for key in self._order if key in present):
+            resource = self._resources[key]
+            with self._on_lane_of(key):
+                for rid, per_key in out.items():
+                    snap = snapshots[rid].get(key)
+                    if snap is None:
+                        continue
+                    info = resource.publish_from_snapshot(
+                        rid, snap, node_name=node_name,
+                        graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
+                    )
+                    if info is not None:
+                        per_key[key] = info
         return out
 
     def publish_after_stop(
@@ -802,22 +822,20 @@ class StepRunner:
             self._sweep(self._node_publish_order, self._publish_order, node_name),
             request_ids,
         )
-        if not order:
-            return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key], self._unpublished[key]) for key in order]
-        out: dict[str, dict[str, PublishedInfo]] = {}
-        for rid in request_ids:
-            per_key: dict[str, PublishedInfo] = {}
-            for key, resource, skip in publishers:
-                if rid in skip:
-                    continue
-                info = resource.publish_after_stop(
-                    rid, node_name=node_name,
-                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
-                )
-                if info is not None:
-                    per_key[key] = info
-            out[rid] = per_key
+        out: dict[str, dict[str, PublishedInfo]] = {rid: {} for rid in request_ids}
+        # a resource at a time, under its lane's context
+        for key in order:
+            resource, skip = self._resources[key], self._unpublished[key]
+            with self._on_lane_of(key):
+                for rid in request_ids:
+                    if rid in skip:
+                        continue
+                    info = resource.publish_after_stop(
+                        rid, node_name=node_name,
+                        graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
+                    )
+                    if info is not None:
+                        out[rid][key] = info
         return out
 
     def build_accelerator_graph_buffers(

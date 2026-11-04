@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -12,11 +12,11 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.recurrent import RecurrentStateSpec
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils import knobs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -123,89 +123,70 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
-def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
-    """The nodes whose node groups set ``side_stream: true``. A node listed by
-    several groups, one per graph walk, must get the same answer from each."""
-    asked: dict[str, bool] = {}
+def node_lanes(node_groups: list[dict]) -> dict[str, int]:
+    """The lane each node runs on, from its node groups' ``lane`` (0, the
+    chain, where unset); only nodes off the chain are listed. A node listed by
+    several groups, one per graph walk, must get the same lane from each."""
+    asked: dict[str, int] = {}
     for group in node_groups:
-        flag = group.get("side_stream", False)
-        if not isinstance(flag, bool):
-            raise ValueError(f"side_stream takes true or false, not {flag!r}")
+        if "side_stream" in group:
+            raise ValueError("side_stream was replaced by lane: <id>; lane: 1 puts the node beside the chain")
+        lane = group.get("lane", 0)
+        if not isinstance(lane, int) or isinstance(lane, bool) or lane < 0:
+            raise ValueError(f"lane takes a lane id, 0 (the chain) or more, not {lane!r}")
         for node in group["node_names"]:
-            if asked.setdefault(node, flag) != flag:
-                raise ValueError(f"node {node!r} gets different side_stream settings from two node_groups")
-    return frozenset(node for node, flag in asked.items() if flag)
+            if asked.setdefault(node, lane) != lane:
+                raise ValueError(f"node {node!r} gets different lanes from two node_groups")
+    return {node: lane for node, lane in asked.items() if lane}
 
 
-def _side_lane_keys(
-    submodules: dict, specs: list, model: Model, node_names: Collection[str], asked: Collection[str],
-    parallel_groups: WorkerParallelGroups, accelerator: bool,
-) -> tuple[tuple[str, str], ...]:
-    """The (node, walk) keys this worker runs beside its chain
-    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
-    group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
-    can't take it. Only nodes that ask are checked.
+def _refuse_unservable_lanes(
+    submodules: dict, model: Model, node_names: Collection[str], lanes: Mapping[str, int],
+    parallel_groups: WorkerParallelGroups, graph_backend: bool,
+) -> dict[str, int]:
+    """Of ``lanes``, the nodes this worker runs beside its chain
+    (``mstar.worker.lanes``), or a ``ValueError`` naming why one can't be.
 
-    A side step is admitted and planned inline on the GPU thread, never
-    speculated or planned ahead, and lands between two chain steps, so the
-    lane takes a stream-fed walk of one node with no stop check, beside
-    another node's chain. Of resources it takes only recurrent state pools of
-    the node's own (``_lane_holds``).
+    A step off the chain runs its node's walks, every one of them, on the
+    node's lane: admitted and planned inline on the GPU thread, never
+    speculated, planned ahead or lockstep, landing between two chain steps.
+    So such a node needs a chain beside it, a graph backend's stream,
+    rank-local timing, and walks of its own that no chain speculation reaches
+    into and that stage no host rows. Which resources it may hold is the
+    engine's to decide (``Engine._lane_contexts``).
     """
     walks = model.get_graph_walk_graphs()
     combined = model.combined_walk_of()
-    keys = []
-    for name in sorted(set(asked) & set(submodules)):
+    placed = {name: lane for name, lane in lanes.items() if name in submodules}
+    if placed and set(node_names) <= set(placed):
+        raise ValueError(f"{type(model).__name__}: every node on this worker ({sorted(placed)}) is off "
+                         "the chain (lane 0); there is no chain to run beside")
+    for name, lane in sorted(placed.items()):
         submodule = submodules[name]
-        side = submodule.side_stream_walks
 
-        def refuse(reason: str, name=name) -> ValueError:
-            return ValueError(f"{type(model).__name__}: {name!r} sets side_stream, but {reason}")
+        def refuse(reason: str, name=name, lane=lane) -> ValueError:
+            return ValueError(f"{type(model).__name__}: {name!r} is placed on lane {lane}, but {reason}")
 
-        if not side:
-            raise refuse("its submodule declares no side_stream_walks")
         if parallel_groups.get_instance_world_size_for_node(name) > 1:
-            raise refuse("it runs tensor or sequence parallel: when a side step lands is per rank, "
-                         "and every rank of a lockstep instance has to agree on it")
-        if set(node_names) <= {name}:
-            raise refuse("it is the only node on its worker, so there is no chain to run beside")
-        if not accelerator:
-            raise refuse("its device has no streams")
-        on_chain = sorted(w for w, graph in walks.items() if name in graph.get_nodes() and w not in side)
-        if on_chain:
-            raise refuse(f"it also runs {on_chain} on the chain, whose graphs would share its capture "
-                         "stream and pool with the side walks' and could run beside them")
-        held = sorted(spec.resource_key for spec in specs if name in spec.nodes and not _lane_holds(spec, name))
-        if held:
-            raise refuse(f"it holds resources {held}: the lane admits and plans only a recurrent state "
-                         "pool of the node's own with no prefix snapshots, so a KV cache, attention, "
-                         "positions, a sampler or a pool another node shares still refuse")
-        if submodule.resident_walks():
-            raise refuse("it plans walks on resident tables, which the lane doesn't")
-        for walk in sorted(side):
-            graph = walks.get(walk)
-            if not isinstance(graph, GraphNode) or graph.name != name:
-                raise refuse(f"side walk {walk!r} is not a walk of that one node")
+            raise refuse("it runs tensor or sequence parallel: when a step off the chain lands is per "
+                         "rank, and every rank of a lockstep instance has to agree on it")
+        if not graph_backend:
+            raise refuse("its device has no accelerator-graph backend (CUDA or XPU) to give it a stream")
+        if submodule.resident_walks() and knobs.resident_planning() != "off":
+            raise refuse("it plans walks on resident tables, which a lane off the chain doesn't")
+        for walk, graph in sorted(walks.items()):
+            if name not in graph.get_nodes():
+                continue
+            if not isinstance(graph, GraphNode):
+                raise refuse(f"walk {walk!r} runs other nodes or a loop around it, which the chain "
+                             "would speculate into")
             if (name, walk) in combined:
-                raise refuse(f"side walk {walk!r} is part of combined walk {combined[name, walk]!r}, "
+                raise refuse(f"walk {walk!r} is part of combined walk {combined[name, walk]!r}, "
                              "which the chain schedules")
             if submodule.spanned_outputs(walk) or _stops_on_a_token(submodule, walk):
-                raise refuse(f"side walk {walk!r} has output spans or a stop check, whose host rows "
-                             "stage through a ring the chain's next steps reuse before a side step lands")
-            keys.append((name, walk))
-    if len({name for name, _ in keys}) > 1:
-        raise ValueError(f"{type(model).__name__}: side_stream is set on {sorted({n for n, _ in keys})}; "
-                         "a worker runs one side lane, for one node")
-    return tuple(keys)
-
-
-def _lane_holds(spec, name: str) -> bool:
-    """Whether a side lane can hold ``spec`` for node ``name``: a recurrent
-    state pool only that node declares and that keys no prefix snapshots on a
-    KV cache. Its slots are then touched by the lane's steps alone, which
-    admit and plan inline, never ahead, so the chain's pre-plan never stages
-    it (``StepRunner._beside_stage``)."""
-    return isinstance(spec, RecurrentStateSpec) and spec.nodes == {name} and not spec.depends_on()
+                raise refuse(f"walk {walk!r} has output spans or a stop check, whose host rows stage "
+                             "through a ring the chain's next steps reuse before a step off it lands")
+    return placed
 
 
 def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
@@ -259,9 +240,9 @@ class EngineManager:
     """
     engine: Engine
     node_names: set[str] = field(default_factory=set)
-    # (node, walk) keys that run beside the chain, as ``build`` decided from
-    # the config's ``side_stream`` (see ``_side_lane_keys``)
-    side_keys: tuple[tuple[str, str], ...] = ()
+    # node -> the lane it runs on, for nodes off the chain, as ``build``
+    # decided from the config's ``lane`` (see ``_refuse_unservable_lanes``)
+    node_lanes: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -323,9 +304,10 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
-        side_keys = _side_lane_keys(
-            submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
-            parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
+        lanes = _refuse_unservable_lanes(
+            submodules, model, node_names, node_lanes(model_config["node_groups"]),
+            # a lane's stream comes from the graph backend (``Engine.on_lane``)
+            parallel_groups, (device_capability or DeviceCapability.of(device)).graph_backend is not None,
         )
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
@@ -336,7 +318,7 @@ class EngineManager:
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
-            side_stream_nodes={name for name, _ in side_keys},
+            node_lanes=lanes,
         )
         engine.load_model(
             submodules,
@@ -366,7 +348,7 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
+        return cls(engine=engine, node_names=set(node_names), node_lanes=lanes)
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

@@ -111,6 +111,7 @@ from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.lanes import Lane, finish_first_to_land
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
     MicroScheduler,
@@ -119,7 +120,6 @@ from mstar.worker.micro_scheduler import (
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -292,7 +292,7 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
-    # the chain's step, or a side lane's (``mstar.worker.side_steps``)
+    # the chain's step, or another lane's (``mstar.worker.lanes``)
     lane: int = CHAIN_LANE
 
 
@@ -478,8 +478,8 @@ class Worker:
     # The CPUs the main, GPU and plan threads share (None: not pinned) and
     # the process mask everything else keeps; see ``mstar.utils.cpus``.
     _step_cpus: cpus.StepCpus | None = None
-    # Walks that run beside the main chain, when this worker has any
-    _side_steps: SideStepLane | None = None
+    # The lanes beside the main chain, in lane order, when this worker has any
+    _lanes: tuple[Lane, ...] = ()
     # lane -> the rows its step in flight holds (``_hold_rows``); replaced,
     # never updated in place
     _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
@@ -730,13 +730,11 @@ class Worker:
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
             batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
-        if self.engine_manager.side_keys:
-            self.scheduler.lane_of = dict.fromkeys(self.engine_manager.side_keys, SIDE_LANE)
-            self._side_steps = SideStepLane(self, SIDE_LANE)
-            logger.info(
-                "Worker %s: %s run beside the chain on a side stream",
-                worker_id, list(self.engine_manager.side_keys),
-            )
+        node_lanes = self.engine_manager.node_lanes
+        if node_lanes:
+            self.scheduler.lane_of = dict(node_lanes)
+            self._lanes = tuple(Lane(self, lane) for lane in sorted(set(node_lanes.values())))
+            logger.info("Worker %s: node -> lane beside the chain %s", worker_id, node_lanes)
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
@@ -2642,7 +2640,7 @@ class Worker:
             walks=step.batch.rids_by_walk(),
         )
         chain = step.lane == CHAIN_LANE
-        span = "worker.postprocess_batch" if chain else "worker.postprocess_side"
+        span = "worker.postprocess_batch" if chain else "worker.postprocess_lane"
         keyed = self._phase_period > 0
         if keyed:
             set_step_key(_step_key(step.node_name, step.graph_walk))
@@ -3749,7 +3747,7 @@ class Worker:
             return
 
         # pending stops are only needed for one iteration of the chain, so can
-        # be cleared now; not by a side lane's step (``_finish_step``), which
+        # be cleared now; not by another lane's step (``_finish_step``), which
         # lands between two chain steps: the chain's next one has yet to read them.
         if clear_loop_stops:
             self._graph_runtime.clear_pending_loop_stops()
@@ -4789,7 +4787,7 @@ class Worker:
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
 
-        # the chain's rows: a side lane's step fails on its own (``SideStepLane``)
+        # the chain's rows: another lane's step fails on its own (``Lane``)
         failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
         for stale in in_flight:
             if stale is None:
@@ -5142,7 +5140,7 @@ class Worker:
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
 
-        side_steps = self._side_steps
+        lanes = self._lanes
 
         def _arm_speculation(spec: Speculation) -> None:
             # Hand N+1 to the plan thread NOW. It waits on N's
@@ -5265,11 +5263,12 @@ class Worker:
                     range_pop(synchronize=False)
                 laps.lap("poll_stream_buffers")
 
-                if side_steps is not None:
-                    if pending is None:
-                        side_steps.finish()
-                    side_steps.launch(gpu_executor)
-                    laps.lap("side_steps")
+                if lanes:
+                    for lane in lanes:
+                        if pending is None:
+                            lane.finish()
+                        lane.launch(gpu_executor)
+                    laps.lap("lanes")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
@@ -5454,8 +5453,8 @@ class Worker:
 
                     # After N, while N+1 runs: the same thread, but not ahead of
                     # the step the chain is about to speculate.
-                    if side_steps is not None:
-                        side_steps.finish()
+                    for lane in lanes:
+                        lane.finish()
                     # Removes for any rid not in the in-flight spec step, or
                     # another lane's, are safe to apply now.
                     laps.lap("step_done")
@@ -5502,8 +5501,9 @@ class Worker:
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
-                    if side_steps is not None and side_steps.pending is not None:
-                        side_steps.finish(block=True)
+                    busy = [lane for lane in lanes if lane.pending is not None]
+                    if busy:
+                        finish_first_to_land(busy)
                         continue
                     self.communicator.wait_for_work(10)
                     continue

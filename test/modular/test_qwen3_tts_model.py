@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.attn.workspace import Workspace
@@ -173,41 +173,49 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
     assert captured["fix_mistral_regex"] is True
 
 
-@pytest.mark.parametrize("config, side", [
-    ("qwen3tts.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_1p7b.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_base.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_voicedesign.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_1p7b_split.yaml", ()),
+@pytest.mark.parametrize("config, placed", [
+    ("qwen3tts.yaml", {"Codec": 1}),
+    ("qwen3tts_1p7b.yaml", {"Codec": 1}),
+    ("qwen3tts_base.yaml", {"Codec": 1}),
+    ("qwen3tts_voicedesign.yaml", {"Codec": 1}),
+    ("qwen3tts_1p7b_split.yaml", {}),
 ])
-def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, side):
+def test_the_codec_runs_on_a_lane_beside_the_talker_where_the_config_asks(config, placed):
     from mstar.distributed.communication import WorkerParallelGroups
-    from mstar.worker.engine_manager import _side_lane_keys, side_stream_nodes
+    from mstar.worker.engine_manager import _refuse_unservable_lanes, node_lanes
 
     model = _make_model()
     groups = yaml.safe_load((CONFIG_PATH.parent / config).read_text(encoding="utf-8"))["node_groups"]
-    assert CodecSubmodule.side_stream_walks == {"codec_chunk"}
     codec = CodecSubmodule.__new__(CodecSubmodule)
     for ranks in ({0}, {1}):
         nodes = [n for g in groups if set(g["ranks"]) & ranks for n in g["node_names"]]
         if "Codec" not in nodes:
             continue
-        keys = _side_lane_keys(
-            {n: codec if n == "Codec" else object() for n in nodes}, model.get_node_resources(), model,
-            nodes, side_stream_nodes(groups), WorkerParallelGroups(num_workers=1, global_rank=0), True,
+        lanes = _refuse_unservable_lanes(
+            {n: codec if n == "Codec" else object() for n in nodes}, model, nodes, node_lanes(groups),
+            WorkerParallelGroups(num_workers=1, global_rank=0), True,
         )
-        assert keys == side
+        assert lanes == placed
 
 
-def test_the_codec_holds_only_what_the_side_lane_admits():
-    """The lane takes a node's recurrent state pools of its own and nothing
-    else, so a resource added to the Codec would turn the colocated configs'
-    ``side_stream`` into a startup error."""
-    from mstar.worker.engine_manager import _lane_holds
+def test_the_codecs_lane_holds_every_resource_the_codec_declares():
+    """The engine's load-time check (``Engine._lane_contexts``) on the model's
+    own specs, as the colocated configs' ``lane: 1`` asks: a resource added to
+    the Codec that a lane can't hold would make those configs fail to start."""
+    specs = _make_model().get_node_resources()
+    engine = Engine.__new__(Engine)
+    engine._node_lanes = {"Codec": 1}
+    engine._lane_streams = {1: "lane 1"}
+    engine._device_capability = SimpleNamespace(graph_backend=SimpleNamespace(stream_context=lambda stream: None))
+    engine._resources = {}
+    for spec in specs:
+        # the class the spec builds, which the check reads, with the spec's dependencies
+        resource = engine._resources[spec.resource_key] = object.__new__(spec.resource_class)
+        resource.depends_on = spec.depends_on
 
-    held = [spec for spec in _make_model().get_node_resources() if "Codec" in spec.nodes]
-    assert [spec.resource_key for spec in held] == ["codec_state"]
-    assert all(_lane_holds(spec, "Codec") for spec in held)
+    contexts = engine._lane_contexts({"Talker", "Codec"}, {s.resource_key: frozenset(s.nodes) for s in specs}, ())
+
+    assert set(contexts) == {spec.resource_key for spec in specs if "Codec" in spec.nodes} == {"codec_state"}
 
 
 def test_qwen3_tts_declares_talker_and_codec_graphs():

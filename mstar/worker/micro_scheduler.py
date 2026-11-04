@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 # tolerated anywhere else -- an unknown rid off the wire is expected, an
 # unknown rid from local state is a bug and should still raise.
 REMOVED_RID = -1
-# The lane of the worker's main chain of steps; a side lane
-# (``mstar.worker.side_steps``) runs its keys' steps beside it
+# The lane of the worker's main chain of steps; other lanes
+# (``mstar.worker.lanes``) run their nodes' steps beside it
 CHAIN_LANE = 0
 
 # Below every turn and arrival: a sort key offset that puts a row ahead of them all
@@ -425,10 +425,10 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # (node, walk) -> the lane its steps run on, for keys off the chain: a
-        # lane schedules only its own keys (``get_next_batch``), so the chain
+        # node -> the lane its steps run on, for nodes off the chain: a lane
+        # schedules only its own nodes' keys (``get_next_batch``), so the chain
         # neither runs nor yields to another lane's
-        self.lane_of: dict[tuple[str, str], int] = {}
+        self.lane_of: dict[str, int] = {}
         # (node, walk) -> whether its speculation chain merges the other walks
         # of its combined walk: the config's settings, then each default as
         # `speculation_mixes` first decides it
@@ -1143,7 +1143,8 @@ class MicroScheduler:
         return None
 
     def _lane(self, key: tuple[str, str]) -> int:
-        return self.lane_of.get(key, CHAIN_LANE)
+        """The lane of a (node, walk) key: its node's, whatever the walk."""
+        return self.lane_of.get(key[0], CHAIN_LANE)
 
     def _left_to_its_chain(
         self, key: tuple[str, str], exclude_key: tuple[str, str] | None,

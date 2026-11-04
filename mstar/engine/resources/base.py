@@ -225,9 +225,11 @@ class Resource(ResidentHooks, ABC):
         """Whether rank 0 decides this resource's state for the other ranks of a lockstep
         instance outside the step that uses it (eviction, prefix leases, page trails). They
         replay each decision with the next step of the node it was journaled under, so
-        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
-        the class a spec's ``resource_class`` names, so the hooks live there, not only on
-        a subclass its ``build`` returns."""
+        validation refuses lockstep nodes on one worker sharing such a resource; and since
+        the main thread drives those moves outside any step, a lane off the chain can't
+        hold one (``Engine._lane_contexts``). Asked of the class a spec's
+        ``resource_class`` names, so the hooks live there, not only on a subclass its
+        ``build`` returns."""
         return any(getattr(cls, hook) is not getattr(Resource, hook)
                    for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
 

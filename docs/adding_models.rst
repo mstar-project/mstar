@@ -1971,23 +1971,31 @@ which is what the engine reads, and resources of one node must agree on a walk's
 rows last, so the kernels read the decode rows as the step's first tokens, in place. Every
 other walk of the combined walk must be one token per row.
 
-**Steps beside the chain.** A worker's main loop runs one chain of steps, and any step on it
-costs a pass of the loop and holds the next one behind its kernels. A node that shares a
-worker with a heavier one can set ``side_stream_walks`` on its submodule to the walks that
-may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
-on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
-makes it yield, runs on a second stream, and the windows that come ready while it runs
-batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
-of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
-walk that nothing on the chain reads, such as a codec. Where the config asks,
-``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
-speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
-alone on its worker, a device without streams, a node with chain walks, resident walks or
-any resource but a recurrent state pool of its own (``RecurrentStateSpec`` declared for
-that node alone, with no KV-keyed snapshots), and a side walk that is not the node's alone,
-sits in a combined walk, or has output spans or a stop check. Such a pool is admitted,
-planned and committed by the side step itself, on the lane's stream. A config without the
-field keeps the node on the chain, whatever it declares.
+**Steps beside the chain.** A worker's main loop runs one chain of steps (lane 0), and any
+step on it costs a pass of the loop and holds the next one behind its kernels. A node that
+shares a worker with a heavier one can run on another lane instead: a deployment sets
+``lane: <id>`` on the node's group (see :doc:`serving`), and the model declares nothing.
+Such a step neither takes a turn on the chain nor makes it yield, runs on its lane's
+stream, and the windows that come ready while it runs batch into the next one (see
+``mstar/worker/lanes.py``). The lane's graphs capture on its stream, since graphs captured
+on one stream must not overlap. It suits stream-fed walks that nothing on the chain reads,
+such as a codec's. Where the config asks, ``EngineManager.build`` refuses what a lane can't
+serve, since a step off the chain is neither speculated nor planned ahead and lands between
+two chain steps: a TP or SP node, a worker with nothing left on the chain, a device without
+an accelerator-graph backend (CUDA or XPU), resident walks while resident planning is on,
+and a walk of the node that has other nodes or a loop in it, sits in a combined walk, or
+has output spans or a stop check.
+The engine then gives the lane the resources only its nodes declare, of any kind, and
+refuses one that another lane's node (or another worker's) declares too, that depends on
+another lane's, that keeps a prefix cache, whose state the main thread moves outside the
+step (``Resource.journals_resident_moves``: eviction, prefix leases, page trails, as the
+paged KV cache's), or that stages host rows (a sampler). The lane admits, plans and commits
+its resources itself, on its stream, and every call into them from outside the step
+(ingest, readiness, output copies, publishing, teardown) runs on that stream too. Nothing
+fences those calls, made on the main thread, against the lane's admit and plan on the GPU
+thread, so a resource a lane holds keeps the two safe against each other, as the recurrent
+pool's lock does. A config without the field keeps the node on the chain, whatever it
+declares.
 
 ``ARNodeSubmodule`` declares ``preprocess`` abstract because autoregressive nodes are
 expected to collate a batch. You can still disable batching for one node, or for specific
