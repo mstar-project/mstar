@@ -59,7 +59,7 @@ The converse matters just as much: **model-level concerns shouldn't leak into en
 
 ### 2. Resources are declared per graph node, and a node gets only what it declares
 
-`get_node_resources()` returns a `NodeResourceSpec` list; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
+`declare_state()` declares the state a model keeps, and `get_node_resources()` returns a `NodeResourceSpec` list for anything else; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
 
 Per-deployment sizing goes in the config YAML under `resources:` overrides, not into Python constants. See "Tuning resources per deployment" in [docs/adding_models.rst](docs/adding_models.rst).
 
