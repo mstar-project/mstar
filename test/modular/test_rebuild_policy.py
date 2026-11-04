@@ -184,8 +184,8 @@ def _ran(walk: str, inputs: dict, request_walks: dict | None = None) -> SimpleNa
     ctx = SimpleNamespace(graph_walk=walk, request_walks=request_walks or {})
     infos = {rid: SimpleNamespace(step_metadata={"is_prefill": True}) for rid in inputs}
     return SimpleNamespace(
-        node_name=NODE, step_context=ctx, per_request_input_tensors=inputs, per_request_info=infos,
-        completion_event=None,
+        node_name=NODE, step_context=ctx, request_ids=list(inputs), per_request_input_tensors=inputs,
+        per_request_info=infos, cached_rids=set(), completion_event=None,
     )
 
 
@@ -212,6 +212,22 @@ def test_a_prompt_rows_ids_are_kept_once_on_the_host():
         "the rebuild row would read its ids in another dtype than the walk's"
     )
     assert B not in kept, "a decode row's input, or an unread row's, would be taken for its prompt"
+
+
+def test_only_the_rows_that_ran_keep_their_prompts():
+    """The engine takes a row it skipped or failed out of the step's rows and their infos, but not out of its
+    inputs."""
+    rebuilds = _rebuilds()
+    step = _ran(PREFILL, _rows(R, A, B))
+    step.cached_rids.add(B)  # the prefix cache served B's walk whole
+    for rid in (A, B):
+        step.request_ids.remove(rid)
+        del step.per_request_info[rid]
+
+    rebuilds.keep_prompts(step)
+
+    assert set(rebuilds._kept[NODE]) == {R}, "a row that never ran would keep a prompt"
+    assert B not in rebuilds._droppable[NODE], "a request the cache served would hold its slice and never use it"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
@@ -301,7 +317,7 @@ def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="mixed", slot=0, capture=False,
                       request_walks={rid: info.graph_walk for rid, info in infos.items()})
     return SimpleNamespace(node_name=NODE, request_ids=list(rids), per_request_info=infos,
-                           per_request_input_tensors=inputs, step_context=ctx, **fields)
+                           per_request_input_tensors=inputs, cached_rids=set(), step_context=ctx, **fields)
 
 
 def test_a_step_of_no_copied_walk_copies_nothing_and_reads_no_row():

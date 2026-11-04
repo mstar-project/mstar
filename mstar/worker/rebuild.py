@@ -271,16 +271,25 @@ class Rebuilds:
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
         """Copy a row's prompt into its request's slice once the step that read the prompt completes, when the row
         is in one of the policy's walks, a drop here can free its request's pages, and the request keeps no ids
-        yet. A row of a walk that reads more than the ids gets its host copies after them (`keep_copies`)."""
-        policy = self._policies.get(node_batch.node_name)
+        yet. A row of a walk that reads more than the ids gets its host copies after them (`keep_copies`).
+
+        A row whose walk the prefix cache served whole never ran, so its request keeps no ids and is never
+        dropped."""
+        node = node_batch.node_name
+        policy = self._policies.get(node)
         if self._pool is None or policy is None:
             return
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk not in policy.walks and policy.walks.isdisjoint(walks.values()):
             return
-        kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
-        for rid, row in node_batch.per_request_input_tensors.items():
-            row_walk = walks.get(rid, walk)
+        kept, droppable = self._kept[node], self._droppable[node]
+        cached = [rid for rid in node_batch.cached_rids if rid in droppable and walks.get(rid, walk) in policy.walks]
+        for rid in cached:
+            self._forget(node, rid)
+        # The rows that ran: the engine takes a row it skipped or failed out of the step's rows and their infos,
+        # but not out of its inputs.
+        for rid in node_batch.request_ids:
+            row, row_walk = node_batch.per_request_input_tensors.get(rid), walks.get(rid, walk)
             # a TP follower's unread row has no inputs, and the step fails it
             if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
                 continue
@@ -293,7 +302,7 @@ class Rebuilds:
             for tensor in tensors:
                 copy = self._pool.copy_out(tensor, HostSlice(offset, tensor.nbytes), node_batch.completion_event)
                 offset += tensor.nbytes
-            copies = bool(self._copied[node_batch.node_name][row_walk])
+            copies = bool(self._copied[node][row_walk])
             kept[rid] = KeptIds(
                 HostCopy(prompt, copy.landed), row_walk, array("i"),
                 dict(node_batch.per_request_info[rid].step_metadata),
@@ -301,7 +310,7 @@ class Rebuilds:
                 HostCopies(droppable[rid].copied_slots) if copies else None,
             )
             if not copies:
-                self._trim(node_batch.node_name, rid, aligned(prompt.nbytes))
+                self._trim(node, rid, aligned(prompt.nbytes))
 
     def keep_copies(self, node_batch: ExecutingBatch) -> None:
         """Queue a copy of what each row of a copied walk read besides its ids, as the step received it, into its
