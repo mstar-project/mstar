@@ -318,16 +318,21 @@ def test_fast_mode_skips_device_time_but_keeps_host_semantics():
 
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
     """``--skipped-in``: the tests a plain CPU run's junit report skipped, in a class or in
-    a module skipped at collection, and none it ran."""
+    a module skipped at collection, and those whose own skipif checks for a GPU; none
+    other it ran."""
     pkg = tmp_path / "test" / "a"
     pkg.mkdir(parents=True)
     (pkg / "test_classes.py").write_text(textwrap.dedent("""
-        import os, pytest
+        import os, pytest, torch
         gpu = pytest.mark.skipif(bool(os.environ.get("PLAIN")), reason="needs a GPU")
         class TestC:
             @gpu
             def test_skipped(self): pass
             def test_ran(self): pass
+        @pytest.mark.skipif(not torch.cuda.is_available(), reason="")
+        def test_checks_for_a_gpu(): pass
+        @pytest.mark.skipif(os.name == "nt", reason="posix only")
+        def test_other_skipif(): pass
     """))
     (pkg / "test_module.py").write_text(textwrap.dedent("""
         import os, pytest
@@ -345,7 +350,8 @@ def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
     pytest_run("--junitxml=plain.xml", "test", PLAIN="1")
     out = pytest_run("-p", "mstar_sim.pytest_plugin", "--skipped-in=plain.xml", "--collect-only", "-q", "test")
     selected = {line for line in out.splitlines() if "::" in line}
-    assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_module.py::test_one"}, out
+    assert selected == {"test/a/test_classes.py::TestC::test_skipped", "test/a/test_classes.py::test_checks_for_a_gpu",
+                        "test/a/test_module.py::test_one"}, out
 
 
 def test_every_cuda_seam_mstar_reaches_is_emulated():

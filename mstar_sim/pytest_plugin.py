@@ -26,10 +26,13 @@ kernel's own error check, which a stand-in doesn't have.
 
 from __future__ import annotations
 
+import ast
+import functools
 import inspect
 import pathlib
 import re
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -163,10 +166,23 @@ def _checks_gpu(item) -> bool:
         if _CHECKS_GPU.search(source):
             return True
         todo.extend(getattr(module, n, None) for n in set(re.findall(r"\b(\w+)\(", source)))
-    if any(item.iter_markers("skipif")) and getattr(module, "__file__", None):
-        with open(module.__file__) as f:
-            return bool(_SKIPIF_GPU.search(f.read()))
-    return False
+    # a skipif on the function is in its source, scanned above; one on its class or module:
+    return any(node is not item and _SKIPIF_GPU.search(_marks_source(node.obj))
+               for node, _ in item.iter_markers_with_node("skipif"))
+
+
+@functools.cache
+def _marks_source(obj) -> str:
+    """The marks a test class or module sets on its tests: its decorators and ``pytestmark``."""
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
+    except (OSError, TypeError, SyntaxError):
+        return ""
+    scope = tree.body[0] if isinstance(obj, type) else tree
+    marks = [*getattr(scope, "decorator_list", ()), *(
+        s for s in scope.body if isinstance(s, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in s.targets))]
+    return "\n".join(ast.unparse(m) for m in marks)
 
 
 def _needs_gpu(item) -> bool:
