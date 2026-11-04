@@ -22,6 +22,20 @@ def test_executor_thread_gets_torch_config():
     assert (limit, unspec) == (recompile_limit(), True)
 
 
+def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
+    """Before torch 2.12 dynamo's config is process-wide: a thread whose initializer ran only at
+    its first job would set the engine's limit inside another thread's ``with_recompile_limit``."""
+    worker = Worker.__new__(Worker)
+    worker.device, worker.worker_id = torch.device("cpu"), "worker_0"
+    pool = worker._engine_thread_pool("mstar-plan")
+    try:
+        with torch._dynamo.config.patch(recompile_limit=500):
+            pool.submit(int).result()  # the first step's pre-plan
+            assert torch._dynamo.config.recompile_limit == 500
+    finally:
+        pool.shutdown()
+
+
 def test_a_submodules_recompile_limit_holds_inside_its_calls_only():
     from mstar.engine import with_recompile_limit
     from mstar.model.submodule_base import NodeSubmodule
