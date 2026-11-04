@@ -102,11 +102,13 @@ def _write_sparse(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> int:
     return sum(math.prod(shape) for _, shape in tensors.values())
 
 
-def _weight_copy(rel: str) -> bool:
-    """A weight format beside the safetensors (``pytorch_model.bin``), not an asset."""
-    name = os.path.basename(rel)
-    return name.startswith(("pytorch_model", "diffusion_pytorch_model", "model.", "consolidated")) or any(
-        fnmatch.fnmatch(name, pat) for pat in ("*.h5", "*.msgpack", "*.gguf", "*.bin.index.json"))
+def _weight_copy(rel: str, files) -> bool:
+    """A weight format beside the safetensors (``pytorch_model.bin`` next to
+    ``model.safetensors``), not an asset (a codec's own ``model.pt``)."""
+    name, where = os.path.basename(rel), os.path.dirname(rel)
+    return (name.startswith(("pytorch_model", "diffusion_pytorch_model", "model.", "consolidated")) or any(
+        fnmatch.fnmatch(name, pat) for pat in ("*.h5", "*.msgpack", "*.gguf", "*.bin.index.json"))) and any(
+        os.path.dirname(f) == where and f.endswith(".safetensors") for f in files)
 
 
 def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
@@ -115,7 +117,10 @@ def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
     import torch
 
     try:
-        obj = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        try:
+            obj = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+        except RuntimeError:  # a legacy (non-zip) file can't be mapped: read it
+            obj = torch.load(path, map_location="cpu", weights_only=True)
     except Exception:  # noqa: BLE001 - not a plain tensor file: keep nothing, say so
         return False
     from torch.utils._pytree import tree_map
@@ -131,7 +136,7 @@ def _build(src, out: Path) -> dict:
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(out / rel, src.header(rel))
-        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin")) and not _weight_copy(rel):
+        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin")) and not _weight_copy(rel, src.files):
             if not _shapes_only_torch_file(src.fetch(rel), out / rel):
                 notes.append(f"skipped {rel}: not a plain tensor file")
         elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
@@ -202,6 +207,8 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(argv)
     if bool(a.out_dir) == bool(a.hf_home):
         ap.error("give either out_dir or --hf-home")
+    if a.hf_home and Path(a.source).is_dir():
+        ap.error("--hf-home takes a Hub repo id (the cache is keyed by its revision), not a local directory")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     manifest = into_hf_cache(a.source, a.hf_home) if a.hf_home else synthesize(a.source, a.out_dir)
     json.dump(manifest, sys.stdout, indent=2)

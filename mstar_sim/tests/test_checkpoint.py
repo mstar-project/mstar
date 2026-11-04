@@ -2,11 +2,12 @@
 
 import json
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from mstar_sim.checkpoint import synthesize
+from mstar_sim.checkpoint import main, synthesize
 
 
 def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
@@ -17,6 +18,11 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
     with open(src / "pytorch_model.bin", "wb") as f:  # a duplicate of the weights: skipped
         f.truncate(16 * 2**20)
     (src / "conds.pt").write_bytes(b"a small asset with no safetensors twin")
+    # large torch assets are kept shapes-only: a component's own model.pt (no safetensors beside
+    # it, so not a copy of the weights), and one saved in torch's legacy (non-zip) format
+    (src / "codec").mkdir()
+    torch.save({"w": torch.zeros(3 << 20)}, src / "codec" / "model.pt")
+    torch.save({"w": torch.zeros(3 << 20)}, src / "hift.pt", _use_new_zipfile_serialization=False)
     shards = {
         "model-00001-of-00002.safetensors": {"embed.weight": torch.zeros(4096, 1024, dtype=torch.bfloat16)},
         "model-00002-of-00002.safetensors": {"layers.0.q.weight": torch.zeros(1024, 1024, dtype=torch.float8_e4m3fn),
@@ -40,7 +46,15 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
         assert (out / name).read_text() == (src / name).read_text()
     assert not (out / "pytorch_model.bin").exists()
     assert (out / "conds.pt").read_bytes() == (src / "conds.pt").read_bytes()
+    for asset in ("codec/model.pt", "hift.pt"):
+        assert torch.load(out / asset, weights_only=True)["w"].shape == (3 << 20,), asset
 
     stamp = (out / "config.json").stat().st_mtime_ns
     synthesize(str(src), out)  # the same source: reused
     assert (out / "config.json").stat().st_mtime_ns == stamp
+
+
+def test_hf_cache_copy_refuses_a_local_directory(tmp_path):
+    """The cache is keyed by a Hub revision, which a local directory doesn't have."""
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), "--hf-home", str(tmp_path / "hf")])
