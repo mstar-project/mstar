@@ -566,6 +566,9 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
 
         import flashinfer  # under the emulator, the whole package is the stand-in
         assert "fake_libs" in flashinfer.__file__, flashinfer.__file__
+        from mstar.engine.resources.attn import wrappers  # it reports mstar's pin, wherever that moves
+        wrappers.DIRECT_PLAN_FLASHINFER_VERSIONS = frozenset({"0.9.1"})
+        assert flashinfer.__version__ == "0.9.1", flashinfer.__version__
 
         def resolves(name):
             obj = importlib.import_module(name.split(".")[0])
