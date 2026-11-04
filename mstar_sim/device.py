@@ -32,6 +32,7 @@ Behaviour a real GPU has, kept on purpose:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import weakref
 
@@ -289,7 +290,7 @@ class _Observe(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         launched = clock.vnow()  # the kernel is launched now; the emulator's time is not device time
-        with clock.computing():
+        with contextlib.nullcontext() if clock.FAST else clock.computing():
             if self.autocast is not None:
                 args, kwargs = _autocast(func, args, kwargs, self.autocast)
             if any(t.device.type == "meta" for t in _shallow(args, kwargs)):
@@ -298,8 +299,8 @@ class _Observe(TorchDispatchMode):
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
             else:
                 out = func(*args, **kwargs)
-        if func.is_view or func in _FREE or clock.in_kernel():
-            return out  # inside a stand-in: its own cost is charged
+        if clock.FAST or func.is_view or func in _FREE or clock.in_kernel():
+            return out  # unpriced, or inside a stand-in (its own cost is charged)
         from mstar_sim import cost
 
         seconds = cost.op_seconds(func, args, kwargs, out)
@@ -490,7 +491,7 @@ def _fast(func, args, kwargs, flat, index):
         if func in _UNINITIALIZED:
             raw.zero_()
     view = func in _VIEWS and (func is not T.__getitem__ or _is_view_index(args[1]))
-    if not view:
+    if not view and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
         key = (func, tuple((t.shape, t.dtype) for t in tensors), tuple((o.shape, o.dtype) for o in outs))
         seconds = _FAST_COST.get(key)
@@ -534,6 +535,8 @@ def _custom_impl(func):
 
 
 def _function(func, args, kwargs):
+    if clock.FAST:
+        return _function_body(func, args, kwargs)
     # the interposer's own time is not the host's: the device stamps exclude it
     token = clock.compute_begin()
     try:
@@ -577,6 +580,8 @@ def replay(tape: clock.Tape) -> None:
     from mstar_sim import cost
 
     clock.STATS["replays"] += 1
+    if clock.FAST:
+        return
     launched = clock.vnow()
     with clock.computing():
         total, nodes = 0.0, 0
@@ -591,6 +596,8 @@ def replay(tape: clock.Tape) -> None:
 
 
 def _copy_seconds(nbytes: int, kind: str) -> float:
+    if clock.FAST:
+        return 0.0
     from mstar_sim import cost
 
     return cost.copy_seconds(nbytes, kind)
@@ -725,6 +732,8 @@ def _plain(func, args, kwargs):
 
 def _emulated(fn, args, kwargs):
     """Emulator work: the host's own time stops at this call."""
+    if clock.FAST:
+        return fn(*args, **kwargs)
     depth = clock.compute_begin()
     try:
         return fn(*args, **kwargs)

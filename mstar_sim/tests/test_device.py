@@ -15,8 +15,8 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def run_sim(code: str, gpu: str = "h100") -> str:
-    env = dict(os.environ, MSTAR_SIM="1", MSTAR_SIM_GPU=gpu,
+def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
+    env = dict(os.environ, MSTAR_SIM="1", MSTAR_SIM_GPU=gpu, **extra_env,
                PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT,
                                            os.environ.get("PYTHONPATH", "")]))
     with tempfile.TemporaryDirectory() as tmp:  # a file, so spawned ranks can import it
@@ -186,3 +186,31 @@ def test_tensor_parallel_collectives_are_timed_not_sent():
             print("ok")
     """)
     assert out.strip().endswith("ok")
+
+
+def test_fast_mode_skips_device_time_but_keeps_host_semantics():
+    """--fast: a host read after a long kernel doesn't wait, graphs still capture
+    and replay, and a host read during capture is still refused."""
+    out = run_sim("""
+        import time, torch
+        a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        t0 = time.perf_counter()
+        for _ in range(50):
+            a @ a  # ~0.1 s of simulated H100 time
+        torch.cuda.synchronize()
+        assert time.perf_counter() - t0 < 0.05, time.perf_counter() - t0
+        pos = torch.arange(4, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = pos + 1
+        g.replay()
+        assert out.tolist() == [1, 2, 3, 4]
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                pos.sum().item()
+            raise SystemExit("a host read during capture was accepted")
+        except RuntimeError as e:
+            assert "capturing" in str(e)
+        print("ok")
+    """, MSTAR_SIM_FAST="1")
+    assert out.strip() == "ok"

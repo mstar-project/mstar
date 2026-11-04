@@ -168,7 +168,8 @@ def configure(gpu: str, profile_db: str | None = None, model: str | None = None)
     spec = gpus.lookup(gpu)
     db, families = (None, {}) if profile_db is None else _load_db(profile_db, spec)
     root = tables.data_dir()
-    model = model or os.environ.get("MSTAR_SIM_COST") or ("tables" if os.path.isdir(root) else "roofline")
+    model = model or os.environ.get("MSTAR_SIM_COST") or (
+        "tables" if os.path.isdir(root) and not clock.FAST else "roofline")  # --fast prices nothing
     if model not in ("tables", "roofline"):
         raise ValueError(f"MSTAR_SIM_COST must be 'tables' or 'roofline', not {model!r}")
     if model == "tables" and not os.path.isdir(root):

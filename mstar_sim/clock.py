@@ -16,6 +16,7 @@ own fused kernels) one kernel of its own cost.
 from __future__ import annotations
 
 import functools
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +24,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 _tls = threading.local()
+# MSTAR_SIM_FAST=1 (``--fast``): host control flow only. No kernel is priced or
+# queued, so a host read never waits; the clock is the real one, so mstar's own
+# timeouts still fire. Graph capture, host-read refusal under capture and value
+# semantics are unchanged.
+FAST = os.environ.get("MSTAR_SIM_FAST") == "1"
 
 
 @dataclass
@@ -120,6 +126,8 @@ def charge(seconds: float, launched: float | None = None) -> float:
     """Queue ``seconds`` of device work, launched at host time ``launched`` (now
     by default), on the current stream; returns its end. While capturing, the
     work goes on the tape instead."""
+    if FAST:
+        return time.perf_counter()
     tape = capturing()
     if tape is not None:
         tape.entries.append(seconds)
@@ -166,7 +174,7 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
         def wrapper(*args, **kwargs):
             from mstar_sim import cost as cost_model
 
-            if in_kernel():
+            if FAST or in_kernel():
                 return fn(*args, **kwargs)
 
             def seconds() -> float:

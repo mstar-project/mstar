@@ -59,7 +59,8 @@ def _collective(name: str, op: str, group_pos: int | None):
             return real(*args, **kwargs)
         n = _group_size(kwargs, args, group_pos)
         nbytes = max(t.numel() * t.element_size() for t in tensors)
-        clock.charge(cost.collective_seconds(op, n, nbytes, graph=clock.capturing() is not None))
+        if not clock.FAST:
+            clock.charge(cost.collective_seconds(op, n, nbytes, graph=clock.capturing() is not None))
         return _Done() if kwargs.get("async_op") else None
 
     return call

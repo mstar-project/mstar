@@ -28,6 +28,8 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
     env["MSTAR_SIM_MAX_CAPTURE_BATCH"] = str(args.max_capture_batch)
     if args.cost:
         env["MSTAR_SIM_COST"] = args.cost
+    if args.fast:
+        env["MSTAR_SIM_FAST"] = "1"
     if args.no_graphs or args.eager_nodes:
         env["MSTAR_SIM_NO_GRAPHS"] = "1" if args.no_graphs else args.eager_nodes
     if args.memory_gb:
@@ -60,6 +62,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-capture-batch", type=int, default=0,
                         help="drop accelerator-graph buckets above this batch size (default 0: "
                              "keep all)")
+    parser.add_argument("--fast", action="store_true",
+                        help="host control flow only, for repros: no kernel is priced and no host "
+                             "read waits for simulated device time (graphs, value and capture "
+                             "semantics unchanged)")
     parser.add_argument("--no-graphs", action="store_true",
                         help="capture no accelerator graphs: every step runs eagerly "
                              "(for debugging: module hooks fire on every forward)")
@@ -95,7 +101,7 @@ def main(argv: list[str] | None = None) -> None:
         command = ["-m", "mstar.cli.main", *rest]
     else:
         parser.error("give an mstar command (e.g. `serve <model>`) or `-- <python args>`")
-    if not args.cost and not os.environ.get("MSTAR_SIM_COST"):
+    if not args.cost and not os.environ.get("MSTAR_SIM_COST") and not args.fast:
         from mstar_sim import tables
 
         if not os.path.isdir(tables.data_dir()):

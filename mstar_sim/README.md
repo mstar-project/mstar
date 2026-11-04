@@ -41,6 +41,12 @@ Prior art it follows: SGLang's simulator (real scheduler, predicted forward, fak
 AIConfigurator (measured op tables, utilization-space interpolation), Vidur (per-request
 attention features), Maya (one interposed process per device, symmetric collectives).
 
+## Fast mode, for bug repros
+
+`--fast` (`MSTAR_SIM_FAST=1`) keeps everything a repro of host control flow depends on: the scheduler, admission, KV and lease bookkeeping, TP agreement, CUDA-graph capture and replay, refusal of host reads during capture, and small-int values. It drops all timing: no kernel is priced or queued, and no host read waits. The clock is the real, monotonic one, so mstar's own timeouts still fire. Timed runs are unchanged without the flag.
+
+Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-capture-tokens N` drops large token buckets. `--max-capture-batch N` does the same for batch buckets, but it also caps the served batch at N (mstar caps eager batches at the largest captured one).
+
 ## Measured kernel times
 
 By default GEMMs, attention, GDN and causal-conv kernels cost the latencies NVIDIA
