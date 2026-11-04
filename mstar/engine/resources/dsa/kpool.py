@@ -302,6 +302,12 @@ class KPoolDSA(Resource):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
+    @property
+    def force_double_buffer(self) -> bool:
+        # a captured slot's sparse plan is re-planned in preprocess through FlashInfer's
+        # pinned staging, which the replay before it may still be reading
+        return True
+
     def step_inputs(self, step_ctx: StepContext, captured: bool, label: str) -> dict[str, Any]:
         """The step's DSA state from the KV plan, as preprocess outputs: top-level tensors,
         which a graph replay restages, and the host half in ``dsa_meta``. Under a graph the

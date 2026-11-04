@@ -415,3 +415,21 @@ def test_a_non_bf16_cache_captures_nothing_in_long_mode():
                           KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
     assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
     assert sub._prefill_captured is False
+
+
+def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
+    """A replay reads its slot's sparse plan, which preprocess re-plans through FlashInfer's
+    pinned staging: the node keeps two capture slots and fences their reuse even when no
+    pre-plan asks for them."""
+    from mstar.engine import engine as engine_mod
+    from mstar.engine.resources.dsa.config import DSAConfig
+
+    monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
+    kv_config = types.SimpleNamespace(tokens_per_page=8, max_seq_len=64, num_qo_heads=4,
+                                      kv_lora_rank=16, qk_rope_head_dim=0)
+    resource = dsa.KPoolDSA(DSAConfig(kv_cache=KV_CACHE, topk=16, kpool=4, sm_scale=0.1),
+                            kv_config, torch.device("cpu"))
+    mgmt = engine_mod.SubmoduleManagement(
+        submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
+        resources={"dsa": resource})
+    assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
