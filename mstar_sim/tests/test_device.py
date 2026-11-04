@@ -308,6 +308,7 @@ def test_timing_only_holds_shapes_not_values():
     keep their values; a value that was never computed reads as zeros."""
     out = run_sim("""
         import torch
+        from mstar_sim import clock
         free0, total = torch.cuda.mem_get_info()
         big = torch.empty(10 * 2**30, dtype=torch.float32, device="cuda")
         free1, _ = torch.cuda.mem_get_info()
@@ -317,6 +318,10 @@ def test_timing_only_holds_shapes_not_values():
         sa, sb = a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr()
         assert sa and sb and abs(sa - sb) >= 4000  # distinct storages: mstar keys bytes by pointer
         assert a[10:].data_ptr() == sa + 40
+        stream = clock.current_timeline()
+        launched = stream.kernels
+        torch.empty_like(a), a.new_empty(8)
+        assert stream.kernels == launched  # an allocation is no kernel
         pos = torch.arange(5, device="cuda") + 1
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
