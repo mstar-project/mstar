@@ -214,15 +214,12 @@ def _make_graph_runtime(
 
 
 def _make_rebuilds(
-    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
-    device: torch.device,
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], device: torch.device,
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
-    # A lockstep node's KV refuses every drop, so its requests keep no ids.
-    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
     host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
         raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
@@ -781,7 +778,7 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.parallel_nodes, self.device)
+        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.device)
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
             self._rid_str,

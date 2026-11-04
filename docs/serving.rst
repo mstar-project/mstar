@@ -348,8 +348,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
        which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
        keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
-       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
+       with ``cpu_offload_pages``. Every rank of a tensor or sequence parallel node keeps the ids,
+       since each rank rebuilds the requests its first rank drops. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
