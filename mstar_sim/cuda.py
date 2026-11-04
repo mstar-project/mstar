@@ -9,6 +9,7 @@ the card's capacity (``MSTAR_SIM_MEMORY_GB``, by default the card's).
 
 from __future__ import annotations
 
+import collections
 import itertools
 import os
 import threading
@@ -181,10 +182,12 @@ def memory_limit(index: int) -> int:
 
 
 def memory_stats(device=None) -> dict:
-    return {"allocated_bytes.all.current": memory_allocated(device),
-            "allocated_bytes.all.peak": max_memory_allocated(device),
-            "reserved_bytes.all.current": memory_reserved(device),
-            "reserved_bytes.all.peak": max_memory_reserved(device)}
+    """The figures the emulator keeps; every other stat torch's allocator reports reads 0."""
+    return collections.defaultdict(int, {"allocated_bytes.all.current": memory_allocated(device),
+                                         "allocated_bytes.all.peak": max_memory_allocated(device),
+                                         "reserved_bytes.all.current": memory_reserved(device),
+                                         "reserved_bytes.all.peak": max_memory_reserved(device),
+                                         "num_alloc_retries": 0, "num_ooms": 0})
 
 
 def memory_snapshot(*_, **__) -> list[dict]:
@@ -200,21 +203,23 @@ def memory_snapshot(*_, **__) -> list[dict]:
 # graph pools, as the caching allocator's (torch._C._cuda_*AllocateToPool, _cuda_releasePool)
 
 
-def _begin_allocate_to_pool(device, mempool_id) -> None:
+def _begin_allocate_to_pool(device, mempool_id, *_) -> None:
+    """This thread's allocations on ``device`` go to the pool (a capture's stream filter, here
+    its thread), until it ends."""
     from mstar_sim import device as dev
 
     p = dev.pool(_as_index(device), mempool_id)
     p.graphs += 1
-    p.recording = True
+    p.recording = threading.get_ident()
 
 
 def _end_allocate_to_pool(device, mempool_id) -> None:
     from mstar_sim import device as dev
 
     p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
-    if p is None or not p.recording:
-        raise RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording")
-    p.recording = False
+    if p is None or p.recording is None:
+        raise dev.gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
+    p.recording = None
 
 
 def _release_pool(device, mempool_id) -> None:
@@ -414,7 +419,7 @@ class CUDAGraph:
         self._device = current_device()
         _begin_allocate_to_pool(self._device, self._pool)
         self._holds_pool = True
-        self.tape = clock.Tape(pool=(self._device, self._pool))
+        self.tape = clock.Tape()
         self._prev = clock.set_capturing(self.tape)
 
     def capture_end(self):
@@ -596,6 +601,7 @@ def install() -> None:
         setattr(tc, name, value)
     for name in ("CUDAGraph", "graph", "graph_pool_handle", "is_current_stream_capturing"):
         setattr(tc.graphs, name, getattr(tc, name))
+    tc.memory.memory_stats = memory_stats  # what torch.cuda.memory_summary reads
     tc.nvtx.range_push = _noop
     tc.nvtx.range_pop = _noop
     tc.nvtx.mark = _noop

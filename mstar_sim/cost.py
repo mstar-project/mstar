@@ -101,7 +101,8 @@ _FREE = frozenset({
     "detach_", "squeeze_", "unsqueeze_", "t_", "transpose_", "swapdims_", "swapaxes_", "as_strided_",
     "size", "stride", "numel", "dim", "storage_offset", "is_contiguous", "is_strides_like_format",
     "is_non_overlapping_and_dense", "is_same_size", "is_pinned", "is_complex", "is_floating_point",
-    "_nnz", "_assert_tensor_metadata", "_has_compatible_shallow_copy_type",
+    "_nnz", "_assert_tensor_metadata", "_has_compatible_shallow_copy_type", "_local_scalar_dense",
+    "sym_size", "sym_stride", "sym_numel", "sym_storage_offset",
 })
 _GATHER = frozenset({"embedding", "index_select", "index", "_unsafe_index", "gather", "take"})
 _SCATTER = frozenset({

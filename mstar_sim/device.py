@@ -198,6 +198,8 @@ class SimTensor(torch.Tensor):
 # mark, until the cache is emptied (a freed block is reused within its pool, never
 # by another). ``graphs`` counts the graphs using a private pool; one no graph uses
 # gives its free bytes back on ``empty_cache``, and goes once nothing in it lives.
+# ``recording``: the thread whose allocations on its device go to the pool (a capture's,
+# or a ``_cuda_beginAllocateToPool`` caller's), or None.
 DEFAULT_POOL = (0, 0)
 
 
@@ -207,7 +209,7 @@ class Pool:
     def __init__(self, device: int, handle: tuple):
         self.device, self.handle = device, handle
         self.live = self.reserved = self.graphs = 0
-        self.recording = False
+        self.recording: int | None = None
 
 
 POOLS: dict[tuple[int, tuple], Pool] = {}
@@ -237,7 +239,7 @@ def release_cached(index: int) -> None:
         for key, p in list(POOLS.items()):
             if p.device == index and (p.handle == DEFAULT_POOL or p.graphs == 0):
                 p.reserved = p.live
-                if p.handle != DEFAULT_POOL and p.live == 0 and not p.recording:
+                if p.handle != DEFAULT_POOL and p.live == 0 and p.recording is None:
                     del POOLS[key]
 
 
@@ -254,13 +256,12 @@ def _release(key: int) -> None:
 
 
 def _allocate(index: int, nbytes: int) -> Pool:
-    """The pool a new storage of ``nbytes`` on device ``index`` comes from: the
-    capture's on its device, else the default. Growing a pool past the card (its
-    memory fraction) raises out of memory, after emptying the cache once, as torch's
+    """The pool a new storage of ``nbytes`` on device ``index`` comes from: the one this
+    thread records into on that device, else the default. Growing a pool past the card
+    (its memory fraction) raises out of memory, after emptying the cache once, as torch's
     allocator retries."""
-    tape = clock.capturing()
-    into = pool(*tape.pool) if tape is not None and tape.pool is not None and tape.pool[0] == index \
-        else pool(index)
+    thread = threading.get_ident()
+    into = next((p for p in POOLS.values() if p.recording == thread and p.device == index), None) or pool(index)
     if into.live + nbytes > into.reserved:
         from mstar_sim import cuda
 
@@ -516,7 +517,7 @@ class _Observe(TorchDispatchMode):
                 out = _captured_values(func, args, kwargs)
             else:
                 out = func(*args, **kwargs)
-        if clock.FAST or func.is_view or func in _FREE or clock.in_kernel():
+        if clock.FAST or func.is_view or clock.in_kernel():
             return out  # unpriced, or inside a stand-in (its own cost is charged)
         from mstar_sim import cost
 
@@ -604,8 +605,7 @@ def _real_index(flat) -> bool:
 
 # composite ops CUDA autocast casts whole, before they decompose
 _F = torch.nn.functional
-_AUTOCAST_COMPOSITES = {_F.scaled_dot_product_attention, torch.matmul, torch.einsum, _F.linear, _F.conv1d,
-                        _F.conv2d, _F.conv3d, _F.conv_transpose1d, _F.conv_transpose2d, _F.conv_transpose3d}
+_AUTOCAST_COMPOSITES = {_F.scaled_dot_product_attention, torch.matmul, torch.einsum}  # with _AUTOCAST_LOW's below
 
 
 def _istft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, normalized=False,
@@ -642,6 +642,7 @@ _AUTOCAST_FP32 = {
     "reciprocal", "rsqrt", "sinh", "tan", "pow", "softplus", "native_layer_norm",
     "native_group_norm", "logsumexp", "cdist", "renorm", "binary_cross_entropy_with_logits",
 }
+_AUTOCAST_COMPOSITES |= {getattr(_F, name) for name in _AUTOCAST_LOW if hasattr(_F, name)}
 # fp32 unless the call names an output dtype
 _AUTOCAST_FP32_UNLESS_DTYPE = {"_softmax", "_log_softmax", "sum", "prod", "cumsum", "cumprod",
                                "linalg_vector_norm"}
@@ -716,14 +717,6 @@ _ALLOCATES = {
     torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default,
     torch.ops.aten.empty_like.default, torch.ops.aten.new_empty.default,
     torch.ops.aten.new_empty_strided.default,
-}
-_FREE = {
-    torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default,
-    torch.ops.aten.empty_like.default, torch.ops.aten.lift_fresh.default,
-    torch.ops.aten._local_scalar_dense.default, torch.ops.aten.sym_size.int,
-    torch.ops.aten.sym_stride.int, torch.ops.aten.sym_numel.default,
-    torch.ops.aten.sym_storage_offset.default, torch.ops.aten.is_same_size.default,
-    torch.ops.aten.set_.source_Tensor,
 }
 
 

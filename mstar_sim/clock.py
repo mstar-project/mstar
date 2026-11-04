@@ -155,8 +155,6 @@ class Tape:
 
     nodes: list[tuple[float | Callable[[], float] | None, Callable[[], None] | None]] = field(
         default_factory=list)
-    # ``(device, pool handle)``: the private memory pool its allocations come from
-    pool: tuple | None = None
 
 
 def on_replay(effect: Callable[[], None]) -> None:

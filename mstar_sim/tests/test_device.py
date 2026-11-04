@@ -317,6 +317,15 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
         del out
         torch.cuda.empty_cache()
         assert torch.cuda.memory_reserved() == before
+        # a pool any caller begins allocating to takes this thread's allocations on its device
+        handle = torch.cuda.graph_pool_handle()
+        torch._C._cuda_beginAllocateToPool(0, handle)
+        held = torch.empty(GiB // 8, device="cuda")
+        torch._C._cuda_endAllocateToPool(0, handle)
+        assert sum(s["total_size"] for s in torch.cuda.memory_snapshot() if s["segment_pool_id"] == handle) == GiB // 2
+        assert "Allocated memory" in torch.cuda.memory_summary()
+        del held
+        torch._C._cuda_releasePool(0, handle)
 
         # a stand-in kernel allocates its outputs only, not what the emulator makes them with
         import flashinfer
