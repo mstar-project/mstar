@@ -198,11 +198,17 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             torch.nn.functional.embedding((ids - 50).clamp_(0, 49), table)  # a TP vocab shard's clamp
             torch.where(ids > 20, torch.arange(2, device="cuda").expand(2, 2), -1)  # an expanded operand
         g3.replay()
+        weight, g7 = torch.nn.Parameter(torch.zeros(4, device="cuda")), torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(g7):
+            weight[:2].add_(1)
+        g7.replay()  # autograd doesn't see a replay, whatever the caller's grad mode
+        assert weight.tolist() == [1, 1, 0, 0], weight.tolist()
         # capture runs nothing: an index that is out of range only before an in-place clamp
         # is fine, and an op whose output shape depends on values is refused, as on CUDA
         table_ids, wide = torch.arange(50, device="cuda"), torch.tensor([200, 10], device="cuda")
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             table_ids[(wide - 50).clamp_(0, 49)]
+            torch.rms_norm(torch.ones(2, 4, device="cuda", dtype=torch.bfloat16), (4,))  # casts inside
             torch._assert(wide.max() < 1000, "a check torch.compile leaves out of a capture on a GPU")
             # so are synchronous copies from host memory: a blocking H2D copy, a tensor from host data
             for sync in (lambda: torch.nonzero(ids), lambda: ids.copy_(torch.tensor([1, 2])),

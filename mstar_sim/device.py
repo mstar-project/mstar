@@ -208,6 +208,7 @@ _SHARED = b"mstar_sim:"
 def _share_cuda(storage):
     """A CUDA IPC handle naming a cuda tensor's storage; another emulated process opens it
     (``UntypedStorage._new_shared_cuda``) as a value-less storage of its size."""
+    uncomputed()  # no values cross: what the reader reports back was never computed
     nbytes = storage.nbytes()
     return (0, _SHARED + f"{storage.data_ptr()}:{nbytes}".encode(), nbytes, 0, b"", 0, b"", False)
 
@@ -848,6 +849,8 @@ def _captured_values(func, args, kwargs):
     real = {}
 
     def shaped(x):
+        if isinstance(x, torch.device) and x.type == "cpu":
+            return META  # a device argument (``_to_copy`` inside a composite): the shapes' device
         if not isinstance(x, torch.Tensor) or x.device.type != "cpu":
             return x
         m = torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device=META)
@@ -890,7 +893,7 @@ def replay(tape: clock.Tape) -> None:
     clock.STATS["replays"] += 1
     launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
     total, kernels = 0.0, 0
-    with contextlib.nullcontext() if clock.FAST else clock.computing():
+    with contextlib.nullcontext() if clock.FAST else clock.computing(), torch.no_grad():
         for seconds, effect in tape.nodes:
             if effect is not None and not FAULT[0]:  # the device faulted: nothing after it runs
                 effect()
