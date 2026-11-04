@@ -153,6 +153,8 @@ class Tape:
 
     entries: list[float | Callable[[], float]] = field(default_factory=list)
     effects: list[Callable[[], None]] = field(default_factory=list)
+    # ``(device, pool handle)``: the private memory pool its allocations come from
+    pool: tuple | None = None
 
 
 def on_replay(effect: Callable[[], None]) -> None:
@@ -184,7 +186,7 @@ def _flag_values(out, written):
     return out
 
 
-def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, static: bool = False,
+def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None = None, dtype=None,
               writes_args: bool = False):
     """Make a stand-in one kernel of the simulated GPU.
 
@@ -192,10 +194,12 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
     (its ``out`` arguments, or empty tensors of the right shape), and the
     tensor ops it uses for that are not charged. ``cost`` (same arguments)
     returns ``(flops, bytes)``, or ``(flops, bytes, features)`` with the
-    geometry a measured table needs (:func:`mstar_sim.cost.kernel_seconds`).
-    ``static``: the cost depends only on argument shapes, so a captured graph
-    prices it once rather than on every replay. ``writes_args``: it writes its
-    arguments in place, with no telling which (a Triton launch)."""
+    geometry a measured table needs (:func:`mstar_sim.cost.kernel_seconds`),
+    priced once; or a callable returning that, for a cost that depends on the
+    values its kernel reads (a plan's lengths), priced at every replay of a
+    graph that captured it. The callable is all a graph keeps of the call, so
+    it should hold what it reads, not the kernel's tensors. ``writes_args``: it
+    writes its arguments in place, with no telling which (a Triton launch)."""
 
     def decorate(fn):
         @functools.wraps(fn)
@@ -207,8 +211,8 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
             if FAST:
                 return _flag_values(fn(*args, **kwargs), args if writes_args else ())
 
-            def seconds() -> float:
-                flops, nbytes, *features = cost(*args, **kwargs) if cost is not None else (0.0, 0.0)
+            def price(terms) -> float:
+                flops, nbytes, *features = terms
                 return cost_model.kernel_seconds(name, flops=flops, bytes=nbytes, dtype=dtype,
                                                  features=features[0] if features else None)
 
@@ -221,10 +225,13 @@ def kernel_fn(name: str, cost: Callable[..., tuple] | None = None, dtype=None, s
                 _tls.in_kernel -= 1
             tape = capturing()
             with computing():
+                terms = cost(*args, **kwargs) if cost is not None else (0.0, 0.0)
                 if tape is None:
-                    charge(seconds(), launched)
+                    charge(price(terms() if callable(terms) else terms), launched)
+                elif callable(terms):
+                    tape.entries.append(lambda: price(terms()))
                 else:
-                    tape.entries.append(graph_node_seconds(seconds) if static else seconds)
+                    tape.entries.append(graph_node_seconds(lambda: price(terms)))
             return out
 
         wrapper.__mstar_sim_kernel__ = name

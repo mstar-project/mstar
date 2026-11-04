@@ -7,7 +7,7 @@ import torch
 from mstar_sim import clock
 
 
-@clock.kernel_fn("flashinfer.silu_and_mul", static=True,
+@clock.kernel_fn("flashinfer.silu_and_mul",
                  cost=lambda input, *a, **kw: (2.5 * input.numel(), 1.5 * input.numel() * input.element_size()))
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor | None = None,
                  enable_pdl: bool | None = None) -> torch.Tensor:

@@ -2,9 +2,9 @@
 
 Streams and events run on :mod:`mstar_sim.clock`; graphs record a
 :class:`~mstar_sim.clock.Tape` and replay it through
-:func:`mstar_sim.device.replay`. Memory figures are the simulated tensors'
-storages against the card's capacity (``MSTAR_SIM_MEMORY_GB``, by default the
-card's).
+:func:`mstar_sim.device.replay`. Memory figures are the caching allocator's
+accounting of the simulated tensors' storages (``mstar_sim.device.Pool``) against
+the card's capacity (``MSTAR_SIM_MEMORY_GB``, by default the card's).
 """
 
 from __future__ import annotations
@@ -130,32 +130,99 @@ def max_memory_allocated(device=None) -> int:
     return _used(device)[1]
 
 
+def memory_reserved(device=None) -> int:
+    """What the caching allocator holds from the card: every pool's high-water mark
+    (``mstar_sim.device.Pool``)."""
+    from mstar_sim import device as dev
+
+    return dev.reserved(_as_index(device))
+
+
+def max_memory_reserved(device=None) -> int:
+    from mstar_sim import device as dev
+
+    return dev.RESERVED_PEAK.get(_as_index(device), 0)
+
+
 def reset_peak_memory_stats(device=None) -> None:
+    from mstar_sim import device as dev
+
     used = _used(device)
     used[1] = used[0]
+    dev.RESERVED_PEAK[_as_index(device)] = memory_reserved(device)
+
+
+def empty_cache() -> None:
+    from mstar_sim import device as dev
+
+    for index in range(device_count()):
+        dev.release_cached(index)
 
 
 def mem_get_info(device=None) -> tuple[int, int]:
     total = spec().total
-    return max(0, total - memory_allocated(device)), total
+    return total - memory_reserved(device), total
 
 
-_fraction = 1.0
+_fraction: dict[int, float] = {}
 
 
 def set_per_process_memory_fraction(fraction: float, device=None) -> None:
-    global _fraction
-    _fraction = fraction
+    _fraction[_as_index(device)] = fraction
 
 
 def get_per_process_memory_fraction(device=None) -> float:
-    return _fraction
+    return _fraction.get(_as_index(device), 1.0)
+
+
+def memory_limit(index: int) -> int:
+    """The bytes this process may reserve on device ``index``: past it, out of memory."""
+    return int(spec().total * get_per_process_memory_fraction(index))
 
 
 def memory_stats(device=None) -> dict:
-    used = memory_allocated(device)
-    return {"allocated_bytes.all.current": used, "reserved_bytes.all.current": used,
-            "allocated_bytes.all.peak": max_memory_allocated(device)}
+    return {"allocated_bytes.all.current": memory_allocated(device),
+            "allocated_bytes.all.peak": max_memory_allocated(device),
+            "reserved_bytes.all.current": memory_reserved(device),
+            "reserved_bytes.all.peak": max_memory_reserved(device)}
+
+
+def memory_snapshot(*_, **__) -> list[dict]:
+    """One segment per pool (no blocks): what reads a pool's size off the snapshot sees it."""
+    from mstar_sim import device as dev
+
+    return [{"device": p.device, "segment_pool_id": p.handle, "total_size": p.reserved,
+             "allocated_size": p.live, "active_size": p.live, "requested_size": p.live,
+             "stream": 0, "segment_type": "large", "address": 0, "blocks": []}
+            for p in list(dev.POOLS.values()) if p.reserved]
+
+
+# graph pools, as the caching allocator's (torch._C._cuda_*AllocateToPool, _cuda_releasePool)
+
+
+def _begin_allocate_to_pool(device, mempool_id) -> None:
+    from mstar_sim import device as dev
+
+    p = dev.pool(_as_index(device), mempool_id)
+    p.graphs += 1
+    p.recording = True
+
+
+def _end_allocate_to_pool(device, mempool_id) -> None:
+    from mstar_sim import device as dev
+
+    p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+    if p is None or not p.recording:
+        raise RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording")
+    p.recording = False
+
+
+def _release_pool(device, mempool_id) -> None:
+    from mstar_sim import device as dev
+
+    p = dev.POOLS.get((_as_index(device), tuple(mempool_id)))
+    if p is not None:
+        p.graphs -= 1
 
 
 # ------------------------------------------------------------ streams, events
@@ -317,18 +384,27 @@ def graph_pool_handle():
 
 
 class CUDAGraph:
+    """A captured graph: its tape, and the private pool its allocations come from,
+    which it holds until reset (torch's ``use_count``)."""
+
     def __init__(self, keep_graph: bool = False):
         self.tape: clock.Tape | None = None
         self._pool = None
+        self._device = None
         self._prev = None
+        self._holds_pool = False
 
     def capture_begin(self, pool=None, capture_error_mode: str = "global"):
-        self._pool = pool if pool is not None else graph_pool_handle()
-        self.tape = clock.Tape()
+        self._pool = tuple(pool) if pool is not None else graph_pool_handle()
+        self._device = current_device()
+        _begin_allocate_to_pool(self._device, self._pool)
+        self._holds_pool = True
+        self.tape = clock.Tape(pool=(self._device, self._pool))
         self._prev = clock.set_capturing(self.tape)
 
     def capture_end(self):
         clock.set_capturing(self._prev)
+        _end_allocate_to_pool(self._device, self._pool)
 
     def instantiate(self):
         pass
@@ -340,6 +416,15 @@ class CUDAGraph:
 
     def reset(self):
         self.tape = None
+        if self._holds_pool:
+            self._holds_pool = False
+            _release_pool(self._device, self._pool)
+
+    def __del__(self):
+        try:
+            self.reset()
+        except Exception:  # noqa: BLE001 - interpreter shutdown
+            pass
 
     def pool(self):
         return self._pool
@@ -367,7 +452,11 @@ class graph:  # noqa: N801  (torch.cuda.graph)
         self.capture_error_mode = capture_error_mode
 
     def __enter__(self):
+        import gc
+
         synchronize()
+        gc.collect()  # as torch does: what the capture can reuse is freed first
+        empty_cache()
         self.ctx = globals()["stream"](self.capture_stream)
         self.ctx.__enter__()
         self.cuda_graph.capture_begin(self.pool, capture_error_mode=self.capture_error_mode)
@@ -441,6 +530,9 @@ TORCH_C = {
     "_cuda_getDevice": current_device,
     # a raw ``cudaStream_t``: the stream's id (no raw CUDA call takes it here, libcudart is refused)
     "_cuda_getCurrentRawStream": lambda device=None: current_stream().cuda_stream,
+    "_cuda_beginAllocateToPool": _begin_allocate_to_pool,
+    "_cuda_endAllocateToPool": _end_allocate_to_pool,
+    "_cuda_releasePool": _release_pool,
 }
 
 
@@ -458,13 +550,13 @@ def install() -> None:
         "get_device_properties": get_device_properties,
         "mem_get_info": mem_get_info,
         "memory_allocated": memory_allocated,
-        "memory_reserved": memory_allocated,
+        "memory_reserved": memory_reserved,
         "max_memory_allocated": max_memory_allocated,
-        "max_memory_reserved": max_memory_allocated,
+        "max_memory_reserved": max_memory_reserved,
         "reset_peak_memory_stats": reset_peak_memory_stats,
         "memory_stats": memory_stats,
-        "memory_snapshot": lambda *a, **k: [],
-        "empty_cache": _noop,
+        "memory_snapshot": memory_snapshot,
+        "empty_cache": empty_cache,
         "set_per_process_memory_fraction": set_per_process_memory_fraction,
         "get_per_process_memory_fraction": get_per_process_memory_fraction,
         "Stream": Stream,
@@ -515,10 +607,10 @@ def install() -> None:
         "synchronize": synchronize,
         "memory_allocated": memory_allocated,
         "max_memory_allocated": max_memory_allocated,
-        "memory_reserved": memory_allocated,
-        "max_memory_reserved": max_memory_allocated,
+        "memory_reserved": memory_reserved,
+        "max_memory_reserved": max_memory_reserved,
         "reset_peak_memory_stats": reset_peak_memory_stats,
-        "empty_cache": _noop,
+        "empty_cache": empty_cache,
         "get_memory_info": mem_get_info,
     }.items():
         setattr(acc, name, value)

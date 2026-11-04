@@ -62,7 +62,7 @@ def _outputs(wrapper, out, lse):
 def attention_kernel(name: str):
     """A wrapper's run as kernel ``name`` (a method): priced by the wrapper's
     latest plan, read when charged, so a replay prices its own step's plan."""
-    return clock.kernel_fn(name, cost=lambda wrapper, out, lse: wrapper._cost)(_outputs)
+    return clock.kernel_fn(name, cost=lambda wrapper, out, lse: lambda: wrapper._cost)(_outputs)
 
 
 def _not_supported(what: str):

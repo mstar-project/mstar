@@ -14,7 +14,7 @@ def _cost(input, weight, *args, **kwargs):
                                   + m * n * 2)
 
 
-@clock.kernel_fn("flashinfer.fp8_blockscale_gemm_sm90", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.fp8_blockscale_gemm_sm90", cost=_cost)
 def fp8_blockscale_gemm_sm90(input, weight, input_scale=None, weight_scale=None, out=None, out_dtype=None):
     """``input [M, K]`` (bf16, quantized per 128 columns inside, or fp8 with ``input_scale``)
     times ``weight [N, K]`` (fp8, 128x128 block scales): ``[M, N]``."""

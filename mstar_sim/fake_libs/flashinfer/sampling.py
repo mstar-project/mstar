@@ -20,19 +20,19 @@ def _drawn(probs, indices, return_valid):
     return (samples, torch.ones(rows, dtype=torch.bool, device=probs.device)) if return_valid else samples
 
 
-@clock.kernel_fn("flashinfer.sampling_from_probs", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.sampling_from_probs", cost=_cost)
 def sampling_from_probs(probs, indices=None, deterministic=True, generator=None, check_nan=False,
                         seed=None, offset=None, return_valid=False):
     return _drawn(probs, indices, return_valid)
 
 
-@clock.kernel_fn("flashinfer.top_p_sampling_from_probs", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.top_p_sampling_from_probs", cost=_cost)
 def top_p_sampling_from_probs(probs, top_p, indices=None, deterministic=True, generator=None,
                               check_nan=False, seed=None, offset=None, return_valid=False):
     return _drawn(probs, indices, return_valid)
 
 
-@clock.kernel_fn("flashinfer.top_k_top_p_sampling_from_probs", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.top_k_top_p_sampling_from_probs", cost=_cost)
 def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
                                     filter_apply_order="top_k_first", deterministic=True,
                                     generator=None, check_nan=False, seed=None, offset=None,
@@ -42,11 +42,11 @@ def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
     return _drawn(probs, indices, return_valid)
 
 
-@clock.kernel_fn("flashinfer.top_k_renorm_probs", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.top_k_renorm_probs", cost=_cost)
 def top_k_renorm_probs(probs: torch.Tensor, top_k) -> torch.Tensor:
     return torch.empty_like(probs)
 
 
-@clock.kernel_fn("flashinfer.top_p_renorm_probs", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.top_p_renorm_probs", cost=_cost)
 def top_p_renorm_probs(probs: torch.Tensor, top_p, is_deterministic: bool = False) -> torch.Tensor:
     return torch.empty_like(probs)

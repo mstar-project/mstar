@@ -85,19 +85,22 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
 
 
 def _trtllm_decode_cost(query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len,
-                        *args, **kwargs) -> tuple:
-    # each row's real KV length; max_seq_len only if the lengths carry no values
+                        *args, **kwargs):
+    # each row's real KV length, read at each replay; max_seq_len only if the lengths carry no values
     batch, heads, dim = query.shape
     k = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache[:, 0]
     kv_heads = k.shape[1] if kwargs.get("kv_layout", "HND") == "HND" else k.shape[2]
-    el = element_size(query.dtype)
-    lens = _row_lengths(seq_lens, batch, max_seq_len)
+    el, kv_dtype = element_size(query.dtype), k.dtype
     window = kwargs.get("window_left", args[2] if len(args) > 2 else -1)
-    rows = [(1, n, min(n, window + 1) if window >= 0 else n) for n in lens]
-    kv = sum(lens)
-    flops = 4.0 * kv * heads * dim
-    features = table_features(rows, heads, kv_heads, dim, dim, k.dtype)
-    return flops, float(el * (2 * batch * heads * dim + 2 * kv * kv_heads * dim)), features
+
+    def terms() -> tuple:
+        lens = _row_lengths(seq_lens, batch, max_seq_len)
+        rows = [(1, n, min(n, window + 1) if window >= 0 else n) for n in lens]
+        kv = sum(lens)
+        features = table_features(rows, heads, kv_heads, dim, dim, kv_dtype)
+        return 4.0 * kv * heads * dim, float(el * (2 * batch * heads * dim + 2 * kv * kv_heads * dim)), features
+
+    return terms
 
 
 def _row_lengths(seq_lens, batch: int, cap: int) -> list[int]:

@@ -86,7 +86,7 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         from mstar_sim import clock
 
         # priced from the lengths in `lens` (small ints keep values), as attention is
-        @clock.kernel_fn("test.rows", cost=lambda lens, out: (0.0, 1e9 * float(lens._data.sum())))
+        @clock.kernel_fn("test.rows", cost=lambda lens, out: lambda: (0.0, 1e9 * float(lens._data.sum())))
         def rows(lens, out):
             return out
 
@@ -129,6 +129,22 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
             raise SystemExit("a host read during capture was accepted")
         except RuntimeError as e:
             assert "capturing" in str(e)
+        # a captured kernel's index bounds are checked at replay, on that step's indices
+        table, ids = torch.empty(50, 8, device="cuda"), torch.tensor([60, 10], device="cuda")
+        g3 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g3):
+            torch.nn.functional.embedding((ids - 50).clamp_(0, 49), table)  # a TP vocab shard's clamp
+            torch.where(ids > 20, torch.arange(2, device="cuda").expand(2, 2), -1)  # an expanded operand
+        g3.replay()
+        g4, bad = torch.cuda.CUDAGraph(), torch.tensor([1, 2], device="cuda")
+        with torch.cuda.graph(g4):
+            torch.nn.functional.embedding(bad + 0, table)
+        bad.copy_(torch.tensor([3, 77]))
+        try:
+            g4.replay()
+            raise SystemExit("an index past the table replayed")
+        except RuntimeError as e:
+            assert "device-side assert" in str(e)
         print("ok")
     """)
     assert out.strip() == "ok"
@@ -178,8 +194,11 @@ def test_timing_only_holds_shapes_not_values():
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
         assert logits.argmax(-1).tolist() == [0, 0, 0, 0]  # never computed
+        torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         del big
+        assert torch.cuda.mem_get_info()[0] == before  # cached, as torch's allocator keeps it
+        torch.cuda.empty_cache()
         assert torch.cuda.mem_get_info()[0] - before == 40 * 2**30
         on0 = torch.cuda.memory_allocated(0)
         other = torch.empty(2**20, device="cuda:1")  # each device counts its own
@@ -187,6 +206,52 @@ def test_timing_only_holds_shapes_not_values():
         assert torch.cuda.mem_get_info(1)[0] == total - 4 * 2**20
         print("ok")
     """)
+    assert out.strip() == "ok"
+
+
+def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
+    """A capture holds its private pool's high-water mark (not 0, not every tensor it
+    saw) until the graph goes; a reservation past the card is out of memory."""
+    out = run_sim("""
+        import torch
+        from mstar_sim import clock
+
+        @clock.kernel_fn("test.read", cost=lambda x, n: lambda: (0.0, float(n.sum())))
+        def read(x, n):
+            return None
+
+        GiB = 2**30
+        n = torch.tensor([1], device="cuda")
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            scratch = torch.empty(GiB // 4, device="cuda")  # 1 GiB, freed inside the capture
+            read(scratch, n)  # a replay-priced kernel: the graph keeps its cost, not its tensors
+            del scratch
+            out = torch.empty(GiB // 16, device="cuda")  # 256 MiB, reuses the freed block
+        took = torch.cuda.memory_reserved() - before
+        assert took == GiB, took
+        pool = [s for s in torch.cuda.memory_snapshot() if s["segment_pool_id"] == g.pool()]
+        assert sum(s["total_size"] for s in pool) == GiB
+        torch.cuda.empty_cache()
+        assert torch.cuda.memory_reserved() - before == GiB  # the graph holds its pool
+        g.reset()
+        del out
+        torch.cuda.empty_cache()
+        assert torch.cuda.memory_reserved() == before
+
+        total = torch.cuda.get_device_properties().total_memory
+        big = torch.empty(total // 6, device="cuda")  # two thirds of the card
+        del big
+        again = torch.empty(total // 6, device="cuda")  # reuses the cached block
+        try:
+            torch.empty(total // 6, device="cuda")
+            raise SystemExit("an allocation past the card succeeded")
+        except torch.cuda.OutOfMemoryError as e:
+            assert "Tried to allocate" in str(e)
+        print("ok")
+    """, MSTAR_SIM_MEMORY_GB="80")
     assert out.strip() == "ok"
 
 

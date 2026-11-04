@@ -63,7 +63,7 @@ def _kernel(name: str, cost):
         def by_name(*args, **kwargs):
             return cost(sig.bind(*args, **kwargs).arguments)
 
-        return clock.kernel_fn(name, cost=by_name, static=True)(fn)
+        return clock.kernel_fn(name, cost=by_name)(fn)
 
     return decorate
 

@@ -32,6 +32,13 @@ class AllReduceFusionWorkspace:
         self.backend, self.world_size, self.rank = backend, world_size, rank
         self.max_token_num, self.hidden_dim, self.dtype = max_token_num, hidden_dim, dtype
 
+    def is_buffer_size_sufficient(self, tp_size: int, num_tokens: int, hidden_dim: int, dtype=None,
+                                  use_oneshot=None) -> bool:
+        """A message fits when its bytes fit the workspace's ``max_token_num x hidden_dim``."""
+        size = torch.empty((), dtype=dtype or self.dtype).element_size()
+        ws = torch.empty((), dtype=self.dtype).element_size()
+        return num_tokens * hidden_dim * size <= self.max_token_num * self.hidden_dim * ws
+
     def destroy(self) -> None:
         pass
 
@@ -45,7 +52,7 @@ def _norm_cost(input, *args, **kwargs):
     return 5.0 * input.numel(), 4.0 * input.numel() * input.element_size()
 
 
-@clock.kernel_fn("flashinfer.allreduce_fusion_norm", cost=_norm_cost, static=True)
+@clock.kernel_fn("flashinfer.allreduce_fusion_norm", cost=_norm_cost)
 def _norm(input, residual_out, norm_out):
     return None  # writes residual_out and norm_out in place
 

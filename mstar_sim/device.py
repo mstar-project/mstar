@@ -194,11 +194,53 @@ class SimTensor(torch.Tensor):
         return _run(func, args, kwargs or {}, index)
 
 
-# simulated device memory: bytes of the distinct storages SimTensors hold, per device
-_STORAGES: dict[int, list[int]] = {}
-ALLOCATED: dict[int, list[int]] = {}  # device index: [current, peak]
+# Simulated device memory, as torch's caching allocator accounts it. Each device has a
+# default pool and the private pools graphs capture into. A pool's ``live`` bytes are
+# its tensors' storages; ``reserved`` is what it holds from the card: its high-water
+# mark, until the cache is emptied (a freed block is reused within its pool, never
+# by another). ``graphs`` counts the graphs using a private pool; one no graph uses
+# gives its free bytes back on ``empty_cache``, and goes once nothing in it lives.
+DEFAULT_POOL = (0, 0)
+
+
+class Pool:
+    __slots__ = ("device", "handle", "live", "reserved", "graphs", "recording")
+
+    def __init__(self, device: int, handle: tuple):
+        self.device, self.handle = device, handle
+        self.live = self.reserved = self.graphs = 0
+        self.recording = False
+
+
+POOLS: dict[tuple[int, tuple], Pool] = {}
+_STORAGES: dict[int, list] = {}  # storage key: [bytes, references, fake address range, pool or None]
+ALLOCATED: dict[int, list[int]] = {}  # device index: [current, peak] bytes in tensors
+RESERVED_PEAK: dict[int, int] = {}
 # reentrant: a finalizer can run (garbage collection) while this thread holds it
 _track_lock = threading.RLock()
+
+
+def pool(index: int, handle=DEFAULT_POOL) -> Pool:
+    key = (index, tuple(handle))
+    found = POOLS.get(key)
+    if found is None:
+        found = POOLS[key] = Pool(*key)
+    return found
+
+
+def reserved(index: int) -> int:
+    return sum(p.reserved for p in POOLS.values() if p.device == index)
+
+
+def release_cached(index: int) -> None:
+    """``empty_cache``: the default pool, and private pools no graph uses, give back
+    what their tensors don't hold."""
+    with _track_lock:
+        for key, p in list(POOLS.items()):
+            if p.device == index and (p.handle == DEFAULT_POOL or p.graphs == 0):
+                p.reserved = p.live
+                if p.handle != DEFAULT_POOL and p.live == 0 and not p.recording:
+                    del POOLS[key]
 
 
 def _release(key: int) -> None:
@@ -208,26 +250,60 @@ def _release(key: int) -> None:
             entry[1] -= 1
             if entry[1] == 0:
                 del _STORAGES[key]
-                ALLOCATED[entry[3]][0] -= entry[0]
+                if entry[3] is not None:
+                    entry[3].live -= entry[0]
+                    ALLOCATED[entry[3].device][0] -= entry[0]
+
+
+def _allocate(index: int, nbytes: int) -> Pool:
+    """The pool a new storage of ``nbytes`` on device ``index`` comes from: the
+    capture's on its device, else the default. Growing a pool past the card (its
+    memory fraction) raises out of memory, after emptying the cache once, as torch's
+    allocator retries."""
+    tape = clock.capturing()
+    into = pool(*tape.pool) if tape is not None and tape.pool is not None and tape.pool[0] == index \
+        else pool(index)
+    grow = into.live + nbytes - into.reserved
+    if grow > 0:
+        from mstar_sim import cuda
+
+        limit = cuda.memory_limit(index)
+        if reserved(index) + grow > limit:
+            release_cached(index)
+            grow = into.live + nbytes - into.reserved
+            if reserved(index) + grow > limit:
+                held = ", ".join(f"{'default' if p.handle == DEFAULT_POOL else p.handle}: {p.reserved / 2**20:.0f}"
+                                 for p in POOLS.values() if p.device == index and p.reserved)
+                raise torch.cuda.OutOfMemoryError(
+                    f"CUDA out of memory. Tried to allocate {nbytes / 2**20:.2f} MiB. GPU {index} has a total "
+                    f"capacity of {limit / 2**30:.2f} GiB, of which {(limit - reserved(index)) / 2**20:.2f} MiB "
+                    f"is free (mstar_sim: MiB reserved per pool: {held})")
+        into.reserved += grow
+        RESERVED_PEAK[index] = max(RESERVED_PEAK.get(index, 0), reserved(index))
+    return into
 
 
 def _track(wrapper, data: torch.Tensor) -> None:
     """Count ``data``'s storage while it lives. The finalizer hangs on the payload,
-    not the wrapper: module moves swap wrappers, and a swap refuses weakrefs."""
+    not the wrapper: module moves swap wrappers, and a swap refuses weakrefs. A
+    storage opened from another process (CUDA IPC) is that process's memory."""
     if data._base is not None or getattr(data, "_sim_tracked", False):
         return  # a view: its base holds (and counts) the storage
-    data._sim_tracked = True
     storage = data.untyped_storage()
     key = storage._cdata
     with _track_lock:
         entry = _STORAGES.get(key)
         if entry is None:
-            index = wrapper.device.index
-            entry = _STORAGES[key] = [storage.nbytes(), 0, _fake_range(storage.nbytes()), index]
-            used = ALLOCATED.setdefault(index, [0, 0])
-            used[0] += entry[0]
-            used[1] = max(used[1], used[0])
+            nbytes = storage.nbytes()
+            into = None if getattr(storage, "_sim_imported", False) else _allocate(wrapper.device.index, nbytes)
+            entry = _STORAGES[key] = [nbytes, 0, _fake_range(nbytes), into]
+            if into is not None:
+                into.live += nbytes
+                used = ALLOCATED.setdefault(into.device, [0, 0])
+                used[0] += nbytes
+                used[1] = max(used[1], used[0])
         entry[1] += 1
+    data._sim_tracked = True
     weakref.finalize(data, _release, key)
 
 
@@ -393,6 +469,10 @@ class _Observe(TorchDispatchMode):
                 # a value-less operand: the op runs on shapes only
                 args, kwargs = tree_map(_as_meta, (args, kwargs))
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
+            elif func in _ALLOCATES:
+                # an allocation, not a kernel (a graph doesn't re-run it): undefined values read
+                # as zeros, never as the host's leftover bytes
+                out = func(*args, **kwargs).zero_()
             elif clock.capturing() is not None and not func.is_view and not clock.in_kernel():
                 out = _captured_values(func, args, kwargs)
             else:
@@ -418,7 +498,9 @@ _TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_"}
 
 def _check_bounds(func, args) -> None:
     """An index a kernel reads (a value the emulator keeps) must fall inside the
-    tensor it indexes, as the CUDA kernel asserts."""
+    tensor it indexes, as the CUDA kernel asserts. Captured, the kernel runs at
+    each replay, on that step's indices (an in-place ``clamp_`` before it has
+    re-run by then): the check goes into the graph."""
     name = func.overloadpacket.__name__
     pairs = []
     if name == "embedding":
@@ -431,10 +513,18 @@ def _check_bounds(func, args) -> None:
         pairs = [(args[1], args[0].numel())]
     elif name in _TAKES_NEGATIVE and len(args) > 1 and isinstance(args[1], (list, tuple)):
         pairs = [(ix, args[0].shape[i]) for i, ix in enumerate(args[1]) if i < args[0].dim()]
+    pairs = [(ix, size) for ix, size in pairs if isinstance(ix, torch.Tensor) and ix.device.type == "cpu"
+             and ix.numel() and ix.dtype != torch.bool and not ix.is_floating_point()]
+    if not pairs:
+        return
+    if clock.capturing() is not None:
+        clock.on_replay(lambda: _assert_in_bounds(name, pairs))
+    else:
+        _assert_in_bounds(name, pairs)
+
+
+def _assert_in_bounds(name: str, pairs) -> None:
     for ix, size in pairs:
-        if (not isinstance(ix, torch.Tensor) or ix.device.type != "cpu" or ix.numel() == 0
-                or ix.dtype == torch.bool or ix.is_floating_point()):
-            continue
         low = -size if name in _TAKES_NEGATIVE else 0
         bad = (ix < low) | (ix >= size)
         if bool(bad.any()):
@@ -540,6 +630,11 @@ def _floating(x) -> bool:
     return x.dtype.is_floating_point or x.dtype.is_complex
 
 
+_ALLOCATES = {
+    torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default,
+    torch.ops.aten.empty_like.default, torch.ops.aten.new_empty.default,
+    torch.ops.aten.new_empty_strided.default,
+}
 _FREE = {
     torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default,
     torch.ops.aten.empty_like.default, torch.ops.aten.lift_fresh.default,
@@ -817,12 +912,29 @@ def _function_body(func, args, kwargs):
 # ---------------------------------------------------------------- graph replay
 
 
+def _written(func, args, kwargs) -> list[torch.Tensor]:
+    """The tensor operands ``func``'s schema marks as written (``self`` of an in-place op, an
+    ``out=``): only these can change, and a read-only operand may be an expanded view that
+    can't be written back (``j.expand(rows, k)``)."""
+    schema = getattr(func, "_schema", None)
+    if schema is None:  # a torch function, not an aten op: every operand that a write can reach
+        flat = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
+        return [t for t in flat if 0 not in t.stride() or t.numel() <= 1]
+    out = []
+    for i, arg in enumerate(schema.arguments):
+        if arg.alias_info is None or not arg.alias_info.is_write:
+            continue
+        value = kwargs.get(arg.name) if arg.kwarg_only or i >= len(args) else args[i]
+        out += [t for t in tree_flatten(value)[0] if isinstance(t, torch.Tensor)]
+    return out
+
+
 def _captured_values(func, args, kwargs):
     """An op over values the emulator keeps, met while capturing: as on CUDA,
     capture runs nothing (its arguments keep their values, its outputs are the
     graph's buffers), and each replay runs it in place."""
     inputs = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
-    saved = [(t, t.clone()) for t in inputs if t.device.type == "cpu"]
+    saved = [(t, t.clone()) for t in _written(func, args, kwargs) if t.device.type == "cpu"]
     out = func(*args, **kwargs)  # for the outputs' buffers
     for t, before in saved:
         t.copy_(before)
@@ -1199,7 +1311,9 @@ def install() -> None:
     def _new_shared_cuda(*args):
         handle = args[1] if len(args) > 1 else b""
         if isinstance(handle, bytes) and handle.startswith(_SHARED):
-            return torch.UntypedStorage(int(handle.split(b":")[-1]), device=META)
+            storage = torch.UntypedStorage(int(handle.split(b":")[-1]), device=META)
+            storage._sim_imported = True  # the exporter's memory, not this process's
+            return storage
         return new_shared(*args)
 
     torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)

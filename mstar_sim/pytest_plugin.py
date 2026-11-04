@@ -32,6 +32,7 @@ import re
 import sys
 
 import pytest
+import torch
 
 from mstar_sim import device
 
@@ -43,6 +44,8 @@ def pytest_runtest_setup(item):
     device.VALUELESS_READS[0] = 0
     device.VALUE_SHAPES[0] = 0
     device.KERNELS_RUN[0] = 0
+    # a device-side assert poisons the process, as on CUDA; each test reports its own
+    device.FAULT[0] = ""
 
 
 def _needs_the_hub(excinfo) -> bool:
@@ -76,7 +79,10 @@ _FAKE_LIBS = pathlib.Path(__file__).resolve().parent / "fake_libs"
 
 def _raised_in_emulator(excinfo) -> str | None:
     """Where the exception started, when that is the emulator's own code: a gap in
-    the emulator, not a fault of mstar's."""
+    the emulator, not a fault of mstar's. CUDA's own errors, which the emulator
+    raises as a GPU would (out of memory, a device-side assert), are mstar's."""
+    if excinfo.errisinstance(torch.cuda.OutOfMemoryError) or "device-side assert triggered" in str(excinfo.value):
+        return None
     # the innermost frame of this tree (not torch, triton or the stdlib under it) decides
     for entry in reversed(excinfo.traceback):
         path = str(entry.path)

@@ -24,7 +24,7 @@ def _cost(scores, *args, **kwargs) -> tuple[float, float]:
     return 4.0 * scores.numel(), 2.0 * scores.numel() * scores.element_size()
 
 
-@clock.kernel_fn("flashinfer.top_k_page_table_transform", cost=_cost, static=True)
+@clock.kernel_fn("flashinfer.top_k_page_table_transform", cost=_cost)
 def top_k_page_table_transform(scores, page_table, lengths, k, *, row_to_batch=None,
                                deterministic=False, tie_break=TopKTieBreak.NONE,
                                dsa_graph_safe=False, page_table_row_starts=None, page_size=1,
