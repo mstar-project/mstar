@@ -44,7 +44,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     # Each video chunk is an mp4 (H.264); return it base64-encoded (bytes, which
     # MediaJSONResponse writes as they are), mirroring the image endpoint's
-    # b64_json shape. A sound request additionally emits a raw
+    # b64_json response. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
     # playable file with sound); if the mux fails the plain video is returned.
     # The mux also rescales the video timestamps to the request frame rate: the
