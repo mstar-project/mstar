@@ -81,11 +81,13 @@ from mstar.model.minicpm_o.config import (
     MiniCPMOConfig,
 )
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
     HostRows,
+    InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -815,29 +817,35 @@ class Token2WavSubmodule(NodeSubmodule):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         is_final_stream_chunk: bool = False,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> NodeInputs | None:
         if not inputs.get("tts_code"):
+            # a text-only reply's stream closes with one empty chunk
             return None
         # A host sync, which serializes this node's async pipeline. It is needed either
         # way: a window's length decides its capture and its cache writes. Filtering
         # the stop code on the device would need check_stop to filter outputs (an
         # engine change), and would still leave the length on the device.
         codes = inputs["tts_code"][0].reshape(-1).to("cpu", torch.int32)
-        # The TTS's stop code is streamed before its stop is seen; it is not speech.
-        # Dropping it can leave a window short, which runs eagerly. Every chunk of a
-        # started stream still runs: a skipped step never completes the node, which
-        # then refuses the stream's later chunks.
+        # The TTS's stop code is streamed before its stop is seen. It is not speech, and
+        # it ends the speech: the window holding it is the last, as upstream's stream
+        # ends there.
+        last = is_final_stream_chunk or bool((codes == self.eos_code).any())
         codes = codes[codes != self.eos_code]
-        if codes.numel() == 0:
-            # a text-only reply's stream closes with one empty chunk
-            return None
+        chunk = input_metadata.stream_chunks["tts_code"]
+        if chunk.context_items == chunk.num_items:
+            # No new codes: the stream's final chunk after a window that held the stop
+            # code, which only repeats that window's tail. It still runs, voicing
+            # nothing (``forward_batched``): a skipped step never completes the node,
+            # which then refuses the stream's end.
+            return NodeInputs(tensor_inputs={"codes": codes[None, :0]}, kwargs={"last": True})
         # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
             codes = torch.cat([self._lead_silence, codes])
             state.add("voice", fwd_info.step_metadata.get("voice"))
-        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": is_final_stream_chunk})
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -858,8 +866,8 @@ class Token2WavSubmodule(NodeSubmodule):
 
     # Each window's flow and HiFT run through a piecewise region: replayed when a graph
     # fits, else eagerly through the same step, so the resources always hold the plan
-    # of exactly the rows being run. Shapes that are never captured (a window short of
-    # the TTS's stop code, a one-window reply's HiFT) have eager-only regions.
+    # of exactly the rows being run. Shapes that are never captured (a one-window
+    # reply's HiFT) have eager-only regions.
 
     @staticmethod
     def flow_region(num_tokens: int, last: bool) -> str:
@@ -981,8 +989,12 @@ class Token2WavSubmodule(NodeSubmodule):
         whatever its voice and position, then HiFT, batched over rows that are all or none
         their request's first window."""
         runners = engine_inputs.piecewise_runners
-        first, num_tokens, flows = {}, {}, {}
+        out, first, num_tokens, flows = {}, {}, {}, {}
         for rid, (codes, last) in zip(engine_inputs.request_ids, rows, strict=True):
+            if not codes.shape[1]:
+                # past its last window (``prepare_inputs``)
+                out[rid] = {}
+                continue
             first[rid] = not self.request_state(rid).get("started", False)
             num_tokens[rid] = codes.shape[1]
             flows.setdefault((codes.shape[1], last), []).append((rid, codes))
@@ -998,7 +1010,6 @@ class Token2WavSubmodule(NodeSubmodule):
                     mels[rid] = mel[i]
                     hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
 
-        out = {}
         for (is_first, frames, last), rids in hifts.items():
             runner = runners.get(self.hift_region(is_first, frames, last)) or runners[
                 self.eager_region("hift", is_first, last)]

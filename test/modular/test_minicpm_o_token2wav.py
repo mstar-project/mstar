@@ -406,61 +406,53 @@ def test_assets_load_completely():
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
 
 
-@pytest.mark.parametrize("device", [
-    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
-])
-def test_window_short_of_its_stop_code(random_token2wav, device):
-    """A window that carried the TTS's stop code is a code short (the node drops it) and
-    not the last; the reply's last window comes after it. The caches' positions follow
-    what each window wrote, so the batched path still matches ``stream``."""
-    import copy
-
-    model = copy.deepcopy(random_token2wav).to(device)
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
-    p = 50
-    torch.manual_seed(2)
-    voice = model.prepare_voice(VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
-        spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
-    ))
-    full = [w for w, last in stream_windows(torch.randint(0, 6561, (200,)).tolist()) if not last]
-    windows = [(w, False) for w in full[:4]] + [(full[4][:-1], False), (full[4][-4:], True)]
-    bank = VoiceBank.build({"v": voice})
-    kv_steps = _CacheSteps(bank, 2, device)
-    ref = model.new_state(voice)
-    for win, last in windows:
-        tokens = torch.tensor([win], dtype=torch.int32, device=device)
-        mel = model.flow_chunk(ref, voice, tokens, last)
-        state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-        got = model.window_flow(state, bank, ids, tokens, kv, last)
-        commit()
-        torch.testing.assert_close(got, mel, **tol)
-
-
-
-@pytest.mark.parametrize("stop_at", [27, 10])
-def test_every_chunk_after_the_stop_code_runs(stop_at):
-    """The stop code is dropped, and no chunk of a started stream is skipped: a skipped
+@pytest.mark.parametrize("n", [1, 21, 22, 23, 24, 25, 49, 99, 100, 230])
+def test_served_windows_are_upstreams(n):
+    """The TTS streams ``n`` codes and then its stop code; the policy's chunks, through
+    ``prepare_inputs``, are ``stream_windows`` of the codes: every code voiced once and the
+    same last window, also when the stop code ends a full window (``n = 25j + 24``). Every
+    chunk of a started stream still runs, voicing nothing past the last window: a skipped
     step never completes the node, which then refuses the stream's final chunk."""
     from types import SimpleNamespace
 
+    from mstar.model.minicpm_o.components.token2wav import HOP, LEAD_SILENCE, SILENCE_CODE
     from mstar.model.minicpm_o.submodules import Token2WavSubmodule
+    from mstar.model.submodule_base import InputMetadata
+    from mstar.streaming.chunk_policy import LeftContextChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
 
     eos = 6561
     node = Token2WavSubmodule.__new__(Token2WavSubmodule)
     torch.nn.Module.__init__(node)
     node.request_states, node.eos_code = {}, eos
-    node._lead_silence = torch.zeros(3, dtype=torch.int32)
-    info = SimpleNamespace(rid_handle=0, step_metadata={})
-    node.request_state(0).add("started", True)
-    window = torch.arange(28, dtype=torch.int32)
-    window[stop_at] = eos
-    keep = [c for c in range(28) if c != stop_at]
+    node._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
+    info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "v"})
+    codes = torch.randint(0, eos, (n,)).tolist()
 
-    got = node.prepare_inputs("t2w_chunk", info, {"tts_code": [window]}, is_final_stream_chunk=False)
-    assert not got.kwargs["last"] and got.tensor_inputs["codes"].tolist() == [keep]
-    got = node.prepare_inputs("t2w_chunk", info, {"tts_code": [window[25:]]}, is_final_stream_chunk=True)
-    assert got.kwargs["last"] and got.tensor_inputs["codes"].tolist() == [[c for c in range(25, 28) if c != stop_at]]
+    buffer = StreamBuffer(request_id=0, edge_name="tts_code", from_partition="main",
+                          policy=LeftContextChunkPolicy(chunk=HOP, left_context=LEAD_SILENCE))
+    served, started = [], False
+    for i, code in enumerate(codes + [eos, None]):
+        if code is None:
+            buffer.signal_done()
+        else:
+            buffer.pre_read_register(f"t{i}")
+            buffer.put(f"t{i}", torch.tensor([code], dtype=torch.int32))
+        while buffer.has_chunk_ready():
+            chunk = buffer.pop_chunk()
+            data = chunk.data["data"]
+            got = node.prepare_inputs(
+                "t2w_chunk", info, {"tts_code": [data]} if data is not None else {},
+                is_final_stream_chunk=chunk.is_final,
+                input_metadata=InputMetadata(stream_chunks={"tts_code": chunk.info} if data is not None else {}),
+            )
+            assert got is not None or not started
+            if got is not None and got.tensor_inputs["codes"].numel():
+                served.append((got.tensor_inputs["codes"][0].tolist(), got.kwargs["last"]))
+                # as the forward does
+                node.request_state(0).add("started", True)
+                started = True
+    assert served == list(stream_windows(codes))
 
 
 @pytest.mark.parametrize("device", [
