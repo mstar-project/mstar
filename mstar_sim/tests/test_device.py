@@ -241,6 +241,13 @@ def test_timing_only_holds_shapes_not_values():
         assert pos.tolist() == [1, 2, 3, 4, 5]  # small ints are real
         logits = torch.randn(4, 1000, device="cuda") @ torch.randn(1000, 1000, device="cuda")
         assert logits.argmax(-1).tolist() == [0, 0, 0, 0]  # never computed
+        # a small tensor keeps the values last written to it, however it was made: a host
+        # float staged into a preallocated buffer, and a never-computed write over a kept one
+        buf = torch.empty(1, device="cuda")
+        buf.copy_(torch.tensor([0.5]))
+        assert buf.item() == 0.5
+        buf.mul_(logits[0, :1])
+        assert buf.item() == 0.0
         torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         del big
