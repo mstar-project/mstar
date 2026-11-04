@@ -176,10 +176,11 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         # so does a reshape that has to copy: a view function only when it can be one
         source = torch.arange(3, device="cuda")
         g7 = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g7):
+        with torch.inference_mode(), torch.cuda.graph(g7):  # (the engine's: composites arrive whole)
             copied = source[:, None].expand(3, 2).reshape(-1)
+            packed = source[:, None].expand(3, 2).contiguous()
         source.add_(1); g7.replay()
-        assert copied.tolist() == [1, 1, 2, 2, 3, 3], copied.tolist()
+        assert copied.tolist() == [1, 1, 2, 2, 3, 3] and packed.tolist() == [[1, 1], [2, 2], [3, 3]], packed.tolist()
         # a stand-in kernel's work on kept values re-runs at each replay too (timed as under --fast),
         # and capture writes nothing: here the top-k transform's slots from the latest page table
         import flashinfer

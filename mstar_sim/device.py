@@ -380,7 +380,7 @@ class _Observe(TorchDispatchMode):
             elif value_less or func not in _ALLOCATES:
                 if value_less:  # a kept tensor written with one: it reads as zeros, and is what lands
                     args, kwargs = tree_map(_zeros, (args, kwargs))
-                if clock.capturing() is not None and not func.is_view:
+                if clock.capturing() is not None:
                     out = _captured_values(func, args, kwargs)
                 else:
                     out = _kept_op(func, args, kwargs)
@@ -592,10 +592,9 @@ def _kept_op(func, args, kwargs):
     """Run an aten op on kept values: what it writes is computed only if all it read was."""
     never = _reads_never_computed(func, args, kwargs)
     out = func(*args, **kwargs)
-    if not func.is_view:  # a view is its base's storage
-        for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
-            if isinstance(t, torch.Tensor) and t.device.type == "cpu":
-                set_never_computed(t, never)
+    for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
+        if isinstance(t, torch.Tensor) and t.device.type == "cpu":
+            set_never_computed(t, never)
     return out
 
 
@@ -906,12 +905,14 @@ def _function_body(func, args, kwargs):
 def _captured_values(func, args, kwargs):
     """An aten op over values the emulator keeps, met while capturing. As on CUDA, capture
     runs nothing: its new outputs are graph buffers, shaped on meta, and each replay runs it
-    (into them, or in place). An in-place metadata op (``unsqueeze_``, ``set_``) changes
-    shapes once, at capture. An op whose output shape depends on the values (``nonzero``, a
-    mask index) is refused, as CUDA refuses the host sync it needs."""
+    (into them, or in place). A view is taken now, and an in-place metadata op (``unsqueeze_``,
+    ``set_``) changes shapes once, at capture; what may be a view by its schema (``reshape``,
+    ``contiguous``, which arrive whole under inference mode) is one only if its shaped run
+    aliases. An op whose output shape depends on the values (``nonzero``, a mask index) is
+    refused, as CUDA refuses the host sync it needs."""
     if torch.Tag.inplace_view in func.tags:
         return func(*args, **kwargs)
-    real = {}
+    real, metas = {}, []
 
     def shaped(x):
         if isinstance(x, torch.device) and x.type == "cpu":
@@ -920,6 +921,7 @@ def _captured_values(func, args, kwargs):
             return x
         m = torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device=META)
         real[id(m)] = x
+        metas.append(m)
         return m
 
     try:
@@ -928,6 +930,10 @@ def _captured_values(func, args, kwargs):
         if not isinstance(e, NotImplementedError) and torch.Tag.dynamic_output_shape not in func.tags:
             raise
         refuse_while_capturing(f"{func.overloadpacket.__name__}'s output shape depends on its input values")
+    if func.is_view:
+        operands = {m.untyped_storage()._cdata for m in metas}
+        if any(t.untyped_storage()._cdata in operands for t in tree_flatten(out)[0] if isinstance(t, torch.Tensor)):
+            return func(*args, **kwargs)
 
     def buffer(m):
         if not isinstance(m, torch.Tensor):
@@ -961,7 +967,7 @@ def replay(tape: clock.Tape) -> None:
     clock.STATS["replays"] += 1
     launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
     total, kernels = 0.0, 0
-    with contextlib.nullcontext() if clock.FAST else clock.computing(), torch.no_grad():
+    with contextlib.nullcontext() if clock.FAST else clock.computing(), torch.inference_mode():
         for seconds, effect in tape.nodes:
             if effect is not None and not FAULT[0]:  # the device faulted: nothing after it runs
                 effect()
