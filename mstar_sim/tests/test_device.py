@@ -87,6 +87,13 @@ def test_cuda_semantics():
             raise SystemExit("a transposed scale was accepted")
         except RuntimeError as e:
             assert "blockwise scaling" in str(e)
+        rowwise = F.ScalingType.RowWise.value
+        try:  # a recipe with no 128-blocks takes no padded scale
+            torch._scaled_mm_v2(a, w, [torch.empty(128, 1, device="cuda")], [rowwise], [none],
+                                [torch.empty(256, device="cuda")], [rowwise], [none], None, torch.bfloat16)
+            raise SystemExit("a scale for a rounded-up N was accepted")
+        except RuntimeError as e:
+            assert "208 elements" in str(e)
         # mstar's custom ops run on the emulated GPU, kept operands included (their torch.empty
         # scratch is a cuda buffer, not host garbage), and a kept storage shares like any other
         @torch.library.custom_op("mstar_sim_test::plus_one", mutates_args=())
