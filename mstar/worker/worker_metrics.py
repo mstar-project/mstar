@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from mstar.engine.engine import Engine
     from mstar.model.submodule_base import NodeInputs
     from mstar.worker.micro_scheduler import MicroScheduler
+    from mstar.worker.rebuild import Rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class WorkerMetrics:
         components: frozenset[str],
         engine: Engine,
         scheduler: MicroScheduler,
+        rebuilds: Rebuilds,
         send: Callable[[WorkerStatus], None],
         *,
         enable_transfers: Callable[[], EdgeTransfers],
@@ -93,6 +95,9 @@ class WorkerMetrics:
             (kv.key, sorted(kv.nodes & components), kv.cache)
             for kv in engine.paged_kv_caches() if kv.nodes & components
         ]
+        # one kept-id pool serves every node here with a rebuild policy, and shows under each of them
+        self._host_pool = rebuilds.pool
+        self._host_nodes = sorted(rebuilds.nodes & components) if rebuilds.pool is not None else []
         # when the worker's last step finished postprocessing
         self._last_done = 0.0
         self._step_seconds = Histogram(catalog.STEP_SECONDS)
@@ -108,6 +113,8 @@ class WorkerMetrics:
             catalog.KV_RETURNS_PREEMPTED,
         )]
         self._rebuild_pages = Counter(catalog.KV_REBUILD_CACHED_PAGES)
+        self._host_used = Gauge(catalog.REBUILD_HOST_BYTES_USED)
+        self._host_total = Gauge(catalog.REBUILD_HOST_BYTES_TOTAL)
 
     def start_counting(self) -> None:
         """Count the steps whose time starts from now on (see ``step_done``),
@@ -189,10 +196,16 @@ class WorkerMetrics:
         pending = self._scheduler.pending_rows() if self.components else {}
         for node in self.components:
             self._pending.set((node,), pending.get(node, 0))
+        if self._host_nodes:
+            used, total = self._host_pool.nbytes_used(), self._host_pool.nbytes
+            for node in self._host_nodes:
+                self._host_used.set((node,), used)
+                self._host_total.set((node,), total)
         return [
             self._kv_used.snapshot(), self._kv_total.snapshot(), self._kv_cached.snapshot(),
             self._step_seconds.snapshot(), self._batch_size.snapshot(),
             self._prefix_query.snapshot(), self._prefix_hit.snapshot(),
             *(counter.snapshot() for counter in self._preemption_counters), self._rebuild_pages.snapshot(),
-            self._pending.snapshot(), *self._transfers.snapshot(),
+            self._pending.snapshot(), self._host_used.snapshot(), self._host_total.snapshot(),
+            *self._transfers.snapshot(),
         ]

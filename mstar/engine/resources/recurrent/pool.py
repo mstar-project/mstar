@@ -369,7 +369,7 @@ class RecurrentStatePool(Resource):
 
     supports_drop = True
 
-    def drop(self, rid: str) -> int:
+    def drop(self, rid: str, tokens: int) -> int:
         # zeroed in place, so recomputing the state never waits for a free slot
         self.reset_request(rid)
         return 0

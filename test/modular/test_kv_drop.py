@@ -105,12 +105,14 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     _prefill(kv, "r", 2 * PAGE_SIZE + 5)
     free = kv._arena.num_free
 
-    assert kv.drop("r") == 1 == kv._arena.num_free - free, "only the partial page is the request's alone"
+    assert kv.drop("r", 2 * PAGE_SIZE + 5) == 1 == kv._arena.num_free - free, (
+        "only the partial page is the request's alone"
+    )
     assert len(kv._index.evictable()) == 2, "the two keyed pages should stay cached, evictable"
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host"])
+@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host", "fewer ids", "more ids"])
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE, kind=refusal if refusal in ("digest", "rows") else "ids")
@@ -121,18 +123,18 @@ def test_a_refused_drop_changes_nothing(refusal):
     pages = list(kv._streams["r"]["main"].page_indices)
 
     with pytest.raises(RuntimeError):
-        kv.drop("r")
+        kv.drop("r", PAGE_SIZE + {"fewer ids": -1, "more ids": 1}.get(refusal, 0))
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
 def test_a_second_drop_before_the_rebuild_lands_is_refused():
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE, kind="ids")
-    kv.drop("r")
+    kv.drop("r", PAGE_SIZE)
     held = kv._dropped["r"]
 
     with pytest.raises(RuntimeError):
-        kv.drop("r")
+        kv.drop("r", PAGE_SIZE)
     assert kv._dropped["r"] == held, "a second drop would overwrite what the rebuild has to write again"
 
 
@@ -151,7 +153,7 @@ def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
     kv.ingest_request("r", config)
 
     with pytest.raises(RuntimeError, match="one rebuild row"):
-        kv.drop("r")
+        kv.drop("r", 0)
     assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
 
 
@@ -196,7 +198,7 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     sampler._sampler._step_offset["r"] = 7
     sampler._sampler.get_token_mask("r").add_tokens(3)
 
-    engine.drop_request(NODE, "r")
+    engine.drop_request(NODE, "r", PAGE_SIZE)
 
     assert sampler._sampler._step_offset["r"] == 7, "the RNG offset can't be recomputed"
     assert sampler._sampler.get_token_mask("r")._seen_token_mask[3], "the repetition mask can't be recomputed"
@@ -215,7 +217,7 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     rope._counters["r"]["main"] = PAGE_SIZE
 
     with pytest.raises(RuntimeError):
-        engine.drop_request(NODE, "r")
+        engine.drop_request(NODE, "r", PAGE_SIZE)
     assert kv.residency("r") is Residency.RESIDENT and kv._streams["r"]["main"].page_indices, (
         "one KV cache dropped and the other kept"
     )
@@ -228,7 +230,7 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     kv.ingest_request("r", _config(prompt, cap=50))
     footprint = kv._streams["r"]["main"].footprint
     _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
-    kv.drop("r")
+    kv.drop("r", len(prompt) + len(sampled) - 1)
 
     kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
     fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29))
@@ -247,7 +249,7 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
     _prefill(kv, "r", 2 * PAGE_SIZE)
     # what the conductor sends back with every INPUT_SIGNALS
     published = {"kv": kv.publish("r", NODE, WALK), "rope": PublishedPositionInfo(counters={"main": 2 * PAGE_SIZE})}
-    engine.drop_request(NODE, "r")
+    engine.drop_request(NODE, "r", 2 * PAGE_SIZE)
 
     outcome = engine.check_ready(NODE, "r", SimpleNamespace(graph_walk=WALK, resource_publish_info=published))
 
@@ -255,21 +257,11 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
     assert rope._counters["r"] == {} and not kv._streams["r"]["main"].page_indices, "the rebuild would start past 0"
 
 
-@pytest.mark.parametrize("ids", [20, 22])
-def test_a_rebuild_that_would_write_other_than_what_the_label_held_raises(ids):
-    kv = _manager()
-    _prefill(kv, "r", 20)
-    kv.drop("r")
-
-    with pytest.raises(RuntimeError, match="held 20"):
-        kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(ids))))
-
-
 def test_removing_a_dropped_or_relaid_request_leaks_no_page():
     kv = _manager()
     for rid in ("dropped", "relaid"):
         _prefill(kv, rid, 20)
-        kv.drop(rid)
+        kv.drop(rid, 20)
     kv.prepare_rebuild("relaid", Rebuild(WALK, array("i", range(21))))
     kv.land_rebuild("relaid")
     assert kv.residency("relaid") is Residency.RESIDENT, "a rebuilt request would never be ready again"
@@ -285,7 +277,7 @@ def test_a_dropped_request_reads_as_dropped_until_its_rebuild_lands():
     kv = _manager()
     engine = _engine({"kv": kv, "rope": RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)})
     _prefill(kv, "r", 20)
-    kv.drop("r")
+    kv.drop("r", 20)
     kv.prepare_rebuild("r", Rebuild(WALK, array("i", range(21))))
 
     assert engine.residency(NODE, "r") is Residency.DROPPED, "the request would read as resident mid-rebuild"
@@ -299,7 +291,7 @@ def test_readiness_answers_a_dropped_request_with_a_rebuild_and_a_follower_with_
     kv = _manager()
     engine = _engine({"kv": kv, "rope": RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)})
     _prefill(kv, "r", 20)
-    kv.drop("r")
+    kv.drop("r", 20)
 
     info = SimpleNamespace(graph_walk=WALK, resource_publish_info={})
     assert engine.check_ready(NODE, "r", info, allow_reload) == outcome, (

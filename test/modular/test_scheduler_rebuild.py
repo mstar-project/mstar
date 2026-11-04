@@ -10,6 +10,7 @@ flight is offered again only as its step's continuation.
 
 from __future__ import annotations
 
+import math
 import sys
 from array import array
 from types import SimpleNamespace
@@ -236,7 +237,7 @@ def test_a_rebuild_whose_request_the_scheduler_wouldnt_run_waits(why):
     sched, _, state, _ = _scheduler({})
     _rebuilding(sched)
     if why == "held":
-        sched.hold_requests([R])
+        sched.held_until[R] = math.inf
     elif why == "failed":
         sched.failed_rids.add(R)
     else:

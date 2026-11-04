@@ -8,6 +8,7 @@ from the policy's input the first time a step runs the policy's walk, and each s
 
 from __future__ import annotations
 
+import logging
 from array import array
 from types import SimpleNamespace
 
@@ -127,6 +128,19 @@ def test_a_full_pool_keeps_no_ids():
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
 
     assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE], "two requests' ids would share host memory"
+
+
+def test_a_full_pool_is_logged_once_and_not_per_request(caplog):
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.rebuild"):
+        for rid in (R, A, B):
+            rebuilds.keep_prompts(_ran(PREFILL, {rid: {"text_inputs": [torch.arange(8)]}}))
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert len(lines) == 1 and "64-byte prompt, with 0 of 32 bytes in use" in lines[0], (
+        "requests that can never be dropped would go unnoticed, or log a line each"
+    )
 
 
 def test_removing_a_request_gives_its_slice_back():

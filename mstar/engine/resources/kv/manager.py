@@ -3606,7 +3606,7 @@ class KVManager(AttentionResource):
             return Residency.DROPPED
         return Residency.ON_HOST if self.is_offloaded(rid) else Residency.RESIDENT
 
-    def check_drop(self, rid: str) -> str | None:
+    def check_drop(self, rid: str, tokens: int) -> str | None:
         if self._world_size > 1:
             return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
@@ -3628,14 +3628,22 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: {rid} writes more than one label, span or growth loop, which one rebuild "
                     "row can't lay out again"
                 )
+            held = self._laid_out_tokens(rid)
+            if laid_out and held != tokens:
+                return f"KV {self.name}: {rid}'s rebuild would write {tokens} tokens, but its label holds {held}"
         return None
 
-    def drop(self, rid: str) -> int:
+    def _laid_out_tokens(self, rid: str) -> int:
+        # `check_drop` allows at most one laid-out label
+        laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+        return sum(self._streams[rid][label].stored_len for label in laid_out)
+
+    def drop(self, rid: str, tokens: int) -> int:
         """Take ``rid``'s KV off the device without a host copy, and return the
         number of pages freed. Pages the index also holds stay cached, where they
         can be evicted, and the rest go back to the free list."""
         with self._lock:
-            refusal = self.check_drop(rid)
+            refusal = self.check_drop(rid, tokens)
             if refusal is not None:
                 raise RuntimeError(refusal)
             # under the lock, so no other step allocates between the two counts
@@ -3655,9 +3663,7 @@ class KVManager(AttentionResource):
                     0 if allotment is None else allotment.prompt,
                     sum(self._one_more(history, stream.footprint) for stream in streams),
                 )
-                # `check_drop` allows at most one laid-out label
-                laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
-                dropped = Dropped(returns, sum(self._streams[rid][label].stored_len for label in laid_out))
+                dropped = Dropped(returns, self._laid_out_tokens(rid))
             self.reset_request(rid, free=True)
             self._dropped[rid] = dropped
             self._vacate(rid, room)
@@ -3680,8 +3686,7 @@ class KVManager(AttentionResource):
         prompt, page_size = ids[:-1], self.config.tokens_per_page
         length = len(prompt)
         held = self._dropped[rid].held
-        if length != held:
-            raise RuntimeError(f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its label held {held}")
+        assert length == held, f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its drop checked {held}"
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it

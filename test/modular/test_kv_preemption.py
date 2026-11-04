@@ -72,7 +72,7 @@ def _ready(kv, rid: str) -> bool:
 
 
 def _drop(kv, rid: str) -> int:
-    freed = kv.drop(rid)
+    freed = kv.drop(rid, kv._laid_out_tokens(rid))
     _runner(kv).readmit(rid, NODE)
     return freed
 
@@ -122,7 +122,7 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
     _remove(kv, "x")
     assert _ready(kv, "a") and _ready(kv, "b") and not _ready(kv, "c")
     assert _step(kv, "a", 3 * PAGE_SIZE).ok and _step(kv, "b", 2 * PAGE_SIZE).ok
-    kv.drop("b")
+    kv.drop("b", 2 * PAGE_SIZE)
     assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
     _runner(kv).readmit("b", NODE)
 
@@ -405,7 +405,7 @@ def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_pro
     _request(kv, "v", 5, arrival=1)
     assert _ready(kv, "v") and _step(kv, "v", 2 * PAGE_SIZE).ok
 
-    kv.drop("v")
+    kv.drop("v", 2 * PAGE_SIZE)
 
     assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
 
