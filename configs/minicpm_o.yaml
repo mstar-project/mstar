@@ -4,9 +4,9 @@ max_seq_len: 16384
 # encoders run once per request and then idle, so they share the LLM's
 # worker. The TTS and the vocoder each get their own worker loop: a vocoder
 # step takes 40-150 ms, which on a shared loop would hold up the
-# TTS's few-millisecond decode steps (and the LLM's). After startup the three
-# hold ~57 GiB in all (est., from an H200 boot at 576 tts_kv pages; GPU re-check
-# pending), which would fit an 80 GB H100.
+# TTS's few-millisecond decode steps (and the LLM's). On an H200 the three hold
+# 55.6 GiB after startup, highest sample 63.0 GiB under load; not booted on an
+# H100.
 rank_devices: {0: 0, 1: 0, 2: 0}
 # The three workers' kernels overlap as clients of one MPS daemon, rather than
 # time-slicing the GPU.
@@ -31,8 +31,9 @@ resources:
   # Admission reserves only a prompt's pages, so 32 long replies can outgrow them;
   # 512 host pages (9 GiB of host memory) give a full pool a request to move, as
   # qwen3omni_2gpu.yaml does, where without them every reply would wait until it
-  # timed out. Past 896 pages in all the worker warns to raise cpu_offload_pages
-  # and holds, as it would without host pages.
+  # timed out. At the cap of 32, with 2048 tokens out on an H200 (one run per
+  # size), a burst of prompts around 3.7k tokens or longer still waits, 2.5k does
+  # not; a wait warns to raise cpu_offload_pages.
   llm_kv:
     max_num_pages: 384
     cpu_offload_pages: 512
