@@ -1378,6 +1378,20 @@ def test_a_follower_whose_kv_holds_other_than_rank_0s_drop_counted_refuses_the_d
     assert follower.residency("v") is Residency.RESIDENT, "the follower dropped what rank 0's rebuild doesn't write"
 
 
+def test_a_follower_that_keeps_no_ids_for_a_request_rank_0_dropped_stops(monkeypatch):
+    """Rank 0 drops v, which it rebuilds from its kept ids, and the follower's rebuild pool had no room for v's
+    prompt. Dropped anyway, the follower couldn't start v's rebuild, and tried again on every pass while rank 0
+    waited for it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.rebuilds = Rebuilds({}, {})
+    _send(scheduler, lead, 0)
+
+    with pytest.raises(SystemExit, match="keeps neither its ids nor the input of its prompt"):
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
+    assert follower.residency("v") is Residency.RESIDENT, "the follower dropped a request it can't rebuild"
+
+
 @pytest.mark.parametrize("dropped", [False, True], ids=["voided head", "row dropped by prepare_inputs"])
 def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkeypatch, dropped):
     """Rank 0 pre-plans the next decode step of r and s, whose tokens each need a fourth page, and throws the stage

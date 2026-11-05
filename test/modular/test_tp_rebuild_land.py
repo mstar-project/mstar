@@ -144,3 +144,22 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
     assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
     assert not one.rebuilds.rebuilding("v", NODE), "the follower would take v's decode row for a rebuild row"
+
+
+def test_a_follower_whose_rebuild_cant_start_stops(monkeypatch):
+    """The follower replays rank 0's drop of v holding the input of v's prompt and no ids, and its chunk loop has
+    v's prompt run whole, so v's rebuild has nothing to start from. The error came back on every pass over rank 0's
+    step while rank 0 waited in it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    zero, one = _Rank(leader, lead), _Rank(follower, follow)
+    del one.rebuilds._kept[NODE]["v"]
+    follow._chunking.prepared["v", NODE] = SimpleNamespace()
+    sched, request_state = one.scheduler, one.worker.request_state
+    sched.register_tp_follow(_head(lead, 0))
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+    sched.pop_tp_follow_head()
+    zero.scheduler._start_rebuild(NODE, "v", "decode")
+    sched.register_tp_follow(_head(lead, 1, ["v"]))
+
+    with pytest.raises(SystemExit, match="TP ranks diverged"):
+        sched.settle_tp_follow_delta(request_state, caught_up=True)
