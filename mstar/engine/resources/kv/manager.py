@@ -2342,12 +2342,11 @@ class KVManager(AttentionResource):
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
                 part.generation += 1
-            # Record the room again after the rollback. Otherwise `preempt` would count the pages the step's other
-            # rows gave back as released since the grant ran short.
-            for segment in step.segments:
-                short = self._ran_short.get(segment.request_id)
-                if short is not None:
-                    self._ran_short[segment.request_id] = short._replace(room=self._room())
+            # Record the room again after the rollback. Otherwise `preempt` would count the pages given back here as
+            # released since a grant ran short. Run row by row, that grant's row has already rolled back on its own.
+            room = self._room()
+            for rid, short in self._ran_short.items():
+                self._ran_short[rid] = short._replace(room=room)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 

@@ -470,6 +470,24 @@ def test_a_page_the_failing_step_gives_back_is_no_release():
     )
 
 
+def test_a_page_an_earlier_row_gives_back_is_no_release():
+    """Run row by row, a step admits each row as a step of its own and rolls back the rows ahead of one that fails,
+    after that row has rolled back. r's grant counted the page a then gave back as room it had seen, took it, and a's
+    retry ran short, which would move r for nothing."""
+    kv = _pool()
+    _running(kv, "a", 4, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    rows = {rid: (KVStep(segments=(Segment(rid, "main", 1),)), _ctx(rid)) for rid in ("a", "r")}
+    assert kv.admit(*rows["a"]).ok
+    outcome = kv.admit(*rows["r"])
+    kv.rollback_admit(*rows["r"])
+    kv.rollback_admit(*rows["a"])
+
+    _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: False)
+
+    assert _step(kv, "a", 1).ok, "r took the page a's rollback gave back, so a's retry ran short"
+
+
 def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
     """A host fetch holds a run of cached pages that starts below the root, and eviction takes leaves only, so the
     pages above that run stay. Counting those pages as room would send a victim to a host that can't take
