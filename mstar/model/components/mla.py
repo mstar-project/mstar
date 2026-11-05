@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
 
@@ -93,15 +92,11 @@ class MLAAttention(nn.Module):
         self._kv = None
         self._attn = None
         self._pos = None
-        self._attend: AttentionCallable | None = None
 
     def bind_resources(self, resources: dict) -> None:
         self._kv = resources[self._kv_key]
         self._attn = resources[self._attn_key]
         self._pos = resources[self._pos_key]
-        # the latent's write and the attention, through the attention's exchange where the node's
-        # steps may split over SP ranks
-        self._attend = AttentionCallable(self._kv, self._attn)
 
     def _rope(
         self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor,
@@ -122,10 +117,13 @@ class MLAAttention(nn.Module):
     # reads it guards on it and compiles once per layer.
     @torch.compiler.disable
     def _write_and_attend(self, q, k, v, q_pe=None):
-        # k (and v) go to the attention too: over a context-parallel pool a step's own tokens
-        # attend each other from them
-        self._attend.set_layer_idx(self.cache_layer_idx)
-        return self._attend(q if q_pe is None else (q, q_pe), k, v)
+        layer_idx = self.cache_layer_idx
+        self._kv.write_kv(k, v, layer_idx=layer_idx)
+        layer = self._kv.layer_view(layer_idx)
+        # k (and v) too: over a context-parallel pool a step's own tokens attend each other from them
+        if q_pe is None:
+            return self._attn.run(q, kv_cache_layer=layer, k=k, v=v)
+        return self._attn.run(q, kv_cache_layer=layer, k=k, q_pe=q_pe)
 
     def forward(
         self,

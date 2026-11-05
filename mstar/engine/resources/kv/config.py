@@ -714,14 +714,11 @@ class KVSpec(NodeResourceSpec):
 
     @property
     def storage(self) -> "Storage | None":
-        # a paged pool's (`PagedKVConfig.context_parallel`); an MLA pool's one latent is every head's,
-        # so whole on every rank; a ring keeps every position on each rank
+        # a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank
         cfg = self.config
         if not isinstance(cfg, PagedKVConfig):
             return None
-        if cfg.context_parallel:
-            return "by_position"
-        return "copied" if cfg.layout == KVLayout.MLA else "by_head"
+        return "by_position" if cfg.context_parallel else "by_head"
 
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
@@ -738,9 +735,6 @@ class KVSpec(NodeResourceSpec):
                     f"{self.resource_key!r} stores them by position (context_parallel), which takes a packed "
                     "split (axis 0) only"
                 ]
-            return []
-        if self.storage == "copied":
-            # whole on every rank: its attention answers for the query heads (kv_gather)
             return []
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:

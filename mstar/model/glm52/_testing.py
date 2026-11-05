@@ -93,9 +93,6 @@ class ReferenceAttentionResource(AttentionResource):
     that manager's plan output.
     """
 
-    # the layer writes the K/V through the KV resource before ``run`` reads its pages
-    requires_kv_write = True
-
     def __init__(self, kv_cache: str = "kv"):
         self._kv_name = kv_cache
         self._views = None

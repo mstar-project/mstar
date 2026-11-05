@@ -2510,7 +2510,7 @@ Splitting is declared in four places:
   on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
   (``SeqShardSpec.splits``), so one declaration serves every deployment shape.
 
-**Recurrent, MLA and sliding-window layers.** They take split steps through their own resources
+**Recurrent and sliding-window layers.** They take split steps through their own resources
 too, and the model writes nothing more than the bracket. Each resource's state is stored one of
 three ways over the SP ranks (``NodeResourceSpec.storage``): by head, by position
 (``context_parallel``), or copied (heads over TP alone, every SP rank holding all of it). A copied
@@ -2531,11 +2531,6 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   doesn't capture the buckets a step could split in (``Resource.captures_bucket``): such a step
   runs eagerly and splits, and every other step keeps its graph. Prefix snapshots stay off above
   one rank.
-- An **MLA** pool is copied (its one latent serves every query head). Its attention gathers the
-  step's latents (``kv_gather``), writes them on every rank, and attends each rank's own queries
-  over each row's keys up to its piece. Copied steps attend on the TP heads with no collective.
-  Over a pool stored by position it takes the shard's ``all_gather`` (both query parts gathered),
-  as GQA does. Split steps run eagerly.
 - A **sliding-window** attention over a pool stored by position keeps its window layers whole on
   every SP rank (``PagedKVConfig.placed_groups``) while the full layers' slots stripe: its copied
   steps (decode included) attend as on one rank, with no collective, and its split steps gather
@@ -2544,8 +2539,8 @@ resource takes its own exchange wherever the node's shard splits, whatever the s
   are tested on CPU only, over FlashInfer's reference.
 
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
-the KV pool, paged FlashInfer, MLA and dense attention, ragged self and cross attention,
-positions, the sampler, the recurrent pool and its GDN and Mamba-2 resources); DSA, flex and XPU
+the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions,
+the sampler, the recurrent pool and its GDN and Mamba-2 resources); MLA, DSA, flex and XPU
 attention don't, so a splitting node can't own them. The engine and the conductor
 also refuse, before a worker starts: a node on SP ranks that neither splits its steps (a
 ``SeqShardSpec`` whose ``exchange`` isn't ``none``, with a resource that takes split steps) nor
@@ -2556,11 +2551,10 @@ axis 0 (a packed split can leave a rank none of a row); a linear ``ulysses`` who
 heads (Mamba-2's heads, or B/C groups neither dividing nor divided by ``sp_size``) per TP rank
 don't divide by ``sp_size`` (use ``state_passing``); a ``state_passing`` with unequal key and value
 head dims at ``sp_size`` 3 or more; a linear layer under a shard on axis 1 or a ring's; a
-``kv_gather`` attention under a ring's or a shard on axis 1 (it plans contiguous pieces of a packed
-row); a window page that doesn't split ``sp_size`` ways; expert parallelism; piecewise captures;
+``kv_gather`` attention under a ring's (it plans contiguous pieces); a window page that doesn't split ``sp_size`` ways; expert parallelism; piecewise captures;
 a capture replayed under listed and unlisted walks; and a packed capture of a listed walk unless
 the shard lists one label on axis 0 (its padding joins that label). When the engine builds an MLA
-attention that plans each rank's own lengths (a placed pool, or ``kv_gather``) on FlashInfer's FA
+attention over a placed pool, whose plans differ by rank, on FlashInfer's FA
 planner, it also refuses query heads per TP rank that don't divide 64. Each attention resource of
 a splitting node logs at load how it takes split steps.
 
@@ -2622,10 +2616,6 @@ And for the copied resources, under any ``exchange`` that splits:
      - Split steps
      - Copied steps
      - Pick it when
-   * - MLA attention (pool copied)
-     - ``kv_gather``: gather the latents, attend own queries, eager only
-     - TP heads, no collective
-     - always (its one latent can't split by head)
    * - sliding-window attention over KV stored by position
      - ``kv_gather``, eager only (CPU-tested only)
      - as on one rank, no collective

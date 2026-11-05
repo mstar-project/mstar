@@ -22,7 +22,6 @@ from mstar.engine.resources.attn.base import (
     PlacedAttention,
     captured_page_capacity,
     one_token_rows,
-    own_queries,
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace
@@ -39,7 +38,6 @@ from mstar.engine.resources.step import (
     SlotLease,
     StepContext,
 )
-from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +303,6 @@ class FlashInferMLAOwnTokensWrapper(WholeRowsKernel):
 
 
 class FlashInferMLAManager(PlacedAttention):
-    # one latent a token, whole on every rank: a split step gathers the latents (`kv_gather`)
-    supports_split_steps = True
 
     def __init__(
         self,
@@ -342,30 +338,12 @@ class FlashInferMLAManager(PlacedAttention):
             device=device,
             backend=backend,
         )
-        # where plans differ by rank on the FA planner (the kernel in use), the device's SMs, for its
-        # work-item cap
+        # over a placed pool on the FA planner (the kernel in use), the device's SMs, for its work-item cap
         self._fa_sm_count: int | None = None
-        # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
-        # rank's queries alone)
-        self._step_qo: dict[str, torch.Tensor] = {}
 
     def _bind_placement(self, geometry: dict[str, int]) -> None:
         # the latent is every TP rank's, so under TP placement it is attended for every partner's heads
         self._wrapper_kwargs.update(geometry)
-        self._check_rank_plans("context-parallel KV pool", self._kv_config.num_qo_heads)
-
-    def bind_dependencies(self, resources) -> None:
-        super().bind_dependencies(resources)
-        if self._shard is not None and self._split_exchange == "kv_gather":
-            # the latent is whole on every rank, the query heads over TP: a split step plans each
-            # rank's own queries
-            self._check_rank_plans("its split steps' gathered latents", self._kv_config.num_qo_heads)
-
-    def _check_rank_plans(self, what: str, heads: int) -> None:
-        """Where each rank plans its own lengths (a placed pool, or ``kv_gather``'s own queries), so
-        FlashInfer's FA planner could refuse a step on one rank alone: plan on a pinned fa2 or fa3,
-        refuse at bind a head count its causal tile check may refuse, and bound every rank's plans
-        alike at admission (``admit``)."""
         # the merge reads the natural-log lse fa2 and fa3 are known to return (`AttentionManager.build`
         # refuses the others); under auto a plan they refuse would fall through to another backend
         if self._wrapper_kwargs["backend"] == "auto" and torch.device(self._device).type == "cuda":
@@ -373,8 +351,8 @@ class FlashInferMLAManager(PlacedAttention):
 
             self._wrapper_kwargs["backend"] = "fa3" if current_platform.arch(self._device) == "sm_90" else "fa2"
             logger.info(
-                "MLA attention over %s %r plans on %s for flashinfer_backend 'auto'",
-                what, self._kv_cache_name, self._wrapper_kwargs["backend"],
+                "MLA attention over context-parallel KV pool %r plans on %s for flashinfer_backend 'auto'",
+                self._kv_cache_name, self._wrapper_kwargs["backend"],
             )
         if self._wrapper_kwargs["backend"] in ("fa2", "fa3") and self.uses_kernel:
             import flashinfer
@@ -382,7 +360,7 @@ class FlashInferMLAManager(PlacedAttention):
 
             if Version(flashinfer.__version__).public != _FA_PLANNER_VERSION:
                 raise ValueError(
-                    f"MLA attention over {what} {self._kv_cache_name!r} refuses, on every "
+                    f"MLA attention over context-parallel KV pool {self._kv_cache_name!r} refuses, on every "
                     f"rank alike, the steps FlashInfer {_FA_PLANNER_VERSION}'s FA planner may refuse on one "
                     f"rank alone, from a copy of that planner's rules; FlashInfer {flashinfer.__version__} "
                     f"is installed. Install flashinfer-python=={_FA_PLANNER_VERSION}"
@@ -390,13 +368,14 @@ class FlashInferMLAManager(PlacedAttention):
             # FA's causal tile-bound check can refuse a causal plan at a head count that doesn't divide
             # its query tile, which is 64 on a plan averaging few queries a row (a captured bucket's
             # padding rows, or a zigzag share's empty ones, make one). The backend is pinned, so such
-            # a step would fail rather than fall through, on one rank's plan alone: refused here instead
+            # a step would fail rather than fall through, under SP placement on one partner's share
+            # alone: refused here instead, under TP placement too
+            heads = self._kv_config.num_qo_heads
             if 64 % heads:
                 raise ValueError(
-                    f"MLA attention over {what} {self._kv_cache_name!r} plans on FlashInfer's "
+                    f"MLA attention over context-parallel KV pool {self._kv_cache_name!r} plans on FlashInfer's "
                     f"FA planner, whose causal tile-bound check can refuse a step at {heads} query heads a rank: "
-                    "use a TP size that gives each rank a head count dividing 64, or "
-                    + ("turn context_parallel off" if self._placement is not None else "run the node on TP ranks")
+                    "use a TP size that gives each rank a head count dividing 64, or turn context_parallel off"
                 )
             self._fa_sm_count = _sm_count(self._device)
 
@@ -467,9 +446,8 @@ class FlashInferMLAManager(PlacedAttention):
         return True
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
-        """Where each rank plans its own lengths on the FA planner (a placed pool, or ``kv_gather``'s
-        own queries), refuses a step its planner may not hold before it is planned (``_fits``), so
-        the worker retries it smaller:
+        """Over a placed pool on the FA planner, refuses a step its planner may not hold before it is
+        planned (``_fits``), so the worker retries it smaller:
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
@@ -484,18 +462,15 @@ class FlashInferMLAManager(PlacedAttention):
         if self._fits(spans, ctx):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
-                f"{self._planned_over()} {self._kv_cache_name!r}"
+                f"context-parallel KV pool {self._kv_cache_name!r}"
         # sized by the real rows: a capture's padding rows (no queries, but they move the planner's
         # tile) go with the bucket, so each retry is strictly smaller
         real = [rid for rid in rows if not ctx.is_padding_row(rid)]
-        walk = ctx.graph_walk
-        alone = frozenset(rid for rid in real if not self._fits([rows[rid]], walk=walk))
-        fit = next(
-            (n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]], walk=walk)), None,
-        )
+        alone = frozenset(rid for rid in real if not self._fits([rows[rid]]))
+        fit = next((n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]])), None)
         if alone or fit is None:
             # (no fit: one real row, which its capture's padding takes past the cap)
-            hint = "" if self._placement is None else self._placed.cap_hint(self._placement)
+            hint = self._placed.cap_hint(self._placement)
             return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
                 message=f"The request's prompt takes {where} in one step; shorten it.{hint}",
                 request_ids=alone or frozenset(real),
@@ -522,23 +497,16 @@ class FlashInferMLAManager(PlacedAttention):
         tiles = -(-self._wrapper_kwargs["num_qo_heads"] // 64)
         return decode and len(step.segments) * tiles + self._fa_sm_count <= _FA_MAX_WORK_ITEMS
 
-    def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None, walk: str | None = None) -> bool:
+    def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
-        the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one of
-        ``walk`` when None): a decode step's context alone; any other step's what its storage's
-        strategy answers: over a placed pool its context and own tokens (``rank_plans``), padded as
-        the leased capture's wrapper pads them, and under ``kv_gather`` the shard's
-        (``SequenceShard.kv_gather_rank_plans``). Its kind comes from the rule ``plan`` picks the
-        wrapper by (``one_token_rows``)."""
+        the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one
+        when None): a decode step's context alone, any other step's context and own tokens
+        (``rank_plans``), padded as the leased capture's wrapper pads them. Its kind comes from the
+        rule ``plan`` picks the wrapper by (``one_token_rows``)."""
         heads = self._wrapper_kwargs["num_qo_heads"]
         lease = None if ctx is None else ctx.slot_lease
         force_prefill = ctx is not None and ctx.force_prefill
-        labels = {label for row in rows for label in row}
-        gathered = None if self._placement is not None else self._shard.kv_gather_rank_plans(
-            {label: [row[label] for row in rows if label in row] for label in labels}, heads,
-            walk if ctx is None else ctx.graph_walk,
-        )
-        for label in labels:
+        for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
             shape = None
             if lease is None:
@@ -548,19 +516,12 @@ class FlashInferMLAManager(PlacedAttention):
                 # the rows the label's wrapper was captured with, which its own-token part pads to
                 wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
                 shape = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
-            if decode:
-                plans = [(qo, heads)]
-            elif self._placement is not None:
+            plans = [(qo, heads)]
+            if not decode:
                 plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, shape)
-            else:
-                plans = gathered[label]
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
-
-    def _planned_over(self) -> str:
-        # what each rank plans its own lengths over, for the refusals' messages
-        return "context-parallel KV pool" if self._placement is not None else "the gathered latents of KV pool"
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:
@@ -575,27 +536,12 @@ class FlashInferMLAManager(PlacedAttention):
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
-            # a pre-planned step is leased, so copied
-            self._step_qo.clear()
             return
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"expected plan result from {self._kv_cache_name}"
-        shard_plan = self._check_sequence_shard(ctx)
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
         plan_states.clear()
-        if not ctx.is_preplan:
-            # not on a pre-plan: the step in flight may still read its own
-            self._step_qo.clear()
         for label, kv_out in plan_outputs.items():
-            # `kv_gather` plans this rank's own queries (eager only, `captures_bucket`); the
-            # other exchanges attend a split step's every query, as a copied one
-            r = None if shard_plan is None or self._split_exchange != "kv_gather" else shard_plan.ranges.get(label)
-            if r is not None:
-                assert lease is None, "a leased step split under kv_gather"
-                if step.context_only:
-                    raise ValueError("FlashInferMLAManager does not plan a context_only step its shard splits")
-                plan_states[label] = self._plan_own_queries(label, kv_out.cpu_indptrs, r, ctx.slot, step.causal)
-                continue
             indptrs = kv_out.cpu_indptrs
             if step.context_only:
                 # the rows' query counts come from this step's own segments, the kv from the
@@ -622,22 +568,8 @@ class FlashInferMLAManager(PlacedAttention):
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
 
-    def _plan_own_queries(self, label: str, indptrs, r, slot: int, causal: bool) -> FlashInferMLAWrapper:
-        """A split label's plan under ``kv_gather`` (``own_queries``). Admission bounded every
-        partner's (``_fits``), so this rank's plan is one its planner holds, as are the others'."""
-        own = own_queries(indptrs, r, self._kv_config.tokens_per_page, causal)
-        wrapper = self._eager_wrapper(label, slot)
-        wrapper.plan(
-            qo_indptr=own.qo_indptr, paged_kv_indptr=own.paged_kv_indptr, paged_kv_indices=own.paged_kv_indices,
-            paged_kv_last_page_len=own.paged_kv_last_page_len, causal=causal, dtype=self._dtype,
-        )
-        self._step_qo[label] = to_device_nonblocking(indptrs.qo_indptr, self._device)
-        return wrapper
-
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
-        if label in self._step_qo:
-            return self._step_qo[label]
         wrapper = self._current_plan_states.get(label)
         return None if wrapper is None else wrapper._qo_indptr_buf
 

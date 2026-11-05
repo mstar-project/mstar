@@ -172,17 +172,11 @@ def test_indexer_rope_hits_first_dims_only():
 
 class _CausalDenseResources:
     """The naive path's two resources, on CPU, for ONE dense pass: the layer
-    writes K/V through ``kv.write_kv`` and attends through ``attn.run``, both
-    reached through the layer's ``AttentionCallable``.
+    writes K/V through ``kv.write_kv`` and attends through ``attn.run``.
     """
-
-    requires_kv_write = True
 
     def __init__(self):
         self.k = self.v = None
-
-    def set_default_layer_idx(self, layer_idx):
-        pass
 
     # kv side
     def write_kv(self, k, v, layer_idx=None):

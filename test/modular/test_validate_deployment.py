@@ -322,16 +322,15 @@ def _cross() -> RaggedCrossAttentionSpec:
     return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
-def _mla_llm(q_heads=4, axis=0) -> _Model:
-    """A model whose ``llm`` attends an MLA pool, and splits its steps."""
+def _mla_llm(q_heads=4) -> _Model:
+    """A model whose ``llm`` attends an MLA pool, and declares a shard to split its steps."""
     kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=q_heads, page_size=16,
         layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4,
     ))
     attn = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA,
                                                           sm_scale=0.1))
-    return _Model(specs=[kv, attn, SeqShardSpec("shard", {"llm"}, ("main",), axis)],
-                  kv_labels={"kv": {"main": KVLabel()}})
+    return _Model(specs=[kv, attn, _shard()], kv_labels={"kv": {"main": KVLabel()}})
 
 
 def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8) -> list[NodeResourceSpec]:
@@ -450,15 +449,12 @@ def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
 
 
-def test_an_mla_node_splits_its_steps_by_gathering_its_latents(tmp_path):
-    """Over an MLA pool stored by head the attention gathers the latents (kv_gather), so the pool's
-    one KV head doesn't refuse the split. kv_gather plans a packed row's contiguous pieces, which an
-    axis-1 shard doesn't give it, so that is refused before spawn rather than at its first split
-    step on every rank."""
+def test_an_mla_node_cant_split_its_steps(tmp_path):
+    """MLA attention takes no split steps: each rank planning its own queries over gathered latents
+    needs admission bounding every rank's plan, which lands with MLA over placed pools. Its pool's
+    one KV head is refused before spawn."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
-    assert _validate(_mla_llm(), cfg).worker_graphs
-    _refused(_mla_llm(axis=1), cfg, r"attention 'attn' gathers a split step's keys into KV 'kv', .* node 'llm''s "
-             r"sequence shard splits each row \(axis 1\): declare the shard on axis 0")
+    _refused(_mla_llm(), cfg, r"KV 'kv' stores 4 query and 1 KV heads by head, which don't split 2 ways per TP rank")
 
 
 def _windowed_llm(window_layers=(1,)) -> _Model:

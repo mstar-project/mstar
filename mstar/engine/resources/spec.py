@@ -152,7 +152,7 @@ class NodeResourceSpec(ABC):
         rank a slice of the heads, over TP x SP), ``by_position`` (each a share of every page's
         token positions over ranks that would otherwise hold the same heads, heads over TP:
         ``mstar.engine.resources.context_parallel``), or ``copied`` (heads over TP, every SP rank the
-        whole state: a recurrent pool, MLA's one latent). None for one holding none. A resource
+        whole state: a recurrent pool). None for one holding none. A resource
         over pools that are all ``copied`` shards its heads over TP (``EngineResourceInfo.head_shards``),
         and a node whose pools store by position runs copied unless its shard's exchange splits it.
         From raw fields, as the shard's hooks."""

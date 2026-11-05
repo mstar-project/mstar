@@ -115,36 +115,25 @@ class AttentionSpec(NodeResourceSpec):
         return exchange
 
     def stores_whole(self, kv: NodeResourceSpec) -> bool:
-        """Whether every rank holds this attention's KV whole: a pool copied over the SP ranks
-        (MLA's one latent), or this attention's window layers of a pool placed by position, which
-        keeps them whole on every partner so a decode step reads them with no collective
-        (`PagedKVConfig.placed_groups`). From raw fields."""
-        if kv.storage == "copied":
-            return True
+        """Whether every rank holds this attention's KV whole: its window layers of a pool placed
+        by position, which keeps them whole on every partner so a decode step reads them with no
+        collective (`PagedKVConfig.placed_groups`). From raw fields."""
         window = getattr(self.config, "sliding_window", None)
         return kv.storage == "by_position" and window is not None and window < kv.config.max_seq_len
 
     def split_step_refusals(
         self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
     ) -> list[str]:
-        # kv_gather plans, and admission bounds, each rank's contiguous pieces of a packed row
-        # (`SeqRange.row_pieces`), which neither a ring's striped step nor an axis-1 split gives it
-        if self.resolve_exchange(specs) != "kv_gather":
+        # kv_gather plans each rank's contiguous pieces of a row (`SeqRange.row_pieces`), which a
+        # ring's striped step doesn't give it; an axis-1 split the pool stored by position refuses
+        if shard.stripe_pool is None or self.resolve_exchange(specs) != "kv_gather":
             return []
-        gathers = (
+        return [
             f"attention {self.resource_key!r} gathers a split step's keys into KV {self.config.kv_cache!r}, which "
-            f"every rank stores whole (kv_gather), planning each rank's contiguous pieces of a packed row, and node "
-            f"{node!r}'s sequence shard"
-        )
-        refusals = []
-        if shard.stripe_pool is not None:
-            refusals.append(
-                f"{gathers} stripes its steps by KV {shard.stripe_pool!r}'s stored positions (its exchange ring): "
-                "split it by all_gather"
-            )
-        if shard.axis != 0:
-            refusals.append(f"{gathers} splits each row (axis {shard.axis}): declare the shard on axis 0")
-        return refusals
+            f"every rank stores whole (kv_gather), planning each rank's contiguous pieces of a row, and node "
+            f"{node!r}'s sequence shard stripes its steps by KV {shard.stripe_pool!r}'s stored positions (its "
+            "exchange ring): split it by all_gather"
+        ]
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits

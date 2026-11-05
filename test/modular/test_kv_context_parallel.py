@@ -299,21 +299,13 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
 
 def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what_cant_split(tmp_path, monkeypatch):
     """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
-    is copied over SP ranks) where its KV's are over TP x SP, and so do an MLA pool's (its one
-    latent copied too) and its attention's; a resource holding no split strategy is refused."""
+    is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
+    is refused."""
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
-    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources() + [
-        KVSpec(resource_key="mla_kv", nodes={NODE}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=LATENT, max_seq_len=256, num_qo_heads=4, max_num_pages=8,
-            page_size=PAGE_SIZE, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE,
-        )),
-        AttentionSpec(resource_key="mla_attn", nodes={NODE}, config=AttentionConfig(
-            kv_cache="mla_kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5,
-        )),
-    ]
+    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
-    pool, mla = (spec for spec in specs if spec.resource_key in (GDN_STATE, "mla_kv"))
+    pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
     heads = pool.config.blocks["state"].shape[0]
 
     def load(specs):
@@ -323,7 +315,6 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
 
     load(specs)
     assert pool.config.blocks["state"].shape[0] == heads
-    assert mla.config.num_qo_heads == 4
     with pytest.raises(ValueError, match="'dependent'.*does not support steps split over SP ranks"):
         load([*specs, _DependentSpec(resource_key="dependent", nodes={NODE}, supports=True)])
 
@@ -461,19 +452,18 @@ class _Case:
 
 def _cp_attention(
     joint: JointGroups, device: torch.device, dtype: torch.dtype, mla=False, num_kv_heads=1, num_qo_heads=Q_HEADS,
-    shard: SequenceShard | None = None, exchange: str = "auto", kv_resource=None, placed=True, **attention,
+    shard: SequenceShard | None = None, exchange: str = "auto", kv_resource=None, **attention,
 ):
-    """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool (by head
-    without ``placed``), and this rank's placement; under ``shard`` (key ``"shard"``) with its spec's
-    ``exchange``, bound to the KV resource ``kv_resource(placement)`` builds (by default one holding
-    only the placement)."""
+    """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool, and this
+    rank's placement; under ``shard`` (key ``"shard"``) with its spec's ``exchange``, bound to the
+    KV resource ``kv_resource(placement)`` builds (by default one holding only the placement)."""
     layout = dict(head_dim=HEAD_DIM)
     if mla:
         layout = dict(head_dim=LATENT, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE)
         attention.update(backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5)
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=num_kv_heads, max_seq_len=64, num_qo_heads=num_qo_heads,
-        max_num_pages=16, page_size=CP_PAGE, context_parallel=placed, **layout,
+        max_num_pages=16, page_size=CP_PAGE, context_parallel=True, **layout,
     ))
     dependencies = {"kv": kv}
     spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
@@ -482,11 +472,10 @@ def _cp_attention(
         dependencies["shard"] = SeqShardSpec("shard", {NODE}, ("main",), 0, exchange=exchange)
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies=dependencies,
-        # heads over TP for a pool placed by position or copied (MLA), as the engine shards them
-        head_shards=joint.world_size if kv.storage == "by_head" else joint.tp_group.world_size,
+        head_shards=joint.tp_group.world_size,
     )
     attn = AttentionManager.build(spec, info)
-    placement = kv.config.place(joint, "kv") if placed else None
+    placement = kv.config.place(joint, "kv")
     # by default the KV resource's one field attention reads
     resource = types.SimpleNamespace(placement=placement, bind_sequence_shard=lambda shard: None) \
         if kv_resource is None else kv_resource(placement)
@@ -697,29 +686,6 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
 
 
-class _LatentKV:
-    """An MLA pool's layer holding ``case``'s stored context, whose ``write_kv`` writes a step's
-    latents at their slots: this rank's under ``placement`` (the rest to the sink page), every one
-    stored by head (None)."""
-
-    def __init__(self, placement, case: _Case):
-        self.placement, self._sequence_shard = placement, None
-        whole = placement or SPPlacement(1, 0, CommGroup.trivial())
-        self.cache = case.cache(whole, stored_only=True)
-        logical = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
-                   for pos in range(view.length - view.to_compute, view.length)]
-        pages, slots = whole.write_slots(*(np.array(a) for a in zip(*logical, strict=True)))
-        self._where = tuple(torch.as_tensor(a, dtype=torch.long) for a in (pages, slots))
-
-    def bind_sequence_shard(self, shard):
-        self._sequence_shard = shard
-
-    def write_kv(self, latent, v=None):
-        assert v is None and latent.shape[0] == len(self._where[0]), "a write of the whole step's latents"
-        self._sequence_shard.check_bypass("main", "a K/V write", by_head=self.placement is None)
-        self.cache[self._where] = latent
-
-
 def _on_sp_ranks(rank, world, store, body, *args):
     """``body(group, *args)`` on one of ``world`` gloo ranks, over FlashInfer's CPU reference."""
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
@@ -732,49 +698,6 @@ def _on_sp_ranks(rank, world, store, body, *args):
     finally:
         group.device_group = None
         dist.destroy_process_group()
-
-
-def _mla_split(group: CommGroup, placed: bool) -> None:
-    """``PREFILL_ROWS`` through ``FlashInferMLAManager.exchange``, as the MLA layer calls it (the
-    latents' write and the attention), copied and then split: over a pool stored by head by
-    ``kv_gather`` (every rank attends its own queries over the gathered latents), over a placed
-    one by ``all_gather`` (the query parts and latents gathered). Each against one rank's
-    attention, and the sampler's rows are each row's last token of the whole step."""
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
-    shard = SequenceShard(("main",), 0, None, 0, group)
-    case = _Case.build(PREFILL_ROWS, CPU, torch.float32, mla=True)
-    kv = None
-
-    def latent_kv(placement):
-        nonlocal kv
-        kv = _LatentKV(placement, case)
-        return kv
-
-    attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, shard=shard, placed=placed,
-                            exchange="all_gather" if placed else "auto", kv_resource=latent_kv)
-    assert attn._split_exchange == ("all_gather" if placed else "kv_gather")
-
-    def run(q, latent, v):
-        kv.write_kv(latent, v)
-        return attn.run(q[0], "main", kv_cache_layer=kv.cache, k=latent, q_pe=q[1])
-
-    (q_nope, q_pe), (latent,) = case.queries(), case.new_keys()
-    n = q_nope.shape[0]
-    for split_it in (False, True):
-        shard.min_tokens = 0 if split_it else n + 1
-        kv.cache = _LatentKV(kv.placement, case).cache
-        _plan(attn, case, shard=shard)
-        assert (shard.split_range("main") is not None) == split_it
-        q_nope_r, q_pe_r, latent_r = shard.scatter("main", q_nope, q_pe, latent)
-        out = shard.gather("main", attn.exchange(run, (q_nope_r, q_pe_r), latent_r, None))
-        torch.testing.assert_close(out, case.want())
-        last = attn.select_last_hidden(torch.arange(n)[:, None])
-        assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
-
-
-@pytest.mark.parametrize("placed", [False, True], ids=["kv_gather", "all_gather"])
-def test_sp_ranks_split_an_mla_step_like_one_rank(tmp_path, placed):
-    mp.spawn(_on_sp_ranks, args=(P, str(tmp_path / "store"), _mla_split, placed), nprocs=P)
 
 
 WINDOW = 3
@@ -1847,39 +1770,6 @@ def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeyp
         attn._cg_wrapper(SlotLease(2, bucket), "main", 2)
 
 
-def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partners_own_queries_fit(monkeypatch):
-    """Under ``kv_gather`` (a pool stored by head, on SP ranks whose steps split) each rank plans its
-    contiguous pieces of the step's rows, which can take the FA planner past its cap where the whole
-    step fits: rows of 8 and 1 queries split 5 | 3, 1, and 16 heads put the step on two-tile
-    clusters and partner 1 on one-tile ones. Admission counts them, as it does a placed pool's, and
-    only where the step may split: one the shard runs copied, or a label it doesn't list (beside one
-    it splits, too), plans its whole rows alone."""
-    _fa_kernel(monkeypatch)
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
-    shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
-    attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=16, flashinfer_backend="fa2",
-                            placed=False, shard=shard)
-    assert attn._split_exchange == "kv_gather" and attn._placement is None
-    step = AttentionStep(segments=(Segment("r0", "main", 8), Segment("r1", "main", 1)))
-    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
-    context = fm.fa_work_items_bound(np.array([0, 8, 9]), 16, 132)
-    assert fm.fa_work_items_bound(np.array([0, 3, 4]), 16, 132) > context
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", context)
-    refused = attn.admit(step, ctx).reason
-    assert refused is not None and "the gathered latents of KV pool 'kv'" in refused.message
-    # copied: fewer tokens than the shard's min_tokens, or a walk it never splits
-    shard.min_tokens = 10
-    assert attn.admit(step, ctx).ok
-    shard.min_tokens, shard.walks = 0, frozenset({"other"})
-    assert attn.admit(step, ctx).ok
-    # a label the shard doesn't list: alone (the step has no listed tokens), and beside a listed one
-    # whose own pieces fit
-    shard.walks, shard.labels = None, ("listed",)
-    assert attn.admit(step, ctx).ok
-    beside = AttentionStep(segments=(*step.segments, Segment("r0", "listed", 5), Segment("r1", "listed", 5)))
-    assert attn.admit(beside, ctx).ok
-
-
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):
     """A decode step's context is planned at every partner's heads, a count bind doesn't check, and
     over each rank's own KV lengths, so FA's causal tile-bound check could refuse it on one rank
@@ -1900,26 +1790,16 @@ def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refu
     (fm._FA_PLANNER_VERSION, 40, "causal tile-bound check can refuse a step at 20 query heads"),
     (fm._FA_PLANNER_VERSION, 128, None),
 ])
-@pytest.mark.parametrize("placed", [True, False], ids=["placed", "kv_gather"])
-def test_mla_attention_planning_per_rank_refuses_at_bind_a_flashinfer_or_head_count_its_fa_planner_may_refuse(
-    monkeypatch, version, heads, refused, placed,
+def test_mla_attention_over_a_placed_pool_refuses_at_bind_a_flashinfer_or_head_count_its_fa_planner_may_refuse(
+    monkeypatch, version, heads, refused,
 ):
-    """Over a placed pool, or gathering a pool stored by head on SP ranks (``kv_gather``: each rank
-    plans its own queries), with its heads over TP alone."""
     _fa_kernel(monkeypatch, version)
-    if placed:
-        joint, attention = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), {}
-    else:
-        joint = JointGroups(tp_group=_group(0, P), sp_group=_group(0, P))
-        attention = dict(placed=False, shard=SequenceShard(("main",), 0, None, 0, joint.sp_group))
-    build = lambda: _cp_attention(  # noqa: E731
-        joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2", **attention,
-    )
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     if refused is None:
-        build()
+        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
         return
     with pytest.raises(ValueError, match=refused):
-        build()
+        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
 
 
 def test_the_fa_work_item_bound_holds_flashinfers_own_count():

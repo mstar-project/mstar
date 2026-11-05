@@ -113,8 +113,9 @@ class AttentionManager(AttentionResource):
             return
         # stored by head, heads over every TP and SP rank: a split step's tokens trade for heads, a
         # copied step's heads are sliced. Stored by position, heads over TP: every rank attends a
-        # copied step, and a split step's tokens are gathered or passed round. Copied over SP (MLA's
-        # latent), heads over TP: a copied step runs as is, a split one gathers its keys (`exchange`)
+        # copied step, and a split step's tokens are gathered or passed round. A window's layers,
+        # whole on every rank, heads over TP: a copied step runs as is, a split one gathers its
+        # keys (`exchange`)
         shard = self._shard = resources[self._shard_key]
         kv = resources[self._kv_cache_name]
         kv.bind_sequence_shard(shard)
@@ -134,8 +135,7 @@ class AttentionManager(AttentionResource):
     def exchange(self, run, q, k, v, label: str | None = None):
         """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
         step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
-        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`). ``q`` is one tensor or
-        a tuple of query parts (MLA's)."""
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
         label = self._default_label if label is None else label
         shard = self._shard
         r = shard.split_range(label)
@@ -151,8 +151,8 @@ class AttentionManager(AttentionResource):
     def _exchange_over_pool(self, run, q, k, v, r):
         """``exchange``'s ``run`` over a pool not placed by position. Stored by head, heads over every
         TP and SP rank: a split step's tokens (range ``r``) trade for heads, a copied step's heads are
-        sliced. Copied over SP (``kv_gather``, MLA's latent), heads over TP: a copied step runs as is,
-        a split one gathers its keys."""
+        sliced. Whole on every rank (``kv_gather``, a window's layers), heads over TP: a copied step
+        runs as is, a split one gathers its keys."""
         if self._split_exchange == "kv_gather":
             return run(q, k, v) if r is None else kv_gather(run, q, k, v, r)
         return head_slice(run, q, k, v, self._shard.group) if r is None else ulysses(run, q, k, v, r=r)

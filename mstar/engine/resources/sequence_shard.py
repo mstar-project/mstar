@@ -26,8 +26,8 @@ own ``run``:
 - ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's
   partial with its log-sum-exp, merged;
 - ``kv_gather``: every rank's k and v gathered, ``run`` writes them and attends this rank's
-  queries (KV every rank stores whole: an MLA pool, or a sliding-window attention's layers of a
-  pool stored by position).
+  queries (KV every rank stores whole: a sliding-window attention's layers of a pool stored by
+  position).
 
 A recurrent layer's resource takes its conv's left context from the earlier ranks (``conv_halo``),
 and its prompt rows through ``ulysses`` (its ``sp_exchange``'s default) or ``state_passing``, the
@@ -88,8 +88,8 @@ class SeqShardSpec(NodeResourceSpec):
       stored position): split;
     - ``none``: never split.
 
-    Where the node splits, a resource over a pool every rank stores whole (``copied``) takes its own
-    exchange whatever this one is: an attention gathers the step's keys (``kv_gather``), a recurrent
+    Where the node splits, a resource over state every rank stores whole takes its own exchange
+    whatever this one is: a window attention gathers the step's keys (``kv_gather``), a recurrent
     layer its ``sp_exchange``. So does a ragged attention, by its model's ``sp_exchange``; a shard
     that never splits stops them all splitting.
 
@@ -501,29 +501,6 @@ class SequenceShard(Resource):
             ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order)
         return SeqShardPlan(True, ranges)
 
-    def kv_gather_rank_plans(
-        self, spans: Mapping[str, Sequence[int]], num_qo_heads: int, walk: str | None,
-    ) -> dict[str, list[tuple[np.ndarray, int]]]:
-        """Every plan an eager step of ``walk`` may make on any rank under ``kv_gather``, per label
-        of ``spans`` (each label's rows' queries, in step order), as ``(qo_indptr, query heads)``
-        (``ContextParallelWrapper.rank_plans``' form): the label's whole rows, as a copied step
-        plans them, and, where this shard may split the step (``may_split`` over its listed labels'
-        tokens, as ``_decide`` counts them) and lists the label, each rank's own queries, its piece
-        of each row it holds any of (``SeqRange.row_pieces``). What an attention whose planner may
-        refuse on lengths bounds such a step by at admission, the same on every rank. A leased step
-        can't split here: its node captures no bucket a step may split in (``captures_bucket``),
-        and its tokens are at most its bucket's. Axis 0 only: ``AttentionSpec.split_step_refusals``
-        refuses kv_gather under an axis-1 shard at load."""
-        listed = {label: label_spans for label, label_spans in spans.items() if label in self.labels}
-        split = self.may_split(walk, sum(map(sum, listed.values())))
-        plans = {}
-        for label, label_spans in spans.items():
-            plans[label] = [(np.cumsum([0, *label_spans]), num_qo_heads)]
-            if split and label in listed:
-                pieces = self._range(list(label_spans)).row_pieces(label_spans)
-                plans[label] += [(np.concatenate([[0], np.cumsum(piece[piece > 0])]), num_qo_heads) for piece in pieces]
-        return plans
-
     def _range(self, spans: list[int]) -> SeqRange:
         world = self.group.world_size
         if self.axis == 0:
@@ -693,11 +670,6 @@ def ulysses(run: Callable, *xs: torch.Tensor | None, r: SeqRange):
     return _packed(out, r)
 
 
-def _query_parts(q) -> tuple[torch.Tensor, ...]:
-    # a query is one tensor, or a tuple of parts (MLA's q_nope and q_pe); None for a write alone
-    return () if q is None else (q,) if isinstance(q, torch.Tensor) else tuple(q)
-
-
 def _whole(r: SeqRange, xs: Sequence[torch.Tensor | None]) -> list[torch.Tensor | None]:
     """Every rank's share of each of ``xs`` (one dtype, None passed through) gathered whole in one
     collective, in the step's order whatever the label's layout."""
@@ -709,23 +681,22 @@ def _whole(r: SeqRange, xs: Sequence[torch.Tensor | None]) -> list[torch.Tensor 
 
 
 def all_gather(run: Callable, q, k, v, r: SeqRange):
-    """Every rank's q (each of its parts), k and v gathered whole in one collective, ``run`` on them
-    as on a copied step, then this rank's share of the output. ``q`` None: k and v alone, for the
-    write."""
-    queries = _query_parts(q)
-    _check_entry(r, *queries, k, v)
-    *whole_q, k, v = _whole(r, [*queries, k, v])
+    """Every rank's q, k and v gathered whole in one collective, ``run`` on them as on a copied
+    step, then this rank's share of the output. ``q`` None: k and v alone, for the write."""
+    _check_entry(r, q, k, v)
+    q, k, v = _whole(r, [q, k, v])
     if q is None:
         run(None, k, v)
         return None
-    return r.local(run(whole_q[0] if isinstance(q, torch.Tensor) else tuple(whole_q), k, v))
+    return r.local(run(q, k, v))
 
 
 def kv_gather(run: Callable, q, k, v, r: SeqRange):
-    """A pool every SP rank stores whole (MLA's one latent): every rank's k and v gathered in one
-    collective, and ``run`` writes the whole step and attends this rank's own queries, which the
-    resource planned over each row's keys up to its own piece (``SeqRange.row_pieces``)."""
-    _check_entry(r, *_query_parts(q), k, v)
+    """KV every SP rank stores whole (a sliding-window attention's layers of a pool stored by
+    position): every rank's k and v gathered in one collective, and ``run`` writes the whole step
+    and attends this rank's own queries, which the resource planned over each row's keys up to its
+    own piece (``SeqRange.row_pieces``)."""
+    _check_entry(r, q, k, v)
     k, v = _whole(r, [k, v])
     return run(q, k, v)
 
