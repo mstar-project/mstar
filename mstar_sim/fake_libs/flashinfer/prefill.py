@@ -126,6 +126,7 @@ class BatchPrefillWithPagedKVCacheWrapper(PagedAttention):
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo, page_size=page_size, causal=causal, window_left=window_left,
             q_data_type=q_data_type, kv_data_type=kv_data_type, o_data_type=o_data_type,
+            fixed_split_size=fixed_split_size, disable_split_kv=disable_split_kv,
         )
 
 
@@ -244,7 +245,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._backend = _resolve_backend(self._requested_backend, self.device, use_fp16_qk_reduction, q_data_type,
                                          kv_data_type, head_dim_qk, head_dim_vo)
         self._cached_module = PrefillPlanner(self._backend)
-        fa2_args = [-1, False, 0, 0] if self._backend == "fa2" else []  # as the paged wrapper plans
+        fa2_args = [fixed_split_size or -1, disable_split_kv, 0, 0] if self._backend == "fa2" else []
         lens = torch.tensor([kv_host[r + 1] - kv_host[r] for r in range(batch)], dtype=torch.int32)
         self._cached_module.plan(  # FlashInfer plans a ragged batch as pages of one token
             self._float_workspace_buffer, None, None, qo_indptr, kv_indptr, lens,

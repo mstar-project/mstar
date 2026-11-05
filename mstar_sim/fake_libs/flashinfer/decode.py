@@ -78,6 +78,8 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             _not_supported("decode window_right")
         if q_len_per_req < 1:
             raise gpu_error(ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}"))
+        if fixed_split_size is not None and not self._use_tensor_cores:
+            raise gpu_error(ValueError("fixed_split_size is only supported by tensor core decode for now."))
         if data_type is not None:
             q_data_type = kv_data_type = data_type
         if self._use_tensor_cores and self._backend == "auto":  # plans with the prefill module: fa2 unless fp8
@@ -90,7 +92,7 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             num_kv_heads=num_kv_heads, head_dim_qk=head_dim, head_dim_vo=None,
             page_size=page_size, causal=q_len_per_req > 1, window_left=window_left,
             q_data_type=q_data_type, kv_data_type=kv_data_type, o_data_type=o_data_type,
-            q_len_per_req=q_len_per_req,
+            q_len_per_req=q_len_per_req, fixed_split_size=fixed_split_size, disable_split_kv=disable_split_kv,
         )
 
 

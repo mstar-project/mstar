@@ -381,7 +381,8 @@ class PagedAttention:
     def _set_plan(
         self, qo_indptr, indptr, indices, last_page_len, *, num_qo_heads: int, num_kv_heads: int,
         head_dim_qk: int, head_dim_vo: int | None, page_size: int, causal: bool, window_left: int,
-        q_data_type, kv_data_type, o_data_type, q_len_per_req: int = 1,
+        q_data_type, kv_data_type, o_data_type, q_len_per_req: int = 1, fixed_split_size: int | None = None,
+        disable_split_kv: bool = False,
     ) -> None:
         """Store the plan. ``qo_indptr`` None means ``q_len_per_req`` queries a row (decode)."""
         if num_qo_heads % num_kv_heads:
@@ -460,7 +461,8 @@ class PagedAttention:
                     self._max_total_num_rows or total_rows, batch, num_qo_heads, num_kv_heads, page_size,
                     self._use_cuda_graph, head_dim_qk, self._head_dim_vo, self._causal, self._window_left]
             if self._backend == "fa2":  # fixed_split_size, disable_split_kv, num_colocated_ctas, uniform_q_len
-                args += [-1, False, 0, q_len_per_req if qo_indptr is None and q_len_per_req > 1 else 0]
+                args += [fixed_split_size or -1, disable_split_kv, 0,
+                         q_len_per_req if qo_indptr is None and q_len_per_req > 1 else 0]
             self._plan_info = self._cached_module.plan(*args)
         self._planned = True
 

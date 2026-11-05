@@ -341,9 +341,9 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             paged_kv_last_page_len_buf=torch.ones(2, **i32), backend="fa2")
         qo, kv = torch.tensor([0, 16, 32], dtype=torch.int32), torch.tensor([0, 2, 4], dtype=torch.int32)
 
-        def plan():
+        def plan(**extras):
             wrapper.plan(qo, kv, torch.arange(4, dtype=torch.int32), torch.tensor([16, 16], dtype=torch.int32),
-                         8, 8, 64, 16, causal=True, q_data_type=torch.bfloat16)
+                         8, 8, 64, 16, causal=True, q_data_type=torch.bfloat16, **extras)
 
         need, _ = get_batch_prefill_module("fa2").workspace_size(
             workspace, qo, kv, None, 32, 2, 8, 8, 16, True, 64, 64, True, -1, -1, False, 0, 0)
@@ -359,6 +359,15 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             raise SystemExit("run() after a failed plan")
         except RuntimeError as e:
             assert "plan() must be called" in str(e), e
+        plan(disable_split_kv=True)  # no split, no partials: any workspace holds it
+        ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa2")
+        one_chunk = torch.tensor([0, 4096, 8192], dtype=torch.int32)
+        ragged.plan(one_chunk, one_chunk, 8, 8, 64, q_data_type=torch.bfloat16, disable_split_kv=True)
+        try:  # a split it fixes writes partials: too many for this workspace
+            ragged.plan(one_chunk, one_chunk, 8, 8, 64, q_data_type=torch.bfloat16, fixed_split_size=128)
+            raise SystemExit("a fixed split kept no partials")
+        except RuntimeError as e:
+            assert "batch_prefill_tmp_v" in str(e), e
         workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
         plan()
         # auto takes fa3, which keeps no partials, only where its kernels serve the plan
@@ -382,6 +391,13 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             decode.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
                         q_data_type=dtype, kv_data_type=dtype)
             assert decode._backend == expected, decode._backend
+        cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD", use_tensor_cores=False)
+        try:
+            cores.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
+                       fixed_split_size=4)
+            raise SystemExit("CUDA-core decode took a fixed split")
+        except ValueError as e:
+            assert "tensor core decode" in str(e), e
     """)
 
 
