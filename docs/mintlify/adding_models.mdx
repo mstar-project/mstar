@@ -552,6 +552,17 @@ Under tensor parallelism each rank of the node's lockstep instance keeps its own
 
 A node that runs sequence parallelism (SP &gt; 1) cannot serve LoRA yet: the pool lays rows out per request, while each SP rank holds a shard of the tokens, so building the pool refuses the deployment.
 
+### Admission: capacity a request holds until it is removed {#admission-capacity-a-request-holds-until-it-is-removed}
+
+A resource whose capacity can run out before a request starts, and that the request then holds until it is removed (KV pages, recurrent-state slots, sampler rows), answers for that capacity through the admission hooks on `Resource`. The runner's `Admission` decides who gets it and when: one arrival order across resources, and a request takes everything it asks for or nothing. Capacity a single step takes and gives back goes through `admit` and `rollback_admit` instead.
+
+- `ask(rid, node_name, graph_walk)` returns `ASKS` while the request needs this resource's capacity to start on the node, None when it needs none, or a failing outcome when it can never fit.
+- `reserve(rid, node_name, graph_walk, published)` takes what the request asked for and returns None, or returns a mark of what it didn't fit against.
+- `unreserve(rid)` gives back what `reserve` took, when another resource the request asks didn't fit.
+- `grew_since(mark)` says whether a request that didn't fit against `mark` may fit now. The runner tries a blocked queue again only once it is True, so a pass that changed nothing costs one call.
+
+A request is admitted once it is first in every queue it waits in. A resource may also let a later request pass a first request that can't start, by overriding `reserve_past(rid, node_name, graph_walk, published)`. It takes the passer's capacity while leaving the first request what it needs, so passing can't starve that request, or returns a mark, and the runner tries a passing request again only once `grew_since` that mark. The runner calls it only while the first request didn't fit and the resource hasn't grown since. A resource that doesn't override it keeps strict order, and a request waiting in its queue can't pass anywhere.
+
 ## Step 3 — Declare the computation graph {#step-3-declare-the-computation-graph}
 
 `get_graph_walk_graphs` returns one graph per walk. The primitives are defined in `mstar/graph/base.py`:
