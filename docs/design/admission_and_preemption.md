@@ -133,13 +133,13 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, and requests with a step or a KV read in flight on their pages. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). One that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn't landed, since the rebuild runs on its reservation, and a request whose lease holds a walk the cache served, since that KV lives only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
-1. If the victims free enough, the worker earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
-2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
+1. If the victims free enough, `preempt` earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
+2. Otherwise, if no newer victim is still to move and R is one a move can take, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
 3. Otherwise, R keeps its reservation and asks the pool for every page its grant needed past it. It waits in the queue at its arrival, parked as a new prompt is, until the room covers them.
 
 While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
@@ -151,7 +151,7 @@ Why this shape:
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
 - **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
-- **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
+- **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older requests, which finish, or by newer ones a move can't take yet: one whose rebuild hasn't landed, or whose lease holds a served walk.
 - **A waiting request waits in the queue.** It is measured again only when the room grows, and let go only once the room covers its whole shortage. Its arrival keeps newer prompts from taking that room first.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
@@ -193,13 +193,14 @@ class KVManager:
         rebuild lands, and RESIDENT otherwise."""
 ```
 
-A drop releases the request's whole reservation. `KVManager.check_drop` refuses:
+A drop releases the request's whole reservation. A drop is refused for:
 
-- a guaranteed request
-- one that keeps no ids, unless it is between two chunks of its prompt, which its rebuild runs again
-- one with a host copy
+- one that keeps no ids, or whose ids haven't reached the host or don't cover its KV, unless it is between two chunks of its prompt, which its rebuild runs again (`Rebuilds.refusal`)
+- one with a host copy, or one dropped already whose rebuild hasn't landed (`KVManager.check_drop`, as are the rest)
 - one with a step, a KV read or a sample in flight, until that lands
+- one whose KV can't be recomputed from token ids, or that writes more than one label, span or growth loop
 - one whose rebuild would write other than the tokens its KV holds
+- any request above one rank, for now
 
 At a drop, the other resources:
 
