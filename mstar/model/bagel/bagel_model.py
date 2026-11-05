@@ -139,6 +139,8 @@ logger = logging.getLogger(__name__)
 # The request's `CFGWindow`, which process_prompt resolves with its guidance
 # kwargs: the conductor's loop caps and walk schedule read it.
 CFG_WINDOW = "cfg_window"
+# kwargs: whether process_prompt wrote role turns. The schedule sees no roles, so it can't tell.
+ROLE_TURNS = "role_turns"
 
 # ---------------------------------------------------------------------------
 # System prompts (used when think_mode=True)
@@ -158,15 +160,15 @@ GEN_THINK_SYSTEM_PROMPT = (
 def uses_role_turns(parts: list[PromptPart], understanding: bool) -> bool:
     """Whether the prompt is written as role turns after a system turn.
 
-    Only understanding with text is. Upstream's ``interleave_inference`` writes
-    no roles for any request, and a chat of images alone under them is answered
-    with a greeting, so it prefills as upstream's does: its images, then the
-    ``<|im_start|>`` that ``gen_text`` opens the reply with. No text span leads
+    Only understanding whose last turn has text is. Upstream's
+    ``interleave_inference`` writes no roles for any request, and a last turn of
+    images alone is answered with a greeting under them, so that chat prefills
+    as upstream's does (see ``BagelModel._render_bare``). No text span need lead
     that plan, and think mode prefills its instruction ahead of it, as
-    generation does. A system message is text, which upstream has no place for,
-    so a chat holding one keeps its turns even if its user turn is images alone.
+    generation does.
     """
-    return understanding and any(part.modality == TEXT for part in parts)
+    turns = chat_turns(parts)
+    return understanding and bool(turns) and any(part.modality == TEXT for part in turns[-1].parts)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +307,7 @@ class BagelModel(Model):
     """
 
 
-    INTERNAL_KWARGS = (CFG_WINDOW,)
+    INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)
 
     def __init__(
         self,
@@ -586,8 +588,8 @@ class BagelModel(Model):
         layout a single user turn could express renders to the string that
         template gave. Generation leaves attachments outside the turn — the
         prefill_vae/vit walks put the input image ahead of the prompt — and
-        wraps what follows. An understanding request with no text part never
-        reaches this: see :func:`uses_role_turns`.
+        wraps what follows. An understanding request ending on images alone
+        never reaches this: see :func:`uses_role_turns`.
         """
         if is_understanding:
             blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
@@ -606,6 +608,18 @@ class BagelModel(Model):
         return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
             prompt="".join(body[lead:])
         )
+
+    def _render_bare(self, parts: list[PromptPart]) -> str:
+        """Write the request as upstream's ``interleave_inference`` prefills it.
+
+        Each text in its own block with no role, each image where it was written,
+        then the ``<|im_start|>`` that ``gen_text`` opens the reply with.
+        """
+        blocks = [
+            self.BOS_EOS_TEMPL.format(prompt=part.text or "") if part.modality == TEXT else self.IMAGE_PLACEHOLDER
+            for part in parts
+        ]
+        return "".join(blocks) + "<|im_start|>"
 
     def _render_body(self, parts: list[PromptPart], sep: str) -> tuple[list[str], bool]:
         """Write ``parts`` out in order, and say whether the last is an attachment.
@@ -670,12 +684,11 @@ class BagelModel(Model):
                     raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
-        if prompt is None and "image" in input_modalities and (output_modalities or ["text"])[0] == "text":
+        is_understanding = (output_modalities or ["text"])[0] == "text"
+        if prompt is None and "image" in input_modalities and is_understanding:
             # an image-only chat still opens its reply
             prompt = ""
         if prompt is not None:
-            target_output = output_modalities[0] if output_modalities else "text"
-            is_understanding = target_output == "text"
             has_image = "image" in input_modalities
             think_mode = params["think_mode"]
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
@@ -707,7 +720,7 @@ class BagelModel(Model):
 
             role_turns = uses_role_turns(parts, is_understanding)
             if is_understanding and not role_turns:
-                text = self.IMAGE_PLACEHOLDER * len(body) + "<|im_start|>"
+                text = self._render_bare(parts)
             else:
                 text = self._render_prompt(
                     body,
@@ -759,7 +772,8 @@ class BagelModel(Model):
             return result
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
-        metadata = {}
+            role_turns = uses_role_turns(parts, is_understanding)
+        metadata = {ROLE_TURNS: role_turns}
         window = None
         if "image" in output_modalities:
             window = cfg_window(
@@ -767,12 +781,14 @@ class BagelModel(Model):
                 params["cfg_text_scale"], params["cfg_img_scale"],
             )
             metadata[CFG_WINDOW] = tuple(window)
-        metadata["kv_layout"] = {"kv": self._kv_layout(parts, segments, images, output_modalities, params, window)}
+        metadata["kv_layout"] = {
+            "kv": self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns),
+        }
         return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
-        output_modalities: list[str], params: dict, window: CFGWindow | None,
+        output_modalities: list[str], params: dict, window: CFGWindow | None, role_turns: bool,
     ) -> dict[str, LabelLayout]:
         """Each label's writes, in the order `_build_prefill_schedule` runs them.
 
@@ -788,7 +804,6 @@ class BagelModel(Model):
         target_output = (output_modalities or ["text"])[0]
         understanding = target_output == "text"
         think_mode, image_preprocess = params["think_mode"], vit_preprocess(params["image_preprocess"])
-        role_turns = uses_role_turns(parts, understanding)
         spans = []
         if think_mode and not role_turns and segments:
             spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
@@ -899,8 +914,8 @@ class BagelModel(Model):
 
         An image in an understanding prompt is keyed by its file. An edit's VAE
         walk writes ``main`` too, but the keys of ``main`` leave that walk out. A
-        chat sends a reply back as its own assistant turn, so its pages match,
-        unless its first turn was images alone, which has no system turn.
+        chat sends a reply back as its own assistant turn, so its pages match
+        while the chat keeps one prompt shape: see :func:`uses_role_turns`.
         """
         decode = ((DECODE, "decode_loop"),)
         return {"kv": {
@@ -1294,6 +1309,7 @@ class BagelModel(Model):
         self, input_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         is_understanding: bool,
+        role_turns: bool,
         think_mode: bool = False,
     ):
         """Sequential list of ``(graph_walk_name, input tensor info)``.
@@ -1305,14 +1321,12 @@ class BagelModel(Model):
         """
         texts = list(input_signals.get("text_inputs", []))
         images = input_signals.get("image_inputs", [])
-        parts = parts_from_modalities(input_modalities)
-        role_turns = uses_role_turns(parts, is_understanding)
 
         schedule: list[tuple[str, TensorPointerInfo]] = []
         if think_mode and not role_turns and texts:
             schedule.append(("prefill_text", texts.pop(0)))
 
-        plan = prefill_plan(parts, leading_text=role_turns)
+        plan = prefill_plan(parts_from_modalities(input_modalities), leading_text=role_turns)
         for step in plan:
             pool = texts if step.modality == "text" else images
             if step.index >= len(pool):
@@ -1486,6 +1500,7 @@ class BagelModel(Model):
             input_modalities=input_modalities,
             input_signals=input_signals,
             is_understanding=(target_output == "text"),
+            role_turns=(model_kwargs or {})[ROLE_TURNS],
             think_mode=think_mode,
         )
 
