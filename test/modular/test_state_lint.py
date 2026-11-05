@@ -20,7 +20,7 @@ PORTED = ("mstar/model/qwen3_5", "mstar/model/command_a_plus")
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
     # what a handle holds
-    "resource", "positions", "_kv", "_pool", "_linear", "_views", "_blocks",
+    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_linear", "_views", "_blocks",
 }
 
 _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
@@ -89,6 +89,8 @@ def test_every_exception_is_still_used():
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),
     ("def f(self): return self.kv._kv", "._kv"),
+    ("def f(self): return self.kv.first_read", ".first_read"),
+    ("def f(self): return self.kv.reads['attn']", ".reads"),
     ("@torch.compiler.disable\ndef f(): pass", "torch.compiler.disable"),
 ])
 def test_the_lint_catches_each_way_past_the_contract(source, expected):

@@ -786,3 +786,5 @@ def test_a_kv_manager_says_which_labels_a_request_opened(monkeypatch):
     assert kv.opens_label(1, "main")
     assert not kv.opens_label(1, "cfg"), "a step on a label its request didn't open has no stream to read"
     assert kv.opens_label(2, "cfg"), "a padding row has no config"
+    kv.ingest_request(3, KVReqConfig(needed_labels_per_node={"LLM": ["cfg"]}))
+    assert kv.opens_label(3, "cfg"), "a label opened per node isn't in needed_labels"
