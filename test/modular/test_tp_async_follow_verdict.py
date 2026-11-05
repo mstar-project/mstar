@@ -36,7 +36,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from test_loop_turns import _looping_worker, _Runtime, _scheduler, _StopLoopError  # noqa: E402
+
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
+from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
@@ -258,6 +261,45 @@ def test_only_the_leader_of_a_lockstep_node_owes_a_marker():
     ld = _leader_stub()
     ld.tp_async_sched = False
     assert not ld._tp_lead_needs_marker(_pending(4), None)
+
+
+def test_a_leader_whose_iteration_raises_before_its_decision_still_sends_the_marker(monkeypatch):
+    """The real run loop on a TP leader: step 0 runs, the yield-away step 1
+    built beside it runs next, and building step 2 raises. No head went out
+    for step 1, so the marker must, or the followers await step 1 for good
+    (and a drain deferred behind it with them)."""
+    runtime = _Runtime()
+    sched, state = _scheduler(runtime, StepOrder.TURNS)
+    for rid in (0, 1):
+        runtime.requests[rid] = None
+        sched.note_arrival(rid)
+    runtime.ready |= {0, 1}
+    w = _looping_worker(monkeypatch, sched, state)
+    node = next(iter(sched.parallel_leader_nodes))
+    w.tp_async_sched, w.tp_async_nodes = True, None
+    w.parallel_nodes, w.parallel_leader_nodes = {node}, {node}
+    w._graph_runtime = types.SimpleNamespace(is_async_schedulable=lambda node, walk: True)
+    w._settle_speculation = w._finish_step = lambda *a, **k: None
+    w.maybe_send_zmq_to_tp_followers = lambda node_batch, **k: 0  # step 0's seq
+    markers, errors = [], []
+    w._broadcast_tp_nospec = lambda pending: markers.append(pending.tp_seq)
+    w._handle_main_loop_error = lambda exc, *a: errors.append(exc)
+
+    def build(pending, consecutive, fair):
+        if pending is None:
+            return None, None
+        if pending.tp_seq == 0:
+            spec = w._yield_away_speculation(sched.get_next_batch(state))
+            spec.tp_seq = 1  # broadcast as step 1, after step 0's marker
+            return spec, None
+        raise RuntimeError("take_chain_step raised")
+
+    w._build_speculation = build
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    assert [str(e) for e in errors] == ["take_chain_step raised"]
+    assert markers == [1]
 
 
 # ------------------------------------------------------------- registration
