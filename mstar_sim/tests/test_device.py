@@ -948,6 +948,9 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             assert not fails
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
+        def test_dynamo_traces_a_device():
+            import torch._dynamo
+            torch._dynamo.explain(lambda x: x + torch.device(0).index)(torch.ones(2, device="cuda"))
     """))
     out = run_pytest(tmp_path, "-p", "mstar_sim.pytest_plugin", "-rfxp", "test_cases.py", emulated=True,
                      MSTAR_SIM_FAST="1")
@@ -976,7 +979,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_dtype_mistake_on_a_stand_ins_output": "FAILED",
                         "test_cpu_kernel_limit": "XFAIL",
                         "test_assert_after_an_integer_index_of_a_never_computed_value": "FAILED",
-                        "test_passing_value_check": "PASSED"}, out
+                        "test_passing_value_check": "PASSED", "test_dynamo_traces_a_device": "XFAIL"}, out
 
 
 def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
