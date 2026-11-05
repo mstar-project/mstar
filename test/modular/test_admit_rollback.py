@@ -242,6 +242,24 @@ def test_a_refused_admit_leaves_the_free_list_as_it_found_it():
     assert kv._arena.free_pages() == free, "the refused admit put its pages back in another order"
 
 
+def test_an_undone_admit_gives_its_pages_back_in_the_order_it_took_them():
+    """Each fork target takes a page for the copy, then each row's span takes one more on the same label, so each
+    label's pages come from both passes. Giving them back label by label put the free list back out of order."""
+    kv = _kv("kv", pages=8)
+    for rid in (1, 2):
+        kv.ingest_request(rid, None)
+        prefill = _kv_step(rid, PAGE)
+        assert kv.admit(prefill, _ctx(rid)).ok
+        kv.commit(prefill, _ctx(rid))
+    free = kv._arena.free_pages()
+    step = KVStep(segments=tuple(Segment(rid, "fork", 2 * PAGE) for rid in (1, 2)), pre_forks=(("main", "fork"),))
+    assert kv.admit(step, _ctx(1, 2)).ok
+
+    kv.rollback_admit(step, _ctx(1, 2))
+
+    assert kv._arena.free_pages() == free, "the undone admit put its pages back in another order"
+
+
 # --- the unbatched fallback admits all or nothing -----------------------------
 
 
