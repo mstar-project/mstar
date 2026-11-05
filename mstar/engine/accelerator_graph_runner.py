@@ -712,6 +712,16 @@ class AcceleratorGraphRunner:
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(device, head_shards)
         )
+        combined = sorted({c.capture_graph_walk for c in self._capture_configs if c.total_tokens_multiplier > 1})
+        placed = combined and sorted(key for key, resource in resources.items() if resource.placement is not None)
+        if placed:
+            # a combined plan is label-major, so a replay's padding rows sit between the real ones,
+            # which attention over a placed pool plans only after them
+            raise ValueError(
+                f"{submodule_name}: the captures of {combined} combine labels into one plan "
+                f"(total_tokens_multiplier), which attention over context-parallel KV pool(s) {placed} "
+                "doesn't support: turn context_parallel off, or don't capture those walks"
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device

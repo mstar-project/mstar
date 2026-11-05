@@ -26,6 +26,8 @@ from test_startup_graph_validation import _qwen3_5
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
 from mstar.engine import engine as engine_mod
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
@@ -41,6 +43,7 @@ from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
+from mstar.model.submodule_base import NodeInputs
 
 P = 2
 CPU = torch.device("cpu")
@@ -730,6 +733,25 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
     _plan(attn, case, bucket=BucketKey("w", bs=2, num_tokens=8))
     torch.testing.assert_close(case.runner(attn, placement)(), case.want())
     assert len(exchanged) == 1
+
+
+def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load():
+    """A combined plan is label-major (cond's rows, then uncond's), so a replay's padding rows sit
+    between real ones, which attention over a placed pool can't plan (Chatterbox T3 with CFG)."""
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+        total_tokens_multiplier=2,
+    )
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    resources = {"kv": types.SimpleNamespace(placement=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
+    ).place(joint, "kv"))}
+    with pytest.raises(ValueError, match=r"t3: the captures of \['decode'\] combine labels.*\['kv'\]"):
+        AcceleratorGraphRunner(
+            submodule_name="t3", submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config]),
+            resources=resources, step_runner=None, device=CPU, autocast_dtype=None, joint_comm_group=joint,
+            num_slots=1, head_shards=1,
+        )
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):
