@@ -1356,6 +1356,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
+# Talker request state: tts_eos has conditioned one decode step (pad from then on)
+TTS_EOS_FED = "tts_eos_fed"
+
+
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
 
@@ -1383,11 +1387,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Lazy-built suppress mask for layer-0 logits.  Shape (vocab_size,)
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
-
-        # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request. We use this flag to
-        # inject tts_eos_embed for ONE step before falling back to pad.
-        self._eos_embed_sent: set[str] = set()
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
@@ -1544,11 +1543,12 @@ class TalkerSubmodule(ARNodeSubmodule):
             # tts_eos for one step, then tts_pad.
             thinker_states = inputs.get("thinker_states", [])
             rid = fwd_info.rid_handle
+            # Read, never set, here: a refused admit prepares the step again,
+            # and postprocess marks tts_eos fed once its step has run.
             if thinker_states:
                 text_raw = thinker_states[0]
-            elif rid not in self._eos_embed_sent:
+            elif not self.request_state(rid).get(TTS_EOS_FED, False):
                 text_raw = self._tts_eos_raw
-                self._eos_embed_sent.add(rid)
             else:
                 text_raw = self._tts_pad_raw
             return ARNodeInputs(
@@ -1787,8 +1787,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
         **kwargs
     ):
+        if inputs is not None and inputs.tensor_inputs.get("text_raw") is self._tts_eos_raw:
+            self.request_state(request_id).add(TTS_EOS_FED, True)
         if "new_token" not in outputs:
             return
         # Rename new_token → layer0_codes for downstream graph routing.
@@ -1812,11 +1815,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         if eos_token_id is None or eos_token_id != token:
             return set()
         return StopCheck({"talker_decode_loop"}, withheld=("codec_tokens",))
-
-    def cleanup_request(self, request_id: str) -> None:
-        """Remove per-request state when a request completes."""
-        super().cleanup_request(request_id)
-        self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [

@@ -30,6 +30,7 @@ Reference behaviour these mirror: ``cosyvoice/cli/frontend.py``
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -41,7 +42,14 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -54,7 +62,7 @@ from mstar.engine.resources import (
 from mstar.model.chatterbox.components.audio import kaldi_fbank_80
 from mstar.model.chatterbox.components.audio_frontend import resample
 from mstar.model.chatterbox.submodules import VoiceCache
-from mstar.model.cosyvoice3.components.flow import CosyVoice3FlowRow, ReferenceVoice
+from mstar.model.cosyvoice3.components.flow import CosyVoice3FlowRow, ReferenceVoice, SolveInputs
 from mstar.model.cosyvoice3.components.hift import HiftStreamState, stream_vocode
 from mstar.model.cosyvoice3.components.sampling import ras_sample
 from mstar.model.cosyvoice3.config import (
@@ -541,6 +549,10 @@ def _without_tf32():
         torch.backends.cudnn.allow_tf32 = cudnn
 
 
+def flow_region(frames: int) -> str:
+    return f"solve_F{frames}"
+
+
 class FlowSubmodule(NodeSubmodule):
     """Settles the stream's tokens in whole attention chunks and emits their mel.
 
@@ -549,6 +561,12 @@ class FlowSubmodule(NodeSubmodule):
     has settled and where its hop schedule is. A request's reference voice is
     conditioned from the clip that rides with its first chunk (per-voice cache)
     and kept in its state for the chunks that follow.
+
+    The Euler solve (10 DiT steps with guidance) is a piecewise CUDA graph per
+    frame bucket and batch size: a batch pads to the smallest bucket holding
+    its longest row, which changes no row's frames (``prepare_solve``). A
+    longer solve, a batch size not captured for its bucket, or another step
+    count runs the same code eagerly.
     """
 
     disable_torch_compile = True
@@ -646,7 +664,21 @@ class FlowSubmodule(NodeSubmodule):
             },
         )
 
-    def _run(self, rids, tokens_list, voices, finals, n_timesteps) -> list[NameToTensorList]:
+    def _solve(self, rows: list[CosyVoice3FlowRow], n_timesteps: int, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+        """Each row's generated mel, from a captured solve when one fits."""
+        runner = None
+        if n_timesteps == self.config.flow.cfm.n_timesteps:
+            frames = max(self.flow.valid_frames(row) for row in rows)
+            bucket = next((b for b in self.config.flow_capture_frame_buckets if b >= frames), None)
+            runner = runners.get(flow_region(bucket)) if bucket is not None else None
+        if runner is None or not runner.can_run(len(rows)):
+            return self.flow.solve_rows(rows, n_timesteps)
+        inputs = self.flow.prepare_solve(rows, frames=bucket)
+        # a copy: the runner's output buffer is overwritten by its next replay
+        mel = runner.run(static_inputs=inputs._asdict(), real_bs=len(rows))["mel"]
+        return self.flow.row_mels(rows, mel)
+
+    def _run(self, rids, tokens_list, voices, finals, n_timesteps, runners=None) -> list[NameToTensorList]:
         rows: list[tuple[int, CosyVoice3FlowRow]] = []
         for i, (rid, tokens, voice, final) in enumerate(zip(rids, tokens_list, voices, finals, strict=True)):
             state = self.request_state(rid)
@@ -657,7 +689,8 @@ class FlowSubmodule(NodeSubmodule):
         with _without_tf32():
             for steps in sorted({n_timesteps[i] for i, _ in rows}):
                 group = [(i, row) for i, row in rows if n_timesteps[i] == steps]
-                for (i, _), mel in zip(group, self.flow.solve_rows([row for _, row in group], steps), strict=True):
+                solved = self._solve([row for _, row in group], steps, runners or {})
+                for (i, _), mel in zip(group, solved, strict=True):
                     mels[i] = mel
         out = []
         n_mel = self.config.flow.output_size
@@ -689,13 +722,71 @@ class FlowSubmodule(NodeSubmodule):
         packed.update({key: [inp.kwargs[key] for inp in inputs] for key in inputs[0].kwargs})
         return packed
 
+    @staticmethod
+    def _runners(engine_inputs) -> Mapping[str, Any]:
+        return engine_inputs.piecewise_runners if engine_inputs is not None else {}
+
     def forward(self, graph_walk, engine_inputs, speech_tokens, rid, voice, final, n_timesteps, **kwargs):
-        del graph_walk, engine_inputs, kwargs
-        return self._run(rid, speech_tokens, voice, final, n_timesteps)[0]
+        del graph_walk, kwargs
+        return self._run(rid, speech_tokens, voice, final, n_timesteps, self._runners(engine_inputs))[0]
 
     def forward_batched(self, graph_walk, engine_inputs, speech_tokens, rid, voice, final, n_timesteps, **kwargs):
-        del graph_walk, engine_inputs, kwargs
-        return dict(zip(rid, self._run(rid, speech_tokens, voice, final, n_timesteps), strict=True))
+        del graph_walk, kwargs
+        out = self._run(rid, speech_tokens, voice, final, n_timesteps, self._runners(engine_inputs))
+        return dict(zip(rid, out, strict=True))
+
+    # -- captured solve ---------------------------------------------------------
+
+    def capture_batch_sizes(self, frames: int) -> list[int]:
+        """Batch sizes captured for a frame bucket: ``bs * frames`` within
+        ``flow_capture_batch_frames``, where a solve is still bound by its
+        kernel launches rather than its compute. None past the flow's noise."""
+        cfg = self.config
+        if frames > cfg.flow.noise_frames:
+            return []
+        sizes = [bs for bs in cfg.flow_capture_batch_sizes if bs <= cfg.flow_max_batch_size]
+        return [bs for bs in sizes if bs * frames <= cfg.flow_capture_batch_frames]
+
+    def _solve_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        si = inp.static_inputs
+        # a padding row has no valid frame; one keeps its (discarded) attention finite
+        inputs = SolveInputs(
+            mu=si["mu"], cond=si["cond"], spks=si["spks"], valid=si["valid"].clamp_min(1), streaming=si["streaming"]
+        )
+        # the precision is baked into the graph at capture, so capture under the solve's
+        with _without_tf32():
+            return {"mel": self.flow.solve_prepared(inputs, self.config.flow.cfm.n_timesteps)}
+
+    def _solve_static_inputs(self, shape: PiecewiseCaptureShape, frames: int, device) -> dict[str, torch.Tensor]:
+        n_mel, dtype = self.config.flow.output_size, self.flow.dtype
+        return {
+            "mu": torch.zeros(shape.bs, n_mel, frames, dtype=dtype, device=device),
+            "cond": torch.zeros(shape.bs, n_mel, frames, dtype=dtype, device=device),
+            "spks": torch.zeros(shape.bs, n_mel, dtype=dtype, device=device),
+            "valid": torch.zeros(shape.bs, dtype=torch.long, device=device),
+            "streaming": torch.zeros(shape.bs, dtype=torch.bool, device=device),
+        }
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """One region per frame bucket. The flow holds no engine resources, so
+        the regions declare no step. The largest bucket comes first: regions
+        capture in this order into one shared pool, and a smaller capture
+        reuses the blocks a larger one freed, where the reverse grows the pool."""
+        del autocast_dtype, tp_world_size, kwargs
+        regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
+        for frames in sorted(self.config.flow_capture_frame_buckets, reverse=True):
+            sizes = self.capture_batch_sizes(frames)
+            if not sizes:
+                continue
+            regions[flow_region(frames)] = PiecewiseBatchedConfig(
+                capture_fn=self._solve_capture,
+                make_static_inputs=functools.partial(self._solve_static_inputs, frames=frames, device=device),
+                seq_len=frames,
+                capture_batch_sizes=sizes,
+            )
+        return regions
 
 
 # ===========================================================================

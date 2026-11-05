@@ -73,7 +73,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -146,6 +146,7 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
     # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
@@ -912,7 +913,7 @@ class APIServer:
             size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
             self._check_call_input(size)
             req.input_bytes = size
-            req.last_input_time = time.time()
+            req.last_input_time = time.monotonic()
             req.open_streams -= ending
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
@@ -1429,7 +1430,7 @@ class APIServer:
     async def _iter_result_chunk_batches(
         self, request_id: str, key: str | None, own: PendingRequest | None,
     ):
-        start = time.time()
+        start = time.monotonic()
         last_activity = start
         finished = False
         # An error chunk ends the response: whatever follows it for this
@@ -1447,7 +1448,7 @@ class APIServer:
                 own.wake = wake
         try:
             while True:
-                if time.time() - last_activity > self.timeout_seconds:
+                if time.monotonic() - last_activity > self.timeout_seconds:
                     timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
@@ -1649,7 +1650,7 @@ class APIServer:
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
         return its chunks. Disconnecting or timing out releases engine state."""
-        start = time.time()
+        start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
         # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
@@ -1673,7 +1674,7 @@ class APIServer:
                 done = req.event.is_set() if req else True
             if done:
                 break
-            now = time.time()
+            now = time.monotonic()
             if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
@@ -2818,9 +2819,10 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's.
+    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
+    # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
-        app, host=host, port=port, access_log=False,
+        app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
     )
 
@@ -2933,6 +2935,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
     # The Rust frontend gets the key explicitly.
@@ -2948,6 +2951,11 @@ def main(argv: list[str] | None = None):
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
         )
+    if args.rust_frontend:
+        from mstar.api_server.rust_frontend import find_server_binary
+
+        # Before anything loads, so a missing or stale binary fails fast.
+        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -2962,7 +2970,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any thread: the pools are sized from the CPUs it leaves unpinned
+    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
     try:
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
@@ -3043,7 +3051,6 @@ def main(argv: list[str] | None = None):
 
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
-                find_server_binary,
                 launch_rust_server,
             )
 
@@ -3052,7 +3059,7 @@ def main(argv: list[str] | None = None):
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
-                find_server_binary(args.rust_frontend_bin), model_name,
+                rust_frontend_bin, model_name,
                 args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)

@@ -3209,8 +3209,9 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     (writing the raw K/V under one label), and sample the first token from
     the last position; the decode loop feeds each sampled token back as the
     next step's single-token input. Positions are the prompt's 3D mRoPE ids
-    (computed in ``process_prompt``) and, past the prompt, the scalar cursor
-    ``max(position) + 1`` on all three axes, carried in per-request state.
+    (computed in ``process_prompt``) and, past the prompt, the same scalar on
+    all three axes: ``max(position) + 1`` (kept in per-request state) plus the
+    decode step's loop iteration.
     """
 
     # The token loop is data-dependent at the Python level (per-step state,
@@ -3262,7 +3263,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
                 tensors["vision_embeds"] = vision[0]
             # Decoding continues at max(position) + 1 on every axis.
             self.request_state(fwd_info.rid_handle).add_all(
-                next_pos=int(position_ids.max().item()) + 1,
+                first_decode_pos=int(position_ids.max().item()) + 1,
             )
             return ARNodeInputs(
                 input_ids=input_ids,
@@ -3270,10 +3271,12 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
                 tensor_inputs=tensors,
             )
         if graph_walk == REASONER_DECODE_WALK:
-            st = self.request_states[fwd_info.rid_handle]
             token = inputs["text_inputs"][0].reshape(-1)[-1:]
-            pos = st["next_pos"]
-            st.add("next_pos", pos + 1)
+            # From the step's own iteration, so a step prepared again (after a
+            # refused admit) feeds the same position
+            pos = self.request_states[fwd_info.rid_handle]["first_decode_pos"] + int(
+                fwd_info.dynamic_loop_iter_counts.get(REASONER_DECODE_LOOP, 0)
+            )
             # On the token's device: a captured decode pads the batch with the
             # capture config's device-resident rows, and `preprocess` concatenates
             # every row's position ids into one tensor.

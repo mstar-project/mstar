@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +79,16 @@ class CosyVoice3FlowRow:
     settle: int
     final: bool
     streaming: bool
+
+
+class SolveInputs(NamedTuple):
+    """A batched solve's inputs, right-padded to a common frame count."""
+
+    mu: torch.Tensor  # [B, 80, frames] token condition
+    cond: torch.Tensor  # [B, 80, frames] prompt mel, zero after it
+    spks: torch.Tensor  # [B, 80] projected x-vector
+    valid: torch.Tensor  # [B] long, frames each row attends to (prompt and settled tokens)
+    streaming: torch.Tensor  # [B] bool, block-causal attention
 
 
 class PreLookaheadLayer(nn.Module):
@@ -138,59 +149,86 @@ class CosyVoice3Flow(nn.Module):
     def project_speaker(self, embedding: torch.Tensor) -> torch.Tensor:
         return self.spk_embed_affine_layer(F.normalize(embedding, dim=1))
 
+    def _used_tokens(self, row: CosyVoice3FlowRow) -> int:
+        """Generated tokens the row's solve reads: the settled ones plus their
+        look-ahead, or all of them for a final row."""
+        n = int(row.tokens.numel())
+        if row.final:
+            if row.settle != n:
+                raise ValueError(f"a final row settles all {n} tokens, not {row.settle}")
+            return n
+        if row.settle + self.config.pre_lookahead_len > n:
+            raise ValueError(f"settling {row.settle} of {n} tokens leaves no look-ahead")
+        return row.settle + self.config.pre_lookahead_len
+
+    def valid_frames(self, row: CosyVoice3FlowRow) -> int:
+        """Mel frames of the row's solve that count: the prompt's and the settled tokens'."""
+        return (row.voice.num_prompt_tokens + row.settle) * self.config.token_mel_ratio
+
     @torch.no_grad()
-    def solve_rows(self, rows: Sequence[CosyVoice3FlowRow], n_timesteps: int | None = None) -> list[torch.Tensor]:
-        """Each row's generated mel ``[80, 2 * settle]`` (frames from the first
-        generated token on), from one right-padded batched solve.
+    def prepare_solve(self, rows: Sequence[CosyVoice3FlowRow], frames: int | None = None) -> SolveInputs:
+        """The batched solve's inputs, right-padded to ``frames`` (default: the
+        longest row's valid frames).
 
         Padding cannot reach a row's frames: embeddings past a row's tokens are
         zeroed, the look-ahead reads at most three tokens past the settled
         ones (which exist unless the row is final), the DiT's convolutions are
-        causal and its attention masks the padded keys.
+        causal and its attention masks the keys past a row's valid frames.
         """
         cfg = self.config
         ratio = cfg.token_mel_ratio
-        lookahead = cfg.pre_lookahead_len
         device, dtype = self.device, self.dtype
-        seqs, valid_tokens = [], []
+        seqs, valid_frames = [], []
         for row in rows:
-            n = int(row.tokens.numel())
-            if row.final:
-                if row.settle != n:
-                    raise ValueError(f"a final row settles all {n} tokens, not {row.settle}")
-                used = n
-            else:
-                if row.settle + lookahead > n:
-                    raise ValueError(f"settling {row.settle} of {n} tokens leaves no look-ahead")
-                used = row.settle + lookahead
             prompt = row.voice.prompt_tokens.to(device, torch.long)
-            seqs.append(torch.cat([prompt, row.tokens[:used].to(device, torch.long)]))
-            valid_tokens.append(prompt.numel() + row.settle)
+            seqs.append(torch.cat([prompt, row.tokens[: self._used_tokens(row)].to(device, torch.long)]))
+            valid_frames.append(self.valid_frames(row))
         batch = len(rows)
-        valid_frames = [v * ratio for v in valid_tokens]
+        total = max(valid_frames) if frames is None else frames
+        if total < max(valid_frames):
+            raise ValueError(f"a {total}-frame solve cannot hold a row of {max(valid_frames)} frames")
+        if total > cfg.noise_frames:
+            raise ValueError(f"the flow noise covers {cfg.noise_frames} frames; this solve needs {total}")
         # every per-row count is known here: one copy for the lot
         counts = torch.empty(3, batch, dtype=torch.long, device=device)
         self._row_stager.copy_(counts, [s.numel() for s in seqs] + valid_frames + [row.streaming for row in rows])
         lens, valid, streaming = counts[0], counts[1], counts[2] != 0
         tokens = nn.utils.rnn.pad_sequence(seqs, batch_first=True)
+        tokens = F.pad(tokens, (0, max(0, -(-total // ratio) - tokens.shape[1])))
         width = tokens.shape[1]
         in_row = torch.arange(width, device=device)[None, :] < lens[:, None]
         emb = self.input_embedding(tokens.clamp_min(0)) * in_row.unsqueeze(-1).to(dtype)
         mu = self.pre_lookahead_layer(emb).repeat_interleave(ratio, dim=1).transpose(1, 2)
-
-        total = max(valid_frames)
-        if total > cfg.noise_frames:
-            raise ValueError(f"the flow noise covers {cfg.noise_frames} frames; this solve needs {total}")
         mu = mu[:, :, :total].contiguous()
         cond = torch.zeros(batch, cfg.output_size, total, device=device, dtype=dtype)
         for i, row in enumerate(rows):
             feat = row.voice.prompt_feat.to(device, dtype)
             cond[i, :, : feat.shape[0]] = feat.transpose(0, 1)
         spks = self.project_speaker(torch.stack([row.voice.embedding.to(device, dtype) for row in rows]))
-        mask = chunk_attention_mask(valid, total, cfg.dit.static_chunk_size, streaming)
-        noise = self.noise[:, :, :total].to(device, dtype).expand(batch, -1, -1).contiguous()
-        mel = self.decoder.solve(mu, mask, spks, cond, noise, n_timesteps or cfg.cfm.n_timesteps)
-        return [mel[i, :, row.voice.num_prompt_tokens * ratio : valid_frames[i]] for i, row in enumerate(rows)]
+        return SolveInputs(mu=mu, cond=cond, spks=spks, valid=valid, streaming=streaming)
+
+    @torch.no_grad()
+    def solve_prepared(self, inputs: SolveInputs, n_timesteps: int) -> torch.Tensor:
+        """``[B, 80, frames]`` mel: the Euler solve of ``prepare_solve``'s
+        inputs, a fixed-shape tensor program (no host reads), so it can be
+        captured per (batch, frames)."""
+        cfg = self.config
+        batch, _, frames = inputs.mu.shape
+        mask = chunk_attention_mask(inputs.valid, frames, cfg.dit.static_chunk_size, inputs.streaming)
+        noise = self.noise[:, :, :frames].to(self.device, self.dtype).expand(batch, -1, -1).contiguous()
+        return self.decoder.solve(inputs.mu, mask, inputs.spks, inputs.cond, noise, n_timesteps)
+
+    def row_mels(self, rows: Sequence[CosyVoice3FlowRow], mel: torch.Tensor) -> list[torch.Tensor]:
+        """Each row's generated frames ``[80, 2 * settle]`` of a batched solve."""
+        ratio = self.config.token_mel_ratio
+        return [mel[i, :, row.voice.num_prompt_tokens * ratio : self.valid_frames(row)] for i, row in enumerate(rows)]
+
+    @torch.no_grad()
+    def solve_rows(self, rows: Sequence[CosyVoice3FlowRow], n_timesteps: int | None = None) -> list[torch.Tensor]:
+        """Each row's generated mel ``[80, 2 * settle]`` (frames from the first
+        generated token on), from one right-padded batched solve."""
+        inputs = self.prepare_solve(rows)
+        return self.row_mels(rows, self.solve_prepared(inputs, n_timesteps or self.config.cfm.n_timesteps))
 
     # ------------------------------------------------------------------
     # Weights
