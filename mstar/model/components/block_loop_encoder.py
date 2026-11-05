@@ -24,7 +24,10 @@ The tower (``self.model``) provides:
 Each takes every tensor of ``tensor_inputs`` and ignores those it does not
 use. ``config`` has ``hidden_size`` and ``head_dim``; the attention is
 declared under ``mstar.model.keys.VISION_ATTN``. The node sends its
-`MediaEncoder`'s ``output``.
+``output`` (on the VLM scaffold, its `MediaEncoder`'s). A tower whose block
+loop returns more than the hidden states (Qwen3-Omni's deepstack taps) adds
+them to the region's outputs in `_capture_block_loop` and reads them off the
+replay in its own `forward_batched`.
 
 A replay's attention plan holds at most the resource's
 ``max_segments_per_step`` segments under each label. A batch that would
@@ -34,7 +37,7 @@ loop eagerly, however few its patches.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -50,8 +53,11 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.keys import VISION_ATTN
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_grids
+from mstar.model.multimodal import MEDIA_LAYOUT, media_grids
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+
+if TYPE_CHECKING:
+    from mstar.engine.accelerator_graph_runner import PiecewiseOutput
 
 # The tower's block loop, as a piecewise capture region
 VISION_BLOCK_LOOP = "vision_block_loop"
@@ -67,11 +73,12 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     # The ragged layouts a step plans over its patches, one label each.
     SEGMENT_LABELS: tuple[str, ...] = ("main",)
 
-    def __init__(self, model: torch.nn.Module, config: Any, encoder: MediaEncoder):
+    def __init__(self, model: torch.nn.Module, config: Any, output: str):
         super().__init__()
         self.model = model
         self.config = config
-        self.output = encoder.output
+        # the node's output signal; a MediaEncoder's ``output`` on the VLM scaffold
+        self.output = output
 
     def grids(self, fwd_info: CurrentForwardPassInfo) -> list[tuple[int, int, int]]:
         """The patch grid ``(t, h, w)`` of each run this node fills, in prompt
@@ -189,8 +196,10 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         cos: torch.Tensor,
         sin: torch.Tensor,
         segment_lengths: Mapping[str, Sequence[int]],
-    ) -> torch.Tensor | None:
-        """The block loop replayed once for the whole step, or None if not leased."""
+    ) -> "PiecewiseOutput | None":
+        """The block loop replayed once for the whole step, or None if not
+        leased: views of the region's outputs (``_capture_block_loop``'s
+        names), valid within this step."""
         if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         spans = {label: list(segment_lengths[label]) for label in self.SEGMENT_LABELS}
@@ -201,7 +210,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
             request_ids=engine_inputs.request_ids,
             seq_lens=spans[self.SEGMENT_LABELS[-1]],
             label_seq_lens=spans,
-        ).get_view("hidden")
+        )
 
     def preprocess(
         self,
@@ -244,9 +253,8 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         # one call for every image; the ragged kernel's segments keep them apart
         hidden, cos, sin = self.model.embed(**tensors)
-        encoded = self._replay_block_loop(engine_inputs, hidden, cos, sin, segment_lengths)
-        if encoded is None:
-            encoded = self.model.encode(hidden, cos, sin)
+        replayed = self._replay_block_loop(engine_inputs, hidden, cos, sin, segment_lengths)
+        encoded = self.model.encode(hidden, cos, sin) if replayed is None else replayed.get_view("hidden")
         embeds = self.model.project(encoded, **tensors)
         return self._split_rows(engine_inputs.request_ids, embeds, row_patches)
 

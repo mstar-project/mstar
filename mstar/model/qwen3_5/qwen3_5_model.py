@@ -478,7 +478,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             tower.requires_grad_(False).eval()
             logger.info("Loaded Qwen3.5 vision tower onto %s", device)
             return VisionEncoderSubmodule(
-                tower, self.vision_config, self.encoder(node_name), self.pixel_normalizer(),
+                tower, self.vision_config, self.encoder(node_name).output, self.pixel_normalizer(),
             )
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights

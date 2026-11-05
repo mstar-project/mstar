@@ -3127,6 +3127,9 @@ tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
 ``project(encoded, **tensors)``. A step whose spans under some label exceed the
 ragged resource's ``max_segments_per_step`` takes no lease and runs eagerly.
+Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns the
+deepstack taps (its ``_capture_block_loop``), which its own ``forward_batched`` reads
+off the replay.
 A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
 ``VisionRotaryEmbedding`` (axial 2D rope; ``keep_fp32`` keeps its frequencies fp32

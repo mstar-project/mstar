@@ -503,7 +503,6 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
 
 def _encoder(max_segments: int):
     """A vision encoder bound to a ragged attention resource with this ceiling."""
-    from mstar.model.multimodal import vision_encoder
     from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
@@ -512,7 +511,7 @@ def _encoder(max_segments: int):
         patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
         num_position_embeddings=16, out_hidden_size=64,
     )
-    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, vision_encoder((0,)), (torch.zeros(1), torch.ones(1)))
+    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, "vision_embeds", (torch.zeros(1), torch.ones(1)))
     encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
     return encoder
 
@@ -522,13 +521,12 @@ def test_the_vision_compile_regions_take_their_start_up_examples():
     start-up, on an accelerator only. Run eagerly here: a call a region
     refuses would first fail a GPU worker's boot, and a merger row unlike the
     block loop's output would compile again on the first image."""
-    from mstar.model.multimodal import vision_encoder
     from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     config = _encoder(max_segments=4).config
     encoder = VisionEncoderSubmodule(
-        Qwen3_5VisionModel(config), config, vision_encoder((0,)), (torch.zeros(1), torch.ones(1)),
+        Qwen3_5VisionModel(config), config, "vision_embeds", (torch.zeros(1), torch.ones(1)),
     )
     regions = encoder.compile_regions()
     assert set(regions) == {"model.embed", "model.merger"} | {f"model.blocks.{i}" for i in range(config.depth)}
@@ -585,7 +583,7 @@ def test_vision_block_loop_replays_exactly_when_leased():
 
     assert replay({}) is None
     assert not hasattr(runner, "ran")
-    assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
+    assert replay({VISION_BLOCK_LOOP: object()}).get_view("hidden") == "replayed"
     assert runner.ran["seq_lens"] == [4, 4]
     assert runner.ran["label_seq_lens"] == {"main": [4, 4]}
 

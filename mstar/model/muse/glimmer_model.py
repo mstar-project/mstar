@@ -256,7 +256,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             tower.requires_grad_(False).eval()
             logger.info("Loaded Muse Glimmer vision encoder onto %s", device)
             return VisionEncoderSubmodule(
-                tower, self.vision_config, self.encoder(node_name),
+                tower, self.vision_config, self.encoder(node_name).output,
             )
 
         from mstar.model.muse.components.text import MuseGlimmerForCausalLM

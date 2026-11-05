@@ -30,6 +30,7 @@ from mstar.engine.resources import RaggedAttentionSpec  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule  # noqa: E402
+from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
 from mstar.model.loader import load_hf_weights  # noqa: E402
 from mstar.model.qwen3_omni.components.vision import Qwen3OmniVisionTower  # noqa: E402
 from mstar.model.qwen3_omni.config import (  # noqa: E402
@@ -59,6 +60,7 @@ class StandInRagged:
     ``run`` attending within each of them, as the planned kernel does."""
 
     max_segments_per_request = 64
+    max_segments_per_step = 64
 
     def __init__(self):
         self.spans: list[int] = []
@@ -187,12 +189,26 @@ def test_audio_windows_match_hf(audio_pair):
     assert ragged.calls == AUDIO["encoder_layers"]
 
 
+class RegionRunner:
+    """The captured block loop as a replay hands it back: the region's
+    outputs, run on the step's buffers, as `PiecewiseOutput` views."""
+
+    def __init__(self, sub):
+        self.sub = sub
+
+    def run(self, static_inputs, **kwargs):
+        out = self.sub._capture_block_loop(SimpleNamespace(static_inputs=static_inputs))
+        return SimpleNamespace(get_view=out.__getitem__)
+
+
+@pytest.mark.parametrize("replayed", [False, True], ids=["eager", "replayed"])
 @pytest.mark.parametrize(
     "grid", [[[1, 4, 6]], [[3, 4, 4]], [[1, 2, 2], [1, 4, 4]]], ids=["image", "video", "two_images"],
 )
-def test_vision_frames_and_deepstack_match_hf(vision_pair, grid):
+def test_vision_frames_and_deepstack_match_hf(vision_pair, grid, replayed):
     """One segment per frame, and the merged embeddings and every deepstack
-    feature match HF's encoder."""
+    feature match HF's encoder, with the block loop run eagerly or read off
+    the captured region's outputs."""
     hf, sub, ragged = vision_pair
     grid_thw = torch.tensor(grid)
     patch_numel = 3 * VISION["temporal_patch_size"] * VISION["patch_size"] ** 2
@@ -204,7 +220,11 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid):
     assert step.steps[VISION_ATTN].causal is False
     ragged.plan(step)
     with torch.no_grad():
-        out = sub.forward("prefill_vision", _engine_inputs("v"), **sub.preprocess("prefill_vision", None, [row]))
+        engine_inputs = _engine_inputs("v")
+        if replayed:
+            engine_inputs.piecewise_runners = {VISION_BLOCK_LOOP: RegionRunner(sub)}
+            engine_inputs.piecewise_leases = {VISION_BLOCK_LOOP: object()}
+        out = sub.forward("prefill_vision", engine_inputs, **sub.preprocess("prefill_vision", None, [row]))
         want = hf(pixels, grid_thw=grid_thw)
     torch.testing.assert_close(out["vision_embeds"][0], want.pooler_output, atol=1e-4, rtol=1e-4)
     assert len(out["deepstack"]) == len(VISION["deepstack_visual_indexes"])
@@ -213,10 +233,13 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid):
 
 
 def test_vision_capture_refuses_more_frames_than_a_replay_plans(vision_pair):
-    """A request with more frames than the resource's per-request ceiling
+    """A request with more frames than the resource's per-step ceiling
     takes no lease, so its block loop runs eagerly."""
     _, sub, ragged = vision_pair
-    rows = [SimpleNamespace(tensor_inputs={"seq_lengths": (4,) * n}) for n in (1, ragged.max_segments_per_request + 1)]
+    rows = [
+        SimpleNamespace(input_seq_len=4 * n, resource_step_info={"main": (4,) * n})
+        for n in (1, ragged.max_segments_per_step + 1)
+    ]
     assert sub._fits_capture(rows[:1])
     assert not sub._fits_capture(rows[1:])
 

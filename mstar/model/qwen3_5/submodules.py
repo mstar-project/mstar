@@ -281,10 +281,10 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     disable_torch_compile = True
 
     def __init__(
-        self, model: torch.nn.Module, config: Qwen3_5VisionConfig, encoder: MediaEncoder,
+        self, model: torch.nn.Module, config: Qwen3_5VisionConfig, output: str,
         pixel_normalizer: tuple[torch.Tensor, torch.Tensor],
     ):
-        super().__init__(model, config, encoder)
+        super().__init__(model, config, output)
         # per-column (mean, std) for byte patches; see `Qwen3_5DenseModel.pixel_normalizer`
         self._pixel_normalizer = pixel_normalizer
 

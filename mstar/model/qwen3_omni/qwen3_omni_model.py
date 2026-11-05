@@ -385,9 +385,9 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
                     # Frames of 256 patches or more fill the largest captured
-                    # bucket at this many; a request with more frames runs the
-                    # block loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    # bucket at this many; a step with more frames runs the
+                    # block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
+                    max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
                 ),
             ),
         ]
