@@ -671,6 +671,24 @@ def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, why):
     assert refusal is None if why is None else refusal.startswith(why)
 
 
+def test_an_input_another_node_of_the_loop_makes_each_iteration_is_not_constant():
+    """BAGEL's split CFG: combine_cfg reads each branch's velocity once an
+    iteration. A run of combine alone would replay on the first velocity while
+    its count skipped the branch's iterations, so it doesn't repeat alone."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    branch = GraphNode(name="b", input_names=["x"], outputs=[GraphEdge("c", "v")], enable_async_scheduling=False)
+    combine = GraphNode(
+        name="c", input_names=["v", "x"], outputs=[GraphEdge("b", "x"), GraphEdge("c", "x")],
+        enable_async_scheduling=False,
+    )
+    edges = loop_edges(Loop(section=Sequential([Parallel([branch]), combine]), max_iters=8, outputs=[], name="l"), "c")
+    assert edges.inputs == {"v": EdgeKind.PER_ITERATION, "x": EdgeKind.LOOP_BACK}
+    assert edges.made_by == {"v": "b", "x": "c"} and edges.streamed == frozenset()
+    assert edge_refusal(edges) == "graph runtime: its input 'v' is made by 'b' once an iteration"
+
+
 @pytest.mark.parametrize(("parallel", "why"), [(False, None), (True, "TP: each rank's window")])
 def test_under_tp_a_walk_reading_a_streamed_iteration_input_does_not_repeat(parallel, why):
     """Each rank's window is what reached it, so a follower would read other items."""

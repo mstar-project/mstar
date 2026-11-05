@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import NamedTuple
 from uuid import uuid4
 
@@ -765,6 +767,17 @@ class LoopEdges(NamedTuple):
     # whether the node's next iteration is speculated (it opts into async
     # scheduling); one that isn't runs every iteration as a step the scheduler picks
     chained: bool = True
+    # input name -> the node of the Loop that makes it each iteration: a
+    # loop-back (its own or another node's), or the output of a node before
+    # it in the iteration
+    made_by: Mapping[str, str] = MappingProxyType({})
+
+    @property
+    def streamed(self) -> frozenset[str]:
+        """The inputs streamed in from outside the Loop, an item an iteration."""
+        return frozenset(
+            name for name, kind in self.inputs.items() if kind is EdgeKind.PER_ITERATION and name not in self.made_by
+        )
 
 
 def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
@@ -780,9 +793,13 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
     back = inner._loop_back_inputs or set()
     terminal = {edge.name for edge in inner.outputs}
     accumulated = {edge.name for edge in inner.accumulated_outputs}
+    made_by = {
+        edge.name: name for name, other in nodes.items() for edge in other.outputs
+        if edge.next_node == node_name and edge.name in node.input_names and not edge.is_streaming
+    }
     inputs = {
         name: EdgeKind.LOOP_BACK if (name, node_name) in back
-        else EdgeKind.PER_ITERATION if name in node._streaming_inputs
+        else EdgeKind.PER_ITERATION if name in node._streaming_inputs or name in made_by
         else EdgeKind.CONSTANT
         for name in node.input_names
     }
@@ -805,7 +822,7 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
         and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
     )
     leaving = frozenset(name for name, _ in outputs if name in terminal)
-    return LoopEdges(inner.name, inputs, outputs, items, leaving, node.enable_async_scheduling)
+    return LoopEdges(inner.name, inputs, outputs, items, leaving, node.enable_async_scheduling, made_by)
 
 
 class GraphStateRegistry(ABC):

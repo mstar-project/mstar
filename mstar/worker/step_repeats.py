@@ -139,6 +139,8 @@ def edge_refusal(edges: LoopEdges, windowed: Collection[str] = (), parallel: boo
     own. Under TP (``parallel``) a window is what reached each rank, so ranks
     would feed different items into the same collectives."""
     for name, kind in sorted(edges.inputs.items()):
+        if kind is EdgeKind.PER_ITERATION and name in edges.made_by:
+            return f"graph runtime: its input {name!r} is made by {edges.made_by[name]!r} once an iteration"
         if kind is EdgeKind.PER_ITERATION and name not in windowed:
             return f"node: its streamed input {name!r} isn't an iteration input it reads an item of a replay"
         if kind is EdgeKind.PER_ITERATION and parallel:
@@ -233,7 +235,7 @@ class StepRepeats:
         a walk that repeats and reads streamed inputs, its limit."""
         return {
             node: self.limit(node) for node, walk in self._walks
-            if any(kind is EdgeKind.PER_ITERATION for kind in self.edges[(node, walk)].inputs.values())
+            if self.edges[(node, walk)].streamed
         }
 
     def config(self, node: str) -> RepeatConfig:

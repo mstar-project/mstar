@@ -46,7 +46,7 @@ from mstar.engine.resources.kv.transfer import (
 )
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB, STOP_ODDS
-from mstar.graph.base import EdgeKind, GraphEdge, GraphSection
+from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
@@ -3212,7 +3212,7 @@ class Worker:
             return "consumer: it joins a producer's pieces into one item"
         if any(
             node == consumer and self._step_repeats.limit(node) > 1
-            and any(kind is EdgeKind.PER_ITERATION for kind in edges.inputs.values())
+            and edges.streamed
             for (node, _), edges in self._step_repeats.edges.items()
         ):
             return "consumer: it reads the stream an item an iteration"
