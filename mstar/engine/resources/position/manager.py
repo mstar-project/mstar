@@ -79,8 +79,8 @@ class PositionManager(Resource):
     def fusable_rope_theta(self, head_dim: int) -> float | None:
         """The theta of the RoPE ``apply_qk`` applies, when that is plain
         rotate-half RoPE over the whole ``head_dim`` (not interleaved, no
-        scaling, no RoPE dtype), which a layer may apply in a fused kernel of
-        its own instead; None otherwise."""
+        scaling, no RoPE dtype, not ``fused``), which a layer may apply in a
+        fused kernel of its own instead; None otherwise."""
         return None
 
 
@@ -132,15 +132,21 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
-        # CUDA rotates from this table instead of in-kernel angles when set.
+        if config.fused and (config.llama31_params or config.interleave
+                             or config.rope_dtype not in (None, torch.float32)
+                             or config.rope_table_dtype is not None):
+            raise ValueError("PositionConfig.fused supports standard non-interleaved float32 RoPE only")
+        # CUDA rotates from this table instead of in-kernel angles when set: FlashInfer's
+        # kernel reads it under rope_table_dtype, torch ops under fused (a float32 table).
         self._rope_table: torch.Tensor | None = None
-        if config.rope_table_dtype is not None and device.type != "xpu":
+        table_dtype = torch.float32 if config.fused else config.rope_table_dtype
+        if table_dtype is not None and device.type != "xpu":
             if config.llama31_params:
                 raise NotImplementedError("rope_table_dtype does not support Llama 3.1 RoPE scaling")
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
-                raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
-            if device.type == "cuda" and rotary_dim % 16:
+                raise ValueError("a RoPE table needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            if device.type == "cuda" and rotary_dim % 16 and not config.fused:
                 # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
                 # rotation reads past each head and returns garbage, without an error
                 raise ValueError(
@@ -150,26 +156,9 @@ class RopeManager(PositionManager):
                 rotary_dim,
                 config.rope_scale,
                 config.rope_theta,
-                config.rope_table_dtype,
+                table_dtype,
             ).float()
             self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
-
-        if config.fused:
-            if (config.llama31_params or config.interleave or config.rope_dtype not in (None, torch.float32)
-                    or config.rope_table_dtype is not None):
-                raise ValueError(
-                    "PositionConfig.fused supports standard non-interleaved float32 RoPE only"
-                )
-            rotary_dim = config.rotary_dim or head_dim
-            if rotary_dim is None:
-                raise ValueError(
-                    "fused RoPE needs PositionConfig.rotary_dim or the "
-                    "dependent KV cache's head_dim"
-                )
-            self._fused_rotary_dim = rotary_dim
-            self._fused_cache = self._build_rope_cache(
-                rotary_dim, config.rope_scale, config.rope_theta, torch.float32,
-            )
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
@@ -194,6 +183,8 @@ class RopeManager(PositionManager):
         plain = (
             cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
             and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+            # fused rotates from its table with torch ops; a layer's kernel would not
+            and not cfg.fused
         )
         return float(cfg.rope_theta) if plain else None
 
@@ -575,9 +566,9 @@ class RopeManager(PositionManager):
 
     @property
     def cos_sin_table(self) -> torch.Tensor | None:
-        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
-        ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a
-        larger fusion; None without ``rope_table_dtype``."""
+        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` (or ``fused``, in
+        float32) builds, each row ``rotary_dim / 2`` cosines then as many sines, for a kernel
+        that rotates inside a larger fusion; None without either."""
         return self._rope_table
 
     @property
@@ -648,7 +639,7 @@ class RopeManager(PositionManager):
         """The fused table is built once from the config, so a call can't change it."""
         config = self._config
         given = {
-            "rotary_dim": (rotary_dim, self._fused_rotary_dim),
+            "rotary_dim": (rotary_dim, self._rope_table_key[0]),
             "interleave": (interleave, config.interleave),
             "rope_scale": (rope_scale, config.rope_scale),
             "rope_theta": (rope_theta, config.rope_theta),
@@ -667,8 +658,8 @@ class RopeManager(PositionManager):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Non-interleaved RoPE in float32 over the cached table, returned in the
         inputs' dtype (as FlashInfer's kernel computes and stores it)."""
-        half = self._fused_rotary_dim // 2
-        cos, sin = self._fused_cache.index_select(0, pos_ids.long()).unsqueeze(1).split(half, dim=-1)
+        half = self._rope_table_key[0] // 2
+        cos, sin = self._rope_table.index_select(0, pos_ids.long()).unsqueeze(1).split(half, dim=-1)
 
         def rotate(x: torch.Tensor) -> torch.Tensor:
             xf = x.float()

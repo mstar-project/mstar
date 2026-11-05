@@ -257,6 +257,7 @@ def test_qwen3_5_layer_loop_compiles_no_frame_per_layer(dynamo_counts):
     ({"interleave": True}, 128, False),
     ({"rope_scale": 2.0}, 128, False),
     ({"rope_dtype": torch.float32}, 128, False),
+    ({"fused": True}, 128, False),  # rotates from its table with torch ops
     ({"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192}, 128, False),
 ])
 def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, head_dim, fusable):
