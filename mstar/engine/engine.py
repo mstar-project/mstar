@@ -3514,6 +3514,14 @@ class Engine:
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
+        if self._beside_chain(batch.node_name):
+            # The chain holds its rotation of slots (a run in flight, the next
+            # step staged), and every per-step buffer is keyed by slot: a step
+            # beside it takes a slot of its lane's, past the rotation, and runs
+            # eager, never on a slot's captures.
+            batch.set_slot(submodule_mgmt.num_slots + self._node_lanes[batch.node_name] - 1)
+            batch.step_context.repeats = 1
+            return None
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 

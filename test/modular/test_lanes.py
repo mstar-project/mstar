@@ -1127,3 +1127,22 @@ def test_a_step_off_the_chain_on_the_chains_resources_waits_out_the_plan_threads
         assert ran.wait(0.2) is bool(held)
     step.join(2)
     assert ran.is_set()
+
+
+def test_a_step_beside_the_chain_takes_a_slot_of_its_lanes_and_runs_eager():
+    """Every per-step buffer is keyed by slot (attention workspaces, KV's static
+    plan buffers, position and sampler rows), and the chain holds its rotation:
+    a run in flight on one slot, its next step staged on the other."""
+    engine = Engine.__new__(Engine)
+    engine._node_lanes = {"n": 1}
+    mgmt = SubmoduleManagement.__new__(SubmoduleManagement)
+    mgmt._num_slots, mgmt._next_slot = 2, 0
+    mgmt.resources = {"kv": object()}
+    engine._submodules = {"n": mgmt}
+    engine._runner = SimpleNamespace(lane_held=frozenset())
+    ctx = StepContext(request_ids=(1,), graph_walk="prefill", slot=None, capture=False, repeats=4)
+    batch = SimpleNamespace(node_name="n", slot=None, step_context=ctx)
+    batch.set_slot = lambda slot: (setattr(batch, "slot", slot), setattr(ctx, "slot", slot))
+    assert engine.reserve_replay_slot(batch) is None
+    assert (batch.slot, ctx.slot, ctx.repeats) == (2, 2, 1)
+    assert mgmt.next_slot == 0, "the chain's rotation is untouched"
