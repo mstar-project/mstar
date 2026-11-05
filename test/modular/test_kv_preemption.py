@@ -818,6 +818,23 @@ def test_a_request_whose_admission_is_undone_waits_with_no_room_set_aside_on_the
     assert kv._cpu_pool.reserved == {}, "r held room on the host while it waited for another pool"
 
 
+def test_a_victim_that_holds_nothing_waits_with_no_room_set_aside_on_the_host():
+    """A victim admitted but not yet run gave back its allotment and kept its room on the host, so r's next page found
+    the host full and r was short of a guarantee it didn't need."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(4)
+    _running(kv, "o", 6, arrival=0)
+    _running(kv, "r", 2, arrival=1, rebuildable=False)
+    _request(kv, "a", 2, arrival=2, rebuildable=False)
+    assert _ready(kv, "a") and kv._cpu_pool.reserved == {"r": 2, "a": 2}
+
+    assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False).to_ask == ["a"]
+
+    assert "a" not in kv._cpu_pool.reserved and _step(kv, "r", PAGE_SIZE).ok, (
+        "a held room on the host while it waited in the queue"
+    )
+
+
 def test_the_room_the_host_sets_aside_grows_with_each_page_a_request_takes():
     """qwen3_asr_realtime's sessions each set their whole decode cap aside on the host at their first ask, so few of
     them got room, and the host's prefix tier was left little."""
