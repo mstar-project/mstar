@@ -557,7 +557,7 @@ def test_the_vision_compile_regions_take_their_start_up_examples():
     config = _encoder(max_segments=4).config
     encoder = VisionEncoderSubmodule(Qwen3_5VisionModel(config), config, (torch.zeros(1), torch.ones(1)))
     regions = encoder.compile_regions()
-    assert set(regions) == {"model.embed", "model.encode", "model.merger"}
+    assert set(regions) == {"model.embed", "model.merger"} | {f"model.blocks.{i}" for i in range(config.depth)}
     with torch.no_grad():
         hidden, _, _ = encoder.model.embed(*regions["model.embed"][0])
         (rows,) = regions["model.merger"][0]
@@ -828,3 +828,74 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
     assert Path(path).suffix == ".mp4" and Path(path).read_bytes().startswith(b"\x00\x00\x00\x18")
     assert [p.modality for p in args.prompt_parts] == ["text", "video", "text"]
     assert args.prompt_parts[1] == PromptPart(modality="video", index=0, role="user")
+
+
+def test_patch_embed_matmul_matches_its_conv():
+    # The patch embed runs its stride=kernel Conv3d as one GEMM over flattened
+    # patches; the checkpoint's conv weights must mean the same thing either way.
+    from mstar.model.qwen3_5.components.vision import VisionPatchEmbed
+    from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+
+    torch.manual_seed(0)
+    config = Qwen3_5VisionConfig(
+        depth=1, hidden_size=32, intermediate_size=64, num_heads=2, in_channels=3,
+        patch_size=4, temporal_patch_size=2, spatial_merge_size=2,
+        num_position_embeddings=16, out_hidden_size=32,
+    )
+    embed = VisionPatchEmbed(config).double()
+    patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
+    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    torch.testing.assert_close(embed(patches), conv)
+
+
+def test_position_table_resample_matches_bilinear_interpolate():
+    # The tower resamples its learned square position table onto each frame's
+    # grid by gathering 2x2 taps on the host; that must be the reference's
+    # align_corners bilinear interpolate, in merge-block order, per frame.
+    import torch.nn.functional as F
+
+    from mstar.model.components.qwen3_vit import vision_interpolation
+
+    side, merge, dim = 6, 2, 3
+    table = torch.randn(side, side, dim, dtype=torch.float64)
+    grid = [(1, 4, 8), (3, 10, 6), (2, 4, 8)]
+    indices, weights = vision_interpolation(grid, side, merge)
+    got = (table.reshape(side * side, dim)[indices] * weights[..., None].double()).sum(1)
+
+    expected = []
+    for t, h, w in grid:
+        frame = F.interpolate(table.permute(2, 0, 1)[None], size=(h, w), mode="bilinear", align_corners=True)
+        frame = frame[0].permute(1, 2, 0).reshape(h // merge, merge, w // merge, merge, dim)
+        expected.append(frame.permute(0, 2, 1, 3, 4).reshape(h * w, dim).repeat(t, 1))
+    torch.testing.assert_close(got, torch.cat(expected), rtol=1e-6, atol=1e-6)
+
+
+def test_vision_blocks_share_one_compiled_frame():
+    # The encoder compiles each block as its own region; that only saves the
+    # unrolled loop's trace if every block reuses one Dynamo frame, i.e. no
+    # block holds per-instance state Dynamo would guard on.
+    from torch._dynamo.testing import CompileCounter
+
+    from mstar.model.qwen3_5.components.vision import VisionBlock
+    from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+
+    config = Qwen3_5VisionConfig(
+        depth=3, hidden_size=16, intermediate_size=32, num_heads=2, in_channels=3,
+        patch_size=4, temporal_patch_size=2, spatial_merge_size=2,
+        num_position_embeddings=16, out_hidden_size=16,
+    )
+    attn = SimpleNamespace(run=lambda q, k, v: v)  # one ragged-attention resource, bound into every block
+    counter = CompileCounter()
+    torch._dynamo.reset()
+    try:
+        blocks = [VisionBlock(config, VISION_ATTN) for _ in range(config.depth)]
+        for block in blocks:
+            block.attn.ragged_attn = attn
+            block.forward = torch.compile(block.forward, backend=counter, dynamic=True)
+        x, cos, sin = torch.randn(8, 16), torch.randn(8, 8), torch.randn(8, 8)
+        with torch.no_grad():
+            for block in blocks:
+                x = block(x, cos, sin)
+        assert counter.frame_count == 1
+    finally:
+        torch._dynamo.reset()

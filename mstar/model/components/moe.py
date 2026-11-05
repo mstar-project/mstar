@@ -88,7 +88,10 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # (or falls back to a torch impl), so no extra kernel package is needed. The
 # actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
+    from mstar.utils.fused_moe import MoeAlignment, moe_block_m
     from mstar.utils.fused_moe import fused_experts as _fused_experts
+    from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
+    from mstar.utils.fused_moe.runner import runs_per_pair
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
@@ -111,12 +114,11 @@ class TopKRouter(nn.Module):
             to (top-k).
         norm_topk_prob: if True, renormalize the top-k probabilities so
             they sum to 1.
-        fused_softmax_topk: on CUDA, route through one Triton kernel
-            (``mstar::moe_router_topk``) instead of softmax, ``torch.topk``
-            and the renormalize. Equal probabilities go to the lower expert
-            id, where ``torch.topk`` may pick another; bf16 logits tie often,
-            so a model opts in once it has checked how often its outputs
-            diverge.
+        fused_softmax_topk: on CUDA, route through Triton kernels instead
+            of softmax, ``torch.topk`` and the renormalize (see :meth:`route`).
+            Equal probabilities go to the lower expert id, where ``torch.topk``
+            may pick another; bf16 logits tie often, so a model opts in once it
+            has checked how often its outputs diverge.
     """
 
     def __init__(
@@ -151,9 +153,39 @@ class TopKRouter(nn.Module):
             selected_experts: ``(tokens, top_k)`` int64 indices.
             router_states_next: always ``None`` (stateless).
         """
+        routing_weights, router_indices, _ = self.route(hidden_states)
+        return routing_weights, router_indices, None
+
+    def route(
+        self, hidden_states: torch.Tensor, align_w1: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, "MoeAlignment | None"]:
+        """The weights and experts, plus the block alignment when one kernel can do both.
+
+        With ``fused_softmax_topk`` on CUDA, a batch of up to ``ROUTE_ALIGN_MAX_SLOTS``
+        renormalized slots whose block can consume an alignment (it passes its
+        ``gate_up_proj`` as ``align_w1``, and its flat batch) takes ``route_align``,
+        unless ``fused_experts`` runs it as per-pair GEMVs, which read no alignment.
+        Any other batch takes ``router_topk``, and with the flag off it's softmax,
+        ``torch.topk`` and the renormalize.
+        """
+        fused = self.fused_softmax_topk and hidden_states.is_cuda
+        tokens = hidden_states.shape[0]
+        if (
+            fused and _HAS_FUSED and align_w1 is not None and self.norm_topk_prob
+            and tokens * self.top_k <= ROUTE_ALIGN_MAX_SLOTS
+            and not runs_per_pair(hidden_states, align_w1)
+        ):
+            router_logits = F.linear(hidden_states, self.weight)
+            # int: the kernel's block sizes are constants, and a compile that keeps the
+            # token count symbolic specializes on it here, for at most these few counts
+            tokens = int(tokens)
+            return route_align(
+                router_logits, self.top_k, moe_block_m(tokens, align_w1, self.top_k),
+                router_logits.dtype, softmax=True,
+            )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
-        if self.fused_softmax_topk and router_logits.is_cuda:
+        if fused:
             from mstar.utils.fused_moe.decode import router_topk
 
             routing_weights, router_indices = router_topk(
@@ -312,17 +344,29 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     skip_invalid: bool = False,
+    alignment: "MoeAlignment | None" = None,
 ) -> torch.Tensor:
     """Pick fused-Triton if available, otherwise the naive loop."""
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
-            routing_weights, selected_experts, skip_invalid=skip_invalid,
+            routing_weights, selected_experts, skip_invalid=skip_invalid, alignment=alignment,
         )
     return dispatch_experts_fused(
         hidden_states, gate_up_proj, down_proj,
         num_experts, selected_experts, routing_weights, skip_invalid=skip_invalid,
     )
+
+
+def _route(
+    gate: nn.Module, flat: torch.Tensor, align_w1: torch.Tensor | None, router_states: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, "MoeAlignment | None"]:
+    """``gate``'s output plus the alignment ``fused_experts`` would otherwise
+    compute, which a :class:`TopKRouter` may give a block that passes ``align_w1``."""
+    if type(gate) is TopKRouter:
+        weights, experts, alignment = gate.route(flat, align_w1)
+        return weights, experts, None, alignment
+    return (*gate(flat, router_states), None)
 
 
 def _sync_routing(
@@ -650,8 +694,12 @@ class ParallelSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
-        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
         skip = token_valid is not None
+        # the mask below moves experts after routing, and TP's dispatch aligns for itself
+        can_align = not skip and self.comm_group.world_size == 1
+        routing_weights, selected_experts, router_states_next, alignment = _route(
+            self.gate, flat, self.experts.gate_up_proj if can_align else None, router_states,
+        )
         if skip:
             selected_experts, routing_weights = _mask_padding(
                 selected_experts, routing_weights, token_valid, self.num_experts,
@@ -660,7 +708,7 @@ class ParallelSparseMoeBlock(nn.Module):
         if self.comm_group.world_size == 1:
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
+                self.num_experts, selected_experts, routing_weights, skip_invalid=skip, alignment=alignment,
             )
         else:
             out = self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
@@ -767,11 +815,13 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
 
         shared = self.shared_expert(flat)
 
-        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        routing_weights, selected_experts, router_states_next, alignment = _route(
+            self.gate, flat, self.experts.gate_up_proj if self.comm_group.world_size == 1 else None, router_states,
+        )
         if self.comm_group.world_size == 1:
             routed = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights,
+                self.num_experts, selected_experts, routing_weights, alignment=alignment,
             )
         else:
             routed = self._dispatch_tp(flat, routing_weights, selected_experts)

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.resident_hooks import ResidentHooks
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.attn.workspace import WorkspacePool
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -116,7 +118,7 @@ class KeyedWalks(NamedTuple):
     growth: tuple[str, ...] = ()
 
 
-class Resource(ABC):
+class Resource(ResidentHooks, ABC):
     @classmethod
     @abstractmethod
     def build(
@@ -241,9 +243,8 @@ class Resource(ABC):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
-        """Must be idempotent: the conductor sends one NewRequest per partition,
-        so a worker serving several partitions of a request ingests it once
-        for each, possibly after a node has already run a step for it."""
+        """Open the request's state. The worker calls this once per request, on
+        its first NewRequest, though one comes per partition it serves."""
         return
 
     def ingest_capture_row(self, rid: str):
@@ -491,6 +492,16 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def seal_capture_buffers(self) -> None:
+        """Every bucket on the device has been sized and none captured yet: from here on,
+        what a captured graph reads keeps its address. Called once, by the engine."""
+        # A no-op is safe for a resource that never reallocates what a graph reads once it
+        # is allocated (at build, in `build_accelerator_graph_buffers`, or at a bucket's first
+        # plan during sizing). The one kind a plan grows is a FlashInfer workspace:
+        # `AttentionResource` seals the pools they come from, and the dense backend's own,
+        # outside a pool, is never captured.
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
@@ -519,6 +530,10 @@ class AttentionResource(Resource):
 
     _default_label: str = "main"
     _default_layer_idx: int | None = None
+    # FlashInfer's float workspaces, on a resource that plans FlashInfer. Kept here so the
+    # seal is too: a workspace grows at a plan that overflows it, which past capture would
+    # free memory a graph reads.
+    _workspaces: WorkspacePool | None = None
 
     @property
     def default_label(self) -> str:
@@ -535,6 +550,10 @@ class AttentionResource(Resource):
     def reset_default_cursors(self) -> None:
         self._default_label = "main"
         self._default_layer_idx = None
+
+    def seal_capture_buffers(self) -> None:
+        if self._workspaces is not None:
+            self._workspaces.seal()
 
 
 class PublishedInfo(ABC):

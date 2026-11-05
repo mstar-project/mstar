@@ -240,7 +240,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
+       true`` runs the group's node beside the worker's main chain of steps (see
+       below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -383,14 +385,17 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Requests the data worker prepares at once, for a model that
        declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
        beside the API server's intra-op threads (``preprocess_torch_threads``),
-       at most 8; ``1`` prepares inline. See :doc:`adding_models`.
+       at most 8; ``1`` prepares inline. It must be a positive integer, for any
+       model: the server refuses to start on another value. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
-       ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold``,
+       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
+       ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
+       ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
+       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
@@ -591,6 +596,25 @@ processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NV
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
 Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
 
+**A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
+group runs that node's steps on a lane of their own instead of the worker's main chain:
+they take no turn on it, run on a second CUDA stream beside its steps, and whatever
+comes ready meanwhile batches into the next one. It applies to the walks the node's
+submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
+``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. Startup fails with a
+``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
+alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn't the node's alone, is part of a
+combined walk, or has output spans or a stop check. Without the field the node runs on
+the chain:
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
+     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
+
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
 
@@ -676,20 +700,33 @@ model_kwargs
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
 baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID variant fixes the action horizon:
+Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune (whose
+``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
+DROID robot's normalization stats:
 
 .. code-block:: yaml
 
    model: "pi05"
    max_seq_len: 2048
    model_kwargs:
-     action_horizon: 15
+     model_path_hf: "lerobot/pi05_droid"
+     num_cameras: 2
+     norm_stats:  # openpi's DROID quantiles, 8 dims each
+       state: {q01: [...], q99: [...]}
+       actions: {q01: [...], q99: [...]}
    node_groups:
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
 
+With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
+actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
+of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
+[-1, 1].
+
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`.
+client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
+it is batched with, so requests sent with the same seed and settings sample the same
+tokens; give each request its own seed for independent samples.
 
 Restarts and the compile cache
 ------------------------------
@@ -727,6 +764,76 @@ upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which 
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
+
+.. _host-idle:
+
+Host idle states
+----------------
+
+A decode step hands work between a worker's main, GPU and plan threads several
+times, and every step's tokens go from the API server's message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the ``powersave`` governor, so a small model's step is mostly
+host time spent waking CPUs. Two knobs deal with it:
+
+- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
+  one hardware thread of each, and the API server a core of its own. ``siblings``
+  puts a worker's three threads on one core's hardware threads (two cores of an L2
+  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
+  and logs one line saying why for this host, since neither layout has beaten no pin
+  on every host it was measured on (table below). ``off`` never pins, a number names
+  the first worker's core. Under a job's mask too small for every GPU the container
+  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
+  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+  on different cores.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
+  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
+  containers hide, and it logs what it got.
+
+Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
+to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Host
+     - no pin
+     - ``always`` (three cores)
+     - ``siblings``
+     - every core held out of idle
+   * - 2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs)
+     - 548 / 3939
+     - 526 / 3851
+     - 808 / 5670
+     - c=1: no pin 906, three cores 935, ``siblings`` 753
+   * - 2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs)
+     - 371 / 2688
+     - not measured
+     - 527 / 3635 (two cores of a cluster)
+     - 636 / 4251, no pin
+   * - H100 VM without deep idle states (a handoff 22 µs)
+     - 529 (c=1) / 6520 (c=16)
+     - not measured
+     - 419 / 5526 (an earlier ``auto``, the same layout)
+     - not measured
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+     - 634 / 3617
+     - not measured
+     - 506 / 3103 (an earlier ``auto``, the same layout)
+     - not measured
+
+The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
+With the cores held awake, ``siblings`` loses to no pin and three separate cores are
+level with it, so ``auto`` names the hold first when it is set.
+
+Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
+at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
+at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
+leave it ``off``.
+
+Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
 
 .. _tensor-transport:
 
@@ -978,9 +1085,8 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
-Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
-report the same series. A tensor already on the reader (one it made, or one it read once
+``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers

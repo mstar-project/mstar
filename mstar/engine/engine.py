@@ -43,6 +43,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
+from mstar.engine.resources.resident import ResidentPlanner, build_planner
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -188,6 +189,8 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # the node's request slots and device tables, where it runs on them
+    resident: ResidentPlanner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -374,6 +377,9 @@ class ExecutingBatch:
     # them to their tokens on first use
     prepared_rids: tuple[int, ...] = ()
     _seq_lens: dict[int, int] | None = field(default=None, repr=False)
+    # the one object every row shares, when the step was prepared with the
+    # submodule's ``uniform_row_inputs``
+    uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -465,9 +471,10 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
-    def register_prepare_batch(self, inputs: list[NodeInputs]):
+    def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
         self._seq_lens = None
+        self.uniform_inputs = uniform
 
     def seq_len_of(self, rid: int) -> int:
         """The tokens ``rid`` runs this step; -1 before it is prepared."""
@@ -547,12 +554,15 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
+        side_stream_nodes: Collection[str] = (),
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
+        # nodes whose steps run beside the worker's chain (``EngineManager.build``)
+        self._side_stream_nodes = frozenset(side_stream_nodes)
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -564,6 +574,9 @@ class Engine:
         self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
+        # node -> the event after its plan stream's latest pre-plan; see
+        # ``_order_after_pre_plans``
+        self._pre_plan_done: dict[str, Any] = {}
         self._graph_runtime = graph_runtime
         # chunked prefill: per-walk policies and budgets, and rows mid-prefill
         self._chunking = ChunkingManagement(self._submodules)
@@ -693,6 +706,28 @@ class Engine:
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
 
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
+        """Put ``node_name`` on resident tables if it can and the deployment
+        lets it; the startup log says why a node that named walks stays on the
+        host. In `order`, so an owner runs after what it depends on. Built here
+        because the tables are sized by the node's captures, and ahead of them
+        because a capture holds the tables' addresses."""
+        if knobs.resident_planning() == "off":
+            return
+        submodule_mgmt = self._submodules[node_name]
+        walks = submodule_mgmt.submodule.resident_walks()
+        if not walks:
+            return
+        resources = submodule_mgmt.resources
+        submodule_mgmt.resident, refused = build_planner(
+            node_name, walks,
+            {key: resources[key] for key in self._runner.order if key in resources},
+            self._resource_nodes, self._device, runner.max_capture_bs(walks),
+        )
+        if submodule_mgmt.resident is None:
+            logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        runner.bind_resident(submodule_mgmt.resident)
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager
@@ -805,7 +840,8 @@ class Engine:
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            ag_runners[node_name] = AcceleratorGraphRunner(
+            capture_stream = self._capture_stream_for(node_name)
+            runner = ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -816,9 +852,11 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
             )
+            self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
-                node_name, submodule_mgmt
+                node_name, submodule_mgmt, capture_stream,
             )
 
         # Every runner claims its static buffers before any of them captures:
@@ -832,6 +870,8 @@ class Engine:
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
         plan = self._plan_captures(ag_runners, piecewise)
+        for resource in self._resources.values():
+            resource.seal_capture_buffers()
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
@@ -970,8 +1010,22 @@ class Engine:
             took / 2**20, plan.predicted[pool] / 2**20,
         )
 
+    def _capture_stream_for(self, node_name: str) -> Any:
+        """The stream a node captures on; None for the backend's shared one.
+
+        Graphs captured on one stream share what the capture ties to it, so two
+        of them must never run at once. On the chain they can't, but a node
+        whose steps run beside it can overlap any graph of any other node, and
+        with a shared capture stream that silently changes the other graph's
+        result.
+        """
+        backend = self.device_capability.graph_backend
+        if node_name not in self._side_stream_nodes or backend is None or not backend.is_available():
+            return None
+        return backend.new_stream()
+
     def _build_piecewise_runners(
-        self, node_name: str, submodule_mgmt: SubmoduleManagement,
+        self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
     ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
         """One runner per region the submodule declares, not yet captured.
 
@@ -1007,6 +1061,7 @@ class Engine:
                 node_name=node_name,
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
+                capture_stream=capture_stream,
                 lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner
@@ -1162,7 +1217,7 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
-                batch.register_prepare_batch(node_inputs)
+                batch.register_prepare_batch(node_inputs, uniform=uniform)
                 batch.prepared_rids = tuple(batch.request_ids)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
@@ -1353,7 +1408,7 @@ class Engine:
         self.extend_prefix_chains(batch, outputs, host_rows=host_rows, skip_rids=skip_rids)
 
     def extend_prefix_chains(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
         skip_rids: Collection[int] = (),
     ) -> None:
@@ -1384,7 +1439,7 @@ class Engine:
             return
         for rid in rids:
             per_rid = outputs.get(rid)
-            if isinstance(per_rid, dict):
+            if isinstance(per_rid, Mapping):
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
@@ -1590,7 +1645,7 @@ class Engine:
         inputs = batch.inputs
         req_info = batch.per_request_info_wrapped
         if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, req_info
             )
@@ -1686,11 +1741,14 @@ class Engine:
     def _exec_per_request(
         self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
-        """Full step cycle per request, eager (no lease), outputs merged.
+        """Full step cycle per request, without a whole-forward lease, outputs merged.
 
-        The unbatchable fallback: no capture applies (a lease would have set
-        ``running_batched``), so each request declares/admits/plans/commits on
-        its own, keeping the plan matched to its single-request forward.
+        The unbatchable fallback: no whole-forward capture applies (a lease
+        would have set ``running_batched``), so each request declares/admits/
+        plans/commits on its own, keeping the plan matched to its
+        single-request forward. Each request still takes its own
+        piecewise-region leases in ``_declare_and_admit``, so a captured inner
+        loop can replay per request.
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
@@ -1946,6 +2004,15 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # before any copy this plan issues, the resident stage's included
+            self._order_after_pre_plans()
+            # promoted and inline plans per resource, apart
+            plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
+            if ctx.resident is not None:
+                ctx.plan_phase = plan_phase
+                t0 = phase_start()
+                ctx.resident.plan(step, ctx)
+                phase_end(f"{plan_phase}.resident", t0)
 
             # Admit was already done, can move on straight to plan
             if nvtx:
@@ -1956,10 +2023,7 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                # promoted and inline plans per resource, apart
-                self._runner.plan(
-                    step, "res.plan" if batch.preplan_event is not None else "res.plan_fresh",
-                )
+                self._runner.plan(step, plan_phase)
             finally:
                 phase_end(
                     "engine.plan.promoted" if batch.preplan_event is not None
@@ -2028,6 +2092,8 @@ class Engine:
             try:
                 self._runner.commit(step)
                 batch.committed = step
+                if submodule_mgmt.resident is not None:
+                    submodule_mgmt.resident.commit(step, ctx)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -2052,8 +2118,12 @@ class Engine:
         the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
+            ctx = batch.step_context
+            if ctx.resident is not None:
+                ctx.resident.flush(ctx.resident_plan)
             return cg_runner.run_forward(
-                lease, preprocessed, plan_done_event=batch.preplan_event,
+                lease, preprocessed,
+                plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -2176,7 +2246,7 @@ class Engine:
         return None if mgmt is None else mgmt.submodule.get_stop_policies(graph_walk)
 
     def check_stop_for_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: Mapping[str, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
@@ -2808,9 +2878,13 @@ class Engine:
                 graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
                 slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
             )
+        planner = submodule_mgmt.resident
+        ctx = batch.step_context
+        ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
+        ctx.resident_plan = None
         if lease is not None:
             batch.lease_slot(lease)
-            batch.step_context.force_prefill = cg_runner.is_packed(lease)
+            ctx.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
@@ -2882,7 +2956,7 @@ class Engine:
         inputs = (
             cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs)
+            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
         )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
@@ -2921,16 +2995,47 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with stream if stream is not None else nullcontext():
-                self._runner.pre_plan(step)
+            ctx = batch.step_context
+            event = torch.Event(device=self._device)
+            try:
+                with stream if stream is not None else nullcontext():
+                    self._order_after_pre_plans()
+                    # A raise here takes what a raise from `pre_plan` below takes:
+                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # stays with its streams for exec's admit to find.
+                    if ctx.resident is not None:
+                        ctx.plan_phase = "res.pre_plan"
+                        t0 = phase_start()
+                        ctx.resident.plan(step, ctx)
+                        phase_end("res.pre_plan.resident", t0)
+                    self._runner.pre_plan(step)
+            finally:
+                # recorded even when the plan raised: its copies are in flight
+                event.record(stream)
+                self._pre_plan_done[batch.node_name] = event
             laps.skip()
-            batch.preplan_event = torch.Event(device=self._device)
-            batch.preplan_event.record(stream)
+            batch.preplan_event = event
             batch.preplanned_rids = tuple(batch.request_ids)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
+
+    def _order_after_pre_plans(self) -> None:
+        """Order the current stream after every copy a pre-plan has issued.
+
+        Resources skip a copy into a slot's buffer that already holds the
+        bytes (``H2DMirror``, ``_SlotBuffer.zero_prefix``), recorded when the
+        copy is issued. A pre-plan's copy runs on its node's plan stream, and
+        the pre-plan may be dropped before its batch runs, so nothing else
+        orders a later step that skips its own copy, or overwrites the buffer,
+        after it. Every plan stream is waited on, not just this node's: nodes
+        can share a resource and its slot buffers."""
+        events = tuple(self._pre_plan_done.values())
+        if events:
+            stream = torch.accelerator.current_stream(self._device)
+            for event in events:
+                stream.wait_event(event)
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""
@@ -3006,11 +3111,19 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
-            self._resident_delta[node_name].add_offloaded(
-                self._graph_runtime.get_rid_string(request_id)
-            )
+        if freed > 0:
+            self._release_resident_slot(node_name, request_id)
+            if node_name in self._resident_delta:
+                self._resident_delta[node_name].add_offloaded(
+                    self._graph_runtime.get_rid_string(request_id)
+                )
         return freed
+
+    def _release_resident_slot(self, node_name: str, request_id: int) -> None:
+        """An offloaded request needs no slot: a reload is written whole anyway."""
+        planner = self._submodules[node_name].resident
+        if planner is not None:
+            planner.release(request_id)
 
     def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
@@ -3143,6 +3256,7 @@ class Engine:
                             wire_rid, node_name, len(delta),
                         )
                         return False
+                    self._release_resident_slot(node_name, rid)
                     logger.info(
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
@@ -3242,6 +3356,8 @@ class Engine:
         self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+            if submodule_mgmt.resident is not None:
+                submodule_mgmt.resident.release(request_id)
         return freed
 
     def shutdown(self):

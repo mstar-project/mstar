@@ -56,7 +56,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )
-    w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
+    w.request_state = SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None)
     w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sharding: registered.append(rid),
