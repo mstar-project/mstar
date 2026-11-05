@@ -1,8 +1,5 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
-# Decode reads its rows off device tables (docs/serving.rst, knobs)
-knobs:
-  resident_planning: on
 # Captured text-prefill ladder (see docs/models.rst): the powers of two to
 # 2048, and 2176 for a mixed step's decode rows beside four prompts. The LLM's
 # 2048-token step budget caps prefill and mixed steps, so no bucket past 2176

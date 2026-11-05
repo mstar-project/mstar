@@ -244,15 +244,15 @@ class StepRepeats:
         """The walks asked to run on the device, by their node's settings."""
         return {key: self.config(key[0]) for key in sorted(self.edges) if self.config(key[0]).device_stop != "off"}
 
-    def kept_rows(self, resident: bool) -> dict[tuple[str, str], frozenset[str]]:
-        """The loop-back signals of each walk whose config asks for resident
-        planning or repeats, kept in device rows between its steps. Not one that
+    def kept_rows(self, resident: Collection[str]) -> dict[tuple[str, str], frozenset[str]]:
+        """The loop-back signals of each walk of a node asked for resident
+        planning (``resident``) or repeats, kept in device rows between its steps. Not one that
         also leaves the Loop (a terminal edge): its last value has to be a
         tensor the Loop's next node reads, which a step kept on the device
         doesn't hand on."""
         return {
             key: loop_back(edges) - edges.leaving
-            for key, edges in self.edges.items() if resident or self.limit(key[0]) > 1
+            for key, edges in self.edges.items() if key[0] in resident or self.limit(key[0]) > 1
         }
 
     def carried(self) -> dict[tuple[str, str], frozenset[str]]:

@@ -56,6 +56,7 @@ from mstar.engine.resources.resident import (
     ResidentPlanner,
     build_planner,
     declared_streams,
+    resident_asked,
     step_refusal,
     watch_table_reads,
     watched_counts,
@@ -859,8 +860,7 @@ class Engine:
             return
         submodule_mgmt = self._submodules[node_name]
         refusals = submodule_mgmt.resident_refusals
-        mode = knobs.resident_planning()
-        if mode == "off" or (mode == "auto" and not submodule_mgmt.submodule.resident_by_default):
+        if not resident_asked(submodule_mgmt.submodule):
             refusals.update(dict.fromkeys(looped, NOT_ASKED))
             return
         steps = {}
@@ -1940,6 +1940,13 @@ class Engine:
             value = preprocessed.get(name)
             if isinstance(value, torch.Tensor):
                 mgmt.loopback_rows.write_rows(signal, rids, value, routed)
+
+    def resident_asked(self, node_name: str) -> bool:
+        return resident_asked(self._submodules[node_name].submodule)
+
+    def resident_nodes(self) -> frozenset[str]:
+        """The nodes the serving config asks for resident planning."""
+        return frozenset(name for name in self._submodules if self.resident_asked(name))
 
     def _keep_rows(
         self, mgmt: SubmoduleManagement, graph_walk: str, rids: Sequence, outputs,

@@ -2623,7 +2623,9 @@ def _engine(resources, device=CPU):
     engine._device = device
     engine._runner = StepRunner(resources)
     engine._resource_nodes = {key: frozenset({"n"}) for key in resources}
-    engine._submodules = {"n": SimpleNamespace(resources=resources, resident=None, resident_refusals={})}
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=SimpleNamespace(), resources=resources, resident=None, resident_refusals={},
+    )}
     return engine, engine._submodules["n"]
 
 
@@ -2835,6 +2837,25 @@ def test_a_node_resident_by_default_is_resident_with_no_knob(monkeypatch, settin
     finally:
         knobs.configure(None)
     assert mgmt.resident_refusals["decode"] == ("runner: probed" if asked else NOT_ASKED)
+
+
+@pytest.mark.parametrize(("setting", "rows"), [(None, {"keeps"}), ("on", {"keeps", "other"}), ("off", set())])
+def test_a_node_that_keeps_resident_planning_keeps_its_rows_under_auto_as_under_on(monkeypatch, setting, rows):
+    """The default (``auto``) asks for a ``resident_by_default`` node what ``on``
+    asks, so a config needn't set the knob (review-r2 F30): rows included."""
+    from mstar.worker.engine_manager import _row_nodes
+
+    monkeypatch.delenv("MSTAR_RESIDENT_PLANNING", raising=False)
+    knobs.configure(None if setting is None else {"resident_planning": setting})
+    loop = SimpleNamespace(get_nodes=lambda: {"keeps": None, "other": None})
+    model = SimpleNamespace(get_graph_walk_graphs=lambda: {"w": SimpleNamespace(get_loops=lambda: {"l": loop})})
+    submodules = {
+        "keeps": SimpleNamespace(resident_by_default=True), "other": SimpleNamespace(resident_by_default=False),
+    }
+    try:
+        assert _row_nodes(model, {}, submodules) == rows
+    finally:
+        knobs.configure(None)
 
 
 def test_the_slot_count_is_no_knob():
@@ -3224,7 +3245,7 @@ def test_a_loop_back_that_also_leaves_the_loop_is_not_kept_in_rows():
     repeats = StepRepeats.__new__(StepRepeats)
     repeats.edges = {("n", "w"): edges}
     repeats.limit = lambda node: 4
-    assert repeats.kept_rows(resident=False) == {("n", "w"): {"t"}}
+    assert repeats.kept_rows(resident=()) == {("n", "w"): {"t"}}
 
 
 def test_a_walk_with_a_capture_key_that_cant_be_resident_is_refused_at_load_not_at_capture():

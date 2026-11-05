@@ -5275,7 +5275,8 @@ class Worker(RepeatingSteps):
             {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
             self._step_repeats.device_stops() if self._step_repeats is not None else {},
-            self._step_repeats.kept_rows(knobs.resident_planning() == "on") if self._step_repeats is not None else {},
+            self._step_repeats.kept_rows(self.engine_manager.engine.resident_nodes())
+            if self._step_repeats is not None else {},
         )
         if self._step_repeats is not None:
             self._ask_rings()

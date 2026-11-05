@@ -19,7 +19,6 @@ from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
 from mstar.streaming.topology import ProducerWalkCtx
-from mstar.utils import knobs
 from mstar.worker.step_repeats import edge_refusal, loop_back, run_columns
 
 if TYPE_CHECKING:
@@ -174,9 +173,10 @@ class RepeatingSteps:
         """Why this walk's loop-back values can't stay in the node's device
         rows between its steps, or None: asked where the node's config asks
         for resident planning or repeats."""
-        if self._step_repeats.limit(node_name) == 1 and knobs.resident_planning() != "on":
+        engine = self.engine_manager.get_engine(node_name)
+        if self._step_repeats.limit(node_name) == 1 and not engine.resident_asked(node_name):
             return NOT_ASKED
-        return self.engine_manager.get_engine(node_name).rows_refusal(node_name, graph_walk)
+        return engine.rows_refusal(node_name, graph_walk)
 
     def _ask_run_columns(self, node_name: str, graph_walk: str) -> None:
         engine = self.engine_manager.get_engine(node_name)

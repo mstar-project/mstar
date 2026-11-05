@@ -3,7 +3,6 @@ max_seq_len: 32768
 # Raise the gen-0 GC threshold: at CPython's 700 a 128-row decode step
 # collects almost every step and runs a full collection every few hundred.
 knobs:
-  resident_planning: on
   gc_gen0_threshold: 50000
 # Captured text-prefill ladder (see docs/models.rst): the powers of two to
 # 2048, and 2176 for a mixed step's decode rows beside four prompts. The LLM's

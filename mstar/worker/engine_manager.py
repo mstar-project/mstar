@@ -13,10 +13,10 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.resident import resident_asked
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils import knobs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -193,17 +193,18 @@ def _refuse_unservable_lanes(
     return placed
 
 
-def _row_nodes(model: Model, model_config: Mapping) -> set[str]:
+def _row_nodes(model: Model, model_config: Mapping, submodules: Mapping) -> set[str]:
     """The nodes whose config asks to keep loop-back values in device rows:
-    those it asks to repeat, or every node in a Loop under resident planning."""
+    those it asks to repeat, or a node in a Loop that resident planning asks."""
     repeating = {
         node for node, block in (model_config.get("step_repeats") or {}).items()
         if isinstance(block, Mapping) and block.get("max", 1) != 1
     }
-    if knobs.resident_planning() != "on":
+    resident = {name for name, submodule in submodules.items() if resident_asked(submodule)}
+    if not resident:
         return repeating
     loops = (loop for section in model.get_graph_walk_graphs().values() for loop in section.get_loops().values())
-    return repeating | {node for loop in loops for node in loop.get_nodes()}
+    return repeating | (resident & {node for loop in loops for node in loop.get_nodes()})
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -340,7 +341,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
-            row_nodes=_row_nodes(model, model_config),
+            row_nodes=_row_nodes(model, model_config, submodules),
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}

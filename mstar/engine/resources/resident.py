@@ -39,6 +39,7 @@ import triton.language as tl
 
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import BucketKey, SubmoduleStep
+from mstar.utils import knobs
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.profiler import PhaseLaps
 
@@ -105,6 +106,13 @@ class _WatchedCounts(dict):
     def values(self):
         table_read(LOOP_COUNTER)
         return super().values()
+
+
+def resident_asked(submodule) -> bool:
+    """Whether the serving config asks ``submodule``'s looping walks for
+    resident planning: ``on`` every node, ``auto`` one that keeps it by default."""
+    mode = knobs.resident_planning()
+    return mode == "on" or (mode == "auto" and submodule.resident_by_default)
 
 
 def watched_counts(counts: Mapping[str, int]) -> Mapping[str, int]:
