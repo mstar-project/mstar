@@ -715,10 +715,12 @@ class KVManager(AttentionResource):
         # `_victims`: a victim not yet moved -> its earmark.
         # `_hosted`: the victims that move to the host, decided when they are chosen.
         # `_ran_short`: request -> its last grant that ran short.
+        # `_parked`: the requests that wait holding their allotment, which `make_room` can move.
         self._earmarks: dict[str, Earmark] = {}
         self._victims: dict[str, Earmark] = {}
         self._hosted: set[str] = set()
         self._ran_short: dict[str, ShortGrant] = {}
+        self._parked: set[str] = set()
         if _DEBUG_ASSERTS and tp_cache:
             self._arena.trail = (0, 0)
         self._device = device
@@ -4405,6 +4407,7 @@ class KVManager(AttentionResource):
                     del self._victims[victim]
                     self._hosted.discard(victim)
             self._ran_short.pop(rid, None)
+            self._parked.discard(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -4504,6 +4507,8 @@ class KVManager(AttentionResource):
                         for page in (*stream.pages(), *(stream.lease or ()))
                     ]
                     assert not held, f"{rid} waits {'on the host' if on_host else 'dropped'}, holding pages {held}"
+            parked = {rid for rid in self._asks if rid in self._allotments}
+            assert self._parked == parked, f"`_parked` lists {sorted(self._parked)}, but {sorted(parked)} wait holding"
             if self._cpu_pool is not None:
                 self._assert_host_pages_conserved()
 
@@ -4643,6 +4648,7 @@ class KVManager(AttentionResource):
     def _admit(self, rid: str, pages: int) -> None:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers. Caller holds the lock."""
         if rid in self._allotments:
+            self._parked.discard(rid)
             self._allot(rid, self._asks.pop(rid))
             return
         returning = self._return_pages(rid) if self._on_host(rid) else None
@@ -4744,6 +4750,7 @@ class KVManager(AttentionResource):
                 allotment = self._allotments[rid]
                 allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + short.pages)
                 self._asks[rid] = short.pages
+                self._parked.add(rid)
                 pages = self._host_pages(rid)
                 if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
                     self._hosted.add(rid)
@@ -4751,6 +4758,10 @@ class KVManager(AttentionResource):
                 return Victims([], [], [], waits=short.pages)
             self._allot(rid, claim)
             return self._earmark(Earmark(rid, short.pages, set(), claim), victims)
+
+    def any_parked(self) -> bool:
+        """Whether a request waits holding its allotment, as `make_room` needs. Read without the lock."""
+        return bool(self._parked)
 
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
@@ -4760,7 +4771,7 @@ class KVManager(AttentionResource):
         if not self._decides:
             return None
         with self._lock:
-            parked = [other for other in newer if other in self._asks and other in self._allotments]
+            parked = [other for other in newer if other in self._parked]
             if not parked or mark.rid not in self._asks:
                 return None
             pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
@@ -4895,6 +4906,7 @@ class KVManager(AttentionResource):
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
         self._ran_short.pop(rid, None)
+        self._parked.discard(rid)
         self._settle(rid, self._room() - room)
 
     def _allot(self, rid: str, pages: int) -> None:
