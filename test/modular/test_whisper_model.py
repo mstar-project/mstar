@@ -394,7 +394,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     # postprocess keeps the state under its own name for the loop-back edge
     outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
     sub.postprocess("ts", None, outputs)
-    assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
+    assert outputs["text_inputs"][0].tolist() == [5] and outputs["ts_rules"] == [routed]
     # the capture templates carry the same row so the graphs' input sets are fixed
     decode_cfg, prefill_cfg = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
