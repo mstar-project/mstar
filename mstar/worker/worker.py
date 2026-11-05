@@ -216,6 +216,7 @@ class Worker:
             model, my_worker_graphs, all_worker_graph_ids_to_nodes,
             sharding_config, parallel_groups, model_config,
         )
+        self.layout = layout
         node_to_partition = dict(layout.node_to_partition)
         my_walks = layout.my_walks
         node_names = set(layout.node_names)
