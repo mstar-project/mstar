@@ -33,7 +33,7 @@ class KVReqConfig(ResourceReqConfig):
 
 A dropped request keeps only its token ids, so a request can be dropped only if its node can rebuild all of its KV from them. One that can't be dropped can still move to the host.
 
-A request that nothing can take pages back from must never run short. It reserves its whole footprint up front, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.
+A request that nothing can take pages back from must never run short. From the moment it is guaranteed, it reserves its whole footprint, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.
 
 The model declares the footprint as KV spans (#832). A span's kind says what its KV is made from:
 
@@ -41,7 +41,7 @@ The model declares the footprint as KV spans (#832). A span's kind says what its
 - `digest`: an encoder's output
 - `rows`: another node's outputs
 
-Each pool decides the class once, at the request's first `ask`, from two facts. The conductor marks a request that streams an output that can't pause, and that mark holds in every pool. The worker marks whether a drop there can free the request's pages: every node of the pool that writes the request's KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible while the host pool sets aside room for its move: its prompt when it is admitted, and each page it takes after that before it takes it. When the host pool has no room for that, at admission or later, it becomes guaranteed, and the host pool logs and counts it.
+Each pool decides the class from two facts. The conductor marks a request that streams an output that can't pause, and that mark holds in every pool. The worker marks whether a drop there can free the request's pages: every node of the pool that writes the request's KV on that worker has a policy that can write all of it again. A request no drop can free is preemptible while the host pool sets aside room for its move: its prompt when it is admitted, and each page it takes after that before it takes it. When the host pool has no room for that, at admission or at any page after, it becomes guaranteed, and the host pool logs and counts it.
 
 | # | A request with | Class | Why |
 |---|---|---|---|
@@ -307,7 +307,7 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 ### 5.5 Why every request finishes
 
-A guaranteed request reserves its whole footprint and is never preempted, so once admitted it finishes.
+A guaranteed request reserves its whole footprint and is never preempted, so once it is admitted and guaranteed it finishes.
 
 Take the oldest request in the pool:
 
