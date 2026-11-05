@@ -349,11 +349,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the node while a request with log-probs is live. ``device_stop`` (default ``off``):
        ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
        ending on the first of: every row done, the run's count, ready work on the worker, a
-       new request arriving while it runs, or ``refill_at`` (a share of the run's rows done; default off). A live row hands on to the
+       new request arriving while it runs, or ``refill_at`` (a share of the run's rows done; default off,
+       and it needs ``device_stop``). A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
-       its stop left them; it needs a resident walk. ``device_launch: on`` asks for that run
-       by itself (``device_stop: skip`` unless set). Both need a token stop, one rank, CUDA
+       its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
        copies alone. ``stream_tokens: true`` sends a run's tokens to the client as its replays
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``

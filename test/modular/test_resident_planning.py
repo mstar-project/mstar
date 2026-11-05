@@ -800,7 +800,9 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"max": 2, "device_stop": "maybe"}}, "must be one of"),
     ({"n": {"device_stop": "skip"}}, "need max above 1"),
     ({"n": {"max": 2, "refill_at": 1.5}}, "must be in"),
-    ({"n": {"max": 2, "device_launch": "maybe"}}, "must be on or off"),
+    ({"n": {"max": 2, "device_stop": "skip", "refill_at": "0.5"}}, "must be in"),
+    ({"n": {"max": 2, "refill_at": 0.5}}, "needs device_stop"),
+    ({"n": {"max": 2, "device_launch": "on"}}, "not settings"),
     ({"n": {"max": 2, "ready_waits": "yes"}}, "must be a boolean"),
     ({"n": {"ready_waits": True}}, "need max above 1"),
     ({"n": {"auto": True}}, "need max above 1"),
@@ -868,12 +870,6 @@ def test_a_tp_followers_settled_counts_the_leader_never_reports_are_let_go():
     for seq in range(2000):
         worker._settle_tp_repeats(seq, follower=2)
     assert len(worker._tp_repeats[0]) <= 257
-
-
-def test_device_launch_means_the_while_run():
-    assert parse_step_repeats({"n": {"max": 2, "device_launch": "on"}}, {"n"})["n"].device_stop == "skip"
-    drop = {"max": 2, "device_launch": "on", "device_stop": "drop_rows"}
-    assert parse_step_repeats({"n": drop}, {"n"})["n"].device_stop == "drop_rows"
 
 
 def test_each_node_asks_for_its_own_repeats():

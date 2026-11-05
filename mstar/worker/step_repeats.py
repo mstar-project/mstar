@@ -46,8 +46,6 @@ class RepeatConfig:
     device_stop: str = "off"
     # end a run once this share of its rows is done, so new ones join sooner
     refill_at: float | None = None
-    # on: the run goes on the device (the WHILE run), with device_stop off taken as skip
-    device_launch: str = "off"
     # send a run's tokens to the client as its replays finish, not when it lands
     stream_tokens: bool = False
     # ready rows wait for a run: after a step that took rows, the next takes none
@@ -84,12 +82,6 @@ class RepeatConfig:
                 f"step_repeats for {node!r}: device_stop is {config.device_stop!r}; "
                 f"it must be one of {cls.DEVICE_STOPS}"
             )
-        if config.device_launch not in ("on", "off"):
-            raise ValueError(
-                f"step_repeats for {node!r}: device_launch is {config.device_launch!r}; it must be on or off"
-            )
-        if config.device_launch == "on" and config.device_stop == "off":
-            config = replace(config, device_stop="skip")
         if type(config.ready_waits) is int and config.ready_waits < 1:
             raise ValueError(
                 f"step_repeats for {node!r}: ready_waits is {config.ready_waits!r}; it must be true or at least 1"
@@ -110,8 +102,11 @@ class RepeatConfig:
                 raise ValueError(
                     f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
                 )
-        if config.refill_at is not None and not 0 < config.refill_at <= 1:
-            raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
+        if config.refill_at is not None:
+            if type(config.refill_at) not in (int, float) or not 0 < config.refill_at <= 1:
+                raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
+            if config.device_stop == "off":
+                raise ValueError(f"step_repeats for {node!r}: refill_at ends a device run, which needs device_stop")
         default = cls()
         needs = [k for k in block if k != "max" and getattr(config, k) != getattr(default, k)]
         if config.max == 1 and needs:
