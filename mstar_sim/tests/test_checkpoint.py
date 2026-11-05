@@ -74,11 +74,26 @@ def _protobuf(*fields) -> bytes:
                     for n, v in fields)
 
 
-def test_a_checkpoint_of_torch_and_onnx_weights_copies_shapes_only(tmp_path):
+def test_a_checkpoint_of_torch_and_onnx_weights_copies_shapes_only(tmp_path, monkeypatch):
     """Weights with no safetensors (Kokoro's ``.pth``, CosyVoice3's speech tokenizer ``.onnx``,
     which mstar reads into torch modules) are copied shapes-only: the ONNX file byte for byte
-    over a hole where its large initializer's data was, which mstar's reader reads unchanged."""
+    over a hole where its large initializer's data was, which mstar's reader reads unchanged.
+    The ONNX model is read by ranges, its structure and small tensors only, not fetched whole."""
     from mstar.model.cosyvoice3.components.onnx_weights import read_onnx
+    from mstar_sim import checkpoint
+
+    fetch, ranges, read = checkpoint._LocalSource.fetch, checkpoint._LocalSource.ranges, []
+
+    def no_onnx(self, rel):
+        assert not rel.endswith(".onnx"), f"{rel} fetched whole"
+        return fetch(self, rel)
+
+    def counted(self, rel, spans):
+        read.extend(stop - start for start, stop in spans)
+        return ranges(self, rel, spans)
+
+    monkeypatch.setattr(checkpoint._LocalSource, "fetch", no_onnx)
+    monkeypatch.setattr(checkpoint._LocalSource, "ranges", counted)
 
     src = tmp_path / "src"
     src.mkdir()
@@ -103,6 +118,7 @@ def test_a_checkpoint_of_torch_and_onnx_weights_copies_shapes_only(tmp_path):
     assert onnx.tensors["w"].shape == big and onnx.tensors["scale"].tolist() == [0.5, 2.0]
     assert [node.op_type for node in onnx.nodes] == ["MatMul"]
     assert any("speech_tokenizer.onnx" in note for note in manifest["notes"])  # holes read as zeros: said so
+    assert sum(read) < 1 << 20
 
 
 def test_an_onnx_model_the_host_could_run_stays_real(tmp_path):

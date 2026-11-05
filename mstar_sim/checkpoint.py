@@ -8,7 +8,7 @@ directory) and writes each file as its header, verbatim, over a sparse
 copies of the configs, tokenizer and other small files. Weights in other formats
 are copied shapes-only too: a ``torch.load`` file saved again with its large
 tensors value-less, an ONNX model over ``MAX_ASSET_BYTES`` byte for byte over a hole
-where its large initializers' data was. Every model's own loader
+where its large initializers' data was (read by ranges, as the safetensors headers are). Every model's own loader
 reads it unchanged; the simulator reads the small tensors for real and the rest
 from the headers only (``mstar_sim.patches.header_only_weights``), so a model of
 any size costs a few MB of disk.
@@ -26,7 +26,6 @@ import fnmatch
 import json
 import logging
 import math
-import mmap
 import os
 import shutil
 import struct
@@ -181,32 +180,63 @@ def _shapes_only_torch_file(path: Path, dest: Path) -> int | None:
     return sum(x.numel() for x in tree_flatten(obj)[0] if isinstance(x, torch.Tensor))
 
 
-def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
+class _Pages:
+    """File ``rel`` of ``src`` as a read-only buffer fetched a page at a time (``src.ranges``)
+    as it is indexed: a walk of an ONNX model's structure reads the pages it touches, not the
+    weights it steps over."""
+
+    SIZE = 1 << 16
+
+    def __init__(self, src, rel: str, size: int):
+        self._src, self._rel, self._size, self._pages = src, rel, size, {}
+
+    def __len__(self) -> int:
+        return self._size
+
+    def _page(self, n: int) -> bytes:
+        if n not in self._pages:
+            start = n * self.SIZE
+            self._pages[n] = self._src.ranges(self._rel, [(start, min(start + self.SIZE, self._size))])[0]
+        return self._pages[n]
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            start, stop, _ = i.indices(self._size)
+            return b"".join(self._page(n)[max(start - n * self.SIZE, 0):stop - n * self.SIZE]
+                            for n in range(start // self.SIZE, -(-stop // self.SIZE)))
+        if not 0 <= i < self._size:
+            raise IndexError(i)
+        return self._page(i // self.SIZE)[i % self.SIZE]
+
+
+def _shapes_only_onnx(src, rel: str, size: int, dest: Path) -> int | None:
     """An ONNX model (CosyVoice3's speech tokenizer, whose weights mstar reads into torch
     modules) copied byte for byte over a hole where each large initializer's data was: its
-    graph and small tensors as they are. Returns its parameter count; None if not ONNX."""
+    graph and small tensors as they are, read by ranges, so the large data is never fetched.
+    Returns its parameter count; None if not ONNX."""
     from mstar.model.cosyvoice3.components.onnx_weights import _fields, _packed_varints
 
-    holes, params = [], 0
-    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
-        try:
-            graph = next(v for n, w, v in _fields(buf, 0, len(buf)) if n == 7 and w == 2)
-            for n, w, span in _fields(buf, *graph):
-                if n != 5 or w != 2:  # not an initializer (a TensorProto)
-                    continue
-                dims, data = [], None
-                for field, wire, value in _fields(buf, *span):
-                    if field == 1:
-                        dims.extend(_packed_varints(buf, value) if wire == 2 else [value])
-                    elif field in (4, 9) and wire == 2:  # float_data or raw_data
-                        data = value
-                params += math.prod(dims)
-                if data is not None and math.prod(dims) >= SMALL_WEIGHT:
-                    holes.append(data)
-        except (StopIteration, ValueError, IndexError):
-            return None
-        kept = zip([0, *(stop for _, stop in holes)], [*(start for start, _ in holes), len(buf)], strict=True)
-        _write_over_hole(dest, len(buf), ((start, buf[start:stop]) for start, stop in kept))
+    buf, holes, params = _Pages(src, rel, size), [], 0
+    try:
+        graph = next(v for n, w, v in _fields(buf, 0, size) if n == 7 and w == 2)
+        for n, w, span in _fields(buf, *graph):
+            if n != 5 or w != 2:  # not an initializer (a TensorProto)
+                continue
+            dims, data = [], None
+            for field, wire, value in _fields(buf, *span):
+                if field == 1:
+                    dims.extend(_packed_varints(buf, value) if wire == 2 else [value])
+                elif field in (4, 9) and wire == 2:  # float_data or raw_data
+                    data = value
+            params += math.prod(dims)
+            if data is not None and math.prod(dims) >= SMALL_WEIGHT:
+                holes.append(data)
+    except (StopIteration, ValueError, IndexError):
+        return None
+    kept = [(start, stop) for start, stop in zip([0, *(stop for _, stop in holes)],
+                                                  [*(start for start, _ in holes), size], strict=True)
+            if stop > start]
+    _write_over_hole(dest, size, zip((start for start, _ in kept), src.ranges(rel, kept), strict=True))
     return params
 
 
@@ -218,8 +248,8 @@ def _build(src, out: Path) -> dict:
             kept = True
         elif (size > (MAX_ASSET_BYTES if rel.endswith(".onnx") else SMALL_WEIGHT_FILE)
               and rel.endswith(_WEIGHT_FILES) and not _weight_copy(rel, src.files)):
-            shapes_only = _shapes_only_onnx if rel.endswith(".onnx") else _shapes_only_torch_file
-            count = shapes_only(src.fetch(rel), out / rel)
+            count = (_shapes_only_onnx(src, rel, size, out / rel) if rel.endswith(".onnx")
+                     else _shapes_only_torch_file(src.fetch(rel), out / rel))
             if count is None:
                 notes.append(f"skipped {rel}: not a plain tensor file or ONNX model")
             elif rel.endswith(".onnx"):
