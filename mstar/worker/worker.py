@@ -3088,7 +3088,7 @@ class Worker:
             # a count stop is the loop's cap, which a run never passes (`loop_room`)
             return "node: the runtime doesn't check its stop: its own check_stop decides"
         edges = self._step_repeats.edges[(node_name, graph_walk)]
-        refusal = edge_refusal(edges, engine.streamed_iteration_inputs(node_name))
+        refusal = edge_refusal(edges, engine.streamed_iteration_inputs(node_name), node_name in self.parallel_nodes)
         if refusal is None:
             # the client's copy of a token rides the step's token column
             inline = (

@@ -671,6 +671,16 @@ def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, why):
     assert refusal is None if why is None else refusal.startswith(why)
 
 
+@pytest.mark.parametrize(("parallel", "why"), [(False, None), (True, "TP: each rank's window")])
+def test_under_tp_a_walk_reading_a_streamed_iteration_input_does_not_repeat(parallel, why):
+    """Each rank's window is what reached it, so a follower would read other items."""
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    refusal = edge_refusal(loop_edges(_token_loop(streamed=("chunk",)), "n"), {"chunk"}, parallel)
+    assert refusal is None if why is None else refusal.startswith(why)
+
+
 def test_a_run_keeps_a_column_of_each_per_iteration_output_the_token_column_doesnt_carry():
     from mstar.graph.base import loop_edges
     from mstar.worker.step_repeats import run_columns

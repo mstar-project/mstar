@@ -129,16 +129,19 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
     return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
 
 
-def edge_refusal(edges: LoopEdges, windowed: Collection[str] = ()) -> str | None:
+def edge_refusal(edges: LoopEdges, windowed: Collection[str] = (), parallel: bool = False) -> str | None:
     """Why a run can't serve one of ``edges``, or None. A loop-back signal is
     carried between replays (``NodeSubmodule.repeat_carry``), a streamed input
     the node reads an item an iteration of (``windowed``: a streamed
     ``IterationInput``) is a window of its ready items, and a per-iteration
     output is served by a column per replay (``run_columns``), as items of its
-    own."""
+    own. Under TP (``parallel``) a window is what reached each rank, so ranks
+    would feed different items into the same collectives."""
     for name, kind in sorted(edges.inputs.items()):
         if kind is EdgeKind.PER_ITERATION and name not in windowed:
             return f"node: its streamed input {name!r} isn't an iteration input it reads an item of a replay"
+        if kind is EdgeKind.PER_ITERATION and parallel:
+            return f"TP: each rank's window of its streamed input {name!r} is what reached that rank"
     for (signal, dest), kind in sorted(edges.outputs.items()):
         if kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION and (signal, dest) not in edges.items:
             return f"graph runtime: {signal!r} -> {dest!r} is read once an iteration by its node"
