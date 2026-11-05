@@ -16,14 +16,16 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import test_kv_drop as kv_drop
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
@@ -718,6 +720,63 @@ def test_a_drop_is_checked_against_the_tokens_its_rebuild_writes(prefilling):
     rebuilds.start(R, NODE, prefilling)
 
     assert tokens == rebuilds.cursor(R, NODE).total, "the drop would check one count and the rebuild write another"
+
+
+def _write_kv(kv, rid: int, walk: str, *spans: int) -> None:
+    """Write ``rid``'s next slots in steps of ``walk``, ``spans[i]`` of them in step ``i``."""
+    for span in spans:
+        step = KVStep(segments=(Segment(rid, "main", span),))
+        ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        kv.commit(step, ctx)
+
+
+@pytest.mark.parametrize("spans", [(PrefixSpan(11, 11, PREFILL),), IMAGE_CHAT], ids=["text", "image"])
+@pytest.mark.parametrize("mid_prefill", [False, True], ids=["mid-decode", "mid-prefill"])
+def test_a_drop_takes_the_slots_its_rebuild_writes_and_the_rebuild_writes_them(spans, mid_prefill):
+    """The drop counted only a request's kept ids, so it refused a prompt with an image, whose rebuild also writes
+    the image's slots from host copies. A count kept apart from the one the rebuild runs could also pass the drop and
+    then write other slots than the KV held, which the KV caught only at the rebuild."""
+    walk, image = spans[0].walk, len(spans) > 1
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    assert _ingest(rebuilds, R, spans)
+    kv = kv_drop._manager()
+    layout = StreamLayout(spans=spans, growth=(("decode_loop", 1),))
+    kv.ingest_request(R, KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    if mid_prefill:
+        _write_kv(kv, R, walk, 9)
+        prefilling, iters = Prefilling(walk, 9, 11), {}
+    else:
+        step = _ran(walk, {R: {
+            "text_inputs": [torch.arange(3), torch.arange(2)] if image else [torch.arange(11)],
+            "embeds": [torch.zeros(6, 2)],
+        }})
+        step.per_request_info[R].graph_walk = walk
+        rebuilds.keep_prompts(step)
+        rebuilds.keep_copies(step)
+        rebuilds.flush()
+        # the prompt, then the prefill's sample and one per decode step
+        _write_kv(kv, R, walk, 11)
+        _write_kv(kv, R, DECODE, 1, 1)
+        rebuilds._kept[NODE][R].sampled.extend([100, 101, 102])
+        prefilling, iters = None, {"decode_loop": 2}
+    assert rebuilds.refusal(R, NODE, DECODE if iters else walk, iters, prefilling) is None
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    assert kv.check_drop(R, tokens) is None, f"the drop refused {tokens} slots for a KV that holds them"
+    kv.drop(R, tokens)
+    held = kv._dropped[R].held
+    rebuild = rebuilds.start(R, NODE, prefilling)
+    if rebuild is not None:
+        kv.prepare_rebuild(R, rebuild)
+    _write_kv(kv, R, walk, rebuilds.cursor(R, NODE).total)
+    rebuilds.land_chunk(R, NODE, None)
+    kv.land_rebuild(R)
+
+    assert kv._streams[R]["main"].stored_len == held, "the rebuild wrote other slots than the drop checked"
+    # the rest of the prompt, or the next decode step
+    _write_kv(kv, R, *((walk, 2) if mid_prefill else (DECODE, 1)))
 
 
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():
