@@ -377,9 +377,10 @@ class _Observe(TorchDispatchMode):
             value_less = any(t.device.type == "meta" for t in _shallow(args, kwargs))
             if not in_bounds or FAULT[0] or (value_less and all(_is_meta(t) for t in _written(func, args, kwargs))):
                 # a value-less operand (or a faulted device): the op runs on shapes only, but for
-                # a computed index, whose values say how many rows it selects
-                args, kwargs = _join(args, kwargs, ints=func is not torch.ops.aten.index.Tensor
-                                     or _shaped_by_never_computed(func, args))
+                # a kept index, whose values say how many rows it selects
+                index = func is torch.ops.aten.index.Tensor
+                VALUE_SHAPES[0] += index and _shaped_by_never_computed(func, args)
+                args, kwargs = _join(args, kwargs, ints=not index)
                 out = meta_call(func, args, kwargs, list(_shallow(args, kwargs)))
             elif value_less or func not in _ALLOCATES:
                 if value_less:  # a kept tensor written with one: it reads as zeros, and is what lands

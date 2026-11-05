@@ -705,6 +705,10 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             assert len([]) == 1
         def test_shape_mistake_on_cuda_tensors():
             torch.ones(3, device="cuda") + torch.ones(4, device="cuda")
+        def test_assert_after_a_never_computed_mask_of_a_value_less_tensor():
+            import flashinfer
+            mask = flashinfer.top_k_renorm_probs(torch.ones(2, 2048, device="cuda"), 1).reshape(-1) >= 0
+            assert torch.empty(4096, 16, device="cuda")[mask].shape[0] == 1
         def test_index_past_the_end():
             torch.arange(3, device="cuda")[7]
         def test_shape_mistake_in_a_collective(tmp_path):
@@ -762,6 +766,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_shape_mistake_on_cuda_tensors": "FAILED",
                         "test_shape_mistake_in_a_collective": "FAILED",
                         "test_index_past_the_end": "FAILED",
+                        "test_assert_after_a_never_computed_mask_of_a_value_less_tensor": "XFAIL",
                         "test_shape_mistake_inside_a_stand_in": "XFAIL",
                         "test_index_into_what_a_never_computed_mask_selected": "XFAIL",
                         "test_mstars_own_raise_after_a_never_computed_mask": "FAILED",
