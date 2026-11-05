@@ -1,15 +1,17 @@
 """KV offload/reload copy microbenchmark, through ``CPUPagePool`` itself.
 
-For each copier that loads here (``cudaMemcpy2DAsync`` per page through
-``cuda.bindings`` or through torch's libcudart, ``hipMemcpy2DAsync`` through
-torch's libamdhip64 on ROCm, and the per-page ``copy_`` that is the fallback and
-was the only path before), direction and page count:
+For each copier that loads here (``cudaMemcpy2DAsync`` per run of adjacent pages
+through ``cuda.bindings`` or through torch's libcudart, ``hipMemcpy2DAsync``
+through torch's libamdhip64 on ROCm, and the per-page ``copy_`` that is the
+fallback and was the only path before), direction and page count:
 
 - host: wall time from issuing the copies to ``sync()`` returning, with a
   ``--queued-ms`` kernel already queued on the compute stream. A path that
   waits for that kernel reports at least ``--queued-ms``.
 - copy: CUDA-event time of the copies alone on the pool's stream, and the
   throughput that implies.
+
+The pages are adjacent in both caches, so a 2D copier copies them all in one call.
 
 Defaults are one BAGEL-7B page per TP2 rank: 28 layers, 2 KV heads of 128,
 128 tokens a page, bf16 (3.7 MB). Median of ``--repeats``.
@@ -24,10 +26,10 @@ import time
 import torch
 
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import PageCopies
-from mstar.engine.resources.kv.manager import PageArena
 
 
 def sleep_cycles_per_ms() -> float:
@@ -96,7 +98,7 @@ def main():
     )
     kv = KVCache(cfg, torch.device("cuda"), getattr(torch, args.dtype))
     kv.tensor.normal_()
-    pool = cpu_page_pool.CPUPagePool(cfg, kv, PageArena(kv_cache=None, allocator=PageAllocator(max(counts))))
+    pool = cpu_page_pool.CPUPagePool(cfg, kv, new_page_arena(max(counts)))
     page_bytes = kv.tensor[:, 0].numel() * kv.tensor.element_size()
     queued = int(args.queued_ms * sleep_cycles_per_ms())
 

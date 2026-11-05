@@ -27,6 +27,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 
 class _Chunk:
@@ -43,10 +44,12 @@ class _StubModel:
 
 class _StubAPI:
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name="bagel"):
         self.model_name = model_name
         self.model = _StubModel()
+        self.served_models = ServedModels.of(model_name, None)
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
         self._chunks: dict = {}
@@ -403,14 +406,14 @@ def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, mon
     body = client.post(
         "/v1/videos/generations",
         json={"model": "ltx2_5", "prompt": "a dog barking", "size": "960x544", "num_frames": 121,
-              "seed": 3, "negative_prompt": "blurry"},
+              "seed": 3, "recipe": "two_stage"},
     ).json()
     assert base64.b64decode(body["data"][0]["b64_json"]) == b"muxed"
     assert muxed == {"video": mp4, "audio": pcm, "sample_rate": 48000, "num_channels": 2}
     assert stub.last_submit["output_modalities"] == ["video", "audio"]
     mk = stub.last_submit["model_kwargs"]
     assert (mk["width"], mk["height"], mk["num_frames"], mk["seed"]) == (960, 544, 121, 3)
-    assert mk["negative_prompt"] == "blurry" and "audio" not in mk  # extra_body passthrough
+    assert mk["recipe"] == "two_stage" and "audio" not in mk
 
 
 def test_videos_generations_ltx2_5_video_only_and_rejects_conditioning(client_and_stub):

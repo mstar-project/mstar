@@ -304,10 +304,8 @@ def mstar_teacher_forced(driver: MStarTalkerDriver, tensors: dict, prompt: dict,
     fwd = driver.open_request(rid, greedy_kwargs, prompt)
     logits, hiddens = [], []
 
-    def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos, text_ids=None):
+    def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos):
         del engine_inputs, suppress_eos
-        if text_ids is not None:   # as ``TalkerSubmodule._run_frame`` adds the decode's text token
-            input_embeds = input_embeds + talker._project_text(text_ids).to(input_embeds.dtype)
         hidden = talker.model(input_embeds, label="main")
         last = hidden.index_select(0, last_token_indices)
         hiddens.append(last[0])

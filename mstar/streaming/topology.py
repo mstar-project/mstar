@@ -4,8 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.graph.base import GraphEdge
+from mstar.conductor.request_info import CurrentForwardPassInfo, PartitionDefinition
+from mstar.graph.base import GraphEdge, GraphSection
 from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
 
 if TYPE_CHECKING:
@@ -69,9 +69,10 @@ class ProducerWalkCtx:
 
 class ClientAudio(NamedTuple):
     """What an audio client stream carries: mono audio at ``sample_rate``.
-    ``frame_samples`` is the frame its consumer computes on, which a route
-    that translates a client's own codec and rate (``/v1/realtime``) cuts the
-    audio into, one frame per item."""
+    ``frame_samples`` is the frame its consumer computes on: the stream's
+    producer (the data worker) sends whole frames on every route, holding
+    the rest for the next append, and turns appends into items itself when
+    every client stream declares one."""
     sample_rate: int
     frame_samples: int
 
@@ -87,6 +88,15 @@ class Connection:
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
     limits: ClientStreamLimits | None = None
+    # Dim to join a chunked producer's pieces on, or None to keep them apart.
+    # A node whose prefill is chunked emits one piece per chunk, but its
+    # consumer's ChunkPolicy counts ITEMS -- so to a FixedChunkPolicy(1) the
+    # pieces look like separate items and it reads only the first. Joining them
+    # here, on the consumer, keeps the item the consumer already expects. Done
+    # on arrival rather than at the producer deliberately: the consumer owns
+    # these tensors outright, so there is no cross-stream ordering to get
+    # wrong, which is where the producer-side join went wrong before.
+    join_dim: int | None = None
     # Set on the connections into a producer-triggered partition. The
     # producer worker calls it for each pass that emits on the edge, and the
     # pass's items run under the consumer walk it returns: the producer, which
@@ -113,9 +123,9 @@ class PartitionTopology:
                 raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
             if (conn.limits is not None or conn.audio is not None) and conn.from_partition != CLIENT:
                 raise ValueError(f"{conn.edge_name!r} has limits or audio but is not a client stream")
-            frame = None if conn.audio is None else conn.audio.frame_samples
-            if frame is not None and (isinstance(frame, bool) or not isinstance(frame, int) or frame < 1):
-                raise ValueError(f"{conn.edge_name!r}'s audio frame_samples must be a positive integer, not {frame!r}")
+            for name, value in (conn.audio._asdict() if conn.audio is not None else {}).items():
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"{conn.edge_name!r}'s audio {name} must be a positive integer, not {value!r}")
             if conn.consumer_walk is not None and conn.from_partition == CLIENT:
                 # the hook runs on the producer worker, and the client has none
                 raise ValueError(f"client stream {conn.edge_name!r} cannot drive its consumer's walk")
@@ -181,33 +191,44 @@ def client_stream_limits(
     }
 
 
-@dataclass(frozen=True, slots=True)
-class ClientStream:
+class ClientStream(NamedTuple):
     """Where a client stream's items go: the node that consumes the edge, a
-    walk it runs in (for routing to its workers) and its partition. A
-    dataclass, which the wire codec carries in the conductor's route and a
-    NamedTuple it would refuse."""
+    walk it runs in (for routing to its workers) and its partition."""
     node: str
     graph_walk: str
     partition: str
 
 
 def find_client_streams(model: Model) -> dict[str, ClientStream]:
-    """Each client stream's consumer, in the partition it flows into, as
-    validate_deployment checked. The conductor derives it, after the worker
-    graphs are built, and sends it to the data worker with each call's route."""
+    """Each client stream's consumer (``find_client_stream``). The conductor
+    reads it after the worker graphs are built (a model may shape its walks
+    from the deployment, as BAGEL does), and names each node in its route to
+    the data worker, whose copy of the model is unshaped."""
     connections = model.get_partition_topology().client_connections()
     if not connections:
         return {}
     walks = model.get_graph_walk_graphs()
     partitions = {p.name: p for p in model.get_partitions()}
-    streams: dict[str, ClientStream] = {}
-    for conn in connections:
-        name, partition = conn.edge_name, partitions[conn.to_partition]
-        (consumer,) = {
-            node.name for walk in walks.values() for node in walk.get_nodes().values()
-            if name in node.input_names
-        }
-        walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
-        streams[name] = ClientStream(consumer, walk, partition.name)
-    return streams
+    return {conn.edge_name: find_client_stream(conn, walks, partitions) for conn in connections}
+
+
+def find_client_stream(
+    conn: Connection, walks: Mapping[str, GraphSection], partitions: Mapping[str, PartitionDefinition],
+) -> ClientStream:
+    """``conn``'s consumer: the one node, over every walk, that takes the edge
+    (as ``mstar.worker.stream_buffers.consumer_nodes`` resolves it), in a walk of the
+    partition it flows into; ``ValueError`` for a stream without one."""
+    name, partition = conn.edge_name, partitions.get(conn.to_partition)
+    if partition is None:
+        raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
+    consumers = {
+        node.name for walk in walks.values() for node in walk.get_nodes().values()
+        if name in node.input_names
+    }
+    in_partition = [walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()]
+    if len(consumers) != 1 or not in_partition:
+        raise ValueError(
+            f"client stream {name!r} needs exactly one consuming node, in "
+            f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
+        )
+    return ClientStream(consumers.pop(), max(in_partition), partition.name)

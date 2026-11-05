@@ -35,11 +35,18 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.resources import Segment, SubmoduleStep
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVStep, SinkWindow, StreamPosition
-from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.resources import NodeResourceSpec, Segment, SubmoduleStep
+from mstar.engine.resources.kv.bounded import (
+    BoundedKVConfig,
+    BoundedKVSpec,
+    BoundedKVStep,
+    SinkWindow,
+    StreamPosition,
+)
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec, RecurrentStep
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.components.audio_features import NemoLogMel
+from mstar.model.components.dft import stft_basis
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
@@ -101,6 +108,24 @@ def encoder_kv_config(config: FastConformerConfig, max_slots: int) -> BoundedKVC
     )
 
 
+def stream_node_resources(
+    config: FastConformerConfig, hop_length: int, node: str, max_streams: int, *,
+    kv_key: str, conv_key: str, front_key: str,
+) -> list[NodeResourceSpec]:
+    """The stream node's resources for ``max_streams`` streams: the conv and
+    front pools, each with a sink slot for a capture's padding rows, and the
+    bounded KV, which padding rows leave alone."""
+    def pool(key: str, num_layers: int, blocks: dict[str, RecurrentBlockConfig]) -> RecurrentStateSpec:
+        return RecurrentStateSpec(resource_key=key, nodes={node}, config=RecurrentStateConfig(
+            num_layers=num_layers, blocks=blocks, max_slots=max_streams + 1))
+
+    return [
+        pool(conv_key, config.num_layers, encoder_state_blocks(config)),
+        pool(front_key, 1, front_state_blocks(config, hop_length)),
+        BoundedKVSpec(resource_key=kv_key, nodes={node}, config=encoder_kv_config(config, max_slots=max_streams)),
+    ]
+
+
 class FastConformerStreamSubmodule(NodeSubmodule):
     """A causal FastConformer over a stream: each step takes one chunk of a
     stream's audio (``input_edge``) and emits the encoder frames no later audio
@@ -109,18 +134,27 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     lets a consumer's ``FixedChunkPolicy(1)`` pace a frame-synchronous loop.
 
     Live streams' chunks run in one batched pass, except that a step holding a
-    chunk of more than a second (an upload, a large append) is not batched
-    (``can_batch``): the engine then runs each stream of it on its own. The
-    encoder is bound to the bounded KV and the conv pool; ``front_key`` names
-    the pool of each stream's audio and mel tails.
+    chunk of more than a second (an upload, an opening clip, the stream's last
+    append) is not batched (``can_batch``): the engine then runs each stream of
+    it on its own. The encoder is bound to the bounded KV and the conv pool;
+    ``front_key`` names the pool of each stream's audio and mel tails.
 
     A stream one frame of audio further on the frame grid (every live step of
-    a client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
+    a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
     others take the front end eagerly, then the blocks as a graph
     (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    stream's end), else eagerly (a one-shot upload, a large append). In a step
-    whose other streams take the eager blocks, or when the whole-step region
-    has no graph for its streams, those streams run eagerly too.
+    stream's end), else eagerly (a one-shot upload, an opening clip, the
+    stream's last append). In a step whose other streams take the eager blocks,
+    or when the whole-step region has no graph for its streams, those streams
+    run eagerly too.
+
+    Nemotron VoiceChat's duplex model is its only user, also after #937.
+    Construction refuses ``lookahead > 0``, ``reflect_edges=False`` and
+    ``normalize=True``. A second user such as Nemotron ASR would need a
+    per-step right-context window for ``lookahead > 0`` (its checkpoint ships
+    0, 3, 6 and 13), and a zero-padded path in ``NemoLogMel.complete_frames``
+    and ``stream_span``, which both assert ``reflect_edges``. Its featurizer
+    zero-pads, so it couldn't use this node even at lookahead 0.
     """
 
     # The captured regions are not compiled (compile=False); the eager front end
@@ -179,6 +213,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # spans more than one hop and at most two (n_fft 512, hop 160); any
         # other runs every step through the front end and the blocks
         self.has_steady_step = -(-(log_mel.n_fft // 2) // log_mel.hop_length) == 2
+        # its STFT as a matmul, built here: before any capture, on the device
+        self.stft_basis = stft_basis(log_mel.window, log_mel.n_fft) if self.has_steady_step else None
 
     # -- frame counts ---------------------------------------------------------
 
@@ -214,8 +250,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
         """A whole clip through the featurizer, encoder and projection, as
         offline: ``(frames, projection out)``."""
-        states, _ = self.encoder(self.log_mel(wav)[None].to(self.projection.weight.dtype))
-        return self.projection(states)[0]
+        return self._blocks(self.encoder.subsample(self.log_mel(wav)[None].to(self.projection.weight.dtype)))[0]
 
     # -- engine contract ------------------------------------------------------
 
@@ -234,7 +269,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         if is_final_stream_chunk and samples < shortest:
             # too short to featurize (offline can't either): fail rather than reply to nothing
             raise ValueError(
-                f"the call ended with {1000 * samples / rate:g} ms of audio; "
+                f"the stream ended with {1000 * samples / rate:g} ms of audio; "
                 f"it needs at least {1000 * shortest / rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
@@ -265,7 +300,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         # A pass pads every stream to its longest chunk, so a chunk of more than
         # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
         # each stream's step on its own (declare, admit, plan, forward, commit).
-        # Such chunks are uploads and large appends, so it is a rare step.
+        # Such chunks are uploads, opening clips and a stream's last append, so
+        # it is a rare step.
         longest = int(self.BATCHED_CHUNK_S * self.log_mel.sampling_rate)
         return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
 
@@ -363,8 +399,13 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         s = call.static_inputs
         return {"y": self._blocks(s["x"], s["n"])}
 
-    def _blocks(self, x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        return self.projection(self.encoder.blocks(x, new=n))
+    def _blocks(self, x: torch.Tensor, n: torch.Tensor | None = None) -> torch.Tensor:
+        """The blocks (a stream step given ``n``) and the projection. The residual
+        goes in fp32, which the fused add + LayerNorm keeps: under bf16 autocast
+        a bf16 residual put the frames measurably further from an fp32 run (see
+        docs/models.rst). The offline encoders keep theirs in bf16; for Canary
+        an fp32 one was no closer."""
+        return self.projection(self.encoder.blocks(x.float(), new=n))
 
     # -- the front end --------------------------------------------------------
 
@@ -386,7 +427,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         y = x - self.log_mel.preemphasis * torch.cat([last, x[:, :-1]], dim=1)
         win = torch.cat([sig, y], dim=1)                                    # samples S - fs .. S + fs
         # mel frames f(k-1)-1 .. fk-2 span samples [S - hop - pad, S + fs - 2 hop + pad)
-        mel_new = self.log_mel.windows(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], by_matmul=True)
+        mel_new = self.log_mel.windows(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], self.stft_basis)
         window = torch.cat([mel_tail[:, 1:], mel_new], dim=1)               # (B, 23, n_mels)
         new = self.encoder.subsample(window)[:, 2:3]
         self.front.scatter_("sig", y)
@@ -452,7 +493,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         windows = torch.stack([F.pad(w, (0, 0, 0, max(lens) - w.shape[0])) for _, w, _ in mel_rows])
         # a strided conv reads a frame past a row's end, which alone is the conv's
         # zero padding: the subsampling masks each row past its own length
-        out = self.encoder.subsample(windows, to_device_nonblocking(torch.tensor(lens), windows.device))
+        out = self.encoder.subsample(windows, to_device_nonblocking(lens, windows.device))
         x = out.new_zeros(len(sts), max(n), out.shape[-1])
         for row, (i, _, (at, k)) in enumerate(mel_rows):
             x[i, :k] = out[row, at: at + k]
@@ -533,7 +574,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                                       request_ids=[rids[i] for i in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
-                y = self._blocks(x, to_device_nonblocking(torch.tensor(eager_n), device))
+                y = self._blocks(x, to_device_nonblocking(eager_n, device))
             for i in new:
                 states[i].frames += eager_n[i]
                 frames[i] = y[i][: eager_n[i]]

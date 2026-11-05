@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import functools
 import math
+import sys
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,7 +29,9 @@ from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
-from mstar.model.components.dft import stft_as_real, stft_basis
+from mstar.model.components.dft import stft_as_real
+from mstar.model.components.masking import length_mask
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import to_device_nonblocking
 
 
@@ -223,8 +227,6 @@ class NemoLogMel:
             window = torch.hann_window(win_length, periodic=False)
         self.mel_filters = mel_filters.reshape(num_mel_bins, n_fft // 2 + 1).to(device=device, dtype=torch.float32)
         self.window = window.to(device=device, dtype=torch.float32)
-        # ``windows``' STFT as a matmul, built here: before any capture, on the device
-        self._stft_basis = stft_basis(self.window, n_fft)
 
     @staticmethod
     def frames(num_samples: int, hop_length: int, reflect_edges: bool) -> int:
@@ -251,6 +253,7 @@ class NemoLogMel:
         reflects ``n_fft/2`` samples past the stream's first, so it needs more
         than that. At the stream's end, every frame of the clip. ``reflect_edges``
         streams only."""
+        assert self.reflect_edges
         if num_samples <= self.n_fft // 2:
             return 0
         if final:
@@ -287,15 +290,15 @@ class NemoLogMel:
         device = self.window.device
         source = waveforms[0].device
         # host clips are padded straight into pinned memory: one copy to the device
-        pin = source.type == "cpu" and device.type == "cuda"
+        pin = source.type == "cpu" and DeviceCapability.of(device).pin_memory
         x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
         for row, w in enumerate(waveforms):
             x[row, :lengths[row]] = w.reshape(-1)
         x = to_device_nonblocking(x, device)
-        n_samples = to_device_nonblocking(torch.tensor(lengths), device)
+        n_samples = to_device_nonblocking(lengths, device)
         if self.preemphasis:
             x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
-            x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
+            x = x * length_mask(n_samples, x.shape[1])
         if self.reflect_edges:
             # each clip reflected at its own end, as alone, not at the batch's zeros
             padded = x.new_zeros(x.shape[0], x.shape[1] + 2 * pad)
@@ -315,22 +318,23 @@ class NemoLogMel:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
             # zero where the reference's rounding amplifies it into noise
-            n = to_device_nonblocking(torch.tensor(frames), device)[:, None, None]
-            valid = torch.arange(mel.shape[2], device=device) < n
+            n_frames = to_device_nonblocking(frames, device)
+            valid = length_mask(n_frames, mel.shape[2])[:, None, :]
+            n = n_frames[:, None, None]
             ref = mel[:, :, :1]
             mean = ref + ((mel - ref) * valid).sum(dim=2, keepdim=True) / n
             std = (((mel - mean) * valid).pow(2).sum(dim=2, keepdim=True) / (n - 1)).sqrt()
             mel = (mel - mean) / (std + 1e-5)
         return [mel[row, :, :f].T for row, f in enumerate(frames)]
 
-    def windows(self, x: torch.Tensor, by_matmul: bool = False) -> torch.Tensor:
+    def windows(self, x: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
         """``(B, samples)`` preemphasized samples -> ``(B, T, n_mels)`` log-mel
         frames, one per ``n_fft`` window at each hop, with no padding (a
-        stream's front end cuts the windows itself). ``by_matmul`` takes the
-        STFT as a matmul, for a captured graph, which must not hold a cuFFT
-        plan (see ``dft``)."""
-        if by_matmul:
-            spec = stft_as_real(x, self._stft_basis, self.n_fft, self.hop_length)
+        stream's front end cuts the windows itself). ``basis``
+        (``stft_basis(self.window, n_fft)``) takes the STFT as a matmul, for a
+        captured graph, which must not hold a cuFFT plan (see ``dft``)."""
+        if basis is not None:
+            spec = stft_as_real(x, basis, self.n_fft, self.hop_length)
         else:
             spec = torch.view_as_real(torch.stft(
                 x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
@@ -348,6 +352,32 @@ class NemoLogMel:
             return torch.log(self.mel_filters @ power + 2.0 ** -24)
 
 
+# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
+NEMO_MEL_SETTINGS = dict(
+    window="hann", log=True, frame_splicing=1, mag_power=2.0, exact_pad=False,
+    log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+)
+# NeMo's ``AudioToMelSpectrogramPreprocessor`` defaults for the checked settings
+# its configs usually leave out
+NEMO_PREPROCESSOR_DEFAULTS = dict(
+    mag_power=2.0, exact_pad=False, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+    preemph=0.97, pad_to=16,
+)
+
+
+def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
+    """Refuse a NeMo ``preprocessor`` config whose settings differ from
+    ``NEMO_MEL_SETTINGS`` and the model's own, the only ones compared. A key it
+    leaves out reads as NeMo's default where ``NEMO_PREPROCESSOR_DEFAULTS``
+    has one, and is refused otherwise."""
+    expected = {**NEMO_MEL_SETTINGS, **model_settings}
+    got = {k: preprocessor.get(k, NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
+    unsupported = {k if k in preprocessor else f"{k} (not in config)": v
+                   for k, v in got.items() if v != expected[k]}
+    if unsupported:
+        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
+
+
 @functools.cache
 def _ffmpeg_decoder_loads() -> bool:
     """Whether torchcodec, and the FFmpeg libraries it loads, work here."""
@@ -355,7 +385,9 @@ def _ffmpeg_decoder_loads() -> bool:
         from torchcodec.decoders import AudioDecoder  # noqa: F401
     except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
         return False
-    return True
+    # newer torchcodec imports without FFmpeg and records whether its FFmpeg ops
+    # loaded; older releases fail the import above
+    return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 
 def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:

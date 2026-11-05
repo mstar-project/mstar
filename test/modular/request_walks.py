@@ -4,12 +4,13 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from test_graph_runtime import StubTensorManager, _sharding_config
+from rust_runtime import build_runtime
+from test_graph_runtime import _sharding_config
 
 from mstar.graph.base import GraphEdge, Loop
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import END_PARTITION
 from mstar.utils.containers import ParallelList
 
 PARTITION = "default"
@@ -30,7 +31,7 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
     walks = model.get_graph_walk_graphs()
     names = sorted(walks)
     ids = list(range(len(names)))
-    runtime = PythonGraphRuntime(
+    runtime = build_runtime(
         my_worker_id="w0",
         my_worker_graphs=[
             WorkerGraph(section=walks[w], graph_walks={w}, ranks=[0], worker_graph_id=i)
@@ -44,7 +45,6 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
         all_wg_ids_to_nodes=dict.fromkeys(ids, {"LLM"}),
         node_to_partition={"LLM": PARTITION},
         sharding_config=_sharding_config(),
-        tensor_manager=StubTensorManager(),
     )
     args = model.get_initial_forward_pass_args(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]})
     metadata = args.full_metadata
@@ -76,6 +76,10 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
                         counted += tokens[0].numel()
                 if edge.persist and tokens:
                     persisted[edge.name] = tokens
+            if END_PARTITION in stops:
+                assert not isinstance(walks[walk], Loop), "END_PARTITION inside a loop fails the request"
+                # the worker reports the partition done, and the conductor ends it
+                return emitted
             runtime.clear_pending_loop_stops()
             stopped = runtime.stop_loops_batched(
                 partition=PARTITION, graph_walk=walk, last_node_run="LLM",

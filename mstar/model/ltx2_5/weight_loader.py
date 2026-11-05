@@ -67,10 +67,10 @@ def remap_ff_and_out(name: str) -> str:
 
 def build_transformer(
     config: LTX25Config, snapshot: Path, device, comm_group: CommGroup | None = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.bfloat16, sp_group: CommGroup | None = None,
 ) -> LTX2DiT:
     with torch.device("meta"):
-        module = LTX2DiT(config.transformer, comm_group)
+        module = LTX2DiT(config.transformer, comm_group, sp_group)
     materialize(module, dtype, device)
     return load_native(
         module, iter_diffusers_component(snapshot / "transformer", device), remap_ff_and_out, "LTX-2.5 transformer",
@@ -92,3 +92,12 @@ def build_text_encoder(config: LTX25Config, snapshot: Path, device, dtype: torch
     return gemma4_weights.build_text_encoder(
         config.text, snapshot / "text_encoder", device, dtype, name="LTX-2.5 Gemma-4",
     )
+
+
+def latent_stats(component: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    """A VAE's ``latents_mean`` and ``latents_std`` in fp32, read from its checkpoint
+    (they are persistent buffers) without building the VAE."""
+    from safetensors import safe_open
+
+    with safe_open(str(component / "diffusion_pytorch_model.safetensors"), framework="pt") as f:
+        return f.get_tensor("latents_mean").float(), f.get_tensor("latents_std").float()

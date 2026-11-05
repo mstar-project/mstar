@@ -8,7 +8,6 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.streaming.topology import ClientStream
 
 
 class Status(Enum):
@@ -36,6 +35,7 @@ class WorkerMessageType(Enum):
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
+    EDGE_ITEMS = "edge_items"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
@@ -74,8 +74,8 @@ class RemoveRequest(MessageBody):
 class DrainRequest(MessageBody):
     # Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no
     # read of it is in flight, starting none after (the data worker also stops
-    # reading its results). Hard cleanup (RemoveRequest) follows once every
-    # reader has ACKed.
+    # reading its results and sending its client stream items). Hard cleanup
+    # (RemoveRequest) follows once every reader has ACKed.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -97,8 +97,51 @@ class InputSignals(MessageBody):
 
 
 @dataclass
+class EdgeItems(MessageBody):
+    """One step's streamed tensors from a producer worker to one consumer
+    worker, as columns: a row per (request, streaming edge), and per row its
+    items, row-major. It carries what one INPUT_SIGNALS per (request, worker)
+    did for an edge that is nothing but streamed tensors -- unsharded, no
+    forward-pass info -- so the receiver decodes, reads and routes a step's
+    tokens once instead of once per request.
+
+    The fields above the columns are shared by every item: a row whose
+    tensors differ in them goes as INPUT_SIGNALS instead.
+    """
+
+    partition_name: str
+    source_session_id: str
+    source_entity: str
+    tp_size: int
+    tp_rank: int
+    source_node_name: str | None = None
+    # signal, node, walk and arena segment names the columns index
+    names: list[str] = field(default_factory=list)
+    # per row
+    request_ids: list[str] = field(default_factory=list)
+    signal_idx: list[int] = field(default_factory=list)
+    next_node_idx: list[int] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
+    num_items: list[int] = field(default_factory=list)
+    # per item
+    uuids: list[int] = field(default_factory=list)
+    addresses: list[int] = field(default_factory=list)
+    nbytes: list[int] = field(default_factory=list)
+    offsets: list[int] = field(default_factory=list)
+    ndims: list[int] = field(default_factory=list)
+    dims_flat: list[int] = field(default_factory=list)
+    stride_flat: list[int] = field(default_factory=list)
+    dtype_idx: list[int] = field(default_factory=list)
+    dtype_names: list[str] = field(default_factory=list)
+    # the arena segment each item is in (an index into names), -1 for none
+    shm_segment_idx: list[int] = field(default_factory=list)
+    shm_offsets: list[int] = field(default_factory=list)
+
+
+@dataclass
 class TensorReceived(MessageBody):
-    request_id: str
+    # Keyed by uuid, which is global, so one ack covers every request whose
+    # reads from this producer finished together.
     successful_tensors: dict[int, int] # uuid -> graph edge count
     failed_tensor_ids: list[int] # uuids
 
@@ -112,14 +155,15 @@ class UnpersistTensors(MessageBody):
 @dataclass
 class ClientStreamRoute(MessageBody):
     """The conductor telling the API server's data worker, the producer of a
-    request's client streams, which ranks consume each one: once at dispatch,
-    and again with an empty list for a stream whose consuming partition has
-    ended, which then takes no more items."""
+    request's client streams, where each one goes: once at dispatch, and
+    again with no ranks for a stream whose consuming partition has ended,
+    which then takes no more items."""
     request_id: str
     # client stream edge -> the consuming node's ranks for this request
     workers: dict[str, list[str]]
-    # client stream edge -> its consumer, which addresses the sends
-    consumers: dict[str, ClientStream]
+    # client stream edge -> that node, from the walks as the deployment shaped
+    # them; the data worker's copy of the model is the unshaped one
+    nodes: dict[str, str]
 
 
 @dataclass
@@ -219,6 +263,15 @@ class ScheduleTPNode(MessageBody):
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
+    # Per request_ids entry, the chunk the leader cut for the row: [start, end)
+    # of a measured total, -1 when the row is not chunked; all empty when no
+    # row is. A follower runs these rather than cutting its own, and caps a
+    # row's chunk Loop on its first chunk from them.
+    chunk_starts: list[int] = field(default_factory=list)
+    chunk_ends: list[int] = field(default_factory=list)
+    chunk_totals: list[int] = field(default_factory=list)
+    # how far each chunk moves its row's chunk Loop (``ChunkRange.stride``)
+    chunk_strides: list[int] = field(default_factory=list)
 
 
 @dataclass

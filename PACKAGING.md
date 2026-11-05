@@ -41,8 +41,8 @@ extension (`rust/`) and the `mstar-server` HTTP frontend binary
 both with setuptools-rust only when `CIBUILDWHEEL=1`; every other build,
 including `pip install -e .`, is pure Python, and a checkout builds the Rust
 parts with maturin and cargo (docs/installation.rst). pip picks the matching
-manylinux wheel and falls back to the pure one elsewhere, which runs on the
-Python transport and graph runtime.
+manylinux wheel and falls back to the pure one elsewhere, which can import
+mstar but cannot serve until the extension is built (docs/installation.rst).
 
 - **Compiler.** `rust-toolchain.toml` at the repo root pins the Rust version
   for CI, the release wheels and local builds. Bump it there.
