@@ -313,7 +313,7 @@ impl GraphRuntime {
     /// iteration that stops it.
     pub(super) fn stops_over(
         &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32],
-        tokens: Option<&TokenColumn>, row_rids: &[u32],
+        tokens: Option<&TokenColumn>, row_rids: &[u32], width: usize,
     ) -> PyResult<Stops> {
         let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
         else {
@@ -358,7 +358,8 @@ impl GraphRuntime {
                 out.missing.push(rid);
                 continue;
             };
-            let width = tokens.map_or(1, |t| t.width) as u32;
+            // the iterations the step ran, read off its tokens where a rule reads them
+            let width = tokens.map_or(width.max(1), |t| t.width) as u32;
             places.clear();
             places.extend(rules.iter().map(|rule| p.map_or((0, u32::MAX), |p| self.loop_place(rid, p, rule.lp))));
             'iters: for at in 0..width {
@@ -504,7 +505,7 @@ impl GraphRuntime {
                 // decision to check_stop
                 let checked = self.stops_over(
                     &pp.partition, &pp.node_name, &pp.graph_walk, &pp.rids,
-                    pp.tokens.as_ref(), &pp.row_rids,
+                    pp.tokens.as_ref(), &pp.row_rids, pp.width,
                 );
                 if let Ok(found) = checked {
                     if found.missing.is_empty() {

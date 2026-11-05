@@ -53,7 +53,7 @@ class _Reference(rust_runtime.RustGraphRuntime):
     resume_postprocess = PhasedPostprocess.resume_postprocess
 
 
-def _runtime(cls, sock_dir):
+def _runtime(cls, sock_dir, policy=POLICY):
     section = Loop(
         name=LOOP,
         section=GraphNode(
@@ -74,7 +74,7 @@ def _runtime(cls, sock_dir):
         bookkeeping=RustTensorBookkeeping(),
         communicator=SimpleNamespace(_inner=ZmqCommunicator(ME, sock_dir)),
     )
-    rt.set_stop_policies(NODE, WALK, {LOOP: POLICY})
+    rt.set_stop_policies(NODE, WALK, {LOOP: policy})
     return rt
 
 
@@ -345,6 +345,16 @@ def test_loop_room_is_what_every_row_has_left_past_what_it_has_in_flight(tmp_pat
     # past its cap a run goes on for its last row
     assert rt.loop_room(NODE, WALK, LOOP, rids, 0, True) == MAX_ITERS - 1
     assert rt.loop_room(NODE, WALK, LOOP, [*rids, 99], 0, True) == 0
+
+
+def test_a_count_stop_counts_every_iteration_of_a_run(tmp_path):
+    """A count stop reads no token column (a DiT's denoise loop), so the
+    step's own width says how far its rows went."""
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path), StopPolicy(StopKind.ITER, max_iters=lambda info: 3))
+    rids = _start(rt, 1)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    stops = rt.check_stops(PART, NODE, WALK, rids, None, rids, token_width=3)
+    assert stops is not None and list(stops.stops) == rids
 
 
 def test_a_row_reaches_its_cap_inside_a_run_and_stops_there(tmp_path):

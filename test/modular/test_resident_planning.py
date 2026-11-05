@@ -2697,11 +2697,11 @@ def test_a_host_planned_walk_repeats_only_if_its_step_keeps_nothing():
     res = _resources()
     segments = (Segment(1, "main", 3),)
 
-    def refusal(commit, advance):
+    def refusal(commit, advance, declares=True):
         engine = Engine.__new__(Engine)
         step = SubmoduleStep(steps={
             "kv": KVStep(segments=segments, commit=commit), "rope": PositionStep(segments=segments, advance=advance),
-        }, segments=list(segments))
+        }, segments=list(segments)) if declares else None
         engine._submodules = {"n": SimpleNamespace(
             resident=None, resident_refusals={WALK: "not asked for"}, template_steps={WALK: step},
             joint_comm_group=SimpleNamespace(world_size=1), submodule=SimpleNamespace(repeat_carry=lambda w, s: {}),
@@ -2713,6 +2713,8 @@ def test_a_host_planned_walk_repeats_only_if_its_step_keeps_nothing():
     assert refusal(commit=False, advance=(0,)) is None
     assert refusal(commit=True, advance=(0,)).startswith("resource 'kv': a host-planned step that commits")
     assert refusal(commit=False, advance=None).startswith("resource 'rope': a host-planned step that advances")
+    # a step that touches no resource (a DiT's) has nothing to plan, so nothing refuses
+    assert refusal(commit=True, advance=None, declares=False) is None
 
 
 # ---- iteration inputs and the watched loop counter ----

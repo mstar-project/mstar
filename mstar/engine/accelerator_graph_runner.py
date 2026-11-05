@@ -1916,7 +1916,8 @@ class AcceleratorGraphRunner:
         (``[rows, repeats, 2]``). ``stream``: where each replay's tokens land
         as it finishes, and the stop buffer that holds them."""
         slot = self.slot_for(lease)
-        buffers = slot.static_outputs.check_stop_buffers
+        # a count stop reads no buffer
+        buffers = slot.static_outputs.check_stop_buffers or {}
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
         # a spanned output's spans, a column a replay like the output itself
         spans = slot.static_outputs.output_spans or {}

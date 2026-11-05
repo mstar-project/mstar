@@ -3446,7 +3446,9 @@ impl GraphRuntime {
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
         let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
             .map(|col| col.wide(token_width));
-        let found = self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)?;
+        let found = self.stops_over(
+            partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids, token_width,
+        )?;
         Ok((found.rids, found.rules, found.kept, found.missing))
     }
 

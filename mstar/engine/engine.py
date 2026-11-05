@@ -3267,24 +3267,27 @@ class Engine:
         signals, each carried between replays (``NodeSubmodule.repeat_carry``).
         After capture, which some resources decide at."""
         mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
         # a host-planned step replays its one plan: each resource answers for its part
-        host_step = None
+        host_planned, host_step = False, None
         if self.resident_refusal(node_name, graph_walk) is not None:
-            host_step = mgmt.template_steps.get(graph_walk)
-            if host_step is None:
-                return "engine: it plans on the host and declares no step"
+            if graph_walk not in mgmt.template_steps:
+                # no batched capture of it was probed
+                why = "it has no capture" if runner is None else runner.resident_refusal(graph_walk)
+                return f"runner: {why or 'its captures were not probed'}"
+            # None: the step touches no resource, so there is nothing to plan
+            host_planned, host_step = True, mgmt.template_steps[graph_walk]
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "deployment: it runs on more than one rank"
         if (refusal := mgmt.carry_refusals.get(graph_walk)) is not None:
             return refusal
         carries = mgmt.submodule.repeat_carry(graph_walk, signals)
-        runner = mgmt.accelerator_graph_runner
         if runner is not None and (refusal := runner.carry_refusal(graph_walk, carries)) is not None:
             return f"runner: {refusal}"
         for key, resource in mgmt.resources.items():
             part = None if host_step is None else host_step.get(key)
-            if host_step is not None and part is None:
+            if host_planned and part is None:
                 continue  # the step doesn't touch it
             if (refusal := resource.repeat_refusal(graph_walk, part)) is not None:
                 return f"resource {key!r}: {refusal}"
