@@ -91,6 +91,11 @@ REFUSALS = {
         lambda: _value(layers=set(), entry=Entry({"conv": TensorType((32, 0.0), dtype=None)})),
         "Array 'gdn'.entry.tensors['conv'].shape",
     ),
+    "an axis of 0 under a read with no layers": (
+        lambda: _array(layers=set(), max_len=1, rewritable=True, reads={"r": _read()},
+                       entry=_entry(TensorType((0, 8), dtype=None), TensorType((0, 8), dtype=None))),
+        "Array 'kv'.entry.tensors['k'].shape",
+    ),
     "negative layer": (lambda: _array(layers={-1}), "Array 'kv'.layers"),
     "max_len of zero": (lambda: _array(max_len=0), "Array 'kv'.max_len"),
     "read layer outside": (lambda: _array(reads={"r": _read(layers={7})}), "Array 'kv'.reads['r'].layers"),
@@ -198,14 +203,10 @@ def test_a_value_is_a_rewritable_array_of_one_entry():
     assert value.rewritable and value.max_len == 1
 
 
-def test_a_value_may_declare_no_layers():
-    assert _value(layers=set()).layers == frozenset(), "main builds a recurrent pool no layer reads"
-
-
 def test_a_value_with_no_layers_may_hold_an_empty_axis():
     conv = TensorType((32, 0), dtype=None, shard=0)
     assert _value(layers=set(), entry=Entry({"conv": conv})).entry.tensors["conv"] == conv, (
-        "a pool with no layers stores nothing, so main serves a conv kernel of 1 on a model with no linear layers"
+        "a model with no linear layers would be refused at a conv kernel of 1"
     )
 
 

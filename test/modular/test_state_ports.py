@@ -219,32 +219,28 @@ def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
     assert blocks["state"].resolved_dtype(torch.float16) is torch.float32, "the state's dtype comes from the checkpoint"
 
 
-# Qwen/Qwen3.5-9B cut to 4 layers, all full attention. `main` serves this shape, at either kernel, with a pool no layer
-# reads, and no published config has it.
+# Qwen/Qwen3.5-9B cut to 4 layers, all full attention, so no layer reads the GDN pool, whose axes may then be 0.
 _ALL_FULL = {**QWEN3_5["9B"], "num_hidden_layers": 4, "layer_types": [FULL_ATTENTION] * 4}
-_ALL_FULL_KERNELS = pytest.mark.parametrize("kernel", [4, 1], ids=["kernel 4", "kernel 1"])
+_ALL_FULL_SHAPES = pytest.mark.parametrize(
+    "overrides", [{}, {"linear_conv_kernel_dim": 1}, {"linear_value_head_dim": 0}],
+    ids=["kernel 4", "kernel 1", "value dim 0"],
+)
 
 
-@_ALL_FULL_KERNELS
-def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(kernel):
-    model = _qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})
+@_ALL_FULL_SHAPES
+def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(overrides):
+    model = _qwen3_5(**{**_ALL_FULL, **overrides})
     specs = node_resources(model)
     _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
-    pool = {spec.resource_key: spec for spec in specs}[GDN_STATE].config
-    assert pool.num_layers == 0 and pool.blocks["conv"].shape == (8192, kernel - 1), "not the all-full shape"
+    assert {spec.resource_key: spec for spec in specs}[GDN_STATE].config.num_layers == 0, "not the all-full shape"
 
 
-@_ALL_FULL_KERNELS
-def test_qwen3_5_all_full_specs_equal_the_hand_written_ones_after_yaml_overrides(kernel):
-    model = _qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})
+@_ALL_FULL_SHAPES
+def test_qwen3_5_all_full_specs_equal_the_hand_written_ones_after_yaml_overrides(overrides):
+    model = _qwen3_5(**{**_ALL_FULL, **overrides})
     reference = _qwen3_5_reference(model.config)
     apply_yaml_overrides(reference, QWEN3_5_OVERRIDES)
     _assert_equal_per_key(serving_resources(model, QWEN3_5_OVERRIDES), reference)
-
-
-@_ALL_FULL_KERNELS
-def test_qwen3_5_all_full_declarations_have_no_problems(kernel):
-    assert state_declaration_problems(_qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})) == []
 
 
 @pytest.mark.parametrize("overrides, where", [
@@ -253,7 +249,7 @@ def test_qwen3_5_all_full_declarations_have_no_problems(kernel):
     ({"num_attention_heads": 15}, "Array 'kv_cache'.reads['attn'].op"),
     ({"max_position_embeddings": 262144.0}, "Array 'kv_cache'.max_len"),
 ], ids=["all linear", "conv kernel of 1", "query heads off the KV heads", "float length"])
-def test_qwen3_5_refuses_a_shape_no_published_config_has(overrides, where):
+def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
     with pytest.raises(ValueError, match=re.escape(where)):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 

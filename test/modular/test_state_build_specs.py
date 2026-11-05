@@ -130,12 +130,12 @@ def test_a_value_with_no_layers_builds_a_pool_of_no_layers_and_its_linear_attent
     )
 
 
-def test_a_pool_built_with_no_layers_stores_nothing_and_still_fingerprints():
-    entry = Entry({"state": _gdn_entry().tensors["state"], "conv": TensorType((1024, 0), dtype=None, shard=0)})
-    config = replace(_by_key(_kv(), _gdn(layers=set(), entry=entry))["gdn"].config, max_slots=4)
-    pool = RecurrentStatePool(torch.device("cpu"), config, kv_dtype=torch.bfloat16)
-    assert pool._blocks["conv"].numel() == 0 and pool._blocks["conv"].dtype is torch.bfloat16
-    assert pool.fingerprint(), "the fingerprint reads each block's dtype, which a pool with no layers still has"
+def test_a_pool_with_no_layers_fingerprints_as_one_with_layers_does():
+    def fingerprint(layers) -> bytes:
+        config = replace(_by_key(_kv(), _gdn(layers=layers))["gdn"].config, max_slots=4)
+        return RecurrentStatePool(torch.device("cpu"), config, kv_dtype=torch.bfloat16).fingerprint()
+
+    assert fingerprint(set()) == fingerprint({0, 1}), "the fingerprint names only each block's shape and stored dtype"
 
 
 def test_a_pool_links_to_the_one_append_only_array_on_its_nodes():
