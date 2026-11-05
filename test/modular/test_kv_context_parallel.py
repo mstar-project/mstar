@@ -1447,7 +1447,8 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
+    kv = types.SimpleNamespace(can_capture=lambda: True, captures_bucket=lambda bucket, packed: True,
+                               placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
     step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
