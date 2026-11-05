@@ -69,6 +69,25 @@ Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-c
   - They run after the emulator installs, by which time mstar modules are already imported. Patch what's in `sys.modules` as well as hooking imports.
   - A probe run against several commits (buggy and fixed) has to tolerate what an older tree lacks: check for the attribute (`getattr(cls, name, None)`) and skip it if missing, and catch `ModuleNotFoundError` for a module only one tree has.
   - A `builtins.__import__` hook that imports inside itself recurses; guard it with a flag. `sys.modules` can hold a module that is still initialising (`partially initialized module`): patch it once its attribute exists, not on first sight.
+- **Holding one request's step, jitter, a mid-step abort.** Stage them in your `sitecustomize`, not with an emulator knob. The GPU thread calls `Engine.prepare_inputs(self, batch)` just before each forward, so wrap it:
+  ```python
+  import os, time
+  try:
+      from mstar.engine.engine import Engine
+  except ImportError:  # the launcher process has no mstar on its path
+      Engine = None
+  if Engine is not None:
+      prepare = Engine.prepare_inputs
+      def held(self, batch):
+          if batch.node_name == "LLM" and 7 in batch.request_ids:  # node X, request id N
+              while not os.path.exists("/tmp/gate"):  # or time.sleep(T)
+                  time.sleep(0.05)
+          return prepare(self, batch)
+      Engine.prepare_inputs = held
+  ```
+  - A mid-step abort is the same recipe: hold the step, send the abort, then open the gate.
+  - For jitter, set `mstar_sim.clock.TIME_SCALE` to a random factor in that wrapper, once per step (timed mode), or sleep a random time under `--fast`.
+  - Under TP, hold and jitter every rank of the instance alike: match on `batch.node_name` on all ranks, and draw the factor from a seed the instance shares plus the step count. A rank held alone leaves its peers waiting at their next collective until it aborts at the group's timeout, which is a GPU hang, not the race you meant to stage.
 - **Modules loaded by file** (`spec_from_file_location`, as Qwen3-TTS loads `qwen_tts`) bypass import hooks. Patch the dependency's own module instead (e.g. `transformers.models.mimi`).
 - **`-- script.py` with multiprocessing.** The script needs an `if __name__ == "__main__":` guard. Spawned children re-import it, and without the guard the conductor dies ("is not going to be frozen") and the launcher hangs.
 - **A small `/dev/shm`.** `--shm-mb N` makes mstar's Python tmpfs sizing see an N MiB `/dev/shm` (`os.statvfs`). Free space is N less what `mstar_*` files there hold, a dead run's leftovers included. Writes past N still succeed, and the Rust arena's growth check (`fstatvfs` in `rust/src/shm.rs`) still sees the real tmpfs, so a growth failure past N doesn't reproduce.
