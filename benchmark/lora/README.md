@@ -116,7 +116,8 @@ What to read:
 
 * `base-captured` against `off-captured` at c=32/64: the price of turning LoRA on
   for traffic that does not use it (the zero-adapter rows still run the kernels,
-  which exit at once). Expect `res.plan.lora` in tens of microseconds and
+  which exit at once), which includes resident decode planning, off on the LLM node
+  with a `lora:` block (the pool keeps no resident table yet). Expect `res.plan.lora` in tens of microseconds and
   `worker.gpu_thread.exec` close to `off`.
 * `adapters-captured` against `base-captured`: the kernels' GPU time
   (`worker.postprocess.event_sync` grows if the step is GPU-bound) and tok/s.
