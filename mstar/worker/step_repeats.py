@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar
 
@@ -43,6 +43,8 @@ class RepeatConfig:
     device_stop: str = "off"
     # end a run once this share of its rows is done, so new ones join sooner
     refill_at: float | None = None
+    # on: the run goes on the device (the WHILE run), with device_stop off taken as skip
+    device_launch: str = "off"
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -61,6 +63,12 @@ class RepeatConfig:
                 f"step_repeats for {node!r}: device_stop is {config.device_stop!r}; "
                 f"it must be one of {cls.DEVICE_STOPS}"
             )
+        if config.device_launch not in ("on", "off"):
+            raise ValueError(
+                f"step_repeats for {node!r}: device_launch is {config.device_launch!r}; it must be on or off"
+            )
+        if config.device_launch == "on" and config.device_stop == "off":
+            config = replace(config, device_stop="skip")
         if config.refill_at is not None and not 0 < config.refill_at <= 1:
             raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
         default = cls()

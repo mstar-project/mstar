@@ -770,10 +770,17 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"max": 2, "device_stop": "maybe"}}, "must be one of"),
     ({"n": {"device_stop": "skip"}}, "need max above 1"),
     ({"n": {"max": 2, "refill_at": 1.5}}, "must be in"),
+    ({"n": {"max": 2, "device_launch": "maybe"}}, "must be on or off"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):
         parse_step_repeats(block, {"n"})
+
+
+def test_device_launch_means_the_while_run():
+    assert parse_step_repeats({"n": {"max": 2, "device_launch": "on"}}, {"n"})["n"].device_stop == "skip"
+    drop = {"max": 2, "device_launch": "on", "device_stop": "drop_rows"}
+    assert parse_step_repeats({"n": drop}, {"n"})["n"].device_stop == "drop_rows"
 
 
 def test_each_node_asks_for_its_own_repeats():
