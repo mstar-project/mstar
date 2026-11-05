@@ -298,6 +298,7 @@ def test_a_pre_plan_rank_0_throws_away_evicts_no_cached_page_a_follower_keeps():
     assert sorted(leader._index.pages()) == sorted(follower._index.pages()), (
         "rank 0 evicted a cached page for a stage it threw away, which the follower still holds"
     )
+    assert "r" not in leader._ran_short, "a refused pre-admit counted as a grant that ran short"
 
 
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
