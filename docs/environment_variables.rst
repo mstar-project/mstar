@@ -691,7 +691,7 @@ Worker scheduling
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
        (``DeviceLoopback``: the decode walks of Qwen3.5, Glimmer, Higgs Audio,
-       Qwen3-ASR and Whisper, which also keeps its timestamp rule state in
+       Qwen3-ASR, Qwen3-Omni's text-only Thinker and Whisper, which also keeps its timestamp rule state in
        the sampler's declared loop-back state; the other
        ``SampledTokenDecoder`` nodes turn it off with
        ``device_loopback = None``) and only when the sampler has graph

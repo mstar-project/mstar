@@ -1870,8 +1870,8 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
-and a node on it that reads the routed token sets ``device_loopback = None``; Whisper
-declares its own.
+and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
+Qwen3-Omni's Thinker declare their own.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are

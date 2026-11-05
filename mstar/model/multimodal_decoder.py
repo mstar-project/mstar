@@ -316,7 +316,7 @@ class MultimodalDecoderModel(Model):
                 )
         inputs: NameToTensorList = {}
         counts: dict[int, list[int]] = {m.pad: [] for m in self.media}
-        grids: dict[int, list[torch.Tensor]] = {}
+        grids: dict[int, list[Sequence[int]]] = {}
         for part in parts:
             intake = media.get(part.modality)
             if intake is None:
