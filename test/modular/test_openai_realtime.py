@@ -17,6 +17,7 @@ import types
 import wave
 from pathlib import Path
 
+import anyio
 import numpy as np
 import pytest
 
@@ -1562,6 +1563,49 @@ def test_an_item_is_reported_only_when_its_audio_was_taken(duplex, monkeypatch):
     assert added["type"] == "conversation.item.added"
     assert added["item"]["content"] == [{"type": "input_audio"}]
     assert len(api.appends) == 1
+
+
+def test_a_server_cancel_as_the_call_ends_is_the_servers_own():
+    """Starlette's TestClient cancels its scope right after the client's
+    disconnect: when that cancel lands while the handler waits for the call's
+    tasks it has just cancelled, the CancelledError the handler raises must be
+    the scope's, which the scope takes, not a task's, which it passes on; and
+    the call is still aborted."""
+    api = _DuplexAPI()   # a live call: its output goes on until it ends
+
+    class _LeavingWS:
+        scope = None
+        inbox = [json.dumps({"type": "input_audio_buffer.append",
+                             "audio": base64.b64encode(b"\0\0" * 480).decode()})]
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, text):
+            pass
+
+        async def close(self, code):
+            pass
+
+        async def receive(self):
+            if self.inbox:
+                return {"type": "websocket.receive", "text": self.inbox.pop(0)}
+            await asyncio.sleep(0.01)   # the call's relay and clock are waiting now
+            # the scope's cancel lands after the handler's next step: once it has
+            # cancelled the call's tasks and before they have run
+            asyncio.get_running_loop().call_soon(self.scope.cancel)
+            return {"type": "websocket.disconnect", "code": 1000}
+
+    ws = _LeavingWS()
+    call = serving_realtime.RealtimeConversation(api, api.model_name, ws, api.client_audio[0])
+
+    async def serve():   # as starlette's WebSocketTestSession._run
+        with anyio.CancelScope() as ws.scope:
+            await call.run()
+            await anyio.sleep_forever()
+
+    asyncio.run(serve())   # raised CancelledError when a task's cancellation escaped the scope
+    assert api.submits and api.aborted == [api.submits[0]["request_id"]]
 
 
 def test_an_option_the_model_cannot_honour_costs_the_update_nothing_else(duplex):
