@@ -1545,8 +1545,8 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
     """Rank 0 sets host room aside for a request that can move only there as it admits the request, and guarantees
-    the request when the host has none left. A follower takes in the request only as it replays its reservation, by
-    when other moves can have changed its own host's room. Here b takes the host's one page, and x, admitted next,
+    the request when the host has none left. A follower sets the room aside as it replays the reservation, and replays
+    the flip, which can come passes before the reservation. Here b takes the host's one page, and x, admitted next,
     finds none."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
     for kv in (leader, follower):
@@ -1565,22 +1565,58 @@ def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_cl
 
 def test_a_follower_holds_the_class_and_allotment_rank_0_gave_a_request_as_its_step_admitted(monkeypatch):
     """r sets the host's two pages aside at admission and grows past them, so rank 0 guarantees r inside the admit
-    of r's next page. The follower's host still has a page free when it admits that step, and deciding for itself it
-    kept r preemptible, on an allotment of the pages it held."""
+    of r's next page. The follower's host holds the room rank 0's does when it admits that step, so it guarantees r
+    there too. A flip rank 0 journaled from the admit reached the follower only after the step."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
-    leader._cpu_pool, follower._cpu_pool = host._HostPool(2), host._HostPool(3)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(2)
     _ingest((leader, follower), "r", 2, arrival=1, rebuildable=False)
     assert _admits(leader, "r")
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
     for tokens in (2 * PAGE_SIZE, 1):
         assert _step(leader, "r", tokens).ok and _step(follower, "r", tokens).ok
+
     assert "r" in leader._guaranteed and "r" not in leader._cpu_pool.reserved
-
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
-
+    assert not lead.take_resident_delta(), "rank 0 journaled a move from inside the admit"
     assert follower._guaranteed == leader._guaranteed, "r is preemptible here and never preempted on rank 0"
     assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower keeps host room r no longer needs"
     assert _counts(follower) == _counts(leader), "r grows into pages here that rank 0 never allotted it"
+
+
+def test_a_follower_refuses_the_page_rank_0_refuses_when_the_host_cant_cover_it(monkeypatch):
+    """r sets the host's two pages aside at admission, and its next page finds the host full, where guaranteeing r
+    would take a page more than the room has. Rank 0 refuses the step. A follower that left the host to rank 0 took
+    the page and ran the step alone."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(2)
+    _ingest((leader, follower), "r", 2, arrival=1, rebuildable=False)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 5 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "r", 1).ok, "the guarantee fit the room, so the test checks nothing"
+
+    assert not _step(follower, "r", 1).ok, "the follower ran a step rank 0 refused"
+
+
+def test_a_pre_plan_rank_0_throws_away_sets_no_host_room_aside(monkeypatch):
+    """r's next page needs host room past what r has set aside. Rank 0 can't give the room back for a stage it throws
+    away, and a follower may never plan the step, so the pre-admit refuses the step and exec admits it on every
+    rank."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    leader._cpu_pool = host._HostPool(8)
+    _ingest((leader,), "r", 2, arrival=1, rebuildable=False)
+    assert _admits(leader, "r") and _step(leader, "r", 2 * PAGE_SIZE).ok
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1)])
+    step.set_ctx(StepContext(["r"], "decode", 0, False, is_preplan=True))
+
+    lead._runner.pre_admit(step)
+    lead._runner.clear_preplan()
+
+    assert leader._cpu_pool.reserved == {"r": 2}, "rank 0 set host room aside for a stage it threw away"
 
 
 def test_a_flip_to_guaranteed_is_counted_and_logged_on_rank_0_alone(monkeypatch, caplog):
@@ -1629,21 +1665,6 @@ def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followe
     leader.unreserve("x")
 
     assert not lead.take_resident_delta(), "two moves per pass would pile up for each follower to replay"
-
-
-def test_an_allotment_undone_in_its_sweep_gives_the_host_room_back_on_the_followers_too(monkeypatch):
-    """Admitting x set host room aside for it, and undoing the allotment gives that room back. Cancelling the
-    RESERVE with its UNRESERVE left the follower replaying the room set aside alone, which kept it from the host."""
-    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
-    for kv in (leader, follower):
-        kv._cpu_pool = host._HostPool(8)
-    _ingest((leader, follower), "x", 1, arrival=1, rebuildable=False)
-    assert _admits(leader, "x")
-    leader.unreserve("x")
-
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
-
-    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved == {}, "the follower keeps host room for x"
 
 
 def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
