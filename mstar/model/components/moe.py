@@ -229,15 +229,24 @@ class NoAuxTcRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
+        # fused_moe's (logits, bias, top_k, scale, renormalize) -> (weights, ids), from
+        # ``finalize_weights(topk_kernel=True)``
+        self._topk_op = None
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once
         # per layer per step is pure waste. A plain attribute, not a buffer,
         # so model.to(bf16) cannot downcast it.
         self._weight_fp32: torch.Tensor | None = None
 
-    def finalize_weights(self) -> None:
-        """Cache the fp32 router weight; call after the weights are loaded."""
+    def finalize_weights(self, topk_kernel: bool = False) -> None:
+        """Cache the fp32 router weight; call after the weights are loaded. ``topk_kernel``
+        routes CUDA logits through fused_moe's top-k kernel, whose ids can differ from
+        torch's at exact ties."""
         self._weight_fp32 = self.weight.detach().float()
+        if topk_kernel:
+            from mstar.utils.fused_moe import decode  # registers the op
+
+            self._topk_op = decode.router_topk
 
     def forward(
         self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
@@ -254,6 +263,11 @@ class NoAuxTcRouter(nn.Module):
                 if w is None or w.device != self.weight.device:
                     w = self.weight.float()
                 logits = F.linear(flat.float(), w)
+        if self._topk_op is not None and logits.is_cuda:
+            topk_weights, topk_ids = self._topk_op(
+                logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
+                self.norm_topk_prob)
+            return topk_weights, topk_ids, None
         scores = logits.sigmoid()  # (T, E)
 
         biased = scores + self.e_score_correction_bias.unsqueeze(0)
