@@ -996,6 +996,26 @@ def _reach_dec(rt, rid, uuid):
     rt.pop_rids("dec", WALK, [rid])
 
 
+def test_a_run_routes_its_items_on_and_its_last_iteration_back():
+    """A signal that loops back and leaves the Loop: a run stores an iteration
+    of it each, the client's edge takes them all, the next step reads the last."""
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    rt._communicator = _Recorder()
+    _reach_dec(rt, rid, 100)
+    bk = rt._bookkeeping_for_test
+    for uuid in (101, 102, 103):
+        bk.put_tensor(uuid, _tensor_info(uuid))
+        bk.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec", output_signals=["token"],
+        wg_ids=ParallelList([rid], [WG_ID]), tensors=[101, 102, 103], num_tensors=[3], loop_strides=[3],
+    ))
+    assert {101, 102, 103} <= set(out.register_uuids)
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    assert rt.pop_rids("dec", WALK, [rid]).input_edges.uuids == [103]
+
+
 def test_the_rust_runtime_offers_inline_emit():
     assert rust_runtime.RustGraphRuntime.supports_inline_emit is True
     assert rust_runtime_base.GraphRuntime.supports_inline_emit is False
