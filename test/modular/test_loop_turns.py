@@ -406,13 +406,24 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
     assert sched.pick_chain_step(state, KEY, [7]).pick.room == 1
 
 
+def test_a_chain_owed_a_run_keeps_its_step_from_a_waiting_row():
+    runtime = _Runtime()
+    runtime.requests.update({7: None, 8: None})
+    sched, state = _scheduler(runtime, TURNS)
+    sched.note_arrival(8)
+    runtime.ready.add(8)
+
+    assert sched.pick_chain_step(state, KEY, [7]).specs
+    assert not sched.pick_chain_step(state, KEY, [7], continuing_only=True).specs
+
+
 # ── the worker's side ───────────────────────────────────────────────────
 
 
 def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
     asked = {} if asked is None else asked
 
-    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         asked["pick"] = next_iter_of
         return chain
 

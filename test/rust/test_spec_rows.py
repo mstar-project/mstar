@@ -86,7 +86,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         # the chain keeps its rows up to the cap whatever loop it advances; the
         # fresh rows come from the take
         rows = list(continuing)

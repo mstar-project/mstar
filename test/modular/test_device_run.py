@@ -216,14 +216,18 @@ def test_the_worker_sends_a_runs_tokens_for_live_rows_up_to_their_limits():
 
     worker = Worker.__new__(Worker)
     sent = []
-    worker._graph_runtime = SimpleNamespace(send_tokens=lambda *args: sent.append(args))
+    worker._graph_runtime = SimpleNamespace(
+        send_tokens=lambda *args: sent.append(args),
+        # the runtime's counts, which a speculated step's own metadata lags
+        loop_progress=lambda node, rids, walks, loops: ([{1: 8, 4: 0}[rid] for rid in rids], [100] * len(rids)),
+    )
     policy = StopPolicy(StopKind.AR, "t", {EOS}, sampler="s")
     worker._streamed = {("n", WALK): (policy, "text", "text")}
     worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
 
-    def info(count, max_tokens):
+    def info(max_tokens):
         return SimpleNamespace(
-            max_tokens=max_tokens, dynamic_loop_iter_counts={"loop": count},
+            max_tokens=max_tokens, dynamic_loop_iter_counts={"loop": 0},
             resource_configs={"s": SimpleNamespace(ignore_eos=False)},
         )
 
@@ -236,7 +240,7 @@ def test_the_worker_sends_a_runs_tokens_for_live_rows_up_to_their_limits():
         node_name="n", graph_walk=WALK,
         node_batch=SimpleNamespace(
             token_stream=stream, request_ids=[1, 4], completion_event=SimpleNamespace(query=lambda: next(done)),
-            per_request_info_wrapped={1: info(8, 10), 4: info(0, 9)},
+            per_request_info_wrapped={1: info(10), 4: info(9)},
         ),
     ))
     # row 1 is at 8 of 10

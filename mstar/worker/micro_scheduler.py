@@ -1357,6 +1357,7 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str], continuing: Sequence[int],
         mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
+        continuing_only: bool = False,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -1377,12 +1378,14 @@ class MicroScheduler:
         ``next_iter_of``: the loop the chain's step runs its rows one
         iteration on in, if it does; their capture group is the one they have
         there (``_chain_capture_group``).
+
+        ``continuing_only``: the rows waiting wait out this step.
         """
         self._let_rows_back(request_state)
         key = self._key(*target)
         own_walk = None if self.speculation_mixes(*target) else target[1]
         backlogged = self.backlog.get(key)
-        live = [] if backlogged is None else self._backlog_candidates(
+        live = [] if backlogged is None or continuing_only else self._backlog_candidates(
             backlogged, only_walk=own_walk,
         )
         mid = [
@@ -1395,7 +1398,7 @@ class MicroScheduler:
             live = [row.request_id for row in mid] + live
         specs = []
         # a chain holding every request here has nothing waiting on the queues
-        if len(request_state.per_request_info) > len(continuing) + len(mid):
+        if not continuing_only and len(request_state.per_request_info) > len(continuing) + len(mid):
             exclude = self.failed_rids.union(self.pending_removes, self.held_until)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(

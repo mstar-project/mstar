@@ -102,6 +102,8 @@ class StepContext:
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
+    # the step is the run ready rows waited for (``step_repeats: ready_waits``)
+    owed_run: bool = False
     slot_lease: SlotLease | None = None
     # label -> the slot a piecewise region of this node holds for this step,
     # for regions that opt into leasing ahead of the declaration. The region

@@ -26,6 +26,7 @@ from mstar.graph.base import EdgeKind, LoopEdges, loop_edges
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.step import StepContext
     from mstar.worker.speculation import Speculation
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,13 @@ class RepeatConfig:
     device_launch: str = "off"
     # send a run's tokens to the client as its replays finish, not when it lands
     stream_tokens: bool = False
+    # ready rows wait for a run: after a step that took rows, the next takes none
+    # and runs at its full length, and ready work doesn't end a run early
+    ready_waits: bool = False
+    # a run goes on for its longest row: a row reaches its iteration cap inside it
+    # and stops there, as at an end token. Only for a node nothing in whose capture
+    # is sized by the cap: the row's replays past it still run
+    past_cap: bool = False
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -71,10 +79,11 @@ class RepeatConfig:
             )
         if config.device_launch == "on" and config.device_stop == "off":
             config = replace(config, device_stop="skip")
-        if type(config.stream_tokens) is not bool:
-            raise ValueError(
-                f"step_repeats for {node!r}: stream_tokens is {config.stream_tokens!r}; it must be a boolean"
-            )
+        for name in ("stream_tokens", "ready_waits", "past_cap"):
+            if type(getattr(config, name)) is not bool:
+                raise ValueError(
+                    f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
+                )
         if config.refill_at is not None and not 0 < config.refill_at <= 1:
             raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
         default = cls()
@@ -200,6 +209,11 @@ class StepRepeats:
                 why = refusal(*key)
                 parts.append(f"{name} {'on' if why is None else f'off: {why}'}")
             logger.info("%s/%s: %s", *key, " | ".join(parts))
+
+    def owes_run(self, node: str, ctx: StepContext) -> bool:
+        """Whether the step after ``ctx``'s is a run that ready rows wait for:
+        once, so a step narrowed to 1 can't keep them out."""
+        return self.config(node).ready_waits and ctx.repeats == 1 and not ctx.owed_run
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step

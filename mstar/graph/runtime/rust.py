@@ -701,8 +701,10 @@ class RustGraphRuntime(GraphRuntime):
             [sorted(p.eos_tokens) for p in policies.values()],
         )
 
-    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
-        return self._rust.loop_room(node_name, graph_walk, loop_name, rids, stride)
+    def loop_room(
+        self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int, past_cap: bool = False,
+    ) -> int:
+        return self._rust.loop_room(node_name, graph_walk, loop_name, rids, stride, past_cap)
 
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it

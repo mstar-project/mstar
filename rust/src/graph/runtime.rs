@@ -889,16 +889,17 @@ pub struct GraphRuntime {
     /// `rid`'s iteration of loop `lp` in partition `p`, as
     /// `get_dynamic_loop_iters` reports it (the last worker graph with the
     /// loop wins); 0 when no live worker graph has it.
-    fn loop_count(&self, rid: u32, p: Sym, lp: Sym) -> u32 {
-        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else { return 0 };
-        let mut count = 0;
+    /// A row's count in a loop and the loop's cap for it.
+    fn loop_place(&self, rid: u32, p: Sym, lp: Sym) -> (u32, u32) {
+        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else { return (0, u32::MAX) };
+        let mut place = (0, u32::MAX);
         for &wg in &part.walk_worker_graphs {
             let Some(state) = self.state(wg, rid) else { continue };
             if let Some(&lid) = self.graphs[wg as usize].loop_by_name.get(&lp) {
-                count = state.loop_iter(lid);
+                place = (state.loop_iter(lid), state.loop_max_iters(lid));
             }
         }
-        count
+        place
     }
 
     /// Whether this request's current walk actually contains the loop. A stop
@@ -2042,17 +2043,23 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// `GraphRuntime.loop_room`: a repeated step never passes a row's cap.
+    /// `GraphRuntime.loop_room`: a repeated step never passes a row's cap, or
+    /// with `past_cap` the last row's. A row that isn't here leaves no room.
+    #[pyo3(signature = (node_name, graph_walk, loop_name, rids, stride, past_cap = false))]
     fn loop_room(
         &self, node_name: &str, graph_walk: &str, loop_name: &str, rids: Vec<u32>, stride: u32,
+        past_cap: bool,
     ) -> u32 {
         let Some((wg, lid)) = self.loop_of(node_name, graph_walk, loop_name) else { return 0 };
-        rids.iter()
-            .map(|&rid| self.state(wg, rid).map_or(0, |state| {
+        let rooms: Option<Vec<u32>> = rids
+            .iter()
+            .map(|&rid| self.state(wg, rid).map(|state| {
                 state.loop_max_iters(lid).saturating_sub(state.loop_iter(lid).saturating_add(stride))
             }))
-            .min()
-            .unwrap_or(0)
+            .collect();
+        let rooms = rooms.unwrap_or_default();
+        let room = if past_cap { rooms.iter().max() } else { rooms.iter().min() };
+        room.copied().unwrap_or(0)
     }
 
     /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.

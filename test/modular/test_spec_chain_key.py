@@ -6,6 +6,7 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+from mstar.worker.step_repeats import RepeatConfig, StepRepeats
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
 
 
@@ -23,7 +24,8 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         _can_speculate=lambda batch: True,
         chunk_loops=SimpleNamespace(speculated=mid_prefill_walks),
         _choose_spec_target=lambda batch: target,
-        _try_speculate_next=lambda pending, target: speculation,
+        _try_speculate_next=lambda pending, target, owes_run=False: speculation,
+        _step_repeats=StepRepeats({}, {}),
         maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
         _tp_lead_needs_marker=lambda pending, speculation: False,
         _span=lambda name: _Span(),
@@ -41,10 +43,13 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
     return fake, peeked, excluded
 
 
-def _pending(repeats=1):
+def _pending(repeats=1, owed_run=False):
     return SimpleNamespace(
         batch=object(), node_name="LLM", graph_walk="mixed",
-        node_batch=SimpleNamespace(admit_error=None, step_context=SimpleNamespace(repeats=repeats)), tp_seq=-1,
+        node_batch=SimpleNamespace(
+            admit_error=None, step_context=SimpleNamespace(repeats=repeats, owed_run=owed_run),
+        ),
+        tp_seq=-1,
     )
 
 
@@ -59,6 +64,25 @@ def test_ready_work_ends_a_run_in_flight_at_its_next_iteration():
     assert yielded == []
     worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
     assert yielded == ["LLM"]
+
+
+def test_ready_rows_wait_out_one_run_and_no_more():
+    """With ``ready_waits`` a step of one iteration is followed by a run that
+    ready work gets no look at and can't end. After the run it gets its look,
+    and after a step narrowed to one too, so nothing keeps it out for good."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, peeked, _ = _worker(target)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=4, ready_waits=True)}, {})
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+    fair = _SpecFairness(peek=True, max_consecutive=8)
+
+    worker._build_speculation(_pending(), 1, fair)
+    assert peeked == []
+    worker._build_speculation(_pending(repeats=4), 1, fair)
+    assert peeked == [("LLM", "decode")] and yielded == []
+    worker._build_speculation(_pending(owed_run=True), 1, fair)
+    assert peeked == [("LLM", "decode")] * 2
 
 
 def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():

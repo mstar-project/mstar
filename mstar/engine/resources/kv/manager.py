@@ -4708,12 +4708,22 @@ class KVManager(AttentionResource):
         """What the pool can hand over covers, one page a row at most: a refused
         admit would break the chain for pages a shorter run doesn't need. Not
         `_room`, which holds back the allotments these rows draw on themselves.
-        A host-planned step that commits nothing reads the same pages each replay."""
+        A host-planned step that commits nothing reads the same pages each replay.
+        A run past a row's cap (``past_cap``) still ends inside the row's table,
+        allowing for a run in flight that its stored length doesn't show yet."""
         if ctx.resident is None:
             return ANY_REPEATS if not step.commit else 1
         rows = max(len(ctx.request_ids), 1)
         evictable = 0 if self._index is None else len(self._index.evictable())
-        return self._groups[0].page_size if self._arena.num_free + evictable >= rows else 1
+        page_size = self._groups[0].page_size
+        if self._arena.num_free + evictable < rows:
+            return 1
+        longest = max((
+            self._streams[s.request_id][s.label].stored_len for s in step.segments
+            if s.label in self._streams.get(s.request_id, ())
+        ), default=0)
+        reach = min(-(-self.config.max_seq_len // page_size), self.config.request_pages) * page_size
+        return max(1, min(page_size, reach - longest - ctx.repeats))
 
     def resident_refusal(self, key, streams) -> str | None:
         if key not in streams:

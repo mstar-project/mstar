@@ -343,6 +343,7 @@ impl GraphRuntime {
             row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect()
         };
         let p = self.interner.get(partition);
+        let mut places: Vec<(u32, u32)> = Vec::with_capacity(rules.len());
         for (i, &rid) in rids.iter().enumerate() {
             let row = match tokens {
                 None => 0,
@@ -358,12 +359,18 @@ impl GraphRuntime {
                 continue;
             };
             let width = tokens.map_or(1, |t| t.width) as u32;
+            places.clear();
+            places.extend(rules.iter().map(|rule| p.map_or((0, u32::MAX), |p| self.loop_place(rid, p, rule.lp))));
             'iters: for at in 0..width {
                 let token = tokens.map_or(0, |t| t.read_at(row, at as usize));
                 let mut stopped = false;
                 for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
-                    let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
-                    if count + at + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
+                    let (count, cap) = places[k];
+                    // the loop's own cap ends a row by its count, unless a run goes past it
+                    let past_cap = at + 1 < width && count + at + 1 >= cap;
+                    if count + at + 1 >= max_iters || past_cap
+                        || (rule.ar && !ignore_eos && rule.eos.contains(&token))
+                    {
                         out.rids.push(rid);
                         out.rules.push(k as u32);
                         out.kept.push(at + 1);

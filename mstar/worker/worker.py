@@ -2946,17 +2946,22 @@ class Worker:
             for walk in batch.rids_by_walk()
         )
 
-    def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
+    def _stamp_repeats(
+        self, speculation: Speculation, pending: PendingBatch, in_chain: int, owes_run: bool = False,
+    ) -> None:
         """Ask for as many iterations as the step can have; its resources narrow
-        it at admit (`_await_admit_settled` takes the answer)."""
+        it at admit (`_await_admit_settled` takes the answer). ``owes_run``: the
+        step is the run ready rows wait for, which needs no turn in the chain."""
         if self._step_repeats is None or not self._step_repeats.asked:
             return
         batch = speculation.scheduled_batch
+        speculation.node_batch.step_context.owed_run = owes_run
         repeats = self._step_repeats.ceiling(
-            speculation, in_chain,
+            speculation, max(in_chain, int(owes_run)),
             lambda: self._graph_runtime.loop_room(
                 batch.node_name, batch.graph_walk, speculation.loop_name,
                 list(speculation.continuing_rids), pending.batch.repeats,
+                self._step_repeats.config(batch.node_name).past_cap,
             ),
         )
         # a stream window: as many iterations as every row has items for, and
@@ -3288,6 +3293,7 @@ class Worker:
         self,
         pending: PendingBatch,
         target: SpeculationTarget,
+        owes_run: bool = False,
     ) -> Speculation | None:
         """Build a speculative N+1 batch + node_batch, by checking which nodes
         will become ready after the current batch's outputs are ingested.
@@ -3346,7 +3352,7 @@ class Worker:
         # rows waiting at its target (backlogged, or on its queues) get the
         # step here or not at all while it runs. Nothing is popped yet.
         chain = self.scheduler.pick_chain_step(
-            self.request_state, spec_target, candidates, mid_prefill, next_iter_of,
+            self.request_state, spec_target, candidates, mid_prefill, next_iter_of, owes_run,
         )
         laps.lap("pick_step")
         mid_prefill = chain.mid_prefill
@@ -3899,16 +3905,22 @@ class Worker:
         policy, signal, modality = self._streamed[(batch_N.node_name, walk)]
         infos = node_batch.per_request_info_wrapped
         loop = self._innermost_loop_by_node.get((walk, batch_N.node_name))
+        live = list(node_batch.request_ids)
+        # the runtime's counts: the step before this one has landed, and a
+        # speculated step's own counts move by one however far a run went
+        counts, caps = self._graph_runtime.loop_progress(
+            batch_N.node_name, live, [walk] * len(live), [loop] * len(live),
+        )
         rows = {
-            rid: (policy.limits(infos[rid]), infos[rid].dynamic_loop_iter_counts.get(loop, 0))
-            for rid in node_batch.request_ids
+            rid: (policy.limits(infos[rid]), count, cap)
+            for rid, count, cap in zip(live, counts, caps, strict=True) if cap >= 0
         }
 
         def decide(rid: int, column: int, token: int) -> tuple[bool, bool]:
             if rid not in rows:
                 return False, True
-            limits, count = rows[rid]
-            return True, policy.stops(count + column, token, limits)
+            limits, count, cap = rows[rid]
+            return True, count + column + 1 >= cap or policy.stops(count + column, token, limits)
 
         while True:
             finished = node_batch.completion_event.query()
@@ -5295,8 +5307,11 @@ class Worker:
             # chunk must not keep decode rows waiting a second prompt step. A
             # walk with no token budget runs its prompts whole and keeps
             # main's order.
+            owes_run = self._step_repeats is not None and self._step_repeats.owes_run(
+                pending.node_name, pending.node_batch.step_context,
+            )
             other_ready = (
-                fair.peek
+                fair.peek and not owes_run
                 and (
                     consecutive >= 1
                     or (chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key))
@@ -5304,16 +5319,19 @@ class Worker:
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
-            if other_ready and pending.node_batch.step_context.repeats > 1:
+            if (
+                other_ready and pending.node_batch.step_context.repeats > 1
+                and not self._step_repeats.config(pending.node_name).ready_waits
+            ):
                 # a run on the device ends at its next iteration, not at its count
                 self.engine_manager.get_engine(pending.node_name).yield_runs(pending.node_name)
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
                 _t0 = _time.perf_counter() if self._phase_period else 0.0
-                speculation = self._try_speculate_next(pending, target)
+                speculation = self._try_speculate_next(pending, target, owes_run)
                 if speculation is not None and not speculation.is_yield_away:
-                    self._stamp_repeats(speculation, pending, consecutive)
+                    self._stamp_repeats(speculation, pending, consecutive, owes_run)
                 if self._phase_period:
                     self._phase_record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:

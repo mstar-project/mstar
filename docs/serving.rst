@@ -353,7 +353,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        by itself (``device_stop: skip`` unless set). Both need a token stop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
        copies alone. ``stream_tokens: true`` sends a run's tokens to the client as its replays
-       finish rather than when it ends, where its landing rides inline.
+       finish rather than when it ends, where its landing rides inline. ``ready_waits: true``
+       makes ready rows wait for one run: after a step that took rows the next takes none and
+       runs at full length, and ready work doesn't end a run early. A new row's first token
+       can come up to ``max`` iterations later. ``past_cap: true`` lets a run go on for its
+       longest row: a row reaches its iteration cap inside the run and stops there, as at an
+       end token. Set it only where nothing the capture reads is sized by that cap (a learned
+       position table is); the KV pool still keeps a run inside the row's context.
        At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches

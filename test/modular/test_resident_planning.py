@@ -774,6 +774,8 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"device_stop": "skip"}}, "need max above 1"),
     ({"n": {"max": 2, "refill_at": 1.5}}, "must be in"),
     ({"n": {"max": 2, "device_launch": "maybe"}}, "must be on or off"),
+    ({"n": {"max": 2, "ready_waits": "yes"}}, "must be a boolean"),
+    ({"n": {"ready_waits": True}}, "need max above 1"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):
@@ -809,8 +811,26 @@ def test_cached_pages_are_room_for_a_step_that_repeats():
     kv._arena = SimpleNamespace(num_free=1)
     kv._groups = [SimpleNamespace(page_size=PAGE)]
     kv._index = SimpleNamespace(evictable=lambda: {5, 6})
-    assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3), resident=object())) == PAGE
-    assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3, 4), resident=object())) == 1
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {}
+    step = SimpleNamespace(segments=())
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3), repeats=2, resident=object())) == PAGE
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == 1
+
+
+def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
+    """``past_cap`` lets a run outlast a row's count, and a row at the end of
+    its context has nowhere to put those tokens."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=8)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = None
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {1: {"main": SimpleNamespace(stored_len=10 * PAGE - 5)}}
+    step = SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main")])
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
+    kv._streams[1]["main"].stored_len = 10 * PAGE
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 1
 
 
 def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
