@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.kv.plan import token_runs
 
 
@@ -69,7 +70,7 @@ class RaggedBlockCausalWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -97,11 +98,12 @@ class RaggedBlockCausalWrapper:
         self.max_total_tokens = max_total_tokens
         self._num_segments = 0
         self._total_tokens = 0
+        self._workspace = workspace_buffer
 
         if not accelerator_graph:
             self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace_buffer, "NHD", backend=backend,
+                self._workspace.tensor, "NHD", backend=backend,
             )
             return
 
@@ -116,7 +118,7 @@ class RaggedBlockCausalWrapper:
         self._kv_indices_buf = torch.zeros(self.max_indices, **i32)
         self._last_page_len_buf = torch.ones(self.max_blocks, **i32)
         self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, "NHD", use_cuda_graph=True,
+            self._workspace.tensor, "NHD", use_cuda_graph=True,
             qo_indptr_buf=self._qo_indptr_buf,
             paged_kv_indptr_buf=self._kv_indptr_buf,
             paged_kv_indices_buf=self._kv_indices_buf,
@@ -173,7 +175,8 @@ class RaggedBlockCausalWrapper:
             n_blocks = self.max_blocks
         self._num_segments = n_seg
         self._total_tokens = total
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             self._pinned(qo),
             self._pinned(kv),
             self._pinned(indices),
@@ -202,6 +205,8 @@ class RaggedBlockCausalWrapper:
         As with the ragged wrapper, rows past the planned total are not a
         valid result; the caller slices.
         """
+        # q/k/v padded by the caller come back padded
+        padded_in = q.shape[-1] == self.padded_head_dim
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
         # each token is a page of one: [num_pages, page_size=1, H, D]
         kv = (kp.unsqueeze(1), vp.unsqueeze(1))
@@ -214,6 +219,6 @@ class RaggedBlockCausalWrapper:
                 f"{self.max_total_tokens} this graph-mode wrapper was built for"
             )
             out = self.attn_wrapper.run(qp, kv, out=self._out_buf[:n])
-        if self.padded_head_dim != self.head_dim:
+        if self.padded_head_dim != self.head_dim and not padded_in:
             return out[..., : self.head_dim].contiguous()
         return out.clone() if self._out_buf is not None else out

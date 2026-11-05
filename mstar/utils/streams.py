@@ -1,9 +1,14 @@
 """CUDA stream state a worker has to manage.
 
-What runs on a side stream matters: work on the SMs there (a kernel, or a
-device-to-device copy) while a CUDA graph replays slows every graph node in
-the process from then on. Side-stream work beside a live graph should be
-H2D / D2H copies only -- see mstar.utils.h2d.
+What runs on a side stream can matter: work on the SMs there (a kernel, or a
+device-to-device copy) while a CUDA graph replays has slowed every graph node
+in the process from then on, so side-stream work beside a live graph is H2D /
+D2H copies (see mstar.utils.h2d) unless measured. Measured on a B300 with
+Qwen3-TTS, whose Codec runs its windows on a side stream beside the Talker's
+captured decode (``side_stream`` in its configs), the decode steps took no
+longer with the codec there than with it on the chain: per-step GPU time p50
+6.10 and 6.16 ms against 6.09 and 6.09 ms at c=8, 4.2 against 5.0 ms at c=1,
+two servers per arm (``benchmark/worker_phases``, ``gpu_exec.talker_decode``).
 """
 from __future__ import annotations
 

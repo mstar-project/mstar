@@ -26,8 +26,8 @@ import time
 import torch
 
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
-from mstar.engine.resources.kv.arena import PageArena
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 
@@ -98,7 +98,7 @@ def main():
     )
     kv = KVCache(cfg, torch.device("cuda"), getattr(torch, args.dtype))
     kv.tensor.normal_()
-    pool = cpu_page_pool.CPUPagePool(cfg, kv, PageArena(kv_cache=None, allocator=PageAllocator(max(counts))))
+    pool = cpu_page_pool.CPUPagePool(cfg, kv, new_page_arena(max(counts)))
     page_bytes = kv.tensor[:, 0].numel() * kv.tensor.element_size()
     queued = int(args.queued_ms * sleep_cycles_per_ms())
 
