@@ -894,6 +894,29 @@ def test_two_nodes_take_two_lanes():
                    ("Codec", "Vocoder", "Talker"), lanes) == lanes
 
 
+def test_a_walk_whose_node_follows_a_chain_node_takes_its_lane_and_the_chain_never_speculates_into_it():
+    """Whisper's prefill is Sequential([encoder, decoder]): with the decoder's
+    prefill on a lane, the encoder's step on the chain hands it rows, which the
+    lane runs; the chain doesn't take them as its next step."""
+    from mstar.graph.base import Sequential
+
+    prefill = Sequential([_codec_node("Encoder"), _codec_node()])
+    model = _Model({"codec_chunk": prefill, "talker_decode": _codec_node("Talker")})
+    assert _placed({"Codec": _Codec(), "Encoder": object(), "Talker": object()}, model,
+                   ("Codec", "Encoder", "Talker")) == {CODEC: LANE}
+
+    ready = [SimpleNamespace(node_name=node, graph_walk="codec_chunk") for node in ("Codec", "Encoder")]
+    worker = Worker.__new__(Worker)
+    worker._graph_runtime = SimpleNamespace(speculate_node=lambda *args: ready)
+    worker.chunk_loops = SimpleNamespace(walks=frozenset())
+    worker._lanes = (object(),)
+    worker.scheduler = SimpleNamespace(lane_of={CODEC: LANE})
+    batch = ScheduledBatch(node_name="Encoder", graph_walk="codec_chunk", request_to_worker_graph={1: 0})
+    assert worker._choose_spec_target(batch).info.node_name == "Encoder"
+    worker.scheduler.lane_of[("Encoder", "codec_chunk")] = LANE
+    assert worker._choose_spec_target(batch) is None
+
+
 def test_the_field_is_read_per_walk_and_must_agree():
     """A group places its graph_walks, or every walk of its nodes; every walk of
     a node with one off the chain is listed."""
@@ -921,8 +944,8 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(nodes=("Codec",)), "no chain to run beside"),
     (dict(graph_backend=False), "no accelerator-graph backend"),
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _LOOP}),
-          lanes={CODEC: LANE, ("Codec", "codec_warm"): LANE}), "speculate into"),
-    (dict(model=_Model({"codec_chunk": _LOOP})), "speculate into"),
+          lanes={CODEC: LANE, ("Codec", "codec_warm"): LANE}), "runs a loop"),
+    (dict(model=_Model({"codec_chunk": _LOOP})), "runs a loop"),
     (dict(model=_Model(combined={CODEC: "codec_mixed"})), "combined walk"),
 ])
 def test_what_a_lane_cannot_serve_is_refused_naming_the_field(kwargs, reason):

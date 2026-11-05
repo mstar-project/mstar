@@ -668,8 +668,8 @@ lane (a prompt walk beside its decode) keeps its resources and captures the chai
 lane walk's steps run eager, on a slot of their own, wait out the chain's next step being
 planned ahead, and make it plan again. Startup fails with a ``ValueError`` naming the
 lane where it can't apply: a walk of a TP or SP node, a worker with no walk left on the
-chain, a device without an accelerator-graph backend (CUDA or XPU), a walk with other
-nodes or a loop in it, or a combined walk; or a resource of a node wholly off the chain
+chain, a device without an accelerator-graph backend (CUDA or XPU), a walk with a loop in
+it, or a combined walk; or a resource of a node wholly off the chain
 that a node on another lane or worker also declares, that depends on (or is depended on
 by) another lane's, that keeps a prefix cache, or whose state the main thread moves
 outside the step (eviction, prefix leases, page trails: a paged KV cache).

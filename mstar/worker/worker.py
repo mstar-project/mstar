@@ -3475,10 +3475,15 @@ class Worker:
         else:
             rows = [rid for walk_rids in groups.values() for rid in walk_rids]
             counts = [len(walk_rids) for walk_rids in groups.values()]
-        ready_for_spec = self._graph_runtime.speculate_node(
-            batch.node_name, list(groups), rows, counts,
-            batch.loop_strides(rows),
-        )
+        # a walk on a lane runs there, never as the chain's next step
+        on_lane = self.scheduler.lane_of if self._lanes else {}
+        ready_for_spec = [
+            info for info in self._graph_runtime.speculate_node(
+                batch.node_name, list(groups), rows, counts,
+                batch.loop_strides(rows),
+            )
+            if (info.node_name, info.graph_walk) not in on_lane
+        ]
         if not ready_for_spec:
             return None
         # TODO: use the microscheduler to break ties when ready_for_spec

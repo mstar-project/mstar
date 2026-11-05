@@ -2037,8 +2037,9 @@ on one stream must not overlap. It suits stream-fed walks that nothing on the ch
 such as a codec's. Where the config asks, ``EngineManager.build`` refuses what a lane can't
 serve, since a step off the chain is neither speculated nor planned ahead and lands between
 two chain steps: a walk of a TP or SP node, a worker with nothing left on the chain, a
-device without an accelerator-graph backend (CUDA or XPU), and a lane walk that has other
-nodes or a loop in it or sits in a combined walk. Each lane stages its host rows (stop
+device without an accelerator-graph backend (CUDA or XPU), and a lane walk that has a loop
+in it or sits in a combined walk. A chain node before it in its walk (an encoder before
+the decoder) never speculates into it. Each lane stages its host rows (stop
 buffers, output spans) through a ring of its own.
 The engine then gives the lane the resources only its nodes declare, of any kind, and
 refuses one that another lane's node (or another worker's) declares too, that depends on

@@ -13,7 +13,6 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
@@ -156,9 +155,11 @@ def _refuse_unservable_lanes(
     A step off the chain runs on its walk's lane: admitted and planned inline
     on the GPU thread, never speculated, planned ahead or lockstep, landing
     between two chain steps. So such a walk needs a chain beside it, a graph
-    backend's stream, rank-local timing, and a graph of its own that no chain
-    speculation reaches into. Which resources it may hold is the engine's to
-    decide (``Engine._lane_contexts``).
+    backend's stream, rank-local timing, and no loop, whose iterations the
+    chain would speculate. A chain step before it in its walk (an encoder
+    before the decoder) doesn't speculate into it
+    (``Worker._choose_spec_target``). Which resources it may hold is the
+    engine's to decide (``Engine._lane_contexts``).
     """
     walks = model.get_graph_walk_graphs()
     combined = model.combined_walk_of()
@@ -183,8 +184,8 @@ def _refuse_unservable_lanes(
         if not graph_backend:
             raise refuse("its device has no accelerator-graph backend (CUDA or XPU) to give it a stream")
         graph = walks.get(walk)
-        if graph is not None and not isinstance(graph, GraphNode):
-            raise refuse("it runs other nodes or a loop around it, which the chain would speculate into")
+        if graph is not None and graph.get_loops():
+            raise refuse("it runs a loop, whose iterations the chain would speculate")
         if (name, walk) in combined:
             raise refuse(f"it is part of combined walk {combined[name, walk]!r}, which the chain schedules")
     return placed
