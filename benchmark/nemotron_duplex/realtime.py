@@ -4,12 +4,13 @@
 Each session streams the same user clip in real time (``--chunk-ms`` appends,
 paced to the clip's own clock) in the input format given, then silence until
 ``--seconds`` of audio have gone out, and closes once its replies are done.
-Sessions connect ``--stagger-s`` apart, each led by silence so that every
-session speaks at once; the timed window runs from the last session's start to
-the first session's end, when all of them are live. Per concurrency it reports:
+Sessions connect together and start streaming ``--stagger-s`` apart (the first
+append opens the call), each led by silence so that every session speaks at
+once; the timed window runs from the last session's start to the first
+session's end, when all of them are live. Per concurrency it reports:
 
-* reply start: the first reply's first audio, after the user stops speaking
-  (``--speech-end``, seconds into the clip);
+* reply start: the first audio after the user stops speaking (``--speech-end``,
+  seconds into the clip), and how many replies came before that;
 * underrun: within a reply, how far its audio arrives behind its own playback
   clock, ``max_k(arrival_k - arrival_0 - audio_before_k)``. A server that keeps
   up holds this near zero; one that grows with concurrency is falling behind
@@ -21,7 +22,9 @@ the first session's end, when all of them are live. Per concurrency it reports:
   process listening on the port, which runs the resampling), and its event-loop
   thread's alone, which runs the short resamples inline; and this client's,
   with how late its sends ran (a row whose sends ran over 50 ms late measures
-  the client, not the server).
+  the client, not the server). Replies land early in the window, so a long
+  ``--seconds`` dilutes output resampling in the cores figure; keep it short for
+  the cost while the agent speaks.
 
 The model's own rates are 16 kHz in and 22.05 kHz out, so a client at those
 rates is resampled on neither side::
@@ -78,6 +81,12 @@ def _cpu_seconds(path: str) -> float:
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
+def _after_speech(reply: dict, speech_end: float | None) -> bool:
+    """The reply's audio started once the user had stopped (any audio without ``--speech-end``)."""
+    first = reply["first_audio"]
+    return first is not None and (speech_end is None or first >= speech_end)
+
+
 def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dict) -> None:
     import websockets.sync.client
 
@@ -88,7 +97,7 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
     audio[lead:lead + min(clip.size, total - lead)] = clip[:total - lead]
     chunk = int(in_rate * args.chunk_ms / 1000)
     replies, errors, open_ = [], [], {}
-    late, t_speech_end = 0.0, None
+    late, t_speech_end, receiver = 0.0, None, None
     url = args.url.replace("http://", "ws://").replace("https://", "wss://") + "/v1/realtime"
     try:
         with websockets.sync.client.connect(url, max_size=None) as ws:
@@ -124,29 +133,43 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
                 "output": {"format": _format(args.out_codec, out_rate)}}}}))
             receiver = threading.Thread(target=receive, daemon=True)
             receiver.start()
-            time.sleep(max(0.0, start_at - time.perf_counter()))
-            t0 = time.perf_counter()
+            # a session that gets here late stays on the schedule, so it shows as late
+            t0 = start_at
             if args.speech_end is not None:
                 t_speech_end = t0 + lead_s + args.speech_end
             for at in range(0, total, chunk):
                 # absolute schedule: each append leaves when its audio has been "spoken"
-                due = t0 + at / in_rate
+                due = t0 + min(at + chunk, total) / in_rate
                 late = max(late, time.perf_counter() - due)
                 time.sleep(max(0.0, due - time.perf_counter()))
                 piece = _encode(audio[at:at + chunk], args.codec)
                 ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(piece).decode()}))
-            end = time.perf_counter() + args.tail_s
-            # a reply still playing finishes first, and one that hasn't started gets its chance
-            while (open_ or not replies) and time.perf_counter() < end:
+            def waiting() -> bool:
+                """A reply is playing, or the one after the user stopped hasn't come yet."""
+                return bool(open_) or not any(_after_speech(r, t_speech_end) for r in replies)
+
+            end, quiet_since = time.perf_counter() + args.tail_s, None
+            while time.perf_counter() < end:
+                if waiting():
+                    quiet_since = None
+                else:
+                    # the server sends a reply's done and the next one's created back to back
+                    quiet_since = quiet_since or time.perf_counter()
+                    if time.perf_counter() - quiet_since > 0.25:
+                        break
                 time.sleep(0.05)
-        receiver.join(5)
     except Exception as exc:  # noqa: BLE001 — reported per session
         errors.append(repr(exc)[:200])
+    finally:
+        if receiver is not None:
+            receiver.join(5)
     step = round(out_bps * STEP_S)
-    started = [r["first_audio"] for r in replies if r["first_audio"] is not None]
+    completed = [r for r in replies if r["status"] == "completed"]
+    started = [r["first_audio"] for r in replies if _after_speech(r, t_speech_end)]
     out.update(
         replies=replies, errors=errors, unfinished=len(open_), send_late_s=late,
-        whole_steps=all(r["bytes"] % step == 0 for r in replies) if replies else None,
+        whole_steps=all(r["bytes"] % step == 0 for r in completed) if completed else None,
+        before_speech_end=len([r for r in replies if r["first_audio"] is not None]) - len(started),
         reply_start_s=(min(started) - t_speech_end) if started and t_speech_end is not None else None,
     )
 
@@ -184,10 +207,12 @@ def run_batch(args, clip: np.ndarray, n: int) -> dict:
     return {
         "sessions": n, "replies": len(replies),
         "not_completed": sum(r["status"] != "completed" for r in replies) + sum(s["unfinished"] for s in results),
-        "sessions_without_a_reply": sum(not s["replies"] for s in results),
+        "sessions_without_a_reply": sum(s["reply_start_s"] is None and args.speech_end is not None for s in results),
+        "replies_before_speech_end": sum(s["before_speech_end"] for s in results),
         "sessions_with_errors": sum(bool(s["errors"]) for s in results),
         "errors": sorted({e for s in results for e in s["errors"]})[:5],
-        "whole_steps": None if not replies else all(s["whole_steps"] is not False for s in results),
+        "whole_steps": None if all(s["whole_steps"] is None for s in results)
+        else all(s["whole_steps"] is not False for s in results),
         "reply_start_s_p50": _pct(starts, 0.5), "reply_start_s_max": _pct(starts, 1.0),
         "underrun_s_p50": _pct([r["underrun_s"] for r in replies], 0.5),
         "underrun_s_max": _pct([r["underrun_s"] for r in replies], 1.0),
