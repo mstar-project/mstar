@@ -26,18 +26,9 @@ from __future__ import annotations
 
 import pytest
 
-# mstar.engine import fails on certain local torch builds that are missing
-# newer dynamo-config attributes.  Guard at module level so collection of
-# the pure-graph tests doesn't crash in those envs.
-try:
-    from mstar.graph.base import DynamicLoop, GraphNode, Sequential
-    from mstar.graph.special_destinations import EMIT_TO_CLIENT
-    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
-except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
-    pytest.skip(
-        f"Cannot import VJepa2Model in this env: {e}", allow_module_level=True
-    )
-
+from mstar.graph.base import GraphNode, Loop, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.vjepa2.vjepa2_model import VJepa2Model
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,16 +51,16 @@ def _make_ac_model() -> VJepa2Model:
     )
 
 
-def _find_rollout_loop(walk: Sequential) -> DynamicLoop:
-    """Rollout walks are ``Sequential([video_encoder_node, DynamicLoop(...)])``."""
+def _find_rollout_loop(walk: Sequential) -> Loop:
+    """Rollout walks are ``Sequential([video_encoder_node, Loop(...)])``."""
     assert isinstance(walk, Sequential), f"expected Sequential, got {type(walk).__name__}"
     for sec in walk.sections:
-        if isinstance(sec, DynamicLoop):
+        if isinstance(sec, Loop):
             return sec
-    raise AssertionError("no DynamicLoop found in rollout walk")
+    raise AssertionError("no Loop found in rollout walk")
 
 
-def _section_graph_node(loop: DynamicLoop) -> GraphNode:
+def _section_graph_node(loop: Loop) -> GraphNode:
     """The section of our rollout loop is a single ``rollout_predictor``
     GraphNode (no Sequential / Parallel nesting)."""
     assert isinstance(loop.section, GraphNode), (
@@ -204,14 +195,13 @@ class TestStreamingWalkShapeAC:
             )
         )
         assert _has_emit_to_client(section.outputs, "predicted_hidden")
-        # AC identity loop-backs preserved (submodule slices from these per
-        # iter via iter_idx; they must keep routing every iter or the
-        # per-iter action/state slice falls off the end).
-        required = {"encoder_hidden", "predicted_hidden", "actions", "states"}
-        assert required.issubset(_loopback_names(section))
+        assert {"encoder_hidden", "predicted_hidden"}.issubset(_loopback_names(section))
+        # actions/states are constant across iterations: inputs of the section
+        # (sliced per iter via iter_idx), not loop-backs.
+        assert {"actions", "states"}.issubset(section.input_names)
 
-    def test_ac_streaming_input_ids_match_batched(self):
-        """Section-level ``input_ids`` must be identical between variants —
+    def test_ac_streaming_input_names_match_batched(self):
+        """Section-level ``input_names`` must be identical between variants —
         the submodule signature + registration don't change between
         batched and streaming walks."""
         m = _make_ac_model()
@@ -220,7 +210,7 @@ class TestStreamingWalkShapeAC:
         streaming = _section_graph_node(
             _find_rollout_loop(walks[VJepa2Model.PREFILL_VIDEO_ROLLOUT_STREAMING])
         )
-        assert batched.input_ids == streaming.input_ids
+        assert batched.input_names == streaming.input_names
 
 
 # ---------------------------------------------------------------------------
