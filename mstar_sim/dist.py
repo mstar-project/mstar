@@ -31,8 +31,6 @@ import torch.distributed as dist
 
 from mstar_sim import clock, cost, device
 
-_all_gather = dist.all_gather_into_tensor  # the real one: a meet's own traffic
-
 
 class _Done:
     """The ``Work`` of a collective that finished at launch (host side)."""
@@ -117,7 +115,9 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
         gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
         began = time.perf_counter()
         try:
-            _all_gather(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu"), group=group)
+            # straight to the backend: torch's public function logs a failure through the group's
+            # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
+            group._allgather_base(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu")).wait()
             waited = time.perf_counter() - began  # for its peers: a wait, not the emulator's work
             clock.STATS["host_compute"] -= waited
             clock.STATS["host_wait"] += waited

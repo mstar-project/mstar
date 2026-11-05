@@ -763,12 +763,13 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     assert out.strip().endswith("ok")
 
 
-@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip"])
+@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip", "fused_skip"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
     a graph replayed against eager calls or against one that captured another size) aborts
-    with both ranks' descriptors; one whose peer never
-    comes aborts at the group's timeout, as NCCL's watchdog does, or hangs in a replay."""
+    with both ranks' descriptors; one whose peer never comes (to a collective, or to a fused
+    all-reduce on its own channel) aborts at the group's timeout, as NCCL's watchdog does, or
+    hangs in a replay."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -779,6 +780,9 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             dist.distributed_c10d._set_pg_timeout(datetime.timedelta(seconds=5), dist.group.WORLD)
             torch.cuda.set_device(r)
             x = torch.empty(1 << 14, device="cuda")
+            if "{case}" == "fused_skip":
+                from flashinfer import comm
+                space = comm.create_allreduce_fusion_workspace(world_size=2, rank=r)
             if "{case}" == "mismatch":
                 dist.all_reduce(x) if r else dist.barrier()
             elif "{case}" in ("graph_vs_eager", "bucket", "extra_replay"):
@@ -792,7 +796,10 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
                     open(path + ".again", "w").close()
                     graph.replay()
             elif r == 0:
-                dist.all_reduce(x)
+                if "{case}" == "skip":
+                    dist.all_reduce(x)
+                else:
+                    comm.allreduce_fusion(x, space, pattern=comm.AllReduceFusionPattern.kAllReduce, output=x)
             else:
                 time.sleep(7)
             print(f"rank {{r}} passed", flush=True)
@@ -811,7 +818,7 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             for p in ctx.processes:
                 p.kill()
     """)
-    if case == "skip":
+    if case in ("skip", "fused_skip"):
         assert "exits [-6, 0]" in out, out
     elif case == "extra_replay":
         assert "exits [0, None]" in out and "rank 1 passed" not in out, out
