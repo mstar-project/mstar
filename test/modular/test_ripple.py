@@ -227,3 +227,14 @@ def test_the_checkpoint_loads_into_this_rank_s_heads(model_dir, rank):
 
     assert torch.equal(attn.qkg_proj.weight, torch.cat([rows("q_proj", q), rows("k_proj", kv), rows("g_proj", q)]))
     assert torch.equal(attn.v_proj.weight, rows("v_proj", kv))
+
+
+def test_a_deployment_s_prefill_ladder_reaches_the_llm(model_dir, monkeypatch):
+    """``model_kwargs.prefill_token_buckets`` is the LLM node's captured ladder."""
+    from mstar.model.ripple import ripple_model
+
+    monkeypatch.setattr(ripple_model, "load_weights_into", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ripple_model, "iter_safetensors_shards", lambda *args, **kwargs: iter(()))
+    model = get_model_class("ripple_65b")(str(model_dir), prefill_token_buckets=[64, 32])
+    llm = model._create_submodule("LLM", "cpu", torch.float32, CommGroup.trivial())
+    assert llm.PREFILL_TOKEN_BUCKETS == [32, 64]
