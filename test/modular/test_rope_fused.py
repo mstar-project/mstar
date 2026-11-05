@@ -23,7 +23,7 @@ def _manager(fused: bool, device: str, **cfg) -> RopeManager:
     {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192},
 ])
 def test_fused_refuses_what_it_does_not_implement(cfg):
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="fused supports"):
         _manager(True, "cpu", **cfg)
 
 
@@ -54,7 +54,7 @@ def test_fused_matches_flashinfer(compiled):
 
 
 def test_fused_refuses_a_rope_dtype_it_does_not_compute_in():
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="fused supports"):
         _manager(True, "cpu", rope_dtype=torch.bfloat16)
 
 

@@ -157,7 +157,7 @@ class RopeManager(PositionManager):
         if config.fused:
             if (config.llama31_params or config.interleave or config.rope_dtype not in (None, torch.float32)
                     or config.rope_table_dtype is not None):
-                raise NotImplementedError(
+                raise ValueError(
                     "PositionConfig.fused supports standard non-interleaved float32 RoPE only"
                 )
             rotary_dim = config.rotary_dim or head_dim

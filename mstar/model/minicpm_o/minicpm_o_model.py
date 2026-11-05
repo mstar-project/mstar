@@ -392,7 +392,7 @@ class MiniCPMOModel(Model):
             PositionSpec(
                 resource_key=TTS_POS, nodes={TTS},
                 # a TTS step is a few small kernels a layer: fused RoPE saves 5-10% of
-                # its GPU time (on the LLM it measured slower at batch 32)
+                # its GPU time
                 config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta, fused=True),
             ),
             # upstream's TTS sampling (see TTSSubmodule)
