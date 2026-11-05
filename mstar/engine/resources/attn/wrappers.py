@@ -457,6 +457,9 @@ class FlashInferDecodeWrapper:
         accelerator_graph: if True, pre-allocate static buffers for graph capture
     """
 
+    # the tokens of each row's pages before its last, for a run (``stage_page_base``)
+    _page_base: torch.Tensor | None = None
+
     def __init__(
         self,
         workspace_buffer: Workspace,
@@ -610,6 +613,21 @@ class FlashInferDecodeWrapper:
         last_page_len = last_page_len.clone()
         last_page_len[:rows] -= repeats - 1
         return last_page_len
+
+    def stage_page_base(self, paged_kv_indptr: torch.Tensor) -> None:
+        """The tokens of each row's pages before its last, on the plan's pages:
+        what ``gather_lengths`` takes off a stored length."""
+        if self._page_base is None:
+            self._page_base = torch.zeros_like(self._paged_kv_last_page_len_buf)
+        pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+        self._page_base[:pages.shape[0]].copy_((pages - 1) * self.page_size, non_blocking=True)
+
+    def gather_lengths(self, kv_len: torch.Tensor) -> None:
+        """Inside a run's capture: ``last_page_len`` off each row's stored length,
+        so a plan made for a longer row reads what's there."""
+        lengths = self._paged_kv_last_page_len_buf
+        rows = min(lengths.shape[0], kv_len.shape[0])
+        lengths[:rows].copy_(kv_len[:rows] + 1 - self._page_base[:rows])
 
     def replay_column(self, repeats: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Each replay's ``last_page_len``: one more than the replay before it."""

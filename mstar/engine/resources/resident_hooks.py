@@ -51,6 +51,11 @@ class ResidentHooks:
         only narrow."""
         return ANY_REPEATS
 
+    def rewind_run(self, step, ctx, replays: int) -> None:
+        """A run landed ``replays`` iterations short of what its commit counted
+        (``device_run``): take them back from what is counted per iteration."""
+        return
+
     def replay_columns(self, step, ctx, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """What each replay of a step that repeats reads and its capture doesn't
         advance itself: ``(column, target)`` pairs, ``column[:, i]`` going into
@@ -86,6 +91,11 @@ class ResidentHooks:
         addresses. Runs at warmup and capture only; a replay repeats the kernels.
         An attention sets `CapturedResidentStep.reads_tables` or ``host_planned``,
         for whether its kernel reads its pages off the tables or a host plan."""
+        return
+
+    def resident_run_gather(self, step: CapturedResidentStep) -> None:
+        """As ``resident_gather``, for a capture that is a WHILE run's body: no
+        host stands between its iterations, or tells it how far the last run got."""
         return
 
     def resident_commit(self, step: CapturedResidentStep) -> None:

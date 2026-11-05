@@ -684,6 +684,10 @@ class ResidentPlanner:
         if step.reads_tables and not step.host_planned:
             self.host_plan_free.add(step.bucket)
 
+    def run_gather(self, step: CapturedResidentStep) -> None:
+        for resource in self._owners:
+            resource.resident_run_gather(step)
+
     def commit_in_graph(self, step: CapturedResidentStep) -> None:
         for resource in self._owners:
             resource.resident_commit(step)

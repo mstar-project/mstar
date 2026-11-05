@@ -4774,6 +4774,16 @@ class KVManager(AttentionResource):
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)
 
+    def rewind_run(self, step, ctx, replays: int) -> None:
+        # its reserved pages stay: the row's next run takes them
+        for segment in step.segments or ():
+            labels = self._streams.get(segment.request_id)
+            stream = labels.get(segment.label) if labels else None
+            if stream is not None and step.commit and segment.span > 0:
+                stream.stored_len -= segment.span * replays
+                if self._resident is not None:
+                    self._resident.rewind(segment.request_id, segment.span * replays)
+
     def resident_advance(self, plan: "ResidentPlan") -> None:
         self._resident.advance(plan)
 

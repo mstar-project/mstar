@@ -565,6 +565,11 @@ class StepRunner:
             ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
         ))
 
+    def rewind_run(self, step: SubmoduleStep, replays: int) -> None:
+        """A run landed ``replays`` iterations short: each resource takes them back."""
+        for key in self._keys_for(step):
+            self._resources[key].rewind_run(step.get(key), step.ctx, replays)
+
     def replay_columns(self, step: SubmoduleStep, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Every resource's ``Resource.replay_columns`` for this step."""
         columns = []

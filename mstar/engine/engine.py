@@ -28,6 +28,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.device_run import RunAsk
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -217,8 +218,10 @@ class SubmoduleManagement:
     # walk -> loop-back signal -> its pair, kept in those rows beside a
     # ``DeviceLoopback``'s, for each walk whose config asks
     row_signals: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
-    # walk -> the token stop whose stopped rows its captures skip, where asked
+    # walk -> the token stop that ends its WHILE runs, where asked
     device_stops: dict[str, StopPolicy] = field(default_factory=dict)
+    # walk -> a run's share of its rows done that ends it, where asked
+    refills: dict[str, float | None] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -947,7 +950,7 @@ class Engine:
     def warmup(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
-        device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
+        device_stops: Mapping[tuple[str, str], Any] = MappingProxyType({}),
         kept_rows: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
     ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
@@ -955,8 +958,8 @@ class Engine:
         the Loop (a mapping) when its iteration inputs read the Loop's counter;
         ``carried``: the loop-back signals of each such pair whose steps may
         repeat, whose ``preprocess`` is checked here (``probe_carries``);
-        ``device_stops``: the pairs whose captures should skip a replay whose
-        rows have all stopped, by their ``step_repeats: device_stop``;
+        ``device_stops``: the pairs asked to run on the device, by their
+        node's ``step_repeats`` settings;
         ``kept_rows``: the loop-back signals of the pairs whose config asks to
         keep them in device rows."""
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
@@ -1013,9 +1016,9 @@ class Engine:
             if node_name in self._submodules:
                 self._probe_carries(node_name, ag_runners[node_name], walk, signals)
         # after the planners bind: dropping rows writes the row their captures read
-        for (node_name, walk), mode in device_stops.items():
+        for (node_name, walk), config in device_stops.items():
             if node_name in self._submodules:
-                self._ask_device_stop(node_name, ag_runners[node_name], walk, mode)
+                self._ask_run(node_name, ag_runners[node_name], walk, config, carried.get((node_name, walk), ()))
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
@@ -1664,18 +1667,42 @@ class Engine:
             tails[signal] = pair.output
         return heads, tails
 
-    def _ask_device_stop(self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, mode: str) -> None:
-        """Before capture: have ``graph_walk``'s captures skip a stopped replay,
+    def _ask_run(
+        self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, config, signals: Collection[str],
+    ) -> None:
+        """Before capture: have ``graph_walk``'s captures run on the device,
         where its stop reads a token and it runs on one rank."""
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
-            return  # one rank would skip a body holding a collective the other runs
+            return  # the stop must match on every rank, and NCCL in a WHILE body is untested
         policy = next(
             (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
         )
-        if policy is not None:
-            mgmt.device_stops[graph_walk] = policy
-            runner.ask_device_stop(graph_walk, policy.token_signal, policy.eos_tokens, mode == "drop_rows")
+        if policy is None:
+            return
+        mgmt.device_stops[graph_walk] = policy
+        mgmt.refills[graph_walk] = config.refill_at
+        heads = self._row_pairs(mgmt, graph_walk)[0] if mgmt.loopback_rows is not None else {}
+        carries = mgmt.submodule.repeat_carry(graph_walk, signals)
+        runner.ask_run(graph_walk, RunAsk(
+            policy.token_signal, policy.eos_tokens, config.device_stop == "drop_rows", config.max,
+            {signal: pair for signal, pair in carries.items() if signal not in heads},
+            mgmt.run_columns.get(graph_walk, frozenset()),
+            frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
+        ))
+
+    def yield_runs(self, node_name: str) -> None:
+        """Other work is ready: the node's run in flight ends at its next iteration."""
+        runner = self._submodules[node_name].accelerator_graph_runner
+        if runner is not None:
+            runner.yield_runs()
+
+    def end_run_early(self, batch: ExecutingBatch, replays: int) -> None:
+        """A run landed ``replays`` iterations in, short of what admit settled:
+        what it counted past them goes back. A live row carries on from there."""
+        ctx = batch.step_context
+        self._runner.rewind_run(batch.step, ctx.repeats - replays)
+        ctx.repeats = replays
 
     def device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """After capture: why ``graph_walk``'s captures don't skip a replay
@@ -1687,7 +1714,7 @@ class Engine:
             return "graph: its stop reads no token"
         if mgmt.accelerator_graph_runner is None:
             return "runner: the node captures no graphs"
-        return mgmt.accelerator_graph_runner.device_stop_refusal(graph_walk)
+        return mgmt.accelerator_graph_runner.run_refusal(graph_walk)
 
     def launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """After capture: why a run of this walk stays on the host's launch
@@ -2509,17 +2536,26 @@ class Engine:
             slot = cg_runner.slot_for(lease)
             if slot.row_heads:
                 self._write_routed_rows(batch, submodule_mgmt, slot, engine_inputs, preprocessed)
-            stop = slot.device_stop
-            if stop is not None:
+            if slot.run is not None:
                 policy = submodule_mgmt.device_stops[graph_walk]
                 infos = engine_inputs.per_request_info
-                stop.stage(len(request_ids), [policy.limits(infos[rid]).ignore_eos for rid in request_ids])
+                slot.run.state.stage(
+                    len(request_ids), [policy.limits(infos[rid]).ignore_eos for rid in request_ids],
+                    ctx.repeats, submodule_mgmt.refills[graph_walk],
+                )
+                slot.run.stage_columns(batch.iteration_columns)
             out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
-            if ctx.repeats > 1:
+            if ctx.repeats > 1 and slot.run is not None:
+                stops, rows, spans = slot.run.results(ctx.repeats)
+                out = dataclasses.replace(
+                    out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
+                    output_spans={**(out.output_spans or {}), **spans} or None,
+                )
+            elif ctx.repeats > 1:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
                 # a signal in the rows moves through them, in the graph
                 carries = {s: pair for s, pair in submodule_mgmt.carries[graph_walk].items() if s not in slot.row_heads}

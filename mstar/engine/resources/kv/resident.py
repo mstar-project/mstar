@@ -117,6 +117,10 @@ class KVResidentTables:
             rows, need = crossed
             self.host_cols[plan.slots[rows]] = need
 
+    def rewind(self, rid: int, tokens: int) -> None:
+        """The host's copy of a row's length, after a run that ended short."""
+        self.host_len[self.planner.slot_of(rid)] -= tokens
+
     def gather(
         self, step: CapturedResidentStep, token_to_page: torch.Tensor | None, token_to_cache: torch.Tensor | None,
     ) -> None:

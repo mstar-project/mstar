@@ -1176,6 +1176,12 @@ class RecurrentStatePool(Resource):
         gather_column(store, step.slots, self._resident_saved.stride, self._resident_saved.col, saved)
         addressing.has_state.copy_(saved != 0)
 
+    def rewind_run(self, step, ctx, replays: int) -> None:
+        for segment in step.segments or ():
+            slot = self._slots.get(segment.request_id, {}).get(segment.label)
+            if slot is not None and segment.span > 0:
+                slot.tokens -= segment.span * replays
+
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         # a row's next iteration, replay or step, resumes what this one wrote
         table = self._resident_saved

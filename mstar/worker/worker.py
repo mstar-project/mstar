@@ -36,6 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
+from mstar.engine.device_run import RUN_REPLAYS
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -3020,6 +3021,14 @@ class Worker:
             return NOT_ASKED
         return self.engine_manager.get_engine(node_name).rows_refusal(node_name, graph_walk)
 
+    def _ask_run_columns(self, node_name: str, graph_walk: str) -> None:
+        engine = self.engine_manager.get_engine(node_name)
+        inline = (
+            engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
+        )
+        edges = self._step_repeats.edges[(node_name, graph_walk)]
+        engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
+
     def _launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs stay on the host's launch loop, or None."""
         if not self._step_repeats.may_repeat(node_name, graph_walk):
@@ -3968,6 +3977,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
+        self._settle_run(batch_N, host_rows, engine)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
@@ -4274,6 +4284,17 @@ class Worker:
                 if token and token[0].reshape(-1)[0].item() in policy.eos_tokens:
                     out.add((rid, 0))
         return frozenset(signals), frozenset(out)
+
+    def _settle_run(self, batch_N: PendingBatch, host_rows: "HostRows | None", engine) -> None:
+        """A run on the device tells how many iterations it ran: from here on
+        the step stood for those. Its columns past them were never written."""
+        replays = None if host_rows is None else host_rows.buffers.pop(RUN_REPLAYS, None)
+        if replays is None:
+            return
+        ran = int(replays[0])
+        if ran < batch_N.batch.repeats:
+            engine.end_run_early(batch_N.node_batch, ran)
+            batch_N.batch.repeats = ran
 
     def _cut_run_items(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep,
@@ -5199,6 +5220,9 @@ class Worker:
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
+            if other_ready and pending.node_batch.step_context.repeats > 1:
+                # a run on the device ends at its next iteration, not at its count
+                self.engine_manager.get_engine(pending.node_name).yield_runs(pending.node_name)
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
@@ -5305,6 +5329,9 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
+        # a run on the device keeps its columns in its capture, so they are settled before it
+        for key in self._step_repeats.device_stops() if self._step_repeats is not None else ():
+            self._ask_run_columns(*key)
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all(
             {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},

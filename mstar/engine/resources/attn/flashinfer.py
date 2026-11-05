@@ -150,6 +150,13 @@ class FlashInferManager(AttentionManager):
             return "a sliding window reads pages a resident row no longer holds"
         return None
 
+    def resident_run_gather(self, step: "CapturedResidentStep") -> None:
+        # the table's lengths: the last run may have ended short of what the plan assumed
+        stream = step.streams[self._kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        if isinstance(wrapper, FlashInferDecodeWrapper) and not stream.reads:
+            wrapper.gather_lengths(step.buffers.kv_len[self._kv_cache_name])
+
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
@@ -346,6 +353,11 @@ class FlashInferManager(AttentionManager):
                 kwargs["paged_kv_last_page_len"] = wrapper.first_replay(
                     kwargs["paged_kv_last_page_len"], len(ctx.request_ids), ctx.repeats,
                 )
+            if (
+                lease is not None and isinstance(wrapper, FlashInferDecodeWrapper)
+                and lease.bucket.graph_walk in self._repeat_walks
+            ):
+                wrapper.stage_page_base(kwargs["paged_kv_indptr"])
             laps.lap("wrapper")
             # TODO: cache the latest plan state
             wrapper.plan(

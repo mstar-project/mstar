@@ -1,0 +1,302 @@
+"""A run of a captured step on the device: one host launch, a WHILE node around
+the step, until a row-by-row stop says it's over.
+
+The body is the step's capture plus what a run needs in the graph: each
+iteration input's column in, each kept output's column out, the loop-back
+signals the rows don't hold carried, and a fused stop kernel that marks rows
+and sets the node's condition. A run ends on the first of: every row done, the
+run's ``limit``, the host's yield word (ready work or an abort), or
+``refill_at`` of its rows done. A row that's still live hands on to the next
+run where it stands: the host learns how many iterations ran (``RUN_REPLAYS``)
+when the run lands.
+
+torch binds no WHILE node, so ``CudaWhile`` calls the runtime through ctypes, as
+``kv/page_copier.py`` does; ``cudaGraphSetConditional`` needs a kernel of ours,
+compiled with NVRTC and linked against ``libcudadevrt``. ``RunState.advance``
+is the same rule in torch, for a backend with no such kernel.
+"""
+from __future__ import annotations
+
+import ctypes
+import os
+from collections.abc import Callable, Collection, Mapping, Sequence
+from typing import Any, NamedTuple
+
+import torch
+
+from mstar.engine.resources.resident import TRASH_SLOT
+
+# a stop buffer of a run that repeats: the iterations it ran, on every row
+RUN_REPLAYS = "__run_replays__"
+
+_STOP_SOURCE = r"""
+typedef unsigned long long cudaGraphConditionalHandle;
+extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphConditionalHandle, unsigned int);
+
+extern "C" __global__ void run_stop(
+    const long long* tokens, int stride, int rows, const long long* stop_ids, int num_ids,
+    const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
+    const long long* refill, const volatile int* yield_word, const unsigned long long* handle
+) {
+    int done = 0;
+    for (int row = 0; row < rows; ++row) {
+        if (!marks[row] && !immune[row]) {
+            for (int i = 0; i < num_ids; ++i) {
+                if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
+            }
+        }
+        done += marks[row];
+    }
+    long long next = *index + 1;
+    *index = next;
+    bool go = done < rows && next < *limit && *yield_word == 0 && (*refill == 0 || done < *refill);
+    cudaGraphSetConditional(*handle, go ? 1u : 0u);
+}
+"""
+
+
+class RunAsk(NamedTuple):
+    """What a walk's WHILE run needs of its captures."""
+    token_signal: str
+    stop_ids: frozenset[int]
+    # also send a stopped row's reads and writes to the trash slot
+    drop_rows: bool
+    # the most iterations a run takes
+    limit: int
+    # loop-back signals the node's rows don't hold, carried in the body
+    carries: Mapping[str, Any]
+    # the row outputs kept a column a replay
+    columns: Collection[str]
+    # the static inputs that take a column a replay
+    iteration: Collection[str]
+    refill_at: float | None = None
+
+
+class RunState:
+    """What a slot's run holds on the device. ``marks``: a row's stop in this
+    run, padding rows set; they last one run, so an EOS from before it doesn't
+    end it."""
+
+    def __init__(
+        self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device,
+        dropping: Any = None, yield_word: torch.Tensor | None = None,
+    ):
+        self.token_signal = token_signal
+        # a capture that also sends a stopped row's reads and writes to the trash slot
+        self.dropping = dropping
+        self.index = torch.zeros(1, dtype=torch.long, device=device)
+        self.limit = torch.ones(1, dtype=torch.long, device=device)
+        # the marks a run ends at, ``refill_at`` of its rows; 0 is off
+        self.refill = torch.zeros(1, dtype=torch.long, device=device)
+        self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
+        self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
+        self.live = torch.ones((), dtype=torch.bool, device=device)
+        self.replays = torch.zeros(bs, dtype=torch.long, device=device)
+        self.yield_word = yield_word if yield_word is not None else torch.zeros(1, dtype=torch.int32)
+        self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
+        self._rows = torch.arange(bs, device=device)
+        self._staged: tuple | None = None
+
+    def stage(self, real: int, immune: Sequence[bool], limit: int, refill_at: float | None = None) -> None:
+        """Before a run, on the host. A staged value keeps its address: the graph reads it."""
+        self.index.zero_()
+        self.yield_word.zero_()
+        key = (real, tuple(immune), limit, refill_at)
+        if key != self._staged:
+            self._staged = key
+            self.limit.fill_(limit)
+            pad = len(self.marks) - real
+            self.refill.fill_(0 if refill_at is None else pad + max(1, int(refill_at * real + 0.999999)))
+            self.immune.zero_()
+            if any(immune):
+                self.immune[:len(immune)].copy_(torch.tensor(immune, dtype=torch.bool))
+        torch.ge(self._rows, real, out=self.marks)
+
+    def head(self) -> None:
+        """Before a replay's forward: a stopped row reads and writes the trash slot."""
+        if self.dropping is not None:
+            rows = self.dropping.rows
+            torch.where(self.marks, torch.full_like(rows, TRASH_SLOT), rows, out=self.dropping.slots)
+
+    def advance(self, tokens: torch.Tensor) -> None:
+        """``run_stop``: after a replay, this replay's stops and whether the run goes on."""
+        token = tokens.reshape(len(self.marks), -1)[:, 0]
+        self.marks |= (token.unsqueeze(-1) == self.stop_ids).any(-1) & ~self.immune
+        self.index += 1
+        done = self.marks.sum()
+        go = ~self.marks.all() & (self.index[0] < self.limit[0]) & (self.yield_word.to(self.index.device)[0] == 0)
+        self.live.copy_(go & ((self.refill[0] == 0) | (done < self.refill[0])))
+
+
+class CudaWhile:
+    """The CUDA runtime calls a WHILE run takes, through ctypes."""
+
+    class _Conditional(ctypes.Structure):
+        _fields_ = [
+            ("handle", ctypes.c_ulonglong), ("type", ctypes.c_int), ("size", ctypes.c_uint),
+            ("graphs", ctypes.POINTER(ctypes.c_void_p)), ("ctx", ctypes.c_void_p),
+        ]
+
+    _NODE_NAMES = {3: "host", 7: "event record", 10: "memory alloc", 11: "memory free", 13: "conditional"}
+    _TYPE_CONDITIONAL, _COND_WHILE, _ASSIGN_DEFAULT = 13, 1, 1
+
+    def __init__(self):
+        self._rt = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
+        self._driver = ctypes.CDLL("libcuda.so.1")
+        self._kernel: ctypes.c_void_p | None = None
+
+    @staticmethod
+    def devrt_path() -> str | None:
+        """``libcudadevrt.a``: ``cudaGraphSetConditional`` links against it."""
+        for root in (os.environ.get("CUDA_HOME"), "/usr/local/cuda"):
+            path = os.path.join(root, "lib64", "libcudadevrt.a") if root else None
+            if path and os.path.exists(path):
+                return path
+        return None
+
+    def _call(self, name: str, *args) -> None:
+        status = getattr(self._rt, name)(*args)
+        if status != 0:
+            raise RuntimeError(f"{name} failed with CUDA error {status}")
+
+    def _driver_call(self, name: str, *args) -> None:
+        status = getattr(self._driver, name)(*args)
+        if status != 0:
+            raise RuntimeError(f"{name} failed with CUDA error {status}")
+
+    def _load_kernel(self) -> ctypes.c_void_p:
+        """``run_stop``, compiled once a process."""
+        if self._kernel is None:
+            from torch.cuda._utils import _nvrtc_compile
+
+            ptx = _nvrtc_compile(_STOP_SOURCE, "run_stop", nvcc_options=["-rdc=true"])
+            ptx = ptx[0] if isinstance(ptx, tuple) else ptx
+            link, cubin, size = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_size_t()
+            self._driver_call("cuLinkCreate_v2", 0, None, None, ctypes.byref(link))
+            self._driver_call(
+                "cuLinkAddData_v2", link, 1, ctypes.c_char_p(ptx), len(ptx), b"run_stop.ptx", 0, None, None,
+            )
+            self._driver_call("cuLinkAddFile_v2", link, 4, self.devrt_path().encode(), 0, None, None)
+            self._driver_call("cuLinkComplete", link, ctypes.byref(cubin), ctypes.byref(size))
+            module, kernel = ctypes.c_void_p(), ctypes.c_void_p()
+            self._driver_call("cuModuleLoadData", ctypes.byref(module), cubin)
+            self._driver_call("cuModuleGetFunction", ctypes.byref(kernel), module, b"run_stop")
+            self._driver_call("cuLinkDestroy", link)
+            self._kernel = kernel
+        return self._kernel
+
+    def new_loop(self, device: torch.device) -> tuple[int, int, torch.Tensor]:
+        """The outer graph, its condition's handle, and the handle on the device."""
+        graph, handle = ctypes.c_void_p(), ctypes.c_ulonglong()
+        self._call("cudaGraphCreate", ctypes.byref(graph), 0)
+        self._call(
+            "cudaGraphConditionalHandleCreate", ctypes.byref(handle), graph, 1, self._ASSIGN_DEFAULT,
+        )
+        return graph.value, handle.value, torch.tensor([handle.value], dtype=torch.int64, device=device)
+
+    def stop(self, state: RunState, tokens: torch.Tensor, handle: torch.Tensor, stream: int) -> None:
+        """Inside the step's capture: ``run_stop`` on ``stream``."""
+        row = tokens.reshape(len(state.marks), -1)
+        values = [
+            ctypes.c_void_p(row.data_ptr()), ctypes.c_int(row.stride(0)), ctypes.c_int(len(state.marks)),
+            ctypes.c_void_p(state.stop_ids.data_ptr()), ctypes.c_int(len(state.stop_ids)),
+            ctypes.c_void_p(state.immune.data_ptr()), ctypes.c_void_p(state.marks.data_ptr()),
+            ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
+            ctypes.c_void_p(state.refill.data_ptr()), ctypes.c_void_p(state.yield_word.data_ptr()),
+            ctypes.c_void_p(handle.data_ptr()),
+        ]
+        args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
+        self._driver_call(
+            "cuLaunchKernel", self._load_kernel(), 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
+        )
+
+    def node_refusal(self, step_graph: int) -> str | None:
+        """Why a WHILE body can't hold ``step_graph``: what the child graph refuses."""
+        count = ctypes.c_size_t()
+        self._call("cudaGraphGetNodes", ctypes.c_void_p(step_graph), None, ctypes.byref(count))
+        nodes = (ctypes.c_void_p * count.value)()
+        self._call("cudaGraphGetNodes", ctypes.c_void_p(step_graph), nodes, ctypes.byref(count))
+        for node in nodes:
+            kind = ctypes.c_int()
+            # the runtime fails to name a conditional node's type
+            found = self._rt.cudaGraphNodeGetType(ctypes.c_void_p(node), ctypes.byref(kind))
+            name = self._NODE_NAMES.get(kind.value if found == 0 else self._TYPE_CONDITIONAL)
+            if name is not None:
+                return f"its capture holds a {name} node, which a child graph of a WHILE body can't"
+        return None
+
+    def finish(self, outer: int, handle: int, step_graph: int) -> int:
+        """The WHILE node, its body the step's graph; the outer graph's exec."""
+        body = ctypes.c_void_p()
+        raw = (ctypes.c_longlong * 32)()  # cudaGraphNodeParams: type, reserved, union, reserved
+        conditional = self._Conditional.from_address(ctypes.addressof(raw) + 16)
+        ctypes.c_int.from_address(ctypes.addressof(raw)).value = self._TYPE_CONDITIONAL
+        conditional.handle, conditional.type, conditional.size = handle, self._COND_WHILE, 1
+        node, child = ctypes.c_void_p(), ctypes.c_void_p()
+        self._call(
+            "cudaGraphAddNode", ctypes.byref(node), ctypes.c_void_p(outer), None, ctypes.c_size_t(0), ctypes.byref(raw),
+        )
+        body = conditional.graphs[0]
+        self._call(
+            "cudaGraphAddChildGraphNode", ctypes.byref(child), ctypes.c_void_p(body), None, ctypes.c_size_t(0),
+            ctypes.c_void_p(step_graph),
+        )
+        graph_exec = ctypes.c_void_p()
+        self._call(
+            "cudaGraphInstantiateWithFlags", ctypes.byref(graph_exec), ctypes.c_void_p(outer), ctypes.c_ulonglong(0),
+        )
+        return graph_exec.value
+
+    def launch(self, graph_exec: int, stream: int) -> None:
+        self._call("cudaGraphLaunch", ctypes.c_void_p(graph_exec), ctypes.c_void_p(stream))
+
+
+class DeviceRun:
+    """A slot's run: its state, its static columns, and what launches it.
+    ``inputs``: static input -> its iteration input's column, staged before
+    the run; ``stops``, ``rows``, ``spans``: the outputs kept per replay,
+    ``[rows, limit, ...]`` each. ``launch`` is the host's one call."""
+
+    def __init__(
+        self, state: RunState, inputs: Mapping[str, torch.Tensor], launch: Callable[[], None], limit: int,
+    ):
+        self.state = state
+        self.inputs = inputs
+        self.limit = limit
+        self.launch = launch
+        self.stops: dict[str, torch.Tensor] = {}
+        self.rows: dict[str, torch.Tensor] = {}
+        self.spans: dict[str, torch.Tensor] = {}
+
+    def stage_columns(self, iteration: Mapping[str, torch.Tensor] | None) -> None:
+        for name, column in (iteration or {}).items():
+            self.inputs[name][:, :column.shape[1]].copy_(column)
+
+    def keep(self, name_of: Mapping[str, torch.Tensor], kept: dict[str, torch.Tensor]) -> None:
+        """Inside the body: a column of each of ``name_of``, this replay's."""
+        for name, tensor in name_of.items():
+            if name not in kept:
+                kept[name] = tensor.new_empty(tensor.shape[0], int(self.limit), *tensor.shape[1:])
+            column_out(self.state, tensor, kept[name])
+
+    def results(self, repeats: int) -> tuple[dict, dict, dict]:
+        """After the launch: what ``AcceleratorGraphRunner.repeat`` returns, and
+        the iterations that ran under ``RUN_REPLAYS``."""
+        state = self.state
+        state.replays.copy_(state.index.expand_as(state.replays))
+        stops = {name: column[:, :repeats] for name, column in self.stops.items()}
+        stops[RUN_REPLAYS] = state.replays
+        return (
+            stops, {name: column[:, :repeats] for name, column in self.rows.items()},
+            {name: column[:, :repeats] for name, column in self.spans.items()},
+        )
+
+
+def column_in(state: RunState, column: torch.Tensor, target: torch.Tensor) -> None:
+    """Inside a body: this replay's column of ``column`` into ``target``."""
+    target.copy_(column.index_select(1, state.index).reshape(target.shape))
+
+
+def column_out(state: RunState, tensor: torch.Tensor, column: torch.Tensor) -> None:
+    """Inside a body: ``tensor`` into this replay's column of ``column``."""
+    column.index_copy_(1, state.index, tensor.unsqueeze(1).to(column.dtype))

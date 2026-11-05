@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol
@@ -118,19 +117,18 @@ class AcceleratorGraphBackend(ABC):
         """What ``mstar_rust.launch_run`` needs to launch ``graph`` on the current stream."""
         raise NotImplementedError(self.launch_refusal())
 
-    def advances_generator(self, graph: CapturedGraph) -> bool:
-        """Whether a replay of ``graph`` moves a registered RNG generator, which
-        a raw launch doesn't do: its draws would repeat. Replays it once."""
-        return False
+    def generator_offset(self) -> int:
+        """Where the device's RNG generator stands: an eager step that moves
+        it draws from it, which a graph's raw launch wouldn't advance."""
+        return 0
 
-    def conditional_refusal(self) -> str | None:
-        """Why a capture can't hold a conditional node (``conditional``), or None."""
-        return f"{type(self).__name__} has no conditional graph nodes"
+    def while_refusal(self) -> str | None:
+        """Why this backend has no WHILE run (``mstar.engine.device_run``), or None."""
+        return f"{type(self).__name__} has no WHILE graph node"
 
-    def conditional(self, graph: CapturedGraph, pred: torch.Tensor) -> AbstractContextManager:
-        """Inside a capture of ``graph``: what is captured in this context runs
-        on each replay only while the device bool scalar ``pred`` is true."""
-        raise NotImplementedError(self.conditional_refusal())
+    def while_runtime(self) -> Any:
+        """What a WHILE run calls: a ``device_run.CudaWhile``."""
+        raise NotImplementedError(self.while_refusal())
 
 
 class _TorchGraphBackend(AcceleratorGraphBackend):
@@ -219,6 +217,7 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="cuda", runtime=torch.cuda)
+        self._while = None
 
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
@@ -240,31 +239,26 @@ class CUDAGraphBackend(_TorchGraphBackend):
             int(graph.raw_cuda_graph_exec()), int(self.current_stream().cuda_stream),
         )
 
-    def advances_generator(self, graph: CapturedGraph) -> bool:
-        generator = torch.cuda.default_generators[self.device.index or 0]
-        before = generator.get_offset()
-        graph.replay()
-        self.synchronize()
-        return generator.get_offset() != before
+    def generator_offset(self) -> int:
+        return torch.cuda.default_generators[self.device.index or 0].get_offset()
 
-    def conditional_refusal(self) -> str | None:
-        # torch binds the IF node from 2.12, on CUDA 12.4 and up, never on ROCm
-        if not hasattr(torch.cuda.CUDAGraph, "begin_capture_to_if_node"):
-            return f"torch {torch.__version__} binds no conditional graph node"
-        if torch.version.hip is not None:
-            return "torch builds no conditional graph node on ROCm"
-        cuda = tuple(int(part) for part in (torch.version.cuda or "0.0").split(".")[:2])
-        if cuda < (12, 4):
+    def while_refusal(self) -> str | None:
+        if not torch.version.cuda or torch.version.hip is not None:
+            return "this torch has no CUDA runtime"
+        if tuple(int(part) for part in torch.version.cuda.split(".")[:2]) < (12, 4):
             return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"
+        from mstar.engine.device_run import CudaWhile
+
+        if CudaWhile.devrt_path() is None:
+            return "no libcudadevrt.a to link its stop kernel against (set CUDA_HOME)"
         return None
 
-    @contextmanager
-    def conditional(self, graph: CapturedGraph, pred: torch.Tensor) -> Iterator[None]:
-        graph.begin_capture_to_if_node(pred)
-        try:
-            yield
-        finally:
-            graph.end_capture_to_conditional_node()
+    def while_runtime(self) -> Any:
+        from mstar.engine.device_run import CudaWhile
+
+        if self._while is None:
+            self._while = CudaWhile()
+        return self._while
 
 
 class XPUGraphBackend(_TorchGraphBackend):

@@ -344,12 +344,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        tensor-core captured decode wrappers whatever ``decode_tensor_cores`` says; the line
        says so. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
        the node while a request with log-probs is live. ``device_stop`` (default ``off``):
-       ``skip`` captures each replay's body in a conditional node, so once every row of a run
-       has stopped on a stop id its later replays skip their forward. ``drop_rows`` does that
-       and sends a stopped row's reads and writes to the trash slot until the run ends, so
-       its KV and recurrent state stay where its stop left them; it needs a resident walk.
-       Both need a token stop, one rank, and a backend with conditional graph nodes (torch
-       2.12 and up, CUDA 12.4 and up). At startup the worker logs one line per Loop walk with each capability
+       ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
+       ending on the first of: every row done, the run's count, ready work on the worker or
+       ``refill_at`` (a share of the run's rows done; default off). A live row hands on to the
+       next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
+       writes to the trash slot until the run ends, so its KV and recurrent state stay where
+       its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA
+       12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
+       copies alone. At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
        and copies go out from one Rust call with the GIL released; a capture that draws from

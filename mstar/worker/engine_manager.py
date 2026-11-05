@@ -366,7 +366,7 @@ class EngineManager:
     def warmup_all(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
-        device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
+        device_stops: Mapping = MappingProxyType({}),
         kept_rows: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
     ) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region.

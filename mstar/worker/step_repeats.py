@@ -38,9 +38,11 @@ class RepeatConfig:
     error."""
     # the most iterations one step may stand for
     max: int = 1
-    # off; skip: a replay whose rows have all stopped skips its body on the
-    # device; drop_rows: a stopped row also reads and writes the trash slot
+    # off; skip: a run goes on the device, a WHILE node ending when its rows
+    # are done; drop_rows: a stopped row also reads and writes the trash slot
     device_stop: str = "off"
+    # end a run once this share of its rows is done, so new ones join sooner
+    refill_at: float | None = None
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -59,6 +61,8 @@ class RepeatConfig:
                 f"step_repeats for {node!r}: device_stop is {config.device_stop!r}; "
                 f"it must be one of {cls.DEVICE_STOPS}"
             )
+        if config.refill_at is not None and not 0 < config.refill_at <= 1:
+            raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
         default = cls()
         needs = [k for k in block if k != "max" and getattr(config, k) != getattr(default, k)]
         if config.max == 1 and needs:
@@ -143,12 +147,9 @@ class StepRepeats:
         """Whether ``settle`` let this walk repeat."""
         return (node, walk) in self._walks
 
-    def device_stops(self) -> dict[tuple[str, str], str]:
-        """The walks asked to skip a replay whose rows have all stopped, by mode."""
-        return {
-            key: self.config(key[0]).device_stop for key in sorted(self.edges)
-            if self.config(key[0]).device_stop != "off"
-        }
+    def device_stops(self) -> dict[tuple[str, str], RepeatConfig]:
+        """The walks asked to run on the device, by their node's settings."""
+        return {key: self.config(key[0]) for key in sorted(self.edges) if self.config(key[0]).device_stop != "off"}
 
     def kept_rows(self, resident: bool) -> dict[tuple[str, str], frozenset[str]]:
         """The loop-back signals of each walk whose config asks for resident

@@ -1,0 +1,215 @@
+"""A run on the device (``mstar.engine.device_run``): when a WHILE run ends, and
+what its body does each iteration. The node itself needs CUDA; this drives the
+same body through the rule in torch, with a backend that loops on its condition."""
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from mstar.engine import accelerator_graph_runner as runner_mod
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, RunAsk
+from mstar.engine.resources.step import BucketKey
+from mstar.model.submodule_base import BatchedModelOutput, CarryPair
+
+CPU = torch.device("cpu")
+WALK = "decode"
+EOS = 9
+
+
+class _Loop:
+    """What ``CudaWhile`` does, off the GPU: ``body`` until the condition clears."""
+
+    def __init__(self, on_iteration=lambda i: None):
+        self.body = None
+        self.on_iteration = on_iteration
+        self.state = None
+
+    def new_loop(self, device):
+        return 1, 2, torch.zeros(1)
+
+    def stop(self, state, tokens, handle, stream):
+        self.state = state
+        state.advance(tokens)
+
+    def node_refusal(self, graph):
+        return None
+
+    def finish(self, outer, handle, graph):
+        return 3
+
+    def launch(self, graph_exec, stream):
+        i = 0
+        while True:
+            self.on_iteration(i)
+            self.body()
+            i += 1
+            if not self.state.live:
+                return
+
+
+def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None):
+    """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._device, runner._memory_pool, runner._autocast_dtype = CPU, None, None
+    runner._submodule_name, runner._capture_stream, runner._resident = "n", None, None
+    runner._run_asks, runner._run_failures, runner._generator_walks = {}, {}, set()
+    runner._yield_word = None
+    runner._graph_backend = SimpleNamespace(
+        while_refusal=lambda: None, while_runtime=lambda: loop,
+        current_stream=lambda: SimpleNamespace(cuda_stream=0),
+    )
+    runner.ask_run(WALK, RunAsk("new_token", frozenset({EOS}), False, limit, carries or {}, ("frame",), ("cond",),
+                                refill_at))
+    static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
+    calls = []
+
+    def forward(in_run=False):
+        i = min(len(calls), len(tokens) - 1)
+        calls.append(static["cond"].clone())
+        token = torch.tensor(tokens[i])
+        return BatchedModelOutput(
+            check_stop_buffers={"new_token": token},
+            row_outputs={"frame": token.float() * 2, "h": static["h"] + 1},
+        )
+
+    def capture(body, *args, **kwargs):
+        loop.body = body
+        out = body()
+        calls.clear()  # capture records; it doesn't run
+        static["h"].zero_()
+        return SimpleNamespace(raw_cuda_graph=lambda: 7), out
+
+    monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
+    spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
+    warmed = SimpleNamespace(run=forward, static_inputs=static)
+    run, _, _ = runner._capture_run(spec, warmed)
+    return runner, run, static, calls
+
+
+def _run(run, real, repeats, immune=None, refill_at=None, columns=None):
+    run.state.stage(real, immune or [False] * real, repeats, refill_at)
+    run.stage_columns(columns)
+    run.launch()
+    return run.results(repeats)
+
+
+def test_a_long_row_beside_a_short_one_runs_to_the_runs_limit(monkeypatch):
+    """A done row doesn't end the run for the row beside it."""
+    tokens = [[1, 1], [EOS, 2], [3, 3], [4, 4]]
+    _, run, _, calls = _runner(monkeypatch, _Loop(), tokens)
+    stops, rows, _ = _run(run, 2, 4)
+    assert len(calls) == 4 and stops[RUN_REPLAYS].tolist() == [4, 4]
+    assert stops["new_token"].tolist() == [[1, EOS, 3, 4], [1, 2, 3, 4]]
+    assert rows["frame"].tolist() == [[2, 18, 6, 8], [2, 4, 6, 8]]
+    assert run.state.marks.tolist() == [True, False]
+
+
+def test_a_run_ends_with_its_last_row_and_padding_keeps_nothing_alive(monkeypatch):
+    _, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 0], [EOS, 0], [3, 0]])
+    stops, _, _ = _run(run, 1, 5)
+    assert len(calls) == 2 and stops[RUN_REPLAYS].tolist() == [2, 2]
+
+
+def test_a_stop_from_before_a_run_does_not_end_it_and_ignore_eos_never_marks(monkeypatch):
+    _, run, _, calls = _runner(monkeypatch, _Loop(), [[EOS, EOS]])
+    _run(run, 2, 3)
+    assert len(calls) == 1
+    calls.clear()
+    stops, _, _ = _run(run, 2, 3, immune=[True, True])
+    assert len(calls) == 3 and not run.state.marks.any(), "a new run starts unmarked"
+
+
+def test_the_hosts_yield_word_ends_a_run_and_its_row_goes_on_in_the_next(monkeypatch):
+    """Ready work ends a run at its next iteration; the live row hands on where
+    it stands, its carried value intact."""
+    holder = {}
+    loop = _Loop(on_iteration=lambda i: holder["runner"].yield_runs() if i == 2 else None)
+    carries = {"h": CarryPair("h", "h")}
+    runner, run, static, calls = _runner(monkeypatch, loop, [[1, 1]], carries=carries)
+    holder["runner"] = runner
+    stops, _, _ = _run(run, 2, 6)
+    assert len(calls) == 3 and stops[RUN_REPLAYS].tolist() == [3, 3]
+    assert static["h"].tolist() == [3, 3]
+    loop.on_iteration = lambda i: None
+    stops, _, _ = _run(run, 2, 2)
+    assert stops[RUN_REPLAYS].tolist() == [2, 2], "the next run clears the word"
+    assert static["h"].tolist() == [5, 5]
+
+
+def test_refill_at_ends_a_run_once_that_share_of_its_rows_is_done(monkeypatch):
+    tokens = [[EOS, 1, 1, 1], [0, EOS, 1, 1], [0, 0, 1, 1]]
+    _, run, _, calls = _runner(monkeypatch, _Loop(), tokens, bs=4)
+    stops, _, _ = _run(run, 4, 6, refill_at=0.5)
+    assert stops[RUN_REPLAYS].tolist() == [2] * 4
+
+
+def test_each_replay_reads_its_column_of_an_iteration_input(monkeypatch):
+    _, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 1]])
+    _run(run, 2, 3, columns={"cond": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])})
+    assert [c.tolist() for c in calls] == [[1, 4], [2, 5], [3, 6]]
+
+
+@pytest.mark.parametrize(("kinds", "why"), [
+    ([0, 1], None),
+    ([0, 3], "a host node"),
+    ([10], "a memory alloc node"),
+    ([7], "a event record node"),
+    ([13], "a conditional node"),
+], ids=["kernels", "host", "alloc", "event", "if"])
+def test_a_step_graph_a_while_body_cant_hold_is_refused(kinds, why):
+    import ctypes
+
+    cuda = CudaWhile.__new__(CudaWhile)
+
+    def get_nodes(graph, nodes, count):
+        count._obj.value = len(kinds)
+        if nodes is not None:
+            for i in range(len(kinds)):
+                nodes[i] = i + 1
+        return 0
+
+    def get_type(node, kind):
+        kind._obj.value = kinds[node.value - 1]
+        return 1 if kinds[node.value - 1] == 13 else 0
+
+    cuda._rt = SimpleNamespace(cudaGraphGetNodes=get_nodes, cudaGraphNodeGetType=get_type)
+    refusal = cuda.node_refusal(ctypes.c_void_p(1).value)
+    assert refusal is None if why is None else why in refusal
+
+
+def test_a_run_refuses_a_generator_draw_and_a_walk_with_no_while_node():
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._run_asks, runner._run_failures, runner._generator_walks = {WALK: object()}, {}, {WALK}
+    runner._graph_backend = SimpleNamespace(while_refusal=lambda: None)
+    spec = SimpleNamespace(bucket=BucketKey(WALK, 1, 1), config=SimpleNamespace(get_config_type=lambda: None))
+    assert runner._capture_run(spec, None) == (None, None, None)
+    runner._buckets = {}
+    assert "torch generator" in runner.run_refusal(WALK)
+    runner._graph_backend = SimpleNamespace(while_refusal=lambda: "no node")
+    assert runner.run_refusal(WALK) == "backend: no node"
+
+
+def test_the_worker_settles_a_run_that_ended_short():
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    ended = []
+    engine = SimpleNamespace(end_run_early=lambda batch, ran: ended.append(ran))
+    batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object())
+    rows = SimpleNamespace(buffers={RUN_REPLAYS: torch.tensor([3, 3]), "t": torch.zeros(2, 4)})
+    worker._settle_run(batch, rows, engine)
+    assert ended == [3] and batch.batch.repeats == 3 and RUN_REPLAYS not in rows.buffers
+
+
+def test_a_decode_wrapper_reads_its_lengths_off_the_table():
+    """A plan for longer rows serves what's there: the next step after a short run."""
+    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
+
+    wrapper = FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)
+    wrapper.page_size = 4
+    wrapper._paged_kv_last_page_len_buf = torch.zeros(3, dtype=torch.int32)
+    wrapper.stage_page_base(torch.tensor([0, 3, 4]))
+    wrapper.gather_lengths(torch.tensor([9, 2, 0]))
+    assert wrapper._paged_kv_last_page_len_buf.tolist()[:2] == [2, 3]
