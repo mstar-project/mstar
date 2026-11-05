@@ -79,17 +79,21 @@ def test_a_queued_message_that_fails_to_send_is_dropped_not_retried():
 
 def test_a_peer_that_stays_behind_is_reported_with_its_depth(monkeypatch, caplog):
     """Nothing bounds the outbox, so a peer that stays behind is logged, every
-    BEHIND_WARN_S, and one that catches up resets its clock."""
+    BEHIND_WARN_S, and one that catches up starts its clock again when it
+    falls behind later."""
     now = [100.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
-    peer = _Peer(full={"worker_0": 10**6, "worker_1": 1})
+    peer = _Peer(full={"worker_0": 10**6, "worker_1": 2})
     out = OutboxCommunicator(peer)
     for i in range(3):
         out.send("worker_0", i)
     out.send("worker_1", "x")
     with caplog.at_level("WARNING", logger="mstar.communication.communicator"):
-        out.flush()                                 # worker_1 catches up here
+        out.flush()                                 # worker_1 still behind
         now[0] += out.BEHIND_WARN_S - 1
+        out.flush()                                 # worker_1 catches up
+        peer.full["worker_1"] = 10**6
+        out.send("worker_1", "y")                   # and falls behind again
         out.flush()
         assert not caplog.records
         now[0] += 1
