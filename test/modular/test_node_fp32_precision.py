@@ -330,10 +330,9 @@ def test_a_thread_started_during_a_forward_keeps_the_node_setting():
     initializer applies only the per-thread dynamo config."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from mstar.worker.worker import Worker
+    from mstar.worker.testing import make_worker
 
-    worker = Worker.__new__(Worker)  # skips __init__, which opens sockets
-    worker.device = torch.device("cpu")
+    worker = make_worker(device=torch.device("cpu"))
 
     class _StartsAThread(_Recorder):
         def forward(self, graph_walk, engine_inputs, x, **kwargs):

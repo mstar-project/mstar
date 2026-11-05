@@ -18,6 +18,7 @@ from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker
 
 # -- wire --------------------------------------------------------------------
@@ -260,8 +261,7 @@ class _Batch:
 
 
 def _worker(runtime=_Runtime()):
-    w = Worker.__new__(Worker)
-    w._graph_runtime = runtime
+    w = make_worker(_graph_runtime=runtime)
     return w
 
 

@@ -21,6 +21,7 @@ from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutpu
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker, _LazyPerRid
 
 NODE, WALK, STOP_TOKEN, LOOP = "producer", "decode", 9, "loop"
@@ -186,8 +187,7 @@ class _RecordingRuntime(PhasedPostprocess):
 
 def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     engine = _engine(_Producer())
-    w = Worker.__new__(Worker)
-    w._phase_period = 0
+    w = make_worker()
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._innermost_loop_by_node = {}

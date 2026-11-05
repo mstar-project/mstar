@@ -8,7 +8,7 @@ import pytest
 from test_resource_runner import _Stub
 
 from mstar.engine.resources import StepRunner
-from mstar.worker.worker import Worker
+from mstar.worker.testing import make_worker
 
 
 def _runner():
@@ -84,9 +84,7 @@ class _Engine:
 
 
 def _worker(worker_id, wg_nodes, publisher_nodes):
-    worker = Worker.__new__(Worker)
-    worker.worker_id = worker_id
-    worker._all_wg_nodes = wg_nodes
+    worker = make_worker(worker_id=worker_id, _all_wg_nodes=wg_nodes)
     engine = _Engine(publisher_nodes)
     worker.engine_manager = type("EM", (), {"engine": engine})()
     return worker, engine

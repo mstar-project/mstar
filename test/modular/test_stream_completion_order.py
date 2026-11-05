@@ -45,7 +45,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
+from mstar.worker.testing import make_worker
 
 PRODUCER = "worker_0"
 CONSUMER = "worker_1"
@@ -200,10 +200,7 @@ def _conduct(c, wgds) -> InputSignals:
 
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
-    w = Worker.__new__(Worker)
-    w._reads_done_sent = set()  # takes every input (`_takes_input`)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
+    w = make_worker()
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
     w._reads_done_sent = set()

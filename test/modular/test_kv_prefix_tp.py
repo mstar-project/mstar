@@ -27,6 +27,7 @@ from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker
 
 WALKS = {"main": KeyedWalks((WALK, IMAGE_WALK), ("decode",))}
@@ -156,8 +157,7 @@ def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
 
 def _follower_worker(follower: KVManager) -> Worker:
     engine = _engine(follower)
-    worker = Worker.__new__(Worker)
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker = make_worker(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
     worker.scheduler = MicroScheduler(engine_manager=worker.engine_manager, parallel_leader_nodes=set())
     worker._tp_nospec = set()
     return worker

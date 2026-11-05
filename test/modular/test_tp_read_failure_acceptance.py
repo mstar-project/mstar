@@ -628,21 +628,15 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.stream_buffers import StreamBufferManager
-    from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
+    from mstar.worker.testing import make_worker
+    from mstar.worker.worker import _REMOVED_RIDS_KEEP
 
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.worker_id = WORKERS[rank]
-    w.device = torch.device("cpu")
+    w = make_worker(worker_id=WORKERS[rank], device=torch.device("cpu"))
     w.enable_nvtx = w.enable_prof = False
     w._launch_wait_s = 1.0
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._phase_period = 0
-    w._phase_buf = {}
-    w._gpu_spans = []
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
@@ -678,7 +672,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._pending_removes = {}
     w._removes_awaiting_step = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.streaming_buffers = {}
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()

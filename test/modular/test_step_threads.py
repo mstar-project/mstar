@@ -28,7 +28,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, interface  # noqa: E402
 from mstar.utils import cpus, threads  # noqa: E402
 from mstar.utils.cpus import CpuPlan, CpuPlanError, StepCpus, deployment_plan, parse_cpu_list  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.testing import make_worker  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 NODES = [parse_cpu_list(f"{32 * n}-{32 * n + 31},{128 + 32 * n}-{128 + 32 * n + 31}") for n in range(4)]
@@ -1253,9 +1253,7 @@ def test_the_api_server_takes_the_next_free_set_and_its_workers_follow(core_serv
 # ── worker ──────────────────────────────────────────────────────────────────
 
 def _bare_worker(worker_id="worker_1", device="cuda:1"):
-    w = Worker.__new__(Worker)
-    w.worker_id = worker_id
-    w.device = torch.device(device)
+    w = make_worker(worker_id=worker_id, device=torch.device(device))
     return w
 
 
@@ -1610,24 +1608,19 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     def stub(*a, **k):
         return None
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.device = torch.device("cpu")
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
-    w._metrics = None
-    w._step_cpus = StepCpus(step, "test")
-    w._process_cpus = allowed
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: None)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(
+    w = make_worker(
+        worker_id="worker_0",
+        device=torch.device("cpu"),
+        _step_cpus=StepCpus(step, "test"),
+        _process_cpus=allowed,
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: None),
+        communicator=SimpleNamespace(send=stub, wait_for_work=stub),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        scheduler=SimpleNamespace(
         take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
+    ),
     )
     for name in ("_verify_tp_async_sched_agrees", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",

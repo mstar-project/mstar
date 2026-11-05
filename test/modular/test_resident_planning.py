@@ -44,7 +44,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.testing import make_worker
 
 PAGE = 4
 WALK = "decode"
@@ -966,11 +966,7 @@ def test_a_stream_wider_than_a_row_raises():
 # ---- what a raise in the plan leaves ----
 
 def _preplan_worker(engine):
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "w"
-    worker.enable_nvtx = False
-    worker._phase_period = 0
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker = make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
     return worker
 
 
@@ -1144,10 +1140,7 @@ def _offload_engine(resources, planner):
 
 def _refused_worker(engine, line):
     """The real handler and the real victim search over a real engine."""
-    worker = Worker.__new__(Worker)
-    worker.parallel_nodes = set()
-    worker.parallel_leader_nodes = set()
-    worker._hold_logged = {}
+    worker = make_worker()
     worker.pushed = []
     worker.held = []
     worker._apply_removes_whose_step_landed = lambda: None

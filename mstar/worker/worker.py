@@ -2,18 +2,16 @@ import gc
 import logging
 import math
 import os
-import re
 import sys
 import threading
 import time
 import time as _time
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache, cached_property, partial
+from functools import cached_property, partial
 from time import sleep
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -96,10 +94,8 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.profiler import (
-    PHASE_PERIOD,
     PhaseLaps,
     nvtx_enabled,
-    phase_buffer,
     phase_end,
     phase_start,
     range_pop,
@@ -119,6 +115,7 @@ from mstar.worker.micro_scheduler import (
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.phase_timer import PhaseTimer, step_key
 from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -155,16 +152,6 @@ _UNCHUNKED = ChunkRange(-1, -1, -1, -1)
 
 # worker_phases span per message type handled in _process_message_list
 _MSG_SPANS = {t: f"worker.msg.{t.name.lower()}" for t in WorkerMessageType}
-
-
-def _thread_role() -> str:
-    """The worker thread this runs on, by the executors' name prefixes."""
-    name = threading.current_thread().name
-    if name.startswith("mstar-gpu-"):
-        return "gpu"
-    if name.startswith("mstar-plan-"):
-        return "plan"
-    return "main" if threading.current_thread() is threading.main_thread() else "other"
 
 
 def _make_graph_runtime(
@@ -368,13 +355,6 @@ class _LazyPerRid(Mapping):
         return self._dict().values()
 
 
-@cache  # (node, walk) pairs are few
-def _step_key(node_name: str, graph_walk: str) -> str:
-    """``step.<node>.<walk>``, as a phase name (``benchmark/worker_phases``
-    reads names of word characters and dots)."""
-    return "step." + re.sub(r"\W", "_", node_name) + "." + re.sub(r"\W", "_", graph_walk)
-
-
 class _LazyHostOutputs(Mapping):
     """Per-rid host copies of a step's outputs, copied by output name on first
     read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
@@ -518,6 +498,7 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
+        self._init_step_state()
 
         # How long the submitter holds off the GIL waiting for the GPU thread
         # to reach the launch. submit_spec often sits on this cap, but raising
@@ -534,17 +515,7 @@ class Worker:
                 "off: every step yields before the next one is built",
                 worker_id,
             )
-        # (node, walk) -> the loop-back signals the node keeps on the device
-        self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
-        self._host_rows_slot = 0
-
-        # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
-        # rather than in run()'s scope because the GPU and plan threads
-        # record into it too; run() owns the periodic flush.
-        self._phase_period = PHASE_PERIOD
-        self._phase_buf = phase_buffer()
-        # (start, end) CUDA events per step, drained once they land
-        self._gpu_spans: deque = deque(maxlen=64)
+        self.timer = PhaseTimer(worker_id, self.enable_nvtx)
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -702,12 +673,6 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
-        self._tp_broadcast_seq = 0
-        # Follower: leader steps that will NOT be followed by a head; the
-        # leader said so (TPNoSpeculation) or this rank closed the step.
-        self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
-        self._tp_leader_gap_warned = False
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -745,6 +710,88 @@ class Worker:
         self.scheduler.rid_of = self._rid
         self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
+
+        # Let the scheduler see deferred removes so it stops initiating new work
+        # for those rids (shared by reference — mutations are visible to both).
+        self.scheduler.pending_removes = self._pending_removes
+
+        # PartitionTopology + StreamBuffer on consumer worker
+        self.partition_topology = topology
+
+        # Determine which partition this worker serves (by checking which node names
+        # appear in my_worker_graphs vs the topology connections)
+        self._my_consumer_connections = []
+        if self.partition_topology:
+            my_node_names = set()
+            for wg in my_worker_graphs:
+                my_node_names.update(wg.section.get_nodes())
+            for conn in self.partition_topology.connections:
+                # Check if any graph walk graph node for the consumer partition is on this worker
+                # by checking if the streaming edge's next_node is in my nodes
+                if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
+                    self._my_consumer_connections.append(conn)
+
+        # producer-triggered partition -> the connection that decides its walk
+        self._walk_drivers: dict[str, Connection] = (
+            self.partition_topology.walk_drivers()
+            if self.partition_topology else {}
+        )
+        # consumer side: walk-driven edge here -> its consumer partition
+        self._walk_driven_edges = {
+            conn.edge_name: conn.to_partition
+            for conn in self._my_consumer_connections
+            if conn.to_partition in self._walk_drivers
+        }
+        # producer side: streamed signal -> its consumer partition, and
+        # (node, walk) -> the walk drivers it emits for
+        self._signal_consumer = {
+            conn.edge_name: conn.to_partition
+            for conn in (
+                self.partition_topology.connections
+                if self.partition_topology else []
+            )
+        }
+
+        # Set of edge names that arrive via streaming (used to distinguish
+        # streaming inputs from conductor-triggered non-streaming inputs
+        # when checking whether a target node is ready for ingestion).
+        self._streaming_edge_names: set[str] = {
+            conn.edge_name for conn in self._my_consumer_connections
+        }
+
+        self.streams = StreamBufferManager(
+            self.request_state, self.tensor_manager, self._my_consumer_connections,
+            model.get_graph_walk_graphs() if model else None,
+            graph_runtime=self._graph_runtime, walk_driven_edges=self._walk_driven_edges,
+        )
+
+        # (graph_walk, node) -> innermost enclosing loop, for ending a
+        # stream-terminated loop and refusing an END_PARTITION from inside a
+        # loop in _postprocess_batch. Structural, so it is derived from the
+        # model here rather than asked of the graph runtime per step.
+        self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
+        if model:
+            self._innermost_loop_by_node = self._build_innermost_loop_cache(
+                model.get_graph_walk_graphs(),
+            )
+
+        if status_interval_s is not None:
+            self._metrics = self._start_metrics(status_interval_s)
+
+    def _init_step_state(self) -> None:
+        """The state a worker carries from step to step, empty; also what
+        ``mstar.worker.testing.make_worker`` starts from, so a field added here
+        reaches every test that builds a worker."""
+        # (node, walk) -> the loop-back signals the node keeps on the device
+        self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        self._host_rows_slot = 0
+
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
+        self._tp_broadcast_seq = 0
+        # Follower: leader steps that will NOT be followed by a head; the
+        # leader said so (TPNoSpeculation) or this rank closed the step.
+        self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
+        self._tp_leader_gap_warned = False
 
         # wire request id -> messages for requests that are not in the queue.
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
@@ -784,10 +831,6 @@ class Worker:
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
 
-        # Let the scheduler see deferred removes so it stops initiating new work
-        # for those rids (shared by reference — mutations are visible to both).
-        self.scheduler.pending_removes = self._pending_removes
-
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
         # speculation, so syncing on default would also drain GPU(N+1) and
@@ -800,75 +843,9 @@ class Worker:
             tuple[str, torch.dtype, int], list[torch.Tensor]
         ] = defaultdict(list)
 
-        # Streaming buffers: request_id -> edge_name -> list of tensors
-        # (Legacy path — kept for models without PartitionTopology)
-        self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
-
-        # New streaming path: PartitionTopology + StreamBuffer on consumer worker
-        self.partition_topology = topology
-
-        # Determine which partition this worker serves (by checking which node names
-        # appear in my_worker_graphs vs the topology connections)
-        self._my_consumer_connections = []
-        if self.partition_topology:
-            my_node_names = set()
-            for wg in my_worker_graphs:
-                my_node_names.update(wg.section.get_nodes())
-            for conn in self.partition_topology.connections:
-                # Check if any graph walk graph node for the consumer partition is on this worker
-                # by checking if the streaming edge's next_node is in my nodes
-                if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
-                    self._my_consumer_connections.append(conn)
-
-        # producer-triggered partition -> the connection that decides its walk
-        self._walk_drivers: dict[str, Connection] = (
-            self.partition_topology.walk_drivers()
-            if self.partition_topology else {}
-        )
-        # consumer side: walk-driven edge here -> its consumer partition
-        self._walk_driven_edges = {
-            conn.edge_name: conn.to_partition
-            for conn in self._my_consumer_connections
-            if conn.to_partition in self._walk_drivers
-        }
-        # producer side: streamed signal -> its consumer partition, and
-        # (node, walk) -> the walk drivers it emits for
-        self._signal_consumer = {
-            conn.edge_name: conn.to_partition
-            for conn in (
-                self.partition_topology.connections
-                if self.partition_topology else []
-            )
-        }
         self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
         # refilled for every walk-hook call rather than built per request per step
         self._walk_ctx = ProducerWalkCtx()
-
-        # Set of edge names that arrive via streaming (used to distinguish
-        # streaming inputs from conductor-triggered non-streaming inputs
-        # when checking whether a target node is ready for ingestion).
-        self._streaming_edge_names: set[str] = {
-            conn.edge_name for conn in self._my_consumer_connections
-        }
-
-        self.streams = StreamBufferManager(
-            self.request_state, self.tensor_manager, self._my_consumer_connections,
-            model.get_graph_walk_graphs() if model else None,
-            graph_runtime=self._graph_runtime, walk_driven_edges=self._walk_driven_edges,
-        )
-
-        # (graph_walk, node) -> innermost enclosing loop, for ending a
-        # stream-terminated loop and refusing an END_PARTITION from inside a
-        # loop in _postprocess_batch. Structural, so it is derived from the
-        # model here rather than asked of the graph runtime per step.
-        self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
-        if model:
-            self._innermost_loop_by_node = self._build_innermost_loop_cache(
-                model.get_graph_walk_graphs(),
-            )
-
-        if status_interval_s is not None:
-            self._metrics = self._start_metrics(status_interval_s)
 
     def _start_metrics(self, interval_s: float) -> WorkerMetrics:
         """Metrics on: send the conductor a WorkerStatus every ``interval_s``,
@@ -1185,7 +1162,6 @@ class Worker:
         self.tensor_manager.force_cleanup_request(request_id)
         laps.lap("worker_state_tensors")
         self.profile_info.pop_request(request_id)
-        self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
 
@@ -2197,14 +2173,14 @@ class Worker:
 
         if not engine.can_pre_plan(spec_batch.node_name):
             return False
-        if self._phase_period:
+        if self.timer.period:
             sb = speculation.scheduled_batch
-            set_step_key(_step_key(sb.node_name, sb.graph_walk))
+            set_step_key(step_key(sb.node_name, sb.graph_walk))
         try:
             if pending is not None:
                 # A step N this slow (a long admit, say) skips the pre-plan
                 # rather than holding plan_executor; exec plans N+1 inline.
-                with self._span("worker.plan_thread.await_commit"):
+                with self.timer.span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
                 if not committed:
                     logger.warning(
@@ -2212,11 +2188,11 @@ class Worker:
                         "batch N commit; skipping pre-plan", self.worker_id,
                     )
                     return False
-            with self._span("worker.plan_thread.reserve_slot"):
+            with self.timer.span("worker.plan_thread.reserve_slot"):
                 leased = engine.reserve_replay_slot(spec_batch) is not None
             if not leased:
                 return False  # eager, or no batched capture for this shape
-            with self._span(
+            with self.timer.span(
                 "worker.plan_thread.pre_plan",
                 cpu="worker.plan_thread.pre_plan.cpu",
             ):
@@ -2226,7 +2202,7 @@ class Worker:
             self._reset_skip_plan_flags(spec_batch)
             return False
         finally:
-            if self._phase_period:
+            if self.timer.period:
                 set_step_key(None)
 
     def _continuing_seq_lens(
@@ -2308,70 +2284,6 @@ class Worker:
         if self._step_cpus is not None:
             pin_thread(self._step_cpus.cpus, self._process_cpus)
 
-    @contextmanager
-    def _span(self, name: str, cpu: str | None = None):
-        """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
-
-        ``cpu`` names a second sample: this thread's CPU time over the span.
-        Wall minus CPU is time spent blocked -- on an event, a lock or the
-        GIL -- which a wall-clock span alone cannot tell from work.
-
-        Safe off the main thread: the append is the only shared mutation and
-        run()'s flush snapshots before it clears.
-        """
-        nvtx = self.enable_nvtx
-        if nvtx:
-            range_push(name, synchronize=False)
-        timed = self._phase_period
-        t0 = _time.perf_counter() if timed else 0.0
-        c0 = _time.thread_time() if timed and cpu else 0.0
-        try:
-            yield
-        finally:
-            if timed:
-                self._phase_buf[name].append(_time.perf_counter() - t0)
-                if cpu:
-                    self._phase_buf[cpu].append(_time.thread_time() - c0)
-            if nvtx:
-                range_pop(synchronize=False)
-
-    # wall time of each collection by generation, on whichever thread ran it;
-    # a per-thread start stamp because collections on two threads can interleave
-    _GC_PHASES = ("gc.gen0", "gc.gen1", "gc.gen2")
-    _gc_t0 = threading.local()
-
-    def _gc_phase_callback(self, phase: str, info: dict) -> None:
-        if phase == "start":
-            self._gc_t0.t = _time.perf_counter()
-        else:
-            t0 = getattr(self._gc_t0, "t", None)
-            if t0 is not None:
-                dt = _time.perf_counter() - t0
-                name = self._GC_PHASES[info["generation"]]
-                self._phase_buf[name].append(dt)
-                # and by thread: a collection is charged to whatever span
-                # allocated when it triggered, so this says whose spans
-                # carry it (gc.gen0.main / .gpu / .plan)
-                self._phase_buf[f"{name}.{_thread_role()}"].append(dt)
-
-    def _phase_record(self, name: str, dt: float) -> None:
-        if self._phase_period > 0:
-            self._phase_buf[name].append(dt)
-
-    def _drain_gpu_spans(self) -> None:
-        """Record the GPU times whose events have landed, leaving the rest:
-        reading a pair still in flight would block the host on the GPU."""
-        while self._gpu_spans:
-            start, end, key = self._gpu_spans[0]
-            if not end.query():
-                return
-            self._gpu_spans.popleft()
-            # elapsed_time is ms; the phase buffer holds seconds
-            elapsed = start.elapsed_time(end) / 1000
-            # drained while another step runs: not that step's sample
-            self._phase_buf.unkeyed("gpu_exec").append(elapsed)
-            self._phase_buf.unkeyed(f"{key}.gpu_exec").append(elapsed)
-
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -2390,11 +2302,11 @@ class Worker:
         """
         from mstar.utils.profiler import range_pop, range_push
 
-        timed = self._phase_period
+        timed = self.timer.period
         t_start = _time.perf_counter() if timed else 0.0
         c_start = _time.thread_time() if timed else 0.0
         if timed:
-            set_step_key(_step_key(batch.node_name, batch.graph_walk))
+            set_step_key(step_key(batch.node_name, batch.graph_walk))
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         if self.enable_nvtx:
@@ -2429,14 +2341,14 @@ class Worker:
             # which is the point: running prepare_inputs here instead just puts
             # the two threads in contention for it, and measured worse.
             if plan_future is not None:
-                with self._span("worker.gpu_thread.await_plan"):
+                with self.timer.span("worker.gpu_thread.await_plan"):
                     plan_future.result()
             laps.skip()
             try:
                 if node_batch.read_check_rids is not None:
-                    with self._span("worker.gpu_thread.read_check"):
+                    with self.timer.span("worker.gpu_thread.read_check"):
                         self._drop_rows_whose_read_failed(node_batch)
-                with self._span(
+                with self.timer.span(
                     "worker.gpu_thread.prepare_inputs",
                     cpu="worker.gpu_thread.prepare_inputs.cpu",
                 ):
@@ -2458,17 +2370,17 @@ class Worker:
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
-            if self._phase_period and execution_stream is not None:
+            if self.timer.period and execution_stream is not None:
                 gpu_start = torch.Event(device=self.device, enable_timing=True)
                 gpu_start.record(execution_stream)
-            if self._phase_period:
+            if self.timer.period:
                 # after prepare_inputs, which can drop rids — this is the row
                 # count the forward really pays for
-                self._phase_record(
+                self.timer.record(
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
             laps.lap("pre_exec")
-            with self._span(
+            with self.timer.span(
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
                 outputs = engine.exec_and_postprocess(node_batch)
@@ -2483,8 +2395,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
-                    self._drain_gpu_spans()
+                    self.timer.record_gpu_span(gpu_start, gpu_end, step_key(batch.node_name, batch.graph_walk))
                     laps.lap("gpu_exec_events")
             return outputs
         finally:
@@ -2504,10 +2415,10 @@ class Worker:
             )
             laps.lap("finalize_batch")
             if timed:
-                self._phase_record(
+                self.timer.record(
                     "worker.gpu_thread.total", _time.perf_counter() - t_start,
                 )
-                self._phase_record(
+                self.timer.record(
                     "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
                 )
                 set_step_key(None)
@@ -2537,7 +2448,7 @@ class Worker:
         if event is None or event.is_set():
             return
         waited = 0.0
-        with self._span("worker.await_admit_settled"):
+        with self.timer.span("worker.await_admit_settled"):
             while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
                 waited += _ADMIT_FENCE_WARN_S
                 logger.warning(
@@ -2626,11 +2537,11 @@ class Worker:
         )
         chain = step.lane == CHAIN_LANE
         span = "worker.postprocess_batch" if chain else "worker.postprocess_side"
-        keyed = self._phase_period > 0
+        keyed = self.timer.period > 0
         if keyed:
-            set_step_key(_step_key(step.node_name, step.graph_walk))
+            set_step_key(step_key(step.node_name, step.graph_walk))
         try:
-            with self._span(span, cpu=f"{span}.cpu"):
+            with self.timer.span(span, cpu=f"{span}.cpu"):
                 self._postprocess_batch(step, outputs, clear_loop_stops=chain)
         finally:
             if keyed:
@@ -3658,10 +3569,10 @@ class Worker:
         if self.device.type == "cpu":
             return
         if batch_N.node_batch.completion_event is not None:
-            with self._span("worker.postprocess.event_sync"):
+            with self.timer.span("worker.postprocess.event_sync"):
                 batch_N.node_batch.completion_event.synchronize()
         else:
-            with self._span("worker.postprocess.device_sync"):
+            with self.timer.span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
 
     def _postprocess_batch(
@@ -3671,13 +3582,13 @@ class Worker:
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
-        _pp_t = _time.perf_counter() if self._phase_period else 0.0
+        _pp_t = _time.perf_counter() if self.timer.period else 0.0
         def _pp_stage(name: str) -> None:
             nonlocal _pp_t
-            if not self._phase_period:
+            if not self.timer.period:
                 return
             now = _time.perf_counter()
-            self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
+            self.timer.buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
 
         if self.enable_nvtx:
@@ -3827,13 +3738,13 @@ class Worker:
         # release, so a concurrent caller gets "Already mutably borrowed"
         # rather than blocking.
         rt = self._graph_runtime
-        _t_rt = _time.perf_counter() if self._phase_period else 0.0
+        _t_rt = _time.perf_counter() if self.timer.period else 0.0
         step = rt.begin_postprocess(request)
-        rt_time = _time.perf_counter() - _t_rt if self._phase_period else 0.0
+        rt_time = _time.perf_counter() - _t_rt if self.timer.period else 0.0
         stored = None
         sent_here = False
         while step.need is not PostprocessNeed.DONE:
-            _t = _time.perf_counter() if self._phase_period else 0.0
+            _t = _time.perf_counter() if self.timer.period else 0.0
             if step.need is PostprocessNeed.STOPS:
                 model_stops = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine)
                 # after the request was built, which carries the step's other
@@ -3841,7 +3752,7 @@ class Worker:
                 for rid in model_stops.ended:
                     rt.mark_partition_done(rid, batch_N.partition)
                 stage = "check_stop"
-                _t_rt = _time.perf_counter() if self._phase_period else 0.0
+                _t_rt = _time.perf_counter() if self.timer.period else 0.0
                 step = rt.resume_postprocess(stops=model_stops.stops, dropped=model_stops.dropped)
             elif step.need is PostprocessNeed.STORE:
                 # What the stop check withheld (``StopCheck.withheld``), and an
@@ -3858,20 +3769,20 @@ class Worker:
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
                 )
                 stage = "store_tensors"
-                _t_rt = _time.perf_counter() if self._phase_period else 0.0
+                _t_rt = _time.perf_counter() if self.timer.period else 0.0
                 step = rt.resume_postprocess(stored=route_tensors)
             else:
                 send = self._send_input(batch_N, request, step, stored, engine)
                 sent_here = True
                 stage = "send_prep"
-                _t_rt = _time.perf_counter() if self._phase_period else 0.0
+                _t_rt = _time.perf_counter() if self.timer.period else 0.0
                 step = rt.resume_postprocess(send=send)
-            if self._phase_period:
+            if self.timer.period:
                 now = _time.perf_counter()
-                self._phase_record(f"worker.postprocess.{stage}", _t_rt - _t)
+                self.timer.record(f"worker.postprocess.{stage}", _t_rt - _t)
                 rt_time += now - _t_rt
-        if self._phase_period:
-            self._phase_record("worker.postprocess.runtime", rt_time)
+        if self.timer.period:
+            self.timer.record("worker.postprocess.runtime", rt_time)
             _pp_t = _time.perf_counter()
 
         if self.enable_nvtx:
@@ -4920,10 +4831,10 @@ class Worker:
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
-                _t0 = _time.perf_counter() if self._phase_period else 0.0
+                _t0 = _time.perf_counter() if self.timer.period else 0.0
                 speculation = self._try_speculate_next(pending, target)
-                if self._phase_period:
-                    self._phase_record("speculate", _time.perf_counter() - _t0)
+                if self.timer.period:
+                    self.timer.record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 if speculation is not None and not speculation.is_yield_away:
@@ -4956,7 +4867,7 @@ class Worker:
                         self.request_state, chain_key,
                     )
                 yield_away_from_target = chain_key if must_yield_away else None
-                with self._span("worker.schedule_yield_away"):
+                with self.timer.span("worker.schedule_yield_away"):
                     batch = self.scheduler.get_next_batch(
                         self.request_state,
                         exclude_target=yield_away_from_target,
@@ -5051,8 +4962,7 @@ class Worker:
         if gen0 := knobs.gc_gen0_threshold():
             gc.set_threshold(gen0, *gc.get_threshold()[1:])
             logger.info("Worker %s: gc thresholds %s", self.worker_id, gc.get_threshold())
-        if self._phase_period:
-            gc.callbacks.append(self._gc_phase_callback)
+        self.timer.track_gc()
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
@@ -5142,51 +5052,11 @@ class Worker:
             pending = p
             self._hold_rows(CHAIN_LANE, p.batch.request_to_worker_graph if p else ())
 
-        # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
-        # When enabled, every Nth speculative iter logs a histogram so we can
-        # see whether await_gpu time = "GPU still running" (overlap working)
-        # vs "GPU done, idle" (overlap not paying off). Set the env var to a
-        # positive integer = the dump period in iters (e.g. 200).
-        phase_period = self._phase_period
-        phase_buf = self._phase_buf
-        phase_iter = [0]
-        _phase_record = self._phase_record
-
-        # Requests in flight per iteration over the window. Reported beside
-        # the timings because it is what separates ramp-up, steady state and
-        # drain: a phase mean averaged across those is not a measurement of
-        # anything. ``benchmark/worker_phases`` segments on it.
-        phase_bs: list[int] = []
+        timer = self.timer
+        phase_period = timer.period
 
         # None with metrics off: then nothing below records or sends anything
         metrics = self._metrics
-
-        def _phase_flush() -> None:
-            if phase_period <= 0 or phase_iter[0] % phase_period != 0:
-                return
-            # list() first: the GPU and plan threads append to this while we
-            # read it, and iterating the live dict would raise on resize.
-            samples = sorted((k, v) for k, v in list(phase_buf.items()) if v)
-            parts = []
-            for name, vs in samples:
-                vs = sorted(vs)
-                n = len(vs)
-                # a trailing '#' marks a count, not a duration
-                scale, unit = (1, "") if name.endswith("#") else (1000, "ms")
-                p50 = vs[n // 2] * scale
-                p95 = vs[min(n - 1, int(n * 0.95))] * scale
-                mean = (sum(vs) / n) * scale
-                parts.append(
-                    f"{name}: p50={p50:.3f}{unit} p95={p95:.3f}{unit} "
-                    f"mean={mean:.3f}{unit} n={n}"
-                )
-            bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
-            logger.info(
-                "Worker %s phase-timing iter=%d bs=%.2f: %s",
-                self.worker_id, phase_iter[0], bs, " | ".join(parts),
-            )
-            phase_buf.clear()
-            phase_bs.clear()
 
         # Reset per iteration (not just where they're first used) so the
         # error handler below sees only this iteration's work — a stale
@@ -5288,7 +5158,7 @@ class Worker:
                             pending, _arm_speculation,
                         )
                         if phase_period:
-                            _phase_record("follow_await", _time.perf_counter() - _t0)
+                            timer.record("follow_await", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
@@ -5298,7 +5168,7 @@ class Worker:
                         _t0 = _time.perf_counter() if phase_period else 0.0
                         outputs = pending.future.result()
                         if phase_period:
-                            _phase_record("await_gpu", _time.perf_counter() - _t0)
+                            timer.record("await_gpu", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
@@ -5414,12 +5284,12 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            with self._span("worker.submit_spec.launch_wait"):
+                            with self.timer.span("worker.submit_spec.launch_wait"):
                                 spec_node_batch.launch_started_event.wait(
                                     timeout=launch_wait_s,
                                 )
                             if phase_period:
-                                _phase_record("submit_spec", _time.perf_counter() - _t0)
+                                timer.record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                         elif speculation.plan_future is not None:
@@ -5472,18 +5342,14 @@ class Worker:
                     else:
                         consecutive_spec_steps += 1
                     if phase_period:
-                        _phase_record("iter_total", _time.perf_counter() - _iter_start)
-                        _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
-                        phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
-                        phase_iter[0] += 1
-                        _phase_flush()
+                        timer.pass_done(len(spec_pending.batch.request_to_worker_graph), _iter_start, _iter_cpu)
                     _set_pending(spec_pending)
                     continue
                 consecutive_spec_steps = 0
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
-                with self._span("worker.schedule"):
+                with self.timer.span("worker.schedule"):
                     batch = None
                     if yield_away_from_target is not None:
                         batch = self.scheduler.get_next_batch(
@@ -5526,11 +5392,7 @@ class Worker:
                 _set_pending(step)
                 # Same accounting as the speculative path above
                 if phase_period:
-                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
-                    _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
-                    phase_bs.append(len(batch.request_to_worker_graph))
-                    phase_iter[0] += 1
-                    _phase_flush()
+                    timer.pass_done(len(batch.request_to_worker_graph), _iter_start, _iter_cpu)
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
                 # Follower: a head from a step that raised must not sit at the

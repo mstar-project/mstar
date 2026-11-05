@@ -24,7 +24,7 @@ from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
+from mstar.worker.testing import make_worker
 
 WG_ID = 0
 WALK = "prefill"
@@ -68,10 +68,7 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     all_loops = {wg_id: set() for wg_id, *_ in graphs}
     node_to_partition = {node: partition for _, node, _, partition in graphs}
 
-    w = Worker.__new__(Worker)
-    w.worker_id = WORKER
-    w.is_tp_follower = False
-    w.tensor_manager = _StubTensorManager()
+    w = make_worker(worker_id=WORKER, tensor_manager=_StubTensorManager())
     w._graph_runtime = build_runtime(
         bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
@@ -102,7 +99,6 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = {}
-    w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
     w.enable_nvtx = False

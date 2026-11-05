@@ -27,6 +27,7 @@ from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutpu
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker
 
 STEPS, RID, NODE, WALK = 4, 7, "rollout_predictor", "rollout"
@@ -85,10 +86,7 @@ def _manager(tmp_path, entity_id):
 
 
 def _worker(tmp_path):
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._phase_period = 0
+    w = make_worker()
     w.enable_nvtx = w.enable_prof = False
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.device = torch.device("cpu")

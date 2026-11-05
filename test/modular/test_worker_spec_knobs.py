@@ -8,7 +8,7 @@ died. Now a bad value is reported, with a warning, before anything loads and
 the default is used, as ``MSTAR_PY_SWITCH_INTERVAL_SEC`` already does.
 
 These run the real ``Worker.__init__`` up to the first call after the knobs
-(``phase_buffer``), which is before the communicator, the graph runtime and
+(``PhaseTimer``), which is before the communicator, the graph runtime and
 the engines are built.
 """
 
@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from mstar.worker import worker as worker_mod
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker
 
 LAUNCH = "MSTAR_LAUNCH_WAIT_MS"
@@ -36,11 +37,11 @@ class _StopError(Exception):
 
 def _build(monkeypatch) -> Worker:
     """Run ``Worker.__init__`` until just after it reads the knobs."""
-    def stop():
+    def stop(*args, **kwargs):
         raise _StopError
 
-    monkeypatch.setattr(worker_mod, "phase_buffer", stop)
-    worker = Worker.__new__(Worker)
+    monkeypatch.setattr(worker_mod, "PhaseTimer", stop)
+    worker = make_worker()
     with pytest.raises(_StopError):
         worker.__init__(
             worker_id="w0", worker_ids=["w0"], model=None, my_worker_graphs=[],

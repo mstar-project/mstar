@@ -55,6 +55,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessageType,
 )
 from mstar.validation.client_streams import check_client_streams  # noqa: E402
+from mstar.worker.testing import make_worker  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PREPROCESS = "api_server_preprocess_worker"
@@ -319,7 +320,7 @@ def _stub_worker(sbuf):
     """What ``Worker._process_new_inputs`` touches for a streaming-only signal."""
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
-    stub = Worker.__new__(Worker)
+    stub = make_worker()
     vars(stub).update(
         _reads_done_sent=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
         _rid=lambda rid: 7 if rid == "r" else None,

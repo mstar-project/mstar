@@ -8,6 +8,7 @@ import torch
 
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import PendingBatch, Worker, _LazyHostOutputs, _LazyPerRid
 
 
@@ -85,11 +86,11 @@ def test_a_host_transport_gets_each_routed_output_in_one_copy(host_transport):
         landed.update(cpu_tensors)
         raise _ReachedStoreError
 
-    worker = Worker.__new__(Worker)
-    worker._phase_period = 0
-    worker._graph_runtime = SimpleNamespace(supports_inline_emit=False)
-    worker.tensor_manager = SimpleNamespace(
+    worker = make_worker(
+        _graph_runtime=SimpleNamespace(supports_inline_emit=False),
+        tensor_manager=SimpleNamespace(
         needs_cpu_tensor=host_transport, store_and_return_tensor_info_batch=store,
+    ),
     )
     pending = PendingBatch(
         batch=ScheduledBatch(

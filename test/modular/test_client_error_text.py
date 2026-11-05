@@ -20,7 +20,7 @@ from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
 from mstar.utils.ipc_format import ConductorMessageType
 from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler
-from mstar.worker.worker import Worker
+from mstar.worker.testing import make_worker
 
 USER = getpass.getuser()
 ERROR_ID = re.compile(r"error id ([0-9a-f]{12})\)")
@@ -106,8 +106,7 @@ def test_an_arena_io_error_reaches_the_client_as_an_error_id(caplog):
 
 
 def _worker(rids=("r1",)):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
+    w = make_worker()
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda entity, msg: w.sent.append(msg))
     w.request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})

@@ -32,6 +32,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import PendingBatch, Speculation, Worker  # noqa: E402
 
 NODE, WALK = "dit", "rollout"
@@ -53,9 +54,7 @@ class _Runtime:
 
 
 def _worker(*, follower=False):
-    w = Worker.__new__(Worker)
-    w.worker_id = 0
-    w._graph_runtime = _Runtime()
+    w = make_worker(worker_id=0, _graph_runtime=_Runtime())
     w.reported: dict[int, str] = {}
     w._fail_requests = w.reported.update
     w._in_flight_rids = set()

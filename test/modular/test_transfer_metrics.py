@@ -43,7 +43,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.testing import make_worker  # noqa: E402
 
 DATA_WORKER = "api_server_preprocess_worker"
 TRANSFER_FAMILIES = {f.name for f in (catalog.TRANSFER_BYTES, catalog.TRANSFERS, catalog.TRANSFER_SECONDS)}
@@ -317,12 +317,12 @@ def test_seconds_land_in_inclusive_buckets_and_the_counts_are_cumulative():
 def _bare_worker(tmp_path):
     """The attributes ``Worker._start_metrics`` reads, for a rank leading no
     node, with a real SHM manager."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "worker_1"
-    worker.parallel_leader_nodes = set()
-    worker.engine_manager = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
-    worker.communicator = _Sink()
-    worker.tensor_manager = _shm("worker_1", tmp_path)
+    worker = make_worker(
+        worker_id="worker_1",
+        engine_manager=SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)),
+        communicator=_Sink(),
+        tensor_manager=_shm("worker_1", tmp_path),
+    )
     return worker
 
 

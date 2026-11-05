@@ -35,6 +35,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
+from mstar.worker.testing import make_worker
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -69,10 +70,7 @@ def _worker(is_tp_follower=False) -> Worker:
     worker_graph = WorkerGraph(
         section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
-    w = Worker.__new__(Worker)
-    w.worker_id = WORKER
-    w.is_tp_follower = is_tp_follower
-    w.tensor_manager = _TensorManager()
+    w = make_worker(worker_id=WORKER, is_tp_follower=is_tp_follower, tensor_manager=_TensorManager())
     w._graph_runtime = build_runtime(
         bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
@@ -107,7 +105,6 @@ def _worker(is_tp_follower=False) -> Worker:
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
-    w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
     w.enable_nvtx = False

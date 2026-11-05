@@ -8,12 +8,11 @@ import pytest
 import torch
 
 from mstar.engine import _default_compile_caches, recompile_limit
-from mstar.worker.worker import Worker
+from mstar.worker.testing import make_worker
 
 
 def test_executor_thread_gets_torch_config():
-    worker = Worker.__new__(Worker)  # skips __init__, which opens sockets
-    worker.device = torch.device("cpu")
+    worker = make_worker(device=torch.device("cpu"))
     with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
         limit, unspec = ex.submit(lambda: (
             torch._dynamo.config.recompile_limit,
