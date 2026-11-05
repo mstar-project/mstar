@@ -155,6 +155,7 @@ class MoveKind(IntEnum):
     LAND = 6
     GUARANTEE = 7
     ALLOT = 8
+    WAIT = 9
 
 
 class Resource(ResidentHooks, ABC):
