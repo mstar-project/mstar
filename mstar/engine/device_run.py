@@ -328,6 +328,8 @@ class DeviceRun:
     ):
         self.state = state
         self.handle = handle
+        # set once the columns are sized, before the capture, which only writes them
+        self.sealed = False
         self.inputs = inputs
         self.limit = limit
         self.launch = launch
@@ -343,6 +345,8 @@ class DeviceRun:
         """Inside the body: a column of each of ``name_of``, this replay's."""
         for name, tensor in name_of.items():
             if name not in kept:
+                if self.sealed:
+                    raise RuntimeError(f"a run's column {name!r} was not sized before its capture")
                 kept[name] = tensor.new_empty(tensor.shape[0], int(self.limit), *tensor.shape[1:])
             column_out(self.state, tensor, kept[name])
 

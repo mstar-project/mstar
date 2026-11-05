@@ -774,6 +774,9 @@ class WarmedSpec(NamedTuple):
     returned: int
     # what its capture reads off the node's rows (``AcceleratorGraphSlot.row_heads``)
     row_heads: Mapping[str, str] = MappingProxyType({})
+    # the last warm-up forward's output, kept for a walk asked to run on the
+    # device: it sizes the run's columns before the capture
+    output: Any = None
 
 
 class AcceleratorGraphRunner:
@@ -1381,6 +1384,19 @@ class AcceleratorGraphRunner:
         run = DeviceRun(
             state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle,
         )
+        # The run's columns live outside the capture's pool: a block the forward
+        # frees mid-capture goes to a later allocation of the same capture, so
+        # the next iteration's forward would write its scratch over all but the
+        # last column. Sized off the last warm-up forward, or one more.
+        with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+            sized = BatchedModelOutput.coerce(warmed.output if warmed.output is not None else warmed.run(False))
+        buffers, spans = sized.check_stop_buffers or {}, sized.output_spans or {}
+        run.keep({name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}, run.stops)
+        run.keep({name: sized.row_outputs[name] for name in ask.columns}, run.rows)
+        run.keep({name: spans[name] for name in ask.columns if name in spans}, run.spans)
+        run.sealed = True
+        del sized, buffers, spans
+        backend.synchronize()
 
         def body() -> Any:
             state.head()
@@ -1485,13 +1501,19 @@ class AcceleratorGraphRunner:
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
             peak = returned = 0
+            output = None
             for _ in range(forwards):
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
                 offset = self._graph_backend.generator_offset()
+                output = None
                 with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
-                    returned = _tensor_bytes(run_forward())
+                    out = run_forward()
+                    returned = _tensor_bytes(out)
+                    if walk in self._run_asks:
+                        output = out
+                    del out
                 if self._graph_backend.generator_offset() != offset:
                     self._generator_walks.add(walk)
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
@@ -1510,6 +1532,7 @@ class AcceleratorGraphRunner:
                 peak=peak,
                 returned=returned,
                 row_heads=row_heads,
+                output=output,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage

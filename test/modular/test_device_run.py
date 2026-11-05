@@ -8,7 +8,7 @@ import torch
 
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, RunAsk, TokenStream
+from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, DeviceRun, RunAsk, TokenStream
 from mstar.engine.resources.step import BucketKey
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
@@ -22,6 +22,7 @@ class _Loop:
 
     def __init__(self, on_iteration=lambda i: None):
         self.body = None
+        self.capturing = lambda body: None
         self.on_iteration = on_iteration
         self.state = None
 
@@ -58,7 +59,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
     runner._yield_word = None
     runner._graph_backend = SimpleNamespace(
         while_refusal=lambda: None, while_runtime=lambda: loop,
-        raw_stream=lambda: 0,
+        raw_stream=lambda: 0, synchronize=lambda: None,
     )
     runner.ask_run(WALK, RunAsk("new_token", frozenset({EOS}), False, limit, carries or {}, ("frame",), ("cond",),
                                 refill_at, stream_tokens))
@@ -76,6 +77,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
 
     def capture(body, *args, **kwargs):
         loop.body = body
+        loop.capturing(body)
         out = body()
         calls.clear()  # capture records; it doesn't run
         static["h"].zero_()
@@ -83,7 +85,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
 
     monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
-    warmed = SimpleNamespace(run=forward, static_inputs=static)
+    warmed = SimpleNamespace(run=forward, static_inputs=static, output=None)
     run, _, _ = runner._capture_run(spec, warmed)
     return runner, run, static, calls
 
@@ -280,6 +282,23 @@ def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
     worker.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     assert worker._stream_refusal("n", WALK) == why
     assert asked == ([] if why else [("n", WALK, "new_token", 4)])
+
+
+def test_a_runs_columns_are_allocated_before_its_capture(monkeypatch):
+    """A column allocated inside the capture took a block the forward had freed
+    there, and each iteration's scratch overwrote it: only the last survived."""
+    runs = []
+    keep = DeviceRun.keep
+
+    def record(self, name_of, kept):
+        runs.append(self)
+        return keep(self, name_of, kept)
+
+    monkeypatch.setattr(DeviceRun, "keep", record)
+    loop, seen = _Loop(), {}
+    loop.capturing = lambda body: seen.update({name: id(column) for name, column in runs[0].stops.items()})
+    _, run, _, _ = _runner(monkeypatch, loop, [[1, 2], [3, 4]])
+    assert seen and {name: id(column) for name, column in run.stops.items()} == seen and run.sealed
 
 
 def test_a_run_holds_the_device_handle_its_graph_reads(monkeypatch):
