@@ -85,6 +85,30 @@ def test_ready_rows_wait_out_one_run_and_no_more():
     assert peeked == [("LLM", "decode")] * 2
 
 
+def test_the_run_ready_rows_wait_for_is_at_most_ready_waits_long():
+    """``ready_waits: k`` lets a prefill in after ``k`` iterations: the owed run
+    stops there, and the next step takes the waiting rows."""
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    ctx = StepContext(request_ids=[0, 1], graph_walk="decode", slot=0, capture=False)
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8, ready_waits=3)}, {("LLM", "decode"): None})
+    worker._step_repeats._walks.add(("LLM", "decode"))
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1, owes_run=True)
+    assert ctx.repeats == 3 and ctx.owed_run
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 8
+
+
 def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():
     target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
     worker, peeked, excluded = _worker(target)

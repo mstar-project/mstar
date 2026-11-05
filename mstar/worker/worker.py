@@ -2964,6 +2964,8 @@ class Worker:
                 self._step_repeats.config(batch.node_name).past_cap,
             ),
         )
+        if owes_run:
+            repeats = min(repeats, self._step_repeats.owed_length(batch.node_name))
         # a stream window: as many iterations as every row has items for, and
         # what a row took past the step's own count goes back after its admit
         windows = {

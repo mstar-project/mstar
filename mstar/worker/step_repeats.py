@@ -49,8 +49,9 @@ class RepeatConfig:
     # send a run's tokens to the client as its replays finish, not when it lands
     stream_tokens: bool = False
     # ready rows wait for a run: after a step that took rows, the next takes none
-    # and runs at its full length, and ready work doesn't end a run early
-    ready_waits: bool = False
+    # and runs at its full length (or at most this many iterations), and ready
+    # work doesn't end a run early
+    ready_waits: bool | int = False
     # a run goes on for its longest row: a row reaches its iteration cap inside it
     # and stops there, as at an end token. Only for a node nothing in whose capture
     # is sized by the cap: the row's replays past it still run
@@ -79,7 +80,11 @@ class RepeatConfig:
             )
         if config.device_launch == "on" and config.device_stop == "off":
             config = replace(config, device_stop="skip")
-        for name in ("stream_tokens", "ready_waits", "past_cap"):
+        if type(config.ready_waits) is int and config.ready_waits < 1:
+            raise ValueError(
+                f"step_repeats for {node!r}: ready_waits is {config.ready_waits!r}; it must be true or at least 1"
+            )
+        for name in ("stream_tokens", "past_cap") + (("ready_waits",) if type(config.ready_waits) is not int else ()):
             if type(getattr(config, name)) is not bool:
                 raise ValueError(
                     f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
@@ -214,6 +219,11 @@ class StepRepeats:
         """Whether the step after ``ctx``'s is a run that ready rows wait for:
         once, so a step narrowed to 1 can't keep them out."""
         return self.config(node).ready_waits and ctx.repeats == 1 and not ctx.owed_run
+
+    def owed_length(self, node: str) -> int:
+        """The most iterations the run ready rows wait for may take."""
+        waits = self.config(node).ready_waits
+        return self.limit(node) if waits is True else min(int(waits), self.limit(node))
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step

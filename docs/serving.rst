@@ -356,7 +356,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``
        makes ready rows wait for one run: after a step that took rows the next takes none and
        runs at full length, and ready work doesn't end a run early. A new row's first token
-       can come up to ``max`` iterations later. ``past_cap: true`` lets a run go on for its
+       can come up to ``max`` iterations later; ``ready_waits: k`` caps the run they wait for at
+       ``k`` iterations, so a prefill lands that soon, between two runs. ``past_cap: true`` lets a run go on for its
        longest row: a row reaches its iteration cap inside the run and stops there, as at an
        end token. Set it only where nothing the capture reads is sized by that cap (a learned
        position table is); the KV pool still keeps a run inside the row's context.
