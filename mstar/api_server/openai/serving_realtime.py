@@ -1046,10 +1046,14 @@ class RealtimeConversation:
         except WebSocketDisconnect:
             pass
         finally:
-            for task in (self.clock_task, self.relay_task):
-                if task is not None:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+            tasks = [task for task in (self.clock_task, self.relay_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                # wait, not gather: if the server cancels this handler meanwhile, the
+                # CancelledError it raises is its own, not the relay's (which gather
+                # passes on, and the server's cancel scope then doesn't recognise)
+                await asyncio.wait(tasks)
             if self.key is not None:
                 self.api.abort_submission(self.key)
 
