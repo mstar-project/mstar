@@ -44,6 +44,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.iteration_tables import IterationTablesSpec, tables_key
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -728,7 +729,7 @@ class Engine:
         node_to_resources = {}
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
-        specs = [*specs, *self._row_specs(submodules, row_nodes)]
+        specs = [*specs, *self._row_specs(submodules, row_nodes), *self._iteration_specs(submodules)]
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -825,6 +826,8 @@ class Engine:
             if (key := rows_key(node_name)) in resources:
                 self._submodules[node_name].loopback_rows = resources[key]
                 submodule.loopback_rows_key = key
+            if (key := tables_key(node_name)) in resources:
+                submodule.iteration_tables = resources[key]
 
     @staticmethod
     def _row_specs(submodules: Mapping[str, NodeSubmodule], row_nodes: Collection[str]) -> list[LoopbackRowsSpec]:
@@ -835,6 +838,14 @@ class Engine:
         return [
             LoopbackRowsSpec(resource_key=rows_key(name), nodes={name}) for name, submodule in submodules.items()
             if name in row_nodes or getattr(submodule, "device_loopback", None) is not None
+        ]
+
+    @staticmethod
+    def _iteration_specs(submodules: Mapping[str, NodeSubmodule]) -> list[IterationTablesSpec]:
+        """The tables of each node with a request's own iteration inputs; a model declares none."""
+        return [
+            IterationTablesSpec(resource_key=tables_key(name), nodes={name}) for name, submodule in submodules.items()
+            if any(not spec.streamed for spec in (getattr(submodule, "ITERATION_INPUTS", None) or {}).values())
         ]
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:

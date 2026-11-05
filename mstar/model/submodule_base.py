@@ -1525,14 +1525,23 @@ def iteration_columns(
     """``submodule``'s ``ITERATION_INPUTS`` for a step's rows, ``[B, repeats,
     *shape]`` each: row i's ``(rid handle, its iteration[, its streamed
     tables])``, or None for a padding row, which takes ``capture_fill`` and
-    gets no state. A streamed table (``IterationInput.streamed``) is the
-    row's items of the stream this step, ``[items, ...]``, read from 0.
-
-    A request's own table is padded once and kept in its state
-    (``_padded_table``), so a step cuts one view a row and stacks them."""
+    gets no state. A request's own tables are the node's ``IterationTables``'
+    (one gather an input). A streamed table (``IterationInput.streamed``) is
+    the row's items of the stream this step, ``[items, ...]``, read from 0."""
+    specs = submodule.ITERATION_INPUTS
+    kept = {name: spec for name, spec in specs.items() if not spec.streamed}
     out: dict[str, torch.Tensor] = {}
+    if kept:
+        from mstar.engine.resources.iteration_tables import IterationTables
+
+        tables = getattr(submodule, "iteration_tables", None)
+        if tables is None:
+            tables = submodule.iteration_tables = IterationTables(device)
+        out = tables.read(kept, rows, submodule.request_states, repeats)
     states = submodule.request_states
-    for name, spec in submodule.ITERATION_INPUTS.items():
+    for name, spec in specs.items():
+        if not spec.streamed:
+            continue
         values = []
         fill = None
         for row in rows:
@@ -1542,16 +1551,11 @@ def iteration_columns(
                     fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
                 values.append(fill)
                 continue
-            if spec.streamed:
-                streamed = row[2] if len(row) > 2 else {}
-                table = streamed.get(spec.source)
-                if table is None:
-                    table = torch.empty(0, *spec.shape, dtype=spec.dtype, device=device)
-                padded = _pad_table(spec, state, table, repeats, name)
-                start = spec.offset
-            else:
-                padded = _padded_table(spec, state, repeats, name)
-                start = row[1] + spec.offset
+            table = (row[2] if len(row) > 2 else {}).get(spec.source)
+            if table is None:
+                table = torch.empty(0, *spec.shape, dtype=spec.dtype, device=device)
+            padded = _pad_table(spec, state, table, repeats)
+            start = spec.offset
             padless = spec.pad is None or (isinstance(spec.pad, str) and spec.pad not in state)
             if padless and start + repeats > padded.shape[0]:
                 raise ValueError(f"iteration input {name!r} reads past the {padded.shape[0]} rows of {spec.source!r}")
@@ -1562,27 +1566,11 @@ def iteration_columns(
     return out
 
 
-def _padded_table(spec: IterationInput, state: PerRequestState, repeats: int, name: str) -> torch.Tensor:
-    """The request's table of ``spec`` with its pad after it, made once and kept
-    in its state while its source and pad are the same tensors (a walk change
-    that reassigns either makes it anew)."""
-    key = f"_iteration:{name}"
-    source = state[spec.source]
-    pad = state.get(spec.pad) if isinstance(spec.pad, str) else None
-    kept = state.get(key)
-    if kept is not None and kept[0] is source and kept[1] is pad and kept[2] >= repeats:
-        return kept[3]
-    padded = _pad_table(spec, state, source, repeats, name)
-    state.add(key, (source, pad, repeats, padded))
-    return padded
-
-
-def _pad_table(
-    spec: IterationInput, state: PerRequestState, table: torch.Tensor, repeats: int, name: str,
-) -> torch.Tensor:
-    """``table``, then its pad rows (a state key's, or the constant), then the
-    last of them ``repeats`` times more: any ``repeats`` rows from any start
-    are one slice. No pad: the table alone (reading past it raises)."""
+def _pad_table(spec: IterationInput, state: PerRequestState, table: torch.Tensor, repeats: int) -> torch.Tensor:
+    """A stream window ``table``, then its pad rows (a state key's, or the
+    constant), then the last of them ``repeats`` times more: any ``repeats``
+    rows from any start are one slice. No pad: the table alone (reading past
+    it raises)."""
     if spec.pad is None or (isinstance(spec.pad, str) and spec.pad not in state):
         return table
     if isinstance(spec.pad, str):

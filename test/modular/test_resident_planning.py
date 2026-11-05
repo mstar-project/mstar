@@ -3105,11 +3105,12 @@ def _cut(table, pad, start, repeats):
 
 
 @pytest.mark.parametrize("repeats", [1, 4])
-def test_iteration_inputs_cut_each_row_from_its_padded_table_once(repeats):
+def test_iteration_inputs_read_each_row_from_its_table_with_one_gather(repeats):
     """Inside the table, across into a state pad, past the pad, a constant pad,
     an empty table, an offset, a padding row; a pad-less read past the end
-    raises; a reassigned source is cut anew; a column keeps its table's dtype;
-    and once the tables are made a step's work doesn't grow with its rows."""
+    raises; a reassigned source is read anew; a column keeps its table's dtype;
+    and once the tables are made a step's device work doesn't grow with its
+    rows (review-r2 F6)."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
     from mstar.model.submodule_base import PerRequestState, iteration_columns
@@ -3163,7 +3164,24 @@ def test_iteration_inputs_cut_each_row_from_its_padded_table_once(repeats):
         with Ops() as ops:
             iteration_columns(node, rows, repeats, CPU)
         counts.append(ops.kernels)
-    assert counts[0] == counts[1] - 3, "only a padding row's fill (once a spec) grows with the rows"
+    assert counts[0] == counts[1], "a step's kernels are one gather an input, whatever its rows"
+
+
+def test_a_removed_requests_rows_of_an_iteration_table_go_to_the_next_request():
+    """A table grows past its rows and never refuses, and what a request held
+    is handed on (a long-running server's table stops growing)."""
+    from mstar.engine.resources.iteration_tables import IterationTables
+
+    spec = {"cond": IterationInput("t", shape=(2,), pad=0.0, capture_fill=-1.0)}
+    tables = IterationTables(CPU)
+    states = {rid: {"t": torch.full((100, 2), float(rid))} for rid in (1, 2, 3)}
+    out = tables.read(spec, [(1, 99), (2, 0), (3, 100), None], states, 1)["cond"]
+    assert out[:, 0, 0].tolist() == [1.0, 2.0, 0.0, -1.0]
+    size = tables._tables["cond"].used
+    tables.remove_request(2)
+    states[4] = {"t": torch.full((100, 2), 4.0)}
+    assert tables.read(spec, [(4, 5), (1, 5)], states, 1)["cond"][:, 0, 0].tolist() == [4.0, 1.0]
+    assert tables._tables["cond"].used == size
 
 
 def test_a_loop_back_that_also_leaves_the_loop_is_not_kept_in_rows():
