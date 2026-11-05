@@ -85,7 +85,7 @@ class RaggedAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedAttentionSpec, info: EngineResourceInfo):
-        if spec.config.backend is RaggedAttnBackend.AUTO:
+        if spec.config.backend is RaggedAttnBackend.AUTO and spec.config.uniform_segments:
             from mstar.engine.resources.attn.ragged.select import build_auto
 
             return _build_ragged(spec, info, build_auto)

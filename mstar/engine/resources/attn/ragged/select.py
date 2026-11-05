@@ -208,13 +208,16 @@ class SelectedRaggedManager(FlashInferRaggedManager):
 
 
 def build_auto(device: torch.device, dtype: torch.dtype, config, key: str):
-    """The ``auto`` backend's manager for one rank's (sharded) config: the table's choice where the
-    layout allows a dense kernel and a table has these heads on ``device``, else FlashInfer's."""
+    """The ``auto`` backend's manager for one rank's (sharded) ``uniform_segments`` config: the
+    table's choice where a table has these heads on ``device``, else FlashInfer's."""
     rows = None
-    if config.uniform_segments and config.flashinfer_backend == "auto":
+    if config.flashinfer_backend == "auto":
         rows = table_rows(config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, device)
     if rows is None:
-        return FlashInferRaggedManager(device=device, dtype=dtype, config=config, key=key)
+        # looked up here, as ``RaggedAttnManager.build`` does, not bound at import
+        from mstar.engine.resources.attn.ragged import flashinfer
+
+        return flashinfer.FlashInferRaggedManager(device=device, dtype=dtype, config=config, key=key)
     logger.info("ragged attention %s (%d/%d heads of %d): %s", key, config.num_qo_heads,
                 config.num_kv_heads, config.head_dim, describe_rows(rows))
     return SelectedRaggedManager(device=device, dtype=dtype, config=config, key=key, rows=rows)
