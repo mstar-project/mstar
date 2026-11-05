@@ -598,6 +598,22 @@ def test_room_the_host_set_aside_stays_when_a_host_fetch_holds_the_cached_pages_
     )
 
 
+def test_room_the_host_set_aside_stays_when_a_host_fetch_holds_the_cached_pages_a_reload_left():
+    """A reload gave its keyed host pages back to the host index, where they count as room without being free, and a
+    host fetch then held them, leaving the room at -3 until the next request reserved."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(6)
+    _running(kv, "r", 3, arrival=0, keyed=list(range(3 * PAGE_SIZE)), rebuildable=False)
+    _running(kv, "s", 3, arrival=1, rebuildable=False)
+    assert _offload(kv, "r")
+    keys = kv._cpu_pool.offloaded["r"]["main"].keys
+    assert kv.reload("r")
+
+    kv._cpu_pool.retain_run(keys)
+
+    assert kv._cpu_pool.room() >= 0, "a host fetch held the pages set aside for r's and s's moves"
+
+
 def test_the_page_check_catches_a_host_page_counted_as_room_that_eviction_cant_free():
     """The host's room counts the evictable set its arena keeps current, so a page counted there that eviction
     can't free would send a victim to a host that can't take it."""
