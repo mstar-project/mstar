@@ -194,6 +194,7 @@ def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
     from mstar.model.components.moe import dispatch_experts_fused
     from mstar.utils.fused_moe import MoeAlignment, fused_experts, moe_block_m
     from mstar.utils.fused_moe.align import moe_align_block_size
+    from mstar.utils.fused_moe.runner import runs_per_pair
 
     # The Command A+ expert shape, which has a tuned table on GB200.
     experts, hidden, inter, top_k = 128, 4096, 1024, 8
@@ -211,7 +212,11 @@ def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
     block_m = moe_block_m(num_tokens, w1, top_k)
     alignment = MoeAlignment(*moe_align_block_size(ids.to(torch.int32), block_m, experts), block_m)
     precomputed = fused_experts(x, w1, w2, weights, ids, alignment=alignment)
-    torch.testing.assert_close(precomputed, out, atol=0, rtol=0)
+    if runs_per_pair(x, w1):
+        # Without an alignment these few tokens took the per-pair path, a different kernel.
+        torch.testing.assert_close(precomputed, naive, atol=2e-2, rtol=2e-2)
+    else:
+        torch.testing.assert_close(precomputed, out, atol=0, rtol=0)
 
     with pytest.raises(AssertionError, match="BLOCK_SIZE_M"):
         fused_experts(x, w1, w2, weights, ids, alignment=alignment._replace(block_m=block_m * 2))
