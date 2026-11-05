@@ -1,5 +1,6 @@
-"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short, made through the
-engine, and the counts the metrics read. The pool keeps every victim, so nothing here outlives a call."""
+"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short or its oldest waiting
+request doesn't fit, made through the engine, and the counts the metrics read. The pool keeps every victim, so nothing
+here outlives a call."""
 
 from __future__ import annotations
 
