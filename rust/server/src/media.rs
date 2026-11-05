@@ -290,13 +290,15 @@ pub fn is_streamable_audio_format(fmt: &str) -> bool {
 /// of whatever type as the Python frontend's `{value!r}` does (`stream_format`
 /// reaches `create_speech` as whatever pydantic parsed into `model_extra`).
 ///
-/// Two limits, both only reachable through a container or an absurd number in
-/// a field whose every accepted value is a short string: an integer outside
-/// `i64`/`u64` arrives as an `f64` here (serde_json carries no
-/// `arbitrary_precision`, and turning it on would restyle every number this
-/// server writes), where Python would still hold it exactly; and an object's
-/// keys come out sorted, since `serde_json::Value` is a `BTreeMap` without
-/// `preserve_order`, where Python keeps the order the client sent.
+/// Exact for a string, a bool, `null`, an integer `serde_json` holds as one,
+/// and a float it parsed to the same bits Python's parser would. What is left
+/// is serde_json's number model, crate-wide and not this function's to change,
+/// and only reachable through a container or an absurd number in a field whose
+/// every accepted value is a short string: an integer outside `i64`/`u64`
+/// arrives here as an `f64`, as does `-0` (Python keeps both exactly, and as an
+/// `int`); a float whose decimal needs 17 digits can land one ULP off, since
+/// the crate's `float_roundtrip` is not on; and an object's keys come out
+/// sorted, `Value` being a `BTreeMap` without `preserve_order`.
 pub fn py_repr_json(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "None".to_string(),
@@ -322,11 +324,11 @@ pub fn py_repr_json(v: &serde_json::Value) -> String {
     }
 }
 
-/// Python's `repr` of a float: the shortest digits that round-trip (what
-/// Rust's `{:e}` gives too), positional while the decimal exponent is in
-/// `-4..16` and always with a point, otherwise `<mantissa>e<sign><2+ digits>`.
-/// `{}` alone diverges — it writes `0.00001` for Python's `1e-05` and
-/// `10000000000000000` for its `1e+16`.
+/// Python's `repr` of a float: the shortest digits that round-trip, written
+/// positionally while the decimal exponent is in `-4..16` and always with a
+/// point, otherwise `<mantissa>e<sign><2+ digits>`. `{}` alone diverges on the
+/// notation — `0.00001` for Python's `1e-05`, `10000000000000000` for its
+/// `1e+16` — and `{:e}` on the digits, see [`shortest_digits`].
 fn py_repr_f64(f: f64) -> String {
     if f.is_nan() {
         return "nan".to_string();
@@ -334,9 +336,9 @@ fn py_repr_f64(f: f64) -> String {
     if f.is_infinite() {
         return if f < 0.0 { "-inf".to_string() } else { "inf".to_string() };
     }
-    let formatted = format!("{f:e}"); // "1.5e0", "1e-5", "-1.25e16"
-    let (mantissa, exponent) = formatted.split_once('e').expect("{:e} writes an exponent");
-    let exponent: i32 = exponent.parse().expect("{:e} writes a decimal exponent");
+    let formatted = shortest_digits(f); // "1.5e0", "1e-5", "-1.25e16"
+    let (mantissa, exponent) = formatted.split_once('e').expect("an exponent is written");
+    let exponent: i32 = exponent.parse().expect("a decimal exponent is written");
     let (sign, mantissa) = match mantissa.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", mantissa),
@@ -362,6 +364,21 @@ fn py_repr_f64(f: f64) -> String {
         out.push_str(".0");
     }
     out
+}
+
+/// The shortest decimal that parses back to `f`, correctly rounded: the digits
+/// Python's `repr` picks, in `{:e}`'s shape. `{:e}` alone is shortest too, but
+/// where two equally short strings both round-trip it can break the tie the
+/// other way (`1000000000000000.3` for Python's `1000000000000000.2`), so ask
+/// for each precision in turn and take the first that round-trips.
+fn shortest_digits(f: f64) -> String {
+    for precision in 0..=16 {
+        let candidate = format!("{f:.precision$e}");
+        if candidate.parse::<f64>().map(f64::to_bits) == Ok(f.to_bits()) {
+            return candidate;
+        }
+    }
+    format!("{f:.17e}")
 }
 
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
@@ -522,6 +539,11 @@ mod tests {
             (0.1 + 0.2, "0.30000000000000004"),
             (f64::MAX, "1.7976931348623157e+308"),
             (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (5e-324, "5e-324"), // the smallest subnormal
+            // Two shortest strings round-trip to these, and `{:e}` picks the
+            // other one of each pair; repr picks the nearer.
+            (f64::from_bits(0x430c_6bf5_2634_0002), "1000000000000000.2"),
+            (f64::from_bits(0x42d6_bcc4_1e90_0008), "100000000000000.12"),
         ] {
             assert_eq!(py_repr_f64(f), want, "{f}");
         }
