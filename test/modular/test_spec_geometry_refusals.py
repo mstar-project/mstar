@@ -44,14 +44,14 @@ def test_a_kv_head_count_below_1_is_refused(bad):
 
 @pytest.mark.parametrize("bad", [262144.0, 0, -1, True, "64"])
 def test_a_max_seq_len_that_is_not_a_positive_int_is_refused(bad):
-    with pytest.raises(ValueError, match=f"max_seq_len must be a positive int; got {bad!r}"):
+    with pytest.raises(ValueError, match=f"max_seq_len must be an integer >= 1; got {bad!r}"):
         _paged(max_seq_len=bad)
 
 
 @pytest.mark.parametrize("bad", [32768.0, 0, -1, True, "64"])
 def test_a_yaml_max_seq_len_that_is_not_a_positive_int_is_refused(bad):
     """``resources:`` sets the field after construction."""
-    with pytest.raises(ValueError, match=f"max_seq_len must be a positive int; got {bad!r}"):
+    with pytest.raises(ValueError, match=f"max_seq_len must be an integer >= 1; got {bad!r}"):
         _paged().apply_yaml_overrides(max_seq_len=bad)
 
 
