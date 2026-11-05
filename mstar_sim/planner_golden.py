@@ -2,8 +2,8 @@
 
 The stand-in sizes its attention workspaces with a port of FlashInfer's host planner
 (``fake_libs/flashinfer/_paged.py``, ``mla.py``). This tool runs the real one, from the wheel of
-the stand-in's ``__version__``, on every named case in :data:`CASES` and on each emulated GPU's
-device properties, and writes what it answered to ``tests/planner_golden.json``:
+the stand-in's ``__version__``, on every named case in :data:`CASES` and on each distinct set of
+the emulated GPUs' device properties, and writes both to ``tests/planner_golden.json``:
 ``tests/test_device.py`` replays every case through the port on a CPU box.
 
 It needs a CUDA toolkit (nvcc 12.8 or newer, and a host compiler it supports), so it runs on a dev
@@ -38,8 +38,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "tests" / "planner_golden.json"
-# one emulated GPU per distinct set of the properties a planner reads (the H200 is an H100's)
-GPUS = ("h100", "h100-pcie", "b200", "a100", "l40s", "4090")
 
 STUB = r"""
 #include <cstring>
@@ -474,16 +472,19 @@ def answer(lib, case: dict) -> dict:
 
 
 def device_properties() -> dict[str, dict]:
-    """The device properties a planner reads, per emulated GPU, as the emulator reports them."""
+    """The device properties a planner reads, as the emulator reports them: an emulated GPU for
+    each distinct set (the H200 has the H100's)."""
     from mstar_sim import cuda, gpus
 
     keys = ("multi_processor_count", "major", "minor", "max_threads_per_multi_processor",
             "shared_memory_per_multiprocessor", "shared_memory_per_block", "shared_memory_per_block_optin",
             "regs_per_multiprocessor")
     out = {}
-    for alias in GPUS:
+    for alias in gpus.ALIASES:
         props = cuda.properties(gpus.lookup(alias))
-        out[alias] = {k: getattr(props, k) for k in keys}
+        read = {k: getattr(props, k) for k in keys}
+        if read not in out.values():
+            out[alias] = read
     return out
 
 

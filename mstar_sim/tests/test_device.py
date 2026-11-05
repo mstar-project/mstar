@@ -479,8 +479,8 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
 
 
 def test_flashinfers_planner_port_answers_as_flashinfers_own():
-    """The stand-in's planner port answers every case FlashInfer's own planner answered on each
-    emulated GPU's properties (``tests/planner_golden.json``, from ``python -m
+    """The stand-in's planner port answers every case FlashInfer's own planner answered on the
+    device properties the golden stores (``tests/planner_golden.json``, from ``python -m
     mstar_sim.planner_golden``): the same workspace bytes, the same overflow one byte short of
     each, the same refusals; and never less than it answered for a kernel of a given register
     count, which the port doesn't take. The golden is of the stand-in's FlashInfer version."""
