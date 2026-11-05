@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Type
 
 import torch
-import yaml
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -40,6 +39,7 @@ from mstar.model.submodule_base import (
     chunk_tick_name,
 )
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
+from mstar.platforms.serving_config import load_serving_config
 
 
 def _wrap_node_in_loop(
@@ -129,6 +129,7 @@ def _applying_chunking(build):
         return self.apply_chunking(build(self))
     get_graph_walk_graphs._applies_chunking = True
     return get_graph_walk_graphs
+
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -682,8 +683,7 @@ class Model(ABC):
         from mstar.validation import DeploymentError
         from mstar.validation.placement import check_placement
 
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        config = load_serving_config(config_path)
         problems = check_placement(self, config)
         if problems:
             raise DeploymentError(config_path, problems)
@@ -697,8 +697,7 @@ class Model(ABC):
         ]
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        config = load_serving_config(config_path)
 
         sharding_config = self.get_default_sharding_config()
 
