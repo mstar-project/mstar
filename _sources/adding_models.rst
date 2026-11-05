@@ -619,6 +619,12 @@ The spec types are:
        A spec whose nodes can run on several workers, as Bagel's LLM nodes do under CFG
        parallel, sets ``leader`` to the node whose pool admits each request. Left unset, each
        worker's pool admits requests on its own.
+       ``correct_len(rid, label, delta)`` moves a stream's length between steps, never
+       between a step's admit and commit. A speculative verify step commits its whole block,
+       and the next ``declare_step`` takes its rejected tail back (``delta < 0``) before
+       admit. The caller also calls the position resource's ``correct_len``, which doesn't
+       move by itself. A cache with KV groups refuses it. GLM-5.2's MTP is the user, and
+       this is interim until draft-verify is an engine resource (#1195).
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -664,7 +670,9 @@ The spec types are:
        with the rope part as ``q_pe``, and returns the output in the latent space, so
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
-       fallback, which cannot be captured in a CUDA graph.
+       fallback, which cannot be captured in a CUDA graph. The layer is ``MLAAttention``
+       (``mstar/model/components/mla.py``); its config picks rotated decoupled dims (GLM-5.2)
+       or none (GLM-5.3).
        ``sliding_window=N`` lets each query attend to the last ``N`` positions, its own
        included, and the cache keeps only about the last ``N`` tokens of this
        attention's layers per request, returning the rest to the pool, so long requests
@@ -753,7 +761,9 @@ The spec types are:
        ``apply_qk(q, k, label)``. ``pos_ids=`` rotates at positions the model passes
        instead of the label's plan, and ``k=None`` rotates one tensor. ``interleave``
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
-       a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
+       a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
+       kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
+       kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
@@ -1432,7 +1442,10 @@ methods are:
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
    prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
-   ``marks_dynamic_dims = True`` and compiles as any other submodule. Keep the compiled
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. A submodule whose
+   captures keep more compiled entries per frame than ``MSTAR_RECOMPILE_LIMIT`` allows
+   returns the number from ``dynamo_recompile_limit()``; the engine raises the limit
+   around that submodule's compiled calls only. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``. A submodule that disables the
@@ -2646,6 +2659,9 @@ its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<o
 on a shared component gets them without code of its own: the component looks its shape up once
 per process and keeps the default config where no table has it, and the server logs the sweep
 command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
+count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
+GPU's row names one that runs there.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.

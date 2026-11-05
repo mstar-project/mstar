@@ -799,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -1922,6 +1923,15 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># forward where the trace cost dwarfs the win. The KV-cache / stateless</span>
     <span class="c1"># engines skip compiling such submodules (CUDA-graph capture is unaffected).</span>
     <span class="n">disable_torch_compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+<div class="viewcode-block" id="NodeSubmodule.dynamo_recompile_limit">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">dynamo_recompile_limit</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Entries dynamo may keep per code object of this submodule's compiled forwards, when</span>
+<span class="sd">        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies</span>
+<span class="sd">        it around this submodule's compiled calls only. None keeps the engine's."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
 
     <span class="c1"># Set True on a submodule that must run in its own parameter dtype — e.g. a</span>
     <span class="c1"># numerically sensitive fp32 vocoder. The engine then neither casts its</span>

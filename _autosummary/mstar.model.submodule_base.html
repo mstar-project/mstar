@@ -446,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -817,6 +818,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.dynamo_recompile_limit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.float32_matmul_precision"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.float32_matmul_precision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>
@@ -2261,6 +2263,19 @@ speculation read the step’s rows instead. Empty by default;
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit">
+<span class="sig-name descname"><span class="pre">dynamo_recompile_limit</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.dynamo_recompile_limit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit" title="Link to this definition">#</a></dt>
+<dd><p>Entries dynamo may keep per code object of this submodule’s compiled forwards, when
+its captures need more than the engine’s <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code>. The engine applies
+it around this submodule’s compiled calls only. None keeps the engine’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.filter_batched_output">
 <span class="sig-name descname"><span class="pre">filter_batched_output</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.filter_batched_output"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output" title="Link to this definition">#</a></dt>
 <dd><p>Drop keys a real request shouldn’t receive. A captured forward emits
@@ -3463,6 +3478,7 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.dynamo_recompile_limit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.float32_matmul_precision"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.float32_matmul_precision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>

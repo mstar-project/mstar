@@ -799,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -1041,6 +1042,38 @@ window.runMermaid = runMermaid;</script>
     <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">recompile_limit</span> <span class="o">=</span> <span class="n">recompile_limit</span><span class="p">()</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">allow_unspec_int_on_nn_module</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">specialize_int</span> <span class="o">=</span> <span class="kc">False</span></div>
+
+
+
+<div class="viewcode-block" id="with_recompile_limit">
+<a class="viewcode-back" href="../../_autosummary/mstar.engine.html#mstar.engine.with_recompile_limit">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">with_recompile_limit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">submodule</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Wrap ``fn``, one of ``submodule``'s torch.compile'd callables, so dynamo compiles it under</span>
+<span class="sd">    the submodule's ``dynamo_recompile_limit()`` where that is above the current limit, for</span>
+<span class="sd">    the call's duration. A submodule that doesn't override the hook gets ``fn`` back as is.</span>
+
+<span class="sd">    From torch 2.12 dynamo's config is per thread. Before it the patch is process-wide while</span>
+<span class="sd">    the call runs, so other nodes keep the engine's limit only because a worker runs one</span>
+<span class="sd">    compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and</span>
+<span class="sd">    plan threads set the engine's config before the loop (``Worker._engine_thread_pool``)."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeSubmodule</span>
+
+    <span class="n">hook</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">submodule</span><span class="p">),</span> <span class="s2">"dynamo_recompile_limit"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">hook</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">hook</span> <span class="ow">is</span> <span class="n">NodeSubmodule</span><span class="o">.</span><span class="n">dynamo_recompile_limit</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">fn</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">need</span> <span class="o">=</span> <span class="n">submodule</span><span class="o">.</span><span class="n">dynamo_recompile_limit</span><span class="p">()</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">if</span> <span class="n">need</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">need</span> <span class="o">&lt;=</span> <span class="n">config</span><span class="o">.</span><span class="n">recompile_limit</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">fn</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="c1"># and dynamo's cap on a code object's entries in all, which past 256 would hold the</span>
+        <span class="c1"># captures over it uncompiled just the same</span>
+        <span class="k">with</span> <span class="n">config</span><span class="o">.</span><span class="n">patch</span><span class="p">(</span><span class="n">recompile_limit</span><span class="o">=</span><span class="n">need</span><span class="p">,</span>
+                          <span class="n">accumulated_recompile_limit</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">need</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">accumulated_recompile_limit</span><span class="p">)):</span>
+            <span class="k">return</span> <span class="n">fn</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">forward</span></div>
 
 
 

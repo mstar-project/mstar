@@ -799,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -1009,9 +1010,25 @@ window.runMermaid = runMermaid;</script>
 
 <span class="n">_LAYER_RE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"^model\.layers\.(\d+)\."</span><span class="p">)</span>
 
+<span class="c1"># Non-expert linears that dense_fp8 keeps fp8 (checkpoint names). kv_b_proj is not one: the</span>
+<span class="c1"># absorbed MLA folds it into bf16 w_kc / w_vc.</span>
+<span class="n">_DENSE_FP8_BASE_RE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+    <span class="sa">r</span><span class="s2">"\.(self_attn\.(q_a_proj|kv_a_proj_with_mqa|q_b_proj|o_proj)"</span>
+    <span class="sa">r</span><span class="s2">"|mlp\.(gate_proj|up_proj|down_proj))$"</span>
+<span class="p">)</span>
+<span class="n">_SHARED_EXPERT_BASE_RE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)$"</span><span class="p">)</span>
+
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_is_routed_expert_base</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">_EXPERT_BASE_RE</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">base</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_dense_fp8_base</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">_DENSE_FP8_BASE_RE</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">base</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_shared_expert_base</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">_SHARED_EXPERT_BASE_RE</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">base</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
 
 <div class="viewcode-block" id="glm52_name_remapper">
@@ -1032,6 +1049,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">weights</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]],</span>
     <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">load_indexer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">load_mtp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]:</span>
 <span class="w">    </span><span class="sd">"""Drop MTP-layer keys — and, with ``load_indexer=False``, indexer keys —</span>
 <span class="sd">    before any dequant buffering.</span>
@@ -1043,7 +1061,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">skipped_indexer</span> <span class="o">+=</span> <span class="mi">1</span>
             <span class="k">continue</span>
         <span class="n">m</span> <span class="o">=</span> <span class="n">_LAYER_RE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">m</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="n">num_hidden_layers</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">load_mtp</span> <span class="ow">and</span> <span class="n">m</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="n">num_hidden_layers</span><span class="p">:</span>
             <span class="n">skipped_mtp</span> <span class="o">+=</span> <span class="mi">1</span>
             <span class="k">continue</span>
         <span class="k">yield</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor</span>
@@ -1129,6 +1147,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">tp_rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">load_indexer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">load_mtp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="s2">"dict[str, tuple[int, int, int]]"</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Keys-to-read + per-key slice specs for the TP fast read path.</span>
 
@@ -1153,8 +1172,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">checkpoint_keys</span><span class="p">:</span>
         <span class="n">m_layer</span> <span class="o">=</span> <span class="n">_LAYER_RE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="n">layer</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">m_layer</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="k">if</span> <span class="n">m_layer</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">layer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">layer</span> <span class="o">&gt;=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">:</span>
-            <span class="k">continue</span>  <span class="c1"># the MTP layer: never read, never transfer</span>
+        <span class="k">if</span> <span class="n">layer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">layer</span> <span class="o">&gt;=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">load_mtp</span><span class="p">:</span>
+            <span class="k">continue</span>  <span class="c1"># MTP module off: never read, never transfer</span>
         <span class="k">if</span> <span class="s2">".self_attn.indexer."</span> <span class="ow">in</span> <span class="n">key</span> <span class="ow">and</span> <span class="p">(</span>
             <span class="ow">not</span> <span class="n">load_indexer</span>
             <span class="ow">or</span> <span class="n">layer</span> <span class="ow">is</span> <span class="kc">None</span>
@@ -1183,6 +1202,27 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_make_glm52_name_remapper</span><span class="p">(</span><span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">load_mtp</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The trunk's remapper, plus the layer-78 keys onto ``mtp.`` through ``remap_mtp_key``;</span>
+<span class="sd">    the expert regexes are prefix-agnostic, so the stacked-param rules cover the MTP MoE."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">load_mtp</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">glm52_name_remapper</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.glm52.components.mtp</span><span class="w"> </span><span class="kn">import</span> <span class="n">remap_mtp_key</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">remap</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">m</span> <span class="o">=</span> <span class="n">_LAYER_RE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">m</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="n">num_hidden_layers</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="o">&gt;</span> <span class="n">num_hidden_layers</span><span class="p">:</span>
+                <span class="c1"># one draft module: a second next-token layer would overwrite the first</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">: MTP serves one next-token layer, "</span>
+                                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">num_hidden_layers</span><span class="si">}</span><span class="s2">; the checkpoint has more"</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">glm52_name_remapper</span><span class="p">(</span><span class="s2">"mtp."</span> <span class="o">+</span> <span class="n">remap_mtp_key</span><span class="p">(</span><span class="n">name</span><span class="p">[</span><span class="n">m</span><span class="o">.</span><span class="n">end</span><span class="p">():]))</span>
+        <span class="k">return</span> <span class="n">glm52_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">remap</span>
+
+
 <div class="viewcode-block" id="load_glm52_hf_weights">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.glm52.weight_loader.html#mstar.model.glm52.weight_loader.load_glm52_hf_weights">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">load_glm52_hf_weights</span><span class="p">(</span>
@@ -1193,15 +1233,28 @@ window.runMermaid = runMermaid;</script>
     <span class="n">fp8_experts</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">78</span><span class="p">,</span>
     <span class="n">load_indexer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="n">dense_fp8</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">fp8_shared_expert</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">load_mtp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_hf_weights</span>
 
-    <span class="n">weights</span> <span class="o">=</span> <span class="n">skip_phase_b_keys</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">num_hidden_layers</span><span class="p">,</span> <span class="n">load_indexer</span><span class="o">=</span><span class="n">load_indexer</span><span class="p">)</span>
+    <span class="n">weights</span> <span class="o">=</span> <span class="n">skip_phase_b_keys</span><span class="p">(</span>
+        <span class="n">weights</span><span class="p">,</span> <span class="n">num_hidden_layers</span><span class="p">,</span> <span class="n">load_indexer</span><span class="o">=</span><span class="n">load_indexer</span><span class="p">,</span> <span class="n">load_mtp</span><span class="o">=</span><span class="n">load_mtp</span><span class="p">,</span>
+    <span class="p">)</span>
     <span class="k">if</span> <span class="n">quant_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">keep</span> <span class="o">=</span> <span class="n">_is_routed_expert_base</span> <span class="k">if</span> <span class="n">fp8_experts</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="n">weights</span> <span class="o">=</span> <span class="n">dequant_fp8_block_stream</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">quant_config</span><span class="p">,</span> <span class="n">keep_fp8</span><span class="o">=</span><span class="n">keep</span><span class="p">)</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">keep</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">((</span><span class="n">fp8_experts</span> <span class="ow">and</span> <span class="n">_is_routed_expert_base</span><span class="p">(</span><span class="n">base</span><span class="p">))</span>
+                    <span class="ow">or</span> <span class="p">(</span><span class="n">dense_fp8</span> <span class="ow">and</span> <span class="n">_is_dense_fp8_base</span><span class="p">(</span><span class="n">base</span><span class="p">))</span>
+                    <span class="ow">or</span> <span class="p">(</span><span class="n">fp8_shared_expert</span> <span class="ow">and</span> <span class="n">_is_shared_expert_base</span><span class="p">(</span><span class="n">base</span><span class="p">)))</span>
+
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">dequant_fp8_block_stream</span><span class="p">(</span>
+            <span class="n">weights</span><span class="p">,</span> <span class="n">quant_config</span><span class="p">,</span>
+            <span class="n">keep_fp8</span><span class="o">=</span><span class="n">keep</span> <span class="k">if</span> <span class="n">fp8_experts</span> <span class="ow">or</span> <span class="n">dense_fp8</span> <span class="ow">or</span> <span class="n">fp8_shared_expert</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">fp8_experts</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"fp8_experts=True requires a quant_config"</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">dense_fp8</span> <span class="ow">or</span> <span class="n">fp8_shared_expert</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"dense_fp8=True requires a quant_config"</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">weights</span> <span class="o">=</span> <span class="n">_refuse_fp8</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
@@ -1212,7 +1265,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">stacked_params</span><span class="o">=</span><span class="n">build_glm52_stacked_params</span><span class="p">(</span>
             <span class="n">n_routed_experts</span><span class="p">,</span> <span class="n">fp8_experts</span><span class="o">=</span><span class="n">fp8_experts</span><span class="p">,</span>
         <span class="p">),</span>
-        <span class="n">name_remapper</span><span class="o">=</span><span class="n">glm52_name_remapper</span><span class="p">,</span>
+        <span class="n">name_remapper</span><span class="o">=</span><span class="n">_make_glm52_name_remapper</span><span class="p">(</span><span class="n">num_hidden_layers</span><span class="p">,</span> <span class="n">load_mtp</span><span class="p">),</span>
     <span class="p">)</span></div>
 
 

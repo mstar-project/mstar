@@ -16,6 +16,7 @@
       apply_dynamo_config
       apply_torch_config
       recompile_limit
+      with_recompile_limit
    
    
 

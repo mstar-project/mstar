@@ -799,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -998,6 +999,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">SAMPLER_RESOURCE</span> <span class="o">=</span> <span class="s2">"sampler"</span>
 <span class="c1"># dsa_long_context: the DSA resource (mstar/engine/resources/dsa)</span>
 <span class="n">DSA_RESOURCE</span> <span class="o">=</span> <span class="s2">"dsa"</span>
+<span class="c1"># Glm52ModelConfig.kernels</span>
+<span class="n">KERNELS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"reference"</span><span class="p">)</span>
 
 <span class="c1"># config.json keys read by Glm52ModelConfig.from_hf_config under the same</span>
 <span class="c1"># name (eos_token_id becomes eos_token_ids).</span>
@@ -1058,6 +1061,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">index_skip_topk_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span>
     <span class="n">index_share_for_mtp_iteration</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">indexer_rope_interleave</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># MTP speculative decoding: draft k tokens per step with the layer-78 module; 0 (off)</span>
+    <span class="c1"># neither builds nor loads it.</span>
+    <span class="n">mtp_num_draft_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the</span>
     <span class="c1"># submodule guard holds every context to index_topk, where dense MLA IS</span>
     <span class="c1"># the exact DSA computation. On: the guard checks max_seq_len instead,</span>
@@ -1093,7 +1099,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># (``Glm52Model.context_limit``), which the conductor holds requests to.</span>
     <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
 
-    <span class="c1"># --- MTP layer (in the checkpoint; not built or loaded) ---</span>
+    <span class="c1"># --- MTP layer (built and loaded only when mtp_num_draft_tokens &gt; 0) ---</span>
     <span class="n">num_nextn_predict_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
     <span class="c1"># --- tokens / generation defaults ---</span>
@@ -1109,25 +1115,28 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># --- quantization / serving knobs ---</span>
     <span class="c1"># The official checkpoint is FP8 e4m3 with [128, 128] block scales</span>
-    <span class="c1"># (`weight_scale_inv`). Populated from config.json by Glm52Model.</span>
+    <span class="c1"># (`weight_scale_inv`). Populated from config.json by Glm52Model. The routed experts</span>
+    <span class="c1"># and the non-expert linears it stores in fp8 stay fp8 (``dense_fp8``).</span>
     <span class="n">quantization_config</span><span class="p">:</span> <span class="n">Fp8BlockQuantConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># Keep routed experts FP8-resident (uint8 container + block scales);</span>
-    <span class="c1"># everything else dequantizes to bf16 on load. Disabling this dequantizes</span>
-    <span class="c1"># experts too — fine for reduced tests, but bf16 routed experts alone</span>
-    <span class="c1"># outsize a device at TP8 on the real 753B checkpoint.</span>
+    <span class="c1"># Keep routed experts FP8-resident (uint8 container + block scales). Disabling this</span>
+    <span class="c1"># dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts</span>
+    <span class="c1"># alone outsize a device at TP8 on the real 753B checkpoint.</span>
     <span class="n">moe_fp8_resident</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="c1"># Routed-expert dispatch for the fp8-resident path: "auto" = the fused</span>
-    <span class="c1"># W8A8 kernel (fused_experts_fp8, capture-safe) where it can run, else</span>
-    <span class="c1"># "reference"; "triton" = the fused kernel or an error; "reference" = the</span>
-    <span class="c1"># per-hit-expert dequant loop, the numerics anchor (uncapturable). W8A8</span>
-    <span class="c1"># activation quantization is the standard fp8 serving numerics, as in vLLM.</span>
-    <span class="n">moe_quant_kernel</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
+    <span class="c1"># "auto": the tuned kernels, each picking per GPU from its module's table: the fused fp8</span>
+    <span class="c1"># MoE with its prefill and decode kernels and router kernel, the MLA latent prep in two</span>
+    <span class="c1"># kernels, each TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at</span>
+    <span class="c1"># prefill on the sampled rows only. "reference": the numerics anchor, all of those op by op</span>
+    <span class="c1"># (the routed experts in a per-expert loop), served eager.</span>
+    <span class="n">kernels</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
     <span class="c1"># torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False</span>
     <span class="c1"># (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that</span>
     <span class="c1"># would otherwise fail every capture and serve eager.</span>
     <span class="n">graph_compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="n">prefill_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Token buckets for the prefill batch sizes above 1; None captures them at</span>
+    <span class="c1"># prefill_token_buckets too.</span>
+    <span class="n">prefill_batched_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">prefill_capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Derived MLA cache geometry: the paged cache stores one 576-dim latent</span>
@@ -1136,6 +1145,23 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cache_latent_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tuned_kernels</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``kernels: auto``, the tuned kernels rather than the reference."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">kernels</span> <span class="o">==</span> <span class="s2">"auto"</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">dense_fp8</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether the non-expert linears the checkpoint stores in fp8 stay fp8 with their block</span>
+<span class="sd">        scales: exactly when it is block fp8. kv_b_proj still dequantizes, since the absorbed</span>
+<span class="sd">        MLA folds it into w_kc / w_vc."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantization_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fp8_shared_expert</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># the decode chain runs the shared expert faster from bf16 weights</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense_fp8</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tuned_kernels</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">qk_head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1178,10 +1204,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_prompt_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The longest prompt served. Decode runs at least one step after the</span>
 <span class="sd">        prefill and the next may already be scheduled when it stops, so the</span>
-<span class="sd">        prompt leaves two rows under the context limit; a DSA prefill attends</span>
-<span class="sd">        densely, within index_topk."""</span>
+<span class="sd">        prompt leaves two steps' rows under the context limit (an MTP step</span>
+<span class="sd">        writes k + 1); a DSA prefill attends densely, within index_topk."""</span>
         <span class="n">limit</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dsa_long_context</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span>
-        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">limit</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">limit</span> <span class="o">-</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mtp_num_draft_tokens</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Glm52ModelConfig.from_hf_config">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.glm52.config.html#mstar.model.glm52.config.Glm52ModelConfig.from_hf_config">[docs]</a>

@@ -446,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -722,7 +723,8 @@ arrival, chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,
 _lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine’s and
-tensor manager’s per-request state (including ChunkingManagement.prepared, and
+tensor manager’s per-request state (including ChunkingManagement.prepared,
+Glm52LLMSubmodule’s MTP maps, cleared by its cleanup_request, and
 the tensor store’s rid -&gt; uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,

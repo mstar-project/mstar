@@ -446,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -817,7 +818,9 @@ RVQ codec; user speech in, agent text and 22.05 kHz speech out.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">glm52</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5.2-FP8</span></code></p></td>
-<td><p>GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.</p></td>
+<td><p>GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
+<code class="docutils literal notranslate"><span class="pre">model_kwargs.kernels</span></code> is <code class="docutils literal notranslate"><span class="pre">auto</span></code> (the tuned kernels) or <code class="docutils literal notranslate"><span class="pre">reference</span></code>, the numerics
+anchor, served eager. <code class="docutils literal notranslate"><span class="pre">configs/glm52_tp8_mtp.yaml</span></code> drafts with MTP k=3 (greedy only).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">canopylabs/orpheus-3b-0.1-ft</span></code></p></td>

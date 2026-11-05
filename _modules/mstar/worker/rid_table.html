@@ -799,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -995,7 +996,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,</span>
 <span class="sd">_lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}</span>
 <span class="sd">and StreamBufferManager._rids (purged by remove_request), the engine's and</span>
-<span class="sd">tensor manager's per-request state (including ChunkingManagement.prepared, and</span>
+<span class="sd">tensor manager's per-request state (including ChunkingManagement.prepared,</span>
+<span class="sd">Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and</span>
 <span class="sd">the tensor store's rid -&gt; uuids ownership, held in the Rust bookkeeper under</span>
 <span class="sd">RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,</span>
 <span class="sd">_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,</span>

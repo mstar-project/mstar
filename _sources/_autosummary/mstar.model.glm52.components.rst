@@ -33,4 +33,5 @@ mstar.model.glm52.components
    indexer
    language_model
    moe
+   mtp
 

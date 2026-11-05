@@ -445,6 +445,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -1330,7 +1331,13 @@ A pool keeps only a window of the layers a windowed attention over it runs
 and <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> then work as described there.
 A spec whose nodes can run on several workers, as Bagel’s LLM nodes do under CFG
 parallel, sets <code class="docutils literal notranslate"><span class="pre">leader</span></code> to the node whose pool admits each request. Left unset, each
-worker’s pool admits requests on its own.</p></td>
+worker’s pool admits requests on its own.
+<code class="docutils literal notranslate"><span class="pre">correct_len(rid,</span> <span class="pre">label,</span> <span class="pre">delta)</span></code> moves a stream’s length between steps, never
+between a step’s admit and commit. A speculative verify step commits its whole block,
+and the next <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> takes its rejected tail back (<code class="docutils literal notranslate"><span class="pre">delta</span> <span class="pre">&lt;</span> <span class="pre">0</span></code>) before
+admit. The caller also calls the position resource’s <code class="docutils literal notranslate"><span class="pre">correct_len</span></code>, which doesn’t
+move by itself. A cache with KV groups refuses it. GLM-5.2’s MTP is the user, and
+this is interim until draft-verify is an engine resource (#1195).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=RingKVConfig(...))</span></code></p></td>
 <td><p>A fixed-capacity frame ring. It adds <code class="docutils literal notranslate"><span class="pre">tokens_per_frame</span></code>, one
@@ -1379,7 +1386,9 @@ refuse. Its <code class="docutils literal notranslate"><span class="pre">run</sp
 with the rope part as <code class="docutils literal notranslate"><span class="pre">q_pe</span></code>, and returns the output in the latent space, so
 the layer applies <code class="docutils literal notranslate"><span class="pre">W_UV</span></code>. FlashInfer’s kernel covers a 512-wide latent with a
 64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
-fallback, which cannot be captured in a CUDA graph.
+fallback, which cannot be captured in a CUDA graph. The layer is <code class="docutils literal notranslate"><span class="pre">MLAAttention</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/mla.py</span></code>); its config picks rotated decoupled dims (GLM-5.2)
+or none (GLM-5.3).
 <code class="docutils literal notranslate"><span class="pre">sliding_window=N</span></code> lets each query attend to the last <code class="docutils literal notranslate"><span class="pre">N</span></code> positions, its own
 included, and the cache keeps only about the last <code class="docutils literal notranslate"><span class="pre">N</span></code> tokens of this
 attention’s layers per request, returning the rest to the pool, so long requests
@@ -1474,7 +1483,9 @@ between <code class="docutils literal notranslate"><span class="pre">block_size<
 <code class="docutils literal notranslate"><span class="pre">apply_qk(q,</span> <span class="pre">k,</span> <span class="pre">label)</span></code>. <code class="docutils literal notranslate"><span class="pre">pos_ids=</span></code> rotates at positions the model passes
 instead of the label’s plan, and <code class="docutils literal notranslate"><span class="pre">k=None</span></code> rotates one tensor. <code class="docutils literal notranslate"><span class="pre">interleave</span></code>
 selects GPT-J pairing, <code class="docutils literal notranslate"><span class="pre">rotary_dim</span></code> a partial rotation, and <code class="docutils literal notranslate"><span class="pre">rope_table_dtype</span></code>
-a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
+a cos/sin table built once (GLM-5.2 uses float32); <code class="docutils literal notranslate"><span class="pre">cos_sin_table</span></code> hands it to a
+kernel that rotates inside a larger fusion, and <code class="docutils literal notranslate"><span class="pre">interleave</span></code> says which pairs that
+kernel must turn. A model with learned position
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
@@ -2124,7 +2135,10 @@ configs (see <a class="reference internal" href="#step-5"><span class="std std-r
 class attribute <code class="docutils literal notranslate"><span class="pre">disable_torch_compile</span> <span class="pre">=</span> <span class="pre">True</span></code>. An encoder whose output feeds a
 prefix cache layout walk compiles with dynamic shapes instead. One that marks every
 dimension that varies with <code class="docutils literal notranslate"><span class="pre">torch._dynamo.mark_dynamic</span></code> in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> sets
-<code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. Keep the compiled
+<code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. A submodule whose
+captures keep more compiled entries per frame than <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code> allows
+returns the number from <code class="docutils literal notranslate"><span class="pre">dynamo_recompile_limit()</span></code>; the engine raises the limit
+around that submodule’s compiled calls only. Keep the compiled
 paths compile-friendly. If a helper must not be traced, because it uses
 data-dependent Python control flow or forces a host synchronization, exclude it
 explicitly with <code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>. A submodule that disables the
@@ -3265,7 +3279,10 @@ not code. Each kernel op (<code class="docutils literal notranslate"><span class
 its tuned configs live in one JSON table per GPU under <code class="docutils literal notranslate"><span class="pre">mstar/kernels/tables/&lt;op&gt;/</span></code>. A model
 on a shared component gets them without code of its own: the component looks its shape up once
 per process and keeps the default config where no table has it, and the server logs the sweep
-command for that shape (<code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">table:</span> <span class="pre">no</span> <span class="pre">moe_gemm</span> <span class="pre">bfloat16</span> <span class="pre">E=128,N=1536,K=2048,top_k=8</span> <span class="pre">...</span></code>).</p>
+command for that shape (<code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">table:</span> <span class="pre">no</span> <span class="pre">moe_gemm</span> <span class="pre">bfloat16</span> <span class="pre">E=128,N=1536,K=2048,top_k=8</span> <span class="pre">...</span></code>).
+A block-fp8 dense linear (<code class="docutils literal notranslate"><span class="pre">fp8_linear</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar/utils/dense_fp8.py</span></code>) takes its kernel per token
+count the same way: the w8a16 Triton kernel, FlashInfer’s or cuBLAS’s block-scale GEMM, where the
+GPU’s row names one that runs there.</p>
 <p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmark.kernels.sweep</span></code> times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.
 <code class="docutils literal notranslate"><span class="pre">--out</span> <span class="pre">DIR</span></code> with <code class="docutils literal notranslate"><span class="pre">MSTAR_KERNEL_TABLES=DIR</span></code> serves a sweep before it is committed;

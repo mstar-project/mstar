@@ -446,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -734,6 +735,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.base_language"><code class="docutils literal notranslate"><span class="pre">base_language()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.capture_ladder"><code class="docutils literal notranslate"><span class="pre">capture_ladder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_kv_pools_fit"><code class="docutils literal notranslate"><span class="pre">check_kv_pools_fit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_loaded"><code class="docutils literal notranslate"><span class="pre">check_loaded()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.drop_stop_tokens"><code class="docutils literal notranslate"><span class="pre">drop_stop_tokens()</span></code></a></li>
@@ -762,31 +764,34 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.base_language" title="mstar.model.utils.base_language"><code class="xref py py-obj docutils literal notranslate"><span class="pre">base_language</span></code></a>(code)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">en-US</span></code>, <code class="docutils literal notranslate"><span class="pre">en_us</span></code> or <code class="docutils literal notranslate"><span class="pre">EN</span></code> -&gt; <code class="docutils literal notranslate"><span class="pre">en</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.check_kv_pools_fit" title="mstar.model.utils.check_kv_pools_fit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_kv_pools_fit</span></code></a>(model, config, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.capture_ladder" title="mstar.model.utils.capture_ladder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_ladder</span></code></a>(key, value)</p></td>
+<td><p>A capture ladder (token buckets or batch sizes) from model_kwargs: a 0, negative or repeated entry would go into the capture build, and an empty one would quietly mean the default.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.check_kv_pools_fit" title="mstar.model.utils.check_kv_pools_fit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_kv_pools_fit</span></code></a>(model, config, ...)</p></td>
 <td><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> the model's KV caches cannot hold.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.check_loaded" title="mstar.model.utils.check_loaded"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_loaded</span></code></a>(module, loaded, what)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.check_loaded" title="mstar.model.utils.check_loaded"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_loaded</span></code></a>(module, loaded, what)</p></td>
 <td><p>Raise unless <code class="docutils literal notranslate"><span class="pre">loaded</span></code> names every parameter of <code class="docutils literal notranslate"><span class="pre">module</span></code>: one built on <code class="docutils literal notranslate"><span class="pre">meta</span></code> and filled by a loader would otherwise serve uninitialized memory.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.drop_stop_tokens" title="mstar.model.utils.drop_stop_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">drop_stop_tokens</span></code></a>(output, stop_token_ids, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.drop_stop_tokens" title="mstar.model.utils.drop_stop_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">drop_stop_tokens</span></code></a>(output, stop_token_ids, ...)</p></td>
 <td><p>Drop the stop tokens that ended a text reply, unless the request sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.kv_pages" title="mstar.model.utils.kv_pages"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pages</span></code></a>(tokens, page_size, requests)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.kv_pages" title="mstar.model.utils.kv_pages"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pages</span></code></a>(tokens, page_size, requests)</p></td>
 <td><p>Pages for <code class="docutils literal notranslate"><span class="pre">requests</span></code> sequences of <code class="docutils literal notranslate"><span class="pre">tokens</span></code> each, plus the sink page every KV cache keeps out of circulation.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_generation_defaults" title="mstar.model.utils.load_generation_defaults"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_generation_defaults</span></code></a>(checkpoint_dir[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_generation_defaults" title="mstar.model.utils.load_generation_defaults"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_generation_defaults</span></code></a>(checkpoint_dir[, ...])</p></td>
 <td><p>The sampling defaults <code class="docutils literal notranslate"><span class="pre">checkpoint_dir/generation_config.json</span></code> declares.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights" title="mstar.model.utils.load_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights</span></code></a>(state_dict, module[, prefix, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights" title="mstar.model.utils.load_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights</span></code></a>(state_dict, module[, prefix, ...])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights_from_file" title="mstar.model.utils.load_weights_from_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights_from_file</span></code></a>(safetensors_file, modules)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights_from_file" title="mstar.model.utils.load_weights_from_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights_from_file</span></code></a>(safetensors_file, modules)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights_from_hf_shards" title="mstar.model.utils.load_weights_from_hf_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights_from_hf_shards</span></code></a>(repo_dir, modules)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights_from_hf_shards" title="mstar.model.utils.load_weights_from_hf_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights_from_hf_shards</span></code></a>(repo_dir, modules)</p></td>
 <td><p>Load weights from a HuggingFace safetensors checkpoint.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.process_weights_after_loading" title="mstar.model.utils.process_weights_after_loading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code></a>(root, device)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.process_weights_after_loading" title="mstar.model.utils.process_weights_after_loading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code></a>(root, device)</p></td>
 <td><p>Finalize kernel layouts across a freshly loaded module tree: any submodule exposing <code class="docutils literal notranslate"><span class="pre">process_weights_after_loading(device)</span></code> gets it called (the attention layers build their absorbed w_kc/w_vc here).</p></td>
 </tr>
 </tbody>
@@ -1127,6 +1132,22 @@ derive their text paths from it.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.capture_ladder">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">capture_ladder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#capture_ladder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.capture_ladder" title="Link to this definition">#</a></dt>
+<dd><p>A capture ladder (token buckets or batch sizes) from model_kwargs: a 0, negative or
+repeated entry would go into the capture build, and an empty one would quietly mean the
+default.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.utils.check_kv_pools_fit">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">check_kv_pools_fit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">log</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#check_kv_pools_fit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.check_kv_pools_fit" title="Link to this definition">#</a></dt>
 <dd><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> the model’s KV caches cannot hold.</p>
@@ -1394,6 +1415,7 @@ their absorbed w_kc/w_vc here).</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.base_language"><code class="docutils literal notranslate"><span class="pre">base_language()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.capture_ladder"><code class="docutils literal notranslate"><span class="pre">capture_ladder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_kv_pools_fit"><code class="docutils literal notranslate"><span class="pre">check_kv_pools_fit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_loaded"><code class="docutils literal notranslate"><span class="pre">check_loaded()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.drop_stop_tokens"><code class="docutils literal notranslate"><span class="pre">drop_stop_tokens()</span></code></a></li>

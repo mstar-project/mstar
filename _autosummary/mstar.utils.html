@@ -442,6 +442,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
@@ -742,22 +743,25 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.logging_config.html#module-mstar.utils.logging_config" title="mstar.utils.logging_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">logging_config</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.orphan.html#module-mstar.utils.orphan" title="mstar.utils.orphan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">orphan</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.mla_latent_norm.html#module-mstar.utils.mla_latent_norm" title="mstar.utils.mla_latent_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_latent_norm</span></code></a></p></td>
+<td><p>MLA without decoupled dims (<code class="docutils literal notranslate"><span class="pre">mla_use_nope</span></code>): both latent RMSNorms and the zero-kpe cache row in one kernel, for <code class="docutils literal notranslate"><span class="pre">components/mla.py</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.orphan.html#module-mstar.utils.orphan" title="mstar.utils.orphan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">orphan</span></code></a></p></td>
 <td><p>Watchdog that leaves once the process that spawned this one is gone.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.profiler.html#module-mstar.utils.profiler" title="mstar.utils.profiler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">profiler</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.profiler.html#module-mstar.utils.profiler" title="mstar.utils.profiler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">profiler</span></code></a></p></td>
 <td><p>Utilities for NVTX range annotations for profiling with nsys.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.socket_prefix.html#module-mstar.utils.socket_prefix" title="mstar.utils.socket_prefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">socket_prefix</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.socket_prefix.html#module-mstar.utils.socket_prefix" title="mstar.utils.socket_prefix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">socket_prefix</span></code></a></p></td>
 <td><p>Default IPC socket prefixes for the server entry points.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.streams.html#module-mstar.utils.streams" title="mstar.utils.streams"><code class="xref py py-obj docutils literal notranslate"><span class="pre">streams</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.streams.html#module-mstar.utils.streams" title="mstar.utils.streams"><code class="xref py py-obj docutils literal notranslate"><span class="pre">streams</span></code></a></p></td>
 <td><p>CUDA stream state a worker has to manage.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.threads.html#module-mstar.utils.threads" title="mstar.utils.threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">threads</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.threads.html#module-mstar.utils.threads" title="mstar.utils.threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">threads</span></code></a></p></td>
 <td><p>Starting threads, and moving the threads a step passes through onto their CPUs.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream" title="mstar.utils.utf8_stream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">utf8_stream</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream" title="mstar.utils.utf8_stream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">utf8_stream</span></code></a></p></td>
 <td><p>Decode a model's text chunks without splitting characters.</p></td>
 </tr>
 </tbody>
