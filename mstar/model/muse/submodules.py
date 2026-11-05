@@ -51,8 +51,8 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
 
     SEGMENT_LABELS = (VISION_WINDOW, VISION_FULL)
     # One request a step: ``window_index`` and ``output_index`` index a
-    # request's own patches, so two requests' indices don't concatenate, and
-    # the config has no ``spatial_merge_size`` to cut the output apart by.
+    # request's own patches, so two requests' do not pack by concatenation,
+    # and the config has no ``spatial_merge_size`` to cut the output apart by.
     MAX_BATCH_SIZE = 1
 
     def prepare_inputs(

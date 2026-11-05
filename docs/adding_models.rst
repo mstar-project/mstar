@@ -3062,22 +3062,23 @@ from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
 submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
-``_sampler_spec``; ``MIXED_SPLIT`` is the attention
-resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``, which
-hands the LLM node ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``).
-``media`` holds a ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
-a template leaves to its processor, how many placeholders an attachment fills
-(``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
-``prepare``, which turns an attachment into the encoder's input tensors and each
-placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and tokenizes the
-whole prompt once. ``intake`` then refuses a prompt whose placeholders don't match its
-attachments, prepares each attachment in prompt order, expands each placeholder to one
-pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``. The layout's runs say which encoders the prompt runs (``media_encoders``), for
-the prefill schedule's walk and the KV layout's alike.
-``kv_layout``'s ``advance``, how far the prompt moves the position counter, defaults to
-the prompt's length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
-``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes from the
+``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
+``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
+``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). ``media`` holds a
+``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
+its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
+temporal group), and ``prepare``, which turns an attachment into the encoder's input
+tensors and each placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and
+tokenizes the whole prompt once. ``intake`` then refuses a prompt whose placeholders don't
+match its attachments, prepares each attachment in prompt order, expands each placeholder
+to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
+layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
+The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
+schedule's walk and the KV layout's alike. ``kv_layout``'s ``advance``, how far the prompt
+moves the position counter, defaults to the prompt's length; under Qwen-style MRoPE it is
+the positions' extent instead, an image spanning ``max(h', w')`` positions rather than its
+tokens, which Qwen3.5 computes from the
 runs' grids in its ``kv_layout`` override. ``process_prompt`` also empties each sent
 attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are
 lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
