@@ -12,6 +12,7 @@ client against a fake API server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import io
 import socket
@@ -98,7 +99,7 @@ def _droid_model() -> Pi05Model:
 
 
 def _policy(**overrides) -> openpi.OpenpiPolicy:
-    return openpi.OpenpiPolicy.from_config({**DROID, **overrides}, "pi05", _droid_model())
+    return openpi.OpenpiPolicy.from_config({**DROID, **overrides}, _droid_model())
 
 
 def _droid_obs(seed: int = 0, **extra) -> dict:
@@ -126,6 +127,9 @@ class _FakeServer:
         self.submitted = []
         self.fail_with: str | None = None
         self.fatal_error = None
+
+    def cleanup(self):  # the app's shutdown hook calls it when a real server stops
+        pass
 
     def submit_request(self, **kwargs):
         rid = f"req-{len(self.submitted)}"
@@ -172,6 +176,14 @@ def test_codec_reads_and_writes_openpi_client_frames():
     msgpack.packb({"x": {b"__ndarray__": True, b"data": b"\0" * 7, b"dtype": "<f4", b"shape": [2]}}),
     msgpack.packb({"x": {b"__ndarray__": True, b"data": b"\0" * 8, b"dtype": "<f4", b"shape": [-2, -1]}}),
     msgpack.packb({"x": {b"__ndarray__": True, b"data": b"", b"dtype": "nonsense", b"shape": [0]}}),
+    # a missing key must not fall back to a default: np.dtype(None) is float64, a scalar of None NaN
+    msgpack.packb({"x": {b"__ndarray__": True, b"data": b"\0" * 8, b"shape": [1]}}),
+    msgpack.packb({"x": {b"__ndarray__": True, b"dtype": "<f8", b"shape": [1]}}),
+    msgpack.packb({"x": {b"__ndarray__": True, b"data": b"\0" * 8, b"dtype": "<f8"}}),
+    msgpack.packb({"x": {b"__npgeneric__": True, b"dtype": "<f8"}}),
+    msgpack.packb({"x": {b"__npgeneric__": True, b"data": None, b"dtype": "<f8"}}),
+    msgpack.packb({"x": {b"__npgeneric__": True, b"data": 1.0}}),
+    msgpack.packb({"x": {b"__ndarray__": True, b"data": b"\0" * 8, b"dtype": 8, b"shape": [1]}}),
     b"\xc1",
     b"\x92\x01",
 ])
@@ -236,17 +248,40 @@ def test_bad_observations_are_refused(change, match):
         _policy().request(obs)
 
 
-@pytest.mark.parametrize("block,model_name,match", [
-    ({**DROID, "action_horizon": 10}, "pi05", "takes"),
-    (DROID, "qwen3_5_0_8b", "served for"),
-    ({**DROID, "images": DROID["images"] * 2}, "pi05", "at most 2"),
-    ({**DROID, "state": []}, "pi05", "state"),
-    ({**DROID, "action_dims": 33}, "pi05", "action_dims"),
-    ({**DROID, "metadata": {"pose": object()}}, "pi05", "metadata"),
+@pytest.mark.parametrize("block,match", [
+    ({**DROID, "action_horizon": 10}, "takes"),
+    ({**DROID, "images": DROID["images"] * 2}, "at most 2"),
+    ({**DROID, "state": []}, "state"),
+    ({**DROID, "action_dims": 33}, "action_dims"),
+    ({**DROID, "metadata": {"pose": object()}}, "metadata"),
 ])
-def test_config_block_is_checked_at_startup(block, model_name, match):
+def test_config_block_is_checked_at_startup(block, match):
     with pytest.raises(ValueError, match=match):
-        openpi.OpenpiPolicy.from_config(block, model_name, _droid_model())
+        openpi.OpenpiPolicy.from_config(block, _droid_model())
+
+
+def test_the_policy_shape_comes_from_the_model():
+    """The API server names no model: it serves whatever declares Model.robot_io."""
+    policy = _policy()
+    io = _droid_model().robot_io()
+    assert tuple(io) == ("robot_state", HORIZON, WIDTH)
+    assert (policy.state_kwarg, policy.action_horizon, policy.action_dim) == tuple(io)
+
+
+def test_only_a_robot_policy_that_takes_decoded_images_is_served():
+    from mstar.model.base import Model
+
+    class _NotAPolicy(Pi05Model):
+        def robot_io(self):
+            return None
+
+    class _FilesOnly(Pi05Model):
+        load_decoded_image = Model.load_decoded_image
+
+    for cls, match in ((_NotAPolicy, "not a robot policy"), (_FilesOnly, "only as files")):
+        model = cls(model_path_hf="lerobot/pi05_droid", skip_weight_loading=True, num_cameras=2)
+        with pytest.raises(ValueError, match=match):
+            openpi.OpenpiPolicy.from_config(DROID, model)
 
 
 def test_reply_keeps_the_leading_action_dims():
@@ -276,7 +311,7 @@ def test_handshake_then_one_reply_per_observation(served):
     sub = served.submitted[0]
     assert sub["text"] == "pick up the marker"
     assert sub["input_modalities"] == ["image", "text"] and sub["output_modalities"] == ["action"]
-    assert len(sub["images"]) == 2 and "file_paths" not in sub
+    assert len(sub["raw_inputs"]["image"]) == 2 and "file_paths" not in sub
     assert len(sub["model_kwargs"]["robot_state"]) == 8
 
 
@@ -371,12 +406,16 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_openpi_client_over_a_real_socket(served):
+@contextlib.contextmanager
+def _real_server(config: dict):
+    """The app on a real uvicorn socket, built as the server builds it."""
     pytest.importorskip("websockets.sync.client")
     import uvicorn
 
     port = _free_port()
-    server = uvicorn.Server(uvicorn.Config(entrypoint.app, host="127.0.0.1", port=port, log_level="warning"))
+    uv_config = entrypoint._uvicorn_config(entrypoint.app, "127.0.0.1", port, config)
+    uv_config.log_level = "warning"
+    server = uvicorn.Server(uv_config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     try:
@@ -384,6 +423,14 @@ def test_openpi_client_over_a_real_socket(served):
         while not server.started:
             assert time.monotonic() < deadline, "uvicorn did not start"
             time.sleep(0.02)
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_openpi_client_over_a_real_socket(served):
+    with _real_server({}) as port:
         client = _OpenpiClient("127.0.0.1", port)
         assert client.metadata == {}
         for i in range(3):
@@ -393,9 +440,28 @@ def test_openpi_client_over_a_real_socket(served):
         with pytest.raises(RuntimeError, match="refused"):
             client.infer(_droid_obs())
         client.close()
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
+
+
+def test_an_observation_over_the_message_limit_closes_the_socket(served):
+    """openpi's client sets no size limit; the server's ws_max_message_mb does."""
+    from websockets.exceptions import ConnectionClosed
+
+    big = _droid_obs()
+    big["observation/exterior_image_1_left"] = np.zeros((1024, 1024, 3), np.uint8)  # 3 MiB
+    with _real_server({}) as port:  # under the default 16 MiB it is served
+        client = _OpenpiClient("127.0.0.1", port)
+        assert client.infer(big)["actions"].shape == (HORIZON, 8)
+        client.close()
+    served.submitted.clear()
+    with _real_server({"ws_max_message_mb": 1}) as port:
+        client = _OpenpiClient("127.0.0.1", port)
+        with pytest.raises(ConnectionClosed) as closed:
+            client.infer(big)
+        # The server closes with 1009 while the client may still be sending; the
+        # reset that closing over unread data causes can drop the close frame.
+        assert closed.value.rcvd is None or closed.value.rcvd.code == 1009
+        assert not served.submitted
+        client.close()
 
 
 # ----------------------------------------------------------------------
@@ -422,7 +488,7 @@ def test_a_decoded_image_loads_as_its_lossless_file_does(tmp_path):
         paths[-1].write_bytes(buf.getvalue())
     worker = _loader(model)
     from_files, _ = worker._load_media({"image": [str(p) for p in paths]})
-    decoded, _ = worker._load_media(None, images)
+    decoded, _ = worker._load_media(None, {"image": images})
     assert len(decoded["image_inputs"]) == 2
     for a, b in zip(from_files["image_inputs"], decoded["image_inputs"], strict=True):
         assert a.dtype == b.dtype == torch.uint8 and torch.equal(a, b)
@@ -432,10 +498,10 @@ def test_decoded_images_are_held_to_the_media_limits(monkeypatch):
     worker = _loader(_droid_model())
     image = torch.zeros(3, 224, 224, dtype=torch.uint8)
     with pytest.raises(ValueError, match="at most 2"):
-        worker._load_media(None, [image] * 3)
+        worker._load_media(None, {"image": [image] * 3})
     monkeypatch.setenv("MSTAR_MAX_IMAGE_PIXELS", str(224 * 224 + 1))
     with pytest.raises(ValueError, match="pixels"):
-        worker._load_media(None, [image] * 2)
+        worker._load_media(None, {"image": [image] * 2})
 
 
 def test_a_model_without_the_hook_takes_images_only_as_files():
@@ -444,7 +510,7 @@ def test_a_model_without_the_hook_takes_images_only_as_files():
     worker = _loader(_droid_model())
     worker.model.load_decoded_image = functools.partial(Model.load_decoded_image, worker.model)
     with pytest.raises(NotImplementedError, match="only as files"):
-        worker._load_media(None, [torch.zeros(3, 8, 8, dtype=torch.uint8)])
+        worker._load_media(None, {"image": [torch.zeros(3, 8, 8, dtype=torch.uint8)]})
 
 
 def test_a_prefix_keyed_deployment_refuses_decoded_images():
@@ -452,18 +518,21 @@ def test_a_prefix_keyed_deployment_refuses_decoded_images():
     worker._keyed_labels = {"llm_kv": {"main": object()}}
     request = PreprocessInput(
         request_id="r#1", text="t", file_paths=None, input_modalities=["image", "text"],
-        output_modalities=["action"], model_kwargs={}, images=[torch.zeros(3, 8, 8, dtype=torch.uint8)],
+        output_modalities=["action"], model_kwargs={},
+        raw_inputs={"image": [torch.zeros(3, 8, 8, dtype=torch.uint8)]},
     )
-    with pytest.raises(ValueError, match="send the images as files"):
+    with pytest.raises(ValueError, match="send the media as files"):
         worker._prepare_input(request)
 
 
-@pytest.mark.parametrize("images,file_paths,match", [
-    ([torch.zeros(3, 8, 8, dtype=torch.uint8)], {"image": ["a.png"]}, "not both"),
-    ([torch.zeros(3, 8, 8, dtype=torch.uint8)], {"image": []}, "not both"),
-    ([torch.zeros(3, 8, 8)], None, "uint8"),
-    ([torch.zeros(8, 8, 3, dtype=torch.uint8)], None, r"\[3, H, W\]"),
+@pytest.mark.parametrize("raw,file_paths,match", [
+    ({"image": [torch.zeros(3, 8, 8, dtype=torch.uint8)]}, {"image": ["a.png"]}, "not both"),
+    ({"image": [torch.zeros(3, 8, 8, dtype=torch.uint8)]}, {"image": []}, "not both"),
+    ({"image": [torch.zeros(3, 8, 8)]}, None, "uint8"),
+    ({"image": [torch.zeros(8, 8, 3, dtype=torch.uint8)]}, None, r"\[3, H, W\]"),
+    # a modality with no decoded loader is refused at submit, not in the data worker
+    ({"audio": [torch.zeros(16000)]}, None, "only as files"),
 ])
-def test_submit_refuses_malformed_decoded_images(images, file_paths, match):
+def test_submit_refuses_malformed_raw_inputs(raw, file_paths, match):
     with pytest.raises(ValueError, match=match):
-        entrypoint._check_decoded_images(images, file_paths)
+        entrypoint._check_raw_inputs(raw, file_paths)

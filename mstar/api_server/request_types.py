@@ -146,10 +146,10 @@ class PreprocessInput:
     client_request_id: str | None = None
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
-    # Images the API server already holds decoded (RGB uint8 ``[3, H, W]``),
-    # in the request's image order, instead of image files: handed to
-    # ``Model.load_decoded_image`` with no file written or decoded.
-    images: list["torch.Tensor"] | None = None
+    # Inputs the API server already holds decoded, by modality and in order,
+    # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
+    # each goes to ``Model.load_decoded_<modality>``, with no file between.
+    raw_inputs: dict[str, list["torch.Tensor"]] | None = None
 
 
 @dataclass

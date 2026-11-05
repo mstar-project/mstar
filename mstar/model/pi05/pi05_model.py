@@ -58,6 +58,7 @@ from mstar.model.base import (
     LabelLayout,
     Model,
     ProcessPromptOutput,
+    RobotIO,
     Span,
     TensorAndMetadata,
 )
@@ -552,6 +553,9 @@ class Pi05Model(Model):
         robot_state = kwargs.get("robot_state")
         if robot_state is not None:
             state = torch.as_tensor(robot_state, dtype=torch.float64).detach().cpu().reshape(-1)
+            # NaN and +inf would bin as 255 and -inf as -1: an ordinary-looking state token
+            if not torch.isfinite(state).all():
+                raise ValueError("robot_state must be finite; it holds NaN or inf")
             if self.norm_stats is not None:
                 state = self.norm_stats.normalize_state(state)
             state_bins = discretize_state(state, num_bins=self.config.state_token_bins).tolist()
@@ -579,6 +583,9 @@ class Pi05Model(Model):
 
     def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
         return TensorAndMetadata(image.to(device))
+
+    def robot_io(self) -> RobotIO:
+        return RobotIO("robot_state", self.config.action_horizon, self.config.action_dim)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {LLM_KV: {"main": KVLabel()}}

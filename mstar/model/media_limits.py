@@ -282,6 +282,13 @@ def charge_decoded_image(image: torch.Tensor) -> None:
     _charge_request("image", width * height)
 
 
+#: Which modalities a request may send as ``raw_inputs`` (tensors instead of files),
+#: each with its size check: the check refuses an input over the limit (for images,
+#: MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request's total, as reading a
+#: file's header does. The model then loads each with ``Model.load_decoded_<modality>``.
+RAW_INPUT_CHARGES = {"image": charge_decoded_image}
+
+
 def sound_file_seconds(frames: int, rate: int) -> float | None:
     """The length a libsndfile header declares, or None when it declares none
     (a sample count of 0 or libsndfile's "unknown" value)."""

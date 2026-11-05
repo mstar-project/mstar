@@ -295,7 +295,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``openpi``
-     - *(optional, pi0.5 only)* Serves openpi's policy WebSocket at ``/`` (see
+     - *(optional)* For a robot policy, a model that declares ``Model.robot_io`` and
+       ``Model.load_decoded_image`` (pi0.5 today). Serves openpi's policy WebSocket at ``/`` (see
        :doc:`clients`), mapping an openpi observation onto the request, as openpi's
        per-robot input and output transforms do. ``images``: the observation keys of the
        cameras, in slot order. ``state``: the keys whose values are joined, in order,
@@ -311,6 +312,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
+   * - ``ws_max_message_mb``
+     - *(optional, default 16)* The largest WebSocket message the server reads, in MiB,
+       on every WebSocket route. A larger one closes its socket with ``1009`` before any
+       handler sees it, so the client gets no error frame. Raise it for clients that send
+       big uncompressed frames, such as several raw camera images in one openpi
+       observation.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation

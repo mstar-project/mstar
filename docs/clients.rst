@@ -248,6 +248,11 @@ takes only ``Bearer``. A server without the block has none of this: it refuses t
 handshake and has no ``/healthz``. Only the Python frontend serves this route;
 ``--rust-frontend`` logs a warning and serves without it.
 
+``openpi_client`` sets no size limit on its messages, but the server does:
+``ws_max_message_mb`` (16 MiB by default, see :doc:`serving`). A larger observation closes
+the socket with ``1009`` and no error frame, so a deployment whose robots send several
+raw high-resolution cameras raises it.
+
 .. code-block:: python
 
    from openpi_client import websocket_client_policy

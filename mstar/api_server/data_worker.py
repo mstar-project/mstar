@@ -60,9 +60,9 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.media_limits import (
+    RAW_INPUT_CHARGES,
     RequestMediaBudget,
     charge_decoded_audio,
-    charge_decoded_image,
     check_audio_duration,
     check_file_counts,
     check_media_limits,
@@ -841,28 +841,30 @@ class PreprocessWorkerThread:
 
     def _load_media(
         self, file_paths: dict[str, list[str]] | None,
-        images: list[torch.Tensor] | None = None,
+        raw_inputs: dict[str, list[torch.Tensor]] | None = None,
     ) -> tuple[NameToTensorList, dict[str, list[dict]]]:
         """Raw modality tensors and their metadata, keyed ``{modality}_inputs``.
-        The files, and ``images`` that arrived decoded (which stand in for image
+        The files, and ``raw_inputs`` (which stand in for their modality's
         files), are held to one media budget together."""
         tensors: NameToTensorList = {}
         input_metadata = {}
-        if not file_paths and not images:
+        if not file_paths and not raw_inputs:
             return tensors, input_metadata
         counts = {modality: len(paths) for modality, paths in (file_paths or {}).items()}
-        if images:
-            counts["image"] = len(images)
+        for modality, items in (raw_inputs or {}).items():
+            counts[modality] = len(items)
         check_file_counts(counts, self.model.max_input_files())
         budget = RequestMediaBudget(sum(counts.values()))
-        if images:
-            tensors["image_inputs"], input_metadata["image_inputs"] = [], []
-            for image in images:
+        for modality, items in (raw_inputs or {}).items():
+            key = f"{modality}_inputs"
+            charge, load = RAW_INPUT_CHARGES[modality], getattr(self.model, f"load_decoded_{modality}")
+            tensors[key], input_metadata[key] = [], []
+            for item in items:
                 with budget.file():
-                    charge_decoded_image(image)
-                    out = self.model.load_decoded_image(image, self.device)
-                tensors["image_inputs"].append(out.data)
-                input_metadata["image_inputs"].append(out.metadata)
+                    charge(item)
+                    out = load(item, self.device)
+                tensors[key].append(out.data)
+                input_metadata[key].append(out.metadata)
         file_paths = file_paths or {}
         for modality, paths in file_paths.items():
             key = f"{modality}_inputs"
@@ -908,10 +910,10 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        if input.images and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
-            # a prefix key hashes each image's file, and these have none
-            raise ValueError("this deployment keys image prompts by their files; send the images as files")
-        tensors, input_metadata = self._load_media(input.file_paths, input.images)
+        if input.raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+            # a prefix key hashes each input's file, and these have none
+            raise ValueError("this deployment keys prompts by their media files; send the media as files")
+        tensors, input_metadata = self._load_media(input.file_paths, input.raw_inputs)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -1032,8 +1034,8 @@ class PreprocessWorkerThread:
                     found.append(os.stat(path).st_size)
                 except (OSError, ValueError):
                     pass  # gone or not a valid path: its load fails, and the failure is counted
-        if input.images:
-            sizes["image"] = [image.nbytes for image in input.images]
+        for modality, items in (input.raw_inputs or {}).items():
+            sizes[modality] = [item.nbytes for item in items]
         return DataWorkerProfile(
             request_id=input.request_id,
             dequeue_time=dequeue_time,
@@ -1401,11 +1403,11 @@ class PreprocessWorkerThread:
                 count=len(paths),
                 total_bytes=total_bytes,
             ))
-        if input.images:
+        for modality, items in (input.raw_inputs or {}).items():
             infos.append(InputInfo(
-                modality="image",
-                count=len(input.images),
-                total_bytes=sum(image.nbytes for image in input.images),
+                modality=modality,
+                count=len(items),
+                total_bytes=sum(item.nbytes for item in items),
             ))
         return infos
 

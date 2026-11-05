@@ -145,6 +145,16 @@ class TensorAndMetadata:
     metadata: dict = field(default_factory=dict)
 
 
+class RobotIO(NamedTuple):
+    """What a robot policy's requests and outputs look like, for the API
+    server's robot protocols (the openpi WebSocket)."""
+    # the model_kwargs key a request's robot state goes under
+    state_kwarg: str
+    # the shape of the float32 actions ``postprocess`` returns for "action"
+    action_horizon: int
+    action_dim: int
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
@@ -1032,6 +1042,11 @@ class Model(ABC):
         the openpi endpoint) overrides this so the two paths agree; the rest
         take images only as files."""
         raise NotImplementedError(f"{type(self).__name__} takes images only as files")
+
+    def robot_io(self) -> RobotIO | None:
+        """A robot policy's request and output shapes, which the openpi
+        WebSocket serves it by; None for a model that is not one."""
+        return None
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the

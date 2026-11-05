@@ -20,7 +20,7 @@ does the job of openpi's per-robot transforms (``DroidInputs``, ``DroidOutputs``
 it names the observation keys that are the cameras, in slot order, the keys whose
 values are joined into the state, and how many action dims a reply keeps. The
 images reach the model decoded, with no file in between
-(``APIServer.submit_request(images=...)``).
+(``APIServer.submit_request(raw_inputs=...)``).
 """
 
 from __future__ import annotations
@@ -36,12 +36,11 @@ import numpy as np
 import torch
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
+from mstar.model.base import Model
 from mstar.utils.client_errors import client_error_text
 
 logger = logging.getLogger(__name__)
 
-# The model_kwargs key each model served over openpi takes its robot state under.
-_STATE_KWARG = {"pi05": "robot_state"}
 # Array dtypes an observation may carry: bool, integers and floats.
 _NUMERIC_KINDS = frozenset("biuf")
 _CONFIG_KEYS = frozenset({"images", "state", "action_dims", "metadata"})
@@ -60,6 +59,9 @@ def _pack_array(obj):
 
 
 def _numeric_dtype(name) -> np.dtype:
+    # dtype.str, as openpi packs it: np.dtype(None) would quietly be float64
+    if not isinstance(name, str):
+        raise ValueError(f"an array's dtype must be a dtype string, not {name!r}")
     try:
         dtype = np.dtype(name)
     except TypeError:
@@ -71,8 +73,10 @@ def _numeric_dtype(name) -> np.dtype:
 
 def _unpack_array(obj: dict):
     if b"__ndarray__" in obj:
-        dtype = _numeric_dtype(obj.get(b"dtype"))
-        shape, data = obj.get(b"shape"), obj.get(b"data")
+        if not {b"data", b"dtype", b"shape"} <= obj.keys():
+            raise ValueError("an array needs data, dtype and shape")
+        dtype = _numeric_dtype(obj[b"dtype"])
+        shape, data = obj[b"shape"], obj[b"data"]
         if not isinstance(data, bytes) or not isinstance(shape, list) or not all(
             type(n) is int and n >= 0 for n in shape
         ):
@@ -81,7 +85,13 @@ def _unpack_array(obj: dict):
             raise ValueError(f"an array of shape {tuple(shape)} and dtype {dtype.str} is not {len(data)} bytes")
         return np.frombuffer(data, dtype=dtype).reshape(shape)
     if b"__npgeneric__" in obj:
-        return _numeric_dtype(obj.get(b"dtype")).type(obj.get(b"data"))
+        if not {b"data", b"dtype"} <= obj.keys():
+            raise ValueError("a scalar needs data and dtype")
+        data = obj[b"data"]
+        # what np.generic.item() packs: a missing or None value would be NaN
+        if type(data) not in (bool, int, float):
+            raise ValueError(f"a scalar's data must be a number, not {type(data).__name__}")
+        return _numeric_dtype(obj[b"dtype"]).type(data)
     return obj
 
 
@@ -144,15 +154,19 @@ class OpenpiPolicy:
     metadata: dict = field(default_factory=dict)
 
     @classmethod
-    def from_config(cls, block, model_name: str, model) -> OpenpiPolicy:
+    def from_config(cls, block, model) -> OpenpiPolicy:
         """Raises ``ValueError`` at startup for a block the model can't serve."""
         if not isinstance(block, dict):
             raise ValueError("openpi: must be a mapping")
         unknown = block.keys() - _CONFIG_KEYS
         if unknown:
             raise ValueError(f"openpi: takes {sorted(_CONFIG_KEYS)}; got {sorted(unknown)}")
-        if model_name not in _STATE_KWARG:
-            raise ValueError(f"openpi: is served for {sorted(_STATE_KWARG)}, not {model_name!r}")
+        io = model.robot_io() if model is not None else None
+        name = type(model).__name__
+        if io is None:
+            raise ValueError(f"openpi: {name} is not a robot policy (it declares no Model.robot_io)")
+        if type(model).load_decoded_image is Model.load_decoded_image:
+            raise ValueError(f"openpi: {name} takes images only as files (no Model.load_decoded_image)")
         images, state = block.get("images"), block.get("state")
         for name, keys in (("images", images), ("state", state)):
             if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
@@ -160,10 +174,9 @@ class OpenpiPolicy:
         cameras = model.max_input_files().get("image")
         if cameras is not None and len(images) > cameras:
             raise ValueError(f"openpi: images names {len(images)} cameras; the model takes at most {cameras}")
-        cfg = model.config
-        action_dims = block.get("action_dims", cfg.action_dim)
-        if type(action_dims) is not int or not 1 <= action_dims <= cfg.action_dim:
-            raise ValueError(f"openpi: action_dims must be an int in [1, {cfg.action_dim}]")
+        action_dims = block.get("action_dims", io.action_dim)
+        if type(action_dims) is not int or not 1 <= action_dims <= io.action_dim:
+            raise ValueError(f"openpi: action_dims must be an int in [1, {io.action_dim}]")
         metadata = block.get("metadata") or {}
         if not isinstance(metadata, dict):
             raise ValueError("openpi: metadata must be a mapping")
@@ -172,8 +185,8 @@ class OpenpiPolicy:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"openpi: metadata cannot be sent as msgpack: {exc}") from None
         return cls(
-            image_keys=tuple(images), state_keys=tuple(state), state_kwarg=_STATE_KWARG[model_name],
-            action_horizon=cfg.action_horizon, action_dim=cfg.action_dim, action_dims=action_dims,
+            image_keys=tuple(images), state_keys=tuple(state), state_kwarg=io.state_kwarg,
+            action_horizon=io.action_horizon, action_dim=io.action_dim, action_dims=action_dims,
             metadata=metadata,
         )
 
@@ -227,7 +240,7 @@ class _CallFailedError(Exception):
 async def _infer(api, policy: OpenpiPolicy, request: PolicyRequest) -> np.ndarray:
     request_id = api.submit_request(
         text=request.prompt,
-        images=request.images,
+        raw_inputs={"image": request.images},
         input_modalities=["image", "text"],
         output_modalities=["action"],
         model_kwargs=request.model_kwargs,

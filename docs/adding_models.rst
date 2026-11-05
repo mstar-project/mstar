@@ -231,7 +231,10 @@ of this page. ``load_decoded_image`` takes an image the API server already holds
 (RGB uint8 ``[3, H, W]``, from the openpi WebSocket) and must return what ``load_image``
 returns for the same pixels in a file. The default refuses, so a model takes images only as
 files until it overrides this. pi0.5's ``load_image`` calls it, so the two paths cannot
-drift apart.
+drift apart. A robot policy also overrides ``robot_io``, returning a ``RobotIO``: the
+``model_kwargs`` key its robot state goes under, and the ``[action_horizon, action_dim]``
+shape of the float32 actions its ``postprocess`` returns. The openpi WebSocket serves a
+model by these two hooks alone, so a new policy needs no change to the API server.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
