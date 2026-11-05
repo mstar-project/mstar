@@ -7,6 +7,8 @@ engine.
 """
 
 import asyncio
+import re
+import runpy
 import sys
 import tempfile
 import types
@@ -26,6 +28,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai import adapters  # noqa: E402
 from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MARK_TABLE = REPO_ROOT / "rust/server/src/unicode_marks.rs"
+GENERATOR = REPO_ROOT / "scripts/gen_unicode_marks.py"
 
 LONG_TEXT = (
     "The train to the coast leaves at seven tomorrow morning, so please pack your bag tonight. "
@@ -99,6 +105,43 @@ def test_tiny_trailing_fragment_merges_into_previous_chunk():
 def test_max_chars_must_be_positive():
     with pytest.raises(ValueError):
         split_sentences("a. b.", max_chars=0)
+
+
+def test_an_even_cut_lands_where_this_interpreters_unicodedata_puts_it():
+    """A cut that falls on a combining mark moves back off it, so where this
+    input is cut depends on the table the splitter reads: U+0897 is unassigned
+    up to Unicode 15.1.0 and a mark from 16.0.0. The Rust frontend reads a
+    table generated from ``unicodedata`` so that it answers the same way
+    (``rust/server/src/unicode_marks.rs``)."""
+    text = "a" * 267 + "\u0897" + "b" * 533
+    chunks = split_sentences(text, max_chars=400, min_chars=24)
+    moves = unicodedata.category("\u0897").startswith("M")
+    assert [len(c) for c in chunks] == ([266, 268, 267] if moves else [267, 267, 267])
+    assert "".join(chunks) == text
+
+
+def test_the_rust_mark_table_is_this_interpreters_unicodedata():
+    """The Rust frontend cannot ask ``unicodedata``, so it reads a table
+    generated from it. Both frontends must call the same code points marks, or
+    they cut long text in different places; this fails when a CPython upgrade
+    moves the categories and the table has not been regenerated."""
+    source = MARK_TABLE.read_text()
+    ranges = [(int(low, 16), int(high, 16))
+              for low, high in re.findall(r"\(0x([0-9a-f]+), 0x([0-9a-f]+)\)", source)]
+    assert len(ranges) > 100, f"no table parsed out of {MARK_TABLE}"
+    tabled = {code for low, high in ranges for code in range(low, high + 1)}
+    marks = {code for code in range(sys.maxunicode + 1)
+             if unicodedata.category(chr(code)).startswith("M")}
+    disagree = sorted(tabled ^ marks)
+    assert not disagree, (
+        f"{len(disagree)} code points disagree with unicodedata "
+        f"{unicodedata.unidata_version} (first {[hex(c) for c in disagree[:8]]}): regenerate "
+        f"with `python {GENERATOR.relative_to(REPO_ROOT)}`, which moves Rust cut points"
+    )
+    # and the checked-in file is what the generator writes, so regenerating it
+    # is the whole fix when this does fail
+    generator = runpy.run_path(str(GENERATOR))
+    assert source == generator["render"](generator["mark_ranges"]())
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +311,19 @@ def test_streaming_request_that_fails_up_front_returns_the_error_status(client_a
 
 def _ids(stub):
     return [s["request_id"] for s in stub.submits]
+
+
+def test_a_zero_max_chars_is_refused_before_anything_is_submitted(client_and_stub, monkeypatch):
+    """``split_sentences``'s ``ValueError`` as the route answers it, which is
+    the refusal the Rust frontend's ``plan_chunks`` returns."""
+    client, stub = client_and_stub
+    monkeypatch.setattr(adapters.OrpheusAdapter, "speech_chunk_max_chars", 0)
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT, "sentence_chunking": True})
+    assert r.status_code == 400 and r.json()["error"]["message"] == "max_chars must be positive"
+    assert stub.submits == []
+    # and an input the route never splits is still synthesized whole
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "Hi.", "sentence_chunking": False})
+    assert r.status_code == 200 and [s["text"] for s in stub.submits] == ["Hi."]
 
 
 def test_chunk_count_is_capped(client_and_stub, monkeypatch):
