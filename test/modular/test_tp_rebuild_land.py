@@ -116,7 +116,7 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
 
     # the step after the refusal carries v's drop
     sched.register_tp_follow(_head(lead, 0))
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     sched.pop_tp_follow_head()
 
     # N: rank 0's log starts v's rebuild and offers its first chunk. The follower knows v from its own KV.
@@ -141,7 +141,7 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
     one.post_process(n_1)
     sched.register_tp_follow(_head(lead, 3))
 
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
     assert not one.rebuilds.rebuilding("v", NODE), "the follower would take v's decode row for a rebuild row"
 
@@ -160,7 +160,7 @@ def test_a_rebuild_over_two_rows_lands_on_the_follower_with_rank_0s(monkeypatch)
     rows = {1: ChunkRange(0, FIRST, FIRST, FIRST), 2: ChunkRange(0, WHOLE - FIRST, WHOLE - FIRST, WHOLE - FIRST)}
     sched, request_state = one.scheduler, one.worker.request_state
     sched.register_tp_follow(_head(lead, 0))
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     sched.pop_tp_follow_head()
 
     zero.scheduler._start_rebuild(NODE, "v", "decode")
@@ -172,6 +172,44 @@ def test_a_rebuild_over_two_rows_lands_on_the_follower_with_rank_0s(monkeypatch)
         one.post_process(step)
     sched.register_tp_follow(_head(lead, 3, chunks=rows))
 
-    assert sched.settle_tp_follow_delta(caught_up=True)
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT and _counts(leader) == _counts(follower)
     assert not one.rebuilds.rebuilding("v", NODE), "the follower's rebuild of v outlived rank 0's"
+
+
+def test_a_follower_whose_rebuild_cant_start_stops(monkeypatch):
+    """The follower replays rank 0's drop of v holding the input of v's prompt and no ids, and its chunk loop has
+    v's prompt run whole, so v's rebuild has nothing to start from. The error came back on every pass over rank 0's
+    step while rank 0 waited in it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    zero, one = _Rank(leader, lead), _Rank(follower, follow)
+    del one.rebuilds._kept[NODE]["v"]
+    follow._chunking.prepared["v", NODE] = SimpleNamespace()
+    sched, request_state = one.scheduler, one.worker.request_state
+    sched.register_tp_follow(_head(lead, 0))
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+    sched.pop_tp_follow_head()
+    zero.scheduler._start_rebuild(NODE, "v", "decode")
+    sched.register_tp_follow(_head(lead, 1, ["v"]))
+
+    with pytest.raises(SystemExit, match="TP ranks diverged"):
+        sched.settle_tp_follow_delta(request_state, caught_up=True)
+
+
+def test_a_follower_starts_the_rebuild_of_a_request_busy_on_another_node(monkeypatch):
+    """v's drop here waits only for a step of this node, so v can be in a step of another node as rank 0 starts its
+    rebuild. A follower that skipped every request in flight on any node didn't start v's rebuild, and missed the keys
+    the rebuild lays out before it took rank 0's lease."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    zero, one = _Rank(leader, lead), _Rank(follower, follow)
+    sched, request_state = one.scheduler, one.worker.request_state
+    sched.register_tp_follow(_head(lead, 0))
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+    sched.pop_tp_follow_head()
+    zero.scheduler._start_rebuild(NODE, "v", "decode")
+    sched.register_tp_follow(_head(lead, 1, ["v"]))
+    sched.in_flight_rids.add("v")
+
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+
+    assert one.rebuilds.rebuilding("v", NODE), "the follower didn't start v's rebuild at rank 0's row of it"

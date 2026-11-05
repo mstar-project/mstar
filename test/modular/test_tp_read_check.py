@@ -262,6 +262,9 @@ class _DroppedHere(_Engine):
     def residency(self, node_name, rid):
         return Residency.DROPPED if rid in self.dropped else Residency.RESIDENT
 
+    def in_step(self, node_name, rid):
+        return False
+
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         if rid in self.dropped:
             return FULL_ADMIT_REBUILD
@@ -283,7 +286,7 @@ def _log(kept):
 
     return SimpleNamespace(
         kept=lambda rid, node: rid if rid in kept else None, start=start,
-        rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items,
+        rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items, nodes=frozenset({NODE}),
         cursor=lambda rid, node: SimpleNamespace(resumes_prefill=cursors[(node, rid)] is not None),
     )
 
@@ -672,7 +675,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
     w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq, w._tp_followers = 0, {}
+    w._tp_broadcast_seq, w._tp_followers = 0, dict.fromkeys(nodes, FOLLOWERS[1:])
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),

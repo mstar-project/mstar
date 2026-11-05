@@ -29,14 +29,21 @@ sys.path.insert(0, ".")
 
 import test_kv_host_index as host
 from test_kv_preemption import _step
-from test_kv_prefix_lease import NODE, PAGE_SIZE, _StubTransfer
+from test_kv_prefix_lease import NODE, PAGE_SIZE, _ctx, _StubTransfer
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Rebuild, Residency
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    RetentionPolicy,
+    StreamLayout,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext, SubmoduleStep
@@ -55,12 +62,18 @@ from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
-def _keeps_none(rid, node):
-    return 0
+class _KeepsIds:
+    """A rebuild log that keeps every request's ids and runs no rebuild."""
+    nodes = frozenset()
+
+    def kept(self, rid, node):
+        return True
+
+    def rebuilding(self, rid, node):
+        return False
 
 
-def _rebuilds_none(rid, node):
-    return False
+_rebuilds_none = _KeepsIds()
 
 
 def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:
@@ -218,6 +231,7 @@ class _Engine:
     admit_request = Engine.admit_request
     offload_request = Engine.offload_request
     paged_kv_caches = Engine.paged_kv_caches
+    in_step = Engine.in_step
     _release_resident_slot = Engine._release_resident_slot
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
@@ -280,12 +294,12 @@ def test_replay_is_exempt_from_both_guards():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is True
     assert engine.residency("node", "a") is Residency.ON_HOST
 
     back = OffloadDelta.new()
     back.add(MoveKind.RELOAD, "wire-a", node="node")
-    assert engine.apply_resident_delta(back, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(back, _rebuilds_none) is True
     assert engine.residency("node", "a") is not Residency.ON_HOST
 
 
@@ -436,7 +450,7 @@ def test_replaying_a_delta_reproduces_the_leaders_state():
     delta.add(MoveKind.RELOAD, "wire-a", node="node")
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is True
     assert engine.residency("node", "a") is Residency.ON_HOST, (
         "replay ended with 'a' resident; the leader has it on the host"
     )
@@ -452,11 +466,11 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
     delta.add(MoveKind.OFFLOAD, "wire-b", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is False
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is False
     assert len(delta) == 2, "a refused entry must stay queued"
 
     engine.resource.refuse_offload = False
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is True
     assert engine.residency("node", "a") is Residency.ON_HOST and engine.residency("node", "b") is Residency.ON_HOST
 
 
@@ -468,13 +482,13 @@ def test_a_move_for_a_request_this_rank_has_not_taken_in_waits_for_it():
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
     delta.add(MoveKind.OFFLOAD, "wire-b", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is False
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is False
     assert len(delta) == 2 and engine.residency("node", "b") is not Residency.ON_HOST, (
         "a move ran ahead of one still owed"
     )
 
     engine._graph_runtime._live.add("a")
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is True
     assert engine.residency("node", "a") is Residency.ON_HOST, "the move was lost while it waited"
 
 
@@ -486,7 +500,7 @@ def test_a_move_of_any_kind_waits_for_a_request_this_rank_has_not_taken_in(kind)
     delta.add(kind, "wire-a", node="node")
     delta.add(MoveKind.OFFLOAD, "wire-b", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is False
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is False
     assert len(delta) == 2 and engine.residency("node", "b") is not Residency.ON_HOST, (
         "a move ran ahead of one still owed"
     )
@@ -501,7 +515,7 @@ def test_a_request_holding_nothing_is_not_a_refusal():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
 
-    assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+    assert engine.apply_resident_delta(delta, _rebuilds_none) is True
     assert len(delta) == 0
 
 
@@ -512,7 +526,7 @@ def test_replaying_does_not_journal_it_onward():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")
 
-    engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none)
+    engine.apply_resident_delta(delta, _rebuilds_none)
 
     assert len(engine.take_resident_delta()) == 0
 
@@ -532,7 +546,7 @@ def test_each_replayed_move_is_logged(caplog):
     delta.add(MoveKind.RELOAD, "wire-a", node="node")
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+        assert engine.apply_resident_delta(delta, _rebuilds_none) is True
 
     lines = [r.getMessage() for r in caplog.records]
     assert any("Replayed rank 0's offload of request wire-a from node" in ln for ln in lines), lines
@@ -548,7 +562,7 @@ def test_a_no_op_replay_is_not_logged_as_a_move(caplog):
     delta.add(MoveKind.OFFLOAD, "wire-a", node="node")  # already off here
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is True
+        assert engine.apply_resident_delta(delta, _rebuilds_none) is True
 
     assert not [r for r in caplog.records if "Replayed" in r.getMessage()]
 
@@ -651,17 +665,10 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
-        self._tp_followers = {}
-        group = SimpleNamespace(_workers=["rank0", *followers])
-        # The runtime owns both the sharding config and the handle table now.
-        # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
+        self._tp_followers = {"node": list(followers)}
+        # The runtime owns the handle table. Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
         # broadcast that shipped local handles instead of wire ids is visible.
-        self._graph_runtime = SimpleNamespace(
-            get_sharding_config=lambda rid: SimpleNamespace(
-                get_sharding_group=lambda n, w: group
-            ),
-            get_rid_string=_Rids().get_rid_string,
-        )
+        self._graph_runtime = SimpleNamespace(get_rid_string=_Rids().get_rid_string)
         # Live requests moved off the worker-graph manager onto here; the
         # broadcast reads it to say what its page state should add up to.
         self.request_state = SimpleNamespace(per_request_info={"r0": object()})
@@ -738,7 +745,7 @@ def test_a_step_of_one_node_carries_rank_0s_moves_on_another():
     leader.offload_request("other", "a")
     leader.offload_request("node", "b")
 
-    assert follower.apply_resident_delta(leader.take_resident_delta(), _keeps_none, _rebuilds_none)
+    assert follower.apply_resident_delta(leader.take_resident_delta(), _rebuilds_none)
 
     assert other.offloaded == {"a"} and follower.resource.offloaded == {"b"}, "a move landed on another node"
 
@@ -768,8 +775,25 @@ def test_a_pass_with_no_step_of_the_instance_sends_rank_0s_moves_in_a_step_with_
 
     [(worker, msg)] = leader.sent
     assert (worker, msg.body.node_name, msg.body.request_ids) == ("rank1", "node", [])
-    assert follower.apply_resident_delta(msg.body.resident_delta, _keeps_none, _rebuilds_none)
+    assert follower.apply_resident_delta(msg.body.resident_delta, _rebuilds_none)
     assert follower.resource.offloaded == {"a"}, "the follower never got rank 0's offload"
+
+
+def test_rank_0_sends_its_moves_to_the_instance_it_leads_before_its_first_step():
+    """A request can fail before rank 0 sends any step of the instance, and teardowns wait while the journal holds
+    moves. Rank 0 knows its followers from the deployment, so the moves go out at once rather than with the next
+    request's first step."""
+    leader = _Leader()
+    leader.worker_id, leader._all_wg_nodes = "rank0", {0: {"encoder"}, 1: {"node"}}
+    instances = {0: [["rank0"]], 1: [["rank2", "rank3"], ["rank0", "rank1"]]}
+    leader._tp_followers = Worker._instance_followers(leader, instances)
+    leader.engine.offload_request("node", "a")
+
+    leader._flush_tp_moves()
+
+    assert [(worker, msg.body.request_ids) for worker, msg in leader.sent] == [("rank1", [])], (
+        "rank 0 held its moves until a step of the instance went out"
+    )
 
 
 # --- the wiring: a follower does not run rank 0's OOM recovery --------------
@@ -893,7 +917,7 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     delta.add(MoveKind.RELOAD, "wire-a", node="node")
 
     with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta(delta, _keeps_none, _rebuilds_none) is False
+        assert engine.apply_resident_delta(delta, _rebuilds_none) is False
 
     line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
     assert "reload of wire-a on node" in line
@@ -911,7 +935,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     """A refused replay leaves moves owed, so the rids the head names do not mean
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
-        apply_resident_delta=lambda delta, kept_count, rebuilding: False,  # refuses
+        apply_resident_delta=lambda delta, rebuilding: False,  # refuses
         residency=lambda node, rid: Residency.RESIDENT,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
@@ -1149,7 +1173,7 @@ class _FollowSpec:
     def __init__(self, *, replay_refuses: bool):
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
-            apply_resident_delta=lambda delta, kept_count, rebuilding: not replay_refuses,
+            apply_resident_delta=lambda delta, rebuilding: not replay_refuses,
             residency=lambda node, rid: Residency.RESIDENT,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
@@ -1314,39 +1338,59 @@ def _preempt(kv, rid: str, droppable: bool):
 _REBUILD = Rebuild([0])
 
 
-def _kept(rid, node):
-    return 5 * PAGE_SIZE + len(_REBUILD.sampled)
-
-
-def _both_short_then_drop(monkeypatch, kept=_kept):
+def _both_short_then_drop(monkeypatch):
     """r (arrival 1) grows past its allotment until its next token finds no room, on both ranks.
-    Rank 0 then chooses v (arrival 2) and drops it, keeping ``kept`` ids of it."""
+    Rank 0 then chooses v (arrival 2) and drops it, with the tokens its rebuild writes."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
     _ingest((leader, follower), "r", 3, arrival=1)
     _ingest((leader, follower), "v", 5, arrival=2)
     assert _admits(leader, "r")
     assert _admits(leader, "v")
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
         assert _counts(leader) == _counts(follower)
     assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
-    lead.drop_request(NODE, "v", kept("v", NODE))
+    lead.drop_request(NODE, "v", 5 * PAGE_SIZE + len(_REBUILD.sampled) - 1)
     return (leader, lead), (follower, follow)
 
 
 def test_a_follower_replays_the_drop_of_a_request_that_keeps_no_ids(monkeypatch):
     """A request dropped mid-prefill can keep no ids, since its rebuild runs its prompt's chunks again. Rank 0
-    journals the drop with the ids it keeps, none, and a follower that keeps none either replays it."""
-    nothing_kept = Rebuilds({}, {})
-    (leader, lead), (follower, follow) = _both_short_then_drop(
-        monkeypatch, kept=nothing_kept.kept_count,
-    )
+    journals the drop with the tokens those chunks wrote, and a follower that keeps no ids either replays it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
     scheduler.rebuilds = Rebuilds({}, {})
+    # the input the engine keeps for v's prompt mid-prefill
+    follow._chunking.prepared["v", NODE] = SimpleNamespace()
 
     assert scheduler._apply_resident_delta(NODE, lead.take_resident_delta())
     assert follower.residency("v") is Residency.DROPPED and _counts(leader) == _counts(follower)
+
+
+def test_a_follower_whose_kv_holds_other_than_rank_0s_drop_counted_refuses_the_drop(monkeypatch):
+    """A follower drops with the tokens rank 0's rebuild writes, which its own KV refuses unless it holds as many.
+    Dropped anyway, the follower would rebuild other KV than it held."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    follower._streams["v"]["main"].stored_len -= 1
+
+    with pytest.raises(RuntimeError, match="would write 80 tokens, but its label holds 79"):
+        follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert follower.residency("v") is Residency.RESIDENT, "the follower dropped what rank 0's rebuild doesn't write"
+
+
+def test_a_follower_that_keeps_no_ids_for_a_request_rank_0_dropped_stops(monkeypatch):
+    """Rank 0 drops v, which it rebuilds from its kept ids, and the follower's rebuild pool had no room for v's
+    prompt. Dropped anyway, the follower couldn't start v's rebuild, and tried again on every pass while rank 0
+    waited for it."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
+    scheduler.rebuilds = Rebuilds({}, {})
+    _send(scheduler, lead, 0)
+
+    with pytest.raises(SystemExit, match="keeps neither its ids nor the input of its prompt"):
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
+    assert follower.residency("v") is Residency.RESIDENT, "the follower dropped a request it can't rebuild"
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["voided head", "row dropped by prepare_inputs"])
@@ -1354,12 +1398,16 @@ def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkey
     """Rank 0 pre-plans the next decode step of r and s, whose tokens each need a fourth page, and throws the stage
     away: N's verdict voids the head, or `prepare_inputs` drops s from a yield-away step it planned. A follower never
     planned the step, so rank 0 has to give back both pages, or the two ranks admit later steps from different
-    counts. The pages go back to the end of rank 0's free list, which only the prefix cache reads."""
+    counts. The pages go back where they came from, or the next prompt takes other pages on each rank and the next
+    cache hit names pages the follower doesn't hold."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        # as under MSTAR_KV_DEBUG_ASSERTS with the prefix cache open
+        kv._arena.trail = (0, 0)
     _ingest((leader, follower), "r", 3, arrival=1)
     _ingest((leader, follower), "s", 3, arrival=2)
     assert _admits(leader, "r") and _admits(leader, "s")
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     for rid in ("r", "s"):
         assert _step(leader, rid, 3 * PAGE_SIZE).ok and _step(follower, rid, 3 * PAGE_SIZE).ok
     step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1), Segment("s", "main", 1)])
@@ -1378,7 +1426,8 @@ def test_a_pre_plan_rank_0_throws_away_gives_back_what_its_pre_admit_took(monkey
         f"rank 0 holds {held(leader)} pages for r and s after throwing its pre-plan away, and a follower that never "
         f"planned the step holds {held(follower)}"
     )
-    assert _counts(leader)[:-1] == _counts(follower)[:-1] and leader._arena.num_free == follower._arena.num_free
+    assert _counts(leader) == _counts(follower), "rank 0's free list is in another order than the follower's"
+    assert leader._arena.trail == follower._arena.trail, "a follower checking rank 0's page trail would stop"
 
 
 def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_0_stops(monkeypatch):
@@ -1399,14 +1448,36 @@ def test_under_debug_asserts_a_follower_that_admits_from_other_counts_than_rank_
 
     assert _admits(leader, "r")
     send(0)
-    assert scheduler.settle_tp_follow_delta(caught_up=True), "the follower stopped on counts that agree"
+    assert scheduler.settle_tp_follow_delta(None, caught_up=True), "the follower stopped on counts that agree"
     scheduler.pop_tp_follow_head()
     assert _admits(leader, "s")
     lead.take_resident_delta()
     send(1)
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
+
+
+def test_under_debug_asserts_a_commit_moves_nothing_a_page_trail_carries(monkeypatch):
+    """Rank 0 sends the next step's page trail before its step in flight commits, and a follower can check it after
+    its own has. Here the commit releases the pages a window no longer reads, so r holds fewer pages than it was
+    allotted. A trail that carried the allotted pages not yet used then stopped a follower whose counts agreed."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    leader, lead = _pool_rank(monkeypatch, 0)
+    window = RetentionPolicy(PAGE_SIZE)
+    layout = StreamLayout((PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, "prefill"),), (("decode", 1),), retention=window)
+    config = KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": PAGE_SIZE})
+    lead._runner.ingest_request("r", {"kv": config}, 1)
+    assert _admits(leader, "r")
+    step = KVStep(segments=(Segment("r", "main", 3 * PAGE_SIZE),), retention={("r", "main"): window})
+    assert leader.admit(step, _ctx("r")).ok
+    leader.plan(step, _ctx("r"))
+    trail = leader.page_trail()
+
+    leader.commit(step, _ctx("r"))
+
+    assert len(leader._streams["r"]["main"].pages()) < 3, "the window released nothing, so the test checks nothing"
+    assert leader.page_trail() == trail, "the counts a follower checks moved with rank 0's commit"
 
 
 def test_a_follower_replays_a_request_that_passed_the_head_into_rank_0s_counts(monkeypatch):
@@ -1415,7 +1486,7 @@ def test_a_follower_replays_a_request_that_passed_the_head_into_rank_0s_counts(m
     _ingest((leader, follower), "head", 8, arrival=2)
     _ingest((leader, follower), "p", 1, arrival=3)
     assert _admits(leader, "r") and not _admits(leader, "head") and _admits(leader, "p")
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert _counts(leader) == _counts(follower), "the follower allotted the request that passed another way"
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("p", PAGE_SIZE)):
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
@@ -1430,7 +1501,7 @@ def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch)
 
     delta = lead.take_resident_delta()
     assert delta.kinds == [MoveKind.EARMARK, MoveKind.DROP]
-    assert follow.apply_resident_delta(delta, _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(delta, _rebuilds_none)
 
     assert _counts(leader) == _counts(follower), "the follower's earmark or drop left other counts"
     assert _step(leader, "r", 1).ok and _step(follower, "r", 1).ok, "the page v's drop freed went elsewhere on one rank"
@@ -1439,14 +1510,14 @@ def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch)
 
 def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(monkeypatch):
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     for kv, engine in ((leader, lead), (follower, follow)):
         assert _step(kv, "r", 1).ok
         engine.remove_request("r")
 
     assert _returns(leader, "v")
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
-    # as `MicroScheduler.follow_rebuilds` starts the follower's rebuild at its first row
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    # as `MicroScheduler._start_follow_rebuilds` starts the follower's rebuild at its first row
     for engine in (lead, follow):
         engine.prepare_rebuild(NODE, "v", _REBUILD)
 
@@ -1464,12 +1535,12 @@ def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps
     step, ctx = KVStep(segments=(Segment("v", "main", 0),)), StepContext(("v",), "prefill", 0, False)
     assert follower.admit(step, ctx).ok
 
-    assert not follow.apply_resident_delta(delta, _kept, _rebuilds_none)
+    assert not follow.apply_resident_delta(delta, _rebuilds_none)
     assert delta.kinds == [MoveKind.DROP, MoveKind.RESERVE], "the drop or the return behind it moved early"
     assert "v" not in follower._dropped and "v" in follower._allotments
 
     follower.rollback_admit(step, ctx)
-    assert follow.apply_resident_delta(delta, _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(delta, _rebuilds_none)
     follow.remove_request("r")
     assert _counts(leader) == _counts(follower)
 
@@ -1485,7 +1556,7 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     _ingest((leader, follower), "v", 5, arrival=2)
     assert _admits(leader, "r")
     assert _admits(leader, "v")
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
     assert _preempt(leader, "r", droppable=False).to_host == ["v"]
@@ -1494,13 +1565,13 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert delta.kinds == [MoveKind.EARMARK, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "a choice or a move went unjournaled"
     if in_step:
         follower._streams["v"]["main"].step_in_flight = True
-        assert not follow.apply_resident_delta(delta, _kept, _rebuilds_none), (
+        assert not follow.apply_resident_delta(delta, _rebuilds_none), (
             "the follower moved a victim its step holds"
         )
         assert "v" in follower._allotments, "a refused move gave up the victim's allotment"
         follower._streams["v"]["main"].step_in_flight = False
 
-    assert follow.apply_resident_delta(delta, _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(delta, _rebuilds_none)
     assert follower.residency("v") is Residency.ON_HOST and _counts(leader) == _counts(follower), (
         "the follower's move left other counts"
     )
@@ -1510,29 +1581,140 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
         engine.remove_request("r")
     assert not follow.reload_request(NODE, "v"), "a follower would reload v ahead of rank 0's journal"
     assert _returns(leader, "v") and lead.reload_request(NODE, "v") and leader.residency("v") is Residency.RESIDENT
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert follower.residency("v") is Residency.RESIDENT, "the follower didn't replay rank 0's return"
     assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
 
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
-    """Rank 0 asks the host to set room aside at a request's first ask, and a follower asks for the request only
-    as it replays its reservation. Here x asks first and takes the host's room, and b, older, then reserves first.
-    A follower asking its own host for b would find x's room still free and keep b preemptible, where rank 0
-    guaranteed it."""
+    """Rank 0 sets host room aside for a request that can move only there as it admits the request, and guarantees
+    the request when the host has none left. A follower sets the room aside as it replays the reservation, and replays
+    the flip, which can come passes before the reservation. Here b takes the host's one page, and x, admitted next,
+    finds none."""
     (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
     for kv in (leader, follower):
-        kv._cpu_pool = host._HostPool(8)
+        kv._cpu_pool = host._HostPool(1)
     _ingest((leader, follower), "b", 1, arrival=1, rebuildable=False)
     _ingest((leader, follower), "x", 1, arrival=2, rebuildable=False)
-    assert leader.ask("x", NODE, "prefill") is not None
-    assert _admits(leader, "b")
-    assert "b" in leader._guaranteed and "x" in leader._cpu_pool.reserved, "the host had room for both"
+    assert _admits(leader, "b") and _admits(leader, "x")
+    assert "x" in leader._guaranteed and leader._cpu_pool.reserved == {"b": 1}, "the host had room for both"
 
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _kept, _rebuilds_none)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower set other host room aside"
     assert follower._guaranteed == leader._guaranteed, "a request rank 0 never preempts is preemptible here"
+    assert _counts(follower) == _counts(leader), "x's allotment here isn't the footprint rank 0 allotted it"
+
+
+def test_a_follower_holds_the_class_and_allotment_rank_0_gave_a_request_as_its_step_admitted(monkeypatch):
+    """r sets the host's two pages aside at admission and grows past them, so rank 0 guarantees r inside the admit
+    of r's next page. The follower's host holds the room rank 0's does when it admits that step, so it guarantees r
+    there too. A flip rank 0 journaled from the admit reached the follower only after the step."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(2)
+    _ingest((leader, follower), "r", 2, arrival=1, rebuildable=False)
+    assert _admits(leader, "r")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    for tokens in (2 * PAGE_SIZE, 1):
+        assert _step(leader, "r", tokens).ok and _step(follower, "r", tokens).ok
+
+    assert "r" in leader._guaranteed and "r" not in leader._cpu_pool.reserved
+    assert not lead.take_resident_delta(), "rank 0 journaled a move from inside the admit"
+    assert follower._guaranteed == leader._guaranteed, "r is preemptible here and never preempted on rank 0"
+    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower keeps host room r no longer needs"
+    assert _counts(follower) == _counts(leader), "r grows into pages here that rank 0 never allotted it"
+
+
+def test_a_follower_refuses_the_page_rank_0_refuses_when_the_host_cant_cover_it(monkeypatch):
+    """r sets the host's two pages aside at admission, and its next page finds the host full, where guaranteeing r
+    would take a page more than the room has. Rank 0 refuses the step. A follower that left the host to rank 0 took
+    the page and ran the step alone."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(2)
+    _ingest((leader, follower), "r", 2, arrival=1, rebuildable=False)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 5 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "r", 1).ok, "the guarantee fit the room, so the test checks nothing"
+
+    assert not _step(follower, "r", 1).ok, "the follower ran a step rank 0 refused"
+
+
+def test_a_pre_plan_rank_0_throws_away_sets_no_host_room_aside(monkeypatch):
+    """r's next page needs host room past what r has set aside. Rank 0 can't give the room back for a stage it throws
+    away, and a follower may never plan the step, so the pre-admit refuses the step and exec admits it on every
+    rank."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    leader._cpu_pool = host._HostPool(8)
+    _ingest((leader,), "r", 2, arrival=1, rebuildable=False)
+    assert _admits(leader, "r") and _step(leader, "r", 2 * PAGE_SIZE).ok
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1)])
+    step.set_ctx(StepContext(["r"], "decode", 0, False, is_preplan=True))
+
+    lead._runner.pre_admit(step)
+    lead._runner.clear_preplan()
+
+    assert leader._cpu_pool.reserved == {"r": 2}, "rank 0 set host room aside for a stage it threw away"
+
+
+def test_a_flip_to_guaranteed_is_counted_and_logged_on_rank_0_alone(monkeypatch, caplog):
+    """A follower replays the flip, and counting it there too logged the same line once per rank."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(1)
+    _ingest((leader, follower), "b", 1, arrival=1, rebuildable=False)
+    _ingest((leader, follower), "x", 1, arrival=2, rebuildable=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert _admits(leader, "b") and _admits(leader, "x")
+        assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert "x" in follower._guaranteed and (leader._cpu_pool.guaranteed, follower._cpu_pool.guaranteed) == (1, 0)
+    assert caplog.text.count("no room to set aside for x's move") == 1, "every rank logged rank 0's flip"
+
+
+def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch):
+    """r's grant needs three pages past its allotment where the room has two, so rank 0 allots r those two and
+    drops v for the third. The follower replayed the earmark and the drop, and r's allotment there was two pages
+    short of rank 0's."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "r", 3 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "r", 3 * PAGE_SIZE).ok
+    victims = leader.preempt("r", outcome.reason.pages_short, _ENGINES[id(leader)]._runner.newer_than("r"), bool)
+    assert victims.to_drop == ["v"]
+    lead.drop_request(NODE, "v", 5 * PAGE_SIZE)
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "r's allotment here lacks the room rank 0 counted for its grant"
+
+
+def test_a_short_grant_with_no_room_to_claim_leaves_the_allotment_alike_on_every_rank(monkeypatch):
+    """r ran short with no room left, so rank 0 claims nothing for r as it chooses v. Allotting r nothing still raised
+    r's allotment to the pages r held past it, on rank 0 alone, since a claim of nothing goes unjournaled."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
+    assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "r's allotment here isn't the one rank 0 holds"
 
 
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
@@ -1555,13 +1737,164 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
     scheduler.register_tp_follow(head)
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)
+
+
+def _make_room(kv, droppable: bool = False):
+    """Rank 0's choice of victims for the oldest waiting request its runner refused, droppable only if
+    ``droppable``."""
+    runner = _ENGINES[id(kv)]._runner
+    refusal = runner.oldest_refusal()
+    return kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
+
+
+@pytest.mark.parametrize("rebuildable", [True, False])
+def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_as_the_move_lands(monkeypatch, rebuildable):
+    """o, older, first asks once v holds the rest of the pool, and v, with nothing newer to move, waits holding its
+    pages. Rank 0 moves v to the host for o, and o takes the room as v's move lands. Only rank 0 knows o waits, so a
+    follower that replayed v's earmark as a short grant's had no allotment of o's to grow. An o no drop can free then
+    finds the host full, and turns guaranteed on every rank."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(8)
+    _ingest((leader, follower), "f", 3, arrival=1)
+    _ingest((leader, follower), "v", 4, arrival=3)
+    assert _admits(leader, "f") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("f", 3 * PAGE_SIZE), ("v", 4 * PAGE_SIZE), ("v", 3 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
+    assert _preempt(leader, "v", droppable=False).waits
+    lead.readmit_request(NODE, "v")
+    _ingest((leader, follower), "o", 2, arrival=2, rebuildable=rebuildable)
+    assert not _admits(leader, "o")
+
+    assert _make_room(leader).to_host == ["v"]
+    lead.offload_request(NODE, "v")
+    assert "o" in leader._allotments, "v's move didn't make room for o"
+    assert ("o" in leader._guaranteed) is not rebuildable, "the host had room for o's prompt"
+    delta = lead.take_resident_delta()
+    assert delta.kinds == [MoveKind.RESERVE, MoveKind.OFFLOAD, MoveKind.OFFLOAD], (
+        "rank 0 journaled o's admit from inside v's move, which a follower replays before v's pages come free"
+    )
+    assert follow.apply_resident_delta(delta, _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 admitted it with"
+    assert follower._guaranteed == leader._guaranteed, "o is preemptible here and never preempted on rank 0"
+    assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower set other host room aside"
+
+
+def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_moves_cover_it(monkeypatch):
+    """o runs short while v has a step in flight, so o waits for its page holding its allotment, and then v runs short
+    with nothing newer to move. Rank 0 moves v to the host for o, and o takes its page once v's move covers it. A
+    follower that took v's earmark as a short grant's grew o page by page as v's pages came free, and again from rank
+    0's reservation."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(64)
+    _ingest((leader, follower), "o", 3, arrival=1)
+    _ingest((leader, follower), "v", 3, arrival=2)
+    assert _admits(leader, "o") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("o", 3 * PAGE_SIZE), ("v", 3 * PAGE_SIZE), ("v", 3 * PAGE_SIZE), ("o", 1)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "o", PAGE_SIZE).ok and not _step(follower, "o", PAGE_SIZE).ok
+    leader._streams["v"]["main"].step_in_flight = True
+    assert _preempt(leader, "o", droppable=False).waits
+    leader._streams["v"]["main"].step_in_flight = False
+    lead.readmit_request(NODE, "o")
+    assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
+    assert _preempt(leader, "v", droppable=False).waits
+    lead.readmit_request(NODE, "v")
+    assert not _admits(leader, "o")
+
+    assert _make_room(leader).to_host == ["v"]
+    lead.offload_request(NODE, "v")
+    assert "o" not in leader._asks, "v's move didn't cover o's page"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 grew it to"
+
+
+def _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable: bool):
+    """v1 and v2 hold the 4 pages f leaves. v1 runs short while v2 has a step in flight, and then v2 runs short, so
+    both wait holding their pages. o, older, then asks for its 2 pages. The host has room only for v1, which can move
+    only there, so rank 0 moves v1 to the host and drops v2 for o, and v1's 3 pages alone cover o."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(4)
+    _ingest((leader, follower), "f", 6, arrival=0)
+    _ingest((leader, follower), "v1", 3, arrival=2, rebuildable=False)
+    _ingest((leader, follower), "v2", 1, arrival=3)
+    assert _admits(leader, "f") and _admits(leader, "v1") and _admits(leader, "v2")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, pages in (("f", 6), ("v1", 3), ("v2", 1)):
+        assert _step(leader, rid, pages * PAGE_SIZE).ok and _step(follower, rid, pages * PAGE_SIZE).ok
+    assert not _step(leader, "v1", 1).ok and not _step(follower, "v1", 1).ok
+    leader._streams["v2"]["main"].step_in_flight = True
+    assert _preempt(leader, "v1", droppable=False).waits
+    leader._streams["v2"]["main"].step_in_flight = False
+    lead.readmit_request(NODE, "v1")
+    assert not _step(leader, "v2", 1).ok and not _step(follower, "v2", 1).ok
+    assert _preempt(leader, "v2", droppable=False).waits
+    lead.readmit_request(NODE, "v2")
+    _ingest((leader, follower), "o", 2, arrival=1, rebuildable=rebuildable)
+    assert not _admits(leader, "o")
+    victims = _make_room(leader, droppable=True)
+    assert victims.to_host == ["v1"] and victims.to_drop == ["v2"]
+    return (leader, lead), (follower, follow)
+
+
+def test_a_waiting_request_admitted_before_its_last_victim_lands_takes_no_more_room_on_any_rank(monkeypatch):
+    """A host move lands before a drop, so v1's move admits o before v2 is dropped. v2's drop then grew o's allotment
+    past its 2 pages, on every rank."""
+    (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=True)
+    lead.offload_request(NODE, "v1")
+    assert "o" in leader._allotments, "v1's move didn't admit o"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 admitted it with"
+
+    lead.drop_request(NODE, "v2", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert leader._allotments["o"].pages == 2, "v2's drop grew the allotment of a request v1's move admitted"
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 left it with"
+
+
+def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_its_footprint_on_every_rank(
+    monkeypatch,
+):
+    """v1's move covers o's prompt, but the host v1 filled has no room for it, so o, which no drop can free, turns
+    guaranteed and asks for its 6-page footprint on every rank. v2's drop then covered the prompt again, and every
+    rank admitted o, guaranteed, with 2 pages."""
+    (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=False)
+    lead.offload_request(NODE, "v1")
+    assert "o" in leader._guaranteed and "o" not in leader._allotments
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert follower._guaranteed == leader._guaranteed, "o is preemptible here and guaranteed on rank 0"
+    assert _counts(follower) == _counts(leader), "o's earmark here waits for other than its footprint"
+
+    lead.drop_request(NODE, "v2", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    for kv in (leader, follower):
+        assert "o" not in kv._allotments, "o was admitted guaranteed with less than its footprint"
+    assert _counts(follower) == _counts(leader), "the follower holds other room for o than rank 0"
+
+
+def test_an_unreserve_cancels_no_reservation_that_moves_victims():
+    """A reservation `make_room` journals names the victims it moves, and the followers have to move them even when
+    the request's next pool refuses it in the same pass."""
+    delta = OffloadDelta.new()
+    delta.add(MoveKind.RESERVE, "o", "kv", 2, ["v"])
+
+    assert not delta.cancel("o", MoveKind.RESERVE, "kv"), "the followers would never move v"
 
 
 def _follower_of(follow) -> MicroScheduler:
     """A follower's scheduler over ``follow``, whose log keeps v's ids and runs no rebuild."""
     scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
-    scheduler.rebuilds = SimpleNamespace(kept_count=_kept, rebuilding=_rebuilds_none)
+    scheduler.rebuilds = _KeepsIds()
     return scheduler
 
 
@@ -1572,7 +1905,7 @@ def _send(scheduler, lead, seq: int) -> None:
 
 
 def _follow_next(scheduler) -> None:
-    assert scheduler.settle_tp_follow_delta(caught_up=True)
+    assert scheduler.settle_tp_follow_delta(None, caught_up=True)
     scheduler.pop_tp_follow_head()
 
 
@@ -1609,4 +1942,4 @@ def test_a_follower_whose_rebuild_still_runs_when_rank_0_lands_it_stops(monkeypa
     _send(scheduler, lead, 1)
 
     with pytest.raises(SystemExit, match="rank 0 landed v's rebuild on LLM, and this rank's is still running"):
-        scheduler.settle_tp_follow_delta(caught_up=True)
+        scheduler.settle_tp_follow_delta(None, caught_up=True)

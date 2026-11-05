@@ -64,7 +64,7 @@ class _FakeEngineManager:
             residency=lambda node, rid: Residency.RESIDENT,
         )
 
-    def _apply(self, delta, kept_count, rebuilding):
+    def _apply(self, delta, rebuilding):
         while (move := delta.pop_left()) is not None:
             self.applied.append((move.rid, move.kind))
         return True
@@ -537,7 +537,7 @@ def test_a_head_a_follower_drops_unbuilt_counts_as_consumed_only_once_its_moves_
     assert s.build_results, "the head was built"
     head = s.scheduler.peek_tp_follow()
     assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
-    assert s.scheduler.settle_tp_follow_delta(caught_up=True)
+    assert s.scheduler.settle_tp_follow_delta(s.request_state, caught_up=True)
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the dropped head's moves were lost"
 
 

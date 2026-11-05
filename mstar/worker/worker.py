@@ -227,8 +227,6 @@ def _make_rebuilds(
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
-    # A lockstep node's KV refuses every drop, so its requests keep no ids.
-    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
     host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
         host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
@@ -737,10 +735,10 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and each
-        # node's followers it last sent one to, for a step with no rows.
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and the
+        # followers it sends them to.
         self._tp_broadcast_seq = 0
-        self._tp_followers: dict[str, list[str]] = {}
+        self._tp_followers = self._instance_followers(all_worker_graph_ids_to_instances)
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -1026,6 +1024,17 @@ class Worker:
                 keys.append(key)
         if keys:
             engine.never_publish(keys)
+
+    def _instance_followers(self, wg_instances: dict[int, list[list[str]]] | None) -> dict[str, list[str]]:
+        """The other ranks of the instance of each lockstep node this rank leads, which rank 0 sends its steps to.
+        Known when the worker starts, so rank 0's moves can go out in a step with no rows before it sends any step."""
+        followers = {}
+        for wg_id, instances in (wg_instances or {}).items():
+            for node in self._all_wg_nodes.get(wg_id, set()) & self._lockstep_led:
+                for instance in instances:
+                    if self.worker_id in instance:
+                        followers[node] = [worker for worker in instance if worker != self.worker_id]
+        return followers
 
     def _skip_unshared_publish(
         self, request_id: int, wg_to_workers: dict[int, list[str]],
@@ -2074,16 +2083,8 @@ class Worker:
         read_check = self._step_reads(node_batch)
         if read_check:
             node_batch.read_check_rids = tuple(node_batch.request_ids)
-        # this worker is only a part of one TP group for this node,
-        # so, we can just look at the sharding_config for the first
-        # request to get the relevant workers
         ctx = node_batch.step_context
-        if node_batch.request_ids:
-            sample_rid = node_batch.request_ids[0]
-            self._tp_followers[node_batch.node_name] = self._graph_runtime.get_sharding_config(
-                sample_rid
-            ).get_sharding_group(node_batch.node_name, ctx.walk_of(sample_rid))._workers[1:]
-        workers = self._tp_followers.get(node_batch.node_name, [])
+        workers = self._tp_followers[node_batch.node_name]
         request_ids = node_batch.request_ids
         walks, walk_idx = [], []
         if ctx.request_walks:
@@ -2146,15 +2147,13 @@ class Worker:
     def _flush_tp_moves(self, pending: PendingBatch | None = None) -> None:
         """Send the instance's followers a step with no rows while the journal holds moves, unless ``pending``
         is a step of the instance's own. That step still waits for its speculation decision, which a step with no
-        rows sent first would read as none. A step of any of the instance's nodes carries every move, so the
-        flush goes to one this rank has sent a step to."""
+        rows sent first would read as none. A step of any of the instance's nodes carries every move."""
         if pending is not None and pending.node_name in self._lockstep_led:
             return
-        node_name = next((node for node in self._lockstep_led if node in self._tp_followers), None)
-        if node_name is not None and self._owes_tp_moves():
+        if self._owes_tp_moves():
             self.maybe_send_zmq_to_tp_followers(make_executing_batch(
-                self.streams, node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
-                per_request_info={},
+                self.streams, node_name=min(self._lockstep_led), graph_walk="", request_ids=[],
+                per_request_input_tensors={}, per_request_info={},
             ))
 
     def _broadcast_tp_nospec(self, pending: PendingBatch) -> None:
@@ -3509,6 +3508,7 @@ class Worker:
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
         if not self.scheduler.settle_tp_follow_delta(
+            self.request_state,
             # Of the steps before the head, only N may still index a page of the head's hit
             caught_up=pending.node_batch.commit_done.is_set(),
         ):
@@ -3526,7 +3526,7 @@ class Worker:
         # rebuild rows, which the graph runtime holds no node of, so they are never popped. A rebuild whose chunk ran
         # in N is one of N's rows mid-prefill, which rank 0 stamps a rebuild row from its log too.
         rebuild = self.scheduler.follow_rebuilds(
-            self.request_state, head.node_name, [r for r in head_rids if r not in in_batch or r in held],
+            head.node_name, [r for r in head_rids if r not in in_batch or r in held],
         )
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N

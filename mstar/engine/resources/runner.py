@@ -639,7 +639,9 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                logger.warning(
+                # exec admits the step again and reports a failure that holds there. A lockstep KV pool refuses
+                # any pre-admit that would evict.
+                logger.debug(
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )

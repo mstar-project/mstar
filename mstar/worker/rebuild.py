@@ -72,10 +72,6 @@ class KeptIds:
     used: int = 0
     laid_out: int = 0
 
-    def __len__(self) -> int:
-        """The slots the log writes again: those of the steps it recorded, and the ids sampled since."""
-        return sum(row.length for row in self.rows[:len(self.records)]) + len(self.sampled)
-
 
 class QueuedCopy(NamedTuple):
     """A device tensor's bytes still to be copied into ``into`` once ``after`` completes, for ``record``."""
@@ -230,12 +226,6 @@ class Rebuilds:
 
     def kept(self, rid: int, node: str) -> KeptIds | None:
         return self._kept.get(node, {}).get(rid)
-
-    def kept_count(self, rid: int, node: str) -> int:
-        """How many slots ``rid``'s log on ``node`` writes again, which rank 0 journals with a drop for each follower
-        to check. A request dropped mid-prefill can keep none."""
-        kept = self.kept(rid, node)
-        return 0 if kept is None else len(kept)
 
     def can_rebuild(self, node: str, layouts: Iterable[StreamLayout]) -> bool:
         """Whether a rebuild on ``node`` can write a request's laid-out labels again: the node declares a policy,

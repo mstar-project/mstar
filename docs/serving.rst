@@ -351,8 +351,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        request dropped from the KV cache is rebuilt from. A request takes its room when it
        arrives, 8 B a token (int64), and gives back what its ids don't use once its prompt is kept. One
        the pool can't hold then is never dropped on that node, though it can still move to the
-       host with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
-       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids. The pool is this plus
+       host with ``cpu_offload_pages``. Every rank of a tensor or sequence parallel node keeps the ids,
+       since each rank rebuilds the requests its first rank drops. A non-negative int, and 0 keeps no ids. The pool is this plus
        ``rebuild_media_host_mb`` where that applies, rounded up to a power of two, as the pinned allocator
        would round it anyway.
    * - ``rebuild_media_host_mb``

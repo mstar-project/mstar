@@ -45,6 +45,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
@@ -1263,7 +1264,7 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
     engine._tp_follower_nodes = {"n"}
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "1", node="n")
-    assert engine.apply_resident_delta(delta, kept_count=lambda rid, node: 0, rebuilding=lambda rid, node: False)
+    assert engine.apply_resident_delta(delta, Rebuilds({}, {}))
     assert planner.slot_of(1) is None
 
 

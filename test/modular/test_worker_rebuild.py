@@ -257,16 +257,15 @@ def test_a_request_whose_kept_ids_dont_rebuild_what_its_kv_holds_is_never_droppe
     )
 
 
-def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
+def test_a_lockstep_node_keeps_ids_and_sets_the_pool_aside():
+    """Rank 0 journals a lockstep node's drops, and every rank rebuilds the request from the ids it keeps."""
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
     engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
     rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine)
 
-    assert rebuilds.pool is None and NODE not in rebuilds.nodes, (
-        "every rank would copy each prompt to pinned memory for a drop its KV refuses"
-    )
+    assert rebuilds.pool is not None and NODE in rebuilds.nodes, "a follower would have no ids to replay a drop from"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():

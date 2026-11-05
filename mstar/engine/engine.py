@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Protocol, Sequence
 
 import torch
 
@@ -116,6 +116,13 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
+
+class RankRebuilds(Protocol):
+    """What a follower's resident delta asks of this rank's rebuilds (`mstar.worker.rebuild.Rebuilds`)."""
+
+    def kept(self, rid: int, node: str) -> object | None: ...
+
+    def rebuilding(self, rid: int, node: str) -> bool: ...
 
 
 @contextmanager
@@ -3213,6 +3220,10 @@ class Engine:
             default=Residency.RESIDENT,
         )
 
+    def in_step(self, node_name: str, request_id: int) -> bool:
+        """Whether a step or a read in flight holds the request's pages in a paged KV cache of the node."""
+        return any(kv.cache.in_step(request_id) for kv in self.paged_kv_caches() if node_name in kv.nodes)
+
     def newer_than(self, request_id: int) -> list[str] | None:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
@@ -3389,14 +3400,11 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(
-        self, delta: OffloadDelta, kept_count: Callable[[int, str], int], rebuilding: Callable[[int, str], bool],
-    ) -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``kept_count(rid, node)`` is how many ids this rank keeps of a request on a node, and ``rebuilding(rid,
-        node)`` whether this rank's rebuild of it is still running.
+        ``rebuilds`` holds this rank's kept ids and the rebuilds it is running.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3418,23 +3426,22 @@ class Engine:
                 if kind == MoveKind.EARMARK:
                     logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
                                 move.pool, move.count, move.victims)
-            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and any(
-                kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes
-            ):
+            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and self.in_step(node_name, rid):
                 logger.debug("Replay: %s's %s on %s waits for its step; %d moves still owed",
                              wire_rid, kind.name, node_name, len(delta))
                 return False
             elif kind == MoveKind.DROP:
-                kept = kept_count(rid, node_name)
-                if kept != move.count:
+                if rebuilds.kept(rid, node_name) is None and (rid, node_name) not in self._chunking.prepared:
                     raise RuntimeError(
-                        f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps {kept}"
+                        f"rank 0 dropped {wire_rid} on {node_name}, and this rank keeps neither its ids nor the input "
+                        "of its prompt mid-prefill to rebuild it from"
                     )
+                # with the tokens rank 0's rebuild writes, which this rank's KV refuses unless it holds as many
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
             elif kind == MoveKind.LAND:
-                if rebuilding(rid, node_name):
+                if rebuilds.rebuilding(rid, node_name):
                     raise RuntimeError(
                         f"rank 0 landed {wire_rid}'s rebuild on {node_name}, and this rank's is still running"
                     )

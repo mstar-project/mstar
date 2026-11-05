@@ -181,7 +181,8 @@ class Move(NamedTuple):
     rid: str
     kind: MoveKind
     # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
-    # `count` is the number of pages of a RESERVE or an EARMARK, and of kept ids for a DROP.
+    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE asks for, and the
+    # tokens a DROP's rebuild writes.
     pool: str = ""
     count: int = 0
     victims: tuple[str, ...] = ()
@@ -229,8 +230,9 @@ class OffloadDelta:
         self.nodes.append(node)
 
     def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
-        """Drop the last move if it is ``kind`` on ``rid`` in ``pool``, and return whether a move was dropped."""
-        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)):
+        """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move
+        was dropped."""
+        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)) or self.victims[-1]:
             return False
         for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
             column.pop()
