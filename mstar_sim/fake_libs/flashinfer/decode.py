@@ -88,7 +88,8 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
         if self._use_tensor_cores and self._backend == "auto":  # plans with the prefill module: fa2 unless fp8
             dtypes = canonical_dtype(q_data_type), canonical_dtype(kv_data_type or q_data_type)
             fp8 = {torch.float8_e4m3fn, torch.float8_e5m2} & set(dtypes)
-            self._backend = determine_attention_backend(self.device, 0, False, False, *dtypes) if fp8 else "fa2"
+            self._backend = determine_attention_backend(
+                self.device, 0, False, False, *dtypes, head_dim_qk=head_dim, head_dim_vo=head_dim) if fp8 else "fa2"
         if q_len_per_req > 1 and self._use_tensor_cores and self._backend == "fa3":
             raise gpu_error(NotImplementedError(
                 "q_len_per_req > 1 is currently only supported on the fa2 tensor-core backend."))

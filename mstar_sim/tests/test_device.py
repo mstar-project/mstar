@@ -385,11 +385,12 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             except RuntimeError as e:
                 assert overflows and "allocating memory for batch_prefill_tmp_v" in str(e), e
         # tensor-core decode's auto is fa2, or the rule's answer when fp8 is in play
-        for dtype, expected in ((torch.bfloat16, "fa2"), (torch.float8_e4m3fn, "fa3")):
+        for dtype, head_dim, expected in ((torch.bfloat16, 128, "fa2"), (torch.float8_e4m3fn, 80, "fa2"),
+                                          (torch.float8_e4m3fn, 128, "fa3")):
             decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 torch.empty(1 << 26, dtype=torch.uint8, device="cuda"), "NHD", use_tensor_cores=True)
-            decode.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
-                        q_data_type=dtype, kv_data_type=dtype)
+            decode.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, head_dim,
+                        16, q_data_type=dtype, kv_data_type=dtype)
             assert decode._backend == expected, decode._backend
         # fa3's work arrays are int, one set per head under a graph: many heads overrun the int workspace
         fa3 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
