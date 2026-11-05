@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer
+from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     ParallelAttention,
@@ -31,10 +31,11 @@ from mstar.model.components.norm import RMSNorm
 
 class Qwen3Attention(ParallelAttention):
     """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
-    the step's KV write in one Triton kernel (``qk_norm_rope_kv_write``). At
-    decode width a step is a few small kernels per layer, and the separate
-    norm, RoPE and KV-write kernels were a sizeable share of it. Falls back to
-    the unfused path off CUDA or without planned positions."""
+    the step's KV write in one Triton kernel, through
+    ``AttentionCallable.norm_rope_attend``. At decode width a step is a few
+    small kernels per layer, and the separate norm, RoPE and KV-write kernels
+    were a sizeable share of it. Falls back to the unfused path off CUDA or
+    without planned positions."""
 
     _fuse_qk = False
 
@@ -42,7 +43,7 @@ class Qwen3Attention(ParallelAttention):
         super().bind_resources(resources)
         # the kernel is plain non-interleaved RoPE over the whole head dim;
         # anything else the position resource would apply stays unfused
-        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
+        self._rope_theta = None if self.pos is None else self.pos.fusable_rope_theta(self.head_dim)
         self._fuse_qk = (
             self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
         )
@@ -53,28 +54,9 @@ class Qwen3Attention(ParallelAttention):
             return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
-        attn_output = self._norm_rope_attend(q, k, v, pos_ids)
+        attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
-
-    @torch.compiler.disable
-    def _norm_rope_attend(self, q, k, v, pos_ids) -> torch.Tensor:
-        """q/k norm and RoPE, the step's KV write and attention. For a backend
-        that reads K/V from the paged cache, the write rides in the norm/RoPE
-        kernel (``qk_norm_rope_kv_write``) rather than a launch of its own."""
-        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
-
-        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), self._rope_theta)
-        attend = self.attend
-        if not attend.attn.requires_kv_write:
-            qk_norm_rope_inplace(q, k, self.q_norm.weight, self.k_norm.weight, pos_ids, *eps)
-            return attend(q, k, v)
-        layer, page_idx, slot_idx, n = attend.kv.write_target()
-        qk_norm_rope_kv_write(
-            q, k, v, self.q_norm.weight, self.k_norm.weight, pos_ids,
-            layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
-        )
-        return attend.attn.run(q, kv_cache_layer=attend.kv.layer_view())
 
 
 @dataclass
@@ -184,24 +166,8 @@ class Qwen3DenseLM(nn.Module):
         the label once, advance the index per layer. Passing them as
         arguments instead would make inductor specialize on the int.
         """
-        hidden_states = input_embeds
         self.layers[0].self_attn.attend.bind_step(label)
-        # Each residual add is deferred into the next norm: one fused add+norm
-        # kernel (in place) per norm instead of an add and a norm, 56 fewer
-        # launches a decode step on a 28-layer model.
-        residual = None
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            if residual is None:
-                residual = hidden_states
-                h = layer.input_layernorm(hidden_states)
-            else:
-                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
-            h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
-            hidden_states = layer.mlp(h)
-        normed, _ = self.norm.forward_residual(hidden_states, residual)
-        return normed
+        return run_layers(self.layers, input_embeds, self.norm)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

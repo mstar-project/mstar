@@ -31,16 +31,16 @@ from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig, LoraSp
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key  # noqa: E402
 from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
 from mstar.engine.resources.spec import instance_key  # noqa: E402
-from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
 from mstar.model.components.lora.modules import _check  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
 from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
-from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
+from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY, Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, VisionEncoderSubmodule  # noqa: E402
-from mstar.model.submodule_base import declared_step  # noqa: E402
+from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # the vision node's pool, as the engine keys it (`LoraSpec.for_node`)
@@ -52,8 +52,7 @@ _SETUP = threading.Lock()
 
 
 def _bound(module) -> bool:
-    return (getattr(module, "lora_delta", None) is not None or getattr(module, "lora_deferred", None) is not None
-            or bool(getattr(module, "lora_params", None)))
+    return getattr(module, "lora_delta", None) is not None or bool(getattr(module, "lora_params", None))
 
 
 def _declared(spec) -> list[str]:
@@ -92,7 +91,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
             sub.bind_node_resources({spec.resource_key: lora_pool})
             assert sum(map(_bound, sub.modules())) == _bound_modules(spec)
             H.admit_declared(lora_pool, stack.declare(sub, rids, rows), ROWS)
-        with torch.no_grad(), H.compute(lora_pool):
+        with torch.no_grad():
             return stack.run(sub, rows)
 
     results = H.run_ranks(world, rank_run)
@@ -386,21 +385,24 @@ class _FrameAttend:
 
 
 def _vision_node(model, resources=None) -> VisionEncoderSubmodule:
-    sub = VisionEncoderSubmodule(model, vision_config())
+    # byte patches to [-1, 1], as the processors' mean and std of 0.5 do
+    half = torch.full((PATCH_NUMEL,), 127.5)
+    sub = VisionEncoderSubmodule(model, vision_config(), (half, half))
     sub._frames = _FrameAttend()
     sub.bind_node_resources({VISION_ATTN: sub._frames, **(resources or {})})
     return sub
 
 
-def _prompt(sub):
-    pixels = torch.randn(PATCHES, PATCH_NUMEL, generator=torch.Generator().manual_seed(5), dtype=H.DTYPE)
-    return sub.prepare_inputs("encode", None, {
-        "image_grid_thw": [torch.tensor([grid]) for grid in GRIDS], "pixel_values": [pixels],
-    })
+def _prompt(sub, grids=GRIDS):
+    patches = sum(t * h * w for t, h, w in grids)
+    pixels = torch.randint(0, 256, (patches, PATCH_NUMEL), generator=torch.Generator().manual_seed(5),
+                           dtype=torch.uint8)
+    fwd_info = SimpleNamespace(step_metadata={STEP_GRIDS_KEY: grids})
+    return sub.prepare_inputs("encode", fwd_info, {"pixel_values": [pixels]})
 
 
 def _engine(rid):
-    return SimpleNamespace(request_ids=[rid], piecewise_runners={}, step=None)
+    return SimpleNamespace(request_ids=[rid], piecewise_runners={}, piecewise_leases={})
 
 
 def _encode(sub, rid="r"):
@@ -421,63 +423,38 @@ def _vision_pool(paths, max_slots=2):
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
     lora_pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter=adapter))
-    # idle as the engine sets it: an eager step of a base row (a region never is)
-    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease,
-                      idle=adapter is None and lease is None)
+    # idle as the engine sets it: a leased step as its bucket was captured, an eager one
+    # when its row names no adapter
+    idle = lease.bucket.idle if lease is not None else adapter is None
+    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease, idle=idle)
     lora = step.steps[VISION_POOL]
     assert lora_pool.admit(lora, ctx).ok
     lora_pool.plan(lora, ctx)
     return lora, ctx
 
 
-def _region_step(region_cfg, resources, request_ids, seq_lens):
-    """The block loop's step as its runner, built over the node's resources, declares it:
-    the region's own, plus the rows it adds for a ``segment_rows`` region, a request's
-    merged into one."""
-    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
-    from mstar.engine.resources.runner import StepRunner
-
-    runner = PiecewiseAcceleratorGraphRunner(
-        label=VISION_BLOCK_LOOP, config=region_cfg, resources=resources, step_runner=StepRunner(resources),
-        device=torch.device("cpu"), autocast_dtype=H.DTYPE, num_slots=1,
-    )
-    return runner._declared_step(request_ids, seq_lens)
-
-
 def _encode_leased(sub, lora_pool):
-    """As the leased path runs it: the outer step plans the adapter rows only (attention
-    is the region's), the block loop's region plans its own into its bucket's buffer as
-    its capture recorded it, and the merger after the region reads the outer plan again."""
+    """As the leased path runs it, for a step whose rows run no adapter (``can_lease``
+    leases a one-row region to no other): the outer step plans only the LoRA rows of the
+    patch embed and merger (attention is the region's), and the block loop's region plans
+    its own, both idle."""
     region_cfg = sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), H.DTYPE)[VISION_BLOCK_LOOP]
-    assert region_cfg.segment_rows
-    resources = {VISION_POOL: lora_pool}
     bucket = 32
-    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP))
-    # the capture, at startup: the region over the bucket's whole shape, on the zero adapter
-    lora_pool.ingest_capture_row("cap")
-    cap = _region_step(region_cfg, resources, ["cap"], [bucket]).steps[VISION_POOL]
-    cap_ctx = StepContext(request_ids=["cap"], graph_walk=PIECEWISE_WALK, slot=0, capture=True, slot_lease=lease)
-    assert lora_pool.admit(cap, cap_ctx).ok
-    lora_pool.plan(cap, cap_ctx)
-    recorded = lora_pool._current  # the views the captured graph reads
-
+    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP, idle=True))
     inp = _prompt(sub)
-    outer = declared_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
+    outer = engine_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
     assert set(outer.steps) == {VISION_POOL}
-    _admit(lora_pool, outer, "r", "v")
+    _admit(lora_pool, outer, "r", None)
     kwargs = sub.preprocess("encode", _engine("r"), [inp])
     with torch.no_grad():
         hidden, cos, sin = sub.model.embed(
             kwargs["pixel_values"], kwargs["indices"], kwargs["weights"], kwargs["position_ids"],
         )
         seq_lens = list(kwargs["seq_lengths"])
-        region = _region_step(region_cfg, resources, ["r"], seq_lens)
-        assert len(seq_lens) > 1 and region.steps[VISION_POOL].segments == (Segment("r", "main", PATCHES),)
-        # control: a region that does not declare segment_rows gets no adapter rows
-        unrowed = dataclasses.replace(region_cfg, segment_rows=False)
-        assert VISION_POOL not in _region_step(unrowed, resources, ["r"], seq_lens).steps
-        lora, ctx = _admit(lora_pool, region, "r", "v", walk=PIECEWISE_WALK, lease=lease)
-        lora_pool._current = recorded  # the replay reads its capture's views of the planned buffer
+        # the runner's step for the region (`with_segment_steps` over `region_step`)
+        region = with_segment_steps(region_cfg.region_step(["r"], seq_lens), sub.segment_keys)
+        assert sum(seg.span for seg in region.steps[VISION_POOL].segments) == PATCHES
+        lora, ctx = _admit(lora_pool, region, "r", None, walk=PIECEWISE_WALK, lease=lease)
         sub._frames.lengths = seq_lens
         pad = (0, 0, 0, bucket - PATCHES)
         encoded = sub.model.encode(F.pad(hidden, pad), F.pad(cos, pad), F.pad(sin, pad))[:PATCHES]
@@ -485,15 +462,16 @@ def _encode_leased(sub, lora_pool):
         return sub.model.merger(encoded)
 
 
-@pytest.mark.parametrize("mode,adapter", [("eager", "v"), ("eager", None), ("leased", "v")])
+@pytest.mark.parametrize("mode,adapter", [("eager", "v"), ("eager", None), ("leased", None)])
 def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
     """Every vision target: the blocks, the merger (a row per four folded patches) and the
-    conv patch embed, eagerly and through the piecewise block loop."""
+    conv patch embed, eagerly; and a leased step on a node serving adapters, whose rows the
+    patch embed and merger still need, through the piecewise block loop."""
     path, ref = write_vision_adapter(tmp_path / "v")
     lora_pool = _vision_pool({"v": path})
     sub = _vision_node(tower(), {VISION_POOL: lora_pool})
     if mode == "eager":
-        step = declared_step(sub, "encode", ["r"], [_prompt(sub)])
+        step = engine_step(sub, "encode", ["r"], [_prompt(sub)])
         assert set(step.steps) == {VISION_ATTN, VISION_POOL}
         _admit(lora_pool, step, "r", adapter)
         got = _encode(sub)
@@ -507,33 +485,32 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
         assert (want - _encode(_vision_node(tower()))).abs().max() > 1e-3
 
 
-def test_qwen3_5_vision_replays_the_block_loop_only_when_leased(tmp_path):
-    """With adapters, a leased step still declares the engine's LoRA rows; it must replay
-    the captured block loop, while an unleased one runs the eager tower on the attention
-    plan it declared."""
+def test_qwen3_5_compiled_patch_embed_with_an_adapter_row_matches_eager(tmp_path):
+    """The bound conv patch embed cuts its patches and adds its delta through views that
+    Inductor traces inside the ``model.embed`` region, compiled as ``compile_regions``
+    compiles it (dynamic in the patch count): equal to eager with an adapter row, at two
+    patch counts."""
     path, _ = write_vision_adapter(tmp_path / "v")
-    sub = _vision_node(tower(), {VISION_POOL: _vision_pool({"v": path})})
-    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 32, VISION_BLOCK_LOOP))
-    replays = []
+    lora_pool = _vision_pool({"v": path})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
+    torch._dynamo.reset()
+    compiled = torch.compile(sub.model.embed, dynamic=True, backend="inductor")
+    for i, grids in enumerate(([(1, 4, 4)], GRIDS)):
+        rid, inp = f"r{i}", _prompt(sub, grids)
+        lora, ctx = _admit(lora_pool, engine_step(sub, "encode", [rid], [inp]), rid, "v")
+        assert lora_pool.active
+        kwargs = sub.preprocess("encode", _engine(rid), [inp])
+        args = [kwargs[k] for k in ("pixel_values", "indices", "weights", "position_ids")]
+        with torch.no_grad():
+            want, got = sub.model.embed(*args), compiled(*args)
+        lora_pool.commit(lora, ctx)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
-    def run(**kwargs):
-        replays.append(kwargs)
-        return SimpleNamespace(get_view=lambda name: kwargs["static_inputs"][name])
 
-    runner = SimpleNamespace(can_run=lambda bs, tokens: True, run=run)
-    rows = torch.zeros(PATCHES, 1)
-    for leases, replayed in (({VISION_BLOCK_LOOP: lease}, True), (None, False)):
-        step = declared_step(sub, "encode", ["r"], [_prompt(sub)], piecewise_leases=leases)
-        engine = SimpleNamespace(request_ids=["r"], piecewise_runners={VISION_BLOCK_LOOP: runner}, step=step)
-        assert (sub._replay_block_loop(engine, rows, rows, rows, (PATCHES,)) is not None) is replayed
-    assert len(replays) == 1
-
-
-def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
-    """An adapter with nothing for the tower is rank 0 on the vision pool. A row on it
-    held back for want of a slot before its adapter was read leaves the wait list once a
-    read finds it empty (else it would age as the oldest waiter and drain a slot), and
-    rows on it are admitted with the pool full."""
+def test_qwen3_5_text_only_adapter_holds_no_vision_slot(tmp_path):
+    """An adapter with nothing for the tower is empty for the vision pool, known from its
+    header through the linked specs: its rows are admitted with the pool full and address
+    the zero adapter."""
     path, _ = write_vision_adapter(tmp_path / "v")
     text, _ = H.write_peft_adapter(tmp_path / "t", 2, ("self_attn.q_proj",), text_only=True)
     lora_pool = _vision_pool({"v": path, "t": text}, max_slots=1)
@@ -543,18 +520,11 @@ def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
         lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
         assert lora_pool.admit_retrieve(rid, "vision_encoder", "encode", None).ready
         ctx = StepContext(request_ids=[rid], graph_walk="encode", slot=0, capture=False)
-        assert lora_pool.admit(declared_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_POOL], ctx).ok
+        assert lora_pool.admit(engine_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_POOL], ctx).ok
         return lora_pool.slot_of(rid)
 
     assert encode("r0", "v") == 1  # the one slot, held
-    lora_pool.ingest_request("w", LoraReqConfig(adapter="t"))
-    assert not lora_pool.admit_retrieve("w", "vision_encoder", "encode", None).ready
-    assert "w" in lora_pool._waiting_since
-    lora_pool.remove_request("r0")
-    assert encode("r1", "t") == 0  # its admit reads the adapter: nothing for the tower
-    assert lora_pool.admit_retrieve("w", "vision_encoder", "encode", None).ready
-    assert "w" not in lora_pool._waiting_since
-    assert encode("r2", "v") == 1 and encode("r3", "t") == 0  # ready with the pool full
+    assert encode("r1", "t") == 0 and encode("r2", "t") == 0  # ready with the pool full
     assert lora_pool.slot_state(1).adapter == "v" and lora_pool.slot_state(1).refcount == 1
 
 
@@ -573,10 +543,51 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
     H.bind(model, H._Rows(), {LORA_RESOURCE_KEY: lora_pool})
     H.plan([lora_pool], [("r0", "h", 1), ("r1", "h", 1), ("r2", "h", 1)])  # three decode rows
     ids, hidden = torch.tensor([1, 2, 60]), H.rand(3, H.HIDDEN, seed=4)
-    with torch.no_grad(), H.compute(lora_pool):
-        embeds, logits = model.model.embed(ids), model.lm_head(hidden)
+    with torch.no_grad():
+        embeds, logits = model.model.embed_tokens(ids), model.lm_head(hidden)
     table = base[embed + ".weight"]
     torch.testing.assert_close(embeds, H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"][ids])
     a, b, s = ref["lm_head"]
     torch.testing.assert_close(logits, hidden @ table.t() + s * (hidden @ a.t()) @ b.t())
     assert torch.equal(model.lm_head.weight, table)
+
+
+def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(tmp_path):
+    """A vision prompt's text and sentinels take their adapter's embedding delta in the
+    step, also when a capture bucket pads the step with a dummy row: three image prompts
+    on the bs-4 bucket, against merged weights. The image rows pass through as they are."""
+    from mstar.model.qwen3_5.config import ROPE
+    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    embed = f"{H.TEXT}embed_tokens"
+    path, ref = H.make_adapter(tmp_path / "e.safetensors", {embed: (H.HIDDEN, 64)}, 4, 8.0, 41, embedding=(embed,))
+    start, end = 60, 61
+    config = dataclasses.replace(H.tiny_config(), vision_start_token_id=start, vision_end_token_id=end,
+                                 mrope_section=[2, 1, 1])
+    base = H.hf_text_weights()
+    lora_pool = H.pool(H.lora_spec({"e": path}))
+    llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config())
+    llm.bind_node_resources({LORA_RESOURCE_KEY: lora_pool})
+    llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: None)
+
+    table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]
+    rows, want = [], []
+    for i, grid in enumerate([(1, 4, 4), (1, 2, 4), (1, 4, 2)]):
+        texts = [torch.tensor([1 + i, 5]), torch.tensor([7, 8 + i, 9])]
+        image = H.rand(grid[1] * grid[2] // 4, H.HIDDEN, seed=50 + i)
+        fwd_info = SimpleNamespace(request_id=f"r{i}", step_metadata={
+            "prefill_order": (TEXT_PART, IMAGE_PART, TEXT_PART), STEP_GRIDS_KEY: [grid],
+        })
+        # prepare_inputs runs outside the planned step, before the plan below
+        rows.append(llm._vision_inputs(fwd_info, {"text_inputs": texts, "vision_embeds": [image]}))
+        want += [table[texts[0]], table[[start]], image, table[[end]], table[texts[1]]]
+    (config_v,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
+                   if c.capture_graph_walk == "prefill_vision"]
+    padded = [*rows, *config_v.get_node_inputs(1, 0)]
+    assert len(padded) == 4 and padded[-1].input_seq_len == 0
+
+    H.plan([lora_pool], [(f"r{i}", "e", row.input_seq_len) for i, row in enumerate(rows)])
+    with torch.no_grad():
+        out = llm.preprocess("prefill_vision", SimpleNamespace(captured=False), padded)
+    torch.testing.assert_close(out["input_embeds"], torch.cat(want))

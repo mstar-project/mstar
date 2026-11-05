@@ -13,14 +13,11 @@ states is what the modules cannot:
 * the layouts adapters on the Hub write the towers under (``adapter_roots``), Tinker's
   split delta-net ``in_proj_q/k/v`` and its ``unembed_tokens`` head
   (``adapter_stacked_params``, ``aliases``), and the MTP head, which is never run
-  (``ignore``);
-* the token embedding's delta is the node's to add (``deferred``): a vision prompt's
-  text is embedded in ``prepare_inputs``, before the step, so ``preprocess`` and
-  ``Qwen3_5LanguageModel.embed`` add it on the step's rows;
-* the vision targets' names, kept as the shipped serving configs spell them (``names``).
+  (``ignore``).
 
-The loader's rules are passed explicitly (the Qwen3.5 roots state no
-``checkpoint_rules()`` yet); they are the same objects ``weight_loader`` loads with.
+Adapters land where the roots' ``checkpoint_rules()`` load the checkpoint. Every
+embedding call is in the step (a vision prompt's ids are embedded in ``preprocess``),
+so the token embedding is an ordinary target.
 """
 
 from __future__ import annotations
@@ -32,13 +29,8 @@ from mstar.model.components.lora.modules import (
     join_lora_specs,
     module_lora_spec,
 )
-from mstar.model.loader.base import CheckpointRules, StackedParamRule
+from mstar.model.loader.base import StackedParamRule
 from mstar.model.qwen3_5.config import Qwen3_5Config, Qwen3_5VisionConfig
-from mstar.model.qwen3_5.weight_loader import (
-    _STACKED_PARAMS,
-    qwen3_5_name_remapper,
-    qwen3_5_vision_name_remapper,
-)
 
 _TEXT = "model.language_model."
 # the released checkpoint, the inner multimodal model, the text-only causal LM, the
@@ -51,16 +43,6 @@ SPLIT_QKV_RULES = tuple(
     StackedParamRule(".in_proj_fused.", f".in_proj_{shard}.", shard) for shard in ("q", "k", "v")
 )
 
-VISION_NAMES = {
-    "patch_embed.proj": "patch_embed",
-    "attn.qkv": "attn_qkv",
-    "attn.proj": "attn_proj",
-    "mlp.linear_fc1": "mlp_fc1",
-    "mlp.linear_fc2": "mlp_fc2",
-    "merger.linear_fc1": "merger_fc1",
-    "merger.linear_fc2": "merger_fc2",
-}
-
 
 def qwen3_5_llm_lora_spec(config: Qwen3_5Config) -> LoraSpec:
     """The LLM node's part (``qwen3_5_lora_spec`` joins it to the vision tower's)."""
@@ -68,7 +50,6 @@ def qwen3_5_llm_lora_spec(config: Qwen3_5Config) -> LoraSpec:
     return module_lora_spec(
         lambda _: Qwen3_5ForCausalLM(config),
         nodes={"LLM"}, root_path="model",
-        rules=CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper),
         adapter_stacked_params=SPLIT_QKV_RULES,
         adapter_roots=TEXT_ROOTS,
         # Tinker's name for the head
@@ -76,9 +57,6 @@ def qwen3_5_llm_lora_spec(config: Qwen3_5Config) -> LoraSpec:
         rows={"lm_head": PER_SEGMENT},
         ignore=("mtp.*", "model.mtp.*"),
         embeddings=True,
-        # a vision prompt's text is embedded in prepare_inputs, before the step: the
-        # node adds the delta itself, on the step's rows (preprocess, and `embed`)
-        deferred=("model.embed_tokens",),
     )
 
 
@@ -88,10 +66,8 @@ def qwen3_5_vision_lora_spec(config: Qwen3_5VisionConfig) -> LoraSpec:
     return module_lora_spec(
         lambda _: Qwen3_5VisionModel(config),
         nodes={"vision_encoder"}, root_path="model",
-        rules=CheckpointRules(remap=qwen3_5_vision_name_remapper),
         adapter_roots=VISION_ROOTS,
         rows={"merger.*": config.merge_unit},
-        names=VISION_NAMES,
     )
 
 

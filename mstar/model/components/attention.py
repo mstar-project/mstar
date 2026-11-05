@@ -205,6 +205,8 @@ class CrossAttention(nn.Module):
     Whisper (q/v/o biased, k unbiased).
     """
 
+    lora_unservable = dict.fromkeys(("k_proj", "v_proj"), "projects the encoder context, not the step's tokens")
+
     def __init__(
         self,
         *,

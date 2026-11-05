@@ -16,13 +16,13 @@ from torch import nn
 
 sys.path.insert(0, ".")
 
-from mstar.model.components.diffusion.lora import apply_loras, merge_lora  # noqa: E402
-from mstar.model.components.linear import FusedColumnLinear  # noqa: E402
-from mstar.model.components.lora import (  # noqa: E402
+from mstar.engine.resources.lora.checkpoint import (  # noqa: E402
     LoraFile,
     normalize_lora_state_dict,
     sidecar_default_alpha,
 )
+from mstar.model.components.diffusion.lora import apply_loras, merge_lora  # noqa: E402
+from mstar.model.components.linear import FusedColumnLinear  # noqa: E402
 from mstar.model.loader.base import StackedParamRule  # noqa: E402
 
 DIM, RANK = 16, 4
@@ -187,7 +187,9 @@ def test_error_paths(model):
             "transformer_blocks.0.attn.to_q.lora_B.weight": b[:, : RANK - 1],
         })
     with pytest.raises(ValueError, match="unrecognized"):
-        normalize_lora_state_dict({"transformer_blocks.0.attn.to_q.weight": a})
+        normalize_lora_state_dict({
+            "transformer_blocks.0.attn.to_q.lora_A.weight": a, "transformer_blocks.0.attn.to_q.weight": a,
+        })
     adapter = normalize_lora_state_dict({
         "transformer_blocks.0.attn.to_q.lora_A.weight": a,
         "transformer_blocks.0.attn.to_q.lora_B.weight": b,

@@ -91,7 +91,7 @@ class LoraBackend(ABC):
     def align_experts(self, ids: torch.Tensor, num_ids: int):
         """What ``apply_experts_`` reads to group the rows of ``ids`` (``[tokens, top_k]``
         combined ids, ``num_ids`` meaning none) by id, shared by every call over them;
-        None where the backend groups nothing (this reference)."""
+        None where nothing groups them (``experts_reference_``)."""
         return None
 
     def apply_experts_(
@@ -102,29 +102,37 @@ class LoraBackend(ABC):
         """``y[m, slice i] += row_weight[m] * (x[m // top_k] @ a[id, slice i]^T) @ b[id,
         slice i]^T`` for each row ``m`` of ``y``, ``id = ids.flatten()[m]``; a row whose id
         is past ``a``'s (``a.shape[0]``) gets nothing. ``a [ids, slices * R, in]``, ``b [ids,
-        out, R]``; ``alignment`` is ``align_experts``' for ``ids``.
-
-        This reference gathers each row's factors, ``_EXPERT_ROWS`` rows at a time so the
-        gathered copies stay bounded: fine on a CPU, at a dense LoRA's work per row."""
+        out, R]``; ``alignment`` is ``align_experts``' for ``ids``."""
         del alignment
-        num_ids, max_rank = a.shape[0], b.shape[-1]
-        ids, row_weight = ids.reshape(-1), row_weight.reshape(-1)
-        acc = torch.promote_types(x.dtype, torch.float32)
-        for start in range(0, y.shape[0], _EXPERT_ROWS):
-            stop = min(start + _EXPERT_ROWS, y.shape[0])
-            chunk = ids[start:stop]
-            keep = chunk < num_ids
-            idx = torch.where(keep, chunk, 0).long()
-            src = x[torch.arange(start, stop, device=x.device) // top_k].to(acc)
-            h = torch.einsum("mk,mrk->mr", src, a[idx].to(acc))
-            weight = torch.where(keep, row_weight[start:stop].to(acc), 0.0)[:, None]
-            offset = 0
-            for i, width in enumerate(out_slices):
-                h_i = h[:, i * max_rank:(i + 1) * max_rank]
-                delta = torch.einsum("mr,mor->mo", h_i, b[idx, offset:offset + width].to(acc))
-                # a select, not a multiply: a captured bucket's tail rows may hold anything
-                y[start:stop, offset:offset + width] += torch.where(keep[:, None], weight * delta, 0.0).to(y.dtype)
-                offset += width
+        experts_reference_(x, y, a, b, ids, row_weight, top_k, list(out_slices))
+
+
+def experts_reference_(
+    x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor, ids: torch.Tensor,
+    row_weight: torch.Tensor, top_k: int, out_slices: list[int],
+) -> None:
+    """Plain torch for ``LoraBackend.apply_experts_``: gathers each row's factors,
+    ``_EXPERT_ROWS`` rows at a time so the gathered copies stay bounded. Fixed shapes and
+    no host sync, so it compiles and captures; fine on a CPU, at a dense LoRA's work per
+    row."""
+    num_ids, max_rank = a.shape[0], b.shape[-1]
+    ids, row_weight = ids.reshape(-1), row_weight.reshape(-1)
+    acc = torch.promote_types(x.dtype, torch.float32)
+    for start in range(0, y.shape[0], _EXPERT_ROWS):
+        stop = min(start + _EXPERT_ROWS, y.shape[0])
+        chunk = ids[start:stop]
+        keep = chunk < num_ids
+        idx = torch.where(keep, chunk, 0).long()
+        src = x[torch.arange(start, stop, device=x.device) // top_k].to(acc)
+        h = torch.einsum("mk,mrk->mr", src, a[idx].to(acc))
+        weight = torch.where(keep, row_weight[start:stop].to(acc), 0.0)[:, None]
+        offset = 0
+        for i, width in enumerate(out_slices):
+            h_i = h[:, i * max_rank:(i + 1) * max_rank]
+            delta = torch.einsum("mr,mor->mo", h_i, b[idx, offset:offset + width].to(acc))
+            # a select, not a multiply: a captured bucket's tail rows may hold anything
+            y[start:stop, offset:offset + width] += torch.where(keep[:, None], weight * delta, 0.0).to(y.dtype)
+            offset += width
 
 
 # rows of an experts target the torch reference gathers factors for at once
@@ -194,26 +202,16 @@ def gather_shrink_reference(
     h = a[slots, :, ids.clamp(0, vocab - 1)]  # [T, slices * R]
     return torch.where(live[:, None], h, torch.zeros((), dtype=h.dtype, device=h.device))
 
-class TorchLoraBackend(LoraBackend):
-    """The plain-torch reference (``shrink_reference`` / ``expand_reference_``), called
-    directly: the custom ops in ``ops.py`` register the same functions as their default
-    kernel, and Triton's over them on CUDA, so this is the one that never dispatches to a
-    GPU kernel. Fine for a reference and for small pools."""
-
-    def shrink(self, x, a, addressing, ranks, num_slices=1):
-        return shrink_reference(x, a, addressing.token_slot, ranks, num_slices)
-
-    def expand_fused(self, h, b, addressing, ranks, scalings, y, out_slices):
-        expand_reference_(y, h, b, addressing.token_slot, ranks, scalings, list(out_slices))
-
-
 def make_backend(kind: str, device: torch.device) -> LoraBackend:
-    if kind == "auto":
-        kind = "triton" if device.type == "cuda" else "torch"
-    if kind == "torch":
-        return TorchLoraBackend()
-    if kind == "triton":
-        from mstar.engine.resources.lora.triton_backend import TritonLoraBackend
+    """The custom ops (``ops.LoraOpsBackend``) on every device, so ``torch.compile`` takes
+    each kernel as one opaque node. ``"triton"`` (``"auto"`` on CUDA) registers the Triton
+    kernels for them; ``"torch"`` registers none. A deployment's pools share one ``lora:``
+    block, so they choose alike, but registration is process-wide: the reference runs only
+    while nothing else in the process has registered the Triton kernels."""
+    if kind not in ("auto", "torch", "triton"):
+        raise ValueError(f"unknown LoRA backend {kind!r}; expected auto, torch or triton")
+    if kind == "triton" or (kind == "auto" and device.type == "cuda"):
+        import mstar.engine.resources.lora.triton_backend  # noqa: F401  (registers the kernels)
+    from mstar.engine.resources.lora.ops import LoraOpsBackend
 
-        return TritonLoraBackend()
-    raise ValueError(f"unknown LoRA backend {kind!r}; expected auto, torch or triton")
+    return LoraOpsBackend()

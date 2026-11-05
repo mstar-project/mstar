@@ -1,10 +1,10 @@
 """Adapter-keyed prefix caching, served: hits only within an adapter's namespace.
 
-GPU only; nothing here runs in CI. Needs a model that both declares a prefix-cache
-stream (``prefix_key_streams``) and serves LoRA adapters (declares a ``LoraSpec``). Orpheus
-does both (speech out, through ``/generate`` with the adapter in ``model_kwargs``); a
-text model goes through the chat endpoint (``--endpoint chat``). Qwen3.5 serves adapters
-but keys no stream (its gated DeltaNet state cannot skip a cached prefix).
+GPU only; nothing here runs in CI. Needs a model that both keys a KV label for prefix
+reuse (``KVLabel.keys`` in its ``kv_labels``) and serves LoRA adapters
+(declares a ``LoraSpec``). Orpheus does both (speech out, through ``/generate`` with the
+adapter in ``model_kwargs``); a text model, Qwen3.5 among them (it keys
+``prefill_text``), goes through the chat endpoint (``--endpoint chat``).
 
 One server, one long prompt, sent one request at a time in this order::
 
@@ -50,19 +50,21 @@ PROMPT = " ".join(
 
 
 def _preflight(model: str) -> None:
-    from mstar.model.base import Model
+    from mstar.model.base import keyed_labels
     from mstar.model.registry import get_model_class
 
     cls = get_model_class(model)
-    missing = [
-        name for name in ("prefix_key_streams",)
-        if getattr(cls, name) is getattr(Model, name)
-    ]
-    if missing:
+    try:
+        # the models that key a label declare it without their config or checkpoint
+        keyed = keyed_labels(object.__new__(cls))
+    except AttributeError:
+        # a kv_labels that reads its config (Cosmos3, V-JEPA 2): none of the LoRA models
+        keyed = {}
+    if not keyed:
         # a model that serves no adapters refuses the `lora:` block when the server starts
         raise SystemExit(
-            f"{model}: {cls.__name__} does not override {missing}; this check needs a model "
-            "that keys a prefix-cache stream"
+            f"{model}: {cls.__name__} keys no KV label (KVLabel.keys in kv_labels); this "
+            "check needs a model that keys a prefix-cache label and serves LoRA adapters"
         )
 
 

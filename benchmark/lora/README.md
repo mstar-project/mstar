@@ -100,7 +100,7 @@ outputs (`benchmark/lora/load.py`, which can put requests on adapters;
 
 | LoRA mode | config | requests |
 | --- | --- | --- |
-| `off` | stock `configs/qwen3_5_0.8b.yaml` | base model |
+| `off` | stock `configs/qwen3_5_0.8b.yaml`, prefix cache off (the load repeats its prompts) | base model |
 | `base` | stock + `resources: lora:` (3 adapters, 3 slots) | base model |
 | `adapters` | same | round-robin over the 3 adapters |
 
@@ -174,9 +174,8 @@ python -m benchmark.lora.prefix_cache --model orpheus --config configs/orpheus_c
 Orpheus is the first model that keys a prefix-cache stream *and* serves LoRA adapters
 (a `LoraSpec` from `module_lora_spec`). Requests go through `/generate` with the
 adapter in `model_kwargs` (`--endpoint speech`, the default for Orpheus), and a
-request's output is its audio; a text model takes `--endpoint chat`. Qwen3.5 serves
-adapters but keys no stream, because its gated DeltaNet state cannot skip a cached
-prefix. The CPU check that requests on an adapter key under its own root (and base
+request's output is its audio; a text model takes `--endpoint chat`. Qwen3.5 keys
+`prefill_text` as well, so it runs the same phase through `--endpoint chat`. The CPU check that requests on an adapter key under its own root (and base
 keys stay as they were) is `test/modular/test_lora_prefix_keys.py`.
 
 On one server, one long prompt is sent greedily, one request at a time: first with
@@ -193,8 +192,8 @@ Results go to `prefix_cache.json` and `server.log` under `--out`.
 
 The CPU tests behind it are in `test/modular/test_lora_prefix_keys.py` (a real
 `KVManager` fed the preprocess worker's kwargs as the conductor hands them over) and
-the Orpheus test above. The prefix cache is off under tensor
-parallelism (`KVManager.enable_prefix_cache`), so there is no TP version of this phase.
+the Orpheus test above. Above one rank the prefix cache is off unless
+`prefix_cache_tp: true` is set (`docs/serving.rst`), which this phase does not cover.
 
 ## 6. Loading and unloading adapters at runtime, under base traffic (about 15 minutes)
 
@@ -215,11 +214,13 @@ base-model requests (`--base-concurrency`) running from start to end. While they
   base model.
 * **unload**: 8 requests of 4096 tokens (`ignore_eos`) on `proofreader`, then its unload
   while they run: 200; a new request on it 400; every held request runs to its length
-  (`finish_reason` length, its text re-tokenized to at least 90% of 4096: the
-  non-streaming `usage` is not filled in); a second unload 404; `/v1/models` no longer lists it.
+  (its text re-tokenized to at least 90% of 4096: the non-streaming `usage` is not
+  filled in, and its `finish_reason` is always `stop`); a second unload 404; `/v1/models` no longer lists it.
 * **reload**: `proofreader` loaded again from the same directory (retried for up to a
   minute while the workers still hold it for the requests that just ended), then the
-  parity prompts again, which must equal the first load's outputs exactly.
+  parity prompts again, which must pass the same rule (how many equal the first load's
+  outputs is reported, not checked: the base traffic's batch composition can move a
+  greedy token).
 
 Pass: exit 0, which includes `failed == 0` for the base traffic. Results:
 `runtime_load.json` (every check, the outputs, the held requests, the base traffic's
@@ -301,9 +302,11 @@ resumable, a finished cell is never rerun, `--first-round N` adds rounds):
 Matched settings: bf16, max rank the loaded adapters' largest `r` (16 for the defaults), the same slot count (mstar `max_slots: S`, vLLM
 `--max-loras S`, SGLang `--max-loras-per-batch S+1`, since SGLang counts base-model rows as
 one of a batch's adapters), every adapter in host memory (vLLM `--max-cpu-loras`), prefix
-caching off (mstar's Qwen3.5 has none; vLLM `--no-enable-prefix-caching`, SGLang
+caching off (mstar `prefix_cache: false`; vLLM `--no-enable-prefix-caching`, SGLang
 `--disable-radix-cache`), context length and running requests from mstar's config
-(32768, 128), fp32 GDN state, CUDA graphs on (mstar with `MSTAR_REQUIRE_CUDA_GRAPHS=1`),
+(32768, 128), fp32 GDN state, CUDA graphs on (mstar with
+`MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`, and a server whose log has a `Failed to capture`
+line does not count),
 thinking off, greedy. SGLang's `--lora-target-modules` is the adapters' own union, which
 must be attention and MLP only. Adapters are selected by the OpenAI `model` field: the
 adapter's name on mstar and vLLM, `<base>:<adapter>` on SGLang (`--sglang-adapter-model`
@@ -322,9 +325,9 @@ Besides attention and MLP they touch the gated delta-net's `in_proj_qkv`, `in_pr
 `in_proj_a`, `in_proj_b` and `out_proj`. `--all-linear-adapter NAME=REPO` (repeatable) and
 `--all-linear-perf-adapters a,b` change them.
 
-* mstar serves them only with LoRA on the delta-net (`lora/gdn` or later). On an earlier
-  branch it refuses each adapter (`LoraSpec.check_adapter`), and (f), (g) and its
-  all-linear correctness rows read "mstar: not supported on this branch".
+* mstar serves them only with LoRA on the delta-net (`in_proj_fused`). Without it, it
+  refuses each adapter (`LoraSpec.check_adapter`), and (f), (g) and its all-linear
+  correctness rows read "mstar: not supported on this branch".
 * Before anything starts, the driver reads each adapter's `target_modules` and the
   modules its file holds, and logs what each engine will apply
   (`support/adapter_modules.json`). mstar and vLLM refuse an adapter with a module they
@@ -378,7 +381,8 @@ and GPU-pending until these pass):
   adapter and the base model in one mixed step, against each adapter merged into the
   weights;
 * `hf`: the same against transformers + PEFT where transformers has the node (Orpheus,
-  Higgs Audio's Qwen3 LLM, the Qwen3-Omni Thinker, Chatterbox T3's Llama backbone), RoPE
+  Higgs Audio's Qwen3 LLM, the Qwen3-Omni Thinker, the Qwen3-TTS Talker as Qwen3 over its
+  codec embedding and head, Chatterbox T3's Llama backbone), RoPE
   as the reference computes it;
 * `serve`: the stock config plus a `lora:` block, captured and compiled as shipped, a
   mixed batch included, against a server on a checkpoint with the adapter merged in.

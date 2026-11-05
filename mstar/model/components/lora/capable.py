@@ -65,19 +65,17 @@ class LoraCapable:
 
     def lora_local_shape(self) -> tuple[int, int]:
         """``(in, out)`` of the delta on this rank: the input columns the module reads
-        and the output columns it writes before any collective."""
-        raise NotImplementedError
+        and the output columns it writes before any collective, which its weight
+        (``[out, in, *kernel]``) holds."""
+        weight = self.weight
+        return math.prod(weight.shape[1:]), weight.shape[0]
 
 
 class LoraBound:
-    """The delta slots of a bound (swapped) module: a forward mixin derives from this."""
+    """The delta slot of a bound (swapped) module: a forward mixin derives from this."""
 
     # set at bind (``bind_module_lora``); class-level None until then
     lora_delta: "LoraLayerDelta | None" = None
-    # a delta bound for the node to add itself (``module_lora_spec(deferred=...)``): the
-    # module's own forward never adds it, since the node also calls the module outside
-    # its planned step (e.g. embedding a prompt in ``prepare_inputs``)
-    lora_deferred: "LoraLayerDelta | None" = None
     # parameter -> its delta, for a module with a target per parameter (``lora_targets``)
     lora_params: "Mapping[str, LoraLayerDelta]" = MappingProxyType({})
 
@@ -97,36 +95,34 @@ class _LoraLinearMixin(LoraOutputAdd, LoraCapable):
     def lora_target(self) -> LoraTarget:
         return LoraTarget(in_features=self.in_features, out_slices=(self.out_features,), parallel="none")
 
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.in_features, self.out_features
-
 
 class _LoraPatchConvMixin(LoraBound, LoraCapable):
-    """A convolution whose kernel is its stride, over inputs one kernel wide: a linear
-    over each flattened patch, as PEFT's conv LoRA (``A [r, c, *kernel]``, ``B [out, r,
-    1, ...]``) is over it."""
+    """A convolution whose kernel is its stride: a linear over each flattened patch, as
+    PEFT's conv LoRA (``A [r, c, *kernel]``, ``B [out, r, 1, ...]``) is over it. Each
+    output position is a row, in the order ``flatten(2).transpose(1, 2)`` makes tokens of
+    them (one per input when a patch embedding is fed pre-cut patches)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = super().forward(x)
         if self.lora_delta is None:
             return y
-        if math.prod(y.shape[2:]) != 1:
-            raise ValueError(
-                f"{type(self).__name__}: LoRA on a convolution needs one patch per "
-                f"row (output {tuple(y.shape)}), as a patch embedding feeds it"
-            )
-        rows = y.shape[0]
-        patch = math.prod(x.shape[1:])
-        return apply_lora(self.lora_delta, x.reshape(rows, patch), y.view(rows, self.out_channels)).view_as(y)
+        n, out, *grid = y.shape
+        kernel = self.kernel_size
+        # the patches the conv read ([N, C, G1, K1, G2, K2, ...], less any remainder it
+        # dropped), each flattened as the weight is: [N * G1 * G2 ..., C * K1 * K2 ...]
+        x = x[(..., *(slice(0, g * k) for g, k in zip(grid, kernel, strict=True)))]
+        x = x.reshape(n, self.in_channels, *(d for g, k in zip(grid, kernel, strict=True) for d in (g, k)))
+        dims = range(len(grid))
+        x = x.permute(0, *(2 + 2 * i for i in dims), 1, *(3 + 2 * i for i in dims))
+        rows = y.movedim(1, -1).reshape(-1, out)
+        rows = apply_lora(self.lora_delta, x.reshape(rows.shape[0], -1), rows)
+        return rows.view(n, *grid, out).movedim(-1, 1).contiguous()
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
             in_features=self.in_channels * math.prod(self.kernel_size),
             out_slices=(self.out_channels,), parallel="none",
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.in_channels * math.prod(self.kernel_size), self.out_channels
 
 
 class LoraLinear(_LoraLinearMixin, nn.Linear):
@@ -241,7 +237,7 @@ def make_lora_capable(module: nn.Module) -> LoraBound:
     place (nothing else about it changes). Raises for a module that cannot be."""
     found = lora_capability(module)
     if found is None or found.capable is None:
-        raise TypeError(found.reason if found else f"{type(module).__name__} holds no weights to adapt")
+        raise ValueError(found.reason if found else f"{type(module).__name__} holds no weights to adapt")
     if type(module) is not found.capable:
         module.__class__ = found.capable
     return module

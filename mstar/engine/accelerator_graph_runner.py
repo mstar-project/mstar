@@ -5,7 +5,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
-from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 from torch.distributed import ReduceOp
@@ -25,22 +25,16 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.resources import (
-    BucketKey,
-    CGSlotSpec,
-    Resource,
-    SlotLease,
-    StepContext,
-    StepRunner,
-    SubmoduleStep,
-)
+from mstar.engine.node_dtype import node_scope
+from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    declared_step,
+    engine_step,
     with_segment_steps,
 )
 from mstar.platforms import current_platform
@@ -130,12 +124,15 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     return sorted(key for key in step.steps if not resources[key].can_capture())
 
 
-def autocast_scope(dtype: torch.dtype | None, device_type: str):
+@contextmanager
+def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str | None = None):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
-    submodule in its own dtype and shuts out any ambient autocast."""
-    return torch.amp.autocast(
+    submodule in its own dtype and shuts out any ambient autocast.
+    ``node_name`` names the node in implicit-downcast warnings."""
+    with node_scope(node_name, dtype), torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
-    )
+    ):
+        yield
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -179,7 +176,11 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
+def capture_into_graph(
+    run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None,
+    stream: Any = None,
+):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -208,8 +209,8 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
     torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
-                autocast_scope(autocast_dtype, backend.device_type):
-            with backend.capture(graph, pool=pool):
+                autocast_scope(autocast_dtype, backend.device_type, node_name):
+            with backend.capture(graph, pool=pool, stream=stream):
                 output = run()
     except BaseException:
         pool.on_failure(graph)
@@ -224,6 +225,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, 
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+    node_name: str | None = None, stream: Any = None,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -252,12 +254,14 @@ def capture_with_static_outputs(
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
+    graph, _ = capture_into_graph(
+        captured, pool, device, autocast_dtype, keep_graph, node_name=node_name, stream=stream,
+    )
     return graph, static_outputs
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
     required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
@@ -452,15 +456,25 @@ def _capture_thrown_away(
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
-    )
+    taken = None if graph is None else _pool_bytes(pool.handle)
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+
+
+def _pool_bytes(pool_id) -> int:
+    """The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole
+    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch
+    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.
+    """
+    pool_id = tuple(pool_id)
+    return sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot()
+        if tuple(segment.get("segment_pool_id", ())) == pool_id
+    )
 
 
 def _graph_nodes(graph) -> int:
@@ -690,6 +704,8 @@ class WarmedSpec(NamedTuple):
 class AcceleratorGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
+    # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
+    _capture_stream: Any = None
 
     def __init__(
         self,
@@ -703,10 +719,13 @@ class AcceleratorGraphRunner:
         num_slots: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
+        capture_stream: Any = None,
     ):
         self._submodule_name = submodule_name
+        self._capture_stream = capture_stream
         self._submodule = submodule
         self._comm_group = joint_comm_group
+        self._resident: ResidentPlanner | None = None
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -787,6 +806,17 @@ class AcceleratorGraphRunner:
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
 
+    def max_capture_bs(self, walks: Collection[str]) -> int:
+        """The widest capture of any of ``walks``, 0 when none of them has one."""
+        return max(
+            (max(self._batch_sizes(config)) for config in self._capture_configs if config.capture_graph_walk in walks),
+            default=0,
+        )
+
+    def bind_resident(self, planner: ResidentPlanner | None) -> None:
+        """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
+        self._resident = planner
+
     # ── Capture ─────────────────────────────────────────────────────────
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
@@ -845,7 +875,7 @@ class AcceleratorGraphRunner:
                     continue
                 checked_configs.add(spec.config_idx)
                 rids = self._dummy_rows.handles(f"{spec.config_idx}_slot0", spec.bs)
-                step = declared_step(
+                step = engine_step(
                     self._submodule,
                     graph_walk=spec.bucket.graph_walk,
                     request_ids=rids,
@@ -915,7 +945,8 @@ class AcceleratorGraphRunner:
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
-                                autocast_dtype=self._autocast_dtype,
+                                autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                                stream=self._capture_stream,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -951,7 +982,8 @@ class AcceleratorGraphRunner:
                     memory = _capture_thrown_away(
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
-                            autocast_dtype=self._autocast_dtype,
+                            autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                            stream=self._capture_stream,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.idle)],
@@ -1136,6 +1168,7 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._submodule_name, stream=self._capture_stream,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1160,7 +1193,7 @@ class AcceleratorGraphRunner:
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
 
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
-        step = declared_step(
+        step = engine_step(
             self._submodule,
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
             slot_lease=lease, per_request_info=engine_inputs.per_request_info,
@@ -1186,12 +1219,11 @@ class AcceleratorGraphRunner:
                         f"capture admit failed for {spec.bucket}: {outcome.reason}"
                     )
                 self._step_runner.plan(step)
-            with self._step_runner.compute_scope(step):
-                return self._submodule.preprocess(
-                    graph_walk=walk,
-                    engine_inputs=engine_inputs,
-                    inputs=dummy_inputs,
-                )
+            return self._submodule.preprocess(
+                graph_walk=walk,
+                engine_inputs=engine_inputs,
+                inputs=dummy_inputs,
+            )
 
         try:
             static_inputs = prepare()
@@ -1212,14 +1244,24 @@ class AcceleratorGraphRunner:
             )
 
             forward = self._forward_for(spec)
+            planner = self._resident
+            resident = (
+                planner.capture_step(spec.bucket, spec.slot, step)
+                if planner is not None and planner.covers(spec.bucket)
+                else None
+            )
 
             def run_forward():
-                with self._step_runner.compute_scope(step):
-                    return forward(
-                        graph_walk=walk,
-                        engine_inputs=engine_inputs,
-                        **static_inputs,
-                    )
+                if resident is not None:
+                    planner.gather(resident)
+                out = forward(
+                    graph_walk=walk,
+                    engine_inputs=engine_inputs,
+                    **static_inputs,
+                )
+                if resident is not None:
+                    planner.commit_in_graph(resident)
+                return out
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
@@ -1228,7 +1270,7 @@ class AcceleratorGraphRunner:
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type):
+                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
                     returned = _tensor_bytes(run_forward())
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -1517,17 +1559,29 @@ class AcceleratorGraphRunner:
         return cached
 
     def pad_inputs(
-        self, lease: SlotLease, inputs: list[NodeInputs],
+        self, lease: SlotLease, inputs: list[NodeInputs], uniform: NodeInputs | None = None,
     ) -> list[NodeInputs]:
         """Real inputs plus the rows that bring the batch to capture batch size.
         Set the length to zero so no new pages are allocated for dummy requests.
+
+        ``uniform``: the object every real row shares (``uniform_row_inputs``,
+        which holds for any request of the walk). With the template row's span
+        it pads too, instead of a fresh clone of the template per padding row.
         """
         num_pad = lease.bucket.bs - len(inputs)
         if num_pad <= 0:
             return list(inputs)
-        padding = self._buckets[lease.bucket].config.get_node_inputs(
-            num_pad, 0
-        )
+        config = self._buckets[lease.bucket].config
+        # a batched config pads with copies of one template row; a packed one
+        # lays tokens out over its rows and has none
+        template = getattr(config, "single_request_inputs", None)
+        if (
+            uniform is not None and template is not None
+            and uniform.input_seq_len == template.input_seq_len
+            and all(inp is uniform for inp in inputs)
+        ):
+            return [*inputs, *[uniform] * num_pad]
+        padding = config.get_node_inputs(num_pad, 0)
         return [*inputs, *padding]
 
     def step_ids(self, lease: SlotLease, request_ids: list[int]) -> list[int]:
@@ -1554,6 +1608,9 @@ class AcceleratorGraphRunner:
         its seq dim, so mrope-style ``[.., seq, ..]`` inputs land on the right
         axis. Trailing slots beyond the real length keep capture-time contents;
         the plan's indptrs keep attention off them.
+
+        Every other dim has to match the buffer: ``copy_`` would broadcast a
+        smaller input into it silently, e.g. one camera into every camera slot.
         """
         slot = self.slot_for(lease)
         for key in slot.static_input_keys:
@@ -1562,7 +1619,16 @@ class AcceleratorGraphRunner:
                 continue
             static_buf = slot.static_inputs[key]
             seq_dim = self._static_buffer_seq_dims.get((slot.config_idx, key), 0)
-            static_buf.narrow(seq_dim, 0, value.shape[seq_dim]).copy_(value)
+            target = (
+                static_buf.narrow(seq_dim, 0, value.shape[seq_dim])
+                if value.dim() == static_buf.dim() else None
+            )
+            if target is None or target.shape != value.shape:
+                raise RuntimeError(
+                    f"{self._submodule_name}: input {key!r} is {tuple(value.shape)}, but its captured "
+                    f"buffer is {tuple(static_buf.shape)}; only dim {seq_dim} may be shorter"
+                )
+            target.copy_(value)
 
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
@@ -1722,6 +1788,8 @@ class PiecewiseAcceleratorGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
 
+    _capture_stream: Any = None
+
     def __init__(
         self,
         label: str,
@@ -1735,14 +1803,18 @@ class PiecewiseAcceleratorGraphRunner:
         node_name: str | None = None,
         memory_pool: AcceleratorGraphPool | None = None,
         device_capability: DeviceCapability | None = None,
+        capture_stream: Any = None,
+        segment_keys: tuple[str, ...] = (),
     ):
         self._label = label
+        self._capture_stream = capture_stream
         self._config = config
+        # the node's resources whose step is its segments (`_region_step`)
+        self._segment_keys = segment_keys
         self._resources = resources
-        # the resources whose step is the region's segments (``Resource.steps_from_segments``)
-        self._segment_keys = tuple(
-            key for key, r in resources.items() if getattr(r, "steps_from_segments", False)
-        ) if config.segment_rows else ()
+        # the node's idle-capable resources (`Resource.idle_capture`): a
+        # `one_row_per_step` region runs with them idle (`_idle`)
+        self._idle_keys = tuple(key for key, r in resources.items() if r.idle_capture)
         self._step_runner = step_runner
         self._device = device
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
@@ -1783,13 +1855,14 @@ class PiecewiseAcceleratorGraphRunner:
         """A region has no pre-plan path, so a second slot buys nothing unless a
         resource its step touches stages into a reused host buffer behind an
         async H2D (see ``Resource.force_double_buffer``)."""
-        if self._max_slots <= 1 or self._config.declare_step is None:
+        if self._max_slots <= 1:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
             # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
-            step = self._declared_step(
-                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs), shape.seq_lens,
+            step = self._region_step(
+                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
+                list(shape.seq_lens),
             )
             if step is not None and any(
                 self._resources[key].force_double_buffer for key in step.steps
@@ -1810,12 +1883,21 @@ class PiecewiseAcceleratorGraphRunner:
         two graphs on one set of per-request state."""
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
 
+    @property
+    def _idle(self) -> bool:
+        """Whether the region runs with the node's idle-capable resources idle: a
+        ``one_row_per_step`` region, replayed as its first request's row, would give every
+        request that row's state in them, so it replays only steps that leave them idle
+        (``can_lease``) and is captured without their kernels."""
+        return self._config.one_row_per_step and bool(self._idle_keys)
+
     def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
         return BucketKey(
             graph_walk=PIECEWISE_WALK,
             bs=shape.bs,
             num_tokens=shape.total_tokens,
             cg_key_info=self._label,
+            idle=self._idle,
         )
 
     # ── Capture ─────────────────────────────────────────────────────────
@@ -1824,10 +1906,11 @@ class PiecewiseAcceleratorGraphRunner:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
-            if shapes and self._config.declare_step is not None:
+            if shapes:
                 shape = shapes[0]
-                step = self._declared_step(
-                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs), shape.seq_lens,
+                step = self._region_step(
+                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
+                    list(shape.seq_lens),
                 )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
@@ -1883,6 +1966,7 @@ class PiecewiseAcceleratorGraphRunner:
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
+                                    node_name=self._node_name,
                                 ),
                                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                             )
@@ -1917,6 +2001,7 @@ class PiecewiseAcceleratorGraphRunner:
                         partial(
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
+                            node_name=self._node_name,
                         ),
                         f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                     )
@@ -2038,6 +2123,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
+                node_name=self._node_name, stream=self._capture_stream,
             )
 
         self._graphs[PiecewiseGraphKey(
@@ -2073,8 +2159,7 @@ class PiecewiseAcceleratorGraphRunner:
             )
 
         def run_fn():
-            with self._step_runner.compute_scope(step):
-                return self._normalize_output(fn(call))
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)
@@ -2084,7 +2169,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # as in `AcceleratorGraphRunner._warmed`
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type):
+                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name):
                     warm_outputs = run_fn()
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -2142,9 +2227,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        if self._config.declare_step is None:
-            return None
-        step = self._declared_step(request_ids, seq_lens)
+        step = self._region_step(request_ids, seq_lens)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2155,18 +2238,18 @@ class PiecewiseAcceleratorGraphRunner:
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
             force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
+            idle=bucket.idle,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
         return step
 
-    def _declared_step(self, request_ids, seq_lens) -> SubmoduleStep | None:
-        """The region's declaration, plus, for a ``segment_rows`` region, its segments
-        under each resource that takes them as its step, as ``declared_step`` adds them
-        for a node: a request's merged into one, as the region's bucket holds a row per
-        request."""
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
-        return with_segment_steps(step, self._segment_keys, f"piecewise region {self._label!r}", per_request=True)
+    def _region_step(self, request_ids: list[int], seq_lens: list[int]):
+        """The config's step for the region, with a step of its own segments under each of
+        the node's resources that takes them (``with_segment_steps``)."""
+        return with_segment_steps(
+            self._config.region_step(list(request_ids), list(seq_lens)), self._segment_keys,
+        )
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
@@ -2208,9 +2291,10 @@ class PiecewiseAcceleratorGraphRunner:
         """The captured bucket serving this call, or None for eager.
 
         BATCHED buckets are fixed by the padded batch size; PACKED ones take
-        the smallest captured token bucket that fits.
+        the smallest captured token bucket that fits. A ``one_row_per_step``
+        region resolves every batch as one row.
         """
-        padded_bs = self._padded_bs(batch_size)
+        padded_bs = self._padded_bs(1 if self._config.one_row_per_step else batch_size)
         if padded_bs is None:
             return None
         if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
@@ -2238,9 +2322,17 @@ class PiecewiseAcceleratorGraphRunner:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
 
-    def can_lease(self, inputs: list[NodeInputs]) -> bool:
-        """The config's ``can_lease`` for this batch; True when it sets none."""
+    def can_lease(self, inputs: list[NodeInputs], request_ids: Sequence) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none. A region
+        captured idle (``_idle``) is refused a batch some row of which uses an idle-capable
+        resource (its answer is the same on every rank), which runs the region eagerly
+        under the node's step."""
+        if self._config.one_row_per_step and not self._rows_idle(request_ids):
+            return False
         return self._config.can_lease is None or self._config.can_lease(inputs)
+
+    def _rows_idle(self, request_ids: Sequence) -> bool:
+        return all(self._resources[key].idle_for(request_ids) for key in self._idle_keys)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
@@ -2271,7 +2363,20 @@ class PiecewiseAcceleratorGraphRunner:
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
+
+        A ``one_row_per_step`` region replays the step as one row named by its
+        first request, however many requests or segments it is passed, with the node's
+        idle-capable resources idle (``can_lease``): no row may use them.
         """
+        if self._config.one_row_per_step:
+            if request_ids is not None and not self._rows_idle(request_ids):
+                raise RuntimeError(
+                    f"piecewise {self._label!r} replays one row per step, idle, but a row of "
+                    f"this step uses {list(self._idle_keys)} (can_lease refuses such a step)"
+                )
+            real_bs = 1
+            if request_ids is not None:
+                request_ids = request_ids[:1]
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)

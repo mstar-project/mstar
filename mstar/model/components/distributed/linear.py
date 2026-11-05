@@ -5,6 +5,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
+from mstar.model.components.quant_linear import QuantCapability
 
 
 class _ColumnLora(LoraBound):
@@ -31,6 +32,11 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
 
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
+
+    ``output_start``: outputs below it are never computed and read ``-inf``,
+    for an LM head whose low vocab rows a model never samples. Each rank
+    computes its shard's part of the window, so the result does not depend on
+    the TP size.
     """
 
     lora_twin = _ColumnLora
@@ -43,7 +49,8 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         bias: bool = False,
         gather_output: bool = False,
         skip_bias_add: bool = False,
-        dtype: torch.dtype | None = None
+        dtype: torch.dtype | None = None,
+        output_start: int = 0,
     ):
         super().__init__()
         # Divide the weight matrix along the last dimension.
@@ -52,6 +59,11 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
+        # the first of this rank's rows inside the window
+        self._local_output_start = min(
+            max(output_start - self.tp_rank * self.output_size_per_partition, 0),
+            self.output_size_per_partition,
+        )
 
         self.weight = nn.Parameter(
             torch.empty(self.output_size_per_partition, self.input_size_per_partition, dtype=dtype)
@@ -123,6 +135,14 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
     def _local(self, input_) -> torch.Tensor:
         """This rank's output columns."""
         bias = self.bias if not self.skip_bias_add else None
+        start = self._local_output_start
+        if start:
+            return torch.nn.functional.pad(
+                torch.nn.functional.linear(
+                    input_, self.weight[start:], None if bias is None else bias[start:],
+                ),
+                (start, 0), value=float("-inf"),
+            )
         return torch.nn.functional.linear(input_, self.weight, bias)
 
     def _gather(self, output_parallel: torch.Tensor) -> torch.Tensor:
@@ -131,15 +151,18 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
             return self.comm_group.all_gather(output_parallel, dim=-1)
         return output_parallel
 
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
+            "([N / tp, K] here) inside that forward, which takes no format yet"
+        ))
+
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
             in_features=self.input_size_per_partition,
             out_slices=(self.output_size_per_partition * self.tp_size,),
             parallel="column",
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.input_size_per_partition, self.output_size_per_partition
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -482,15 +505,18 @@ class RowParallelLinear(nn.Module, LoraCapable):
 
         return output
 
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
+            "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"
+        ))
+
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
             in_features=self.input_size_per_partition * self.tp_size,
             out_slices=(self.output_size_per_partition,),
             parallel="row",
         )
-
-    def lora_local_shape(self) -> tuple[int, int]:
-        return self.input_size_per_partition, self.output_size_per_partition
 
 class KVColumnParallelLinear(ColumnParallelLinear):
     """One K or V projection, sharded by head, replicated when heads run out.

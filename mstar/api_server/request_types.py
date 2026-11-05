@@ -16,6 +16,12 @@ class ResultChunk:
     modality: str  # "text" | "image" | "audio" | "video" | "video_frame"
     data: bytes  # raw payload (text encoded as utf-8)
     metadata: dict = field(default_factory=dict)
+    # --log-stats only: when the output tensor was read (None for a value
+    # sent inline), and the seconds spent postprocessing it
+    # (``Model.postprocess``, or its share of the step's
+    # ``postprocess_inline`` call for a value sent inline)
+    read_time: float | None = None
+    postprocess_s: float = 0.0
 
 
 @dataclass
@@ -39,6 +45,9 @@ class ResultTokens:
     signal: str
     modality: str
     metadata: dict = field(default_factory=dict)
+    # per request, its sampled token's log-prob or None; None when no
+    # request of the step asked
+    logprobs: list[float | None] | None = None
 
 
 @dataclass
@@ -165,6 +174,7 @@ class ClientAppend:
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
     # Answers the append as late, with an error naming why; called from the
-    # preprocess thread when the model routes items to a stream the client
-    # already ended. None: nobody to answer.
+    # preprocess thread when the model routes items to a stream that has
+    # ended (by the client, or with its consuming partition). None: nobody
+    # to answer.
     on_late: Callable[[str], None] | None = field(default=None, compare=False)

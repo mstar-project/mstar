@@ -44,6 +44,7 @@ from mstar.model.base import (  # noqa: E402
     declared_resources,
     serving_resources,
 )
+from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.streaming.topology import PartitionTopology  # noqa: E402
 
 PAGE_SIZE = 16
@@ -56,13 +57,16 @@ def _lora_spec() -> LoraSpec:
     return LoraSpec(
         resource_key=LORA_RESOURCE_KEY, nodes={NODE}, num_layers=1,
         targets={"q": LoraTarget(in_features=8, out_slices=(8,))},
-        module_map=lambda m: LoraModuleRef("q", 0) if m == "layers.0.q" else None,
+        module_map=ModuleLoraMap({"layers.0.q": LoraModuleRef("q", 0)}),
         backend="torch",
     )
 
 
 class _Model:
     """Declares one id-keyed label and a LoRA spec."""
+
+    # names a checkpoint, so its prefix cache opens without a salt
+    checkpoint_path = "stub"
 
     def kv_labels(self):
         return {"kv": {"main": KVLabel(keys=PrefixKeys(TENSOR, (WALK,)))}}
@@ -105,7 +109,7 @@ def _deployment(adapters: dict[str, str] | None) -> dict:
     resources = {"kv": {"page_size": PAGE_SIZE}}
     if adapters is not None:
         resources[LORA_RESOURCE_KEY] = {"adapters": dict(adapters)}
-    return {"model": "stub", "resources": resources}
+    return {"model": "stub", "resources": resources, "node_groups": [{"ranks": [0], "node_names": [NODE]}]}
 
 
 def _worker(model, config: dict) -> PreprocessWorkerThread:

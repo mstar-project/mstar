@@ -21,7 +21,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
@@ -238,6 +238,39 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     assert _pages(leader, "big") == _pages(follower, "big"), "one rank kept pages the other evicted"
 
 
+def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_page_only_the_index_holds():
+    ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
+    x = _tokens(2 * PAGE_SIZE + 1, seed=40)
+    z, h = (x[:2 * PAGE_SIZE] + _tokens(n, seed=s) for n, s in ((PAGE_SIZE + 3, 41), (3, 42)))
+    steps = {}
+    for kv in ranks:
+        for rid, tokens in (("x", x), ("z", z), ("h", h)):
+            _ingest(kv, rid, tokens)
+        # x and z prefill in one step, so z finds nothing cached and loses x's keys at commit
+        steps[kv] = (_step(kv, "x", len(x)), _step(kv, "z", len(z)))
+        kv.commit(steps[kv][0], _ctx("x"))
+        kv.remove_request("x")
+    head = _send(leader, "h")  # rank 0 leases x's pages before z commits, the follower adopts after
+    head.speculative, head.spec_from_seq = True, 4
+    for kv in ranks:
+        kv.commit(steps[kv][1], _ctx("z"))
+    worker = _follower_worker(follower)
+    worker.scheduler.register_tp_follow(head)
+    assert worker.scheduler.settle_tp_follow_delta(caught_up=True)
+    worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
+    _abandon(leader, "h")
+    for kv in ranks:
+        kv.remove_request("z")
+        kv.remove_request("h")
+
+    big = _tokens(9 * PAGE_SIZE, seed=43)
+    for kv in ranks:
+        _ingest(kv, "big", big)
+        _run(kv, "big", big)
+
+    assert _pages(leader, "big") == _pages(follower, "big"), "the ranks linked z's page differently and evicted apart"
+
+
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
     ranks = leader, follower = _manager(0), _manager(1)
     for kv in ranks:
@@ -271,22 +304,16 @@ def test_above_one_rank_a_commit_caches_no_image_end():
     )
 
 
-def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
-    assert _manager(0, opt_in=False)._index is None
-    assert _manager(0)._index is not None
-
-
-def test_the_serving_config_turns_on_prefix_cache_tp():
+def test_above_one_rank_the_cache_opens_only_where_the_serving_config_opts_in():
     spec = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2, max_num_pages=32,
         page_size=PAGE_SIZE,
     ))
+    assert "kv" not in opening_prefix_caches([spec], {NODE: 2}, checkpoint_named=True)
     apply_yaml_overrides([spec], yaml.safe_load("resources:\n  kv:\n    prefix_cache_tp: true\n"))
-    kv = KVManager(
-        cfg=spec.config, name="kv", joint_comm_group=SimpleNamespace(rank=0, world_size=2),
-        transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    assert "kv" in opening_prefix_caches([spec], {NODE: 2}, checkpoint_named=True), (
+        "the serving config's prefix_cache_tp never reached the rule"
     )
-    assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"
 
 
 def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(monkeypatch):
@@ -361,3 +388,39 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
     assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
     assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
+
+
+def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
+    """Rank 0 leases the cached prefix a chunked row's chunks start past as it
+    sends the step. The lease goes out with the step, so a
+    follower's first chunk finds the same prefix; its own probe would find
+    none, and its chunk would not start where rank 0's does."""
+    from mstar.engine.chunking import ChunkingManagement, ChunkRange
+
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(40, seed=1)
+    _cache(ranks, "b0", shared)
+    for kv in ranks:
+        _ingest(kv, "b", prompt)
+
+    head = _send(leader, "b")  # rank 0 leases the prefix as it sends the step
+    start = leader.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt))).tokens
+    assert start == 5 * PAGE_SIZE
+    assert _follow(follower, head)
+
+    class _Prompt(_Submodule):
+        def prepare_inputs(self, **kwargs):
+            return ARNodeInputs(input_ids=torch.tensor(prompt), input_seq_len=len(prompt))
+
+    engine = _engine(follower)
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Prompt(), resources={})
+    engine._chunking = ChunkingManagement(engine._submodules)
+    batch = SimpleNamespace(
+        node_name=NODE, per_request_info_wrapped={"b": None}, per_request_input_tensors={},
+        final_stream_rids=set(), per_request_input_metadata={}, first_chunk_rids=set(),
+    )
+    end = start + PAGE_SIZE
+    first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
+
+    assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)

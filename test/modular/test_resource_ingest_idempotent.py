@@ -1,10 +1,8 @@
-"""A second ingest of a request leaves its resource state alone.
+"""A request ingested after its handle was removed starts from a clean slate.
 
-The conductor sends one NewRequest per partition, all with the same request id,
-and the worker ingests engine resources on each, so a worker serving two
-partitions of a request ingests it twice. The second can arrive after a node of
-the first partition has already committed a step: a reset there would put the
-next decode back at position 0 with an empty penalty mask, and nothing raises.
+The worker opens a request's resources once, on its first NewRequest, and handles
+are recycled after removal, so the next request to get a handle must not inherit
+the position counter, penalty mask or RNG offset of the one before it.
 """
 
 from __future__ import annotations
@@ -84,36 +82,8 @@ def _sampled(sampler, token: int = 5) -> int:
     return token
 
 
-def test_a_second_ingest_keeps_the_position_counter():
-    runner = _runner()
-    runner.ingest_request(RID)
-    assert _step(runner, 4) == [0, 1, 2, 3]
-
-    runner.ingest_request(RID)  # the request's second partition on this worker
-
-    assert _step(runner, 2) == [4, 5], "the second ingest reset the position counter"
-
-
-def test_a_second_ingest_keeps_the_sampler_state():
-    res = SamplerResource(vocab_size=16, enable_repetion_penalty=True, device=CPU)
-    cfg = SamplingReqConfig(temperature=0.7, top_k=4, repetition_penalty=1.3)
-    res.ingest_request(RID, cfg)
-    sampler = res._sampler
-    token = _sampled(sampler)
-    offset = sampler._step_offset[RID]
-
-    res.ingest_request(RID, cfg)
-
-    mask = sampler.get_token_mask(RID)._seen_token_mask
-    assert mask is not None and bool(mask[token]), "the seen-token mask was reset"
-    assert sampler._step_offset[RID] == offset, "the RNG offset was reset"
-    assert sampler._sampling_config[RID].temperature == pytest.approx(0.7)
-    assert sampler._sampling_config[RID].top_k == 4
-    assert RID in res._penalty_rids
-
-
 def test_remove_then_ingest_still_starts_fresh():
-    """Idempotence must not outlive the request: a recycled handle starts clean."""
+    """A recycled handle starts clean."""
     runner = _runner()
     runner.ingest_request(RID)
     _step(runner, 4)

@@ -13,7 +13,11 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
+from mstar.engine.resources.lora.checkpoint import (
+    normalize_lora_key,
+    parse_lora_key,
+    read_lora_file,
+)
 from mstar.engine.resources.lora.config import (
     AdapterInfo,
     LoraSpec,
@@ -139,7 +143,8 @@ def classify_adapter(spec: LoraSpec, shapes: dict[str, dict[str, tuple[int, ...]
 def check_adapter_file(spec: LoraSpec, name: str, path: str) -> bytes:
     """The adapter at ``path`` checked against ``spec`` and its digest, which a worker's
     read holds the file to; the digest is of the read that was checked. Raises
-    ``ValueError`` for an adapter the deployment cannot serve."""
+    ``ValueError`` for an adapter the deployment cannot serve (``OSError`` for a file
+    that is not a LoRA adapter, as ``read_lora_file`` refuses it)."""
     raw = read_lora_file(path, convert_keys=spec.convert_keys)
     spec.check_adapter(name, classify_adapter(spec, {
         module: {"A": tuple(layer.a.shape), "B": tuple(layer.b.shape)}
@@ -170,7 +175,14 @@ def check_adapters(spec: LoraSpec) -> dict[str, bytes]:
 
 
 class LoraAdapterStore:
-    """Adapters held in pinned host memory, least recently used dropped past ``capacity``."""
+    """Adapters held in pinned host memory.
+
+    Which adapters it holds follows from the ``hold`` calls alone, in their order: each
+    makes an adapter the most recent, dropping the least recent past ``capacity`` but none
+    the call's ``keep`` names. A held adapter's copy arrives later, by ``put``, once read.
+    So when a read lands or fails never changes what is held, and ranks that make the same
+    calls hold the same set.
+    """
 
     def __init__(
         self, spec: LoraSpec, rank: int = 0, world_size: int = 1, pin: bool | None = None,
@@ -188,26 +200,46 @@ class LoraAdapterStore:
             name: {layer: row for row, layer in enumerate(_target_layers(spec, t))}
             for name, t in spec.targets.items()
         }
-        self._adapters: OrderedDict[str, LoadedAdapter] = OrderedDict()
+        # held adapters, least recent first; None until a held adapter's copy is put
+        self._adapters: OrderedDict[str, LoadedAdapter | None] = OrderedDict()
 
     def __contains__(self, name: str) -> bool:
-        return name in self._adapters
-
-    def __len__(self) -> int:
-        return len(self._adapters)
+        """Whether ``name``'s copy is in."""
+        return self._adapters.get(name) is not None
 
     def get(self, name: str) -> LoadedAdapter | None:
-        adapter = self._adapters.get(name)
-        if adapter is not None:
-            self._adapters.move_to_end(name)
-        return adapter
+        return self._adapters.get(name)
+
+    def hold(self, name: str, keep: Collection[str] = ()) -> bool:
+        """Make ``name`` the most recent adapter held, dropping the least recent past
+        ``capacity``, but none named in ``keep`` (which may hold the tier past capacity for
+        a while). True when it was not held, so its copy is the caller's to read in."""
+        new = name not in self._adapters
+        if new:
+            self._adapters[name] = None
+        self._adapters.move_to_end(name)
+        excess = len(self._adapters) - self._spec.cpu_capacity
+        if excess > 0:
+            for dropped in [n for n in self._adapters if n not in keep and n != name][:excess]:
+                del self._adapters[dropped]
+                logger.info("LoRA store: dropped %s from the host tier", dropped)
+        return new
+
+    def put(self, adapter: LoadedAdapter) -> bool:
+        """``adapter``'s copy, kept if it is still held."""
+        if adapter.name not in self._adapters:
+            return False
+        self._adapters[adapter.name] = adapter
+        return True
 
     def load(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
-        """The adapter under ``name``, read from ``path`` unless it is already held."""
+        """Hold ``name`` and read it from ``path`` unless its copy is in."""
+        self.hold(name)
         adapter = self.get(name)
-        if adapter is not None:
-            return adapter
-        return self.put(self.read(name, path, digest))
+        if adapter is None:
+            adapter = self.read(name, path, digest)
+            self.put(adapter)
+        return adapter
 
     def read(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
         """``path`` read and sharded for this rank, without holding it: a caller can read
@@ -298,18 +330,6 @@ class LoraAdapterStore:
             b=b_host,
             layer_ranks={t: _pinned((a_live[t] & b_live[t]).to(torch.int32) * rank, self._pin) for t in a_host},
         )
-
-    def put(self, adapter: LoadedAdapter, keep: Collection[str] = ()) -> LoadedAdapter:
-        """Hold ``adapter``, dropping the least recently used past ``capacity``, but none
-        named in ``keep`` (which may hold the tier past capacity for a while)."""
-        self._adapters[adapter.name] = adapter
-        self._adapters.move_to_end(adapter.name)
-        excess = len(self._adapters) - self._spec.cpu_capacity
-        if excess > 0:
-            for dropped in [n for n in self._adapters if n not in keep and n != adapter.name][:excess]:
-                del self._adapters[dropped]
-                logger.info("LoRA store: dropped %s from the host tier", dropped)
-        return adapter
 
     def drop(self, name: str) -> None:
         self._adapters.pop(name, None)

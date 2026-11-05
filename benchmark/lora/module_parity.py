@@ -4,7 +4,7 @@ weights and real or random adapters, on GPU. Nothing here runs in CI.
 Per model (``MODELS``): the LoRA node's submodule is built by the model itself (its
 checkpoint, its loader, bf16 on CUDA), its LoRA pool on CUDA (Triton kernels, bf16
 slots) is bound by the generic path, and one step is declared through
-``declared_step`` over a batch mixing every adapter and the base model. Phases, each
+``engine_step`` over a batch mixing every adapter and the base model. Phases, each
 writing JSON under ``--out``:
 
 ``merged``
@@ -18,8 +18,9 @@ writing JSON under ``--out``:
 ``hf``
     Models with a transformers reference for the LoRA node (``MODELS[...].hf``):
     Orpheus (``LlamaForCausalLM`` + ``PeftModel``), Higgs Audio's LLM (``Qwen3ForCausalLM``
-    over the checkpoint's text weights), the Qwen3-Omni Thinker (transformers' thinker)
-    and Chatterbox T3 (transformers' ``LlamaModel`` under the speech head); the adapter
+    over the checkpoint's text weights), the Qwen3-Omni Thinker (transformers' thinker),
+    the Qwen3-TTS Talker (``Qwen3ForCausalLM`` over its codec embedding, stack and
+    codec head) and Chatterbox T3 (transformers' ``LlamaModel`` under the speech head); the adapter
     goes in through PEFT (``inject_adapter_in_model`` where the reference is not a
     ``PreTrainedModel`` whose layout the adapter names). The stub applies the
     reference's own RoPE. Rule: top-1 in the reference's top-5, cosine at least 0.99,
@@ -53,6 +54,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable
@@ -82,7 +84,7 @@ class ModelSpec:
     node: str
     prompts: Callable          # (model) -> list of 1-D id tensors
     run: Callable              # (submodule, ids, lengths, rope) -> last-token logits, a row each
-    declare: Callable          # (submodule, rids, ids) -> SubmoduleStep, via declared_step
+    declare: Callable          # (submodule, rids, ids) -> SubmoduleStep, via engine_step
     config: str                # the stock serving config
     request: dict              # serve: /generate fields (output_modalities, model_kwargs, audio)
     hf: Callable | None = None  # (model) -> HfReference
@@ -191,6 +193,19 @@ def _hf_rope(rotary, three_d: bool = False):
     return rope
 
 
+def _fp32_rotary(module) -> None:
+    """Every rotary embedding under ``module`` with its frequencies recomputed in fp32. A
+    reference built and then cast whole with ``.to(torch.bfloat16)`` rounds its
+    ``inv_freq`` buffer too, which transformers' own bf16 models keep in fp32."""
+    import torch
+
+    for rotary in module.modules():
+        if isinstance(getattr(rotary, "inv_freq", None), torch.Tensor) and hasattr(rotary, "config"):
+            fresh = type(rotary)(rotary.config)
+            rotary.inv_freq = fresh.inv_freq.to(rotary.inv_freq.device)
+            rotary.original_inv_freq = fresh.original_inv_freq.to(rotary.inv_freq.device)
+
+
 def _load_hf(module, snapshot: str, rename, strict: bool = True, files=None) -> None:
     """The checkpoint's tensors into ``module`` under ``rename`` (None skips one)."""
     import torch
@@ -218,7 +233,7 @@ def _snapshot(model) -> str:
 # --- per model ----------------------------------------------------------------------------
 
 def _orpheus() -> ModelSpec:
-    from mstar.model.submodule_base import declared_step
+    from mstar.model.submodule_base import engine_step
 
     def prompts(model):
         import torch
@@ -247,7 +262,7 @@ def _orpheus() -> ModelSpec:
         )
 
     return ModelSpec(
-        "LLM", prompts, run, lambda sub, rids, ids: declared_step(sub, "prefill", rids, _ar_inputs(ids)),
+        "LLM", prompts, run, lambda sub, rids, ids: engine_step(sub, "prefill", rids, _ar_inputs(ids)),
         config="configs/orpheus_colocated.yaml",
         request={"output_modalities": "audio", "model_kwargs": {"voice": "tara", "temperature": 0.0}},
         hf=hf,
@@ -255,7 +270,7 @@ def _orpheus() -> ModelSpec:
 
 
 def _higgs() -> ModelSpec:
-    from mstar.model.submodule_base import declared_step
+    from mstar.model.submodule_base import engine_step
 
     def run(sub, ids, lengths, rope=None):
         _stub_attention(sub.model, lengths, rope)
@@ -284,6 +299,7 @@ def _higgs() -> ModelSpec:
             return name if name.startswith("lm_head") else f"model.{name}"
 
         _load_hf(ref, _snapshot(model), rename)
+        _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
             model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
@@ -292,7 +308,7 @@ def _higgs() -> ModelSpec:
 
     return ModelSpec(
         "LLM", lambda model: [model.tokenizer(t, return_tensors="pt").input_ids[0] for t in TEXTS], run,
-        lambda sub, rids, ids: declared_step(sub, "prefill_text", rids, _ar_inputs(ids)),
+        lambda sub, rids, ids: engine_step(sub, "prefill_text", rids, _ar_inputs(ids)),
         config="configs/higgs_audio.yaml",
         request={"output_modalities": "text", "model_kwargs": {"temperature": 0.0}, "audio": True},
         hf=hf,
@@ -300,7 +316,7 @@ def _higgs() -> ModelSpec:
 
 
 def _qwen3_omni() -> ModelSpec:
-    from mstar.model.submodule_base import declared_step
+    from mstar.model.submodule_base import engine_step
 
     def run(sub, ids, lengths, rope=None):
         _stub_attention(sub.model, lengths, rope)
@@ -314,15 +330,24 @@ def _qwen3_omni() -> ModelSpec:
         thinker = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
             _snapshot(model), torch_dtype=torch.bfloat16, device_map="cuda",
         ).thinker
+        # newer transformers 5 releases (5.22, not 5.19) keep the thinker's text stack
+        # under `model.language_model`, where the checkpoint (and so an adapter) names it `model`
+        text = getattr(thinker.model, "language_model", thinker.model)
+        nested = text is not thinker.model
+
+        def adapter_name(module):
+            module = module.removeprefix("thinker.")
+            return re.sub(r"^model\.", "model.language_model.", module) if nested else module
+
         return HfReference(
             forward=lambda m, ids: m(input_ids=ids[None].cuda()).logits[0, -1].float(),
-            model=thinker.eval(), rope=_hf_rope(thinker.model.rotary_emb, three_d=True),
-            adapter_name=lambda module: module.removeprefix("thinker."),
+            model=thinker.eval(), rope=_hf_rope(text.rotary_emb, three_d=True),
+            adapter_name=adapter_name,
         )
 
     return ModelSpec(
         "Thinker", lambda model: _random_ids(150000), run,
-        lambda sub, rids, ids: declared_step(sub, "prefill_text", rids, _ar_inputs(ids)),
+        lambda sub, rids, ids: engine_step(sub, "prefill_text", rids, _ar_inputs(ids)),
         config="configs/qwen3omni_colocated.yaml",
         request={"output_modalities": "text", "model_kwargs": {"temperature": 0.0}},
         hf=hf,
@@ -330,23 +355,59 @@ def _qwen3_omni() -> ModelSpec:
 
 
 def _qwen3_tts() -> ModelSpec:
-    from mstar.model.submodule_base import declared_step
+    from mstar.model.submodule_base import engine_step
 
     def run(sub, ids, lengths, rope=None):
         _stub_attention(sub.model, lengths, rope)
         hidden = sub.model(sub.model.model.codec_embedding(ids), label="main")
         return sub.model.codec_head(_last(hidden, lengths)).float()
 
+    def hf(model):
+        """transformers' Qwen3 over the Talker's checkpoint tensors (the codec embedding as
+        its token embedding, the codec-group-0 head as its LM head): the stack the Talker
+        node runs."""
+        import torch
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        t = model.config.talker
+        ref = Qwen3ForCausalLM(Qwen3Config(
+            vocab_size=t.vocab_size, hidden_size=t.hidden_size, intermediate_size=t.intermediate_size,
+            num_hidden_layers=t.num_hidden_layers, num_attention_heads=t.num_attention_heads,
+            num_key_value_heads=t.num_key_value_heads, head_dim=t.head_dim, rms_norm_eps=t.rms_norm_eps,
+            rope_theta=t.rope_theta, max_position_embeddings=t.max_position_embeddings,
+            tie_word_embeddings=False,
+        )).to(torch.bfloat16)
+        native = {"model.codec_embedding.weight": "model.embed_tokens.weight", "codec_head.weight": "lm_head.weight"}
+
+        def rename(name):
+            name = name.removeprefix("talker.") if name.startswith("talker.") else None
+            if name is None or name.startswith(("code_predictor.", "text_projection.", "model.text_embedding.")):
+                return None
+            return native.get(name, name)
+
+        def adapter_name(module):
+            weight = module.removeprefix("talker.") + ".weight"
+            return native.get(weight, weight).removesuffix(".weight")
+
+        _load_hf(ref, _snapshot(model), rename)
+        _fp32_rotary(ref)
+        return HfReference(
+            forward=lambda m, ids: m(ids[None].cuda()).logits[0, -1].float(),
+            model=ref.cuda().eval(), rope=_hf_rope(ref.model.rotary_emb),
+            adapter_name=adapter_name,
+        )
+
     return ModelSpec(
         "Talker", lambda model: _random_ids(2048), run,
-        lambda sub, rids, ids: declared_step(sub, "talker_prefill", rids, _ar_inputs(ids)),
+        lambda sub, rids, ids: engine_step(sub, "talker_prefill", rids, _ar_inputs(ids)),
         config="configs/qwen3tts.yaml",
         request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0}},
+        hf=hf,
     )
 
 
 def _chatterbox() -> ModelSpec:
-    from mstar.model.submodule_base import declared_step
+    from mstar.model.submodule_base import engine_step
 
     def run(sub, ids, lengths, rope=None):
         _stub_attention(sub.model, lengths, rope)
@@ -357,7 +418,7 @@ def _chatterbox() -> ModelSpec:
         from mstar.model.submodule_base import ARNodeInputs
 
         # without guidance, a row per request (the CPU test covers guidance's two)
-        return declared_step(sub, "prefill", rids, [
+        return engine_step(sub, "prefill", rids, [
             ARNodeInputs(input_seq_len=len(i), input_embeds=sub.model.speech_emb(i), resource_step_info=False)
             for i in ids
         ])
@@ -394,6 +455,7 @@ def _chatterbox() -> ModelSpec:
         _load_hf(ref, _snapshot(model),
                  lambda n: n if n.startswith(keep) and not n.startswith("tfmr.embed_tokens.") else None,
                  strict=False, files=(model.config.t3_weights,))
+        _fp32_rotary(ref)
         return HfReference(
             forward=lambda m, ids: m(ids.cuda()).float(), model=ref.cuda().eval(),
             rope=_hf_rope(ref.tfmr.rotary_emb),
@@ -549,8 +611,8 @@ def _row(rows, adapter, j) -> str:
 
 
 def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rope=None):
-    """Every (adapter, prompt) in one mixed step through the generic path, inside the
-    step's compute scope."""
+    """Every (adapter, prompt) in one mixed step through the generic path, run between
+    the step's plan and its commit, as the engine runs a forward."""
     import torch
 
     from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig
@@ -574,16 +636,14 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
     for rid, adapter, _ in rows:
         pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter))
     ctx = StepContext(request_ids=rids, graph_walk="prefill", slot=0, capture=False)
-    assert pool.admit(step.get(LORA_RESOURCE_KEY), ctx).ok
-    pool.plan(step.get(LORA_RESOURCE_KEY), ctx)
+    lora_step = step.get(LORA_RESOURCE_KEY)
+    assert pool.admit(lora_step, ctx).ok
+    pool.plan(lora_step, ctx)
     lengths = [len(i) for _, _, i in rows]
     _set_positions(lengths)
-    pool.enter_compute()
-    try:
-        with torch.no_grad():
-            logits = spec_.run(sub, torch.cat([i for _, _, i in rows]).cuda(), lengths, rope)
-    finally:
-        pool.exit_compute()
+    with torch.no_grad():
+        logits = spec_.run(sub, torch.cat([i for _, _, i in rows]).cuda(), lengths, rope)
+    pool.commit(lora_step, ctx)
     return {rid: logits[k] for k, rid in enumerate(rids)}, rows
 
 
@@ -853,6 +913,10 @@ def _merged_checkpoint(args, out: Path, adapter_path: str) -> Path:
         alias.update({k: f"{names[0]}.weight" for k in (spec.module_map.rules.native(f"{n}.weight") for n in names)
                       if k is not None})
     out.mkdir(parents=True, exist_ok=True)
+    # every file holding a tensor is merged, not the first: a snapshot can hold another
+    # checkpoint under the same names (Chatterbox's multilingual T3 beside t3_cfg), and
+    # the loader reads only one of them
+    merged = set()
     for path in snapshot.rglob("*"):
         target = out / path.relative_to(snapshot)
         if path.is_dir():
@@ -865,11 +929,12 @@ def _merged_checkpoint(args, out: Path, adapter_path: str) -> Path:
             os.symlink(path.resolve(), target)
             continue
         for k in hit:
-            delta = deltas.pop(alias[native(k)])
-            tensors[k] = (tensors[k].float() + delta.view_as(tensors[k])).to(tensors[k].dtype)
+            name = alias[native(k)]
+            merged.add(name)
+            tensors[k] = (tensors[k].float() + deltas[name].view_as(tensors[k])).to(tensors[k].dtype)
         save_file(tensors, str(target))
-    if deltas:
-        raise SystemExit(f"merge: {sorted(deltas)[:5]} are in no checkpoint shard")
+    if missing := sorted(set(deltas) - merged):
+        raise SystemExit(f"merge: {missing[:5]} are in no checkpoint shard")
     return out
 
 

@@ -4,11 +4,12 @@
 built on the meta device at one rank, so any process can declare it, and only once the
 spec is read, so a deployment without LoRA builds nothing), finds every
 LoRA-capable module (``capable.py``), groups them into targets by their role in a layer
-stack (``layers.N.<role>`` / ``blocks.N.<role>``; a module outside the stacks is a target
-of its own), and places checkpoint modules with the root's own ``CheckpointRules`` (the
-ones its weight loader uses). The model states only what its modules cannot: how a
+stack (``<stack>.N.<role>``, a stack being a ``ModuleList`` or ``Sequential`` whose
+entries agree in shape at that role; any other module is a target of its own), and
+places checkpoint modules with the root's own ``CheckpointRules`` (the ones its weight
+loader uses). The model states only what its modules cannot: how a
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
-(``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
+(``exclude``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
 A module itself names the children it runs through their weights rather than their
 forward (``lora_unservable``), which the walk refuses.
@@ -27,7 +28,6 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
-import re
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -51,8 +51,17 @@ logger = logging.getLogger(__name__)
 PER_SEGMENT = "segment"
 RowSpec = int | Literal["segment"]
 
-# `<stack>.<layer>.<role>`, the first stack in the path
-_STACK = re.compile(r"^(?P<stack>(?:.*?\.)?(?:layers|blocks))\.(?P<layer>\d+)\.(?P<role>.+)$")
+_STACKS = (nn.ModuleList, nn.Sequential)
+
+
+def _in_stack(path: str, stacks: set[str]) -> tuple[str, int, str] | None:
+    """``(stack, layer, role)`` for ``path`` = ``<stack>.<layer>.<role>`` under the first
+    ``ModuleList`` or ``Sequential`` in it (``stacks``, by path), whatever it is named."""
+    parts = path.split(".")
+    for i in range(len(parts) - 1):
+        if parts[i].isdigit() and ".".join(parts[:i]) in stacks:
+            return ".".join(parts[:i]), int(parts[i]), ".".join(parts[i + 1:])
+    return None
 
 
 class AdapterRoot(NamedTuple):
@@ -92,8 +101,8 @@ class ModuleLoraMap(LoraMap):
     ``aliases``) goes through the loader's ``CheckpointRules`` (prefix, remap, stacked
     rules, then any adapter-only stacked rules) to a native module, which ``bindings``
     names. Also what binding reads: ``bindings`` below ``root_path`` (the weights root's
-    path in the node submodule), the ``deferred`` ones the node adds itself, and why a
-    module the walk found is not a target (``unservable``)."""
+    path in the node submodule), and why a module the walk found is not a target
+    (``unservable``)."""
 
     def __init__(
         self,
@@ -105,12 +114,10 @@ class ModuleLoraMap(LoraMap):
         unservable: Mapping[str, str] | None = None,
         ignore: Sequence[str] = (),
         root_path: str = "",
-        deferred: frozenset[str] = frozenset(),
     ):
         self.bindings = dict(bindings)
         self.unservable = dict(unservable or {})
         self.root_path = root_path
-        self.deferred = frozenset(deferred)
         self.rules = rules
         self._stacked = [*rules.stacked_params, *adapter_stacked_params]
         roots = [AdapterRoot(*r) for r in adapter_roots]
@@ -191,14 +198,19 @@ class ModuleLoraMap(LoraMap):
 
 class _JoinedLoraMap(LoraMap):
     """Several nodes' ``ModuleLoraMap``s as one spec's (``join_lora_specs``): a
-    checkpoint module goes to the node whose adapter roots claim it most specifically,
-    which places or refuses it."""
+    checkpoint module goes to the node that places it (the one whose adapter roots claim
+    it most specifically, when several do), and one no node places to the most specific
+    claimant, which refuses it."""
 
     def __init__(self, parts: Mapping[str, ModuleLoraMap]):
         self._parts = dict(parts)
 
     def _claimant(self, module: str) -> ModuleLoraMap:
-        return max(self._parts.values(), key=lambda m: m.claim(module))
+        """The node that places ``module``, the most specific root's when several do; with
+        none placing it, the most specific claimant, which refuses it with its reason."""
+        parts = list(self._parts.values())
+        placing = [m for m in parts if m(module) is not None]
+        return max(placing or parts, key=lambda m: m.claim(module))
 
     def __call__(self, module: str) -> LoraModuleRef | None:
         return self._claimant(module)(module)
@@ -234,7 +246,8 @@ class _Found(NamedTuple):
     path: str
     layer: int
     target: LoraTarget
-    param: str | None = None
+    role: str  # what `rows` / `names` match
+    param: str | None = None  # the parameter adapted, for a target per parameter (MoE experts)
 
 
 _EXCLUDED = "excluded by the model's LoRA declaration"
@@ -252,7 +265,6 @@ def module_lora_spec(
     rows: Mapping[str, RowSpec] | None = None,
     names: Mapping[str, str] | None = None,
     exclude: Sequence[str] | Mapping[str, str] = (),
-    deferred: Sequence[str] = (),
     ignore: Sequence[str] = (),
     embeddings: bool = False,
     convert_keys: Callable | None = None,
@@ -269,8 +281,10 @@ def module_lora_spec(
     (``CheckpointRules``); by default the root's own ``checkpoint_rules()``, so placement
     cannot drift from loading. ``adapter_stacked_params`` adds rules only adapters need
     (Tinker's split projections). Module paths, ``rows`` / ``names`` keys and ``exclude``
-    / ``deferred`` patterns are relative to ``root``; a role is the path below a stack
-    layer (``self_attn.qkv_proj``), or the whole path for a module outside the stacks.
+    patterns are relative to ``root``; a role is the path below a stack
+    layer (``self_attn.qkv_proj``), or the whole path for a module outside the stacks. A
+    stack whose entries differ in shape at a role gives each entry a target of its own,
+    named by its path, which ``rows`` still matches by the role (``names`` cannot name it).
 
     * ``rows``: role (fnmatch) -> ``PER_SEGMENT`` or a fold ``k``, for a target that sees
       other rows than the step's tokens (an LM head after the last-token select, a merger
@@ -280,15 +294,11 @@ def module_lora_spec(
     * ``exclude``: module paths (fnmatch, children included) not served, optionally
       mapped to the reason (a module called outside the planned step); an adapter
       touching one is refused with it.
-    * ``deferred``: modules whose delta the node adds itself, where the step's rows are
-      planned (``preprocess``, the forward), because it also calls them before the step
-      (an embedding run in ``prepare_inputs``): bound as ``lora_deferred``, which the
-      module's own forward never adds.
     * ``ignore``: checkpoint module paths (fnmatch) an adapter may hold that this
       deployment never runs, neither loaded nor refused.
     * ``embeddings``: serve token-embedding targets. Off by default: a node that embeds
       in ``prepare_inputs`` calls the embedding outside its planned step; turn it on when
-      every call is in the step, or list the embedding in ``deferred``.
+      every call is in the step.
 
     A module with a target per parameter (``LoraCapable.lora_targets``: MoE experts'
     ``gate_up_proj`` and ``down_proj``) is bound once per parameter, under its role plus
@@ -316,6 +326,8 @@ def module_lora_spec(
         excluded = dict(exclude) if isinstance(exclude, Mapping) else dict.fromkeys(exclude, _EXCLUDED)
         row_specs, renames = dict(rows or {}), dict(names or {})
         groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
+        stacks = {p for p, m in root.named_modules() if isinstance(m, _STACKS)}
+        walked: list[str] = []  # every module that takes, or is refused, a delta
         unservable: dict[str, str] = {}
         declared: dict[str, str] = {}  # modules' own `lora_unservable`, by exact path
         for path, module in root.named_modules():
@@ -335,6 +347,7 @@ def module_lora_spec(
             capability = lora_capability(module)
             if capability is None:
                 continue
+            walked.append(path)
             reason = _declared(path, declared)
             if reason is None and (pattern := _match(path, excluded)) is not None:
                 reason = excluded[pattern]
@@ -344,23 +357,39 @@ def module_lora_spec(
             if capability.capable is None:
                 unservable[path] = capability.reason
                 continue
-            m = _STACK.match(path)
+            found = _in_stack(path, stacks)
             for param, target in _lora_targets(capability.capable, module).items():
                 if target.kind == "embedding" and not embeddings:
                     unservable[path] = "a token embedding, which this node does not serve LoRA on"
                     continue
-                stack, role, layer = (None, path, 0) if m is None else (m["stack"], m["role"], int(m["layer"]))
+                stack, layer, role = (None, 0, path) if found is None else found
                 if param is not None:
                     role = f"{role}.{param}"
-                    renames.setdefault(role, f"{role.split('.')[-2]}_{param}")
-                groups[(stack, role)].append(_Found(path, layer, target, param))
+                groups[(stack, role)].append(_Found(path, layer, target, role, param))
+        # a stack's entries that differ in shape at a role (UNet levels, vision stages) are
+        # not one layer's target: each is a target of its own
+        mixed = [k for k, fs in groups.items() if k[0] is not None and any(f.target != fs[0].target for f in fs)]
+        for key in mixed:
+            if key[1] in renames:
+                raise ValueError(f"`names` names role {key[1]!r}, whose entries differ in shape and are each a target")
+            for f in groups.pop(key):
+                own = f.path if f.param is None else f"{f.path}.{f.param}"
+                groups[(None, own)].append(f._replace(layer=0))
+        # a target per parameter is named <module>_<parameter> (experts_gate_up_proj) by default
+        for (_, role), found in groups.items():
+            if found[0].param is not None and role == found[0].role:
+                renames.setdefault(role, f"{role.split('.')[-2]}_{found[0].param}")
+        unmatched = [p for p in excluded if not any(_match(w, [p]) for w in walked)]
+        if unmatched:
+            raise ValueError(f"`exclude` patterns {unmatched} match no LoRA-capable module of {type(root).__name__}")
         if not groups:
             raise ValueError(f"{type(root).__name__} has no LoRA-capable modules")
 
         stacked = [f.layer for (stack, _), found in groups.items() if stack is not None for f in found]
         num_layers = max(stacked, default=0) + 1
         target_names = _target_names(list(groups), renames)
-        unused = set(renames) - {role for _, role in groups}
+        roles = {found[0].role for found in groups.values()}
+        unused = set(renames) - roles
         if unused:
             raise ValueError(f"`names` names roles {sorted(unused)} that {type(root).__name__} does not have")
 
@@ -368,14 +397,8 @@ def module_lora_spec(
         dropped: dict[str, LoraTarget] = {}
         bindings: dict[str, LoraModuleRef] = {}
         for key, found in groups.items():
-            stack, role = key
+            stack = key[0]
             first = found[0].target
-            differ = [f.path for f in found if f.target != first]
-            if differ:
-                raise ValueError(
-                    f"LoRA target {role!r} has other shapes at {differ[:3]} than at "
-                    f"{found[0].path}; exclude them or give them a stack of their own"
-                )
             layers = tuple(sorted(f.layer for f in found))
             if stack is not None and layers == tuple(range(num_layers)):
                 layers = None
@@ -383,34 +406,24 @@ def module_lora_spec(
             # experts targets are served only where the YAML's `targets:` names them: each
             # slot holds every expert's A and B (GBs for a large MoE)
             (targets if first.experts == 1 else dropped)[name] = dataclasses.replace(
-                first, layers=layers, **_row_fields(row_specs, role),
+                first, layers=layers, **_row_fields(row_specs, found[0].role),
             )
             for f in found:
                 path = f.path if f.param is None else f"{f.path}.{f.param}"
                 bindings[path] = LoraModuleRef(name, f.layer, param=f.param)
-        unmatched = [p for p in row_specs if not any(fnmatch.fnmatchcase(r, p) for _, r in groups)]
+        unmatched = [p for p in row_specs if not any(fnmatch.fnmatchcase(r, p) for r in roles)]
         if unmatched:
             raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
-        deferred_paths = frozenset(p for p in bindings if _match(p, deferred) is not None)
-        unmatched = [p for p in deferred if not any(_match(b, [p]) for b in bindings)]
-        if unmatched:
-            raise ValueError(f"`deferred` patterns {unmatched} match no LoRA target module")
-        per_param = sorted(p for p in deferred_paths if bindings[p].param is not None)
-        if per_param:
-            raise ValueError(
-                f"`deferred` matches {per_param[:3]}, a target per parameter (MoE experts), whose "
-                "delta its dispatch adds; a node cannot add it itself"
-            )
         if unservable:
             logger.info(
                 "LoRA on %s: %d module(s) take no delta, e.g. %s",
                 sorted(nodes), len(unservable), [f"{p} ({r})" for p, r in list(unservable.items())[:3]],
-            )
+        )
 
         module_map = ModuleLoraMap(
             bindings, rules=placing, adapter_stacked_params=adapter_stacked_params,
             adapter_roots=adapter_roots, aliases=aliases, unservable=unservable, ignore=ignore,
-            root_path=root_path, deferred=deferred_paths,
+            root_path=root_path,
         )
         return {"num_layers": num_layers, "targets": targets, "dropped_targets": dropped,
                 "module_map": module_map, "ignored_modules": module_map.ignores}
@@ -466,8 +479,9 @@ def _target_names(keys: list[tuple[str | None, str]], names: Mapping[str, str]) 
 def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
     """One spec over the nodes of ``specs``, each a node's from ``module_lora_spec`` (an
     LLM's and its vision tower's): their targets, each naming its node, under the first's
-    key. A checkpoint module is placed by the node whose ``AdapterRoot``s claim it most
-    specifically, so one adapter file serves them all. Declared, like its parts, on first
+    key. A checkpoint module is placed by the node that places it (the one whose
+    ``AdapterRoot``s claim it most specifically, when several do), so one adapter file
+    serves them all and a module either node places is not refused by the other. Declared, like its parts, on first
     read."""
     convert_keys = specs[0].convert_keys
     if any(spec.convert_keys is not convert_keys for spec in specs):
@@ -585,7 +599,7 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None
             module = modules[path]
             held = (
                 getattr(module, "lora_params", {}).get(ref.param) if ref.param is not None
-                else getattr(module, "lora_delta", None) or getattr(module, "lora_deferred", None)
+                else getattr(module, "lora_delta", None)
             )
             if held is not None:
                 raise ValueError(f"{path} already holds a LoRA delta from another resource of this node")
@@ -599,7 +613,5 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None
             delta = pool.layer_delta(ref.target, ref.layer)
             if ref.param is not None:
                 module.lora_params = {**module.lora_params, ref.param: delta}
-            elif path in module_map.deferred:
-                module.lora_deferred = delta
             else:
                 module.lora_delta = delta
