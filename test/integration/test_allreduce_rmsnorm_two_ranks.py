@@ -1,8 +1,9 @@
 """``CommGroup.allreduce_rmsnorm`` on two real ranks: the fused all-reduce +
 norm kernel (rows up to the workspace's ``max_tokens``, eager and replayed
 from a CUDA graph) and its NCCL fallback (past it) both give
-``rms_norm(all_reduce(x))``. Needs two CUDA GPUs; skips where FlashInfer
-builds no fused workspace."""
+``rms_norm(all_reduce(x))``. Needs two peer-connected CUDA GPUs and
+FlashInfer's comm kernels; on such a box a workspace that fails to build fails
+the test, since the server would quietly lose the fusion."""
 
 from __future__ import annotations
 
@@ -95,6 +96,9 @@ def _entry(rank: int, world: int, store: str, out: dict) -> None:
 
 
 def test_the_fused_norm_matches_nccl_then_norm(tmp_path):
+    pytest.importorskip("flashinfer.comm")
+    if not torch.cuda.can_device_access_peer(0, 1):
+        pytest.skip("GPUs 0 and 1 have no peer access, which the fused all-reduce needs")
     world = 2
     with mp.Manager() as manager:
         out = manager.dict()
@@ -109,8 +113,7 @@ def test_the_fused_norm_matches_nccl_then_norm(tmp_path):
                 pytest.fail(f"the two ranks did not finish within {DEADLINE_S} s")
         results = dict(out)
     assert sorted(results) == [0, 1]
-    if not all(fused for fused, _ in results.values()):
-        pytest.skip("FlashInfer built no fused all-reduce workspace on this box")
-    for rank, (_, errors) in results.items():
+    for rank, (fused, errors) in results.items():
+        assert fused, f"rank {rank}: no fused workspace, so only the NCCL fallback ran"
         for (bias, rows), errs in errors.items():
             assert max(errs) <= TOLERANCE, (rank, bias, rows, errs)
