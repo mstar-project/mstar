@@ -85,7 +85,7 @@ class Preemption:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits in the queue for %d pages past its allotment, since moving "
+                "KV short on node=%s walk=%s: %s waits for %d pages past its allotment, since moving "
                 "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
                 node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
                 reason.pages_short,

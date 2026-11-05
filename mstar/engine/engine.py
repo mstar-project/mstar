@@ -3160,7 +3160,7 @@ class Engine:
         return self._runner.newer_than(request_id)
 
     def readmit_request(self, node_name: str, request_id: int) -> None:
-        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        """Ask the node's resources again for the request, which then waits until they fit it; see
         `Admission.readmit`."""
         self._runner.readmit(request_id, node_name)
 

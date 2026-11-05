@@ -28,7 +28,8 @@ class Admission:
     """The queues of the resources that ask, and the nodes each request was admitted on.
 
     A waiting request is admitted once it is first in every queue it is in and each resource it
-    asked reserves for it, all or nothing.
+    asked reserves for it, all or nothing. A request that asks again (`readmit`) waits in no queue, so it
+    holds up no newer request, and `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -37,6 +38,8 @@ class Admission:
         # one, in the order it first asked. `_numbered` lists the requests with a number, in that order.
         # `_waiting` holds what each waiting request asked.
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
+        # `_returns` maps each waiting request that asks again to the resource and the mark it didn't fit against, or
+        # to None until `admit_waiting` tries it. Such a request is in no queue.
         # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
         # against, until that request leaves the front of the queue.
         # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried.
@@ -48,6 +51,7 @@ class Admission:
         self._numbered: list[str] = []
         self._waiting: dict[str, _Waiting] = {}
         self._queues: dict[str, list[str]] = {key: [] for key in ask_order}
+        self._returns: dict[str, tuple[str, object] | None] = {}
         self._short: dict[str, object] = {}
         self._untried = False
         self._admitted: dict[str, dict[str, str]] = {}
@@ -99,7 +103,9 @@ class Admission:
             return None
         entry.nodes[node_name] = graph_walk
         entry.published[node_name] = published
-        tried = all(self._queues[key][0] == rid and key not in self._short for key in entry.asked)
+        tried = rid not in self._returns and all(
+            self._queues[key][0] == rid and key not in self._short for key in entry.asked
+        )
         if tried and (nodes := self._reserve(rid, entry.published.get)):
             if others := nodes.keys() - {node_name}:
                 self._started.setdefault(rid, set()).update(others)
@@ -108,22 +114,28 @@ class Admission:
 
     def readmit(self, rid: str, node_name: str, keys: Collection[str]) -> None:
         """Ask ``node_name``'s resources again for ``rid``, since a drop or a move to the host may have given
-        back what they admitted it with. A resource that did asks now, so ``rid`` waits at its arrival and no
-        later request takes the room first. ``keys`` are the resources of ``node_name`` that ask."""
+        back what they admitted it with. A resource that did asks now, and ``rid`` waits as a return unless it
+        already waits as a new request. ``keys`` are the resources of ``node_name`` that ask."""
         walk = self._admitted.get(rid, {}).pop(node_name, None)
-        if walk is not None:
-            self.admit(rid, node_name, walk, None, keys)
+        if walk is None:
+            return
+        if rid not in self._waiting:
+            self._returns[rid] = None
+        self.admit(rid, node_name, walk, None, keys)
+        if rid not in self._waiting:
+            self._returns.pop(rid, None)
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
     ) -> list[tuple[str, str]]:
-        """Admit each waiting request that is now first in every queue it is in and fits, and return
-        the (node, rid) pairs that may start. ``published_of(rid, node)`` gives what the request
-        published for that node's resources.
+        """Admit each return that now fits, oldest first, then each waiting request that is now first
+        in every queue it is in and fits, and return the (node, rid) pairs that may start.
+        ``published_of(rid, node)`` gives what the request published for that node's resources.
 
         Nothing is tried until a resource whose first waiting request didn't fit has grown, or a
-        queue has a new first request, so a pass that changed neither costs one
-        `Resource.grew_since` for each such resource.
+        queue has a new first request, and a return is tried once it starts to return or what it
+        didn't fit has grown. A pass that changed none of these costs one `Resource.grew_since` for
+        each such resource and return.
         """
         started = []
         if self._started:
@@ -132,10 +144,17 @@ class Admission:
         if not self._waiting:
             return started
         grown = [key for key, mark in self._short.items() if self._resources[key].grew_since(mark)]
-        if not grown and not self._untried:
+        returns = [
+            rid for rid, held in self._returns.items() if held is None or self._resources[held[0]].grew_since(held[1])
+        ]
+        if not grown and not returns and not self._untried:
             return started
         for key in grown:
             del self._short[key]
+        for rid in sorted(returns, key=self._arrival.__getitem__):
+            nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
+            if nodes:
+                started.extend((node, rid) for node in nodes)
         admitted = True
         while admitted:
             admitted = False
@@ -171,10 +190,12 @@ class Admission:
             entry = self._waiting[rid] = _Waiting()
             self._arrival.setdefault(rid, (True, next(self._arrivals)))
         entry.asked[key] = (node_name, graph_walk)
+        if rid in self._returns:
+            return entry
         queue = self._queues[key]
         bisect.insort(queue, rid, key=self._arrival.__getitem__)
         if queue[0] == rid:
-            # an earlier arrival, such as a dropped request, goes ahead of the request the mark measured
+            # an earlier arrival goes ahead of the request the mark measured
             self._short.pop(key, None)
         return entry
 
@@ -194,7 +215,10 @@ class Admission:
             if mark is not None:
                 for done in taken:
                     self._resources[done].unreserve(rid)
-                self._short[key] = mark
+                if rid in self._returns:
+                    self._returns[rid] = (key, mark)
+                else:
+                    self._short[key] = mark
                 return None
             taken.append(key)
         del self._waiting[rid]
@@ -205,6 +229,9 @@ class Admission:
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
         which measured ``rid``, and its next request is left for `admit_waiting` to try."""
+        if rid in self._returns:
+            del self._returns[rid]
+            return
         for key in keys:
             queue = self._queues[key]
             if queue[0] == rid:

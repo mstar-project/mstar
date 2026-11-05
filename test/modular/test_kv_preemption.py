@@ -92,6 +92,10 @@ def _queue(kv) -> list[str]:
     return _runner(kv)._admission._queues["kv"]
 
 
+def _returns(kv) -> list[str]:
+    return list(_runner(kv)._admission._returns)
+
+
 def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
     """One step of ``tokens`` for ``rid``, committed when it is admitted."""
     step = KVStep(segments=(Segment(rid, "main", tokens),))
@@ -111,7 +115,7 @@ def _running(kv, rid: str, pages: int, arrival: int) -> None:
     assert _step(kv, rid, pages * PAGE_SIZE).ok
 
 
-def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
+def test_a_dropped_request_returns_ahead_of_the_queue():
     kv = _pool()
     _running(kv, "x", 8, arrival=0)
     for rid, pages, arrival in (("c", 5, 3), ("a", 3, 1), ("b", 3, 2)):
@@ -126,7 +130,20 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
     assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
     _runner(kv).readmit("b", NODE)
 
-    assert "b" in kv._allotments and not _ready(kv, "c"), "c passed the request dropped ahead of it"
+    assert not _ready(kv, "c") and "b" in kv._allotments, "c took the room the request dropped ahead of it returns into"
+
+
+def test_a_request_that_asks_again_holds_up_no_newer_prompt():
+    """A dropped request returns with its whole history and a page, which can take long to fit. Waiting at its
+    arrival, it held back every newer prompt, though they fit."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    _request(kv, "c", 1, arrival=3)
+
+    assert _ready(kv, "c") and not _admitted(kv, "v"), "c waited behind v, which can't return yet"
 
 
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
@@ -281,7 +298,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     assert not kv._earmarks, "nothing newer frees a page"
     if not drops:
         _runner(kv).readmit("r", NODE)
-        assert _queue(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait in the queue for its shortage"
+        assert _returns(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
         returns = kv._dropped["r"].returns
@@ -473,13 +490,13 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     assert _preempt(kv, "r", short, droppable=lambda rid: False).to_host == ["b", "a"]
     _offload(kv, "b")
     _offload(kv, "a")
-    assert _queue(kv) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"
+    assert sorted(_returns(kv)) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"
 
     _remove(kv, "r")
 
     assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a"), (NODE, "b")], "b returned ahead of a"
     assert _ready(kv, "a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
-    assert _ready(kv, "b") and not _queue(kv)
+    assert _ready(kv, "b") and not _returns(kv)
 
 
 @pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
@@ -492,7 +509,7 @@ def test_an_offload_outside_preemption_reloads_as_before(decides):
     _ready(kv, "w")
     remaining = kv._allotments.get("r", manager_mod.Allotment(0)).remaining
 
-    assert _offload(kv, "r") == 5 and "r" not in _queue(kv)
+    assert _offload(kv, "r") == 5 and "r" not in _returns(kv)
 
-    assert kv.can_reload("r") and kv.reload("r"), "r waited in the queue behind w"
+    assert kv.can_reload("r") and kv.reload("r"), "r waited to return behind w"
     assert kv._allotments.get("r", manager_mod.Allotment(0)).remaining == remaining, "the reload changed r's allotment"
