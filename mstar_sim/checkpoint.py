@@ -49,6 +49,7 @@ MAX_ASSET_BYTES = 50 * 2**20
 _DUPLICATE_WEIGHTS = ("*.bin", "*.h5", "*.msgpack", "*.gguf", "*.pt", "*.pth")
 # a weight-format file this small is an asset (Chatterbox's conds.pt), not a weight copy
 SMALL_WEIGHT_FILE = 8 * 2**20
+_WEIGHT_FILES = (".pt", ".pth", ".bin", ".onnx")
 
 
 def _hidden(rel: str) -> bool:
@@ -243,14 +244,13 @@ def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
 
 
 def _build(src, out: Path) -> dict:
-    if not any(rel.endswith((".safetensors", ".pt", ".pth", ".bin", ".onnx")) for rel in src.files):
-        raise ValueError("the source has no weights (safetensors, torch or ONNX files)")
-    params, notes = 0, []
+    params, notes, kept = 0, [], False  # kept: a weight file, though a small one counts no parameters
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(src, rel, out / rel)
+            kept = True
         elif (size > (MAX_ASSET_BYTES if rel.endswith(".onnx") else SMALL_WEIGHT_FILE)
-              and rel.endswith((".pt", ".pth", ".bin", ".onnx")) and not _weight_copy(rel, src.files)):
+              and rel.endswith(_WEIGHT_FILES) and not _weight_copy(rel, src.files)):
             shapes_only = _shapes_only_onnx if rel.endswith(".onnx") else _shapes_only_torch_file
             count = shapes_only(src.fetch(rel), out / rel)
             if count is None:
@@ -258,12 +258,17 @@ def _build(src, out: Path) -> dict:
             elif rel.endswith(".onnx"):
                 notes.append(f"{rel}: its large weights read as zeros, so a runtime would run it on them")
             params += count or 0
+            kept = kept or count is not None
         elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
                 fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS)):
             notes.append(f"skipped {rel} ({size / 2**20:.0f} MB)")
         else:
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src.fetch(rel), out / rel)
+            kept = kept or rel.endswith(_WEIGHT_FILES)
+    if not kept:
+        raise ValueError(" ".join(["the source has no weights a copy can keep (safetensors, torch or ONNX files).",
+                                   *notes]))
     return {"param_count": params, "notes": notes, "revision": src.revision}
 
 

@@ -129,6 +129,10 @@ def test_a_repo_of_small_weights_is_copied_and_one_of_none_refused(tmp_path):
     (small / "voice.pth").rename(small / "config.json")
     with pytest.raises(ValueError, match="no weights"):
         synthesize(str(small), tmp_path / "empty_out")
+    (small / "config.json").unlink()  # one a copy can't keep is none either: a whole pickled module
+    torch.save(torch.nn.Linear(1600, 1600), small / "model.pt")
+    with pytest.raises(ValueError, match="skipped model.pt"):
+        synthesize(str(small), tmp_path / "unkept_out")
 
 
 def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
