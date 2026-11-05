@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import time as _time
+import zlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
@@ -98,6 +99,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     PhaseLaps,
+    hop_stamp,
     nvtx_enabled,
     phase_buffer,
     phase_end,
@@ -294,6 +296,10 @@ class PendingBatch:
     submitted_at: float = 0.0
     # the chain's step, or a side lane's (``mstar.worker.side_steps``)
     lane: int = CHAIN_LANE
+    # This rank has taken its part in the vote on this step's verdict
+    # (``Worker._agree_on_step``), and whether any rank failed a row of it.
+    voted: bool = False
+    failed_on_a_rank: bool = False
 
 
 class EvictionPolicy(Enum):
@@ -464,6 +470,12 @@ class Worker:
     # postprocess.
     chunk_loops: ChunkLoops = ChunkLoops()
 
+    # Set in __init__; a bare instance runs no lockstep-parallel node and has
+    # TP async scheduling off.
+    parallel_nodes: frozenset[str] | set[str] = frozenset()
+    tp_async_sched: bool = False
+    tp_async_nodes: frozenset[str] | None = None
+
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
@@ -484,6 +496,11 @@ class Worker:
     # never updated in place
     _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
     _process_cpus: frozenset[int] = frozenset()
+
+    # Handle -> wire key of the requests whose first step has not sent its
+    # outputs yet, for the TTFT hop stamps (``_hop``). Filled only while
+    # MSTAR_PHASE_TIMING is on; purged with the handle.
+    _hop_keys: dict[int, str] = {}
 
     @cached_property
     def device_capability(self) -> DeviceCapability:
@@ -779,6 +796,7 @@ class Worker:
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
+        self._hop_keys = {}
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
@@ -1017,6 +1035,9 @@ class Worker:
             # does for an admitted rid, while committed TP steps still run.
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
+        if PHASE_PERIOD:
+            self._hop_keys.setdefault(request_id, body.request_id)
+            hop_stamp(body.request_id, "wk.ingest")
 
         # One NewRequest comes per partition this worker serves, and a later one
         # can land after a step already ran. The tensor manager and the engine
@@ -1198,6 +1219,7 @@ class Worker:
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
+        self._hop_keys.pop(request_id, None)
 
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
@@ -1804,6 +1826,8 @@ class Worker:
                 self._graph_runtime.ingest_inputs_batch(
                     self._one_rids_edges(request_id, normal), can_buffer=True,
                 )
+                if self._hop_keys:
+                    self._hop((request_id,), "wk.ready")
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2329,6 +2353,16 @@ class Worker:
         if self._step_cpus is not None:
             pin_thread(self._step_cpus.cpus, self._process_cpus)
 
+    def _hop(self, rids, hop: str, done: bool = False) -> None:
+        """Stamp ``hop`` for those of ``rids`` still before their first step's
+        send (``_hop_keys``); ``done`` takes them out. Callers check
+        ``self._hop_keys`` first, so this costs nothing with timing off."""
+        keys = self._hop_keys
+        for rid in rids:
+            key = keys.pop(rid, None) if done else keys.get(rid)
+            if key is not None:
+                hop_stamp(key, hop)
+
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
@@ -2489,10 +2523,14 @@ class Worker:
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
             laps.lap("pre_exec")
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.launch")
             with self._span(
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
                 outputs = engine.exec_and_postprocess(node_batch)
+            if self._hop_keys:
+                self._hop(node_batch.request_ids, "wk.enqueued")
             laps.skip()
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
@@ -2610,6 +2648,8 @@ class Worker:
         if not speculated:
             self._set_in_flight_flag(batch, True)
         submitted_at = _time.perf_counter() if self._metrics is not None and not speculated else 0.0
+        if self._hop_keys:
+            self._hop(batch.request_to_worker_graph, "wk.submit")
         future = self._submit_gpu_step(gpu_executor, batch, node_batch, plan_future, execute=execute)
         self.wakeup_event.register_future(future)
         step.setdefault("partition", self.request_state.get_partition_for_node(batch.node_name))
@@ -3350,7 +3390,8 @@ class Worker:
     # ------------------------------------------------------------------
     # A follower whose in-flight batch N is a head's spec_from_seq rebuilds
     # that head from replicated state during its own N. No commit / cancel:
-    # every post-N verdict is derived per rank. The leader always sends a head
+    # each rank applies N's verdict itself, from fields the ranks make equal by
+    # a vote once N is done (``_agree_on_step``). The leader always sends a head
     # or a TPNoSpeculation marker per step, settled before N is post-processed.
 
     def _try_follow_speculation(self, pending: PendingBatch) -> Speculation | None:
@@ -3582,11 +3623,12 @@ class Worker:
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
-        """Why N's verdict voids a head built on it, or ``None``. Both fields are
-        final once N's future is done; the leader clears on exactly these two."""
+        """Why N's verdict voids a head built on it, or ``None``. Final once N's
+        future is done and the ranks have voted on it; the leader clears on
+        exactly this."""
         if pending.node_batch.admit_error is not None:
             return "admit_error"
-        if pending.node_batch.failed_requests:
+        if pending.node_batch.failed_requests or pending.failed_on_a_rank:
             return "failed rids"
         return None
 
@@ -3601,7 +3643,11 @@ class Worker:
         t_done = last_warn = 0.0
         while True:
             if outputs is None and pending.future.done():
-                outputs = pending.future.result()
+                outputs = self._step_outputs(pending)
+                # At once, not once the head can be built: the vote then waits only
+                # on every rank finishing N, and the verdict below is the instance's.
+                if self._votes_on_step(pending):
+                    self._agree_on_step(pending)
                 t_done = last_warn = _time.perf_counter()
             if s in self._tp_nospec:
                 return outputs, None
@@ -3650,6 +3696,92 @@ class Worker:
                         self.worker_id, s, now - t_done,
                         head is not None and head.spec_from_seq == s,
                     )
+
+    def _votes_on_step(self, pending: PendingBatch) -> bool:
+        """Every rank of a lockstep instance under TP async votes on each of its
+        steps; the flag agrees across the ranks (``_verify_tp_async_sched_agrees``)."""
+        return pending.node_name in self.parallel_nodes and self._tp_async_for(pending.node_name)
+
+    def _agree_on_step(self, pending: PendingBatch, raised: bool = False) -> None:
+        """Make step N's verdict the same on every rank before anything acts on it.
+
+        Each rank runs or drops the head built on N by N's ``admit_error`` and
+        ``failed_requests``, and a per-rid stage can fail on one rank alone; a rank
+        that drops a head the others run leaves them in its collective. So the
+        ranks vote once per step: a row that failed after the forward on any rank
+        fails on every rank. A step that raised, was admitted, or ran different
+        rows on some ranks only has already mismatched their collectives, and
+        stops the instance with the reason rather than hang it.
+        """
+        # before the collective: if it raises, the error handler must not vote on
+        # this step again
+        pending.voted = True
+        node_batch = pending.node_batch
+        refused = int(node_batch.admit_error is not None)
+        rows = len(node_batch.request_ids)
+        joint = self.parallel_groups.get_joint_group_for_node(pending.node_name)
+        with self._span("worker.tp_step_vote"):
+            (seq_hi, neg_seq_lo, any_raised, any_ran, any_refused, any_admitted,
+             rows_hi, neg_rows_lo, any_failed) = joint.agree(
+                [pending.tp_seq, -pending.tp_seq, int(raised), int(not raised),
+                 refused, 1 - refused, rows, -rows, int(bool(node_batch.failed_requests))],
+                ReduceOp.MAX,
+            )
+        if seq_hi != -neg_seq_lo:
+            raise self._divergence(pending, f"its ranks voted on steps {-neg_seq_lo} and {seq_hi}")
+        if any_raised:
+            if any_ran:
+                raise self._divergence(pending, "it raised on some ranks and not on others")
+            return
+        if any_refused and any_admitted:
+            raise self._divergence(pending, "it was admitted on some ranks and refused on others")
+        if rows_hi != -neg_rows_lo:
+            raise self._divergence(pending, f"it ran {-neg_rows_lo} rows on one rank and {rows_hi} on another")
+        if any_failed:
+            self._agree_on_failed_rows(pending)
+        pending.failed_on_a_rank = bool(any_failed)
+
+    def _step_outputs(self, pending: PendingBatch) -> dict[int, NameToTensorList]:
+        """N's outputs. A step that raised still takes its part in the vote, so
+        that the other ranks are not left waiting in it."""
+        try:
+            return pending.future.result()
+        except Exception:
+            if not pending.voted and self._votes_on_step(pending):
+                self._agree_on_step(pending, raised=True)
+            raise
+
+    def _agree_on_failed_rows(self, pending: PendingBatch) -> None:
+        """Fail here the rows of N another rank failed after the forward: a flag
+        per row the forward ran, by position, with a checksum of the row's wire id,
+        so ranks whose forwards ran different rows stop instead of pairing one
+        rank's row with another's. A row taken out before the forward stays the
+        failing rank's own (rank 0 may fail one before it sends the step); the
+        vote's ``failed_on_a_rank`` still drops the head everywhere."""
+        node_batch = pending.node_batch
+        rids = list(node_batch.request_ids)
+        failed = node_batch.failed_requests
+        sums = [zlib.crc32(self._rid_str(rid).encode()) for rid in rids]
+        n = len(rids)
+        votes = self.parallel_groups.get_joint_group_for_node(pending.node_name).agree(
+            sums + [-s for s in sums] + [int(rid in failed) for rid in rids], ReduceOp.MAX,
+        )
+        if any(hi != -neg_lo for hi, neg_lo in zip(votes[:n], votes[n:2 * n], strict=True)):
+            raise self._divergence(pending, "it ran different rows on different ranks")
+        for rid, flagged in zip(rids, votes[2 * n:], strict=True):
+            if flagged and rid not in failed:
+                failed[rid] = "Error in worker: failed on another rank of its TP group"
+
+    def _divergence(self, pending: PendingBatch, why: str) -> SystemExit:
+        """What stops this rank: step N ran differently on the instance's ranks,
+        so their next collective would hang. Every rank reaches it from the same
+        vote."""
+        message = (
+            f"TP ranks diverged at step seq {pending.tp_seq} of "
+            f"{pending.node_name}/{pending.graph_walk}: {why}"
+        )
+        logger.error("Worker %s: %s", self.worker_id, message)
+        return SystemExit(message)
 
     # ------------------------------------------------------------------
     # Postprocessing
@@ -3711,6 +3843,8 @@ class Worker:
         ] if held else list(batch_N.batch.request_to_worker_graph)
         if self._lockstep_unread and batch_N.node_name in self._lockstep_led:
             self._consume_lockstep_reads(batch_N.node_batch)
+        if self._hop_keys:
+            self._hop(rids, "wk.postprocess")
         # What the runtime dereferenced to zero and cannot reclaim itself: a
         # runtime behind the contract has the bookkeeper, not the shm files or
         # the registered memory.
@@ -3797,6 +3931,8 @@ class Worker:
         # TODO: may need to refine this based on how it affects performance?
         if batch_N.batch.request_to_worker_graph:
             self._wait_for_step(batch_N)
+        if self._hop_keys:
+            self._hop(batch_N.node_batch.request_ids, "wk.gpu_done")
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -3903,6 +4039,8 @@ class Worker:
             rt.update_dynamic_loop_iters(
                 batch_N.node_batch.per_request_info, batch_N.partition,
             )
+        if self._hop_keys:
+            self._hop(batch_N.node_batch.request_ids, "wk.sent", done=True)
         for rid in step.completed_rids:
             self.request_state.flush_publish_info(rid, batch_N.partition)
         # Those sends were the last readers of this step's host copies.
@@ -4813,6 +4951,9 @@ class Worker:
                     "Worker %s discarding failed batch for node %s",
                     self.worker_id, stale.node_name,
                 )
+            # this rank fails the step, so the other ranks have to hear of it
+            if not stale.voted and self._votes_on_step(stale):
+                self._agree_on_step(stale, raised=True)
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)
@@ -5311,11 +5452,14 @@ class Worker:
                         if self.enable_nvtx:
                             range_push("worker.await_gpu", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
-                        outputs = pending.future.result()
+                        outputs = self._step_outputs(pending)
                         if phase_period:
                             _phase_record("await_gpu", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
+
+                    if not pending.voted and self._votes_on_step(pending):
+                        self._agree_on_step(pending)
 
                     laps.skip()
                     # set node._in_flight to false, since
@@ -5382,6 +5526,10 @@ class Worker:
                         # never produced.
                         _maybe_clear_spec()
                         self._fail_step_rows(pending, outputs)
+                    elif pending.failed_on_a_rank:
+                        # Another rank failed a row only it held, so it drops
+                        # the speculation; this rank does too.
+                        _maybe_clear_spec()
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
@@ -5468,6 +5616,12 @@ class Worker:
                     in_flight = self._held_beside(CHAIN_LANE)
                     if spec_pending is not None:
                         in_flight.update(spec_pending.batch.request_to_worker_graph)
+                    if spec_pending is not None and spec_pending.node_name in self.parallel_nodes:
+                        # The launch wait above may have expired, and no page may move
+                        # between a lockstep step's broadcast and its admit. The next
+                        # pass opens on this same wait.
+                        self._await_admit_settled(spec_pending)
+                        laps.skip()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
