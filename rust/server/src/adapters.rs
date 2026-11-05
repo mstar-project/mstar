@@ -269,6 +269,37 @@ fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
+/// A client-sent `speed` into `model_kwargs` for a model with no speed
+/// control, so the server logs it as ignored (`_forward_sent_speed`). An
+/// unsent one stays out; it would warn on every request.
+fn forward_sent_speed(mk: &mut Map<String, Value>, req: &SpeechRequest) {
+    if let Some(speed) = req.speed {
+        set_default(mk, "speed", speed.map_or(Value::Null, json_num));
+    }
+}
+
+/// Voice cloning needs the reference clip decoded and checked before submit
+/// (`_resolve_ref_audio`), and this frontend has no audio decoder.
+pub const REF_AUDIO_REFUSAL: &str =
+    "ref_audio is not supported by the Rust frontend; serve without --rust-frontend to clone a voice";
+
+/// `/v1/audio/speech` sentence chunking: the adapter's `speech_chunk_*`
+/// attributes (see `speech_chunking::plan_chunks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeechChunking {
+    /// Inputs of at least this many characters are split; `None` splits only
+    /// when the client sends `sentence_chunking: true`.
+    pub min_chars: Option<usize>,
+    pub max_chars: usize,
+    /// Pieces kept in flight ahead of the one being streamed.
+    pub lookahead: usize,
+    /// Most pieces one input may split into; more is a 400.
+    pub max_pieces: usize,
+}
+
+const SPEECH_CHUNKING: SpeechChunking =
+    SpeechChunking { min_chars: None, max_chars: 400, lookahead: 2, max_pieces: 32 };
+
 /// Which OpenAI surfaces a model serves + the request translation. One
 /// variant per ported `OpenAIAdapter` subclass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +310,7 @@ pub enum Adapter {
     Orpheus,
     Cosmos3,
     Cosmos3Edge,
+    Qwen3TTS,
 }
 
 impl Adapter {
@@ -292,6 +324,7 @@ impl Adapter {
             "OrpheusAdapter" => Some(Adapter::Orpheus),
             "Cosmos3Adapter" => Some(Adapter::Cosmos3),
             "Cosmos3EdgeAdapter" => Some(Adapter::Cosmos3Edge),
+            "Qwen3TTSAdapter" => Some(Adapter::Qwen3TTS),
             _ => None,
         }
     }
@@ -301,7 +334,15 @@ impl Adapter {
     }
 
     pub fn supports_speech(&self) -> bool {
-        matches!(self, Adapter::Qwen3Omni | Adapter::Orpheus)
+        matches!(self, Adapter::Qwen3Omni | Adapter::Orpheus | Adapter::Qwen3TTS)
+    }
+
+    pub fn speech_chunking(&self) -> SpeechChunking {
+        match self {
+            // Each Talker request stays near the lengths the model was trained on.
+            Adapter::Qwen3TTS => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
+            _ => SPEECH_CHUNKING,
+        }
     }
 
     pub fn supports_images(&self) -> bool {
@@ -389,7 +430,7 @@ impl Adapter {
                     parts,
                 })
             }
-            Adapter::Orpheus | Adapter::Cosmos3 => {
+            Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS => {
                 Err("chat is not supported by this model".to_string())
             }
         }
@@ -414,6 +455,7 @@ impl Adapter {
                         max_tokens_key: None,
                     },
                 );
+                forward_sent_speed(&mut mk, req);
                 Ok(SubmitArgs {
                     tokens: None,
                     text: Some(req.input.clone()),
@@ -424,10 +466,16 @@ impl Adapter {
                     parts: Vec::new(),
                 })
             }
-            Adapter::Orpheus => {
+            Adapter::Orpheus | Adapter::Qwen3TTS => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 if let Some(v) = &req.voice {
                     mk.insert("voice".to_string(), Value::from(v.clone()));
+                }
+                if *self == Adapter::Qwen3TTS {
+                    // OpenAI's field is `instructions`; the model reads `instruct`.
+                    if let Some(instructions) = mk.remove("instructions").filter(truthy) {
+                        set_default(&mut mk, "instruct", instructions);
+                    }
                 }
                 apply_sampling(
                     &mut mk,
@@ -441,6 +489,10 @@ impl Adapter {
                         max_tokens_key: None,
                     },
                 );
+                forward_sent_speed(&mut mk, req);
+                if *self == Adapter::Qwen3TTS && mk.remove("ref_audio").is_some_and(|r| truthy(&r)) {
+                    return Err(REF_AUDIO_REFUSAL.to_string());
+                }
                 Ok(SubmitArgs {
                     tokens: None,
                     text: Some(req.input.clone()),
@@ -811,6 +863,7 @@ mod tests {
             ("OrpheusAdapter", Adapter::Orpheus),
             ("Cosmos3Adapter", Adapter::Cosmos3),
             ("Cosmos3EdgeAdapter", Adapter::Cosmos3Edge),
+            ("Qwen3TTSAdapter", Adapter::Qwen3TTS),
         ] {
             assert_eq!(Adapter::from_python(class), Some(adapter));
         }
@@ -822,6 +875,66 @@ mod tests {
         assert!(Adapter::Cosmos3Edge.supports_images() && Adapter::Cosmos3Edge.supports_videos());
         let q = Adapter::Qwen3_5;
         assert!(!q.supports_speech() && !q.supports_images() && !q.supports_videos());
+        let t = Adapter::Qwen3TTS;
+        assert!(t.supports_speech() && !t.supports_chat() && !t.supports_images() && !t.supports_videos());
+    }
+
+    fn speech(body: &str) -> SpeechRequest {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn a_qwen3_tts_speech_maps_instructions_sampling_and_a_sent_speed() {
+        let args = Adapter::Qwen3TTS
+            .speech_to_request(&speech(
+                r#"{"input":"Hello.","voice":"ryan","language":"English","instructions":"calm",
+                    "temperature":0.7,"top_p":0.8,"seed":4,"speed":1.25,"top_k":20,"stream":true}"#,
+            ))
+            .unwrap();
+        assert_eq!(args.text.as_deref(), Some("Hello."));
+        assert_eq!((args.input_modalities, args.output_modalities), (vec!["text".to_string()], vec!["audio".to_string()]));
+        assert!(args.file_paths.is_empty());
+        assert_eq!(Value::Object(args.model_kwargs), serde_json::json!({
+            "voice": "ryan", "language": "English", "instruct": "calm", "temperature": 0.7,
+            "top_p": 0.8, "seed": 4, "speed": 1.25, "top_k": 20,
+        }));
+    }
+
+    #[test]
+    fn a_qwen3_tts_speech_keeps_an_explicit_instruct_and_drops_empty_instructions() {
+        let mk = |body: &str| Value::Object(Adapter::Qwen3TTS.speech_to_request(&speech(body)).unwrap().model_kwargs);
+        assert_eq!(mk(r#"{"input":"x","instructions":"calm","instruct":"bright"}"#), serde_json::json!({"instruct": "bright"}));
+        assert_eq!(mk(r#"{"input":"x","instructions":""}"#), serde_json::json!({}));
+        assert_eq!(mk(r#"{"input":"x","speed":null}"#), serde_json::json!({"speed": null}));
+        assert_eq!(mk(r#"{"input":"x","ref_audio":""}"#), serde_json::json!({}));
+    }
+
+    #[test]
+    fn every_speech_adapter_forwards_only_a_sent_speed() {
+        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+            let args = adapter.speech_to_request(&speech(r#"{"input":"x"}"#)).unwrap();
+            assert!(!args.model_kwargs.contains_key("speed"), "{adapter:?}");
+            let args = adapter.speech_to_request(&speech(r#"{"input":"x","speed":"2"}"#)).unwrap();
+            assert_eq!(args.model_kwargs["speed"], serde_json::json!(2.0), "{adapter:?}");
+        }
+    }
+
+    #[test]
+    fn a_qwen3_tts_voice_clone_is_refused_here() {
+        let err = Adapter::Qwen3TTS
+            .speech_to_request(&speech(r#"{"input":"x","ref_audio":"data:audio/wav;base64,UklGRg=="}"#))
+            .unwrap_err();
+        assert_eq!(err, REF_AUDIO_REFUSAL);
+    }
+
+    #[test]
+    fn only_qwen3_tts_chunks_long_speech_by_default() {
+        assert_eq!(Adapter::Qwen3TTS.speech_chunking().min_chars, Some(600));
+        assert_eq!(Adapter::Orpheus.speech_chunking().min_chars, None);
+        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+            let c = adapter.speech_chunking();
+            assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{adapter:?}");
+        }
     }
 
     #[test]

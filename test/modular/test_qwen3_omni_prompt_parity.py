@@ -362,19 +362,17 @@ def test_ignore_eos_keeps_every_end_token(model):
 
 
 def test_schedule_matches_the_spans(model):
-    """As many text walks as spans, one media walk per attachment, in order."""
+    """One media walk per attachment, in order, and every span in one of them."""
     mods = ["image", "text", "image"]
-    spans = _new_text_inputs(model, "Between.", mods)
-    signals = {
-        **{f"text_inputs.{i}": [f"t{i}"] for i in range(len(spans))},
-        "pixel_values.0": ["px0"], "pixel_values.1": ["px1"], "image_grid_thw.0": ["g0"], "image_grid_thw.1": ["g1"],
-    }
-    schedule = model._build_thinker_prefill_schedule(mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text",
-    ]
-    assert sum(1 for w, _ in schedule if w == "prefill_text") == len(spans)
+    tensors = model.process_prompt("Between.", mods, ["text"]).new_input_tensors
+    schedule = model._build_thinker_prefill_schedule(mods)
+    assert [walk for walk, _, _ in schedule] == ["prefill_vision", "prefill_vision"]
+    # each step binds its own text signal, and the signals hold every span
+    texts = [name for name in tensors if name.startswith("text_inputs.")]
+    assert [bind["text_inputs"] for _, bind, _ in schedule] == texts
+    assert sum(len(tensors[bind["text_inputs"]]) for _, bind, _ in schedule) == len(
+        _new_text_inputs(model, "Between.", mods)
+    )
 
 
 @pytest.mark.skipif(

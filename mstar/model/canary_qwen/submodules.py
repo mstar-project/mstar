@@ -25,8 +25,5 @@ class CanaryQwenLLMSubmodule(SampledTokenDecoder):
     # request, as before the scaffold; the device path is a measured change
     reads_device_loopback = False
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}
-
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

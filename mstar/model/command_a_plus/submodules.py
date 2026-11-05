@@ -71,9 +71,6 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     # prefill stays eager: its captures are unmeasured on this model
     CAPTURE_PREFILL = False
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}
-
     def max_batch_size(self, graph_walk: str) -> int | None:
         # no prefill is captured, so nothing sizes an image step: uncapped, as before
         return None

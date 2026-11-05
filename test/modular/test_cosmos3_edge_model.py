@@ -328,6 +328,13 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     text = sub.prepare_inputs(Cosmos3Model.REASONER_PREFILL_WALK, fwd, {"text_inputs": [ids[:3]]})
     assert text.custom_pos_ids is None
     assert sub.declare_step(Cosmos3Model.REASONER_PREFILL_WALK, ["r"], [text]).steps[ROPE].advance is None
+    # a decode step prepared again after a refused admit feeds the same position:
+    # preparing moves nothing, the position resource advances when the step commits
+    rope = sub.node_resources[ROPE]
+    before = rope.position(rid="r", label="main")
+    rows = [sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
+            for _ in range(2)]
+    assert all(row.custom_pos_ids is None for row in rows) and rope.position(rid="r", label="main") == before
 
     def stops(walk, token, ignore_eos=False, max_tokens=100):
         info = types.SimpleNamespace(

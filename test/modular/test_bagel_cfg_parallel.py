@@ -10,6 +10,7 @@ import yaml
 from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
@@ -28,14 +29,14 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.bagel.bagel_model import CFG_WINDOW, BagelModel
 from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
-from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule
+from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule, cfg_window
 from mstar.model.submodule_base import END_PARTITION
 
 
 def test_offload_reset_preserves_remote_content_epoch():
-    stream = CacheStream(remote_reset_generation=7)
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), remote_reset_generation=7)
     stream.reset(content_reset=False)
     assert stream.remote_reset_generation == 7
     stream.reset()
@@ -45,7 +46,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50, max_position_embeddings=32768,
+        num_timesteps=50, timestep_shift=3.0, max_position_embeddings=32768,
         think_mode=False, cfg_text_scale=1.0, cfg_img_scale=1.0, cfg_interval=[0.4, 1.0],
         cfg_renorm_type="global", cfg_renorm_min=0.0,
         temperature=1.0,
@@ -61,19 +62,29 @@ def _bare_model() -> BagelModel:
     return model
 
 
+def _image_kwargs(model: BagelModel, kwargs: dict) -> dict:
+    """An image request's kwargs with the `CFGWindow` process_prompt resolves from them."""
+    params = model._request_params(["text"], ["image"], kwargs)
+    window = cfg_window(
+        model.config.num_timesteps, model.config.timestep_shift, tuple(params["cfg_interval"]),
+        params["cfg_text_scale"], params["cfg_img_scale"],
+    )
+    return {**kwargs, CFG_WINDOW: tuple(window)}
+
+
 def test_cfg_graph_is_reused_for_tp_branches():
     model = _bare_model()
     walks = model.get_graph_walk_graphs()
 
     assert set(walks) == {
         "prefill_text", "prefill_vit", "prefill_vae", "decode",
-        "image_gen", "image_gen_cfg",
+        "image_gen", "image_gen_head", "image_gen_cfg2", "image_gen_cfg3", "image_decode",
     }
     assert model.get_default_sharding_config().tp_enabled_nodes == {
         "LLM", "LLM_cfg_text", "LLM_cfg_img",
     }
-    assert set(walks["image_gen_cfg"].get_nodes()) == {
-        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg", "vae_decoder",
+    assert set(walks["image_gen_cfg3"].get_nodes()) == {
+        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg",
     }
 
 
@@ -90,14 +101,17 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
 
     assert len(cfg_groups) == 2
     assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
-    assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
+    assert [group.get("graph_walks") for group in cfg_groups] == [
+        ["image_gen_cfg2", "image_gen_cfg3"], ["image_gen_cfg3"],
+    ]
 
 
 def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model = _bare_model()
     model._has_llm_disaggregation = True
     # a text-to-image request, guided or not by its own cfg_text_scale
-    config = model.get_request_resource_configs(["text"], ["image"], {"cfg_text_scale": 4.0})["kv"]
+    kwargs = _image_kwargs(model, {"cfg_text_scale": 4.0})
+    config = model.get_request_resource_configs(["text"], ["image"], kwargs)["kv"]
 
     assert config.publish_labels_per_node_walk == {
         ("LLM", "prefill_text"): ["main", "cfg_text", "cfg_img"],
@@ -109,7 +123,8 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     }
     assert config.get_publish_labels("LLM", "decode", ["main", "cfg_img"]) == []
 
-    config = model.get_request_resource_configs(["text"], ["image"], {"cfg_text_scale": 1.0})["kv"]
+    kwargs = _image_kwargs(model, {"cfg_text_scale": 1.0})
+    config = model.get_request_resource_configs(["text"], ["image"], kwargs)["kv"]
     assert {
         tuple(labels)
         for labels in config.publish_labels_per_node_walk.values()
@@ -160,7 +175,10 @@ def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(inputs, targ
     model._has_cfg_parallel = False
     signals = {name: [SimpleNamespace(dims=[3, 8, 8])]
                for name in ("text_inputs.0", "text_inputs.1", *(("image_inputs.0",) if "image" in inputs else ()))}
-    plan = model.walk_plan("default", inputs, [target], signals, {"think_mode": think})
+    kwargs = {"think_mode": think}
+    if target == "image":
+        kwargs = _image_kwargs(model, kwargs)
+    plan = model.walk_plan("default", inputs, [target], signals, kwargs)
     step = plan_step(model, plan, k, signals)
     info = CurrentForwardPassInfo(
         request_id="r", graph_walk=plan[k].walk, fwd_index=0, random_seed=0, max_tokens=100,
@@ -606,13 +624,13 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     )
 
     broken = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     broken_again = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     healthy = manager.admit_retrieve(
-        "healthy", "LLM_cfg_text", "image_gen_cfg", healthy_publish,
+        "healthy", "LLM_cfg_text", "image_gen_cfg2", healthy_publish,
     )
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]

@@ -30,8 +30,5 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     reads_device_loopback = False
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}
-
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

@@ -25,6 +25,7 @@ from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
 from mstar.model.fish_s2_pro.components.slow_ar import FishSlowAR, remap_slow_ar_weights
 from mstar.model.fish_s2_pro.config import (
     AR_SAMPLER,
+    CODEC_STATE,
     PROMPT_LAYOUT_KEY,
     FishDACConfig,
     FishFastARConfig,
@@ -261,7 +262,6 @@ def test_config_reads_fish_field_names(tmp_path):
     assert (config.slow_ar.n_layer, config.slow_ar.n_local_heads, config.fast_ar.n_layer) == (36, 8, 4)
     assert config.eos_code == 4096 and config.semantic_head_size == 4097
     assert config.codec.hop_length == 2048 and config.codec.chunk_frames == 16
-    assert config.codec.left_context_frames == 8 * 127 + 10 and config.codec.exact_streaming
     assert config.vq_scale == pytest.approx(1 / math.sqrt(11))
 
 
@@ -431,36 +431,23 @@ def test_clone_prefill_splices_reference_frames_after_the_prefix():
         ar._build_prefill(ids, 2, 4, ref_codes)
 
 
-def test_check_stop_on_im_end_on_the_frame_limit_and_not_with_ignore_eos():
+def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
+    """<|im_end|> ends decode, and its frame stays out of the codec stream either
+    way, so the codec never reads it; under ``ignore_eos`` the row goes on. Other
+    frames neither stop nor withhold: the frame budget is the loop's cap."""
     ar = tiny_ar()
 
-    def info(ignore_eos=False):
-        return SimpleNamespace(
-            step_metadata={},
-            max_tokens=3,
+    def check(head, ignore_eos=False, walk="ar_decode"):
+        info = SimpleNamespace(
+            graph_walk=walk, max_tokens=3,  # a prefill row's check reads the budget (one token ends there)
             resource_configs={AR_SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         )
+        return ar.check_stop("r", info, {"new_token": [torch.tensor(head)]})
 
-    def step(rid, head, ignore_eos=False):
-        outputs = {"new_token": [torch.tensor([head])]}
-        ar.postprocess(rid, info(ignore_eos), outputs)
-        return ar.check_stop(rid, info(ignore_eos), outputs)
-
-    assert step("a", 4) == set()
-    # the <|im_end|> frame stays out of the codec stream, stopping or not
-    assert step("a", ar.eos_code) == StopCheck({"ar_decode_loop"}, ("codec_tokens",))
-    assert step("b", ar.eos_code, ignore_eos=True) == StopCheck(set(), ("codec_tokens",))
-    assert step("b", 1) == set()
-    assert step("b", 2) == {"ar_decode_loop"}
-
-    # speculation: step N+1's postprocess runs before step N's stop check
-    frames = [{"new_token": [torch.tensor([head])]} for head in (4, 5, 6)]
-    ar.postprocess("c", info(), frames[0])
-    assert ar.check_stop("c", info(), frames[0]) == set()
-    ar.postprocess("c", info(), frames[1])
-    ar.postprocess("c", info(), frames[2])
-    assert ar.check_stop("c", info(), frames[1]) == set()
-    assert ar.check_stop("c", info(), frames[2]) == {"ar_decode_loop"}
+    assert check(4, walk="ar_prefill") == set()
+    assert check(4) == set()
+    assert check(ar.eos_code) == StopCheck({"ar_decode_loop"}, withheld=("codec_tokens",))
+    assert check(ar.eos_code, ignore_eos=True) == StopCheck(set(), withheld=("codec_tokens",))
 
 
 def ar_info(ignore_eos=False, layout=None):
@@ -541,7 +528,13 @@ def test_preprocess_packs_the_tensors_the_per_row_device_copies_did():
     assert_same_tensor(packed["last_token_indices"], torch.tensor(seq_lens).cumsum(0) - 1)
     assert_same_tensor(packed["suppress_eos"], old_flags([True, True, True]))
 
-    (graph_config,) = ar.get_accelerator_graph_configs(torch.device("cpu"))
+    prefill_config, graph_config = ar.get_accelerator_graph_configs(torch.device("cpu"))
+    # Plain prefills replay packed captures; their padding rows suppress EOS.
+    assert prefill_config.capture_graph_walk == "ar_prefill"
+    # a voice clone's prefill is the same forward: it replays these captures too
+    assert prefill_config.replay_graph_walks == ["ar_prefill", "ar_prefill_clone"]
+    assert prefill_config.make_node_input(5).kwargs == {"suppress_eos": True}
+    assert graph_config.capture_graph_walk == "ar_decode"
     template = graph_config.single_request_inputs
     assert template.kwargs == {"suppress_eos": False} and not template.tensor_inputs
     padded = [decode_row(True), decode_row(False), *graph_config.get_node_inputs(2, 0)]
@@ -655,3 +648,16 @@ def test_sampling_defaults_and_greedy():
         [], [], {"do_sample": False, "temperature": 0.7, "top_k": 5},
     )[AR_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.top_k == 5
+
+
+def test_the_shipped_request_cap_fits_the_codec_streams():
+    """A request keeps its codec stream until it ends, so the shipped yaml caps
+    requests at the pool and a cap past it (or a smaller pool) is refused."""
+    cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    model = tiny_model()
+    model.validate_config_yaml(cfg, str(CONFIG_PATH))
+    # a null override means the default pool, as apply_yaml_overrides reads it
+    model.validate_config_yaml({**cfg, "resources": {CODEC_STATE: {"max_slots": None}}}, str(CONFIG_PATH))
+    small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        model.validate_config_yaml(small, str(CONFIG_PATH))

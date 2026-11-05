@@ -9,11 +9,18 @@ ATTN = "attn"
 SAMPLER = keys.SAMPLER
 ROPE = keys.ROPE
 
-# SNAC captures one CUDA graph per window size at every capture batch size,
-# and every size from 1 frame up to the widest window occurs (final flushes),
-# so the widest window (left + right context + largest chunk) bounds startup
-# and graph memory.
+# SNAC captures one CUDA graph per window size ``snac_window_frames`` lists, at
+# every capture batch size, so the widest window (left + right context +
+# largest chunk) bounds startup and graph memory. Some of those sizes never
+# replay: a window past the decoder's left reach is padded to the widest.
 SNAC_MAX_WINDOW_FRAMES = 16
+
+# A decoded frame's audio depends on fewer than this many frames to its left:
+# the snac_24khz decoder's receptive field reaches about 2.5 frames, and
+# frames 3 or more into a window decode the same audio (to float rounding) with
+# any frames prepended. So it is also the default left context
+# (``snac_left_context_frames``): more adds nothing to a window's audio.
+SNAC_LEFT_REACH_FRAMES = 3
 
 @dataclass
 class OrpheusModelConfig:
@@ -67,7 +74,7 @@ class OrpheusModelConfig:
     # plus the largest chunk may be at most ``SNAC_MAX_WINDOW_FRAMES``.
     snac_chunk_schedule: tuple[int, ...] = (4, 2, 2, 2)
     snac_chunk_frames: int = 4
-    snac_left_context_frames: int = 3
+    snac_left_context_frames: int = SNAC_LEFT_REACH_FRAMES
     snac_right_context_frames: int = 2
 
     # Generation defaults
@@ -84,6 +91,10 @@ class OrpheusModelConfig:
     default_voice: str = "tara"
 
     def __post_init__(self):
+        # The LM head computes the custom-token rows alone and reads -inf for
+        # the text rows (``output_start``), so a stop token must be one of them.
+        if min(self.stop_token_ids) < self.custom_token_base_id:
+            raise ValueError("Orpheus's stop tokens must be custom tokens")
         if self.default_voice not in self.available_voices:
             raise ValueError(
                 f"default_voice {self.default_voice!r} is not in available_voices"

@@ -56,8 +56,9 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
     reads_device_loopback = False
     _capture_block_warned = False
 
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        return {}
+    def __init__(self, language_model: torch.nn.Module, config):
+        # a deployment's own prefill ladder (``prefill_token_buckets``) replaces the class's
+        super().__init__(language_model, config, prefill_token_buckets=config.prefill_token_buckets)
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)}
@@ -158,7 +159,7 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
             _PackedPrefillConfig(
                 max_row_tokens=self._context_limit(),
                 capture_graph_walk=self.PREFILL_WALK,
-                capture_token_lengths=list(self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=list(
                     self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES

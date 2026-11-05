@@ -20,8 +20,7 @@ import torch
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.arena import PageArena
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.manager import KVManager
@@ -70,7 +69,7 @@ class _HostPoolStub(CPUPagePool):
     succeeds, so ``offload`` is gated only by the manager's own claim."""
 
     def __init__(self):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(64))
+        self.arena = new_page_arena(64)
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
         self._refused_logged_at = None
@@ -255,6 +254,7 @@ def _engine(resources: dict) -> Engine:
     eng._enable_nvtx = False
     eng._enable_profile = False
     eng._device = torch.device("cpu")
+    eng._pre_plan_done = {}
     eng._submodules = {"n": SubmoduleManagement(
         submodule=_Sub(list(resources)), forward=None, forward_batched=None,
         joint_comm_group=None, resources=resources,

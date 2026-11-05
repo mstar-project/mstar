@@ -51,10 +51,9 @@ logger = logging.getLogger(__name__)
 
 def audio_encoder(pad_id: int) -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's mel chunks in, one LLM-space
-    row per audio pad out."""
-    return MediaEncoder(
-        "audio", "audio_encoder", ("audio_features", "audio_feature_lens"), "audio_embeds", (pad_id,),
-    )
+    row per audio pad out. Each chunk's mel frame count rides the walk's
+    ``MEDIA_LAYOUT`` as the clip's grid, so the node reads it on the host."""
+    return MediaEncoder("audio", "audio_encoder", ("audio_features",), "audio_embeds", (pad_id,))
 
 
 class HiggsAudioModel(MultimodalDecoderModel):
@@ -76,6 +75,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
         **kwargs,
     ):
         super().__init__(model_path_hf, cache_dir)
+        # ``model_kwargs: {encoder_graphs: false}`` runs the audio tower eagerly
+        self.encoder_graphs = bool(kwargs.get("encoder_graphs", True))
         self.config = HiggsAudioModelConfig.from_pretrained(self.local_dir)
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
@@ -186,7 +187,9 @@ class HiggsAudioModel(MultimodalDecoderModel):
     def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
         """The reference's front end: fixed ``chunk_size_seconds`` chunks (no
         VAD), whisper-large-v3 mels padded to the longest chunk. The clip
-        fills a pad per row the projector keeps."""
+        fills a pad per row the projector keeps; its grid is each chunk's
+        mel frame count (the feature extractor's attention-mask sum), from
+        which the encoder masks and slices its chunks."""
         waveform = clip.reshape(-1).cpu().numpy()
         n = self.config.chunk_size_samples
         chunks = [waveform[i:i + n] for i in range(0, max(len(waveform), 1), n)]
@@ -200,9 +203,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         )
         lens = feat["attention_mask"].sum(-1).to(torch.long)
         tokens = sum(self.config.encoder_output_length(int(m)) for m in lens.tolist())
-        return PreparedMedia(
-            {"audio_features": feat["input_features"], "audio_feature_lens": lens}, [tokens],
-        )
+        return PreparedMedia({"audio_features": feat["input_features"]}, [tokens], [lens])
 
     def text_output(self) -> TextOutput:
         # a transcript, its special tokens dropped
@@ -247,6 +248,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         projector.eval()
         return HiggsAudioEncoderSubmodule(
             audio_tower=audio_tower, projector=projector, config=self.config,
+            graphs=self.encoder_graphs,
         )
 
     @staticmethod

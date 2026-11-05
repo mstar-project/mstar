@@ -29,6 +29,14 @@ def test_embeds_count_their_two_sentinels(thinker, walk, name):
     assert _len(thinker, walk, {name: [torch.zeros(10, HIDDEN)]}) == 12
 
 
+@pytest.mark.parametrize("walk,name", [
+    ("prefill_audio", "audio_embeds"), ("prefill_vision", "vision_embeds"),
+])
+def test_an_attachment_row_counts_the_text_around_it(thinker, walk, name):
+    inputs = {name: [torch.zeros(10, HIDDEN)], "text_inputs": [torch.zeros(3), torch.zeros(4)]}
+    assert _len(thinker, walk, inputs) == 19
+
+
 def test_decode_is_one_token(thinker):
     assert _len(thinker, "thinker_decode", {}) == 1
 

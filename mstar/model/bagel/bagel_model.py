@@ -6,23 +6,34 @@ SigLIP2 ViT for image understanding, and FLUX VAE for image generation.
 The LLM itself serves as the denoiser for rectified flow image generation
 (no separate diffusion model).
 
-Architecture (4 nodes):
+Architecture (4 nodes, 7 with CFG-parallel placement):
     vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
     vae_encoder   (enc_dec) - VAE encode + patchify + projection
     LLM           (ar)      - Fat node: embed + Qwen2 + lm_head + CFG + Euler
     vae_decoder   (enc_dec) - VAE decode to pixels
+    LLM_cfg_text, LLM_cfg_img, combine_cfg - only when the deployment places
+                  the guidance branches on their own workers (the CFG walks)
 
-Graph walks (5):
-    prefill_text  - Text token embedding + LLM prefill (causal)
-    prefill_vit   - ViT encoding + LLM prefill (bidirectional for images)
-    prefill_vae   - VAE encoding + LLM prefill (bidirectional for images)
-    decode        - Autoregressive text generation
-    image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
+Graph walks (9, or 11 with CFG-parallel placement):
+    prefill_text   - Text token embedding + LLM prefill (causal)
+    prefill_vit    - ViT encoding + LLM prefill (bidirectional for images)
+    prefill_vae    - VAE encoding + LLM prefill (bidirectional for images)
+    decode         - Autoregressive text generation
+    image_gen      - Flow matching loop (Euler, main branch only) + VAE decode
+    A guided request's phases (``image_gen_phases``):
+    image_gen_head - The steps before the CFG window, on LLM alone
+    image_gen_guided2, image_gen_guided3 - The CFG window on LLM alone, every
+                     branch in one combined forward
+    image_gen_cfg2, image_gen_cfg3 - CFG-parallel only: the CFG window, one
+                     node per guidance branch, the velocities combined in combine_cfg
+    image_decode   - The VAE decode alone, when the window reaches the last step
+    (the steps after the window run as image_gen, from the window's end)
 
 The LLM node absorbs text_emb, lm_head, and flow_proj because they are
 always colocated on the same GPU. Keeping them as separate graph nodes
-would add unnecessary IPC overhead. CFG requires 3 LLM forward passes +
-velocity combination, which is easier as one atomic operation.
+would add unnecessary IPC overhead. A denoise step runs the guidance
+branches it needs (one to three LLM passes: a branch whose scale or
+interval leaves it out sits the step out) and combines their velocities.
 
 Output mode is known upfront from the API request's output_modalities
 field (no BOI token detection). Prefill is sequential: text tokens are
@@ -64,7 +75,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.bagel.components.autoencoder import BagelAutoEncoder
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
@@ -72,13 +83,25 @@ from mstar.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
 from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
+    CFG_WALKS,
+    DENOISE_WALKS,
     IMAGE_ADVANCE,
+    IMAGE_DECODE,
+    IMAGE_GEN,
     IMAGE_SENTINELS,
+    LLM_GRAPH_WALKS,
+    NODE_TO_CFG_LABEL,
+    CFGWindow,
     CombineCFGSubmodule,
+    ImageGenPhase,
     LLMSubmodule,
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    cfg_window,
+    denoise_loop,
+    guided,
+    image_gen_phases,
     vae_latents,
     vit_patches,
     vit_preprocess,
@@ -94,7 +117,7 @@ from mstar.model.base import (
     WalkStep,
     prompt_spans,
 )
-from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -114,6 +137,10 @@ from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
+
+# The request's `CFGWindow`, which process_prompt resolves with its guidance
+# kwargs: the conductor's loop caps and walk schedule read it.
+CFG_WINDOW = "cfg_window"
 
 # ---------------------------------------------------------------------------
 # System prompts (used when think_mode=True)
@@ -255,18 +282,9 @@ class BagelModel(Model):
     The LLM serves as both the autoregressive text model and the denoiser
     for rectified flow image generation (no separate diffusion model).
 
-    Nodes (4):
-        vit_encoder   (enc_dec) - SigLIP2 ViT + connector + pos embed
-        vae_encoder   (enc_dec) - VAE encode + patchify + projection
-        LLM           (ar)      - Fat node: embed + Qwen2 + lm_head + CFG
-        vae_decoder   (enc_dec) - VAE decode to pixels
-
-    Graph walks (5):
-        prefill_text  - Text token embedding + LLM prefill (causal)
-        prefill_vit   - ViT encoding + LLM prefill (bidirectional)
-        prefill_vae   - VAE encoding + LLM prefill (bidirectional)
-        decode        - Autoregressive text generation
-        image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
+    Nodes and walks: see the module docstring (the CFG-parallel walks and
+    their three nodes exist only when a deployment places the guidance
+    branches apart).
 
     The walk plan is schedule-driven (no BOI token detection). The output
     mode is known upfront from the API request's output_modalities. Prefill
@@ -279,6 +297,8 @@ class BagelModel(Model):
     # the prompt lists whose entries each prefill in a walk of their own
     SPANS = ("text_inputs", "image_inputs")
 
+
+    INTERNAL_KWARGS = (CFG_WINDOW,)
 
     def __init__(
         self,
@@ -337,11 +357,9 @@ class BagelModel(Model):
         # until its published KV handoff and speculative scheduling agree.
         self._image_gen_remote_handoff = False
 
-    @property
-    def _image_gen_walk(self) -> str:
-        """Return the appropriate image_gen graph walk based on config."""
-        return "image_gen_cfg" if self._has_cfg_parallel else "image_gen"
-
+    def _image_gen_phases(self, window) -> tuple[ImageGenPhase, ...]:
+        """The request's denoise walks on this deployment (`image_gen_phases`)."""
+        return image_gen_phases(CFGWindow(*window), self.config.num_timesteps, self._has_cfg_parallel)
 
     def _download_hf(self):
         if self.repo is not None:
@@ -634,13 +652,20 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        params = self._request_params(input_modalities, output_modalities, kwargs)
+        if "image" in output_modalities:
+            image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
+            for key in ("width", "height"):
+                value = params[key]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = target_output == "text"
             has_image = "image" in input_modalities
-            think_mode = kwargs.get("think_mode", self.config.think_mode)
+            think_mode = params["think_mode"]
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
             texts, roles = prompt, None
@@ -695,39 +720,50 @@ class BagelModel(Model):
                     )
             result["text_inputs"] = segments
 
-        # Image edit path: both input and output include "image".
-        # request specifies a target width and/or height, resize the input
-        # images to be the largest that fits within that box (preserving
-        # aspect ratio) so the edited output matches the requested size.
+        # Image edit path: both input and output include "image". Resize the
+        # input images to the largest that fits within the requested width x
+        # height (preserving aspect ratio) so the edited output matches it.
         is_image_edit = "image" in input_modalities and "image" in output_modalities
-        max_width = kwargs.get("width")
-        max_height = kwargs.get("height")
         if (
             is_image_edit
             and tensors is not None
             and tensors.get("image_inputs")
         ):
             result["image_inputs"] = [
-                self._resize_to_fit(img, max_width, max_height)
+                self._resize_to_fit(img, params["width"], params["height"])
                 for img in tensors["image_inputs"]
             ]
 
+        images = result.get("image_inputs") or (tensors or {}).get("image_inputs", [])
+        if "image" in output_modalities:
+            # an edit's output takes its (resized) input's size, a generation the requested one;
+            # under 16 pixels a side (the VAE's 8x times the 2x2 patch) it has no latent patch,
+            # and the loop would fail mid-request
+            sides = images[0].shape[-2:] if images else (params["height"], params["width"])
+            if any(side < 16 for side in sides):
+                raise ValueError(f"BAGEL's output image must be at least 16 pixels a side, got {list(sides)} (h, w)")
         if tensors is None:
             return split_spans(result, self.SPANS)[0]
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
-        images = result.get("image_inputs") or tensors.get("image_inputs", [])
         if images:
             # split into spans below, in place of the loaded list
             result["image_inputs"] = images
-        params = self._request_params(input_modalities, output_modalities, kwargs)
-        layout = self._kv_layout(parts, segments, images, output_modalities, params)
-        result, kv_layout = split_spans(result, self.SPANS, {"kv": layout})
-        return ProcessPromptOutput(result, {"kv_layout": kv_layout})
+        metadata = {}
+        window = None
+        if "image" in output_modalities:
+            window = cfg_window(
+                self.config.num_timesteps, self.config.timestep_shift, tuple(params["cfg_interval"]),
+                params["cfg_text_scale"], params["cfg_img_scale"],
+            )
+            metadata[CFG_WINDOW] = tuple(window)
+        layout = self._kv_layout(parts, segments, images, output_modalities, params, window)
+        result, metadata["kv_layout"] = split_spans(result, self.SPANS, {"kv": layout})
+        return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
-        output_modalities: list[str], params: dict,
+        output_modalities: list[str], params: dict, window: CFGWindow | None,
     ) -> dict[str, LabelLayout]:
         """Each label's writes, in the order `_build_prefill_schedule` runs them.
 
@@ -736,8 +772,8 @@ class BagelModel(Model):
         doesn't cover the resize. Under guidance, ``cfg_img`` holds the text alone.
         ``cfg_text`` forks before a text walk and after an image walk, so it holds all
         but the last span when the last span is text, and every span when the prompt
-        ends on an image. Without guidance a generation still denoises on all three
-        labels on a CFG-parallel deployment, which isn't known here.
+        ends on an image. A branch label denoises (its scratch) only where the
+        request's ``window`` runs that branch.
         """
         cfg = self.config
         target_output = (output_modalities or ["text"])[0]
@@ -775,37 +811,31 @@ class BagelModel(Model):
         scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
         growth = (("decode_loop", 1),) if think_mode else ()
         main = LabelLayout(spans=tuple(spans), growth=growth, scratch=scratch, keyed_spans=keyed)
-        if not self._requires_cfg(target_output=target_output, **params):
-            return {"main": main, "cfg_text": LabelLayout(scratch=scratch), "cfg_img": LabelLayout(scratch=scratch)}
+        if not guided(window):
+            return {"main": main, "cfg_text": LabelLayout(), "cfg_img": LabelLayout()}
         return {
             "main": main,
             "cfg_text": LabelLayout(
                 spans=tuple(spans[:-1] if spans and spans[-1].walk == "prefill_text" else spans), scratch=scratch,
             ),
             "cfg_img": LabelLayout(
-                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth, scratch=scratch,
+                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth,
+                scratch=scratch if window.branches == 3 else 0,
             ),
         }
 
     @staticmethod
     def _resize_to_fit(
         image: torch.Tensor,
-        max_width: int | None,
-        max_height: int | None,
+        max_width: int,
+        max_height: int,
     ) -> torch.Tensor:
         """Resize a c x h x w image to the largest size fitting within
-        max_width x max_height while preserving aspect ratio.
-
-        If only one of max_width / max_height is given, only that dimension
-        constrains the result. Both dimensions are capped at 1024.
+        max_width x max_height while preserving aspect ratio. Both dimensions
+        are capped at 1024.
         """
         _, h, w = image.shape
-        scales = [1024 / w, 1024 / h]
-        if max_width is not None:
-            scales.append(max_width / w)
-        if max_height is not None:
-            scales.append(max_height / h)
-        scale = min(scales)
+        scale = min(1024 / w, 1024 / h, max_width / w, max_height / h)
         new_h = max(1, round(h * scale))
         new_w = max(1, round(w * scale))
         if new_h == h and new_w == w:
@@ -833,8 +863,9 @@ class BagelModel(Model):
         if modality == "text":
             return super().postprocess(output, modality, request_kwargs)
         if modality == "image":
-            # quantized here, as the reference does: inside the node's compiled
-            # forward, bf16 pixels would round differently
+            # truncated to uint8 here, as the reference does (inside the node's compiled
+            # forward, bf16 pixels would round differently), through the shared writer:
+            # PIL's default PNG encode (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
             return encode_image((output[0] * 255).to(torch.uint8), request_kwargs)
         raise ValueError(f"Unsupported modality: {modality!r}")
 
@@ -868,6 +899,15 @@ class BagelModel(Model):
             "cfg_text": KVLabel(),
             "cfg_img": KVLabel(growth=decode),
         }}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        caps = super().get_loop_caps(**model_kwargs)
+        if (window := model_kwargs.get(CFG_WINDOW)) is not None:
+            # each denoise walk runs exactly its phase's steps
+            caps.update(
+                (denoise_loop(phase.walk), phase.steps) for phase in self._image_gen_phases(window) if phase.steps
+            )
+        return caps
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -929,25 +969,36 @@ class BagelModel(Model):
         The conductor resolves this once and the engine hands each config to
         its resource at ingest.
         """
-        from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
+        from mstar.model.bagel.submodules import active_labels
 
         model_kwargs = model_kwargs or {}
         # the guidance `walk_plan` settles, from the same request
         target_output = output_modalities[0]
-        params = self._request_params(input_modalities, output_modalities, model_kwargs)
-        cfg = self._requires_cfg(target_output=target_output, **params)
-        # only a generation's image_gen_cfg runs the CFG nodes
+        window = self._cfg_window(target_output, model_kwargs)
+        cfg = guided(window)
+        # only a generation's CFG walks run the CFG nodes
         nodes = self._LLM_NODES if self._has_cfg_parallel and target_output == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
         if cfg:
-            publish_labels.update({
+            branch_labels = ["cfg_text", "cfg_img"]
+            if self._has_cfg_parallel and not self._has_llm_disaggregation:
+                # The branch labels' only readers are the CFG walk's branch nodes, one
+                # label each. (A remote LLM, on an LLM-disaggregated deployment, may also
+                # run decode, which reads cfg_img, and its single-node denoise walks still
+                # name both labels per request, not per walk.)
+                cfg_walk = next(p.walk for p in self._image_gen_phases(window) if p.walk in CFG_WALKS)
+                branch_labels = list(NODE_TO_CFG_LABEL.values())[1:CFG_WALKS[cfg_walk]]
+            for (node, walk), labels in {
                 ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
                 ("LLM", "prefill_vit"): ["cfg_text"],
                 ("LLM", "prefill_vae"): ["cfg_text"],
-            })
-            final_publish_labels[("LLM", "decode")] = ["cfg_img"]
+            }.items():
+                if labels := [label for label in labels if label in branch_labels]:
+                    publish_labels[(node, walk)] = labels
+            if "cfg_img" in branch_labels:
+                final_publish_labels[("LLM", "decode")] = ["cfg_img"]
 
         if self._has_llm_disaggregation:
             # Any prefill walk can be the last one before a remote decode or
@@ -968,12 +1019,13 @@ class BagelModel(Model):
                 needed_labels_per_node_walk={
                     (node, walk): active_labels(walk, cfg, node)
                     for node in nodes
-                    for walk in LLM_GRAPH_WALKS
+                    for walk in LLM_GRAPH_WALKS[self._has_cfg_parallel]
                 },
                 # Only the main LLM instance creates cache branches consumed
-                # by the remote CFG replicas. Text-only requests export
+                # by the remote CFG replicas, and it exports only the ones the
+                # request's CFG walk reads. Text-only requests export
                 # nothing. Think-then-image exports cfg_img once after decode
-                # stops, so image_gen_cfg sees the final KV without rewriting
+                # stops, so the CFG walks see the final KV without rewriting
                 # the SHM payload on every token. Disaggregated LLM placements
                 # additionally export main at prefill boundaries and once when
                 # decode stops.
@@ -1032,7 +1084,7 @@ class BagelModel(Model):
                 for rank in group["ranks"]
             }
 
-        image_ranks = llm_ranks("image_gen")
+        image_ranks = llm_ranks(IMAGE_GEN)
         self._image_gen_remote_handoff = bool(
             image_ranks
             and image_ranks.isdisjoint(llm_ranks("prefill_text"))
@@ -1134,122 +1186,97 @@ class BagelModel(Model):
             outputs=[],
         )
 
-        # -- image_gen: denoising loop (LLM does CFG+Euler) -> VAE decode --
-        # n_iters = num_timesteps - 1 because the loop body performs one
-        # Euler step per iteration. With N timestep boundaries (e.g. 50),
-        # there are N-1 intervals, so N-1 Euler steps are needed.
-        image_gen = Sequential([
-            Loop(
-                section=GraphNode(
-                    name="LLM",
-                    input_names=["latents", "time_index"],
-                    outputs=[
-                        GraphEdge(next_node="LLM", name="latents"),
-                        GraphEdge(next_node="LLM", name="time_index"),
-                    ],
-                    # A separate image-generation worker combines a remote
-                    # KV handoff with this loop. The Rust speculative path
-                    # produced nondeterministic seeded output on that layout;
-                    # serial steps preserve the handoff's output.
-                    enable_async_scheduling=not self._image_gen_remote_handoff,
-                ),
-                max_iters=self.config.num_timesteps - 1,
-                outputs=[
-                    GraphEdge(next_node="vae_decoder", name="latents"),
-                ],
-            ),
-            GraphNode(
-                name="vae_decoder",
-                input_names=["latents"],
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="image_output",
-                        output_modality="image",
-                    ),
-                ],
-            ),
-        ])
-
-        # -- image_gen_cfg: parallel 3-branch CFG denoising loop -> VAE decode --
-        # Each CFG branch (main, cfg_text, cfg_img) runs on its own GPU.
-        # combine_cfg applies the CFG formula + Euler step after each iteration.
-        image_gen_cfg = Sequential([
-            Loop(
-                section=Sequential([
-                    Parallel([
-                        GraphNode(
-                            name="LLM",
-                            input_names=["latents", "time_index"],
-                            outputs=[
-                                GraphEdge(next_node="combine_cfg", name="v_main"),
-                            ],
-                            enable_async_scheduling=False
-                        ),
-                        GraphNode(
-                            name="LLM_cfg_text",
-                            input_names=["latents", "time_index"],
-                            outputs=[
-                                GraphEdge(next_node="combine_cfg", name="v_cfg_text"),
-                            ],
-                            enable_async_scheduling=False
-                        ),
-                        GraphNode(
-                            name="LLM_cfg_img",
-                            input_names=["latents", "time_index"],
-                            outputs=[
-                                GraphEdge(next_node="combine_cfg", name="v_cfg_img"),
-                            ],
-                            enable_async_scheduling=False
-                        ),
-                    ]),
-                    GraphNode(
-                        name="combine_cfg",
-                        input_names=[
-                            "v_main", "v_cfg_text", "v_cfg_img",
-                            "latents", "time_index",
-                        ],
-                        outputs=[
-                            GraphEdge(next_node="LLM", name="latents"),
-                            GraphEdge(next_node="LLM", name="time_index"),
-                            GraphEdge(next_node="LLM_cfg_text", name="latents"),
-                            GraphEdge(next_node="LLM_cfg_text", name="time_index"),
-                            GraphEdge(next_node="LLM_cfg_img", name="latents"),
-                            GraphEdge(next_node="LLM_cfg_img", name="time_index"),
-                            GraphEdge(next_node="combine_cfg", name="latents"),
-                            GraphEdge(next_node="combine_cfg", name="time_index"),
-                        ],
-                        enable_async_scheduling=False
-                    ),
-                ]),
-                max_iters=self.config.num_timesteps - 1,
-                outputs=[
-                    GraphEdge(next_node="vae_decoder", name="latents"),
-                ],
-            ),
-            GraphNode(
-                name="vae_decoder",
-                input_names=["latents"],
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="image_output",
-                        output_modality="image",
-                    ),
-                ],
-            ),
-        ])
-
         walks = {
             "prefill_text": prefill_text,
             "prefill_vit": prefill_vit,
             "prefill_vae": prefill_vae,
             DECODE: decode,
-            "image_gen": image_gen,
+            IMAGE_DECODE: self._vae_decode(),
         }
-        if self._has_cfg_parallel:
-            walks["image_gen_cfg"] = image_gen_cfg
+        walks.update({
+            walk: self._denoise_walk(walk) for walk in LLM_GRAPH_WALKS[self._has_cfg_parallel] if walk in DENOISE_WALKS
+        })
         return walks
+
+    @staticmethod
+    def _denoise_nodes(walk: str) -> tuple[str, ...]:
+        """The nodes of a denoise walk that read latents and time_index."""
+        branches, split, _ = DENOISE_WALKS[walk]
+        if not split:
+            return ("LLM",)
+        return (*list(NODE_TO_CFG_LABEL)[:branches], "combine_cfg")
+
+    def _denoise_walk(self, walk: str) -> GraphSection:
+        """A denoise walk, from its `DenoiseWalk` (branches, split, decode).
+
+        One Euler step per iteration, so a request's N timestep boundaries take
+        N - 1 iterations in all; the request's loop cap (`get_loop_caps`) sets
+        the walk's share. Unsplit is the LLM node alone, running the walk's
+        branches as one forward; split is a node per branch whose velocities
+        combine_cfg combines into the step. Without the decode the loop's last
+        latents and time_index persist for the request's next walk.
+        """
+        branches, split, decode = DENOISE_WALKS[walk]
+        loop_back = [GraphEdge(next_node=node, name=name) for node in self._denoise_nodes(walk)
+                     for name in ("latents", "time_index")]
+        if not split:
+            section = GraphNode(
+                name="LLM",
+                input_names=["latents", "time_index"],
+                outputs=loop_back,
+                # A separate image-generation worker combines a remote
+                # KV handoff with this loop. The Rust speculative path
+                # produced nondeterministic seeded output on that layout;
+                # serial steps preserve the handoff's output.
+                enable_async_scheduling=not self._image_gen_remote_handoff,
+            )
+        else:
+            nodes = list(NODE_TO_CFG_LABEL.items())[:branches]
+            section = Sequential([
+                Parallel([
+                    GraphNode(
+                        name=node,
+                        input_names=["latents", "time_index"],
+                        outputs=[GraphEdge(next_node="combine_cfg", name=f"v_{label}")],
+                        enable_async_scheduling=False,
+                    )
+                    for node, label in nodes
+                ]),
+                GraphNode(
+                    name="combine_cfg",
+                    input_names=[*(f"v_{label}" for _, label in nodes), "latents", "time_index"],
+                    outputs=loop_back,
+                    enable_async_scheduling=False,
+                ),
+            ])
+        if decode:
+            outputs = [GraphEdge(next_node="vae_decoder", name="latents")]
+        else:
+            outputs = [
+                GraphEdge(next_node=EMPTY_DESTINATION, name=name, persist=True)
+                for name in ("latents", "time_index")
+            ]
+        loop = Loop(
+            name=denoise_loop(walk),
+            section=section,
+            max_iters=self.config.num_timesteps - 1,
+            outputs=outputs,
+        )
+        return Sequential([loop, self._vae_decode()]) if decode else loop
+
+    @staticmethod
+    def _vae_decode() -> GraphNode:
+        return GraphNode(
+            name="vae_decoder",
+            input_names=["latents"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="image_output",
+                    output_modality="image",
+                ),
+            ],
+        )
 
     def _build_prefill_schedule(
         self, input_modalities: list[str],
@@ -1320,20 +1347,16 @@ class BagelModel(Model):
 
         if model_kwargs:
             for key in overridable_keys:
-                if key in model_kwargs:
+                if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return params
 
-    def _requires_cfg(
-        self, **kwargs,
-    ):
-        return (
-            kwargs["target_output"] == "image" \
-                and (
-                    kwargs["cfg_img_scale"] > 1.0 \
-                    or kwargs["cfg_text_scale"] > 1.0
-                )
-        )
+    def _cfg_window(self, target_output: str, model_kwargs: dict) -> CFGWindow | None:
+        """An image request's `CFGWindow`, which process_prompt resolved with its
+        guidance kwargs; None for a text reply."""
+        if target_output != "image":
+            return None
+        return CFGWindow(*model_kwargs[CFG_WINDOW])
 
     def walk_plan(
         self,
@@ -1345,7 +1368,8 @@ class BagelModel(Model):
     ) -> list[WalkStep]:
         """One prefill walk per span of the schedule, then decode for a text
         reply, decode then image generation for a think-then-image request, or
-        straight to image generation.
+        straight to image generation: the request's denoise walks, in the order
+        of its `image_gen_phases`.
 
         Every step carries the request's guidance and image params. The step
         before decode, the one that samples the reply's first token, is marked
@@ -1360,7 +1384,8 @@ class BagelModel(Model):
             params["height"], params["width"] = image[0].dims[1], image[0].dims[2]
             logger.info(f"Will generate an image of shape {params['height']} x {params['width']}")
         think_mode = params.pop("think_mode")
-        params["requires_cfg"] = self._requires_cfg(target_output=target_output, **params)
+        window = self._cfg_window(target_output, model_kwargs)
+        params["requires_cfg"] = guided(window)
         params["prefill_stop_ends"] = target_output == "text"
 
         schedule = self._build_prefill_schedule(
@@ -1370,14 +1395,17 @@ class BagelModel(Model):
             think_mode=think_mode,
         )
         decode = WalkStep(DECODE, bind={"text_inputs": "new_token"}, step_metadata=params)
-        image_gen = WalkStep(self._image_gen_walk, step_metadata=params)
+        # the denoise walks, in the order of the request's `image_gen_phases`
+        image_gen = [
+            WalkStep(phase.walk, step_metadata=params) for phase in self._image_gen_phases(window)
+        ] if window is not None else []
         if target_output == "text":
             after = [decode]
         else:
-            after = [decode, image_gen] if think_mode else [image_gen]
-        if not schedule:
-            # a request with nothing to prefill opens on decode
-            after = [decode, *after[1:]]
+            after = [decode, *image_gen] if think_mode else image_gen
+        if not schedule and after[0] is not decode:
+            # a request with nothing to prefill opens on decode, its last walk
+            after = [decode]
         first_token = after[0] is decode
         return [
             WalkStep(walk, bind={name: span}, step_metadata={
@@ -1397,7 +1425,7 @@ class BagelModel(Model):
         params = {k: getattr(self.config, k) for k in keys}
         if model_kwargs:
             for key in keys:
-                if key in model_kwargs:
+                if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
         return SamplingConfig(
             vocab_size=self.config.vocab_size,

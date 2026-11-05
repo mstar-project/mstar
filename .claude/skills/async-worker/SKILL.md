@@ -17,6 +17,7 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 | `gpu_executor` (1 worker) | `_execute_on_gpu_thread`: declare → admit → plan → forward launch → commit |
 | Plan thread (1 worker) | Pre-plan for N+1, on its own CUDA stream, gated on N's commit event |
 | Side stream | D2H copies for `check_stop` pre-materialization |
+| `SideStepLane` stream | A side lane's steps (`side_stream: true` on a node group), launched from the GPU thread between two chain steps; its windows collate there on the main thread |
 
 Knobs: **`MSTAR_TP_ASYNC_SCHED` is `1`, so lockstep-parallel (TP/SP) nodes speculate too.** `0` runs them serially, which is still a supported path: a change that only works with speculation on needs testing with it off as well. It also takes a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
 
@@ -48,6 +49,15 @@ The loop is circular, so this starts at an arbitrary point: **batch N is running
 **6. Launch N+1.** Submit to the GPU thread, which starts queuing kernels. The main thread then blocks on the step's `launch_started_event` (set at launch, or on completion by `_submit_gpu_step`; timeout `MSTAR_LAUNCH_WAIT_MS`) so it holds off the GIL until the GPU thread reaches the forward launch. Staleness is checked on the GPU thread, after the plan future resolves and after prepare. From submission on, the GPU thread owns the pre-plan.
 
 **7. Postprocess N.** Now wait for the actual GPU work (`event_sync`), D2H the outputs, pre-materialize on the side stream, run `check_stop` to look for EOS, extend prefix hash chains from the host copy of sampled tokens, then route and send outputs. The side stream exists because the default stream has GPU(N+1) queued behind GPU(N)'s outputs by this point.
+
+## Steps beside the chain
+
+A node whose group sets `side_stream: true` runs its `side_stream_walks` on a side lane (`mstar/worker/side_steps.py`), not in the stages above. The chain is lane 0: a step carries its lane (`PendingBatch.lane`), both submit through `_submit_step` and finish through `_finish_step`, `get_next_batch(lane=...)` hands each lane only its own keys (`MicroScheduler.lane_of`), and `_hold_rows` keeps each lane's rows in flight. The lane launches at the top of a pass and postprocesses once its step has landed, at the top when the chain is idle or after N's postprocess otherwise, so it costs no pass and the chain never yields to it. One step at a time; it is never speculated, pre-planned or lockstep, which `EngineManager.build` enforces at startup for the groups that ask.
+
+- **Overlap needs its own capture stream.** Graphs captured on one stream must not run at once; the chain never overlaps its own, but a side step overlaps all of them. Sharing a capture stream, a prefill beside a codec window derailed about 1 in 2000 rows at c=8: the sentence reads fine, EOS never comes, and the request runs to the frame cap. Seeded c=1 and WER both miss it (at c=1 a prefill never overlaps a codec step), so soak at c=8 and count runaways.
+- **Its inputs land before it launches.** Streamed items reach the lane only after the producing step's completion event was waited on, and the window's collate (the stack in `StreamBufferManager.input_tensors`) runs on the lane's stream, so nothing on the main stream is ahead of the step and there is no fence. Postprocess frees its inputs first, and those include main-stream allocations, so it waits for the step to land.
+- **It lands between two chain steps, whenever it finishes.** Postprocess state that assumes the next postprocess is the chain's next step does not hold for it: only a chain step clears the pending loop stops (`_finish_step`), or the speculative step past an EOS gets routed and the audio gains a frame. A seeded byte compare finds this; WER does not.
+- **It fails alone.** A raise in a side step fails its rows, not the chain's, and a chain error fails the chain's rows (`_handle_main_loop_error`) and leaves the side step to finish.
 
 ## What breaks it
 

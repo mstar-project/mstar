@@ -67,8 +67,11 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         "tokenizer_config.json", "tokenizer.json", "chat_template.jinja",
     )
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
-        super().__init__(model_path_hf, cache_dir)
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None, **kwargs: Any,
+    ):
+        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
         self.config = MuseGlimmerConfig.from_hf(self.local_dir)
         self.vision_config = MuseGlimmerVisionConfig.from_hf(self.local_dir)
         self.tokenizer = load_tokenizer(self.local_dir)
@@ -130,7 +133,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         # (windows, frames). Every replay plans for this many, so it is sized
         # to real prompts rather than the worst case: the top bucket's patches
         # in whole windows, four times over for partial edge windows and
-        # several images. A prompt with more runs the block loop eagerly
+        # several images. A step with more runs the block loop eagerly
         # (`PackedBlockLoopEncoder._fits_capture`); YAML can raise it.
         from mstar.model.muse.submodules import VisionEncoderSubmodule
 
@@ -174,7 +177,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                     num_qo_heads=vision.num_attention_heads,
                     num_kv_heads=vision.num_attention_heads,
                     head_dim=vision.head_dim,
-                    max_segments_per_request=max_segments,
+                    max_segments_per_step=max_segments,
                 ),
             ),
         ]
@@ -256,7 +259,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             tower.requires_grad_(False).eval()
             logger.info("Loaded Muse Glimmer vision encoder onto %s", device)
             return VisionEncoderSubmodule(
-                tower, self.vision_config, self.encoder(node_name),
+                tower, self.vision_config, self.encoder(node_name).output,
             )
 
         from mstar.model.muse.components.text import MuseGlimmerForCausalLM
@@ -265,4 +268,4 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         weight_loader.load_text_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Muse Glimmer LLM onto %s", device)
-        return LLMSubmodule(model, self.config, self.encoders)
+        return LLMSubmodule(model, self.config, self.encoders, prefill_token_buckets=self.prefill_token_buckets)

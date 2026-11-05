@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B node submodules (all four declare no engine resources).
+"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares a ragged attention resource).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -311,8 +311,14 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
+    # The ragged self-attention resource (Wan22Model.get_node_resources).
+    SELF_ATTN = "dit_self_attn"
+
     def __init__(self, transformer: nn.Module, config: Wan22Config):
-        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
+        super().__init__(
+            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
+            attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
+        )
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
@@ -357,6 +363,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
         )
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
+
+    def attention_segments(self, bucket_key: WanStepKey):
+        # one segment per guidance branch, all the same span
+        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (2 if bucket_key.guidance > 1.0 else 1)
 
     def seed_latents(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
@@ -471,6 +481,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            self_attn_fn=self._ragged(),
         )
         if not do_cfg:
             return out
@@ -537,15 +548,13 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
         self._record_fp32_islands()
-        self._fast_step = None
+        self._fast = None
         self._fast_sizes = config.fast_decode_sizes()
         if config.vae_decode_fast:
             from mstar.model.components import wan_vae
 
-            # Before the compile traces the decoder; this VAE instance is the
-            # decoder node's own.
-            wan_vae.to_channels_last(self.vae)
-            self._fast_step = wan_vae.DecoderStep(self.vae, compile=True, deterministic=True)
+            # this VAE instance is the decoder node's own
+            self._fast = wan_vae.FastDecoder(self.vae)
             logger.info(
                 "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled); "
                 "other sizes decode stock",
@@ -650,22 +659,15 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
                 "tiled" if tiled else "untiled", height, width, num_frames,
                 estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
             )
-            fast = self._fast_step is not None and not tiled and (width, height) in self._fast_sizes
-            if self._fast_step is not None:
-                from mstar.model.components import wan_vae
-
+            fast = self._fast is not None and not tiled and (width, height) in self._fast_sizes
+            if self._fast is not None and not fast:
                 # One request per step, so nothing else decodes on this VAE
-                # while its layout switches. Outside inference mode: a weight
-                # made in it is an inference tensor, whose dispatch keys the
-                # compiled graph's parameter guards reject (a recompile).
-                with torch.inference_mode(False):
-                    (wan_vae.to_channels_last if fast else wan_vae.to_default_layout)(vae)
+                # while its layout switches; the fast decode switches it back.
+                self._fast.use_stock_layout()
             if tiled:
                 video = vae.tiled_decode(latents, return_dict=False)[0]
             elif fast:
-                video = wan_vae.decode_causal(
-                    vae, latents, wan_vae.new_feat_cache(vae), self._fast_step, clip_start=True,
-                )
+                video = self._fast.decode(latents)
             else:
                 video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).

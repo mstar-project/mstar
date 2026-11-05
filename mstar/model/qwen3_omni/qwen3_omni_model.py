@@ -68,6 +68,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.components import MoeParallelConfig
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -84,7 +85,6 @@ from mstar.model.multimodal import (
     split_spans,
 )
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
     CODE_PRED_SAMPLER,
@@ -97,6 +97,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_TEXT_DECODE,
     VISION_ATTN,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
@@ -111,6 +112,9 @@ from mstar.streaming.topology import (
 )
 
 logger = logging.getLogger(__name__)
+
+# In a prefill schedule entry: how many of the step's text tensors lead its attachment
+TEXT_BEFORE = "text_before"
 
 # Code2Wav streaming knobs a deployment YAML's ``model_kwargs`` may set; the
 # rest of the Code2Wav config comes from the checkpoint.
@@ -166,6 +170,28 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+class ThinkerStep(NamedTuple):
+    """One Thinker prefill: its walk and the plan parts its row writes, in order."""
+    walk: str
+    parts: list[PromptPart]
+
+
+def _thinker_steps(plan: list[PromptPart]) -> list[ThinkerStep]:
+    """``plan`` grouped into Thinker prefills: each attachment with the text
+    before it, the last one also with the text after it. The prefill schedule
+    and the KV layout both read this, so the layout's steps are the ones that run."""
+    media = [i for i, part in enumerate(plan) if part.modality != TEXT]
+    if not media:
+        return [ThinkerStep("prefill_text", [part]) for part in plan]
+    steps: list[ThinkerStep] = []
+    start = 0
+    for at in media:
+        end = len(plan) if at == media[-1] else at + 1
+        steps.append(ThinkerStep(Qwen3OmniModel._MM_WALKS[plan[at].modality][0], plan[start:end]))
+        start = end
+    return steps
+
+
 class ImageSpan(NamedTuple):
     length: int
     advance: int
@@ -193,10 +219,13 @@ class Qwen3OmniModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
+        # the Thinker's captured prefill ladder (`ThinkerSubmodule.PREFILL_TOKEN_BUCKETS`)
+        self.prefill_token_buckets = prefill_token_buckets
 
         self.CONVERTER = [
             WeightConverter(
@@ -354,9 +383,9 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
                     # Frames of 256 patches or more fill the largest captured
-                    # bucket at this many; a request with more frames runs the
-                    # block loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    # bucket at this many; a step with more frames runs the
+                    # block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
+                    max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
                 ),
             ),
         ]
@@ -390,11 +419,6 @@ class Qwen3OmniModel(Model):
     def checkpoint_path(self) -> str:
         return self.local_dir
 
-    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
-
-        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
-
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
@@ -404,7 +428,7 @@ class Qwen3OmniModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"Thinker": {THINKER_MIXED: {
-            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
+            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode", THINKER_TEXT_DECODE,
         }}}
 
     def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
@@ -426,10 +450,13 @@ class Qwen3OmniModel(Model):
         """Define all graph walks for the 3-partition architecture.
 
         Thinker walks:
-            prefill_text   - text token embedding + Thinker prefill
-            prefill_audio  - audio feature encoding + Thinker prefill
-            prefill_vision - vision feature encoding + Thinker prefill
-            thinker_decode - autoregressive text token generation
+            prefill_text   - a prompt with no attachment: one Thinker prefill
+            prefill_audio  - audio feature encoding, then one Thinker prefill of
+                             the clip spliced between the text around it
+            prefill_vision - the same for an image or a video
+            thinker_decode - autoregressive text token generation, streaming
+                             its states to the Talker
+            thinker_text_decode - the same for a request with no audio output
 
         Talker walks:
             talker_prefill - prefill Talker KV cache from Thinker states
@@ -469,15 +496,14 @@ class Qwen3OmniModel(Model):
         prefill_audio = Sequential([
             GraphNode(
                 name="audio_encoder",
-                # audio_seqlens carries the original (pre-padding) length of
-                # each audio clip, used by the encoder to compute attention
-                # masks and output position IDs.
-                input_names=["audio_features", "audio_seqlens"],
+                # a clip's unpadded log-mel features: its frame count is the
+                # tensor's last dim
+                input_names=["audio_features"],
                 outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
             ),
             GraphNode(
                 name="Thinker",
-                input_names=["audio_embeds"],
+                input_names=["audio_embeds", "text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -513,7 +539,7 @@ class Qwen3OmniModel(Model):
             ),
             GraphNode(
                 name="Thinker",
-                input_names=["vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw"],
+                input_names=["vision_embeds", "deepstack", "video_second_per_grid", "image_grid_thw", "text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -562,6 +588,26 @@ class Qwen3OmniModel(Model):
                         next_node="Talker",
                         name="thinker_mask",
                         target_partition="Talker",
+                    ),
+                ],
+            ),
+            max_iters=self.config.thinker_text.max_position_embeddings,
+            outputs=[],
+        )
+
+        # -- Thinker decode with no Talker: the sampled token stays on the
+        #    device between steps and reaches the client inline --
+        thinker_text_decode = Loop(
+            name="thinker_decode_loop",
+            section=GraphNode(
+                name="Thinker",
+                input_names=["text_inputs"],
+                outputs=[
+                    GraphEdge(next_node="Thinker", name="text_inputs"),
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="text_inputs",
+                        output_modality="text",
                     ),
                 ],
             ),
@@ -641,6 +687,7 @@ class Qwen3OmniModel(Model):
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
             "thinker_decode": thinker_decode,
+            THINKER_TEXT_DECODE: thinker_text_decode,
             "talker_prefill": talker_prefill,
             "talker_last_prefill": talker_last_prefill,
             "talker_decode": talker_decode,
@@ -657,7 +704,7 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 graph_walks={
                     "prefill_text", "prefill_audio",
-                    "prefill_vision", "thinker_decode",
+                    "prefill_vision", "thinker_decode", THINKER_TEXT_DECODE,
                 },
             ),
             PartitionDefinition(
@@ -718,22 +765,26 @@ class Qwen3OmniModel(Model):
         emit ``thinker_states``: a text-only request skips them, to save
         cross-partition bandwidth.
 
-        With audio out, the Thinker's stream moves the Talker through its
-        prefill walks (``_talker_walk``), and the conductor feeds
-        ``talker_decode`` its first input once ``talker_last_prefill`` has
-        sampled the first codec token. Code2Wav runs once per chunk of codec
-        tokens, until the worker reports the stream's final chunk; a
-        count-based end would miss the left-context policy's flush pass.
+        A request with no audio out decodes on ``THINKER_TEXT_DECODE``, whose
+        token stays on the device between steps. With audio out, the Thinker's
+        stream moves the Talker through its prefill walks (``_talker_walk``),
+        and the conductor feeds ``talker_decode`` its first input once
+        ``talker_last_prefill`` has sampled the first codec token. Code2Wav runs
+        once per chunk of codec tokens, until the worker reports the stream's
+        final chunk; a count-based end would miss the left-context policy's
+        flush pass.
         """
         audio_output = "audio" in output_modalities
         if partition_name == "Thinker":
             thinker = {"audio_output": audio_output}
-            prefills = self._build_thinker_prefill_schedule(input_modalities, input_signals)
+            prefills = self._build_thinker_prefill_schedule(input_modalities)
             # the last prefill samples the reply's first token
             return [
-                WalkStep(walk, bind=bind, step_metadata={**thinker, FINAL_PREFILL: k == len(prefills) - 1})
-                for k, (walk, bind) in enumerate(prefills)
-            ] + [WalkStep("thinker_decode", bind={"text_inputs": "new_token"}, step_metadata=thinker)]
+                WalkStep(walk, bind=bind, step_metadata={
+                    **thinker, TEXT_BEFORE: text_before, FINAL_PREFILL: k == len(prefills) - 1,
+                })
+                for k, (walk, bind, text_before) in enumerate(prefills)
+            ] + [WalkStep(self._decode_walk(audio_output), bind={"text_inputs": "new_token"}, step_metadata=thinker)]
         if partition_name not in ("Talker", "Code2Wav"):
             raise ValueError(f"Unknown partition: {partition_name!r}")
         if not audio_output:
@@ -748,15 +799,16 @@ class Qwen3OmniModel(Model):
             WalkStep("talker_decode", step_metadata={"talker_max_tokens": talker_max_tokens}),
         ]
 
+    @staticmethod
+    def _decode_walk(audio_output: bool) -> str:
+        return "thinker_decode" if audio_output else THINKER_TEXT_DECODE
+
     # Per-modality walk name and the signals it binds: the walk's input names
     # (primary feature tensor first, then that encoder's auxiliary tensors) to
     # the prompt lists whose entries fill them. Video rides the vision encoder,
     # so its tensors arrive under the vision input names.
     _MM_WALKS: dict[str, tuple[str, dict[str, str]]] = {
-        "audio": ("prefill_audio", {
-            "audio_features": "audio_features",
-            "audio_seqlens": "audio_seqlens",
-        }),
+        "audio": ("prefill_audio", {"audio_features": "audio_features"}),
         "image": ("prefill_vision", {
             "pixel_values": "pixel_values",
             "image_grid_thw": "image_grid_thw",
@@ -767,41 +819,32 @@ class Qwen3OmniModel(Model):
             "video_second_per_grid": "video_second_per_grid",
         }),
     }
-    # the prompt lists whose entries each prefill in a walk of their own
-    SPANS = ("text_inputs", *sorted({key for _, keys in _MM_WALKS.values() for key in keys.values()}))
+    # the attachment lists whose entries each prefill in a walk of their own
+    MEDIA_SPANS = tuple(sorted({key for _, keys in _MM_WALKS.values() for key in keys.values()}))
 
-    def _build_thinker_prefill_schedule(
-        self,
-        input_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[tuple[str, dict[str, str]]]:
-        """The Thinker's prefill walks, each as ``(walk_name, {input_name: span signal})``.
+    def _build_thinker_prefill_schedule(self, input_modalities: list[str]) -> list[tuple[str, dict[str, str], int]]:
+        """The Thinker's prefill walks, an entry per step of ``_thinker_steps``
+        (so a prompt of text, a clip and text is one step), each as
+        ``(walk_name, {input_name: signal}, text_before)``.
 
-        Walks the prefill plan, so text spans and attachments prefill in the
-        order written and each attachment gets its own walk. ``process_prompt``
-        split ``text_inputs`` against the same plan, so the nth span belongs to
-        the nth text step; each list entry arrives as a signal of its own
-        (`split_spans`). A modality walk binds every tensor its walk's nodes
-        need: the auxiliary tensors alongside the primary feature tensor.
+        Step ``k``'s text arrives as signal ``text_inputs.k``, the spans around
+        its attachment, ``text_before`` of them leading it; each attachment's
+        tensors arrive as signals of their own (`split_spans`), and a modality
+        walk binds every tensor its walk's nodes need: the auxiliary tensors
+        alongside the primary feature tensor. ``process_prompt`` split the
+        prompt against the same plan, and failed at intake any request whose
+        tensors don't fill it.
         """
-        schedule: list[tuple[str, dict[str, str]]] = []
-        # ``check_plan`` already failed a mismatch at intake, where a 400 can
-        # still be returned; skipping here keeps one that slipped through from
-        # raising inside the conductor instead.
-        for step in prefill_plan(parts_from_modalities(input_modalities)):
-            if step.modality == TEXT:
-                span = span_name("text_inputs", step.index)
-                if span in input_signals:
-                    schedule.append(("prefill_text", {"text_inputs": span}))
+        schedule: list[tuple[str, dict[str, str], int]] = []
+        for k, step in enumerate(_thinker_steps(prefill_plan(parts_from_modalities(input_modalities)))):
+            bind = {"text_inputs": span_name("text_inputs", k)}
+            if step.walk == "prefill_text":
+                schedule.append((step.walk, bind, 0))
                 continue
-            walk, signal_names = self._MM_WALKS[step.modality]
-            bind = {
-                name: span_name(key, step.index)
-                for name, key in signal_names.items()
-                if span_name(key, step.index) in input_signals
-            }
-            if bind:
-                schedule.append((walk, bind))
+            at = next(i for i, part in enumerate(step.parts) if part.modality != TEXT)
+            item = step.parts[at]
+            bind |= {name: span_name(key, item.index) for name, key in self._MM_WALKS[item.modality][1].items()}
+            schedule.append((step.walk, bind, at))
         return schedule
 
     # -----------------------------------------------------------------------
@@ -880,7 +923,7 @@ class Qwen3OmniModel(Model):
            assistant response.
         3. Run the image_processor / feature_extractor on the raw modality
            tensors to produce ``pixel_values`` / ``image_grid_thw`` /
-           ``audio_features`` / ``audio_seqlens``.
+           ``audio_features``.
         4. Expand the single ``<|image_pad|>`` / ``<|audio_pad|>`` /
            ``<|video_pad|>`` placeholder in the tokenized text to N copies
            where N = number of patches after spatial merge (this is what
@@ -888,8 +931,9 @@ class Qwen3OmniModel(Model):
            internally).
 
         The result holds the text spans and the per-modality tensors the
-        Thinker's prefill walks need, each list entry as a signal of its own
-        (`split_spans`: ``text_inputs.N``, ``pixel_values.N``, ...).
+        Thinker's prefill walks need (`_split_steps`): each prefill step's text
+        as one signal (``text_inputs.N``), each attachment's tensors as signals
+        of their own (``pixel_values.N``, ...).
         """
         result: NameToTensorList = {}
 
@@ -964,7 +1008,6 @@ class Qwen3OmniModel(Model):
 
         result["pixel_values"] = []
         result["image_grid_thw"] = []
-        result["audio_seqlens"] = []
         result["audio_features"] = []
         result["video_second_per_grid"] = []
         result["video_grid_thw"] = []
@@ -988,13 +1031,11 @@ class Qwen3OmniModel(Model):
                 return_attention_mask=True,
                 return_tensors="pt"
             )
+            # the clip's valid frames only, so its frame count is the width
             aud_out["input_features"] = (
                 aud_out["input_features"]
                 .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
                 .permute(1, 0)
-            )
-            result["audio_seqlens"].append(
-                aud_out["attention_mask"].sum(-1).to(torch.long)
             )
             result["audio_features"].append(
                 aud_out["input_features"]
@@ -1020,49 +1061,69 @@ class Qwen3OmniModel(Model):
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
         if not attached:
-            return ProcessPromptOutput(split_spans(result, self.SPANS)[0], {})
-        result, kv_layout = split_spans(result, self.SPANS, self._kv_layout(plan, result, "audio" in output_modalities))
+            return ProcessPromptOutput(self._split_steps(result, plan)[0], {})
+        kv_layout = self._kv_layout(plan, result, "audio" in output_modalities)
+        result, kv_layout = self._split_steps(result, plan, kv_layout)
         return ProcessPromptOutput(result, {"kv_layout": kv_layout})
+
+    def _split_steps(
+        self, tensors: NameToTensorList, plan: list[PromptPart], kv_layout: dict | None = None,
+    ) -> tuple[NameToTensorList, dict | None]:
+        """``tensors`` as the walk plan binds them: step ``k`` of ``_thinker_steps``
+        takes its text spans as one signal, ``text_inputs.k`` (``_kv_layout``
+        keys its ids spans under it), and each attachment's tensors are signals
+        of their own (`split_spans`)."""
+        texts = tensors["text_inputs"]
+        out = {**tensors, "text_inputs": []}
+        for k, step in enumerate(_thinker_steps(plan)):
+            out[span_name("text_inputs", k)] = [texts[part.index] for part in step.parts if part.modality == TEXT]
+        return split_spans(out, self.MEDIA_SPANS, kv_layout)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.
 
         The Talker prefills every step's rows except those of a system or earlier
-        assistant turn. It then prefills its assistant prefix, and writes a row per decode step.
+        assistant turn, one prefill a step. It then prefills its assistant prefix,
+        and writes a row per decode step.
         """
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
 
         merge = self.config.vision.spatial_merge_size
-        thinker, talker, position = [], [], 0
-        for step in plan:
-            if step.modality == TEXT:
-                ids = tensors["text_inputs"][step.index]
-                span = Span("ids", "prefill_text", len(ids), len(ids), "text_inputs")
-                kept = int(talker_text_mask(ids, self.config).sum())
-            elif step.modality == "audio":
-                # the encoder's rows between two sentinels
-                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
-                span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
-                kept = rows
-            elif step.modality == "image":
-                image = image_span(tensors["image_grid_thw"][step.index], merge)
-                span = Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index))
-                kept = image.length
-            else:
-                grid = tensors["video_grid_thw"][step.index]
-                per_grid = tensors["video_second_per_grid"][step.index].item()
-                rows = int(grid.prod()) // merge ** 2 + 2
-                # the walk moves the counter one past its end sentinel, which follows the grid's largest position
-                positions = get_rope_index_vision(
-                    grid, position + 1, self.config.thinker.position_id_per_seconds,
-                    spatial_merge_size=merge, seconds_per_grid=per_grid,
-                )
-                advance = int(positions.max()) + 2 - position
-                span = Span("digest", "prefill_vision", rows, advance, ("video", step.index))
-                kept = rows
-            thinker.append(span)
-            talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
-            position += span.advance
+        thinker, talker_rows, position = [], [], 0
+        for k, step in enumerate(_thinker_steps(plan)):
+            talker_rows.append(0)
+            for i, part in enumerate(step.parts):
+                if part.modality == TEXT:
+                    ids = tensors["text_inputs"][part.index]
+                    # the step's text is one signal (`_split_steps`)
+                    span = Span("ids", step.walk, len(ids), len(ids), span_name("text_inputs", k))
+                    kept = int(talker_text_mask(ids, self.config).sum())
+                elif part.modality == "audio":
+                    # the encoder's rows between two sentinels
+                    frames = tensors["audio_features"][part.index].shape[-1]
+                    rows = self.config.audio_encoder.tokens_for_frames(frames) + 2
+                    span = Span("digest", step.walk, rows, rows, ("audio", part.index))
+                    kept = rows
+                elif part.modality == "image":
+                    image = image_span(tensors["image_grid_thw"][part.index], merge)
+                    span = Span("digest", step.walk, image.length, image.advance, ("image", part.index))
+                    kept = image.length
+                else:
+                    grid = tensors["video_grid_thw"][part.index]
+                    per_grid = tensors["video_second_per_grid"][part.index].item()
+                    rows = int(grid.prod()) // merge ** 2 + 2
+                    # the walk moves the counter one past its end sentinel, which follows the grid's largest position
+                    positions = get_rope_index_vision(
+                        grid, position + 1, self.config.thinker.position_id_per_seconds,
+                        spatial_merge_size=merge, seconds_per_grid=per_grid,
+                    )
+                    advance = int(positions.max()) + 2 - position
+                    span = Span("digest", step.walk, rows, advance, ("video", part.index))
+                    kept = rows
+                thinker.append(span._replace(opens_step=i == 0))
+                talker_rows[-1] += kept
+                position += span.advance
+        talker = [Span("rows", "talker_prefill", kept, kept, "thinker_states") for kept in talker_rows]
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
         # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
         video = any(step.modality == "video" for step in plan)
@@ -1077,9 +1138,11 @@ class Qwen3OmniModel(Model):
         }
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the Thinker's last prefill emits its first text token and
+        # talker_last_prefill its first codec frame, so each loop runs one fewer
         return {
-            "thinker_decode_loop": self.get_max_output_tokens(**model_kwargs),
-            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs)),
+            "thinker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            "talker_decode_loop": max(1, self._get_max_talker_output_tokens(**model_kwargs) - 1),
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
@@ -1087,7 +1150,7 @@ class Qwen3OmniModel(Model):
         file, and its replies as they decode."""
         return {
             THINKER_KV: {"main": KVLabel(
-                growth=(("thinker_decode", "thinker_decode_loop"),),
+                growth=(("thinker_decode", "thinker_decode_loop"), (THINKER_TEXT_DECODE, "thinker_decode_loop")),
                 keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vision", "prefill_audio"), growth=True),
             )},
             TALKER_KV: {"main": KVLabel(
@@ -1224,7 +1287,7 @@ class Qwen3OmniModel(Model):
         E = self.config.thinker_text.num_experts
         # MoE expert rules MUST come before dense MLP rules because
         # the dense ".gate_proj" suffix would also match the remapped
-        # MoE key "experts.gate_proj.__expertN__.weight". _apply_stacked
+        # MoE key "experts.gate_proj.__expertN__.weight". apply_stacked
         # returns on first match, so longer/more-specific rules go first.
         rules = []
         for i in range(E):
@@ -1294,6 +1357,7 @@ class Qwen3OmniModel(Model):
         return ThinkerSubmodule(
             thinker_model=thinker_model,
             config=self.config,
+            prefill_token_buckets=self.prefill_token_buckets,
         )
 
     def _create_talker_submodule(
@@ -1357,8 +1421,15 @@ class Qwen3OmniModel(Model):
         )
         talker_model.eval()
 
+        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config)
+            # its inputs and codec embeddings are in the Talker's width, which
+            # Qwen3-Omni's code predictor shares (it has no input projection)
+            # the frame's embedding sum accumulates in fp32, rounded once
+            code_predictor = ResidualCodePredictor(
+                self.config.code_predictor, self.config.code_predictor.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                embed_sum_dtype=torch.float32,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:
@@ -1372,7 +1443,6 @@ class Qwen3OmniModel(Model):
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
 
-        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         talker_sub = TalkerSubmodule(
             talker_model=talker_model,
             code_predictor=code_predictor,

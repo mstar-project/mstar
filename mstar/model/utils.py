@@ -605,7 +605,7 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     queues the rest. Warnings go to the model's ``log``.
     """
     from mstar.engine.resources import KVSpec, PagedKVConfig
-    from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.model.base import serving_resources
 
     cap = config.get("max_concurrent_requests")
     if cap is None:
@@ -617,10 +617,9 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
         raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-    specs = model.get_node_resources()
     try:
         # as a server builds them: the deployment's overrides, and what the pools derive
-        apply_yaml_overrides(specs, config)
+        specs = serving_resources(model, config)
     except ValueError:
         return  # a `resources:` block the validation's resource checks report
     for spec in specs:

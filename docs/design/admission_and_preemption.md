@@ -267,7 +267,7 @@ The data worker already reads the prompt's ids on the host to key the prefix cac
 
 Why this shape:
 
-- **The graph runtime never sees the row.** Switching the request's runtime walk for one step would touch both runtimes, the output edges, `WORKER_GRAPHS_DONE` and the loop-back.
+- **The graph runtime never sees the row.** Switching the request's runtime walk for one step would touch the runtime, the output edges, `WORKER_GRAPHS_DONE` and the loop-back.
 - **The prefill walk.** Each model's decode walk breaks a multi-token row in its own way. Bagel's declares a span of 1, the Qwen3-Omni Thinker's embeds every id at one position, and Qwen3.5's with device loop-back reads one token off the sampler.
 - **The prompt's ids from the data worker.** A drop can come at any token, after the prompt tensor is freed. Keeping the ids any other way means a device-to-host copy of every prefill's input.
 - **Not a remove and re-ingest.** The sampler's RNG offset and repetition mask would be lost.
