@@ -151,12 +151,10 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: ZShape) -> FlowMatchSchedule:
-        return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: ZShape) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: ZShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: ZShape, generator: torch.Generator) -> torch.Tensor:
         h, w = bucket_key.grid
         patch = self.config.transformer.patch_size
         # randn_tensor parity: fp32 on the CPU generator, in the unpacked [C, H/8, W/8] layout

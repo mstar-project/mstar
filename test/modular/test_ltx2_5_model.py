@@ -352,7 +352,7 @@ def test_seed_draws_video_then_audio_noise_from_one_generator():
     their unpacked layouts; the same seed must reproduce both."""
     cfg = LTX25Config()
     shape = LTXShape(frames=2, height=3, width=4, audio_frames=5, fps=24.0, text_len=1024)
-    seeds = _dit(cfg).seed_loop_back(None, shape, torch.Generator().manual_seed(7))
+    seeds = _dit(cfg).seed_loop_back(shape, torch.Generator().manual_seed(7))
     gen = torch.Generator().manual_seed(7)
     video = torch.randn((1, 128, 2, 3, 4), generator=gen)
     audio = torch.randn((1, 8, 5, 16), generator=gen)

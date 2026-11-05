@@ -179,7 +179,6 @@ def _wan22_steps(sub, walk, steps, latents, image_latent):
     from the loop counter and the solver state over the loop-back edges."""
     device = latents.device
     sub.get_device = lambda: device
-    sub.request_states.pop("r", None)
     ring, last = torch.zeros((2, *latents.shape), device=device), torch.zeros_like(latents)
     inputs = {
         "text_embeds_pos": [torch.full((1, 8, 16), 1.0, device=device, dtype=torch.bfloat16)],

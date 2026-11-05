@@ -181,12 +181,10 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
-        return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: KleinShape) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: drawn in the packed [C, h, w] layout in bf16 on the CPU
         # generator, then packed row-major to tokens.
         h, w = bucket_key.grid

@@ -393,19 +393,15 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             i2v=fwd_info.graph_walk == self._I2V_WALK,
         )
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> FlowMatchSchedule:
-        sigmas, timesteps = make_unipc_tables(
-            int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        sigmas, timesteps = make_unipc_tables(int(num_steps), self.config.flow_shift)
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
     def attention_segments(self, bucket_key: WanStepKey):
         # one segment per guidance branch, all the same span
         return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (2 if bucket_key.guidance > 1.0 else 1)
 
-    def seed_latents(
-        self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
-    ) -> torch.Tensor:
+    def seed_latents(self, bucket_key: WanStepKey, generator: torch.Generator) -> torch.Tensor:
         shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
         # randn_tensor parity: CPU generator, CPU randn, then move.
         return torch.randn(shape, generator=generator, dtype=torch.float32)
@@ -443,7 +439,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
                 out[self.LATENTS] = torch.stack([
                     (1 - mask) * image_latent + mask * sample
-                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["num_steps"] else sample
+                    if self.step_index(info) + 1 >= self.num_steps_of(info) else sample
                     for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
                 ])
         return out

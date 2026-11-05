@@ -59,7 +59,6 @@ def _step(node: Wan22DitSubmodule, width: int, height: int, frames: int, guidanc
         request_id="r", rid_handle="r", graph_walk="video_gen", step_metadata=meta,
         dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
     )
-    node.request_states.pop("r", None)
     node.get_device = lambda: torch.device("cpu")
     prepared = node.prepare_inputs("video_gen", info, {
         "latents": [torch.randn(shape, generator=gen)],

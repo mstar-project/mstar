@@ -469,16 +469,10 @@ def _dit() -> Wan22DitSubmodule:
 ])
 def test_wan22_check_stop_boundary(requested_steps, iter_count, expect_stop):
     submodule = _dit()
-    submodule.request_state("r0").add("num_steps", requested_steps)
     stops = submodule.check_stop("r0", _fwd_info(requested_steps, iter_count), outputs={})
     assert (DENOISE_LOOP_NAME in stops) == expect_stop
     if not expect_stop:
         assert stops == set()
-
-
-def test_wan22_check_stop_without_a_schedule_never_stops():
-    # A missing step count must not stop the loop; max_iters still bounds it.
-    assert _dit().check_stop("r0", _fwd_info(requested_steps=0, iter_count=99), outputs={}) == set()
 
 
 # ----------------------------------------------------------------------

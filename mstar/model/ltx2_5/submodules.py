@@ -255,10 +255,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> LTXShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: LTXShape) -> FlowMatchSchedule:
-        if fwd_info.graph_walk in self.refine_walks:
-            return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES)
-        return distilled_schedule()
+    def schedule_for(self, walk: str, num_steps: None, bucket_key: LTXShape) -> FlowMatchSchedule:
+        return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES) if walk in self.refine_walks else distilled_schedule()
 
     def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
         """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,
@@ -269,9 +267,9 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         dropped) first. Stage 2 draws its video noise in bf16 in the packed layout (it
         takes the dtype of the upsampled latents) and its audio noise in fp32."""
         if fwd_info.graph_walk not in self.refine_walks:
-            return self.seed_loop_back(fwd_info, bucket_key, generator)
+            return self.seed_loop_back(bucket_key, generator)
         stage1 = dataclasses.replace(bucket_key, height=bucket_key.height // 2, width=bucket_key.width // 2)
-        self.seed_loop_back(fwd_info, stage1, generator)
+        self.seed_loop_back(stage1, generator)
         device = self.get_device()
         refine_video = inputs[REFINE_LATENTS][0].to(device)
         refine_audio = inputs[REFINE_AUDIO][0].to(device)
@@ -282,7 +280,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         audio = scale * self.stage_seed(audio_noise, device) + (1 - scale) * refine_audio
         return {LATENTS: video.to(torch.float32), AUDIO_LATENTS: audio.to(torch.float32)}
 
-    def seed_loop_back(self, fwd_info, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
+    def seed_loop_back(self, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
         # LTX2Pipeline draws the video noise, then the audio noise, from one generator,
         # both fp32 in the unpacked layout, then packs them.
         geo = self.config.geometry
