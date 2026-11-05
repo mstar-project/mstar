@@ -230,3 +230,18 @@ def test_a_request_turned_away_by_an_out_of_date_mark_passes_once_that_head_is_m
     assert runner.admit_retrieve("p", "one", WALK).queued
 
     assert ("one", "p") in runner.admit_waiting(_nothing), "p waits a pass more, though x was just refused again"
+
+
+def test_requests_pass_one_refused_while_passing_where_it_is_first():
+    # "head" asks only the KV pool, so "big" is first in the rows pool's queue
+    kv, rows = _PassingPool(8, needs={"head": 10, "big": 8}), _PassingPool(20)
+    runner = _runner({"solo": ["kv"], NODE: ["kv", "rows"]}, kv=kv, rows=rows)
+    assert runner.admit_retrieve("head", "solo", WALK).queued
+    assert runner.admit_retrieve("big", NODE, WALK).queued
+    small = [f"s{n}" for n in range(6)]
+    for rid in small:
+        runner.admit_retrieve(rid, NODE, WALK)
+
+    runner.admit_waiting(_nothing)
+
+    assert kv.held == set(small), "six small requests waited behind one refused while it passed, with room for them"

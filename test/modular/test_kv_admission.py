@@ -228,6 +228,26 @@ def test_a_filed_page_tries_no_request_whose_output_cant_fit_beside_the_head(mon
     assert not tried, f"one filed page tried {len(tried)} requests whose output doesn't fit whatever their hit"
 
 
+def test_a_filed_page_tries_no_guaranteed_request_whose_footprint_cant_fit_beside_the_head(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        tokens = HELD + [7000 + n] * 8
+        kv.ingest_request(f"w{n}", KVReqConfig(
+            prefix_keys={"main": _keys(tokens)}, loop_caps={"decode_loop": 128}, unpausable=True,
+            kv_layout={"main": StreamLayout(
+                (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+            )},
+        ))
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv._index.filed += 1
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, f"one filed page tried {len(tried)} guaranteed requests, whose hit takes nothing off"
+
+
 def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the_head_is_refused_again():
     kv = _passing(free=3, head=5)
     kv._index.filed += 1  # the head may fit now, so nothing passes it until it is measured again
@@ -341,6 +361,27 @@ def test_a_snapshot_filed_under_a_waiting_heads_hit_retries_it():
     _snapshot(state, kv, "r", 3)
 
     assert _ready(kv, "h"), "a snapshot lowered what the head needs, and nothing its mark reads moved"
+
+
+def test_a_snapshot_filed_while_the_head_is_measured_retries_it(monkeypatch):
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(5000, 5000 + (kv._room() - 2) * PAGE_SIZE)))
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+    need, filed = kv._need, []
+
+    def need_then_snapshot(*args):
+        pages = need(*args)
+        if not filed:
+            # filed under the recurrent pool's own lock, after the head's need was read
+            filed.append(_snapshot(state, kv, "r", 3))
+        return pages
+
+    monkeypatch.setattr(kv, "_need", need_then_snapshot)
+    assert not _ready(kv, "h")
+
+    assert _ready(kv, "h"), "the head's mark counted a snapshot its need didn't, so nothing tried it again"
 
 
 @pytest.mark.parametrize("leave", [KVManager.remove_request, KVManager.offload], ids=["finishes", "is offloaded"])
