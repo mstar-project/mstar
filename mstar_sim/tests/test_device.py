@@ -737,6 +737,10 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 dist.all_reduce(x, group=tp)
                 dist.all_to_all_single(y, x, group=sp)
             graph.replay()
+            # a reduce leaves its other ranks' buffers as they were (gloo's, past two ranks, doesn't)
+            summed = torch.full((4,), r + 1.0, device="cuda")
+            dist.reduce(summed, dst=0)
+            assert summed.tolist() == [[10.0] * 4, [r + 1.0] * 4][r > 0], summed.tolist()
             # a fused all-reduce's workspace, on ranks that hold more groups than their peers (only
             # TP 0-1 takes the fused path): its channel meets eagerly and replayed, with its group
             from flashinfer import comm
