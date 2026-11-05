@@ -1687,12 +1687,18 @@ and each of its node's edges in the Loop (``mstar.graph.base.loop_edges``: const
 per-iteration or terminal) must be one a run serves, and every resource of the node must answer
 ``Resource.repeat_refusal(walk, host_step)`` with None (``host_step``: its part of a
 host-planned walk's step). The default refuses, so a resource takes part only
-once it says how far its capture advances itself. At admit each resource can narrow a
-step with ``Resource.max_repeats``, for what only that step decides (free pages, a live
-penalty), and the step runs the smallest answer. Whatever it counts per step (stored lengths, positions,
+once it says how far its capture advances itself. ``Resource.ask_repeats(walk)`` tells it
+before capture that the config asks, so it can build what serves that, and
+``Resource.repeat_note(walk)`` says on the walk's line what that changed. At admit each resource can narrow a
+step with ``Resource.max_repeats``, for what only that step decides (free pages, a row's
+log-probs), and the step runs the smallest answer; under TP the answer must come from facts
+every rank shares, or the ranks replay different counts. Whatever it counts per step (stored lengths, positions,
 recurrent token counts) it counts with ``StepContext.run_span``, not the declared
-``span``. What a replay reads that its capture doesn't advance moves in
-``Resource.replay_columns``, before each replay. Each per-iteration output of the node in its
+``span``. A run on the device can end short of what it counted: ``Resource.rewind_run(step,
+ctx, replays, rows)`` takes the ``replays`` it didn't run back, for ``rows`` only, the step's rows
+still the requests it counted for. What a replay reads that its capture doesn't advance moves in
+``Resource.replay_columns``, before each replay; in a capture that is a WHILE run's body, where no
+host stands between iterations, ``Resource.resident_run_gather`` does that work in the graph. Each per-iteration output of the node in its
 Loop (a client, streaming or accumulated edge) keeps a column per replay, which must be
 a row output of the capture; at STORE each row routes the iterations its stop kept, one
 item each, less an EOS iteration's item of a withheld output. A step that emits a count of

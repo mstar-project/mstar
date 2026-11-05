@@ -1,12 +1,13 @@
-"""Lanes: the steps of nodes placed off a worker's main chain, each lane on a
+"""Lanes: the steps of walks placed off a worker's main chain, each lane on a
 stream of its own.
 
 A worker's GPU runs any number of lanes. Lane 0 is the chain (``CHAIN_LANE``):
 step N on the device, N+1 speculated behind it. A step on the chain costs a
 pass of the loop and holds the next step behind its kernels on the main stream,
-which is what a codec window does to the decode steps around it. A node whose
-node group in the serving config sets ``lane: <id>`` runs every walk of its on
-that lane instead: the scheduler hands the lane only its nodes' keys
+which is what a codec window does to the decode steps around it. A node group
+in the serving config that sets ``lane: <id>`` runs its walks (its
+``graph_walks``, else every walk of its nodes) on that lane instead: the
+scheduler hands the lane only those keys
 (``MicroScheduler.lane_of``), its steps run on the GPU thread between two chain
 steps, and they land on the lane's stream while the chain carries on. Submit,
 the refused-step tail and postprocess are the chain's own
@@ -14,7 +15,7 @@ the refused-step tail and postprocess are the chain's own
 keyed by lane.
 
 Each lane has one step in flight; steps that come ready meanwhile batch into
-the next one. ``EngineManager.build`` decides which nodes a lane can take and
+the next one. ``EngineManager.build`` decides which walks a lane can take and
 refuses what it can't serve: a step here is admitted and planned inline, never
 speculated, planned ahead or lockstep.
 

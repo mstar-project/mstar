@@ -332,9 +332,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        one step may stand for. The host plans once, the captured graph replays that many
        times, and stops are read when the step lands. The next step is already running by
        then, so a row that stops inside a step runs up to 2N-1 iterations past its stop,
-       against 1 at N=1. A step repeats only inside a speculated chain (async scheduling
-       on), with no new rows (a TP group runs its leader's count, which every rank's
-       resources narrow alike), for a Loop walk on resident tables or one
+       against 1 at N=1. A step repeats inside a speculated chain (async scheduling on),
+       with no new rows (a TP group runs its leader's count, which every rank's
+       resources narrow alike), or, for a node with async scheduling off, as the step
+       the scheduler picks (not under TP, or with a stream window, a ring or a
+       walk-driven consumer: its startup line says which), for a Loop walk on resident tables or one
        planned on the host whose step keeps nothing, with a stop the runtime checks, and
        at most a KV page's worth of iterations. Each edge of the
        node in its Loop must be one a run serves: a loop-back (carried between replays),
@@ -452,7 +454,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
        ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
        ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
-       ``off``, the default, or ``on``). ``compile_deterministic`` reaches
+       ``auto``, the default, ``on`` or ``off``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
