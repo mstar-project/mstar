@@ -186,19 +186,18 @@ _PAYLOAD_TAGS = itertools.count(1 << 30)
 
 
 class _Posted(_Done):
-    """The ``Work`` of a point-to-point call. ``finish``, which returns the rank (in the group)
-    it heard from, runs on its own thread, as gloo's progress does: a receive has to post for
-    its payload once the descriptor comes, and its peer's ``wait`` can't hang on this rank's.
-    What it raises is raised at the wait."""
+    """The ``Work`` of a point-to-point call. ``finish`` runs on its own thread, as gloo's
+    progress does: a receive has to post for its payload once the descriptor comes, and its
+    peer's ``wait`` can't hang on this rank's. What it raises is raised at the wait."""
 
     def __init__(self, finish):
         def run():
             try:
-                self._source = finish()
+                finish()
             except Exception as e:  # noqa: BLE001 - for the caller's thread
                 self._error = e
 
-        self._source = self._error = None
+        self._error = None
         self._thread = threading.Thread(target=run, name="mstar_sim-point-to-point", daemon=True)
         self._thread.start()
 
@@ -219,9 +218,6 @@ class _Posted(_Done):
         self.wait()
         return super().get_future()
 
-    def _source_rank(self):
-        return self._source
-
 
 def _send(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
     """Post ``tensor``'s descriptor, and its data if this rank holds it."""
@@ -240,6 +236,11 @@ def _send(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
     return _Posted(finish)
 
 
+def _named_source(a: dict, group) -> int:
+    """The global rank a receive names, what ``dist.recv`` returns."""
+    return a["src"] if a["group_src"] is None else dist.get_global_rank(group or dist.group.WORLD, a["group_src"])
+
+
 def _receive(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
     """Post for a sender's descriptor, then take what follows it: into ``tensor``, or dropped
     if this rank holds no values. What it leaves is computed only if both ranks' were."""
@@ -256,12 +257,11 @@ def _receive(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
             print(f"{where}: the ranks' sends don't pair (NCCL would hang or corrupt data): {_describe(desc)} "
                   f"received {_describe(theirs)}", file=sys.stderr, flush=True)
             _abort()
-        source, values = posted._source_rank(), theirs[_VALUES] & mine
+        values = theirs[_VALUES] & mine
         if theirs[_VALUES] & HELD:
-            _watched(lambda: dist.recv(into, group=group, group_src=source, tag=theirs[3]), where, desc)
+            _watched(lambda: dist.recv(into, a["src"], group, theirs[3], a["group_src"]), where, desc)
         if mine & HELD:
             device.set_never_computed(into, not (values & HELD and values & COMPUTED))
-        return source
 
     return _Posted(finish)
 
@@ -362,12 +362,11 @@ def _collective(name: str, family: str, primitive: str | None):
             if name in _RETURN_WORK:
                 return work
             work.wait()
-            return None if name == "send" else dist.get_global_rank(group or dist.group.WORLD, work._source_rank())
+            return _named_source(a, group) if name == "recv" else None
         moved = bool(values & HELD)
         work = _Done() if kwargs.get("async_op") or name in _RETURN_WORK else None
-        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names
-            work = (a["src"] if a["group_src"] is None
-                    else dist.get_global_rank(group or dist.group.WORLD, a["group_src"]))
+        if name == "recv":  # captured, it hears from nobody yet
+            work = _named_source(a, group)
         if moved:
             # every rank holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
