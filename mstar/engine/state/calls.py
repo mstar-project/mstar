@@ -296,7 +296,10 @@ class SamplerHandle(StepHandle):
         self._drawn = 0
 
     def check_step(self, step) -> None:
-        if not step.ctx.replays and self._drawn != self.sampler.draws:
+        # a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk
+        if step.ctx.replays or (not self._drawn and step.state[self.name].kept_rows == frozenset()):
+            return
+        if self._drawn != self.sampler.draws:
             raise self._refusal(f"a step listing it sampled {self._drawn} times, and draws is {self.sampler.draws}")
 
     def commit_step(self, step) -> None:

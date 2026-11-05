@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -56,10 +57,13 @@ class AuTEncoderSubmodule(NodeSubmodule):
         most this many full windows, and each request adds one partial."""
         return cls.ENCODE_TOKEN_BUCKETS[-1] // config.window_tokens + 1
 
-    def __init__(self, encoder: AuTEncoder, attn_key: str):
+    def __init__(self, encoder: AuTEncoder, attn_key: str | None = None, array: str | None = None):
+        """``array`` is what the windows' attention reads on a model on the state contract, and ``attn_key`` the
+        resource a model still on resources names."""
         super().__init__()
         self.encoder = encoder
         self.attn_key = attn_key
+        self.array = array
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv2d1.weight.dtype
@@ -91,6 +95,11 @@ class AuTEncoderSubmodule(NodeSubmodule):
             for rid, inp in zip(request_ids, inputs, strict=True)
             for window in self.encoder.config.window_lengths(inp.input_seq_len)
         ]
+        return self._windows_step(segments)
+
+    def _windows_step(self, segments: list[Segment]) -> SubmoduleStep:
+        if self.array is not None:
+            return SubmoduleStep(segments=segments, state={self.array: ArrayStep()})
         return SubmoduleStep(segments=segments, steps={self.attn_key: AttentionStep(causal=False)})
 
     def preprocess(
@@ -112,7 +121,6 @@ class AuTEncoderSubmodule(NodeSubmodule):
         is ~6.3 ms eager and ~1.9 ms replayed. The conv frontend before it
         runs eagerly. A clip past the largest bucket runs eagerly, alone."""
         d_model = self.encoder.config.d_model
-        attn_key = self.attn_key
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
             return {"hidden": torch.zeros(shape.total_tokens, d_model, dtype=autocast_dtype, device=device)}
@@ -121,9 +129,8 @@ class AuTEncoderSubmodule(NodeSubmodule):
             # Every window of every request is a segment; the kernel needs
             # only the boundaries, so they all name the first row's id.
             # Zero-length rows pad the batch to the bucket.
-            return SubmoduleStep(
-                segments=[Segment(request_id=request_ids[0], label=WINDOW_LABEL, span=n) for n in seq_lens],
-                steps={attn_key: AttentionStep(causal=False)},
+            return self._windows_step(
+                [Segment(request_id=request_ids[0], label=WINDOW_LABEL, span=n) for n in seq_lens],
             )
 
         return {

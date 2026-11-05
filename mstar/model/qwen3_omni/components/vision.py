@@ -43,13 +43,13 @@ class OmniPatchMerger(nn.Module):
 
 
 class Qwen3OmniVisionTower(nn.Module):
-    def __init__(self, config: VisionEncoderConfig, attn_key: str):
+    def __init__(self, config: VisionEncoderConfig, attn_key: str, array: str):
         super().__init__()
         self.config = config
         self.patch_embed = VisionPatchEmbed(config)
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
-        self.blocks = nn.ModuleList(VisionBlock(config, attn_key) for _ in range(config.depth))
+        self.blocks = nn.ModuleList(VisionBlock(config, attn_key, array, layer) for layer in range(config.depth))
         self.merger = OmniPatchMerger(config, postshuffle=False)
         self.merger_list = nn.ModuleList(
             OmniPatchMerger(config, postshuffle=True) for _ in config.deepstack_visual_indexes

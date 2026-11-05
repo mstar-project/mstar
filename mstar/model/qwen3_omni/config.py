@@ -29,6 +29,9 @@ TALKER_ATTN = "talker_attn"
 # the encoders' cacheless attention (ragged: within each window / frame)
 AUDIO_ATTN = "audio_attn"
 VISION_ATTN = "vision_attn"
+# What each encoder's attention reads, and what the Talker keeps per request.
+AUDIO_TOKENS, VISION_TOKENS = "audio_tokens", "vision_tokens"
+TALKER_TEXT = "talker_text"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"

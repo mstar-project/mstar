@@ -911,3 +911,19 @@ def test_a_within_step_handle_adds_no_break_of_its_own():
     block = torch._dynamo.optimize(backend, dynamic=True)(_Block(0, h))
     block(torch.randn(TOKENS, HEADS, DIM))
     assert len(graphs) == 1, "a break in the add or the read would split a block compiled alone"
+
+
+def test_a_step_that_keeps_no_rows_sample_may_draw_nothing():
+    """An eager prefill short of its last chunk has no token to keep, and sampling anyway would change its kernels."""
+    h = _sampler_handle()
+    step = _step(h, sampler=SampleStep(kept_rows=frozenset()))
+    h.begin_step(step)
+    h.check_step(step)
+
+
+def test_a_step_that_keeps_a_rows_sample_still_needs_its_draw():
+    h = _sampler_handle()
+    step = _step(h, sampler=SampleStep(kept_rows=frozenset({1})))
+    h.begin_step(step)
+    with pytest.raises(ValueError, match="sampled 0 times, and draws is 1"):
+        h.check_step(step)
