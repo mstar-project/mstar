@@ -155,6 +155,9 @@ _ADMIT_FENCE_WARN_S = 10.0
 
 # How often a wait on a run that streams its tokens looks for new ones.
 _LANDED_POLL_S = 1e-4
+# a TP step's settled count waits this many later seqs for the other side's
+# (``_settle_tp_repeats``): a chain's last step never gets the leader's
+_TP_REPEATS_KEPT = 256
 
 # How many torn-down request keys a worker remembers, so that a message landing
 # after the teardown (a duplicate REMOVE, a peer's late stream chunk or
@@ -3964,6 +3967,10 @@ class Worker:
                     f"{theirs.pop(seq)} on the leader; the ranks would split"
                 )
             del mine[seq], theirs[seq]
+        for record in (mine, theirs):
+            if len(record) > _TP_REPEATS_KEPT:
+                for old in [k for k in record if k < seq - _TP_REPEATS_KEPT]:
+                    del record[old]
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
         """Queue a ScheduleTPNode; drop a head for a step this rank closed."""

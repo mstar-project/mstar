@@ -842,6 +842,16 @@ def test_a_tp_follower_that_settles_a_step_otherwise_than_its_leader_stops(leade
             worker._settle_tp_repeats(8, **{side: 1 if side == "follower" else n})
 
 
+def test_a_tp_followers_settled_counts_the_leader_never_reports_are_let_go():
+    """A chain's last step (TP_NO_SPEC, a yield-away) gets no head after it."""
+    worker = Worker.__new__(Worker)
+    worker.worker_id = "w1"
+    worker._tp_repeats = ({}, {})
+    for seq in range(2000):
+        worker._settle_tp_repeats(seq, follower=2)
+    assert len(worker._tp_repeats[0]) <= 257
+
+
 def test_device_launch_means_the_while_run():
     assert parse_step_repeats({"n": {"max": 2, "device_launch": "on"}}, {"n"})["n"].device_stop == "skip"
     drop = {"max": 2, "device_launch": "on", "device_stop": "drop_rows"}
