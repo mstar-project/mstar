@@ -658,14 +658,13 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
 
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.testing_utils.worker import make_worker
-    from mstar.utils.containers import RecentSet
     from mstar.worker.admission import Admission
     from mstar.worker.lockstep import Lockstep
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.rebuild import Rebuilds
+    from mstar.worker.request_lifecycle import RequestLifecycle
     from mstar.worker.services import WorkerLayout, WorkerServices
     from mstar.worker.stream_buffers import StreamBufferManager
-    from mstar.worker.worker import _REMOVED_RIDS_KEEP
 
     parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
@@ -680,10 +679,11 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         get_engine=lambda node: engine, warmup_all=lambda: None,
         remove_request=engine.remove_request,
     )
+    streams = StreamBufferManager(graph, tm, [])
     services = WorkerServices(
         worker_id=WORKERS[rank], device=torch.device("cpu"), graph_runtime=graph,
         engine_manager=engine_manager, tensor_manager=tm, request_state=graph,
-        communicator=comm, parallel_groups=parallel_groups, rebuilds=Rebuilds({}, {}),
+        communicator=comm, parallel_groups=parallel_groups, rebuilds=Rebuilds({}, {}), streams=streams,
     )
     layout = WorkerLayout(
         parallel_nodes=frozenset({NODE}), parallel_leader_nodes=frozenset({NODE} if rank == 0 else ()),
@@ -691,11 +691,18 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     )
     admission = Admission(services=services, layout=layout)
     lockstep = Lockstep(services=services, layout=layout, admission=admission)
+    lifecycle = RequestLifecycle(layout=layout)
     w = make_worker(
         worker_id=WORKERS[rank], device=torch.device("cpu"), communicator=comm, tensor_manager=tm,
         _graph_runtime=graph, engine_manager=engine_manager, request_state=graph,
         parallel_groups=parallel_groups, layout=layout, admission=admission, lockstep=lockstep,
-        scheduler=MicroScheduler(services=services, layout=layout, lockstep=lockstep, admission=admission),
+        streams=streams, lifecycle=lifecycle,
+        scheduler=MicroScheduler(
+            services=services, layout=layout, lifecycle=lifecycle, lockstep=lockstep, admission=admission,
+        ),
+        wakeup_event=SimpleNamespace(
+            drain=lambda: None, register_future=lambda f: None, register_futures=lambda f: None,
+        ),
         parallel_nodes={NODE}, parallel_leader_nodes=set(layout.parallel_leader_nodes),
         is_tp_follower=rank != 0,
     )
@@ -705,17 +712,10 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._device_loopback = {}
     w._host_rows_slot = 0
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.wakeup_event = SimpleNamespace(drain=lambda: None, register_future=lambda f: None)
-    w._unprocessed_messages = {}
-    w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
     w._in_flight_rids = set()
-    w._pending_removes = {}
-    w._removes_awaiting_step = {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
@@ -805,6 +805,8 @@ def _rank_main(rank, scenario, inbox, outbox):
         )
         tm.communicator = comm
         w = _worker(rank, scenario, comm, graph, engine, tm, group)
+        for rid in ("r0", "r1"):
+            w.lifecycle.add(rid, rid)
         try:
             w.run()
         except _Stop:

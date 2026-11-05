@@ -328,7 +328,9 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     out, rather than this rank waiting on r1 with no warning while rank 0 waits
     in the check."""
     sched, manager = _follower_scheduler(ready=["r0"])
-    sched.fail_rids({"r1"})
+    sched.lifecycle.add("r1", "r1")
+    sched.lifecycle.fail({"r1": "failed for another reason"})
+    sched.lifecycle.take_failures()
     tm, _ = _shm_manager(tmp_path)
     w = make_worker(
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
@@ -339,11 +341,9 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
         tensor_manager=tm,
         wakeup_event=SimpleNamespace(drain=lambda: None),
     )
-    reported = []
-    w._fail_requests = reported.append
     tm.pending.append(_read("r1", _input(17, "text_inputs"), _failed_future()))
-    w._check_ready_tensors()
-    assert reported == [], "r1 was already reported failed"
+    w.ingest.check_ready_tensors()
+    assert w.lifecycle.take_failures() == {}, "r1 was already reported failed"
     assert sched.lockstep.read_failed_rids == {"r1"}
 
     sched.lockstep.enqueue_follow(_head(read_check=True))
@@ -563,7 +563,7 @@ def _land(w, rid, edge):
     for info in edge.tensor_info:
         w.tensor_manager.tensor_store.put_tensor(rid, info.uuid, torch.zeros(3, dtype=torch.int64), info)
     w.tensor_manager.pending.append(_read(rid, edge, done))
-    w._check_ready_tensors()
+    w.ingest.check_ready_tensors()
 
 
 def _step(rows, node=NODE):
@@ -659,9 +659,8 @@ def test_a_streamed_input_is_checked_on_every_step(tmp_path):
 
 def test_rank_0_records_its_own_failed_reads_for_the_check(tmp_path):
     w = _leader(tmp_path)
-    w._fail_requests = lambda errors: None
     w.tensor_manager.pending.append(_read("r1", _input(15, "text_inputs"), _failed_future()))
-    w._check_ready_tensors()
+    w.ingest.check_ready_tensors()
     assert w.lockstep.read_failed_rids == {"r1"}
 
 

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.node_manager_utils import RequestStateManager
     from mstar.worker.rebuild import Rebuilds
+    from mstar.worker.stream_buffers import StreamBufferManager
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,8 @@ class WorkerServices:
     parallel_groups: WorkerParallelGroups
     # what this worker rebuilds a dropped request's KV from
     rebuilds: Rebuilds
+    # the consumer side of streaming edges, and the producer side's walk hooks
+    streams: StreamBufferManager
 
 
 def _no_entries() -> Mapping:
