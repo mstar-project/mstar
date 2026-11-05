@@ -10,7 +10,8 @@ once; the timed window runs from the last session's start to the first
 session's end, when all of them are live. Per concurrency it reports:
 
 * reply start: the first audio after the user stops speaking (``--speech-end``,
-  seconds into the clip), and how many replies came before that;
+  seconds into the clip), how many replies came before that, and how many
+  sessions got none by the end of ``--tail-s``;
 * underrun: within a reply, how far its audio arrives behind its own playback
   clock, ``max_k(arrival_k - arrival_0 - audio_before_k)``. A server that keeps
   up holds this near zero; one that grows with concurrency is falling behind
@@ -23,8 +24,8 @@ session's end, when all of them are live. Per concurrency it reports:
   thread's alone, which runs the short resamples inline; and this client's,
   with how late its sends ran (a row whose sends ran over 50 ms late measures
   the client, not the server). Replies land early in the window, so a long
-  ``--seconds`` dilutes output resampling in the cores figure; keep it short for
-  the cost while the agent speaks.
+  ``--seconds`` dilutes output resampling in the cores figure; keep it just long
+  enough to cover the reply for the cost while the agent speaks.
 
 The model's own rates are 16 kHz in and 22.05 kHz out, so a client at those
 rates is resampled on neither side::
@@ -165,11 +166,15 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
             receiver.join(5)
     step = round(out_bps * STEP_S)
     completed = [r for r in replies if r["status"] == "completed"]
-    started = [r["first_audio"] for r in replies if _after_speech(r, t_speech_end)]
+    # a reply still playing when the wait ran out started all the same, and may be the furthest behind
+    still_open = [{"first_audio": r[1], "underrun_s": r[3]} for r in open_.values()]
+    opened = replies + still_open
+    started = [r["first_audio"] for r in opened if _after_speech(r, t_speech_end)]
     out.update(
         replies=replies, errors=errors, unfinished=len(open_), send_late_s=late,
+        underruns=[r["underrun_s"] for r in opened],
         whole_steps=all(r["bytes"] % step == 0 for r in completed) if completed else None,
-        before_speech_end=len([r for r in replies if r["first_audio"] is not None]) - len(started),
+        before_speech_end=sum(r["first_audio"] is not None for r in opened) - len(started),
         reply_start_s=(min(started) - t_speech_end) if started and t_speech_end is not None else None,
     )
 
@@ -214,8 +219,8 @@ def run_batch(args, clip: np.ndarray, n: int) -> dict:
         "whole_steps": None if all(s["whole_steps"] is None for s in results)
         else all(s["whole_steps"] is not False for s in results),
         "reply_start_s_p50": _pct(starts, 0.5), "reply_start_s_max": _pct(starts, 1.0),
-        "underrun_s_p50": _pct([r["underrun_s"] for r in replies], 0.5),
-        "underrun_s_max": _pct([r["underrun_s"] for r in replies], 1.0),
+        "underrun_s_p50": _pct([u for s in results for u in s["underruns"]], 0.5),
+        "underrun_s_max": _pct([u for s in results for u in s["underruns"]], 1.0),
         "api_server_cpu_cores": cpu[0] if cpu else None,
         "api_event_loop_cpu_cores": cpu[1] if cpu else None,
         "client_cpu_cores": client_cpu, "client_send_late_s_max": round(late, 3),
@@ -237,7 +242,8 @@ def main():
     ap.add_argument("--out-rate", type=int, default=24000, help="output PCM16 rate (pcm only)")
     ap.add_argument("--chunk-ms", type=float, default=20.0)
     ap.add_argument("--seconds", type=float, default=30.0, help="audio each session sends after its lead")
-    ap.add_argument("--tail-s", type=float, default=10.0, help="longest wait for replies still open at the end")
+    ap.add_argument("--tail-s", type=float, default=10.0,
+                    help="longest wait after the last append for replies to start and finish")
     ap.add_argument("--stagger-s", type=float, default=0.25)
     ap.add_argument("--server-pid", type=int, default=None, help="the API server process, for its CPU")
     ap.add_argument("--output", default=None)
