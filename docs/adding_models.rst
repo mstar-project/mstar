@@ -505,8 +505,10 @@ Snapshots stay off without ``prefix_slots``, and also above one rank, without a 
 cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
 off or can't open at the pool's world size; in those cases the pool allocates no snapshot
 slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+model that names no checkpoint and sets no salt, or a resource over the pool that can't
+write its snapshots, as AITER's GDN kernels on AMD GPUs can't (they keep no state
+checkpoints; ``NodeResourceSpec.restore_refusal`` says so). Every cache on the node of a
+pool without snapshots stays shut, and the engine logs which pool kept it shut.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt
@@ -766,6 +768,15 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
+     - The linear-attention layers' kernels, planned against the named pool:
+       ``LinearAttnVariant.GDN`` or ``MAMBA2``. ``backend`` selects the GDN kernels:
+       ``LinearAttnBackend.AUTO`` (the default: AITER's on an AMD GPU, FlashInfer's
+       elsewhere), ``FLASHINFER`` or ``AITER``. Mamba-2 runs M*'s own Triton kernels
+       under every backend. AITER's chunked prefill builds its schedule on the host,
+       so a prefill capture bucket larger than ``max_captured_prefill_tokens`` (512
+       by default) runs eagerly; smaller ones capture a sequential kernel whose cost
+       grows with the longest row.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
@@ -2434,6 +2445,10 @@ that a misspelled setting is never silently ignored:
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
+   * - ``LinearAttnSpec``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``; ``auto`` is the platform's
+       default), ``max_captured_prefill_tokens`` (AITER only: the largest prefill
+       capture bucket; larger buckets run eagerly)
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``

@@ -496,6 +496,12 @@ reproduces across server processes and the cold start more than halves. One-row
 decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
 at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
 c=4 up it makes no difference.
+On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
+auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
+buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by default) a
+sequential kernel; text and vision prefill buckets above that run eagerly. Prefix
+caching is off for these layers on AMD GPUs: AITER's kernels keep no state checkpoints,
+so the recurrent pool keeps no snapshot slots and the node's caches stay shut.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
