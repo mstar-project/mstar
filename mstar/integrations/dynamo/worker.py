@@ -58,8 +58,6 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.auth import keep_api_key_from_children
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
-    from mstar.communication.communicator import CommProtocol
 
     # Dynamo's frontend serves HTTP here; this worker never checks a key, so
     # an exported one must not reach the conductor and workers either.
@@ -75,6 +73,16 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    if model.get_partition_topology().client_connections():
+        # a live call appends input to a running request, which no Dynamo
+        # surface carries; refused before any GPU worker starts
+        raise SystemExit(
+            f"model {model_name!r} takes live client input (a full-duplex call), which the Dynamo "
+            "worker does not serve; serve it with `mstar serve` and use /v1/realtime or /generate/ws"
+        )
+    # after the refusal, which needs only the model class
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
+    from mstar.communication.communicator import CommProtocol
 
     # before the workers exist: under ``auto`` this takes the GPUs' locks
     try:
