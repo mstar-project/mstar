@@ -16,7 +16,7 @@ import torch
 from mstar.engine.resources.context_parallel import TPPlacement
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState, _SlotBuffer
-from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
+from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, PagedIndptrs
 from mstar.utils.h2d import PinnedStager
 
 PAGE, CAPTURE = 16, 96
@@ -114,10 +114,34 @@ def test_host_addressing_matches_device_unpacking(addressing, placement):
         indptrs = _indptrs(rng)
         ref = _device_unpacked(kv, indptrs)
         # the pool's first group, which the placement stripes
-        got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE, kv.placement)
+        got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE, placement=kv.placement)
         assert got.total_tokens == ref.total_tokens
         assert torch.equal(got.token_to_page[:CAPTURE], ref.token_to_page[:CAPTURE])
         assert torch.equal(got.token_to_cache[:CAPTURE], ref.token_to_cache[:CAPTURE])
+
+
+@pytest.mark.parametrize("decode", [False, True], ids=["packed", "decode"])
+def test_a_placed_pool_writes_its_first_group_at_its_slots_and_a_window_group_whole(decode):
+    """An eager write's addressing (`_setup_plan_states`) per group of a placed pool: the first
+    group's tokens at this rank's slots of each page (``write_slots``), a window group's whole on
+    every partner (`PagedKVConfig.placed_groups`), as on one rank."""
+    kv = _kv()
+    placement = kv.kv_cache.placement = TPPlacement(2, 1, None, (0, 1))
+    kv._groups = [SimpleNamespace(page_size=PAGE)] * 2
+    kv._current_plan_states, kv._preplan_states = {}, {}
+    indptrs = _indptrs(np.random.default_rng(0))
+    if decode:
+        pages, offsets = [5, 9, 12], [0, 7, 15]
+        out = KVPlanOutput(indptrs, decode_pages=pages, decode_offsets=offsets)
+    else:
+        out = KVPlanOutput(indptrs, decode=False)
+        pages, offsets = (t.tolist() for t in _unpacked(indptrs, int(indptrs.qo_indptr[-1])))
+    striped = placement.write_slots(pages, offsets)
+    for group, (want_pages, want_offsets) in ((0, striped), (1, (pages, offsets))):
+        kv._setup_plan_states({"main": out}, SimpleNamespace(is_preplan=False), None, group)
+        state = kv._current_plan_states[("main", group)]
+        assert state.token_to_page.tolist() == list(want_pages), group
+        assert state.token_to_cache.tolist() == list(want_offsets), group
 
 
 def test_a_step_that_only_reads_stages_the_sink():
@@ -130,7 +154,7 @@ def test_a_step_that_only_reads_stages_the_sink():
         qo_indptr=i32([0, 0, 0, 0]), paged_kv_indptr=i32([0, 2, 3, 3]), paged_kv_indices=i32([5, 6, 9]),
         paged_kv_last_page_len=i32([4, PAGE, PAGE]), kv_lens=None,
     )
-    got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE)
+    got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE, placement=None)
     assert got.total_tokens == 0
     assert got.token_to_page.tolist() == [SINK_PAGE] * CAPTURE
     assert got.token_to_cache.tolist() == [0] * CAPTURE
@@ -151,7 +175,7 @@ def test_a_row_past_its_pages_is_refused(addressing):
             paged_kv_last_page_len=i32(last), kv_lens=None,
         )
         with pytest.raises((RuntimeError, ValueError), match="past its own pages"):
-            kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE)
+            kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE, placement=None)
 
 
 def test_an_eager_writes_host_addressing_matches_the_reference(addressing):
@@ -161,7 +185,7 @@ def test_an_eager_writes_host_addressing_matches_the_reference(addressing):
         indptrs = _indptrs(rng)
         total = int(indptrs.qo_indptr[-1])
         pages, offsets = _unpacked(indptrs, total)
-        got = kv._host_plan_state(indptrs, total, PAGE)
+        got = kv._host_plan_state(indptrs, total, PAGE, placement=None)
         assert got.total_tokens == total
         assert torch.equal(got.token_to_page, pages)
         assert torch.equal(got.token_to_cache, offsets)
