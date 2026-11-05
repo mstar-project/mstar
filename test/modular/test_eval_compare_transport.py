@@ -29,6 +29,8 @@ from test_eval_compare import RUN, chat_model, fake_tree, finish, write_arm  # n
 from benchmark.eval.e2e import arm, checks, compare, hosts, report, request_path, stress, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus")
+
 CONFIGS = ("qwen3tts_1p7b_split", "orpheus_pd_disaggregated", "qwen3omni_pd_disaggregated")
 
 
