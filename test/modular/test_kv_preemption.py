@@ -171,6 +171,21 @@ def test_a_dropped_request_keeps_its_place_ahead_of_newer_prompts():
     assert _admitted(kv, "v") and _ready(kv, "c")
 
 
+def test_no_request_passes_a_dropped_request_waiting_at_its_arrival():
+    """A dropped request waits in the queue at its arrival for its whole history and a page, which can take long to
+    fit. Passing it whenever their own pages fit, a steady stream of newer requests kept it waiting until it timed
+    out."""
+    kv = _pool()
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "v", 6, arrival=2)
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    _request(kv, "c", 1, arrival=3)
+
+    assert not _ready(kv, "c") and _queue(kv) == ["v", "c"], "c passed v, which waits at its arrival to return"
+
+
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
     kv = _pool()
     engine = Engine.__new__(Engine)
