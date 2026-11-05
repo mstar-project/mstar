@@ -616,8 +616,15 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
             first = _Case.build(((0, 5), (0, 3)), device, dtype)
             _plan(attn, first)
             exchanged = len(calls)
+            context = attn._current_plan_states["main"].context
+            attend_slots, context.run = context.run, None
             torch.testing.assert_close(first.runner(attn, placement, heads)().float(), first.want()[:, heads], **tol)
+            context.run = attend_slots
             assert len(calls) == exchanged + over_sp, "a step with no stored context ran the exchange"
+            # one stored token, which one rank alone holds: every rank attends and exchanges alike
+            one = _Case.build(((1, 3),), device, dtype)
+            _plan(attn, one)
+            torch.testing.assert_close(one.runner(attn, placement, heads)().float(), one.want()[:, heads], **tol)
         everyone = [None] * world
         dist.all_gather_object(everyone, calls)
         assert calls and all(c == calls for c in everyone), everyone
@@ -626,7 +633,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
             # a live graph holds its captured NCCL work, and destroy waits on it
             graph.reset()
         # clear our reference so destroy drops the group's last one and joins gloo's threads,
-        # whatever else holds the group; ranks were seen to abort at exit without this
+        # whatever else holds the group
         group.device_group = None
         dist.destroy_process_group()
 
@@ -651,7 +658,7 @@ class _IdleContext(PagedKernel):
     def plan(self, **kwargs):
         pass
 
-    def run(self, *parts, return_lse=False):
+    def run(self, q, kv_cache_layer, return_lse=False):
         raise AssertionError("the context isn't run here")
 
 

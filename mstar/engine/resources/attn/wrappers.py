@@ -149,9 +149,13 @@ class PagedKernel(ABC):
         ``causal``."""
 
     @abstractmethod
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False):
-        """The planned attention of ``q`` ``[N, H, D]`` over the paged layer ``kv_cache_layer``.
-        Returns ``out``, and with ``return_lse`` also the natural-log lse ``[N, H]`` fp32."""
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
+    ):
+        """The planned attention of ``q`` ``[N, H, D]`` over the paged layer ``kv_cache_layer``, one
+        tensor or its ``(k, v)``. Returns ``out``, and with ``return_lse`` also the natural-log lse
+        ``[N, H]`` fp32."""
 
 
 class FlashInferPrefillWrapper(PagedKernel):

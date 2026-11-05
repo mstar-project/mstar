@@ -2425,8 +2425,9 @@ page. Attention runs on each rank's slots and merges the partials across the par
 (``mstar/engine/resources/context_parallel.py``). The model declares nothing.
 
 - **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,
-  ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the contiguous blocks ``kv_head_replicas``
-  (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
+  ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the
+  contiguous blocks ``kv_head_replicas`` (``mstar/distributed/utils.py``) gives, as
+  ``QKVParallelLinear`` loads them; a model that
   shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
   though an eager step with no stored context attends its own tokens alone, with no exchange.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone

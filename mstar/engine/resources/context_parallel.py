@@ -185,15 +185,6 @@ class OwnTokensKernel(ABC):
         """Every ``plan`` plans the kernel, so there is nothing to forget."""
 
 
-def one_slot_pages(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """A step's own keys ``[N, H, D]`` as a paged kernel's ``(k, v)`` layer of one-slot pages, page
-    ``i`` token ``i``. Views, unless K's and V's strides differ, for which FA2 runs a kernel of its
-    own that a capture would have to prewarm."""
-    if k.stride() != v.stride():
-        k, v = k.contiguous(), v.contiguous()
-    return k.unsqueeze(1), v.unsqueeze(1)
-
-
 class OneSlotPages(OwnTokensKernel):
     """An ``OwnTokensKernel`` on a backend's paged kernel over pages of one slot, page ``i`` the
     step's token ``i``: rows whose key lists overlap (a zigzag share's two chunks) plan as rows of
@@ -222,7 +213,11 @@ class OneSlotPages(OwnTokensKernel):
         )
 
     def run(self, q, k, v):
-        return self.kernel.run(q, one_slot_pages(k, v), return_lse=True)
+        # views, unless K's and V's strides differ, for which FA2 runs a kernel of its own that a
+        # capture would have to prewarm
+        if k.stride() != v.stride():
+            k, v = k.contiguous(), v.contiguous()
+        return self.kernel.run(q, (k.unsqueeze(1), v.unsqueeze(1)), return_lse=True)
 
 
 class ContextParallelWrapper(ABC):
@@ -347,15 +342,16 @@ class ContextParallelWrapper(ABC):
         self, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
         """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``q``
-        ``[N, H, D]``, and the step's own keys as this backend's ``run`` takes them (read only on a
-        step that isn't one token a row). Every rank runs the same collectives."""
+        ``[N, H, D]``, and the step's own keys ``k`` and ``v`` (read only on a step that isn't one
+        token a row). Every rank runs the same collectives."""
         if self.new is not None and (k is None or v is None):
             raise ValueError(
                 "attention over a context-parallel KV pool attends a step's own tokens from the k and v "
                 "run is passed; this step has more than one token a row and got none"
             )
         new = None if self.new is None else self.new.run(q, k, v)
-        return self._merged_over_ranks(q, kv_cache_layer, new).to(q.dtype)
+        merged = self._own_alone(new) if self._own_only else self._merged_over_ranks(q, kv_cache_layer, new)
+        return merged.to(q.dtype)
 
     @abstractmethod
     def _merged_over_ranks(
@@ -363,6 +359,11 @@ class ContextParallelWrapper(ABC):
     ) -> torch.Tensor:
         """This rank's slots' partial for ``q``, exchanged with the partners' and merged with the
         own tokens' ``(out, lse)`` (None for a one-token-a-row step)."""
+
+    @abstractmethod
+    def _own_alone(self, new: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """The own tokens' attention from ``new``, for a step with no stored context (``plan``): no
+        rank has a partial to merge."""
 
     def forget_plan(self) -> None:
         """Replan the own-token wrapper on the next ``plan`` whatever its layout, for a dropped
@@ -412,10 +413,11 @@ class TPContextParallelWrapper(ContextParallelWrapper):
     def _plan_own(self, qo_indptr, causal):
         self.new.plan(KeyRows.whole(qo_indptr.numpy()), causal)
 
+    def _own_alone(self, new):
+        # whole on every rank: no exchange
+        return new[0]
+
     def _merged_over_ranks(self, q, kv_cache_layer, new):
-        if self._own_only:
-            # every partial would be masked (a first prefill): no exchange, no merge
-            return new[0]
         queries = self._exchange_queries(q)
         # over this rank's slots, with the rows holding any of them
         out, lse = self.context.run(queries, kv_cache_layer, return_lse=True)
@@ -470,11 +472,11 @@ class SPContextParallelWrapper(ContextParallelWrapper):
     def _plan_own(self, qo_indptr, causal):
         self.new.plan(qo_indptr, causal=causal)
 
+    def _own_alone(self, new):
+        # a rank holds its own share alone
+        return gather_merge(self._placement.group, *new)
+
     def _merged_over_ranks(self, q, kv_cache_layer, new):
-        group = self._placement.group
-        if self._own_only:
-            # no partial to merge (a first prefill), but a rank holds its own share alone
-            return gather_merge(group, *new)
         # this rank's slots' partial merged with its share of the own tokens, rounded back to the
         # partial's dtype for the one gather: one rounding more than TP placement's, at the floor a
         # bf16 partial carries already; gathering the fp32 merge would double the gather's bytes
@@ -483,7 +485,7 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         if new is not None:
             merged, lse = merge_lse((out, new[0]), torch.stack([lse, new[1]]))
             out = merged.to(out.dtype)
-        return gather_merge(group, out, lse)
+        return gather_merge(self._placement.group, out, lse)
 
 
 def _own_tokens_kernel(kernels, workspace, kwargs, captured: ShareCapture | None, whole: bool) -> OwnTokensKernel:
@@ -504,24 +506,6 @@ def zigzag_rows(qo_indptr: np.ndarray, size: int, index: int, causal: bool = Tru
     and ``2P - 1 - r`` of each row's ``2P``; see the context-parallel docs): the step's tokens it
     attends, chunk by chunk, and its chunks as rows over their keys, each row's first token to the
     chunk's last (or the row's, not causal)."""
-    row, first, end, kv_end = _zigzag_chunks(qo_indptr, size, index, causal)
-    _, tokens = token_runs(row + first, end - first)
-    kv, kv_tokens = token_runs(row, kv_end)
-    return tokens, KeyRows(np.concatenate([[0], np.cumsum(end - first)]), kv, kv_tokens)
-
-
-def zigzag_capture(size: int, rows: int, tokens: int) -> ShareCapture:
-    """A zigzag share's kernel captured for a bucket of ``rows`` rows and ``tokens`` tokens: its
-    fixed rows (at most 2 chunks a row, and one more for the padding queries) and queries (at most
-    ``ceil(T / 2P)`` a chunk)."""
-    return ShareCapture(2 * rows + 1, min(tokens, -(-(tokens + rows * (2 * size - 1)) // size)), tokens)
-
-
-def _zigzag_chunks(
-    qo_indptr: np.ndarray, size: int, index: int, causal: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """``zigzag_rows``' non-empty chunks as counts: each one's row start, its first and end token
-    in the row, and its keys' end in the row."""
     starts, lens = qo_indptr[:-1].astype(np.int64), np.diff(qo_indptr).astype(np.int64)
     chunks = 2 * size
     base, rem = lens // chunks, lens % chunks
@@ -535,7 +519,16 @@ def _zigzag_chunks(
     row, row_len = np.repeat(starts, 2), np.repeat(lens, 2)
     keep = end > first
     first, end, row, row_len = first[keep], end[keep], row[keep], row_len[keep]
-    return row, first, end, end if causal else row_len
+    _, tokens = token_runs(row + first, end - first)
+    kv, kv_tokens = token_runs(row, end if causal else row_len)
+    return tokens, KeyRows(np.concatenate([[0], np.cumsum(end - first)]), kv, kv_tokens)
+
+
+def zigzag_capture(size: int, rows: int, tokens: int) -> ShareCapture:
+    """A zigzag share's kernel captured for a bucket of ``rows`` rows and ``tokens`` tokens: its
+    fixed rows (at most 2 chunks a row, and one more for the padding queries) and queries (at most
+    ``ceil(T / 2P)`` a chunk)."""
+    return ShareCapture(2 * rows + 1, min(tokens, -(-(tokens + rows * (2 * size - 1)) // size)), tokens)
 
 
 class ZigzagWrapper:
