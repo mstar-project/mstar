@@ -2,7 +2,7 @@
 
 A ScheduleTPNode is a mandate from the TP group leader: rank 0 has already
 committed to the batch and will sit on the collective inside the forward
-until every follower joins it (see the note in MicroScheduler.get_next_batch).
+until every follower joins it (see the note in MicroScheduler.next_batch).
 Once the message is popped from the FIFO, nothing on a follower worker will
 ever reschedule that batch — followers cannot initiate scheduling for
 parallel nodes — so whoever pops it must submit it unconditionally.
@@ -13,7 +13,7 @@ reject rids from the batch it is handed (the "in-flight rid wins" branch).
 Handing it a TP-follow batch therefore risks stranding a popped
 ScheduleTPNode with no re-queue path, hanging the whole TP group at the next
 collective. The guard under test: the chain's step leaves the FIFO
-untouched; ``get_next_batch`` still serves it, in order.
+untouched; ``next_batch`` still serves it, in order.
 """
 
 import sys
@@ -28,9 +28,9 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     RequestWalks,
 )
+from mstar.testing_utils.worker import bound, make_scheduler
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -103,6 +103,9 @@ class _FakeRuntime:
         # in wire ids; these tests drive the scheduling path, not that check.
         return f"wire-{handle}"
 
+    def get_rid_handle(self, wire_rid):
+        return wire_rid
+
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
@@ -164,14 +167,14 @@ WALK = "decode"
 
 
 def _setup(rids=("r0", "r1")):
-    sched = MicroScheduler(
+    sched = make_scheduler(
         engine_manager=_FakeEngineManager(),
         # Follower role: NODE is parallel here but this rank does not lead it.
         parallel_leader_nodes=set(),
     )
     queue = _FakeQueue(rids, NODE)
     manager = _FakeRequestStateManager(queue)
-    sched.runtime = manager.runtime
+    bound(sched, runtime=manager.runtime)
     return sched, manager
 
 
@@ -181,22 +184,22 @@ def _msg(rids=("r0", "r1")):
 
 def _chain_step(sched, manager):
     """What a speculation chain on (NODE, WALK) asks of the scheduler."""
-    chain = sched.pick_chain_step(manager, (NODE, WALK), ["r9"])
-    return sched.take_chain_step(manager, chain)
+    chain = bound(sched, manager).pick_chain_step((NODE, WALK), ["r9"])
+    return bound(sched, manager).take_chain_step(chain)
 
 
 def test_the_chains_step_never_pops_tp_follow():
     sched, manager = _setup()
-    sched.register_tp_follow(_msg())
+    sched.lockstep.enqueue_follow(_msg())
 
     # Even at a matching target: the chain may reject the batch, and a popped
     # message has no re-queue path.
     assert _chain_step(sched, manager) is None
-    assert len(sched.tp_batches_pending_schedule) == 1
+    assert len(sched.lockstep._follow_fifo) == 1
 
     # The refusals consumed nothing: an untargeted call still builds the
     # full batch afterwards.
-    batch = sched.get_next_batch(manager)
+    batch = bound(sched, manager).next_batch()
     assert batch is not None
     assert batch.node_name == NODE
     assert set(batch.request_to_worker_graph) == {"r0", "r1"}
@@ -204,37 +207,37 @@ def test_the_chains_step_never_pops_tp_follow():
 
 def test_untargeted_call_serves_and_drains():
     sched, manager = _setup()
-    sched.register_tp_follow(_msg())
+    sched.lockstep.enqueue_follow(_msg())
 
-    batch = sched.get_next_batch(manager)
+    batch = bound(sched, manager).next_batch()
     assert batch is not None
     assert batch.node_name == NODE
     assert batch.graph_walk == WALK
     assert set(batch.request_to_worker_graph) == {"r0", "r1"}
-    assert len(sched.tp_batches_pending_schedule) == 0
+    assert len(sched.lockstep._follow_fifo) == 0
 
 
 def test_exclude_target_skips_head_but_keeps_it_queued():
     sched, manager = _setup()
-    sched.register_tp_follow(_msg())
+    sched.lockstep.enqueue_follow(_msg())
 
-    assert sched.get_next_batch(manager, exclude_target=(NODE, WALK)) is None
-    assert len(sched.tp_batches_pending_schedule) == 1
+    assert bound(sched, manager).next_batch(exclude_target=(NODE, WALK)) is None
+    assert len(sched.lockstep._follow_fifo) == 1
 
-    batch = sched.get_next_batch(manager)
+    batch = bound(sched, manager).next_batch()
     assert batch is not None
     assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
 def test_fifo_order_survives_the_chains_steps():
     sched, manager = _setup(rids=("r0", "r1", "r2", "r3"))
-    sched.register_tp_follow(_msg(("r0", "r1")))
-    sched.register_tp_follow(_msg(("r2", "r3")))
+    sched.lockstep.enqueue_follow(_msg(("r0", "r1")))
+    sched.lockstep.enqueue_follow(_msg(("r2", "r3")))
 
     assert _chain_step(sched, manager) is None
 
-    first = sched.get_next_batch(manager)
+    first = bound(sched, manager).next_batch()
     assert set(first.request_to_worker_graph) == {"r0", "r1"}
-    second = sched.get_next_batch(manager)
+    second = bound(sched, manager).next_batch()
     assert set(second.request_to_worker_graph) == {"r2", "r3"}
-    assert len(sched.tp_batches_pending_schedule) == 0
+    assert len(sched.lockstep._follow_fifo) == 0
