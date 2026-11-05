@@ -11,6 +11,8 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
+import torch
+
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -390,8 +392,15 @@ class StepRunner:
             if stream is None:
                 self._resources[key].remove_request(rid)
                 continue
-            with stream:
+            # Not ``with stream:``, whose enter state is kept on the stream
+            # object and so shared with the GPU thread, which holds it entered
+            # for the whole of a side step; set this thread's stream instead.
+            previous = torch.accelerator.current_stream(stream.device)
+            torch.accelerator.set_stream(stream)
+            try:
                 self._resources[key].remove_request(rid)
+            finally:
+                torch.accelerator.set_stream(previous)
         for rids in self._unpublished.values():
             rids.discard(rid)
 

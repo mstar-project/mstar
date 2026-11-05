@@ -46,27 +46,53 @@ _OUTPUTS = SimpleNamespace(host_rows=None, host_spans=None)
 
 
 class _StreamBackend:
-    """Records what reaches the stream API, in order."""
+    """Records what reaches the stream API, in order.
+
+    Each thread has a current stream, ``"main"`` until it sets one. As in torch
+    2.10, a ``Stream`` keeps its enter state on the object, whichever thread
+    entered it, and refuses a second enter while one is open (later builds
+    stack the enters on the object instead, which is no safer across threads).
+    """
 
     def __init__(self, monkeypatch):
         self.log: list[str] = []
         self.streams = 0
+        self._current: dict[int, object] = {}
         backend = self
 
         class Stream:
             def __init__(self, device):
                 backend.streams += 1
+                self.device = device
+                self._previous = None
 
             def wait_event(self, event):
                 backend.log.append("wait")
 
             def __enter__(self):
+                if self._previous is not None:
+                    raise RuntimeError("Stream's context should not be initialized.")
+                self._previous = backend.current()
+                backend._current[threading.get_ident()] = self
                 backend.log.append("enter side")
 
             def __exit__(self, *exc):
+                backend._current[threading.get_ident()], self._previous = self._previous, None
                 backend.log.append("exit side")
 
+            def __repr__(self):
+                return "side"
+
+        def set_stream(stream):
+            backend._current[threading.get_ident()] = stream
+            backend.log.append(f"set {stream}")
+
         monkeypatch.setattr(side_steps.torch, "Stream", Stream)
+        monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: self.current())
+        monkeypatch.setattr(torch.accelerator, "set_stream", set_stream)
+
+    def current(self):
+        return self._current.get(threading.get_ident(), "main")
 
 
 def _batch(rids, node="Codec", walk="codec_chunk"):
@@ -546,6 +572,12 @@ def _logged(log, obj, *names):
         setattr(obj, name, lambda *a, _m=method, _n=name, **k: log.append(_n) or _m(*a, **k))
 
 
+def _zeroed_on(backend, pool):
+    """Log each slot zero with the stream current on its thread."""
+    zero = pool._zero_slot
+    pool._zero_slot = lambda index: backend.log.append(f"zero on {backend.current()}") or zero(index)
+
+
 def _side_lane(eng, monkeypatch):
     """A lane whose GPU-thread step is the engine's exec, on a recorded stream."""
     backend = _StreamBackend(monkeypatch)
@@ -563,7 +595,8 @@ def test_a_side_step_takes_plans_and_commits_its_slot_on_the_lane_stream(monkeyp
     eng.add_request(1)
     free = pool.num_free_slots
     lane, backend = _side_lane(eng, monkeypatch)
-    _logged(backend.log, pool, "admit", "plan", "commit", "_zero_slot")
+    _logged(backend.log, pool, "admit", "plan", "commit")
+    _zeroed_on(backend, pool)
 
     first, second = _side_batch([1]), _side_batch([1])
     lane.execute(_batch([1]), first, None)
@@ -580,9 +613,55 @@ def test_a_side_step_takes_plans_and_commits_its_slot_on_the_lane_stream(monkeyp
     eng.remove_request(1)
 
     assert pool.num_free_slots == free and 1 not in pool._slots
-    assert backend.log[-3:] == ["enter side", "_zero_slot", "exit side"], (
+    assert backend.log[-3:] == ["set side", "zero on side", "set main"], (
         "the slot was zeroed off the lane's stream, where the next stream's first write could land ahead of it"
     )
+    assert backend.current() == "main"
+
+
+def test_a_teardown_beside_a_side_step_in_flight_sets_its_own_stream(monkeypatch):
+    """The GPU thread holds the lane's stream entered for the whole of a side
+    step, and a cancel tears a stream down on the main thread meanwhile: the
+    teardown can't enter the stream object, but its zero still goes on it."""
+    pool = _pool()
+    eng = _state_engine(pool)
+    for rid in (1, 2):
+        eng.add_request(rid)
+    lane, backend = _side_lane(eng, monkeypatch)
+    lane.execute(_batch([1]), _side_batch([1]), None)
+    _zeroed_on(backend, pool)
+    inside, release = threading.Event(), threading.Event()
+    seen, errors = {}, []
+
+    def forward(*args, **kwargs):
+        # past its admit, which is as far as a teardown waits for (``Worker._settle_side_admit``)
+        inside.set()
+        release.wait(5)
+        seen["gpu thread"] = backend.current()
+        return _advance(*args, **kwargs)
+
+    eng._submodules["Codec"].forward_batched = forward
+
+    def gpu_thread():
+        try:
+            lane.execute(_batch([2]), _side_batch([2]), None)
+        except Exception as exc:  # noqa: BLE001 - the assert below reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=gpu_thread)
+    thread.start()
+    assert inside.wait(5)
+    with pytest.raises(RuntimeError, match="context should not be initialized"), lane._stream:
+        pass
+    try:
+        eng.remove_request(1)
+    finally:
+        release.set()
+        thread.join(5)
+
+    assert "zero on side" in backend.log and backend.current() == "main"
+    assert not errors and seen["gpu thread"] is lane._stream
+    assert 1 not in pool._slots and pool._slots[2]["main"].tokens == 1
 
 
 def test_a_side_step_leaves_the_chains_staged_pre_plan_alone(monkeypatch):
