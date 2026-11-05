@@ -165,9 +165,10 @@ def seal(tape: clock.Tape) -> None:
     one row per group (in first-use order) with the count and a hash of the captured
     collectives over its ranks, on it or on another group of the same ranks (a device group
     and its fused-AR channel). Every rank of a group holds each of those groups, so the rows
-    agree unless the ranks captured differently (a wrong bucket, an order inversion across
-    those groups); a replay is one host call, so nothing sits between them. Groups of other
-    ranks meet on their own, in first-use order, as NCCL's communicators do."""
+    agree unless the ranks captured differently: they disagree for a wrong bucket, or for a
+    reorder that keeps each group's first use; an inversion of first uses meets on different
+    groups and hangs, as on a GPU. A replay is one host call, so nothing sits between them.
+    Groups of other ranks meet on their own, in first-use order, as NCCL's communicators do."""
     ranks = {group: tuple(sorted(dist.get_process_group_ranks(group))) for group, _ in tape.collectives}
     over: dict[tuple[int, ...], list[list[int]]] = {}
     for group, desc in tape.collectives:
