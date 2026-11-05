@@ -1532,6 +1532,9 @@ def iteration_columns(
     for name, spec in submodule.ITERATION_INPUTS.items():
         values = []
         fill = None
+        # each row's value is a view where it can be: one kernel a spec (the
+        # stack), not a few a row, at every step of a long batch
+        constant: dict = {}
         for row in rows:
             streamed = row[2] if row is not None and len(row) > 2 else {}
             state = None if row is None else states.get(row[0])
@@ -1550,8 +1553,8 @@ def iteration_columns(
             value = table[start:start + repeats]
             if value.shape[0] < repeats:
                 past = max(0, start - table.shape[0])
-                pad = _iteration_pad(spec, state, table, past, repeats - value.shape[0], name)
-                value = torch.cat([value, pad.to(table.dtype)])
+                pad = _iteration_pad(spec, state, table, past, repeats - value.shape[0], name, constant)
+                value = pad if value.shape[0] == 0 else torch.cat([value, pad.to(table.dtype)])
             values.append(value.reshape(repeats, *spec.shape))
         out[name] = torch.stack(values)
     return out
@@ -1559,15 +1562,25 @@ def iteration_columns(
 
 def _iteration_pad(
     spec: IterationInput, state: PerRequestState, table: torch.Tensor, past: int, n: int, name: str,
+    constant: dict,
 ) -> torch.Tensor:
-    """``n`` rows past ``table``'s end, the first of them ``past`` rows past it."""
+    """``n`` rows past ``table``'s end, the first of them ``past`` rows past it.
+    ``constant``: a constant pad's rows already made this step, by table kind."""
     if spec.pad is None:
         raise ValueError(f"iteration input {name!r} reads past the {table.shape[0]} rows of {spec.source!r}")
     if isinstance(spec.pad, str):
         rows = state[spec.pad].reshape(-1, *table.shape[1:])
-        at = torch.arange(past, past + n, device=rows.device).clamp_(max=rows.shape[0] - 1)
-        return rows[at]
-    return table.new_full((n, *table.shape[1:]), spec.pad)
+        last = rows.shape[0] - 1
+        if past >= last:
+            # past the pad's own rows: its last, repeated, as a view
+            return rows[last:].expand(n, *rows.shape[1:]).to(table.dtype)
+        at = torch.arange(past, past + n, device=rows.device).clamp_(max=last)
+        return rows[at].to(table.dtype)
+    key = (table.dtype, table.device, tuple(table.shape[1:]))
+    made = constant.get(key)
+    if made is None or made.shape[0] < n:
+        made = constant[key] = table.new_full((max(n, 1), *table.shape[1:]), spec.pad)
+    return made[:n]
 
 
 def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
