@@ -354,6 +354,11 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
                 raise SystemExit(f"a {size}-byte workspace held a plan that needs {need}")
             except RuntimeError as e:
                 assert f"allocating memory for {short_of}" in str(e), e
+        try:  # a failed plan is no plan
+            wrapper.run(torch.zeros(32, 8, 64, device="cuda"), None)
+            raise SystemExit("run() after a failed plan")
+        except RuntimeError as e:
+            assert "plan() must be called" in str(e), e
         workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
         plan()
         # auto takes fa3, which keeps no partials, only where its kernels serve the plan
