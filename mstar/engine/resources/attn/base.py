@@ -22,7 +22,7 @@ from mstar.engine.resources.kv.keys import fingerprint
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
+    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper, PagedKernel
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -79,15 +79,15 @@ class AttentionManager(AttentionResource):
         """This rank's share of a context-parallel pool. Reached only for a backend that supports
         one (``supports_context_parallel``): the engine refuses the others at load."""
 
-    # A backend that supports a placed pool supplies the two wrappers a step attends it on;
+    # A backend that supports a placed pool supplies the kernels a step attends it on;
     # `_context_parallel_wrapper` composes them and `_attend_placed` runs them.
-    # ``run``'s query parts, as `_attend_placed` passes them
-    _query_parts = 1
 
-    def _context_wrapper(self, workspace: torch.Tensor, decode: bool, kwargs: dict, max_total_tokens: int | None):
-        """The paged wrapper over this rank's slots, from ``kwargs`` (the backend's wrapper
-        arguments with the placed geometry, and any capture sizes), for a one-token-a-row step or
-        not."""
+    def _context_wrapper(
+        self, workspace: torch.Tensor, decode: bool, kwargs: dict, max_total_tokens: int | None,
+    ) -> "PagedKernel":
+        """The paged kernel over this rank's slots, from ``kwargs`` (the backend's wrapper arguments
+        with the placed geometry, and any capture sizes), for a one-token-a-row step or not; or,
+        with ``page_size`` 1, over pages of one slot (``OneSlotPages``)."""
         raise NotImplementedError
 
     def _own_tokens_wrapper(self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):

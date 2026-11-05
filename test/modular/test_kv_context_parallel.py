@@ -34,10 +34,12 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
+    OneSlotPages,
     SPPlacement,
     ZigzagWrapper,
     local_indptrs,
     merge,
+    zigzag_capture,
     zigzag_rows,
     zigzag_share,
 )
@@ -654,16 +656,16 @@ def test_zigzag_rows_split_a_steps_tokens_over_the_ranks_with_equal_causal_work(
     rows a multiple of 2P long, each the same number of query-key pairs."""
     for lens in ([2 * size, 6 * size, 4 * size], [6 * size + 1, 2 * size - 1, 3, 1]):
         qo = np.concatenate([[0], np.cumsum(lens)])
-        shares = [zigzag_rows(qo, size, rank) for rank in range(size)]
-        assert sorted(np.concatenate([share.tokens for share in shares]).tolist()) == list(range(qo[-1]))
+        shares = [zigzag_rows(qo, size, rank)[0] for rank in range(size)]
+        assert sorted(np.concatenate(shares).tolist()) == list(range(qo[-1]))
         if all(n % (2 * size) == 0 for n in lens):
             # a query at position t of its row sees t + 1 keys
-            work = {int((s.tokens - qo[np.searchsorted(qo, s.tokens, side="right") - 1] + 1).sum()) for s in shares}
+            work = {int((s - qo[np.searchsorted(qo, s, side="right") - 1] + 1).sum()) for s in shares}
             assert len(work) == 1, work
 
 
 class _OneSlotPrefill:
-    """The paged prefill a ``ZigzagWrapper`` plans, as torch math over its pages of one token."""
+    """A paged prefill as ``OneSlotPages`` plans it, as torch math over its pages of one token."""
 
     def plan(self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens, causal, dtype):
         self.qo, self.kv = qo_indptr.tolist(), paged_kv_indptr.tolist()
@@ -685,17 +687,11 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     graph runner pads): each plan writes the buffers a replay reads, the bucket's padding tokens
     merge to 0, and the real ones to their rows' attention."""
     rows, tokens = 3, 16
-    kernels = []
-
-    def paged(**captured):
-        assert set(captured) == {"batch_size", "max_total_tokens", "max_num_pages"}
-        kernels.append(_OneSlotPrefill())
-        return kernels[-1]
-
+    captured = zigzag_capture(P, rows, tokens)
     wrappers = [
         ZigzagWrapper(
-            SPPlacement(P, index, CommGroup.trivial()), paged, 1, CPU, torch.float32,
-            rows, tokens,
+            SPPlacement(P, index, CommGroup.trivial()), OneSlotPages(_OneSlotPrefill(), torch.float32, captured),
+            CPU, captured[1], tokens,
         )
         for index in range(P)
     ]
@@ -707,7 +703,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
         shares = []
         for wrapper in wrappers:
             wrapper.plan(qo, causal=causal)
-            shares.append(wrapper.run(q, k, v))
+            shares.append(wrapper.run((q,), (k, v)))
         assert [(w._gather.data_ptr(), w._scatter.data_ptr()) for w in wrappers] == addresses
         got = merge(torch.stack([out for out, _ in shares]), torch.stack([lse for _, lse in shares]))
         assert torch.isfinite(got).all() and not got[int(qo[-1]):].any()

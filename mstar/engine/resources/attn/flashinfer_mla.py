@@ -305,8 +305,6 @@ class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
 
 class FlashInferMLAManager(AttentionManager):
     supports_context_parallel = True
-    # q_nope, q_pe
-    _query_parts = 2
 
     def __init__(
         self,
