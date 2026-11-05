@@ -738,7 +738,7 @@ def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     )
     # the bundled voice's length, read from the checkpoint's clip in a real boot
     voice = (6.016, 6.016)
-    return _bare(MiniCPMOModel, config=config, tts_config=TTSConfig(), custom_voices=0, _voice_seconds=lambda: voice)
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -850,26 +850,6 @@ def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 
 
-def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
-    import soundfile as sf
-
-    from mstar.model.components.qwen3_lm import Qwen3LMConfig
-    from mstar.model.minicpm_o.components.tts import TTSConfig
-    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
-    from mstar.model.minicpm_o.minicpm_o_model import VOICES, MiniCPMOModel
-
-    # the vocoder's caches are sized by the bundled voice clip's length (6 s)
-    (tmp_path / "assets").mkdir()
-    for clip in VOICES.values():
-        sf.write(tmp_path / "assets" / clip, torch.zeros(6 * 16000).numpy(), 16000)
-    return _bare(
-        MiniCPMOModel, max_seq_len=64, local_dir=str(tmp_path), tts_config=TTSConfig(),
-        config=MiniCPMOConfig(
-            llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
-        ),
-    )
-
-
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
@@ -889,7 +869,6 @@ _FACTORIES = {
     "KokoroModel": _kokoro,
     "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
-    "MiniCPMOModel": _minicpm_o,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
