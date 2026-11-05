@@ -52,7 +52,7 @@ runpy.run_module("pytest", run_name="__main__")
         # location from the active interpreter, including outside setup-python.
         python_lib=$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
         export LD_LIBRARY_PATH="$python_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        (cd rust && cargo test --release --no-default-features)
+        (cd rust && cargo test --release --no-default-features --features python)
         (cd rust/server && cargo build --release)
 
         # A fresh wheel directory prevents installing an earlier cached build.

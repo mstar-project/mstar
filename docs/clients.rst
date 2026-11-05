@@ -123,22 +123,25 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
    with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
        ws.send(msgpack.packb({
-           "text": "pick up the mug",
-           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "text": prompt,  # task + view, duration and resolution text
+           "files": [{"name": "obs.png", "data": open("obs.png", "rb").read()}],  # 736x544 composite
            "output_modalities": ["action"],
-           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "model_kwargs": {"size": "736x544",
+                            "robot_state": joints + [gripper]},  # current state, as DROID records it
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
            reply = msgpack.unpackb(ws.recv(), raw=False)
            if reply.get("modality") == "action":
-               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)[:, :8]
            if reply.get("finish") or reply.get("error"):
                break
 
-``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
-loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+The chunk (32 rows), the fps and the domain come from the checkpoint, and the reply holds
+the predicted rows after the state, in the robot's values. ``examples/cosmos3_action_ws_client.py``
+is a complete openpi-style client that builds the observation image and prompt the way
+NVIDIA's RoboLab server does for the DROID policies, runs this loop at a fixed observation
+rate and reports chunks/s, actions/s and latency percentiles.
 
 **Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
 request's input open after the opening message, so the opening message may carry no media
@@ -329,7 +332,8 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``whisper_large_v3_turbo``, ``qwen3_asr``, ``qwen3_asr_realtime``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``
+     - ``whisper_large``, ``whisper_large_v3_turbo``, ``qwen3_asr``, ``qwen3_asr_realtime``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``, ``parakeet``,
+       ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -372,11 +376,17 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
-  ``/v1/images/edits`` for image output.
+  ``/v1/images/edits`` for image output, with ``output_format`` and ``output_compression``
+  as for FLUX.2 klein below.
 - **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
   klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
   ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
-  WebP quality) and ``png_compress_level`` (0-9, default 1) via ``extra_body``.
+  WebP quality, 0-100) and ``png_compress_level`` (0-9, default 1) via ``extra_body``; a
+  value of the chosen format's knob that is not a whole number in range (``90``, ``90.0``
+  and ``"90"`` are; ``true`` and ``50.9`` are not) is a 400, the other format's knob is
+  ignored, and ``null`` means the default. The PNG writer favours
+  speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL's
+  defaults; a higher ``png_compress_level`` shrinks them.
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
@@ -415,13 +425,15 @@ Per-model notes:
   in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
   get one cue per window, timed to the windows. Nothing detects the language: ``verbose_json``'s
   ``language`` is the request's ``language`` as given, or null.
-- **Canary / Canary-Qwen** — no conditioning text (``prompt`` is dropped) and no
-  timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
+- **Canary / Canary-Qwen / Parakeet / Nemotron ASR** — no conditioning text (``prompt`` is
+  dropped) and no timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
   ``verbose_json`` get one segment per window. Canary takes ``language`` (the speech's,
   English by default) and, through ``extra_body``, ``target_language`` or
-  ``task="translate"`` (into English) and ``punctuation``. Canary-Qwen only transcribes
-  English, and refuses a ``task`` other than ``transcribe``. Uploads longer than the
-  models' 40 s clip run as parallel windows.
+  ``task="translate"`` (into English) and ``punctuation``; the other three only transcribe,
+  and refuse a ``task`` other than ``transcribe``. Canary-Qwen is English only. Parakeet detects the language itself and refuses a ``language`` outside the 25 it knows;
+  Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
+  model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
+  parallel windows.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``

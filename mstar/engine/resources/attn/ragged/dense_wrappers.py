@@ -9,6 +9,7 @@ import triton.language as tl
 
 from mstar.engine.resources.attn.dense import flash_attn_varlen_func
 from mstar.engine.resources.attn.ragged.wrappers import (
+    PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,
     RaggedPrefillWrapper,
     _RaggedPrefillBase,
@@ -77,7 +78,9 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         self._max_q, self._max_k = _max_span(cu.cpu()), _max_span(kv_cu.cpu())
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False) -> torch.Tensor:
+        if return_lse:
+            raise NotImplementedError("the DENSE ragged backend does not return the log-sum-exp; use FLASHINFER")
         q, k, v = (t.to(self.q_data_type).contiguous() for t in (q, k, v))
         out = flash_attn_varlen_func(
             q, k, v, self._cu_q, self._cu_k, self._max_q, self._max_k,
@@ -101,3 +104,7 @@ class DenseRaggedPrefillWrapper(_DenseRaggedPrefillBase, RaggedPrefillWrapper):
 
 class DenseRaggedCrossPrefillWrapper(_DenseRaggedPrefillBase, RaggedCrossPrefillWrapper):
     """Ragged cross-attention through FA3 varlen."""
+
+
+class DensePrefixedPrefillWrapper(_DenseRaggedPrefillBase, PrefixedPrefillWrapper):
+    """Prefixed attention through FA3 varlen."""

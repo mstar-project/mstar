@@ -1,18 +1,24 @@
-"""Compiling a flow transformer: which modules stay eager, and the inductor
-rounding the compiled region is traced under.
+"""Compiling a diffusion model's transformer or VAE decode: which modules stay
+eager, and the inductor rounding the compiled region is traced under.
 
-Shared by every model on the DiT scaffold (FLUX.2 klein, Z-Image); nothing here
-is model-specific. Lives beside the scaffold rather than in a model package so a
-model never imports a sibling model.
+Shared by the flow models (FLUX.2 klein, Z-Image and LTX-2.5 compile their
+transformer forward, LingBot-World its blocks) and by the VAE decode side (the
+compile wrappers in ``decode_utils`` and the fused GroupNorm in ``group_norm``,
+which asks ``kept_exact``); nothing here is model-specific. Lives beside the
+scaffold rather than in a model package so a model never imports a sibling model.
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
+
+from mstar.model.components.diffusion.exact_norm import exact_rms_norm
 
 logger = logging.getLogger(__name__)
 
@@ -40,55 +46,141 @@ def exact_op_types(spec: ExactOps) -> tuple[type, ...] | None:
 
 
 def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_OP_TYPES) -> int:
-    """Keep the transformer's norms and/or activations on the eager kernels inside a compiled
-    forward: each excluded module's forward becomes a dynamo graph break, so inductor only
-    fuses the pointwise chains around the GEMMs and attention. A module is excluded by type
-    (``types``) or, when ``types`` include the norms, with a ``compile_exact_op = True`` class
-    attribute. Returns the number of modules excluded."""
+    """Keep the transformer's norms and/or activations on the eager result inside a compiled
+    forward. A module is kept by type (``types``) or, when ``types`` include the norms, with a
+    ``compile_exact_op = True`` class attribute. A 1-D ``torch.nn.RMSNorm`` (not a subclass) runs
+    :func:`exact_rms_norm`, an op the compiled graph keeps whole (on NVIDIA, several times faster
+    than torch's kernel on the per-head q/k norms); every other kept module's forward becomes a
+    dynamo graph break, so inductor only fuses the pointwise chains around it. A compiled path
+    that would replace a module, such as a fused kernel, asks :func:`kept_exact` first. Returns
+    the number of modules kept."""
     types = tuple(types)
     with_marked = any(t in EXACT_OP_CLASSES["norms"] for t in types)
     count = 0
     for module in transformer.modules():
         if isinstance(module, types) or (with_marked and getattr(module, "compile_exact_op", False)):
-            module.forward = torch._dynamo.disable(module.forward)
+            if not kept_exact(module):
+                exact_rms = type(module) is nn.RMSNorm and len(module.normalized_shape) == 1
+                module.__class__ = _kept_class(type(module), exact_rms)
             count += 1
     return count
 
 
+def kept_exact(module: nn.Module | None) -> bool:
+    """Whether :func:`exclude_from_compile` keeps ``module`` on the eager result."""
+    return getattr(module, "compile_kept_exact", False)
+
+
+@functools.cache
+def _kept_class(cls: type[nn.Module], exact_rms: bool) -> type[nn.Module]:
+    """The subclass a kept module of class ``cls`` becomes, made once, so every kept module of a
+    class shares one ``forward``. Dynamo guards a non-function ``forward`` set on an instance (a
+    ``functools.partial``) by identity, so a frame the blocks share would recompile once per block;
+    with ``forward`` on the shared class, every block passes the same guards."""
+    forward = _exact_rms_norm_forward if exact_rms else torch.compiler.disable(cls.forward)
+    return type(cls.__name__, (cls,), {"forward": forward, "compile_kept_exact": True})
+
+
+def _exact_rms_norm_forward(module: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    return exact_rms_norm(x, module.weight, module.eps)
+
+
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
+    recompile_limit: int | None = None,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
     tensor dtype exactly where eager PyTorch does (``emulate_precision_casts``): without it, fused
-    bf16 chains keep fp32 intermediates and the served images drift to 35-39 dB from the bit-exact
-    eager path on a 4-step distilled sampler (measured). Even with it the compiled transformer
-    lands at a median 37.6 dB over 100 prompts (klein-4B), because inductor's own reductions and
-    activation decompositions round differently: ``exact_ops`` keeps those modules eager
-    (``exclude_from_compile``) and compiles the rest — ``True`` for all of them, or a list of the
-    op classes to keep eager (``["norms"]``, ``["activations"]``), since each excluded module is a
-    graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%)."""
+    bf16 chains keep fp32 intermediates and the served images drift from the bit-exact eager
+    path. Even with it the compiled transformer is not bit-exact, because inductor's own
+    reductions and activation decompositions round differently: ``exact_ops`` keeps those
+    modules on the eager result (``exclude_from_compile``) and compiles the rest — ``True`` for
+    all of them, or a list of the op classes to keep (``["norms"]``, ``["activations"]``), since
+    every kept module but a 1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion
+    (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst).
+
+    ``recompile_limit`` replaces the process-wide limit for this forward only, where ``torch.compile`` takes it
+    (torch 2.12 and up); an older torch gets the process-wide limit raised to it instead, since the keyword would
+    raise at load. Past the limit a frame silently runs uncompiled, inside the captured graphs too."""
     types = exact_op_types(exact_ops)
     if types:
-        excluded = exclude_from_compile(transformer, types)
-        logger.info("compiled transformer keeps %d modules (%s) on the eager kernels", excluded,
+        kept = exclude_from_compile(transformer, types)
+        logger.info("compiled transformer keeps %d modules (%s) on the eager result", kept,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
+    kwargs: dict[str, object] = {}
+    if recompile_limit is not None:
+        if _compile_takes_recompile_limit():
+            kwargs["recompile_limit"] = recompile_limit
+        else:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, recompile_limit)
+            logger.info("torch.compile on torch %s takes no recompile_limit; the process-wide limit is %d",
+                        torch.__version__, dynamo_config.recompile_limit)
     transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False),
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False, **kwargs),
         eager_rounding=bool(eager_rounding),
     )
 
 
-def with_inductor_rounding(compiled, *, eager_rounding: bool):
+def _compile_takes_recompile_limit() -> bool:
+    """Whether this torch's ``torch.compile`` takes ``recompile_limit`` (added in 2.12)."""
+    params = inspect.signature(torch.compile).parameters
+    return "recompile_limit" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def step_schedule_recompile_limit(step_dtypes) -> int | None:
+    """The recompile limit for transformers run under a step schedule (``StepDtypes``): one per dtype compiles the
+    same code objects, so Dynamo's entries per frame grow with the dtypes (3 capture sizes x 8 batch sizes is 48
+    entries, 96 with a bf16 twin, past the default 84). None without a schedule."""
+    if step_dtypes is None:
+        return None
+    from mstar.engine import recompile_limit
+
+    return len(step_dtypes.dtypes) * recompile_limit()
+
+
+def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
-    a global config change.
+    a global config change. ``deterministic`` also builds them with the engine's
+    deterministic compile option (``accelerator_graph_runner.
+    deterministic_inductor_options``): no on-device benchmarking that changes
+    numerics, so every process compiles the same kernels.
     """
     import torch._inductor.config as inductor_config
 
+    options = {"emulate_precision_casts": eager_rounding}
+    if deterministic:
+        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+        options.update(deterministic_inductor_options())
+
     def forward(*args, **kwargs):
-        with inductor_config.patch(emulate_precision_casts=eager_rounding):
+        with inductor_config.patch(**options):
             return compiled(*args, **kwargs)
 
     return forward
+
+
+def compile_blocks(blocks: Iterable[nn.Module], *, autotune: bool = False, **compile_kwargs) -> None:
+    """Compile each block's forward in place, rounding every intermediate where
+    eager does (``emulate_precision_casts``): by default under Inductor's
+    defaults in its deterministic mode, so every process compiles the same
+    kernels; with ``autotune`` under the -O level's options, whose kernel picks
+    are per process. ``compile_kwargs`` go to ``torch.compile`` (static shapes
+    and no full graph unless overridden). For a transformer whose blocks keep
+    an eager call in the middle (a cache write, a ragged attention), so each
+    block traces into graphs around it once.
+    """
+    if autotune:
+        from mstar.engine.accelerator_graph_runner import compile_kwargs as level_kwargs
+
+        compile_kwargs = {**level_kwargs(None), **compile_kwargs}
+    compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
+    for block in blocks:
+        block.forward = with_inductor_rounding(
+            torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
+        )

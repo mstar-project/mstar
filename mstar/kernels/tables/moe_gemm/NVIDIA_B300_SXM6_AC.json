@@ -1,0 +1,526 @@
+{
+  "format": 2,
+  "op": "moe_gemm",
+  "entries": [
+    {
+      "dtype": "bfloat16",
+      "shape": {
+        "E": 128,
+        "K": 1024,
+        "N": 768,
+        "top_k": 6
+      },
+      "provenance": {
+        "device": "NVIDIA B300 SXM6 AC",
+        "date": "2026-11-01",
+        "harness": "python -m mstar.utils.fused_moe.tune (#1111, E=128,N=768,K=1024,device_name=NVIDIA_B300_SXM6_AC.json)",
+        "mstar": "4b1ad5769",
+        "note": "Qwen3-Omni-30B-A3B talker experts, TP1; its rows took the nearest tuned batch size, so each key here is the largest count nearer to that row's batch size than to the next one's, which picks the same tiles at every count"
+      },
+      "rows": {
+        "1": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 5,
+            "down": {
+              "BLOCK_SIZE_N": 32,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "3": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 5
+            }
+          }
+        },
+        "6": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 5,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 4
+            }
+          }
+        },
+        "12": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 5,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "20": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {
+              "BLOCK_SIZE_N": 128,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 4
+            }
+          }
+        },
+        "28": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {
+              "BLOCK_SIZE_N": 256,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "40": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {
+              "BLOCK_SIZE_N": 256,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "56": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "BLOCK_SIZE_N": 128,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "80": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 1,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "112": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 8,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "192": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 8,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "384": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "BLOCK_SIZE_N": 128,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 8,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        },
+        "*": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 4,
+            "down": {
+              "BLOCK_SIZE_N": 128,
+              "BLOCK_SIZE_K": 64,
+              "GROUP_SIZE_M": 8,
+              "num_warps": 4,
+              "num_stages": 3
+            }
+          }
+        }
+      }
+    },
+    {
+      "dtype": "bfloat16",
+      "shape": {
+        "E": 128,
+        "K": 2048,
+        "N": 1536,
+        "top_k": 8
+      },
+      "provenance": {
+        "device": "NVIDIA B300 SXM6 AC",
+        "arch": "sm_103",
+        "date": "2026-11-03",
+        "harness": "python -m benchmark.kernels.sweep moe_gemm --dtype bfloat16 --shape E=128,N=1536,K=2048,top_k=8",
+        "torch": "2.12.1+cu132",
+        "triton": "3.7.1",
+        "mstar": "f609cac54",
+        "note": "Qwen3-Omni thinker, TP1"
+      },
+      "rows": {
+        "1": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "BLOCK_SIZE_K": 64,
+              "num_stages": 5
+            }
+          }
+        },
+        "2": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 5,
+            "down": {}
+          }
+        },
+        "4": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+            "down": {
+              "num_stages": 3
+            }
+          }
+        },
+        "16": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {}
+          }
+        },
+        "24": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 3,
+            "down": {
+              "BLOCK_SIZE_N": 64,
+              "num_warps": 4
+            }
+          }
+        },
+        "64": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "down": {}
+          }
+        },
+        "128": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "num_stages": 3
+            }
+          }
+        },
+        "256": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "down": {
+              "BLOCK_SIZE_K": 64,
+              "num_stages": 4
+            }
+          }
+        },
+        "512": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 3,
+            "down": {
+              "GROUP_SIZE_M": 1
+            }
+          }
+        },
+        "1024": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 4,
+            "down": {
+              "GROUP_SIZE_M": 1,
+              "num_stages": 3
+            }
+          }
+        },
+        "2048": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 4,
+            "down": {
+              "GROUP_SIZE_M": 1
+            }
+          }
+        },
+        "*": {
+          "impl": "triton",
+          "config": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 4,
+            "down": {}
+          }
+        }
+      },
+      "measured": {
+        "1": {
+          "us": 19.18,
+          "default_us": 25.96,
+          "triton_us": 19.18
+        },
+        "2": {
+          "us": 28.73,
+          "default_us": 33.31,
+          "triton_us": 28.73
+        },
+        "4": {
+          "us": 48.66,
+          "default_us": 55.8,
+          "triton_us": 48.66
+        },
+        "8": {
+          "us": 83.64,
+          "default_us": 98.57,
+          "triton_us": 83.64
+        },
+        "16": {
+          "us": 124.86,
+          "default_us": 141.02,
+          "triton_us": 124.86
+        },
+        "24": {
+          "us": 148.7,
+          "default_us": 162.9,
+          "triton_us": 148.7
+        },
+        "32": {
+          "us": 163.02,
+          "default_us": 174.16,
+          "triton_us": 163.02
+        },
+        "48": {
+          "us": 180.63,
+          "default_us": 200.66,
+          "triton_us": 180.63
+        },
+        "64": {
+          "us": 186.21,
+          "default_us": 207.11,
+          "triton_us": 186.21
+        },
+        "96": {
+          "us": 189.35,
+          "default_us": 209.59,
+          "triton_us": 189.35
+        },
+        "128": {
+          "us": 190.63,
+          "default_us": 209.53,
+          "triton_us": 190.63
+        },
+        "256": {
+          "us": 205.46,
+          "default_us": 230.57,
+          "triton_us": 205.46
+        },
+        "512": {
+          "us": 215.89,
+          "default_us": 237.05,
+          "triton_us": 215.89
+        },
+        "1024": {
+          "us": 252.93,
+          "default_us": 305.59,
+          "triton_us": 252.93
+        },
+        "2048": {
+          "us": 302.16,
+          "default_us": 455.41,
+          "triton_us": 302.16
+        },
+        "4096": {
+          "us": 438.76,
+          "default_us": 786.41,
+          "triton_us": 438.76
+        }
+      }
+    }
+  ]
+}

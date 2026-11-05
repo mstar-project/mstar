@@ -185,6 +185,25 @@ def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
     kv.assert_pages_conserved()
 
 
+def test_chain_key_is_the_key_the_index_files_each_page_under():
+    """A recurrent pool files its snapshots under `chain_key`, so a key the index doesn't use
+    names a snapshot no probe finds. The key the probe rooted for the prompt's partial last
+    page becomes such a key once the generation fills that page."""
+    kv = _manager()
+    prompt = list(range(200))
+    generated = list(range(9000, 9000 + 56))
+    _ingest(kv, "r0", prompt, decode=len(generated))
+    kv.resolve_cached_prefix("r0", NODE, WALK, ARNodeInputs(input_seq_len=len(prompt)))
+    _prefill(kv, "r0", prompt, sampled=generated[0])
+    for token in generated[1:]:
+        _decode(kv, "r0", token)
+    _decode(kv, "r0", 9999)
+    assert _indexed(kv) == 2
+    for pages in (1, 2):
+        assert kv._index.page_for(kv.chain_key("r0", "main", pages)) is not None, f"page {pages} is keyed apart"
+    assert kv.chain_keys("r0", "main", 3) == [kv.chain_key("r0", "main", 1), kv.chain_key("r0", "main", 2)]
+
+
 # ── nodes that cannot chain what they generate ──────────────────────────
 
 

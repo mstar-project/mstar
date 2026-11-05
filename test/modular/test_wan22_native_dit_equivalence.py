@@ -1,18 +1,25 @@
 """Per-layer equivalence: the native ``Wan22DiT`` vs the wrapped diffusers
 ``WanTransformer3DModel``, both loaded in the serving dtypes (bf16 + fp32 islands).
 
-The native module is an exact port, so the bar is BIT-EXACT at every stage: the
-weights (which also proves the loader's remap is a bijection), the RoPE tables, the
-condition-embedder outputs, and the activations at patchify, at each of the 30 block
-boundaries, and at the head. Never widen a bound to pass — a nonzero anywhere is a
-port bug, and the printed table names the first divergent stage.
+The bar is BIT-EXACT for the weights (which also proves the loader's remap is a
+bijection), the RoPE tables, the projected text stream, and the activations at
+patchify, at each of the 30 block boundaries, and at the head. Never widen a bound to
+pass — a nonzero there is a port bug, and the printed table names the first divergent
+stage.
+
+The native module computes the time embedding and modulation rows per latent frame and
+the reference per token, and cuBLAS may pick another GEMM kernel at the other row count.
+So the embedder is compared on the reference's per-token timesteps, where both run the
+same GEMMs, and the stage comparison gives both modules the native per-frame rows
+(expanded per token for the reference).
 
 Stage outputs are captured with forward hooks in execution order on BOTH modules, so
 a block-indexing mistake shifts every later row rather than passing silently.
 
 Inputs use the batch-2 CFG serving shape with an I2V-style per-token timestep grid
 (frame-0 tokens zeroed), which exercises the general path; T2V's uniform grid is the
-special case. Skipped without CUDA or the checkpoint in the local HF cache.
+special case. The native module takes that grid one value per latent frame. Skipped
+without CUDA or the checkpoint in the local HF cache.
 """
 
 from __future__ import annotations
@@ -60,6 +67,7 @@ DEVICE = torch.device("cuda")
 # Oracle-run latent grid: 480x832x33 frames -> (9, 30, 52), post-patch
 # (9, 15, 26) = 3510 tokens.
 LATENT_SHAPE = (2, 48, 9, 30, 52)
+TOKENS_PER_FRAME = (30 // 2) * (52 // 2)
 
 
 @pytest.fixture(scope="module")
@@ -92,7 +100,14 @@ def inputs():
     t = torch.tensor(999, dtype=torch.int64, device=DEVICE)
     temp_ts = (mask[0, 0][:, ::2, ::2] * t).flatten()
     timestep = temp_ts.unsqueeze(0).expand(2, -1)
-    return hidden, timestep, text
+    # the native module takes the same grid one value per frame
+    frame_timestep = (mask[0, 0, :, 0, 0] * t).unsqueeze(0).expand(2, -1)
+    return hidden, timestep, frame_timestep, text
+
+
+def _per_token(per_frame: torch.Tensor) -> torch.Tensor:
+    """Native per-frame embedder rows expanded to the reference's per-token rows."""
+    return per_frame.repeat_interleave(TOKENS_PER_FRAME, dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +177,9 @@ def _first_tensor(output):
 
 
 def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
-    hidden, timestep, text = inputs
+    """Everything past the condition embedder, on the same time embedding and
+    modulation rows: the native module's, expanded per token for the reference."""
+    hidden, timestep, frame_timestep, text = inputs
 
     stages: dict[str, list[torch.Tensor]] = {"wrapped": [], "native": []}
     hooks = []
@@ -172,29 +189,40 @@ def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
             stages[side].append(_first_tensor(output).detach())
         hooks.append(module.register_forward_hook(hook))
 
-    # Identical capture order on both sides: patchify, embedder temb,
-    # blocks 0..29 (execution order), then the forward return as the head.
+    rows = {}
+
+    def keep_native_rows(_module, _args, output):
+        rows["temb"], rows["proj"], _ = output
+
+    def use_native_rows(_module, _args, output):
+        _, _, text_out, image_out = output
+        return _per_token(rows["temb"]), _per_token(rows["proj"]).flatten(2), text_out, image_out
+
+    hooks.append(native.condition_embedder.register_forward_hook(keep_native_rows))
+    hooks.append(wrapped.condition_embedder.register_forward_hook(use_native_rows))
+
+    # Identical capture order on both sides: patchify, blocks 0..29 (execution
+    # order), then the forward return as the head.
     for side, model in (("wrapped", wrapped), ("native", native)):
         capture(side, model.patch_embedding)
-        capture(side, model.condition_embedder)
         assert len(model.blocks) == 30
         for block in model.blocks:
             capture(side, block)
 
     try:
         with torch.no_grad():
+            native_out = native(hidden_states=hidden, timestep=frame_timestep, encoder_hidden_states=text)
             wrapped_out = wrapped(
                 hidden_states=hidden, timestep=timestep,
                 encoder_hidden_states=text, return_dict=False,
             )[0]
-            native_out = native(hidden_states=hidden, timestep=timestep, encoder_hidden_states=text)
     finally:
         for hook in hooks:
             hook.remove()
 
     stages["wrapped"].append(wrapped_out)
     stages["native"].append(native_out)
-    labels = ["patchify", "time_embed"] + [f"block_{i:02d}" for i in range(30)] + ["head_out"]
+    labels = ["patchify"] + [f"block_{i:02d}" for i in range(30)] + ["head_out"]
     assert len(stages["wrapped"]) == len(stages["native"]) == len(labels)
 
     print("\nper-stage max-abs diff (wrapped vs native):")
@@ -214,9 +242,10 @@ def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
 
 
 def test_condition_embedder_all_outputs_bitwise_identical(wrapped, native, inputs):
-    """The per-stage table sees only the embedder's first output (temb); pin
-    the modulation projection and the projected text stream too."""
-    _, timestep, text = inputs
+    """The embedder given the reference's per-token timesteps, so both sides run the
+    same GEMM shapes: every output, the modulation projection and the projected text
+    stream included, must match exactly."""
+    _, timestep, _, text = inputs
     with torch.no_grad():
         ref_temb, ref_proj, ref_text, _ = wrapped.condition_embedder(
             timestep.flatten(), text, None, timestep_seq_len=timestep.shape[1]
@@ -228,6 +257,7 @@ def test_condition_embedder_all_outputs_bitwise_identical(wrapped, native, input
         ("timestep_proj", proj, ref_proj),
         ("text_proj", text_out, ref_text),
     ):
+        assert ours.shape == theirs.shape and ours.dtype == theirs.dtype
         diff = (ours.float() - theirs.float()).abs().max().item()
         print(f"condition_embedder {name}: max_abs={diff:.3e}")
         assert torch.equal(ours, theirs), f"condition_embedder {name} diverges (max_abs {diff:.3e})"

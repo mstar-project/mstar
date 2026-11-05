@@ -149,7 +149,8 @@ def test_rows_only_collect_takes_no_clone():
     eng = Engine.__new__(Engine)
     out = eng._collect_outputs(
         SimpleNamespace(submodule=_Sub(), accelerator_graph_runner=None), None, raw,
-        [], {}, request_ids=rids, step_request_ids=tuple(rids), rows_only=True,
+        [], {}, request_ids=rids, step_request_ids=tuple(rids), graph_walk="decode",
+        rows_only=True,
     )
     assert out.rows_only and out.per_rid_outputs == {} and out.row_views is None
     assert out.check_stop_buffers["new_token"] is raw.check_stop_buffers["new_token"]

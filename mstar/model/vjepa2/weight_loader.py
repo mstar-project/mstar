@@ -37,6 +37,7 @@ from mstar.model.loader import (
     iter_safetensors_shards,
     load_hf_weights,
 )
+from mstar.utils.cache_home import user_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -248,12 +249,7 @@ def download_vjepa2_ac_upstream_pt(
     ignored (we don't need an HF repo ID for the S3 path).
     """
     del model_path_hf  # not used — S3 path is unique, not keyed by repo ID.
-    import os
-    cache_home = Path(os.environ.get(
-        "XDG_CACHE_HOME",
-        Path.home() / ".cache"
-    ))
-    cache_root = Path(cache_dir) if cache_dir else cache_home / "mstar_vjepa2"
+    cache_root = Path(cache_dir) if cache_dir else user_cache_dir() / "mstar_vjepa2"
     cache_root.mkdir(parents=True, exist_ok=True)
 
     pt_path = cache_root / "vjepa2-ac-vitg.pt"
