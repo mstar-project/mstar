@@ -9,6 +9,10 @@ rank_devices: {0: 0, 1: 0, 2: 0}
 # The three workers' kernels overlap as clients of one MPS daemon, rather than
 # time-slicing the GPU.
 mps: true
+# Requests past 32 in flight queue here. Nothing else caps the spoken replies
+# the TTS holds at once (the vocoder's slots gate only the vocoder), so tts_kv
+# is sized for this many; startup refuses a tts_kv that can't hold them.
+max_concurrent_requests: 32
 # Text and spoken replies decode in one step (`decode_mixed`) rather than taking
 # turns. Mixing is on by default only where the LLM has a token budget, and it
 # has none.
@@ -24,13 +28,16 @@ resources:
   # 128-token pages. The LLM's ~144 KiB/token: 384 pages (49k tokens) is 6.8 GiB.
   llm_kv:
     max_num_pages: 384
-  # The TTS's ~60 KiB/token: a spoken reply's condition plus up to 2047 codes.
+  # The TTS's ~60 KiB/token. A spoken reply's condition and codes fill at most
+  # its 4096 positions (32 pages), kept until its last code: 1025 pages (7.5 GiB)
+  # hold `max_concurrent_requests` full replies and the sink page. With fewer, a
+  # burst of long replies fills the pool and stalls.
   tts_kv:
-    max_num_pages: 256
+    max_num_pages: 1025
   # The vocoder holds a slot in each of these per spoken reply, ~0.4 GiB in all
   # (t2w_state has one more, its sink; startup refuses counts that disagree). A
-  # reply waits for slots before its first audio, so they cap concurrent spoken
-  # replies.
+  # reply waits for slots before its first audio, so they cap the replies being
+  # voiced at once.
   t2w_state:
     max_slots: 33
   t2w_enc1_kv:

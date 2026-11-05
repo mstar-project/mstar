@@ -57,6 +57,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVSpec
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -244,7 +245,13 @@ class MiniCPMOModel(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """A spoken reply holds a slot of each ``t2w_*`` resource, so one count sizes
         them all: ``t2w_state`` has one more (its sink). Set apart, the smallest caps
-        concurrent spoken replies and the rest strand ~0.4 GiB a slot."""
+        concurrent spoken replies and the rest strand ~0.4 GiB a slot.
+
+        The vocoder's slots don't hold back the TTS: it takes every spoken reply the
+        LLM finishes and keeps its pages, up to its positions, until its last code.
+        Only ``max_concurrent_requests`` caps those replies, so ``tts_kv`` must hold
+        that many full ones; a burst that overfills it stalls with no reply able to
+        finish."""
         resources = config.get("resources") or {}
 
         def slots(key: str, default: int) -> int:
@@ -256,6 +263,18 @@ class MiniCPMOModel(Model):
             raise ValueError(
                 f"{config_path}: resources.{T2W_STATE}.max_slots ({state}) must be one more than "
                 f"each of {', '.join(f'{k}.max_slots ({n})' for k, n in kv.items())}"
+            )
+
+        tts = resources.get(TTS_KV) or {}
+        reply = -(-self.tts_config.max_position_embeddings // int(tts.get("page_size") or DEFAULT_PAGE_SIZE))
+        pages = int(tts.get("max_num_pages", PagedKVConfig.max_num_pages))
+        cap = config.get("max_concurrent_requests")
+        # and the pool's sink page
+        if cap is None or pages < int(cap) * reply + 1:
+            raise ValueError(
+                f"{config_path}: resources.{TTS_KV}.max_num_pages ({pages}) must hold "
+                f"max_concurrent_requests ({cap}) full spoken replies of {reply} pages, plus a sink page: "
+                "nothing else caps the replies the TTS holds at once, and a burst past the pool stalls"
             )
 
     def checkpoint_path(self) -> str | None:

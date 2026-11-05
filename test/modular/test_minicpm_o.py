@@ -542,19 +542,44 @@ def test_audio_block_loop_leases_within_the_resources_segment_limit():
     assert not region.can_lease(request(3))
 
 
+def a_deployment(cap: int | None = 32, tts_pages: int = 32 * 32 + 1, **resources) -> dict:
+    """A YAML whose tts_kv holds ``cap`` full spoken replies (32 pages each) and its sink page."""
+    from mstar.model.minicpm_o.config import TTS_KV
+
+    config = {"resources": {TTS_KV: {"max_num_pages": tts_pages}, **resources}}
+    return config if cap is None else {"max_concurrent_requests": cap, **config}
+
+
 def test_vocoder_slot_counts_must_agree():
     """A spoken reply holds a slot of each t2w resource, so one count sizes all four:
     t2w_state has one more (its sink). A YAML that sets them apart is refused."""
+    from mstar.model.minicpm_o.components.tts import TTSConfig
     from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
 
-    model = a_bare_model()
+    model = a_bare_model(tts_config=TTSConfig())
 
     def yaml(state, kv):
-        return {"resources": {T2W_STATE: {"max_slots": state}, **{key: {"max_slots": kv} for key in T2W_KV.values()}}}
+        return a_deployment(**{T2W_STATE: {"max_slots": state}, **{key: {"max_slots": kv} for key in T2W_KV.values()}})
 
     model.validate_config_yaml(yaml(33, 32), "minicpm_o.yaml")
-    model.validate_config_yaml({}, "minicpm_o.yaml")
+    model.validate_config_yaml(a_deployment(), "minicpm_o.yaml")
     with pytest.raises(ValueError, match="t2w_state"):
         model.validate_config_yaml(yaml(33, 33), "minicpm_o.yaml")
     with pytest.raises(ValueError, match="t2w_state"):
-        model.validate_config_yaml({"resources": {T2W_STATE: {"max_slots": 33}}}, "minicpm_o.yaml")
+        model.validate_config_yaml(a_deployment(**{T2W_STATE: {"max_slots": 33}}), "minicpm_o.yaml")
+
+
+def test_tts_kv_must_hold_every_admitted_spoken_reply():
+    """Nothing gates the TTS on the vocoder's slots: it holds every spoken reply the
+    LLM has finished, each up to its 4096 positions, until its last code. A tts_kv
+    that can't hold `max_concurrent_requests` full replies, or no cap, is refused:
+    a burst of long replies would fill it and stall (G2.1)."""
+    from mstar.model.minicpm_o.components.tts import TTSConfig
+
+    model = a_bare_model(tts_config=TTSConfig())
+
+    model.validate_config_yaml(a_deployment(), "minicpm_o.yaml")
+    model.validate_config_yaml(a_deployment(cap=8, tts_pages=8 * 32 + 1), "minicpm_o.yaml")
+    for config in (a_deployment(tts_pages=32 * 32), a_deployment(cap=None)):
+        with pytest.raises(ValueError, match="tts_kv"):
+            model.validate_config_yaml(config, "minicpm_o.yaml")
