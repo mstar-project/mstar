@@ -648,12 +648,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         the ``code_predictor`` aux sampler. Both read their params from
         engine-owned static buffers, so this single path serves eager execution
         and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
-        ``text_ids`` are a decode step's text tokens, whose conditions join
-        the codec embeddings here.
         """
-        if text_ids is not None:
-            input_embeds = input_embeds + self._text_conditions(text_ids, input_embeds.dtype)
-        hidden = self.model(input_embeds, label="main")
+        hidden = self._main_hidden(input_embeds, text_ids)
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.model.codec_head(last_hidden)
         logits = self._mask_invalid_logits(logits, suppress_eos)
@@ -679,6 +675,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             "codec_tokens": all_codes,
             "layer0_codes": layer0_codes,
         }
+
+    def _main_hidden(self, input_embeds: torch.Tensor, text_ids: torch.Tensor | None) -> torch.Tensor:
+        """The main Talker over ``input_embeds``; ``text_ids`` are a decode
+        step's text tokens, whose conditions join the codec embeddings here."""
+        if text_ids is not None:
+            input_embeds = input_embeds + self._text_conditions(text_ids, input_embeds.dtype)
+        return self.model(input_embeds, label="main")
 
     def _run_depth(
         self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor, sampler: SamplerResource, request_ids: list[str],

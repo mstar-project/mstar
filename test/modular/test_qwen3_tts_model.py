@@ -1403,6 +1403,19 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     _assert_same_tensor(packed["last_token_indices"], torch.arange(len(rows)))
     _assert_same_tensor(packed["input_embeds"], torch.cat([row.input_embeds for row in rows]))
 
+    seen = []
+
+    def main_input(input_embeds, label):
+        seen.append(input_embeds)
+        raise RuntimeError("the main Talker ran")
+
+    # the decode forward adds the rows' text conditions before the main Talker
+    submodule.model.forward = main_input
+    with pytest.raises(RuntimeError, match="the main Talker ran"):
+        submodule.forward_batched("talker_decode", engine_inputs, **packed)
+    del submodule.model.forward
+    _assert_same_tensor(seen[0], packed["input_embeds"] + text_conditions(rows))
+
     def prefill_row(rid, walk, text_ids, layout, speaker_id, language_id, **inputs) -> ARNodeInputs:
         metadata = {PROMPT_LAYOUT_KEY: layout, SPEAKER_ID_KEY: speaker_id, LANGUAGE_ID_KEY: language_id}
         return submodule.prepare_inputs(walk, info(rid, **metadata), {"text_inputs": [text_ids], **inputs})
