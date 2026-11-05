@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar_sim import clock, memory
+from mstar_sim import clock, gpus, memory
 
 _tls = threading.local()
 _ids = itertools.count(1)
@@ -31,13 +31,7 @@ class Spec(SimpleNamespace):
 
 
 def _spec() -> Spec:
-    try:
-        from mstar_sim import gpus
-
-        gpu = gpus.lookup(os.environ.get("MSTAR_SIM_GPU", "h100"))
-    except (ImportError, AttributeError):  # the spec table is optional for the device itself
-        gpu = SimpleNamespace(name="NVIDIA H100 80GB HBM3", capability=(9, 0), sm_count=132,
-                              memory_bytes=80 << 30, smem_per_sm=233472)
+    gpu = gpus.lookup(os.environ.get("MSTAR_SIM_GPU", "h100"))
     mem_gb = os.environ.get("MSTAR_SIM_MEMORY_GB")
     total = int(float(mem_gb) * (1 << 30)) if mem_gb else gpu.memory_bytes
     return Spec(gpu=gpu, total=total)
