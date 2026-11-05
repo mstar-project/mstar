@@ -356,6 +356,27 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
                 assert f"allocating memory for {short_of}" in str(e), e
         workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
         plan()
+        # auto takes fa3, which keeps no partials, only where its kernels serve the plan
+        rows, pages = torch.tensor([0, 16, 32], dtype=torch.int32), torch.tensor([0, 2, 4], dtype=torch.int32)
+        for head_dim, kv_dtype, overflows in ((128, torch.bfloat16, False), (80, torch.bfloat16, True),
+                                              (128, torch.float8_e4m3fn, True)):
+            auto = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                torch.empty(1024, dtype=torch.uint8, device="cuda"), "NHD", use_cuda_graph=True,
+                qo_indptr_buf=torch.zeros(3, **i32), paged_kv_indptr_buf=torch.zeros(3, **i32),
+                paged_kv_indices_buf=torch.zeros(8, **i32), paged_kv_last_page_len_buf=torch.ones(2, **i32))
+            try:
+                auto.plan(rows, pages, torch.arange(4, dtype=torch.int32), torch.tensor([16, 16], dtype=torch.int32),
+                          8, 8, head_dim, 16, causal=True, q_data_type=torch.bfloat16, kv_data_type=kv_dtype)
+                assert not overflows, (head_dim, kv_dtype)
+            except RuntimeError as e:
+                assert overflows and "allocating memory for batch_prefill_tmp_v" in str(e), e
+        # tensor-core decode's auto is fa2, or the rule's answer when fp8 is in play
+        for dtype, expected in ((torch.bfloat16, "fa2"), (torch.float8_e4m3fn, "fa3")):
+            decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                torch.empty(1 << 26, dtype=torch.uint8, device="cuda"), "NHD", use_tensor_cores=True)
+            decode.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
+                        q_data_type=dtype, kv_data_type=dtype)
+            assert decode._backend == expected, decode._backend
     """)
 
 

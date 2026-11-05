@@ -7,7 +7,8 @@ import torch
 from mstar_sim import clock
 from mstar_sim.device import gpu_error
 
-from ._paged import PagedAttention, _not_supported, check_layout, element_size, table_features
+from ._paged import PagedAttention, _not_supported, canonical_dtype, check_layout, element_size, table_features
+from .utils import determine_attention_backend
 
 
 class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
@@ -79,8 +80,10 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             raise gpu_error(ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}"))
         if data_type is not None:
             q_data_type = kv_data_type = data_type
-        if self._use_tensor_cores and self._backend == "auto":
-            self._backend = "fa2"  # tensor-core decode plans with the fa2 prefill module
+        if self._use_tensor_cores and self._backend == "auto":  # plans with the prefill module: fa2 unless fp8
+            dtypes = canonical_dtype(q_data_type), canonical_dtype(kv_data_type or q_data_type)
+            fp8 = {torch.float8_e4m3fn, torch.float8_e5m2} & set(dtypes)
+            self._backend = determine_attention_backend(self.device, 0, False, False, *dtypes) if fp8 else "fa2"
         self._logits_soft_cap = logits_soft_cap or 0.0
         self._set_plan(
             None, indptr, indices, last_page_len, num_qo_heads=num_qo_heads,

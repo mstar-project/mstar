@@ -20,6 +20,22 @@ def _get_range_buf(seq_len: int, device) -> torch.Tensor:
     return buf[:seq_len]
 
 
+def determine_attention_backend(device, pos_encoding_mode: int, use_fp16_qk_reductions: bool, use_custom_mask: bool,
+                                dtype_q: torch.dtype, dtype_kv: torch.dtype, *, head_dim_qk: int | None = None,
+                                head_dim_vo: int | None = None) -> str:
+    """FlashInfer's answer to ``backend="auto"``: fa3 on Hopper where its kernels serve the
+    call, else fa2."""
+    fp8 = {torch.float8_e4m3fn, torch.float8_e5m2}
+    if (torch.cuda.get_device_capability(device)[0] != 9 or use_custom_mask or pos_encoding_mode != 0
+            or use_fp16_qk_reductions or (dtype_kv in fp8 and dtype_q not in fp8) or dtype_kv == torch.uint8):
+        return "fa2"
+    if head_dim_qk is None or head_dim_vo is None:
+        return "fa3"
+    if head_dim_qk == head_dim_vo:
+        return "fa3" if head_dim_qk in (64, 128, 256) else "fa2"
+    return "fa3" if (head_dim_qk, head_dim_vo) == (192, 128) else "fa2"
+
+
 def get_device_sm_count(device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
