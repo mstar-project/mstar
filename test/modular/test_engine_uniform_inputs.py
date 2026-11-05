@@ -23,7 +23,7 @@ class _Batch:
         self.node_name = "llm"
         self.request_ids = list(rids)
         self.step_context = SimpleNamespace(
-            graph_walk=walk, request_walks={}, walk_of=lambda _r: walk,
+            graph_walk=walk, request_walks={}, walk_of=lambda _r: walk, repeats=1,
         )
         self.per_request_info_wrapped = {r: SimpleNamespace() for r in rids}
         self.per_request_input_tensors = {}

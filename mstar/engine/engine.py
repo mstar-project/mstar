@@ -11,7 +11,7 @@ from functools import partial
 from itertools import repeat
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -46,7 +46,14 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.resident import NOT_ASKED, ResidentPlanner, build_planner, watch_table_reads
+from mstar.engine.resources.resident import (
+    LOOP_COUNTER,
+    NOT_ASKED,
+    ResidentPlanner,
+    build_planner,
+    watch_table_reads,
+    watched_counts,
+)
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -73,6 +80,7 @@ from mstar.model.submodule_base import (
     StepOrder,
     StopPolicy,
     engine_step,
+    iteration_columns,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -287,6 +295,17 @@ class SubmoduleManagement:
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
 
+def _refuse_counter_read(batch: "ExecutingBatch", reads: Collection[str], stage: str) -> None:
+    """A step that repeats runs its ``prepare_inputs`` and ``preprocess``
+    once, so a value they derive from the loop counter would hold for every
+    replay; an iteration's value belongs in ``ITERATION_INPUTS``."""
+    if batch.step_context.repeats > 1 and LOOP_COUNTER in reads:
+        raise SystemExit(
+            f"{batch.node_name}/{batch.step_context.graph_walk}: a repeating step's {stage} read "
+            f"{LOOP_COUNTER}, which its later replays don't renew; declare the value in ITERATION_INPUTS"
+        )
+
+
 @dataclass
 class ForwardPassInfoWrapper:
     """
@@ -307,7 +326,7 @@ class ForwardPassInfoWrapper:
     # failed lookup plus a Python call per read.
     @property
     def dynamic_loop_iter_counts(self):
-        return self.metadata.dynamic_loop_iter_counts
+        return watched_counts(self.metadata.dynamic_loop_iter_counts)
 
     @property
     def resource_configs(self):
@@ -327,7 +346,7 @@ class ForwardPassInfoWrapper:
 
     def __getattr__(self, name):
         if name == "dynamic_loop_iter_counts":
-            return self.metadata.dynamic_loop_iter_counts
+            return watched_counts(self.metadata.dynamic_loop_iter_counts)
         return getattr(self.info, name)
 
 
@@ -392,6 +411,9 @@ class ExecutingBatch:
     # the one object every row shares, when the step was prepared with the
     # submodule's ``uniform_row_inputs``
     uniform_inputs: NodeInputs | None = None
+    # the step's iteration inputs (``NodeSubmodule.ITERATION_INPUTS``), a
+    # column a replay: ``[rows, repeats, ...]``, staged after ``preprocess``
+    iteration_columns: dict[str, torch.Tensor] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -552,6 +574,8 @@ class Engine:
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
     _node_lanes: Mapping[str, int] = MappingProxyType({})
+    # (node, walk) -> the Loop it runs in; set at warmup
+    _loops: Mapping[tuple[str, str], str] = MappingProxyType({})
     _lane_streams: Mapping[int, Any] = MappingProxyType({})
 
     @property
@@ -752,7 +776,8 @@ class Engine:
             # a resident step's tables fill these in its graph, after its preprocess
             with watch_table_reads() as reads:
                 runner.prepare_template(walk)
-            return f"node: its captured preprocess reads {reads[0]}, which the graph fills after it" if reads else None
+            read = next((r for r in reads if r != LOOP_COUNTER), None)
+            return f"node: its captured preprocess reads {read}, which the graph fills after it" if read else None
 
         if not steps:
             return
@@ -883,9 +908,12 @@ class Engine:
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
     ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
-        walk runs the node inside a Loop, which may run on resident tables;
+        walk runs the node inside a Loop, which may run on resident tables, by
+        the Loop (a mapping) when its iteration inputs read the Loop's counter;
         ``carried``: the loop-back signals of each such pair whose steps may
         repeat, whose ``preprocess`` is checked here (``probe_carries``)."""
+        # the Loop each (node, walk) runs in, whose counter its iteration inputs read
+        self._loops = dict(looped) if isinstance(looped, Mapping) else {}
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -1314,7 +1342,12 @@ class Engine:
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
         try:
-            self._prepare_inputs(batch)
+            if batch.step_context.repeats > 1:
+                with watch_table_reads() as reads:
+                    self._prepare_inputs(batch)
+                _refuse_counter_read(batch, reads, "prepare_inputs")
+            else:
+                self._prepare_inputs(batch)
         finally:
             if self._enable_nvtx:
                 range_pop()
@@ -2192,17 +2225,22 @@ class Engine:
             range_push("engine.preprocess")
         t0 = phase_start()
         try:
-            if ctx.resident is None:
+            if ctx.resident is None and ctx.repeats == 1:
                 preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
             else:
                 with watch_table_reads() as reads:
                     preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
-                if reads:
+                table = next((r for r in reads if r != LOOP_COUNTER), None)
+                if table is not None and ctx.resident is not None:
                     # a branch the capture template didn't take at load
                     raise SystemExit(
-                        f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {reads[0]}, "
+                        f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {table}, "
                         "which its graph fills after it; serve it with resident_planning: off"
                     )
+                _refuse_counter_read(batch, reads, "preprocess")
+            if getattr(submodule, "ITERATION_INPUTS", None):
+                batch.iteration_columns = self._iteration_columns(batch.node_name, submodule, ctx, rids, req_info)
+                preprocessed.update((name, column[:, 0]) for name, column in batch.iteration_columns.items())
         finally:
             phase_end("engine.preprocess", t0)
             if nvtx:
@@ -2277,7 +2315,7 @@ class Engine:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
                 stops, rows = cg_runner.repeat(
                     lease, submodule_mgmt.carries[graph_walk], ctx.repeats,
-                    partial(self._runner.next_replay, step), columns,
+                    partial(self._runner.next_replay, step), columns, batch.iteration_columns,
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
@@ -2878,6 +2916,23 @@ class Engine:
         column of per replay (``keep_run_columns``)."""
         return self._submodules[node_name].run_columns.get(graph_walk, frozenset())
 
+    def _iteration_columns(
+        self, node_name: str, submodule: NodeSubmodule, ctx: StepContext, rids: Sequence[int],
+        req_info: Mapping[int, Any],
+    ) -> dict[str, torch.Tensor]:
+        """The step's iteration inputs, a column a replay: each row at its own
+        iteration of its walk's Loop (0 outside one), a padding row at its
+        ``capture_fill``."""
+        rows = []
+        for rid in rids:
+            info = req_info.get(rid)
+            loop = self._loops.get((node_name, ctx.walk_of(rid)))
+            # the counter as the engine reads it, not watched
+            counts = getattr(info, "metadata", info)
+            k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop, 0)
+            rows.append((rid, k))
+        return iteration_columns(submodule, rows, ctx.repeats, self._device)
+
     def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
         """Have a step of this walk that repeats keep a column per replay of
         each of ``signals`` (its per-iteration outputs); why it can't, or None."""
@@ -2899,7 +2954,10 @@ class Engine:
         if runner.resident_refusal(walk) is not None:
             return  # no batched capture of it: its steps never repeat
         mgmt.template_steps[walk] = runner.template_step(walk)
-        refusal = runner.prepare_template(walk, mgmt.submodule.repeat_carry(walk, signals))
+        with watch_table_reads() as reads:
+            refusal = runner.prepare_template(walk, mgmt.submodule.repeat_carry(walk, signals))
+        if refusal is None and LOOP_COUNTER in reads:
+            refusal = f"its captured preprocess reads {LOOP_COUNTER}, which a run's later replays don't renew"
         if refusal is not None:
             mgmt.carry_refusals[walk] = f"node: {refusal}"
 

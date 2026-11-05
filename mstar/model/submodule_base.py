@@ -94,6 +94,25 @@ class TokenStop:
         return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
+class IterationInput(NamedTuple):
+    """A static input that differs each iteration of the node's Loop, cut per
+    row from a table in the row's request state (``NodeSubmodule.request_state``):
+    iteration k reads ``table[k + offset]``. Declared in
+    ``NodeSubmodule.ITERATION_INPUTS``; the engine stages it for every walk,
+    one value a row a step, and a step that repeats a column a replay."""
+    # the request-state entry holding the table, ``[T, ...]``
+    source: str
+    offset: int = 0
+    # past the table's end: a request-state entry holding the row, a value to
+    # fill it with, or None, where reading past it is an error
+    pad: str | float | None = None
+    # one row's value, as the forward reads it ([B, *shape] batched)
+    shape: tuple[int, ...] = ()
+    # a padding row's value, which has no request state
+    capture_fill: float = 0.0
+    dtype: torch.dtype = torch.float32
+
+
 class CarryPair(NamedTuple):
     """A loop-back signal between two replays of a step that repeats."""
     # the output (a row output or ``check_stop_buffers`` entry) a replay leaves it in
@@ -854,6 +873,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # declares its own ``LoraStep`` under the pool's key.
     lora_keys: tuple[str, ...] = ()
 
+    # static input -> its value per iteration of the node's Loop, cut per row
+    # from the row's request state (``IterationInput``). The engine stages these
+    # after ``preprocess``, for every walk; ``prepare_inputs`` and ``preprocess``
+    # don't read the loop counter for them, and a step that repeats may not read
+    # it at all: its later replays would see the first one's.
+    ITERATION_INPUTS: Mapping[str, IterationInput] = MappingProxyType({})
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -1463,6 +1489,43 @@ class NodeSubmodule(torch.nn.Module, ABC):
         this on request removal; overrides with extra internal state should
         call super()."""
         self.request_states.pop(request_id, None)
+
+
+def iteration_columns(
+    submodule: NodeSubmodule, rows: Sequence[tuple[Any, int] | None], repeats: int, device,
+) -> dict[str, torch.Tensor]:
+    """``submodule``'s ``ITERATION_INPUTS`` for a step's rows, ``[B, repeats,
+    *shape]`` each: row i's ``(rid handle, its iteration)``, or None for a
+    padding row, which takes ``capture_fill`` and gets no state."""
+    out: dict[str, torch.Tensor] = {}
+    states = submodule.request_states
+    for name, spec in submodule.ITERATION_INPUTS.items():
+        values = []
+        fill = None
+        for row in rows:
+            state = None if row is None else states.get(row[0])
+            if state is None:
+                if fill is None:
+                    fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
+                values.append(fill)
+                continue
+            table = state[spec.source]
+            start = row[1] + spec.offset
+            value = table[start:start + repeats]
+            if value.shape[0] < repeats:
+                value = torch.cat([value, _iteration_pad(spec, state, table, repeats - value.shape[0], name)])
+            values.append(value.reshape(repeats, *spec.shape))
+        out[name] = torch.stack(values)
+    return out
+
+
+def _iteration_pad(spec: IterationInput, state: PerRequestState, table: torch.Tensor, n: int, name: str):
+    if spec.pad is None:
+        raise ValueError(f"iteration input {name!r} reads past the {table.shape[0]} rows of {spec.source!r}")
+    if isinstance(spec.pad, str):
+        row = state[spec.pad].reshape(1, *table.shape[1:])
+        return row.expand(n, *table.shape[1:])
+    return table.new_full((n, *table.shape[1:]), spec.pad)
 
 
 def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:

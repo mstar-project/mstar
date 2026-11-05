@@ -47,6 +47,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.graph.base import EdgeKind, LoopEdges  # noqa: E402
+from mstar.model.submodule_base import IterationInput  # noqa: E402
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
@@ -2435,3 +2436,108 @@ def test_a_host_planned_walk_repeats_only_if_its_step_keeps_nothing():
     assert refusal(commit=False, advance=(0,)) is None
     assert refusal(commit=True, advance=(0,)).startswith("resource 'kv': a host-planned step that commits")
     assert refusal(commit=False, advance=None).startswith("resource 'rope': a host-planned step that advances")
+
+
+# ---- iteration inputs and the watched loop counter ----
+
+class _Conditioned(torch.nn.Module):
+    """A node whose ``cond`` input is row i's ``trailing[k]`` at iteration k."""
+
+    ITERATION_INPUTS = {"cond": IterationInput("trailing", shape=(2,), pad="pad", capture_fill=-1.0)}
+
+    def __init__(self):
+        super().__init__()
+        self.request_states = {}
+
+
+def test_a_mixed_step_stages_each_rows_iteration_of_its_own_walk():
+    """A decode row at k=3 reads trailing[3]; a prefill row of the same step,
+    outside the Loop, reads trailing[0]; a padding row takes its fill."""
+    from mstar.engine.engine import Engine, ForwardPassInfoWrapper
+    from mstar.model.submodule_base import InputMetadata, PerRequestState
+
+    node = _Conditioned()
+    for rid in (1, 2):
+        node.request_states[rid] = PerRequestState()
+        node.request_states[rid].add("trailing", torch.arange(10.0).reshape(5, 2) + 100 * rid)
+    engine = Engine.__new__(Engine)
+    engine._device, engine._loops = CPU, {("n", "decode"): "loop"}
+    ctx = StepContext(request_ids=(1, 2), graph_walk="mixed", slot=0, capture=False, repeats=1)
+    ctx.request_walks = {1: "decode", 2: "prefill"}
+    info = {
+        rid: ForwardPassInfoWrapper(SimpleNamespace(), InputMetadata(dynamic_loop_iter_counts={"loop": k}))
+        for rid, k in ((1, 3), (2, 0))
+    }
+    cond = engine._iteration_columns("n", node, ctx, [1, 2, -1], info)["cond"]
+    assert cond[:, 0].tolist() == [[106.0, 107.0], [200.0, 201.0], [-1.0, -1.0]]
+
+
+def test_a_run_stages_each_replays_iteration_input_before_it():
+    cond_in, seen = torch.zeros(2), []
+
+    class Graph:
+        def replay(self):
+            seen.append(cond_in.tolist())
+
+    slot = SimpleNamespace(
+        graph=Graph(), static_inputs={"cond": cond_in},
+        static_outputs=SimpleNamespace(check_stop_buffers={"t": torch.zeros(2)}, row_outputs={}),
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: slot
+    columns = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    cond_in.copy_(columns[:, 0])  # the first replay's, staged with the step
+    seen.append(cond_in.tolist())
+    runner.repeat(None, {}, 3, lambda: None, iteration={"cond": columns})
+    assert seen == [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
+
+
+@pytest.mark.parametrize("repeats", [1, 2])
+def test_a_repeating_step_that_reads_the_loop_counter_stops_the_worker(repeats):
+    """A run's later replays don't run prepare_inputs or preprocess again, so a
+    value either derives from the counter would hold for all of them."""
+    from mstar.engine.engine import ForwardPassInfoWrapper, _refuse_counter_read
+    from mstar.engine.resources.resident import LOOP_COUNTER, watch_table_reads
+    from mstar.model.submodule_base import InputMetadata
+
+    info = ForwardPassInfoWrapper(SimpleNamespace(), InputMetadata(dynamic_loop_iter_counts={"loop": 4}))
+    assert info.dynamic_loop_iter_counts["loop"] == 4  # unwatched: free
+    with watch_table_reads() as reads:
+        assert info.dynamic_loop_iter_counts.get("loop") == 4
+    assert reads == [LOOP_COUNTER]
+    batch = SimpleNamespace(node_name="n", step_context=SimpleNamespace(repeats=repeats, graph_walk=WALK))
+    if repeats == 1:
+        _refuse_counter_read(batch, reads, "preprocess")
+    else:
+        with pytest.raises(SystemExit, match="preprocess read the loop counter"):
+            _refuse_counter_read(batch, reads, "preprocess")
+
+
+def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_repeating():
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.engine.engine import Engine
+
+    def preprocess(graph_walk, engine_inputs, inputs):
+        info = next(iter(engine_inputs.per_request_info.values()))
+        return {"x": torch.tensor([info.dynamic_loop_iter_counts.get("loop", 0)])}
+
+    rows = [SimpleNamespace(tensor_inputs={})]
+    template_info = {-1: SimpleNamespace(dynamic_loop_iter_counts={})}
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.resident_refusal = lambda walk: None
+    runner.template_step = lambda walk: None
+    runner._widest = lambda walk: SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk))
+    runner._template = lambda spec: CaptureTemplate(
+        [-1], rows, SimpleNamespace(per_request_info=template_info), None,
+    )
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids, free: None)
+    runner._submodule = SimpleNamespace(preprocess=preprocess, ITERATION_INPUTS={})
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}), template_steps={}, carry_refusals={},
+    )
+    engine._submodules = {"n": mgmt}
+    engine._probe_carries("n", runner, WALK, ())
+    assert mgmt.carry_refusals[WALK] == (
+        "node: its captured preprocess reads the loop counter, which a run's later replays don't renew"
+    )

@@ -29,7 +29,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
-from mstar.engine.resources.resident import ResidentPlanner
+from mstar.engine.resources.resident import ResidentPlanner, watched_counts
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -38,6 +38,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     engine_step,
+    iteration_columns,
     lora_rows,
 )
 from mstar.platforms import current_platform
@@ -874,6 +875,9 @@ class AcceleratorGraphRunner:
         template = self._template(spec)
         rows, probed = _probe_rows(template.inputs, carries)
         template = template._replace(inputs=rows)
+        # inside an engine watch, a read of a padding row's loop counter is recorded
+        for info in (template.engine_inputs.per_request_info if template.engine_inputs is not None else {}).values():
+            info.dynamic_loop_iter_counts = watched_counts(info.dynamic_loop_iter_counts)
         try:
             preprocessed = self._prepare(spec, template)
         finally:
@@ -1347,9 +1351,14 @@ class AcceleratorGraphRunner:
             if not outcome.ok:
                 raise RuntimeError(f"capture admit failed for {spec.bucket}: {outcome.reason}")
             self._step_runner.plan(template.step)
-        return self._submodule.preprocess(
+        preprocessed = self._submodule.preprocess(
             graph_walk=spec.bucket.graph_walk, engine_inputs=template.engine_inputs, inputs=template.inputs,
         )
+        if getattr(self._submodule, "ITERATION_INPUTS", None):
+            # padding rows all: each takes its capture_fill
+            columns = iteration_columns(self._submodule, [None] * len(template.inputs), 1, self._device)
+            preprocessed.update((name, column[:, 0]) for name, column in columns.items())
+        return preprocessed
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -1693,11 +1702,12 @@ class AcceleratorGraphRunner:
 
     def repeat(
         self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int, next_replay: Callable[[], None],
-        columns: Collection[str] = (),
+        columns: Collection[str] = (), iteration: Mapping[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """The rest of a step that repeats, after its first replay: before
         each replay, every loop-back signal's output is copied into the static
-        input it feeds (``carries``). Returns the stop buffers, one value a
+        input it feeds (``carries``), and each iteration input's column for
+        that replay into its own (``iteration``, ``[rows, repeats, ...]``). Returns the stop buffers, one value a
         row each, and the row outputs named in ``columns``, ``[rows, ...]``
         each, both with a column per replay (``[rows, repeats, ...]``): a
         replay overwrites what the last one left, so each is copied out on the
@@ -1706,6 +1716,7 @@ class AcceleratorGraphRunner:
         buffers = slot.static_outputs.check_stop_buffers
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
         copies = [(_carried(slot, pair.output), slot.static_inputs[pair.input]) for pair in carries.values()]
+        stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
         # two names can share a buffer
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
         unique.update((id(t), t) for t in rows_out.values())
@@ -1714,6 +1725,8 @@ class AcceleratorGraphRunner:
             if i:
                 for source, target in copies:
                     target.copy_(source.reshape(target.shape))
+                for column, target in stage:
+                    target.copy_(column[:, i].reshape(target.shape))
                 next_replay()
                 slot.graph.replay()
             for key, tensor in unique.items():

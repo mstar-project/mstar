@@ -5196,7 +5196,7 @@ class Worker:
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all(
-            {(node, walk) for walk, node in self._innermost_loop_by_node},
+            {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
         )
         if self._step_repeats is not None:

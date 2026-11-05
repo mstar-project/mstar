@@ -1693,6 +1693,18 @@ item each, less an EOS iteration's item of a withheld output. A step that emits 
 items per row per replay (``EMITTED_COUNT`` in its ``check_stop_buffers``) holds them along
 dim 1 of each such output, and each row routes that many.
 
+A static input that differs each iteration of the node's Loop is declared rather than
+cut in ``prepare_inputs``: ``ITERATION_INPUTS = {name: IterationInput(source, offset, pad,
+shape, capture_fill, dtype)}``, where ``source`` names a ``[T, ...]`` table in the row's
+request state and iteration ``k`` reads ``table[k + offset]`` (past the end, ``pad``: a
+value, or the name of a request-state row). The engine stages each after ``preprocess``,
+for every walk, as ``[B, *shape]`` (a padding row at ``capture_fill``, with no state made
+for it), and a step that repeats reads a column per replay, so a run of N reads iterations
+k to k+N-1. ``prepare_inputs`` and ``preprocess`` then never read the loop counter for it,
+and a step that repeats may not read the counter at all: the engine watches
+``dynamic_loop_iter_counts`` there, refuses a walk whose captured ``preprocess`` reads it at
+load, and stops the worker if a repeating step's ``prepare_inputs`` or ``preprocess`` does.
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 
@@ -3017,9 +3029,9 @@ comes with the scaffold: a subclass of ``UniPCDenoiseLoopSubmodule`` implements
 ``unipc_model_outputs`` and ``unipc_last_sample`` and steps each row by the loop counter
 from its own tables, with no host read, so rows at different steps share a forward
 (wan22 is the example). A scheduler needing another per-step
-scalar adds a ``STEP_SCALARS`` entry naming the attribute of its ``FlowMatchSchedule``
-to slice it from — the base stages that tensor on the device and slices it per step, so
-nothing in the batching path has to change.
+scalar adds an ``ITERATION_INPUTS`` entry naming the attribute of its ``FlowMatchSchedule``
+to read it from — the base stages that tensor in the request's state, and the engine cuts
+each row's value per step, so nothing in the batching path has to change.
 
 A model whose ``seed_loop_back`` depends on nothing but the bucket key and the request's
 seed sets ``PREFETCH_SEEDS = True`` (klein and Z-Image do): the base then draws the noise

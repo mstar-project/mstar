@@ -73,6 +73,47 @@ def watch_table_reads() -> Iterator[list[str]]:
         _TABLE_READS.reset(token)
 
 
+# What `watched_counts` records a read of the loop counter as. It matters only
+# to a step that repeats, whose later replays don't run its prepare_inputs or
+# preprocess again; a resident step's tables are a separate question.
+LOOP_COUNTER = "the loop counter"
+
+
+class _WatchedCounts(dict):
+    """A row's loop counters, recording each read (`table_read`)."""
+
+    def __getitem__(self, key):
+        table_read(LOOP_COUNTER)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        table_read(LOOP_COUNTER)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        table_read(LOOP_COUNTER)
+        return super().__contains__(key)
+
+    def __iter__(self):
+        table_read(LOOP_COUNTER)
+        return super().__iter__()
+
+    def items(self):
+        table_read(LOOP_COUNTER)
+        return super().items()
+
+    def values(self):
+        table_read(LOOP_COUNTER)
+        return super().values()
+
+
+def watched_counts(counts: Mapping[str, int]) -> Mapping[str, int]:
+    """``counts`` as a step's code reads them: inside a watch, every read is
+    recorded as `LOOP_COUNTER`. The engine's own reads (an iteration input's
+    cut) take ``counts`` directly."""
+    return counts if _TABLE_READS.get() is None else _WatchedCounts(counts)
+
+
 # What a captured step records: a small kernel apiece. The torch ops for the same
 # work take several times the GPU time, and the replay's launch on the GPU thread.
 
