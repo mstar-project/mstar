@@ -28,15 +28,6 @@ def _failed(source: str, why: str):
     raise RuntimeError(f"Error building extension: mstar_sim: {source}: {why} (no nvcc here)")
 
 
-def _block(text: str, start: int) -> str:
-    """The body of the brace-delimited block opening just before ``start``."""
-    depth, i = 1, start
-    while depth and i < len(text):
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-    return text[start:i - 1]
-
-
 def _defs(source: str) -> list[tuple[str, str]]:
     """``(namespace, schema)`` of each op the source defines."""
     with open(source) as f:
@@ -46,7 +37,11 @@ def _defs(source: str) -> list[tuple[str, str]]:
         ns, lib = block.groups()
         if ns == "TORCH_EXTENSION_NAME":
             _failed(source, "a TORCH_EXTENSION_NAME namespace")
-        body = _block(text, block.end())
+        depth, end = 1, block.end()  # to the brace that closes the block
+        while depth and end < len(text):
+            depth += {"{": 1, "}": -1}.get(text[end], 0)
+            end += 1
+        body = text[block.end():end]
         for call in re.finditer(rf"\b{lib}\s*\.\s*def\s*\(", body):
             literals = _LITERALS.match(body, call.end())
             schema = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', literals.group(1))) if literals else ""
