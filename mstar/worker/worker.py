@@ -4678,19 +4678,22 @@ class Worker:
         an iteration whose token is a stop id routes none of the withheld
         signals (``_withheld_items``); and a replay that emitted a count
         (``EMITTED_COUNT``) routes that many of each, along dim 1."""
-        key = (batch_N.node_name, batch_N.graph_walk)
         width = batch_N.batch.repeats
+        # the step's columns, a replay each, as it ran them: a run on the device
+        # that ended early settled ``width`` to what it ran, down to 1
+        columns = outputs.run_columns
         withhold, withheld = (
             self._withheld_items(batch_N, host_rows, cpu_outputs) if self._withholding else ((), frozenset())
         )
         if not withheld:
             withhold = ()
         emitted = None if host_rows is None else host_rows.buffers.get(EMITTED_COUNT)
-        if width == 1 and not withhold and emitted is None:
+        if not columns and not withhold and emitted is None:
             return
-        signals = set(withhold)
-        if width > 1 or emitted is not None:
-            signals |= engine.run_columns(*key)
+        signals = set(withhold) | columns
+        if emitted is not None:
+            # a step that emits a count splits its outputs, run or not
+            signals |= engine.run_columns(batch_N.node_name, batch_N.graph_walk)
         row_of = {} if emitted is None else {rid: i for i, rid in enumerate(host_rows.request_ids)}
         emitted = None if emitted is None else emitted.reshape(emitted.shape[0], -1).tolist()
         # a spanned output's span per replay, [rows, repeats, 2]
@@ -4714,7 +4717,7 @@ class Worker:
                         continue
                     if copies is None:
                         copies = self._run_copies(column)
-                    replay = run_item(column, i, copies) if width > 1 else column
+                    replay = run_item(column, i, copies) if name in columns else column
                     if name in span_of:
                         start, end = span_of[name][rid][i]
                         if end <= start:

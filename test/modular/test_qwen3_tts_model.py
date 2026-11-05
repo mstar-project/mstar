@@ -1813,7 +1813,8 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
             batch = SimpleNamespace(
                 node_name="Codec", request_ids=rids, inputs=items,
                 per_request_info_wrapped={rid: None for rid in rids}, failed_requests=failures,
-                register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk="codec_chunk"),
+                register_failure=failures.__setitem__,
+                step_context=SimpleNamespace(graph_walk="codec_chunk", repeats=1),
             )
             Engine._postprocess_batch(engine, batch, out)
             assert not failures

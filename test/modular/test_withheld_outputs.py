@@ -177,15 +177,17 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path, stop):
     assert len(route.tensors) == 3
 
 
-def _cut(width, tokens, kept=None, emitted=None, columns=("frame",), spans=None):
+def _cut(width, tokens, kept=None, emitted=None, columns=("frame",), spans=None, asked=None, whole=False):
     """``Worker._cut_run_items`` over two rows whose "frame" holds a column
     per replay (KEEP's values 0.., DROP's 10..) beside each replay's
-    ``tokens``; the frames a row routes."""
+    ``tokens``; the frames a row routes. ``asked``: the columns a run kept,
+    which a run on the device that ended early settled to ``width``."""
+    held = asked or width
     def column(base):
         if emitted is not None:  # two items a replay along dim 1, as many as it emitted real
-            return torch.arange(base, base + width * 2, dtype=torch.float32).reshape(1, width, 2)
-        values = torch.arange(base, base + width, dtype=torch.float32).reshape(1, width, 1)
-        return values if width > 1 else values[:, 0]
+            return torch.arange(base, base + held * 2, dtype=torch.float32).reshape(1, held, 2)
+        values = torch.arange(base, base + held, dtype=torch.float32).reshape(1, held, 1)
+        return values if held > 1 else values[:, 0]
 
     w = Worker.__new__(Worker)
     w._withholding = WITHHOLDING
@@ -194,6 +196,8 @@ def _cut(width, tokens, kept=None, emitted=None, columns=("frame",), spans=None)
         output_spans=None if spans is None else {"frame": torch.tensor(spans)},
         span_request_ids=None if spans is None else (KEEP, DROP),
     )
+    if held > 1:
+        outputs.run_columns = frozenset(columns)
     buffers = {"token": torch.tensor(tokens)}
     if emitted is not None:
         buffers["emitted_count"] = torch.tensor(emitted)
@@ -206,7 +210,7 @@ def _cut(width, tokens, kept=None, emitted=None, columns=("frame",), spans=None)
     engine = SimpleNamespace(run_columns=lambda node, walk: frozenset(columns))
     Worker._cut_run_items(w, pending, outputs, step, HostRows((KEEP, DROP), buffers), None, engine)
     return {
-        rid: [t.reshape(-1)[0].item() for t in outs.get("frame", [])]
+        rid: [t.reshape(-1).tolist() if whole else t.reshape(-1)[0].item() for t in outs.get("frame", [])]
         for rid, outs in outputs.per_rid_outputs.items()
     }
 
@@ -220,6 +224,14 @@ def test_a_run_routes_each_row_its_kept_iterations_less_the_withheld_eos_column(
     assert _cut(3, [[1, 2, 3], [4, 5, 6]], kept={DROP: 2}) == {KEEP: [0, 1, 2], DROP: [10, 11]}
     # one iteration: the stop-token row routes no frame
     assert _cut(1, [[1], [STOP_TOKEN]]) == {KEEP: [0], DROP: []}
+
+
+def test_a_device_run_that_ended_after_one_iteration_routes_one_item_a_row():
+    """A run of 4 that ran 1 (``_settle_run`` settled the step to 1) still holds
+    its columns of 4: each row routes its first, not the whole column (GPU
+    finding 19, Canary's 'Xi Xiiiiiiii')."""
+    assert _cut(1, [[1], [2]], asked=4, whole=True) == {KEEP: [[0]], DROP: [[10]]}
+    assert _cut(2, [[1, 2], [3, 4]], asked=4, whole=True) == {KEEP: [[0], [1]], DROP: [[10], [11]]}
 
 
 def test_a_replay_that_emits_two_items_routes_both():

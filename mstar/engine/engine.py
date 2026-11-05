@@ -2783,10 +2783,11 @@ class Engine:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
         failed = batch.failed_requests
-        walk = batch.graph_walk
-        columns = submodule_mgmt.run_columns.get(walk, frozenset()) if batch.step_context.repeats > 1 else ()
-        # loop-back signals a node may name after a run column (``text_inputs = new_token``)
-        loop_back = [s for s in submodule_mgmt.carries.get(walk, {}) if s not in columns] if columns else ()
+        columns = loop_back = ()
+        if batch.step_context.repeats > 1:
+            columns = submodule_mgmt.run_columns.get(batch.graph_walk, frozenset())
+            # loop-back signals a node may name after a run column (``text_inputs = new_token``)
+            loop_back = [s for s in submodule_mgmt.carries.get(batch.graph_walk, {}) if s not in columns]
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             if failed and rid in failed:
                 # its per-request forward raised: nothing to finish, and a

@@ -123,7 +123,7 @@ def _batch(rids):
         per_request_info_wrapped={rid: None for rid in rids},
         failed_requests=failures,
         register_failure=lambda rid, error: failures.__setitem__(rid, str(error)),
-        step_context=SimpleNamespace(graph_walk="codec_chunk"),
+        step_context=SimpleNamespace(graph_walk="codec_chunk", repeats=1),
     )
 
 
