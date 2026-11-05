@@ -345,8 +345,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        resources can refuse the walk (``Resource.repeat_refusal``): fa3 or cuDNN FlashInfer
        decode, or a sampler without the in-graph scatter. A walk that asks for repeats gets
        tensor-core captured decode wrappers whatever ``decode_tensor_cores`` says; the line
-       says so. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
-       the node while a request with log-probs is live. ``device_stop`` (default ``off``):
+       says so. They can narrow a step to 1 (``Resource.max_repeats``), as for a step with a
+       row that asks for log-probs. ``device_stop`` (default ``off``):
        ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
        ending on the first of: every row done, the run's count, ready work on the worker, a
        new request arriving while it runs, or ``refill_at`` (a share of the run's rows done; default off,
@@ -354,8 +354,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA
-       12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
-       copies alone. ``stream_tokens: true`` sends a run's tokens to the client as its replays
+       12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
+       copies alone, and a node without iteration inputs (not Qwen3-TTS's Talker or a DiT). ``stream_tokens: true`` sends a run's tokens to the client as its replays
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``
        makes ready rows wait for one run: after a step that took rows the next takes none and
        runs at full length, and ready work doesn't end a run early. A new row's first token

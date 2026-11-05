@@ -12,8 +12,8 @@ when the run lands.
 
 torch binds no WHILE node, so ``CudaWhile`` calls the runtime through ctypes, as
 ``kv/page_copier.py`` does; ``cudaGraphSetConditional`` needs a kernel of ours,
-compiled with NVRTC and linked against ``libcudadevrt``. ``run_stop`` is the
-one definition of a run's stop.
+compiled with NVRTC and linked against ``libcudadevrt``. ``run_stop`` is a
+device run's stop rule; a host-launched step's is ``StopPolicy.stops``.
 """
 from __future__ import annotations
 

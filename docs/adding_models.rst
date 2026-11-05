@@ -1663,7 +1663,7 @@ accessor of one, such as ``RopeManager.pos_ids``, calls ``resident.table_read``)
 pool of the node keeps its own block table and lengths; positions read the pool their
 ``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying, for each
 capability, ``on``, ``off: not asked for`` or ``off: <owner>: <reason>``. A resident ``preprocess`` that reads such a buffer on a branch the capture
-didn't take stops the worker, and so does a row that declares other streams than its walk's
+didn't take fails the step's rows, and so does a row that declares other streams than its walk's
 capture: the tables advance every row on the walk's streams. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
@@ -1715,7 +1715,7 @@ for it), and a step that repeats reads a column per replay, so a run of N reads 
 k to k+N-1. ``prepare_inputs`` and ``preprocess`` then never read the loop counter for it,
 and a step that repeats may not read the counter at all: the engine watches
 ``dynamic_loop_iter_counts`` there, refuses a walk whose captured ``preprocess`` reads it at
-load, and stops the worker if a repeating step's ``prepare_inputs`` or ``preprocess`` does.
+load, and fails the step's rows if a repeating step's ``prepare_inputs`` or ``preprocess`` does.
 An input streamed in an item an iteration (a one-item chunk policy) is declared the same
 way with ``streamed=True``: its table is the row's items of that stream for the step, a
 window of as many ready items as the step repeats, and the stream answers how far a run
