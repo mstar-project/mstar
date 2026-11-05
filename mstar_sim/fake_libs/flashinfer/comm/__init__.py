@@ -1,9 +1,11 @@
 """``flashinfer.comm``: the one-kernel all-reduce + residual add + RMSNorm.
 
 ``create_allreduce_fusion_workspace`` builds a workspace on every rank, so
-``mstar.distributed.ar_fusion`` takes its fused path as on a GPU. A fused call
-returns its outputs' shapes and is priced as the NCCL all-reduce of its input
-plus the norm.
+``mstar.distributed.ar_fusion`` takes its fused path as on a GPU. The real
+workspace's ranks talk through its own IPC buffers, not NCCL: here it owns a
+gloo group of its ranks, which a fused call meets on (``mstar_sim.dist``). A
+fused call returns its outputs' shapes and is priced as the NCCL all-reduce of
+its input plus the norm.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import enum
 
 import torch
+import torch.distributed as dist
 
 from mstar_sim import clock
 
@@ -26,11 +29,14 @@ def _missing(name: str):
 
 
 class AllReduceFusionWorkspace:
-    """What a workspace is to its caller: its group's size and limits."""
+    """What a workspace is to its caller: its group's size and limits; and its ranks'
+    channel (``group``)."""
 
-    def __init__(self, backend, world_size: int, rank: int, max_token_num: int, hidden_dim: int, dtype):
+    def __init__(self, backend, world_size: int, rank: int, max_token_num: int, hidden_dim: int, dtype,
+                 group=None):
         self.backend, self.world_size, self.rank = backend, world_size, rank
         self.max_token_num, self.hidden_dim, self.dtype = max_token_num, hidden_dim, dtype
+        self.group = group
 
     def is_buffer_size_sufficient(self, tp_size: int, num_tokens: int, hidden_dim: int, dtype=None,
                                   use_oneshot=None) -> bool:
@@ -40,12 +46,19 @@ class AllReduceFusionWorkspace:
         return num_tokens * hidden_dim * size <= self.max_token_num * self.hidden_dim * ws
 
     def destroy(self) -> None:
-        pass
+        if self.group is not None:
+            dist.destroy_process_group(self.group)
+            self.group = None
 
 
 def create_allreduce_fusion_workspace(backend="auto", world_size=1, rank=0, max_token_num=0, hidden_dim=0,
                                       dtype=torch.bfloat16, comm_backend=None, group=None, **kwargs):
-    return AllReduceFusionWorkspace(backend, world_size, rank, max_token_num, hidden_dim, dtype)
+    """Collective over ``group``'s ranks, as the real one is: their channel is made here."""
+    channel = None
+    if world_size > 1:
+        channel = dist.new_group(dist.get_process_group_ranks(group or dist.group.WORLD), backend="gloo",
+                                 use_local_synchronization=True)
+    return AllReduceFusionWorkspace(backend, world_size, rank, max_token_num, hidden_dim, dtype, channel)
 
 
 def _norm_cost(input, *args, **kwargs):
@@ -62,11 +75,10 @@ def allreduce_fusion(input, workspace, pattern=AllReduceFusionPattern.kARResidua
                      residual_out=None, norm_out=None, output=None, rms_gamma=None, rms_eps=1e-6, **kwargs):
     if pattern not in (AllReduceFusionPattern.kAllReduce, AllReduceFusionPattern.kARResidualRMSNorm):
         _missing(f"allreduce_fusion(pattern={pattern!r})")
-    from mstar_sim import cost
+    from mstar_sim import dist as sim_dist
 
-    if not clock.FAST:
-        clock.charge(cost.collective_seconds("all_reduce", workspace.world_size,
-                                             input.numel() * input.element_size(),
-                                             graph=clock.capturing() is not None))
+    if workspace.world_size > 1:
+        sim_dist.collective("all_reduce", workspace.group, input.numel() * input.element_size(), sim_dist.row(
+            "AllReduceFusion", input.numel(), input.dtype, op=int(pattern), size=workspace.world_size))
     _norm(input, residual_out, norm_out, output)
     return norm_out if norm_out is not None else input

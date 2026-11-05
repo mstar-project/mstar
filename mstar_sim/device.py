@@ -1020,6 +1020,10 @@ def replay(tape: clock.Tape) -> None:
     from mstar_sim import cost
 
     check_fault()
+    if tape.collectives:
+        from mstar_sim import dist
+
+        dist.meet_replay(tape)
     clock.STATS["replays"] += 1
     launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
     total, kernels = 0.0, 0

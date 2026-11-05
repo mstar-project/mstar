@@ -423,7 +423,7 @@ def test_timing_only_holds_shapes_not_values():
         assert never_computed(q._data) and never_computed(k._data)
         kernels.causal_conv1d_update(weight.clone(), state, weight)
         assert never_computed(state._data)
-        ws = types.SimpleNamespace(world_size=2)
+        ws = types.SimpleNamespace(world_size=1)
         comm.allreduce_fusion(weight, ws, residual_in=weight, residual_out=residual, norm_out=normed)
         comm.allreduce_fusion(input=weight, workspace=ws, pattern=comm.AllReduceFusionPattern.kAllReduce, output=summed)
         assert all(never_computed(t._data) for t in (residual, normed, summed)) and not never_computed(weight._data)
@@ -573,9 +573,10 @@ def test_memory_tracking_lock_is_reentrant():
         memory._track_lock.release()
 
 
-def test_tensor_parallel_collectives_are_timed_not_sent():
+def test_tensor_parallel_ranks_meet_at_each_collective():
     """Two ranks ask for NCCL, as mstar does: they get gloo, and an all-reduce of
-    a value-less GPU tensor moves nothing but costs its NCCL time."""
+    a value-less GPU tensor moves nothing but costs its NCCL time. Data moves only
+    if every rank holds it."""
     out = run_sim("""
         import os, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -606,6 +607,11 @@ def test_tensor_parallel_collectives_are_timed_not_sent():
             assert not never_computed(stale._data) and stale.view(-1).tolist() == [0, 1, 2, 3] * 2
             dist.all_gather_into_tensor(torch.empty(1 << 14, device="cuda")[:8], src)
             assert not never_computed(src._data)
+            # an uneven all-to-all held on rank 0 and value-less on rank 1 moves nothing on either
+            sends, receives = [[2048, 2048], [2048, 4096]][r], [2048, [2048, 4096][r]]
+            out = torch.zeros(sum(receives), device="cuda")
+            dist.all_to_all_single(out, torch.ones(sum(sends), device="cuda"), receives, sends)
+            assert never_computed(out._data) if r == 0 else out._data.device.type == "meta"
             # captured, nothing moves, at each replay
             y, graph = torch.zeros(4, device="cuda"), torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -620,6 +626,47 @@ def test_tensor_parallel_collectives_are_timed_not_sent():
             print("ok")
     """)
     assert out.strip().endswith("ok")
+
+
+@pytest.mark.parametrize("case", ["mismatch", "extra_replay", "skip"])
+def test_ranks_whose_collectives_dont_pair_abort(case):
+    """A rank whose collective doesn't pair with its peer's (another primitive, a graph
+    replayed once more on one rank) aborts with both ranks' descriptors; one whose peer
+    never comes aborts at the group's timeout, as NCCL's watchdog does."""
+    out = run_sim(f"""
+        import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
+
+        def rank(r, path):
+            os.dup2(1, 2)
+            dist.init_process_group("nccl", init_method=f"file://{{path}}", rank=r, world_size=2,
+                                    timeout=datetime.timedelta(seconds=5))
+            torch.cuda.set_device(r)
+            x = torch.empty(1 << 14, device="cuda")
+            if "{case}" == "mismatch":
+                dist.all_reduce(x) if r else dist.all_gather_into_tensor(x, x[:1 << 13])
+            elif "{case}" == "extra_replay":
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    dist.all_reduce(x)
+                graph.replay()
+                graph.replay() if r else dist.all_reduce(x)
+            elif r == 0:
+                dist.all_reduce(x)
+            else:
+                time.sleep(7)
+            print(f"rank {{r}} passed", flush=True)
+
+        if __name__ == "__main__":
+            ctx = mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=2, join=False)
+            for p in ctx.processes:
+                p.join()
+            print("exits", [p.exitcode for p in ctx.processes])
+    """)
+    if case == "skip":
+        assert "exits [-6, 0]" in out and "rank 0, call" in out and "met no peer" in out, out
+    else:
+        assert "exits [-6, -6]" in out and "don't pair" in out and "rank 0: " in out and "rank 1: " in out, out
+        assert "passed" not in out, out
 
 
 def test_fast_mode_skips_device_time_but_keeps_host_semantics():

@@ -45,7 +45,7 @@ Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_
 | Autocast | The engine runs forwards under CUDA autocast, which never sees the emulated tensors' payloads; its cast policy is applied by hand, so matmuls run (and are priced) in the autocast dtype. | `device.py` |
 | Weights | Read from safetensors headers only; a model built on the CPU in a worker allocates nothing. | `patches.py` |
 | Kernel stand-ins | A `flashinfer` package, mstar's GDN and causal-conv kernels, Triton launches: each is one priced kernel that returns its outputs' shapes (`clock.kernel_fn`). | `fake_libs/`, `kernels.py`, `triton_launch.py` |
-| Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo; a collective over GPU tensors moves no data and is charged its NCCL time on every rank. | `dist.py` |
+| Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo. Ranks meet at each collective over GPU tensors, as NCCL's do, and a rank whose collective doesn't pair with its peers' (skipped, reordered, another size) aborts, printing every rank's; a captured graph meets once per group at each replay, on its whole collective sequence. Data moves only if every rank holds values; each collective is charged its NCCL time on every rank. | `dist.py` |
 | Bootstrap | A `sitecustomize` the launcher puts on `PYTHONPATH` installs the emulator in every process. | `_site/`, `install.py`, `__main__.py` |
 
 Prior art it follows: SGLang's simulator (real scheduler, predicted forward, fake tokens),
@@ -135,7 +135,15 @@ the roofline.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
   ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
   here are not validated and not accurate (see the top of this file).
-- Collectives assume symmetric ranks (no waiting on the slowest rank).
+- Collective timing assumes symmetric ranks: no rank's device waits on a slower one's.
+- A host blocks at an eager collective's call until its peers come, where a GPU's host only
+  enqueues it. Device times are unchanged, but the host waits for its slowest peer to launch.
+- A skipped eager collective shifts its group's pairing, which shows at the next collective of
+  another shape: between identical ones (per-layer all-reduces outside a graph) it is silent
+  until then, as NCCL's corruption is. Inside a graph, the replay's sequence hash catches it.
+- A peer that never comes aborts an eager collective at the group's timeout (gloo's 30 min, or
+  mstar's `dist_timeout_s` while loading), as NCCL's watchdog does; a replay hangs, as an
+  unwatched one does on a GPU. `kill -USR1` prints the peers' stacks.
 - Nothing checks numerics: a port's wrong math (a transposed weight, a bad mask) still serves.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
   has no stand-in yet")` when called.

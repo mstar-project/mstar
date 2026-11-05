@@ -152,10 +152,13 @@ class Tape:
     cost depends on the values in its arguments, such as attention over the latest
     plan), or None; and the work it does on values the emulator keeps (small tensors, host
     copies to and from them), re-run at each replay, or None. A replay runs the nodes in
-    order, so a cost reads the values the nodes before it left."""
+    order, so a cost reads the values the nodes before it left. ``collectives``: what it
+    launches on other ranks' groups, in order, as ``(group, descriptor)``; each replay meets
+    them on it (:func:`mstar_sim.dist.meet_replay`)."""
 
     nodes: list[tuple[float | Callable[[], float] | None, Callable[[], None] | None]] = field(
         default_factory=list)
+    collectives: list[tuple[object, list[int]]] = field(default_factory=list)
 
 
 def on_replay(effect: Callable[[], None]) -> None:
