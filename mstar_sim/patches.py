@@ -365,7 +365,7 @@ def rust_poll() -> None:
 
     def initialized(self, my_id, *args, **kwargs):
         init(self, my_id, *args, **kwargs)
-        self._inner.register_wakeup_fd(waits.wakefd())
+        self._inner.register_wakeup_fd(waits._wakefd[0])
         waits.TABLE.answer_to(my_id)
 
     def polled(self, timeout_ms):

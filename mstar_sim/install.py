@@ -189,7 +189,9 @@ def _report_at_exit(path: str) -> None:
     that ended in real time because another thread ran, with ``jump_blockers`` the call sites
     that ran; ``late_resumes`` those ended over a millisecond late; ``thread_time_faster`` reads
     of ``time.thread_time`` that ran ahead of the clock (an op that released the GIL inside the
-    emulator); ``run_delay_s`` the emulator's time the box descheduled."""
+    emulator); ``run_delay_s`` the emulator's time the box descheduled; ``ahead_stalls`` the times
+    a thread waited for the deployment's bound; ``settle_overruns`` state changes that broke a
+    settle window; ``meet_skew_s`` the widest gap between ranks' streams at a collective."""
     import atexit
     import json
 
@@ -212,6 +214,8 @@ def _report_at_exit(path: str) -> None:
             **{k: round(v, 3) if isinstance(v, float) else v for k, v in clock.STATS.items()
                if k not in ("replays", "calls")},
             "slept_s": round(waits.REPORT["slept_s"], 3), "late_resumes": waits.REPORT["late_resumes"],
+            "ahead_stalls": waits.REPORT["ahead_stalls"], "settle_overruns": waits.REPORT["settle_overruns"],
+            "meet_skew_s": round(waits.REPORT["meet_skew_s"], 6),
             "jump_blockers": dict(sorted(waits.REPORT["jump_blockers"].items(), key=lambda kv: -kv[1])[:8]),
         }
         with open(path, "a") as f:

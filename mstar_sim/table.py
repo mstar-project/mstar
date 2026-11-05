@@ -31,7 +31,7 @@ import struct
 SLOTS = 64
 NAMES = 8  # communicator ids a process can answer to
 _WORDS = 8 + NAMES + SLOTS  # a slot's 64-bit words
-_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _TAKEN, _PID = range(7)
+_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _TAKEN = range(6)
 _NAME, _SENT = 8, 8 + NAMES
 _HEADER = 8  # words before the first slot: the futex word, then how many slots were ever used
 _SIZE = (_HEADER + SLOTS * _WORDS) * 8
@@ -84,7 +84,6 @@ class Table:
         self._d[self._mine + _NEXT] = math.inf
         self._q[self._mine + _RUNNING] = 1
         self._q[self._mine + _MEET] = 0
-        self._q[self._mine + _PID] = os.getpid()
         for i in range(NAMES):
             self._q[self._mine + _NAME + i] = 0
         for i in range(SLOTS):

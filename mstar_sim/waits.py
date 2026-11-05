@@ -569,8 +569,6 @@ def poked() -> bool:
     return bool(_poked)
 
 
-def wakefd() -> int:
-    return _wakefd[0]
 
 
 # ---------------------------------------------------------------- installation

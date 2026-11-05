@@ -900,7 +900,8 @@ def test_a_native_process_holds_the_deployment_only_while_it_works():
         print(time.perf_counter() - start)
     """)
     worked, real, wall = map(float, owner.split())
-    assert 0.3 <= worked <= real and wall < 0.2 and 0.1 <= float(peer) < 0.2, (worked, real, wall, peer)
+    # (+0.06: its two sleeps, which jump once the child is idle)
+    assert 0.3 <= worked <= real + 0.06 and wall < 0.2 and 0.1 <= float(peer) < 0.2, (worked, real, wall, peer)
 
 
 def test_timing_only_holds_shapes_not_values():

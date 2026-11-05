@@ -144,8 +144,18 @@ the roofline.
 - A thread in a wait the emulator doesn't know (a plain lock, `Thread.join`, a socket) counts as
   running, so its process sleeps for the device instead of jumping: `--report` counts that time
   (`slept_s`) and names the call sites (`jump_blockers`).
-- Each process has its own clock: clients and the API server read real time less their own blocked
-  and emulator time, which isn't the workers' time.
+- Processes agree on one time through a table named by the server's port, so run a client with
+  `python -m mstar_sim -- -m benchmark.runner --url ...` for it to read that time (`MSTAR_SIM_NODE`
+  names the table when no port can be read). They agree only so far. Ranks at a collective stand
+  aside from the bound, and at TP2 workers were measured 1.7 s behind the API server, so don't
+  read client latencies under TP from this clock. The Rust runtime's own sends are counted by
+  neither side, and an unseen channel (HTTP, a pipe) relies on a 200 us settle window that a
+  loaded box overruns: a blocked receiver can be moved past a message on its way.
+- A real run takes longer in wall time than the old clock did: holding processes to one time cost
+  2-9x on a loaded box (TP2 client 37 s to 81 s, Rust frontend client 15 s to 135 s).
+- The Rust frontend reads real time, so its safety timeouts fire on real time. It counts as running
+  while a thread of its own works, sampled at 100 us while a move is pending, so the start of its
+  work can be missed. uvloop's stand-in hasn't been run.
 - `--eager-nodes A,B` runs just those nodes eagerly. Use it for a node whose capture needs a real
   Triton build.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
