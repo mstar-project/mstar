@@ -1,9 +1,13 @@
 """``CommGroup.allreduce_rmsnorm`` on two real ranks: the fused all-reduce +
-norm kernel (rows up to the workspace's ``max_tokens``, eager and replayed from a
-CUDA graph) and its NCCL fallback (past it) both give
-``rms_norm(all_reduce(x))``. Needs two CUDA GPUs and FlashInfer's fused all-reduce."""
+norm kernel (rows up to the workspace's ``max_tokens``, eager and replayed
+from a CUDA graph) and its NCCL fallback (past it) both give
+``rms_norm(all_reduce(x))``. Needs two CUDA GPUs; skips where FlashInfer
+builds no fused workspace."""
 
 from __future__ import annotations
+
+import time
+from datetime import timedelta
 
 import pytest
 import torch
@@ -18,22 +22,39 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN = 2048
 MAX_TOKENS = 2048
+EPS = 1e-6
+# bf16 output of a unit-RMS row: a couple of ulps at its largest values
+TOLERANCE = 0.0625
+# a hung collective fails the test instead of the session
+DEADLINE_S = 600
 
 
-def _reference(x: torch.Tensor, weight: torch.Tensor, eps: float, bias: float) -> torch.Tensor:
+def _reference(x: torch.Tensor, weight: torch.Tensor, bias: float) -> torch.Tensor:
     """NCCL's sum, then the norm in fp32."""
     r = x.clone()
     dist.all_reduce(r)
     v = r.float()
-    v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + EPS)
     return (v * (weight.float() + bias)).to(x.dtype)
 
 
-def _ranks(rank: int, world: int, store: str, out: dict) -> None:
+def _inputs(rows: int, rank: int, seed: int) -> torch.Tensor:
+    g = torch.Generator("cuda").manual_seed(1000 * seed + 10 * rows + rank)
+    return torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
+
+
+def _error(got: torch.Tensor, want: torch.Tensor) -> float:
+    return (got.float() - want.float()).abs().max().item()
+
+
+def _entry(rank: int, world: int, store: str, out: dict) -> None:
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"file://{store}", rank=rank, world_size=world,
-                            device_id=torch.device("cuda", rank))
+    dist.init_process_group(
+        "nccl", init_method=f"file://{store}", rank=rank, world_size=world,
+        timeout=timedelta(seconds=120), device_id=torch.device("cuda", rank),
+    )
     try:
+        # as `init_dist` sets up a TP group
         group = CommGroup(rank, rank, list(range(world)))
         group.device_group = dist.group.WORLD
         group.cpu_group = dist.new_group(backend="gloo")
@@ -42,52 +63,54 @@ def _ranks(rank: int, world: int, store: str, out: dict) -> None:
         fused = group.init_allreduce_fusion(HIDDEN, torch.bfloat16, MAX_TOKENS)
         errors = {}
         for bias in (0.0, 1.0):  # unit weights, and Gemma-style zero-centred ones
-            weight = torch.randn(HIDDEN, device="cuda", generator=torch.Generator("cuda").manual_seed(1)) * 0.1
-            weight = weight + (1.0 - bias)
+            gen = torch.Generator("cuda").manual_seed(1)
+            # the checkpoint's dtype: the fused kernel reads the weight as the input's
+            weight = (torch.randn(HIDDEN, device="cuda", generator=gen) * 0.1 + (1.0 - bias)).to(torch.bfloat16)
             for rows in (1, 7, MAX_TOKENS, MAX_TOKENS + 1):
-                gen = torch.Generator("cuda").manual_seed(100 * rows + rank)
-                x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen)
-                want = _reference(x, weight, 1e-6, bias)
-                got = group.allreduce_rmsnorm(x, weight, 1e-6, bias)
-                if rows > MAX_TOKENS:
-                    # NCCL's fallback, eager only: a captured NCCL call has hung
-                    # this harness's teardown (see #952)
-                    errors[(bias, rows)] = ((got.float() - want.float()).abs().max().item(), 0.0)
-                    continue
-                # captured: the replay reads the static input written after capture
-                static = torch.zeros_like(x)
-                graph = torch.cuda.CUDAGraph()
-                stream = torch.cuda.Stream()
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    group.allreduce_rmsnorm(static, weight, 1e-6, bias)  # warm-up
-                    with torch.cuda.graph(graph, stream=stream):
-                        captured = group.allreduce_rmsnorm(static, weight, 1e-6, bias)
-                torch.cuda.current_stream().wait_stream(stream)
-                static.copy_(x)
-                graph.replay()
-                torch.cuda.synchronize()
-                errors[(bias, rows)] = (
-                    (got.float() - want.float()).abs().max().item(),
-                    (captured.float() - want.float()).abs().max().item(),
-                )
+                x = _inputs(rows, rank, 0)
+                errs = [_error(group.allreduce_rmsnorm(x, weight, EPS, bias), _reference(x, weight, bias))]
+                if rows <= MAX_TOKENS:
+                    # captured, replayed twice on new inputs: the kernel's
+                    # buffers rotate between calls
+                    static = torch.zeros_like(x)
+                    graph = torch.cuda.CUDAGraph()
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        group.allreduce_rmsnorm(static, weight, EPS, bias)  # warm-up
+                        with torch.cuda.graph(graph, stream=stream):
+                            captured = group.allreduce_rmsnorm(static, weight, EPS, bias)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    for seed in (1, 2):
+                        static.copy_(_inputs(rows, rank, seed))
+                        graph.replay()
+                        errs.append(_error(captured, _reference(static, weight, bias)))
+                # past max_tokens NCCL's fallback runs eagerly only: a captured
+                # NCCL call hung an earlier harness's teardown
+                errors[(bias, rows)] = errs
+        torch.cuda.synchronize()
         out[rank] = (fused, errors)
     finally:
         dist.destroy_process_group()
-
-
-def _entry(rank, world, store, out):
-    _ranks(rank, world, store, out)
 
 
 def test_the_fused_norm_matches_nccl_then_norm(tmp_path):
     world = 2
     with mp.Manager() as manager:
         out = manager.dict()
-        mp.spawn(_entry, args=(world, str(tmp_path / "store"), out), nprocs=world)
+        ctx = mp.start_processes(
+            _entry, args=(world, str(tmp_path / "store"), out), nprocs=world, join=False,
+        )
+        deadline = time.monotonic() + DEADLINE_S
+        while not ctx.join(timeout=5):
+            if time.monotonic() > deadline:
+                for p in ctx.processes:
+                    p.kill()
+                pytest.fail(f"the two ranks did not finish within {DEADLINE_S} s")
         results = dict(out)
-    for rank, (fused, errors) in results.items():
-        assert fused, f"rank {rank}: no fused workspace, so only the fallback ran"
-        for (bias, rows), (eager, captured) in errors.items():
-            # bf16 output: one or two ulps of a unit-RMS row
-            assert eager <= 0.0625 and captured <= 0.0625, (rank, bias, rows, eager, captured)
+    assert sorted(results) == [0, 1]
+    if not all(fused for fused, _ in results.values()):
+        pytest.skip("FlashInfer built no fused all-reduce workspace on this box")
+    for rank, (_, errors) in results.items():
+        for (bias, rows), errs in errors.items():
+            assert max(errs) <= TOLERANCE, (rank, bias, rows, errs)
