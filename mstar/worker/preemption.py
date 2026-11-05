@@ -1,5 +1,6 @@
-"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short, made through the
-engine, and the counts the metrics read. The pool keeps every victim, so nothing here outlives a call."""
+"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short or its oldest waiting
+request doesn't fit, made through the engine, and the counts the metrics read. The pool keeps every victim, so nothing
+here outlives a call."""
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING
 from mstar.worker.worker_metrics import PreemptionCounts
 
 if TYPE_CHECKING:
-    from mstar.engine.engine import ExecutingBatch, PagedKVCache
+    from mstar.engine.engine import Engine, ExecutingBatch, PagedKVCache
     from mstar.engine.resources.kv.manager import Victims
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.micro_scheduler import MicroScheduler
@@ -61,23 +62,11 @@ class Preemption:
         returns None."""
         kv = self._caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
-        if kv is None or not (
-            node_name in self._rebuilds.nodes or (kv.cache.supports_eviction and self._keys[node_name] == [kv.key])
-        ):
+        if kv is None or not self._moves(kv, node_name):
             return False
         reason, engine = node_batch.admit_error, self._engine_manager.get_engine(node_name)
-        nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
-
-        def droppable(rid: int) -> bool:
-            held = self._held(rid, nodes)
-            return bool(held) and all(
-                self._rebuild_refusal(rid, node) is None
-                and engine.drop_refusal(node, rid, self._tokens(rid, node)) is None
-                for node in held
-            )
-
         newer = engine.newer_than(reason.request_id)
-        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, droppable)
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, self._droppable(kv, engine))
         if victims is None:
             return False
         if victims.waits:
@@ -85,21 +74,28 @@ class Preemption:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits in the queue for %d pages past its allotment, since moving "
+                "KV short on node=%s walk=%s: %s waits for %d pages past its allotment, since moving "
                 "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
                 node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
                 reason.pages_short,
             )
-        counts = self.counts[node_name]
-        for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
-            record = self._preempted.setdefault(rid, Preempted())
-            record.times += 1
-            counts.victims += 1
-            counts.preempted_again += record.times == 2
-            kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
-            counts.returns_preempted += kept is not None and record.returned_at == len(kept.sampled)
-        self._move(kv, nodes, victims, reason.pages_short)
+        self._move(kv, self.counts[node_name], victims, reason.request_id)
         return True
+
+    def make_room(self) -> None:
+        """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused, as
+        `KVManager.make_room` chooses them. No step of theirs runs short to move them, since none of them runs."""
+        if not self._caches:
+            return
+        engine = self._engine_manager.engine
+        refusal = engine.oldest_refusal()
+        kv = None if refusal is None else self._caches.get(refusal.key)
+        if kv is None or not self._moves(kv, refusal.mark.node_name):
+            return
+        newer = engine.newer_than(refusal.rid)
+        victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
+        if victims is not None:
+            self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` a row of ``rid``'s rebuild on ``node_name`` ran."""
@@ -110,6 +106,25 @@ class Preemption:
 
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)
+
+    def _moves(self, kv: PagedKVCache, node_name: str) -> bool:
+        """Whether the pool moves requests for ``node_name``: the node rebuilds requests here, or the cache has a host
+        pool and is the node's only one."""
+        return node_name in self._rebuilds.nodes or (kv.cache.supports_eviction and self._keys[node_name] == [kv.key])
+
+    def _droppable(self, kv: PagedKVCache, engine: Engine) -> Callable[[int], bool]:
+        """Whether a rebuild can write a request's KV in ``kv`` again on every node that holds it, and its launched
+        steps allow the drop."""
+        nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
+
+        def droppable(rid: int) -> bool:
+            held = self._held(rid, nodes)
+            return bool(held) and all(
+                self._rebuild_refusal(rid, node) is None
+                and engine.drop_refusal(node, rid, self._tokens(rid, node)) is None
+                for node in held
+            )
+        return droppable
 
     def _held(self, rid: int, nodes: list[str]) -> list[str]:
         """The nodes of ``nodes`` where a rebuild can write ``rid``'s KV again: it keeps ids there, or its prompt
@@ -142,20 +157,27 @@ class Preemption:
             raise RuntimeError(f"{self._rid_str(rid)} is in a backlog on {node_name}")
         return self._engine_manager.get_engine(node_name).drop_request(node_name, rid, self._tokens(rid, node_name))
 
-    def _move(self, kv: PagedKVCache, nodes: list[str], victims: Victims, pages_short: int) -> None:
-        """Move each victim to the host, drop it, or ask the node's resources again for one that gave back its
-        allotment, as `KVManager.preempt` decided. A backlogged row goes back to the runtime first, so it doesn't
-        run on pages the move gave up."""
+    def _move(self, kv: PagedKVCache, counts: PreemptionCounts, victims: Victims, owner: int) -> None:
+        """Count each victim in ``counts`` and move it to the host, drop it, or ask the node's resources again for
+        one that gave back its allotment, as ``kv`` decided for ``owner``. A backlogged row goes back to the runtime
+        first, so it doesn't run on pages the move gave up."""
+        nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
         for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
+            record = self._preempted.setdefault(rid, Preempted())
+            record.times += 1
+            counts.victims += 1
+            counts.preempted_again += record.times == 2
+            kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
+            counts.returns_preempted += kept is not None and record.returned_at == len(kept.sampled)
             self._scheduler.return_backlogged(rid)
         for rid in victims.to_host:
             for node_name in kv.nodes:
                 freed = self._engine_manager.get_engine(node_name).offload_request(node_name, rid)
                 self._log(
                     self._moves_logged, node_name,
-                    "KV short on node=%s: moved %s to the host, %d pages freed for a shortage of %d, "
+                    "KV short on node=%s: moved %s to the host, %d pages freed for %s, "
                     "preempted %d times (%d earlier moves not logged)",
-                    node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
+                    node_name, self._rid_str(rid), freed, self._rid_str(owner), self._preempted[rid].times,
                 )
         for rid in victims.to_drop:
             for node_name in self._held(rid, nodes):
@@ -163,16 +185,16 @@ class Preemption:
                 self.counts[node_name].drops += 1
                 self._log(
                     self._moves_logged, node_name,
-                    "KV short on node=%s: dropped %s, %d pages freed for a shortage of %d, "
+                    "KV short on node=%s: dropped %s, %d pages freed for %s, "
                     "preempted %d times (%d earlier moves not logged)",
-                    node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
+                    node_name, self._rid_str(rid), freed, self._rid_str(owner), self._preempted[rid].times,
                 )
         for rid in victims.to_ask:
             for node_name in kv.nodes:
                 self._engine_manager.get_engine(node_name).readmit_request(node_name, rid)
                 self._log(
                     self._moves_logged, node_name,
-                    "KV short on node=%s: %s, holding no page of its own, gave back its allotment for a shortage of "
-                    "%d, preempted %d times (%d earlier moves not logged)",
-                    node_name, self._rid_str(rid), pages_short, self._preempted[rid].times,
+                    "KV short on node=%s: %s, holding no page of its own, gave back its allotment for %s, "
+                    "preempted %d times (%d earlier moves not logged)",
+                    node_name, self._rid_str(rid), self._rid_str(owner), self._preempted[rid].times,
                 )

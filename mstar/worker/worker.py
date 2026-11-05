@@ -5356,6 +5356,7 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
+                self._preemption.make_room()
                 laps.lap("teardown")
 
                 # 1. CPU preamble — overlaps with GPU(N).
