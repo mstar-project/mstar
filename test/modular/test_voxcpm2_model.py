@@ -1382,7 +1382,7 @@ def _wav_bytes() -> bytes:
 def media_dirs(tmp_path):
     """An upload dir holding a stored clip, and a server-only clip beside it (#411)."""
     uploads, secret = tmp_path / "uploads", tmp_path / "secret"
-    uploads.mkdir()
+    uploads.mkdir(mode=0o700)
     secret.mkdir()
     (uploads / "stored.wav").write_bytes(_wav_bytes())
     (secret / "voice.wav").write_bytes(_wav_bytes())
