@@ -24,6 +24,7 @@ from test_kv_admission import _remove, _runner
 from test_kv_prefix_layout_lease import IMAGE, IMAGE_WALK, RID, TAIL, TEXT, TEXT_WALK
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
+from test_kv_release import _window_manager
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -417,6 +418,25 @@ def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_pro
     kv.drop("v", 2 * PAGE_SIZE)
 
     assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
+
+
+def test_a_request_dropped_on_a_pool_that_keeps_a_window_returns_with_its_window_pages_too():
+    """A drop counted the first group's pages alone, where a return from the host counts every group's, so a request
+    whose window held pages returned with too few and ran short again once its rebuild wrote them."""
+    kv = _window_manager()
+    kv.local_loops = {"decode"}
+    page = kv.config.tokens_per_page
+    layout = StreamLayout(spans=(PrefixSpan(2 * page, 2 * page, WALK),), growth=(("decode", 1),))
+    _runner(kv).ingest_request("r", {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 4 * page})}, 0)
+    assert _ready(kv, "r") and _step(kv, "r", 2 * page).ok
+    for _ in range(2 * page):
+        assert _step(kv, "r", 1).ok
+    window = len(kv._streams["r"]["main"].later[0].page_indices)
+
+    kv.drop("r", kv._laid_out_tokens("r"))
+
+    # the first group's 5 pages of history, with the sample its next step writes, and a page more
+    assert window and kv._dropped["r"].returns == window + 6, "r would return without room for its window's pages"
 
 
 @pytest.mark.usefixtures("backend")
