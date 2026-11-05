@@ -374,6 +374,99 @@ def test_a_forward_that_raised_fails_its_rows_and_the_loop_goes_on(monkeypatch, 
     assert rec.ran == ([[0]] if head else [[0], [1]])
 
 
+@pytest.mark.parametrize("raise_at", ["threading", "clearing N's flag", "settling"])
+def test_a_leader_that_drops_a_step_after_its_head_went_out_stops(monkeypatch, raise_at):
+    """Head 1 went out during step 0, step 0 ran clean, and something on the
+    leader alone raises before step 1 is submitted. The follower runs step 1,
+    so the leader can't drop it and go on: its next step would wait on a rank
+    that waits on step 1's collectives (#1171's live test). It stops."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+    if raise_at == "threading":
+        w._thread_outputs_to_speculative = _raises
+    else:
+        w._thread_outputs_to_speculative = lambda *a: None
+    if raise_at == "clearing N's flag":
+        w._clear_in_flight_flag = _raises_once()
+    if raise_at == "settling":
+        w._settle_speculation = _raises
+    with pytest.raises(SystemExit, match="seq 1"):
+        w.run()
+    assert rec.ran == [[0]]
+
+
+def test_a_leader_that_drops_a_step_it_broadcast_on_the_serial_path_stops(monkeypatch):
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = lambda *a: (None, None)
+    w._submit_step = _raises
+    with pytest.raises(SystemExit, match="seq 0"):
+        w.run()
+
+
+@pytest.mark.parametrize("raise_in", ["post-processing", "clearing N's flag", "voiding the head"])
+def test_a_leader_goes_on_after_a_raise_past_a_head_every_rank_voided(monkeypatch, raise_in):
+    """Step 0 failed, so no rank runs head 1, and a raise that follows, even
+    while the leader is still dropping the head, costs step 0's rows alone."""
+    w, sched, state, rec = _tp_loop(monkeypatch, forward_raises={0})
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+    if raise_in == "post-processing":
+        w._finish_step = _raises
+    elif raise_in == "clearing N's flag":
+        w._clear_in_flight_flag = _raises_once()
+    else:
+        w._settle_speculation = _raises
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
+
+
+def test_a_leader_goes_on_after_a_raise_past_a_head_whose_rows_every_rank_dropped(monkeypatch):
+    """Every row of head 1 was dropped on every rank, as a request's last step
+    routinely does, so nothing runs: the raise that follows costs step 0 only."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+
+    def thread(speculation, outputs):
+        for rid in list(speculation.scheduled_batch.request_to_worker_graph):
+            speculation.scheduled_batch.discard_rid(rid)
+
+    w._thread_outputs_to_speculative = thread
+    w._finish_step = _raises
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
+
+
+def test_a_leader_goes_on_after_a_raise_past_a_step_it_submitted(monkeypatch):
+    """Step 0 runs on every rank, so a raise after its submit drops nothing the
+    followers run: they get its marker instead."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = lambda *a: (None, None)
+    hold = w._hold_rows
+
+    def hold_raising_once(lane, rids):
+        hold(lane, rids)
+        if rids and not rec.errors:
+            raise RuntimeError("boom")
+
+    w._hold_rows = hold_raising_once
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"] and rec.markers == [0]
+
+
+def test_a_followers_own_raise_does_not_stop_it(monkeypatch):
+    """Only a leader knows the step it dropped was broadcast. A follower stays
+    on the handler's path, however its step was taken."""
+    w, sched, state, rec = _tp_loop(monkeypatch, follower=True)
+    w._build_speculation = _builds_step_1(w, sched, state)
+    w._settle_speculation = _raises
+    w._close_tp_follow_step = lambda pending: None
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
+
+
 # ------------------------------------------------------------- registration
 
 def test_nospec_marker_is_recorded_and_never_queued():
