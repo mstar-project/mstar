@@ -57,6 +57,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     StackingMethod,
+    StopPolicy,
 )
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -1917,6 +1918,13 @@ class LLMSubmodule(ARNodeSubmodule):
             outputs.pop("new_token")
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        # a denoise step samples no token: its loop ends at its own cap, which
+        # check_stop agrees with (it stops nothing without a new_token)
+        if graph_walk in DENOISE_WALKS:
+            return {}
+        return super().get_stop_policies(graph_walk)
 
     def check_stop(
         self, request_id: str,

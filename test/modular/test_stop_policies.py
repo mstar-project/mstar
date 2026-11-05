@@ -147,3 +147,18 @@ def test_the_omni_talker_carries_its_codec_embedding_into_the_input_its_preproce
     pair = sub.repeat_carry("talker_decode", {"talker_input_embeds"})["talker_input_embeds"]
     assert pair.output == "talker_input_embeds"
     assert torch.equal(sub.preprocess("talker_decode", None, [row])[pair.input], row.input_embeds)
+
+
+def test_a_bagel_denoise_walk_stops_by_its_count_where_the_runtime_checks_it():
+    """A denoise step samples no token, so its loop ends at its cap; declaring
+    that lets the runtime check the stop, which a step that repeats needs."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.bagel.submodules import DENOISE_WALKS, LLMSubmodule
+
+    llm = LLMSubmodule.__new__(LLMSubmodule)
+    for walk in DENOISE_WALKS:
+        assert llm.get_stop_policies(walk) == {}
+        assert llm.check_stop("r", SimpleNamespace(graph_walk=walk), {"latents": [torch.zeros(1)]}) == set()
