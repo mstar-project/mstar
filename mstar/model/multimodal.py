@@ -184,7 +184,8 @@ def prefill_plan(
 
 
 def span_name(name: str, index: int) -> str:
-    """The signal that carries entry ``index`` of a prompt's ``name`` list on its own (see `split_spans`)."""
+    """The signal that carries slot ``index`` of a prompt's ``name`` list on its own: an
+    entry (`split_spans`), or Qwen3-Omni's Thinker step, which holds zero to two."""
     return f"{name}.{index}"
 
 

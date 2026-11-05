@@ -1868,8 +1868,10 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.
+the prefill) still brings it routed, and that read puts it over the slot's.
+``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
+and a node on it that reads the routed token sets ``device_loopback = None``; Whisper
+declares its own.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are

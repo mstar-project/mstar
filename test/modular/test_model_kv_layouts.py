@@ -457,6 +457,9 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
     assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
     assert span.walk in model.get_graph_walk_graphs()
+    # the layout's walk is the one the request runs
+    signals = {k: list(v) for k, v in out.new_input_tensors.items()}
+    assert model.walk_plan("main", ["text", "audio"], ["text"], signals, out.metadata)[0].walk == span.walk
     # every prompt carries the clip: no text walk, mixed step or prefix keys
     assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
     assert model.kv_labels()[KV_CACHE]["main"].keys is None
@@ -557,6 +560,32 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     if extrinsics:
         model.config.ac_predictor.use_extrinsics = True
     return model
+
+
+@pytest.mark.parametrize("kind", ["masked", "ac"])
+def test_vjepa2_s_plan_is_the_routed_walk_and_needs_the_video(kind):
+    from mstar.graph.base import TensorPointerInfo
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    m = _vjepa2(kind)
+    frames = {"video_frames": [TensorPointerInfo(
+        dims=[1], dtype="float32", nbytes=0, address=0, stride=[], uuid=0, source_session_id="", source_entity="",
+    )]}
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {"rollout_horizon": 4})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO and step.step_metadata == {"video_shape": (1,)} and not step.bind
+    # every walk starts at the encoder: without frames the request could never finish
+    with pytest.raises(ValueError, match="video_frames"):
+        m.walk_plan("default", ["video"], ["video"], {}, {})
+
+
+@pytest.mark.parametrize("horizon", [2, 5, 10_000])
+def test_vjepa2_s_cap_alone_ends_the_rollout_at_its_horizon(horizon):
+    """No stop check ends the rollout, so its cap is every frame a request gets."""
+    model = _vjepa2()
+    caps = model.get_loop_caps(rollout_horizon=horizon)
+    assert caps[model.ROLLOUT_LOOP_NAME] == min(horizon, model.config.max_rollout_horizon)
 
 
 @pytest.mark.parametrize("extrinsics", [False, True])

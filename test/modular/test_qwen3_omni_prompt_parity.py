@@ -162,9 +162,11 @@ def _new_text_inputs(model, prompt, input_modalities, prompt_parts=None):
     tensors = model.process_prompt(
         prompt, input_modalities, ["text"], prompt_parts=prompt_parts,
     ).new_input_tensors
-    spans = []
-    while f"text_inputs.{len(spans)}" in tensors:
-        spans += tensors[f"text_inputs.{len(spans)}"]
+    # one signal per Thinker step, and a step may hold no text
+    spans, k = [], 0
+    while (name := f"text_inputs.{k}") in tensors:
+        spans += tensors[name]
+        k += 1
     return spans
 
 

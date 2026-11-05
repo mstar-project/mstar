@@ -23,7 +23,7 @@ class CanaryQwenLLMSubmodule(SampledTokenDecoder):
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [16]
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
-    reads_device_loopback = False
+    device_loopback = None
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

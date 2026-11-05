@@ -694,7 +694,7 @@ Worker scheduling
        Qwen3-ASR and Whisper, which also keeps its timestamp rule state in
        the sampler's declared loop-back state; the other
        ``SampledTokenDecoder`` nodes turn it off with
-       ``reads_device_loopback = False``) and only when the sampler has graph
+       ``device_loopback = None``) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
        node that takes its tokens on the host does not pay the eager-step
        master write. ``0`` keeps every node on the per-request tensor path.

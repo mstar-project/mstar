@@ -43,6 +43,7 @@ The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and
 its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
+import functools
 import os
 from collections.abc import Mapping, Sequence
 from time import perf_counter
@@ -82,11 +83,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # the text-only prompt's walk; a model whose own graph names it otherwise
     # sets this
     PREFILL_WALK = PREFILL_TEXT
-    # the decode walk reads its input ids off the sampler's slot masters
-    # (`device_loopback`); a model that reads them off the routed token sets
-    # this False
-    reads_device_loopback = True
-
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size); a longer step prefills eagerly. Static buffers are
     # sized by the largest bucket. `prefill_token_buckets` replaces it per
@@ -160,10 +156,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
             runtime_check=True,
         )
-        if self.reads_device_loopback:
-            self.device_loopback = DeviceLoopback(
-                walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
-            )
+
+    @functools.cached_property
+    def device_loopback(self) -> DeviceLoopback | None:
+        """The decode walk reads its input ids off the sampler's slot masters;
+        a model that reads them off the routed token sets this None."""
+        return DeviceLoopback(
+            walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
+        )
 
     # ------------------------------------------------------------------
     # What a model declares

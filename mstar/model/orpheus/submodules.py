@@ -33,7 +33,7 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     # The decode step also streams its token to SNAC, so its outputs never all
     # stay on the device, which the loop-back needs: the sampler keeps no slot
     # masters for it.
-    reads_device_loopback = False
+    device_loopback = None
     # A prompt is a voice and its text, so the ladder stops at 1024: a longer
     # step runs eagerly rather than every capture being sized for 8192.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]

@@ -53,7 +53,7 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
-    reads_device_loopback = False
+    device_loopback = None
     _capture_block_warned = False
 
     def __init__(self, language_model: torch.nn.Module, config):

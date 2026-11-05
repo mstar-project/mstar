@@ -930,7 +930,7 @@ class Qwen3TTSModel(Model):
     ) -> list[WalkStep]:
         """Talker prefills (a request with a reference clip takes the clone
         prefill, whose RefEncoder runs first), then decodes. Codec has no API
-        inputs: it runs its chunk walk whenever the stream has a window ready.
+        inputs: it runs its chunk walk whenever the stream has a chunk ready.
         """
         if partition_name == "Talker":
             clone = "audio" in input_modalities

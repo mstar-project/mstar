@@ -319,7 +319,7 @@ def test_conductor_walks_a_request_through_its_phases(kwargs, walks, cfg_paralle
     first fed the previous one's persisted latents and time_index on every
     node that reads them, and the request ends after the decode. On one node
     the window is a walk of its own too, so its branch count is fixed."""
-    from test_ingest_unpersist import plan_step
+    from test_ingest_unpersist import plan_step, released_by_step
 
     if not cfg_parallel:
         walks = [walk.replace("_cfg", "_guided") for walk in walks]
@@ -333,6 +333,10 @@ def test_conductor_walks_a_request_through_its_phases(kwargs, walks, cfg_paralle
         fed = {(edge.next_node, edge.name): [info.uuid for info in edge.tensor_info]
                for edge in plan_step(model, plan, k, persist).inputs}
         expected = [] if not seen else [100 * len(seen) + i for i in range(2)]
+        # what a phase is fed goes with it
+        assert {u for uuids in fed.values() for u in uuids} <= {
+            info.uuid for info in released_by_step(model, plan, k, persist)
+        }
         if walk == IMAGE_DECODE:
             assert fed == {("vae_decoder", "latents"): expected[:1]}
         else:

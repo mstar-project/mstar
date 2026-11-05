@@ -100,11 +100,11 @@ class MediaIntake:
 
 class MediaPrompt(NamedTuple):
     """A prompt after intake: its ids with each placeholder expanded, every
-    encoder's inputs in prompt order, and the runs' patch grids by pad."""
+    encoder's inputs in prompt order, and the runs' grids by pad."""
 
     pads: MediaPads
     inputs: NameToTensorList
-    grids: dict[int, list[torch.Tensor]]
+    grids: dict[int, list[Sequence[int]]]
 
 
 class MultimodalDecoderModel(Model):

@@ -28,7 +28,7 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
     # reads its ids from the routed token and emits a tensor a request; the
     # device loop-back is a measured change of its own
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-    reads_device_loopback = False
+    device_loopback = None
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

@@ -234,6 +234,5 @@ class HiggsAudioLLMSubmodule(SampledTokenDecoder):
         # max-autotune until the default compile level (mstar serve -O) is measured on this model
         return "max-autotune-no-cudagraphs"
 
-
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

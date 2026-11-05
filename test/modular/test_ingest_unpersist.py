@@ -177,6 +177,15 @@ def plan_step(model, plan, k, signals) -> ForwardPassArgs:
     return c._plan_step(SimpleNamespace(persist_signals=signals), PartitionState("p", plan=list(plan)), k)
 
 
+def released_by_step(model, plan, k, signals) -> list[TensorPointerInfo]:
+    """What the conductor releases as a request's step ``plan[k]`` goes out, by
+    its own `_consumed`."""
+    c = Conductor.__new__(Conductor)
+    c._walk_inputs, c._walk_persists, _ = _walk_io(model)
+    state = PartitionState("p", plan=list(plan), cursor=k)
+    return c._consumed(SimpleNamespace(persist_signals=signals, partition_states={"p": state}), ["p"])
+
+
 def _decoder_walks(prefills=("prefill",)):
     """Prefill walks that persist the sampled token, and a decode loop."""
     walks = {walk: GraphNode(name="llm", input_names=["text_inputs", *extra], outputs=[
