@@ -113,7 +113,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, moves or drops the request itself, or makes it wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 
@@ -141,15 +141,17 @@ Say request R's grant is short by `pages_short` pages, one for a decode row. A r
 Then:
 
 1. If the victims free enough, `preempt` earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
-2. Otherwise, if an older request that asks again (§2) waits, the room R's move frees lets it in, and R can move to the host or be dropped, R gives up its pages, and the older request takes that room as R's move lands (§3.3).
-3. Otherwise, R keeps its reservation and its pages, and asks the pool for every page its grant needed past it. It waits, parked as a new prompt is, until the room covers them.
+2. Otherwise, R keeps its reservation and its pages, and asks the pool for every page its grant needed past it. It waits, parked as a new prompt is, until the room covers them.
+
+A waiting request chooses victims too. Once each step's admit has settled, the worker takes the oldest waiting request a pool has refused, whether a new prompt, a request that asks again or one waiting for its shortage, and the pool chooses its victims among the newer requests that wait holding pages, newest first, as for a short grant (`KVManager.make_room`). It takes the room their moves free as they land (§3.3).
 
 The choice is one `KVManager.preempt` call under the pool's lock.
 
 Why this shape:
 
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
-- **R moves itself only for an older request.** Moving whenever nothing newer covered its shortage, R came straight back into the room it freed and ran short again, since nothing older wanted that room. Waiting, it gets its pages once a newer request moves itself for it or a request finishes. A newer request whose rebuild hasn't landed doesn't change this, since R would re-prefill its history for room only newer requests take.
+- **A waiting request moves newer ones that wait holding pages.** A rule decided only when a request runs short can't see an older request that asks later, as one held in an encoder does. The newer request that waited first holds the pages it needs and runs no step that could run short, so both waited for good. R moving itself whenever nothing newer covered its shortage avoided that, but R came straight back into the room it freed and ran short again.
+- **Only requests that wait are moved for one.** A running request is never moved for a waiting one, so prompts still start in arrival order whenever they fit and requests that ask again are tried first. A new prompt is usually the newest request, so it rarely has anyone to move. A waiting request runs no step, so moving it once the admit has settled races nothing.
 - **A waiting request waits for its whole shortage.** It is measured again only when the room grows, and let go only once the room covers its whole shortage.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
@@ -168,7 +170,7 @@ The room R's grant counted joins R's reservation at once. As each victim's move 
 
 Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
 
-When R moves itself for an older request W that asks again, the earmark is W's, with R as its victim. W takes the room as R's move lands, if it covers all W asks for, so R, which asks again at once, can't take it back first.
+When a waiting request W chooses victims, the earmark is W's. W takes the room as its victims' moves land, once that covers all W asks for, so a victim, which asks again at once, can't take it back first.
 
 Lifecycle:
 
@@ -304,18 +306,16 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 A guaranteed request reserves its whole footprint and is never preempted, so it finishes.
 
-Take the oldest preemptible request that holds pages, O:
+Take the oldest preemptible request O that holds pages or waits:
 
-1. No request chooses O as a victim, since a victim is newer than the request that runs short, and every older request holds no page, so runs no step. O moves itself only to let an older waiting request in, which then holds pages and takes O's place in the argument.
-2. When O runs short, newer requests move to the host or are dropped first. When their moves can't cover the shortage, O waits, holding its pages.
-3. A newer request that then runs short with nothing newer to move moves itself once that lets O in, and O takes that room as the move lands. With O and one other request holding pages, that move always lets O in: it frees every page O doesn't hold, and O's footprint fits the pool. So two requests that hold pages can't wait on each other for good.
-4. O's footprint fits the pool, so O finishes.
+1. No request chooses O as a victim, since a victim is newer than the request it is chosen for.
+2. When O runs short, newer requests move to the host or are dropped first. When their moves can't cover the shortage, O waits.
+3. While O waits, every other request that holds pages is newer. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. O's footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.
+4. So O runs again each time it waits, and each time it has grown by at least a page. Its footprint fits the pool, so it finishes.
 
-The next oldest request then takes its place in the argument. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
+The next oldest request then takes its place in the argument. Two requests that hold pages and wait can't wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
 
 For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
-
-> Note: step 3 needs one move to cover O's shortage. When three or more requests each run short by several pages in one step, and none holds enough pages of its own to cover an older one's shortage, all of them wait: three requests holding 4, 3 and 3 pages of a 10-page pool, each 4 pages short, never run again. Moving whenever nothing newer covered the shortage avoided this. Covering it here would take a waiting request keeping what each move frees for it until its shortage is met.
 
 ---
 
