@@ -586,8 +586,8 @@ class BagelModel(Model):
         layout a single user turn could express renders to the string that
         template gave. Generation leaves attachments outside the turn — the
         prefill_vae/vit walks put the input image ahead of the prompt — and
-        wraps what follows. Images with no text never reach this: see
-        :func:`uses_role_turns`.
+        wraps what follows. An understanding request with no text part never
+        reaches this: see :func:`uses_role_turns`.
         """
         if is_understanding:
             blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
