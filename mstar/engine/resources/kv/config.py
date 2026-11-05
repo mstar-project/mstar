@@ -765,6 +765,12 @@ class KVStep(ResourceStep):
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)
+    # (request_id, label) -> tokens this commit adds beyond the segment's span:
+    # positive reserves room past it (admit sizes the pages for it too),
+    # negative gives back tokens an earlier commit over-counted. Speculative
+    # decoding commits the most a verify step could keep and settles the
+    # difference here once the host has learned it.
+    commit_adjust: Mapping[tuple[str, str], int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, kw_only=True)
