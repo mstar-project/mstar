@@ -2129,13 +2129,9 @@ class Engine:
     def _add_resource_host_rows(
         submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput, repeats: int,
     ) -> None:
-        """Adds ``Resource.step_host_rows`` to the step's stop buffers. Not to a
-        step that repeats: no row of it wants any, or it would have settled at 1,
-        so rows offered now are for a request that arrived after it settled."""
-        if repeats > 1:
-            return
+        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
         for key, resource in submodule_mgmt.resources.items():
-            if not (rows := resource.step_host_rows()):
+            if not (rows := resource.step_host_rows(repeats)):
                 continue
             if out.check_stop_buffers is None:
                 raise RuntimeError(
@@ -2722,6 +2718,20 @@ class Engine:
                 submodule.record_tokens(
                     walk, {rid: tokens[row_of[rid]] for rid in wanted}, batch.per_request_info_wrapped,
                 )
+
+    def ask_stop_odds(self, node_name: str, graph_walk: str) -> str | None:
+        """Before capture: have the sampler of ``graph_walk``'s token stop
+        score its stop ids each sample; why it can't, or None."""
+        policy = next(
+            (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
+        )
+        if policy is None or not policy.eos_tokens:
+            return "node: its stop reads no token"
+        sampler = self._submodules[node_name].resources.get(policy.sampler)
+        if not hasattr(sampler, "ask_stop_odds"):
+            return "node: its stop names no sampler"
+        sampler.ask_stop_odds(policy.eos_tokens)
+        return None
 
     def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
         """The node's declared stop policies on ``graph_walk``

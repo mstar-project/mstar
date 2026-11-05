@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 # The sampler's ``step_host_rows`` entry: each row's sampled-token log-prob,
 # NaN in a row that did not ask for one.
 SAMPLED_LOGPROB = "sampled_logprob"
+# Its entry while a walk asks for EOS odds (``step_repeats: eos_odds``): each
+# row's probability, at temperature 1, that it sampled one of its stop ids.
+STOP_ODDS = "stop_odds"
 
 
 # knob -> (rule text, predicate); the one copy, also applied at the API by normalize_generation_kwargs

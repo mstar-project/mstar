@@ -59,6 +59,9 @@ class RepeatConfig:
     past_cap: bool = False
     # pick each walk's run length under max from measured times (``AutoRepeats``)
     auto: bool = False
+    # a run's last iteration gave a row this probability of a stop id or more:
+    # the next run is no longer than the iterations that stop takes on average
+    eos_odds: float | None = None
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -87,6 +90,8 @@ class RepeatConfig:
             raise ValueError(
                 f"step_repeats for {node!r}: ready_waits is {config.ready_waits!r}; it must be true or at least 1"
             )
+        if config.eos_odds is not None and not (type(config.eos_odds) in (int, float) and 0 < config.eos_odds < 1):
+            raise ValueError(f"step_repeats for {node!r}: eos_odds is {config.eos_odds!r}; it must be in (0, 1)")
         for name in ("stream_tokens", "past_cap", "auto") + (
             ("ready_waits",) if type(config.ready_waits) is not int else ()
         ):
@@ -197,6 +202,8 @@ class StepRepeats:
         self._walks: set[tuple[str, str]] = set()
         # (node, walk) -> its run length, for a node whose config asks for auto
         self.auto: dict[tuple[str, str], AutoRepeats] = {}
+        # (node, walk) -> the next run's length, after a run whose stop odds passed eos_odds
+        self._odds_caps: dict[tuple[str, str], int] = {}
 
     def limit(self, node: str) -> int:
         config = self._configs.get(node)
@@ -269,6 +276,16 @@ class StepRepeats:
         once, so a step narrowed to 1 can't keep them out."""
         return self.config(node).ready_waits and ctx.repeats == 1 and not ctx.owed_run
 
+    def observe_odds(self, key: tuple[str, str], odds: float) -> None:
+        """A run landed with ``odds``, its rows' highest probability of a stop
+        id at its last iteration. Past the node's ``eos_odds``, the next run
+        is cut to the iterations such a stop takes on average, ``1 / odds``."""
+        threshold = self.config(key[0]).eos_odds
+        if threshold is not None and odds > threshold:
+            self._odds_caps[key] = max(1, int(1 / odds))
+        else:
+            self._odds_caps.pop(key, None)
+
     def owed_length(self, node: str) -> int:
         """The most iterations the run ready rows wait for may take."""
         waits = self.config(node).ready_waits
@@ -286,8 +303,10 @@ class StepRepeats:
             return 1
         if (batch.node_name, batch.graph_walk) not in self._walks:
             return 1
-        auto = self.auto.get((batch.node_name, batch.graph_walk))
+        key = (batch.node_name, batch.graph_walk)
+        auto = self.auto.get(key)
         limit = self.limit(batch.node_name) if auto is None else auto.n
+        limit = min(limit, self._odds_caps.get(key, limit))
         return max(1, min(limit, loop_room()))
 
 

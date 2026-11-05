@@ -9,6 +9,7 @@ from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, 
 from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
+    STOP_ODDS,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
@@ -116,6 +117,11 @@ class SamplerResource(Resource):
         self._cg_buffers: SamplerBuffers | None = None
         self._cg_max_bs = 0
         self._cg_slots = 1
+        # ``ask_stop_odds``: the stop ids, the rows a capture writes, and an
+        # eager step's own rows
+        self._odds_ids: torch.Tensor | None = None
+        self._odds: torch.Tensor | None = None
+        self._odds_eager: torch.Tensor | None = None
 
         # This is set during plan in the cuda graph case
         self._cg_sampler: AcceleratorGraphableSampler | None = None
@@ -179,6 +185,9 @@ class SamplerResource(Resource):
             return
         self._cg_max_bs = max(max_bs, self._cg_max_bs)
         self._cg_slots = max(cg_slots, self._cg_slots)
+        if self._odds_ids is not None:
+            # before any capture: every one writes these rows
+            self._odds = torch.zeros(self._cg_max_bs, dtype=torch.float32, device=self._device)
         self._cg_buffers = SamplerBuffers.allocate(
             max_batch_size=self._cg_max_bs, device=self._device,
             tp_group=self._comm_group,
@@ -653,6 +662,8 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
+        if self._odds_ids is not None:
+            self._score_stops(logits)
         if self._enable_logprobs:
             # under capture this fires once, at capture; a replay never calls in
             if self._sampled_this_step:
@@ -688,14 +699,35 @@ class SamplerResource(Resource):
             )
         return tokens
 
-    def step_host_rows(self) -> dict[str, torch.Tensor]:
-        """The step's log-prob rows. They assume one ``sample`` per step whose
-        token is the row's emitted one, which ``sample`` enforces while
-        log-probs are on; a node that samples more than once (a code
-        predictor) needs its own path."""
-        if not self._logprob_rids:
-            return {}
+    def ask_stop_odds(self, stop_ids) -> None:
+        """Before capture: score each row's stop ids at every sample (``STOP_ODDS``)."""
+        self._odds_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=self._device)
+
+    def _score_stops(self, logits: torch.Tensor) -> None:
+        """Each row's probability of its stop ids, off the raw logits, so a
+        greedy request has one too; into the rows a capture writes."""
+        logits = logits.float()
+        odds = (logits.index_select(-1, self._odds_ids) - logits.logsumexp(-1, keepdim=True)).exp().sum(-1)
+        rows = odds.shape[0]
+        if self._odds is not None and rows <= self._odds.shape[0]:
+            self._odds[:rows].copy_(odds)
+            self._odds_eager = None
+        else:
+            self._odds_eager = odds
+
+    def step_host_rows(self, repeats: int = 1) -> dict[str, torch.Tensor]:
+        """The step's log-prob rows, and its stop odds where asked. The
+        log-probs assume one ``sample`` per step whose token is the row's
+        emitted one, which ``sample`` enforces while log-probs are on; a node
+        that samples more than once (a code predictor) needs its own path. A
+        step that repeats has none: no row of it asked, or it would have
+        settled at 1. Its odds are its last iteration's."""
+        out = {}
+        if self._odds_ids is not None:
+            out[STOP_ODDS] = self._odds_eager if self._odds_eager is not None else self._odds
+        if not self._logprob_rids or repeats > 1:
+            return out
         # a replay never calls `sample`: its rows are the slot's static ones
         rows = self._cg_sampler.logprob_buf if self._cg_sampler is not None else self._sampler.logprobs
-        return {} if rows is None else {SAMPLED_LOGPROB: rows}
+        return out if rows is None else {**out, SAMPLED_LOGPROB: rows}
 

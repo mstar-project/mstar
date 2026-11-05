@@ -45,7 +45,7 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.engine.resources.resident import NOT_ASKED
-from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
+from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB, STOP_ODDS
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
@@ -3110,6 +3110,14 @@ class Worker:
         engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
         return None
 
+    def _odds_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why this walk's runs don't shorten on their rows' stop odds, or None."""
+        if self._step_repeats.config(node_name).eos_odds is None:
+            return NOT_ASKED
+        if not self._step_repeats.may_repeat(node_name, graph_walk):
+            return "repeats: the walk doesn't repeat"
+        return self._odds_refusals.get((node_name, graph_walk))
+
     def _launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs stay on the host's launch loop, or None."""
         if not self._step_repeats.may_repeat(node_name, graph_walk):
@@ -4123,6 +4131,10 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         self._settle_run(batch_N, host_rows, engine)
+        if host_rows is not None and host_rows.request_ids and (odds := host_rows.buffers.get(STOP_ODDS)) is not None:
+            self._step_repeats.observe_odds(
+                (batch_N.node_name, batch_N.graph_walk), float(odds[:len(host_rows.request_ids)].max()),
+            )
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
@@ -5489,6 +5501,11 @@ class Worker:
         # a run on the device keeps its columns in its capture, so they are settled before it
         for key in self._step_repeats.device_stops() if self._step_repeats is not None else ():
             self._ask_run_columns(*key)
+        # the sampler scores its stops in every capture, so it is asked before them
+        self._odds_refusals: dict[tuple[str, str], str | None] = {}
+        for key in self._step_repeats.edges if self._step_repeats is not None else ():
+            if self._step_repeats.config(key[0]).eos_odds is not None:
+                self._odds_refusals[key] = self.engine_manager.get_engine(key[0]).ask_stop_odds(*key)
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all(
             {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
@@ -5503,6 +5520,7 @@ class Worker:
                 {
                     "rows": self._rows_refusal, "device stop": self._device_stop_refusal,
                     "launch loop": self._launch_refusal, "stream tokens": self._stream_refusal,
+                    "eos odds": self._odds_refusal,
                 },
                 self.engine_manager.engine.repeat_note,
             )

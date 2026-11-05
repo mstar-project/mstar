@@ -777,6 +777,7 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"max": 2, "ready_waits": "yes"}}, "must be a boolean"),
     ({"n": {"ready_waits": True}}, "need max above 1"),
     ({"n": {"auto": True}}, "need max above 1"),
+    ({"n": {"max": 2, "eos_odds": 1.5}}, "must be in"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):
@@ -801,6 +802,16 @@ def test_auto_raises_the_run_at_once_and_lowers_it_after_eight_quiet_steps():
     # a launch's own gap is no host time
     assert all(auto.observe(5e-6, 7 * ms, 7) == 7 for _ in range(7))
     assert auto.observe(5e-6, 7 * ms, 7) == 6
+
+
+def test_a_run_whose_rows_near_a_stop_shortens_the_next_one():
+    """Past ``eos_odds`` the next run takes the iterations such a stop takes on
+    average; below it, the full length again."""
+    repeats = StepRepeats({"n": RepeatConfig(max=8, eos_odds=0.2)}, {})
+    key = ("n", WALK)
+    for odds, cap in [(0.05, None), (0.3, 3), (0.6, 1), (0.1, None)]:
+        repeats.observe_odds(key, odds)
+        assert repeats._odds_caps.get(key) == cap
 
 
 def test_device_launch_means_the_while_run():

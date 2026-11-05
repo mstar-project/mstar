@@ -946,7 +946,7 @@ class _Evicting(_Owned):
 
 
 class _HostRows(_Owned):
-    def step_host_rows(self):  # pragma: no cover - never called
+    def step_host_rows(self, repeats=1):  # pragma: no cover - never called
         return {}
 
 

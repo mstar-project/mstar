@@ -191,7 +191,7 @@ class _Rows:
     def __init__(self, rows):
         self.rows = rows
 
-    def step_host_rows(self):
+    def step_host_rows(self, repeats=1):
         return self.rows
 
 
@@ -210,13 +210,10 @@ def test_resource_rows_join_the_stop_buffers_without_touching_the_models_dict():
 def test_a_step_that_repeats_takes_no_rows_from_a_request_that_arrived_after_it_settled():
     """Log-prob rows would send the step down the store path, which reads one
     iteration, so every other row of it would lose the rest of its tokens."""
-    stop = {"new_token": torch.tensor([[5, 6], [7, 8]])}
-    out = BatchedModelOutput(check_stop_buffers=stop)
-    mgmt = SimpleNamespace(resources={"sampler": _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1, -0.2])})})
-
-    Engine._add_resource_host_rows(mgmt, out, 2)
-
-    assert out.check_stop_buffers is stop
+    res = _resource()
+    res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+    assert SAMPLED_LOGPROB in _step(res, [0], _logits()[:1])
+    assert SAMPLED_LOGPROB not in res.step_host_rows(2)
 
 
 def test_resource_rows_with_nowhere_to_go_raise():
@@ -241,3 +238,17 @@ def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
     plain.ingest_request(0, SamplingReqConfig())
     plain.sample([0], _logits()[:1])
     plain.sample([0], _logits()[:1])
+
+
+def test_a_sample_scores_each_rows_stop_ids_greedy_or_not():
+    """``step_repeats: eos_odds`` reads a row's chance of a stop id off the raw
+    logits, so a greedy request has one too; a step that repeats keeps them."""
+    from mstar.engine.resources.sampler.config import STOP_ODDS
+
+    res = _resource(enable=False)
+    res.ask_stop_odds({2, 3})
+    for rid in (0, 1):
+        res.ingest_request(rid, SamplingReqConfig(temperature=0.0))
+    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 10.0, -100.0]])
+    _step(res, [0, 1], logits)
+    assert res.step_host_rows(4)[STOP_ODDS][:2].tolist() == pytest.approx([0.5, 1.0], abs=1e-3)
