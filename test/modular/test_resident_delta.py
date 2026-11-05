@@ -1496,6 +1496,28 @@ def test_a_follower_replays_a_request_that_passed_the_head_into_rank_0s_counts(m
     assert _counts(leader) == _counts(follower), "the pages the request that passed freed went elsewhere on one rank"
 
 
+def test_a_follower_settles_a_passer_dropped_for_an_older_request_into_rank_0s_counts(monkeypatch):
+    """r, older than the head, runs short and drops p, which passed the head. Each rank gives r the page it is short
+    of, and rank 0 alone keeps the rest from passers, which no count a follower admits from reads."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "head", 8, arrival=2)
+    _ingest((leader, follower), "p", 1, arrival=3)
+    assert _admits(leader, "r") and not _admits(leader, "head") and _admits(leader, "p")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("p", PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
+    assert _preempt(leader, "r", droppable=True).to_drop == ["p"]
+    lead.drop_request(NODE, "p", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "a rank settled the drop of the request that passed another way"
+    assert leader._kept == 4, "rank 0 left a passer the pages p freed past r's shortage"
+
+    assert _returns(leader, "p")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "the return took the kept pages into another allotment on one rank"
+
+
 def test_a_follower_admits_each_step_from_the_counts_rank_0_decided(monkeypatch):
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
 
