@@ -230,8 +230,9 @@ class OffloadDelta:
         self.nodes.append(node)
 
     def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
-        """Drop the last move if it is ``kind`` on ``rid`` in ``pool``, and return whether a move was dropped."""
-        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)):
+        """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move
+        was dropped."""
+        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)) or self.victims[-1]:
             return False
         for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
             column.pop()

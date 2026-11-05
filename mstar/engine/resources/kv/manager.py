@@ -4641,24 +4641,27 @@ class KVManager(AttentionResource):
                 # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
                 return None
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
-            if pages > room or not self._admit(rid, pages):
+            if pages > room or not self._admit(rid, pages, self.journal):
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
             return None
 
-    def _admit(self, rid: str, pages: int) -> bool:
+    def _admit(self, rid: str, pages: int, journal: Callable[..., None] | None = None) -> bool:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers, or return False when ``rid`` turns
-        guaranteed here and the room doesn't cover its footprint. Caller holds the lock."""
+        guaranteed here and the room doesn't cover its footprint. ``journal`` takes the flip and the reservation for
+        the other ranks to replay. Caller holds the lock."""
         # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
         # grows it page by page. With no room for even that, the request reserves what it grows into.
         if not self._sets_aside(rid):
             self._guarantee(rid)
             pages = self._asks[rid] = self._footprint(rid)
             # the other ranks replay the flip, since it can come passes before the reservation they replay
-            if self.journal is not None:
-                self.journal(MoveKind.GUARANTEE, rid, pages)
+            if journal is not None:
+                journal(MoveKind.GUARANTEE, rid, pages)
             if pages > self._room():
                 return False
         self._reserve(rid, pages)
+        if journal is not None:
+            journal(MoveKind.RESERVE, rid, pages)
         return True
 
     def _reserve(self, rid: str, pages: int) -> None:
@@ -4671,8 +4674,6 @@ class KVManager(AttentionResource):
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), returning=returning)
             self._recount(rid)
-        if self.journal is not None:
-            self.journal(MoveKind.RESERVE, rid, pages)
 
     def unreserve(self, rid: str) -> None:
         with self._lock:
@@ -4882,7 +4883,10 @@ class KVManager(AttentionResource):
         """Set aside what ``victims`` free for ``earmark.rid``. Caller holds the lock."""
         moving = [*victims.to_host, *victims.to_drop, *victims.to_ask]
         if self.journal is not None:
-            self.journal(MoveKind.EARMARK, earmark.rid, earmark.pages, moving)
+            # A waiting request takes the room whole once it covers all it asks for (`_settle`), so the other ranks
+            # replay its earmark as the reservation it ends in.
+            kind = MoveKind.RESERVE if earmark.rid in self._asks else MoveKind.EARMARK
+            self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
         self._host(earmark.rid, victims.to_host)
         return victims
@@ -4970,6 +4974,8 @@ class KVManager(AttentionResource):
         if not earmark.victims:
             del self._earmarks[earmark.rid]
         if earmark.rid in self._asks:
+            # Every rank admits it here, from the earmark it replayed as rank 0's reservation. Journaled from inside
+            # the move, the reservation would reach a follower before the move frees the room.
             if earmark.pages <= self._room():
                 self._admit(earmark.rid, earmark.pages)
             return
@@ -4993,28 +4999,33 @@ class KVManager(AttentionResource):
     def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
         with self._lock:
-            if kind == MoveKind.EARMARK:
+            if kind in (MoveKind.EARMARK, MoveKind.RESERVE):
                 # The same filter as rank 0's `_choose`, which can choose a dropped request again once it is
                 # allotted pages.
                 stale = [victim for victim in victims if victim not in self._streams or not self._holds(victim)]
-                if stale or rid not in self._allotments:
+                if stale or (kind == MoveKind.EARMARK and rid not in self._allotments):
                     raise RuntimeError(
                         f"KV {self.name}: rank 0 earmarked {count} pages for {rid} on victims {victims}, but here "
                         f"{stale} aren't live or hold nothing, or {rid} holds no allotment"
                     )
+            if kind == MoveKind.EARMARK:
                 self._mark_victims(Earmark(rid, count, set()), victims)
             elif kind == MoveKind.RESERVE:
-                # a request that holds an allotment asks only for the shortage it waited on in `preempt`
+                # a request that holds an allotment asks only for the shortage it waits on
                 if rid in self._allotments:
                     self._asks[rid] = count
                 elif (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
-                elif not self._sets_aside(rid):
+                if victims:
+                    # rank 0's `make_room`, whose reservation `_settle` makes as the moves of ``victims`` land
+                    self._mark_victims(Earmark(rid, count, set()), victims)
+                elif self._sets_aside(rid):
+                    self._reserve(rid, count)
+                else:
                     raise RuntimeError(
                         f"KV {self.name}: rank 0 reserved {rid} with host room set aside, and this rank's host has "
                         "no room for it"
                     )
-                self._reserve(rid, count)
             elif kind == MoveKind.OFFLOAD:
                 stale = [victim for victim in victims if victim not in self._streams]
                 if stale:
