@@ -90,7 +90,6 @@ class FlashInferManager(PlacedAttention):
             and fmha_decode_applies(device)
         )
 
-
     def _bind_placement(self, geometry: dict[str, int]) -> None:
         if geometry["num_qo_heads"] != self._kv_config.num_qo_heads and not self._decode_tensor_cores:
             # a rank attending every partner's query heads over its one KV head (TP placement) forms

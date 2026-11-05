@@ -364,7 +364,7 @@ class PlacedAttention(AttentionManager):
         new = None if decode else self._placed.own_tokens(
             self, self._placement, self._device, self._dtype, workspace, kwargs, max_total_tokens,
         )
-        if not isinstance(context, PagedKernel) or not isinstance(new, (WholeRowsKernel, ZigzagWrapper, type(None))):
+        if not isinstance(context, PagedKernel) or not (decode or isinstance(new, (WholeRowsKernel, ZigzagWrapper))):
             raise ValueError(
                 f"attention over a placed pool takes a PagedKernel and a WholeRowsKernel or ZigzagWrapper, "
                 f"not a {type(context).__name__} and a {type(new).__name__}"

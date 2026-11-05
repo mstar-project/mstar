@@ -706,6 +706,9 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     monkeypatch.setattr(attn, "whole_rows_kernel", lambda *args: types.SimpleNamespace())
     with pytest.raises(ValueError, match="WholeRowsKernel"):
         attn._context_parallel_wrapper("main", 0, False, kwargs)
+    monkeypatch.setattr(attn, "whole_rows_kernel", lambda *args: None)
+    with pytest.raises(ValueError, match="WholeRowsKernel"):
+        attn._context_parallel_wrapper("main", 0, False, kwargs)
     with pytest.raises(ValueError, match="OwnTokensKernel"):
         ZigzagWrapper(SPPlacement(P, 0, CommGroup.trivial()), _OneSlotPrefill(), CPU)
 
@@ -1206,6 +1209,9 @@ def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeyp
     attn.own_kernel = Forgetful
     with pytest.raises(ValueError, match="built for"):
         attn._cg_wrapper(SlotLease(1, bucket), "main", 2)
+    attn.own_kernel = types.SimpleNamespace(build=lambda *args: _OneSlotPrefill())
+    with pytest.raises(ValueError, match="OwnTokensKernel"):
+        attn._cg_wrapper(SlotLease(2, bucket), "main", 2)
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):

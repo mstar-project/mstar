@@ -156,8 +156,9 @@ class OwnTokensKernel(ABC):
     (``OneSlotPages``); a ragged one would gather them by ``kv_tokens``.
 
     A captured kernel is run on ``captured.queries`` queries every replay, however few its plan
-    has: ``ZigzagWrapper`` gathers that many, and the kernel pads its plan to them (``padded``). A
-    backend names its kernel in ``PlacedAttention.own_kernel``."""
+    has: ``ZigzagWrapper`` gathers that many. ``padded`` is the plan it makes of them, which admission
+    bounds; a kernel whose planner doesn't pad leaves it as it is. A backend names its kernel in
+    ``PlacedAttention.own_kernel``."""
 
     # what a captured kernel is sized for; None on an eager one
     captured: ShareCapture | None = None
@@ -184,7 +185,8 @@ class OwnTokensKernel(ABC):
         self, queries: tuple[torch.Tensor, ...], keys: tuple[torch.Tensor, ...],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``(out, lse)`` (lse natural-log fp32) of the planned rows' ``queries``, in plan order,
-        over the step's ``keys``: query parts and keys as the backend's ``run`` takes them."""
+        over the step's ``keys``: query parts and keys as the backend's ``run`` takes them. A row for
+        every query passed: a captured kernel's past its plan are dropped, whatever they hold."""
 
     def forget_plan(self) -> None:  # noqa: B027 - a kernel that skips a layout it holds replans
         """Every ``plan`` plans the kernel, so there is nothing to forget."""
