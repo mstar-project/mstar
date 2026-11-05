@@ -190,6 +190,13 @@ def computing():
         compute_end(depth)
 
 
+def start_at(t: float) -> None:
+    """A new process joins its deployment at time ``t``, before anything has read the clock."""
+    global _base
+    _base = (_real() - t, None)
+    _last[0] = t
+
+
 def freeze() -> None:
     """Every thread is blocked: the clock stands still (B accrues). Under LOCK."""
     global _base

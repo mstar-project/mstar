@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MSTAR_COMMANDS = {"serve"}
+SERVE_PORT = "8000"  # ``mstar serve``'s default
 
 
 def environment(args: argparse.Namespace) -> dict[str, str]:
@@ -52,6 +54,17 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
     # the driver's tools: nvidia-cuda-mps-control, for mstar's MPS daemon
     env["PATH"] = os.pathsep.join([os.path.join(HERE, "_bin"), env.get("PATH", "")])
     return env
+
+
+def deployment(command: list[str]) -> str | None:
+    """The name of the clock table a command joins: its server's port, as a server or a client
+    gives it (``--port N``, ``--url http://host:N``), so ``serve`` and ``benchmark.runner``
+    share one time. None: a process alone. ``MSTAR_SIM_NODE`` in the environment names it
+    instead, for a command whose port can't be read."""
+    found = re.search(r"--port[= ](\d+)|://[^/\s]*:(\d+)", " ".join(command))
+    if found:
+        return found.group(1) or found.group(2)
+    return SERVE_PORT if "mstar.cli.main" in command else None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -111,7 +124,11 @@ def main(argv: list[str] | None = None) -> None:
         if not os.path.isdir(tables.data_dir()):
             print("mstar_sim: kernel times from the roofline model; for NVIDIA's measured tables: "
                   f"{tables.FETCH}", file=sys.stderr)
-    os.execvpe(sys.executable, [sys.executable, *command], environment(args))
+    env = environment(args)
+    name = deployment(command)
+    if name is not None:
+        env.setdefault("MSTAR_SIM_NODE", name)
+    os.execvpe(sys.executable, [sys.executable, *command], env)
 
 
 if __name__ == "__main__":

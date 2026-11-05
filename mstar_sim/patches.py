@@ -346,29 +346,56 @@ def worker_process_target(*args, **kwargs):
 
 
 def rust_poll() -> None:
-    """The Rust communicator's poll is a wait on other processes: its thread counts as blocked,
-    a write to its eventfd (``EventWakeup``) wakes it, and its timeout is a host deadline that
-    holds until the clock reaches it (:func:`mstar_sim.waits.polling`)."""
+    """The Rust communicator on the deployment's clock (:mod:`mstar_sim.waits`). Its poll is a
+    wait on other processes: its thread counts as blocked, a write to its eventfd
+    (``EventWakeup``) wakes it, the mover's eventfd can end it, and its timeout is a host
+    deadline that holds until the clock reaches it. Its sends count as in flight to their
+    receiver until a poll there finds nothing."""
     communicator = importlib.import_module("mstar.communication.rust_communicator").RustZMQCommunicator
-    _require(communicator, "_poll_once")
+    for name in ("__init__", "_poll_once", "send", "try_send_bytes"):
+        _require(communicator, name)
     from mstar_sim import clock, waits
 
     if clock.FAST:
         return
-    poll_once = communicator._poll_once
+    init, poll_once = communicator.__init__, communicator._poll_once
+    send, try_send = communicator.send, communicator.try_send_bytes
+
+    def initialized(self, my_id, *args, **kwargs):
+        init(self, my_id, *args, **kwargs)
+        self._inner.register_wakeup_fd(waits.wakefd())
+        waits.TABLE.answer_to(my_id)
 
     def polled(self, timeout_ms):
+        sent = waits.TABLE.sent_to_me()
+        kind = poll_once(self, 0)
+        if kind != "timeout" and not (kind == "wake" and waits.poked()):
+            return kind
+        waits.TABLE.take(sent)
         if timeout_ms <= 0:
-            return poll_once(self, timeout_ms)
+            return "timeout"
 
         def poll(seconds):
             kind = poll_once(self, max(1, math.ceil(seconds * 1000)))
-            return None if kind == "timeout" else kind
+            return None if kind == "timeout" or (kind == "wake" and waits.poked()) else kind
 
         event = getattr(self, "event", None)
         return waits.polling(poll, event.fd if event is not None else None, timeout_ms / 1000) or "timeout"
 
+    def sending(self, entity_id, msg):
+        waits.read()
+        waits.TABLE.sent(entity_id)
+        send(self, entity_id, msg)
+
+    def sending_bytes(self, entity_id, data):
+        waits.read()
+        waits.TABLE.sent(entity_id)
+        return try_send(self, entity_id, data)
+
+    communicator.__init__ = initialized
     communicator._poll_once = polled
+    communicator.send = sending
+    communicator.try_send_bytes = sending_bytes
 
 
 def swap_or_assign() -> None:

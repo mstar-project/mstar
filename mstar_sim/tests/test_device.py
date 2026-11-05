@@ -681,7 +681,7 @@ def test_a_wait_on_the_gpu_threads_step_spans_its_device_time_not_the_emulators(
         busy, t0 = clock.DEFAULT.busy, time.perf_counter()
         gpu.submit(step).result().synchronize()  # the worker's await and event_sync
         print(time.perf_counter() - t0, clock.DEFAULT.busy - busy, flush=True)
-        os._exit(0)  # (torch's teardown can abort with a pool's thread gone: not what this tests)
+        os._exit(0)  # (a normal exit here sometimes segfaults, on the base tree too; cause unknown)
     """, gpu)
     span, device = map(float, out.split())
     assert device <= span < 1.25 * device, (span, device)
@@ -730,10 +730,145 @@ def test_a_thread_woken_by_another_runs_before_the_clock_can_jump():
         span = time.perf_counter() - t0
         far.wait()
         print(span, time.clock_gettime(time.CLOCK_MONOTONIC) - wall, flush=True)
-        os._exit(0)  # (torch's teardown can abort with a pool's thread gone: not what this tests)
+        os._exit(0)  # (a normal exit here sometimes segfaults, on the base tree too; cause unknown)
     """)
     span, wall = map(float, out.split())
     assert 0.2 <= span < 1 and wall < 5, (span, wall)
+
+
+def run_deployment(*codes: str) -> list[str]:
+    """Each of ``codes`` as one process of a deployment of its own (a fresh table), all at once.
+    Each gets ``barrier()``, which returns once all have joined the table, and exits hard
+    after its last print."""
+    with tempfile.TemporaryDirectory() as tmp:
+        node = os.path.basename(tmp)
+        env = dict(caller_env(), MSTAR_SIM="1", MSTAR_SIM_GPU="h100", MSTAR_SIM_NODE=node,
+                   PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT]))
+        os.mkdir(os.path.join(tmp, "joined"))
+        prelude = f"""
+import os, sys, time, threading, torch
+from mstar_sim import clock, waits
+TMP = {tmp!r}
+def barrier():
+    open(TMP + f"/joined/{{os.getpid()}}", "w").close()
+    while len(os.listdir(TMP + "/joined")) < {len(codes)}:
+        waits._real_sleep(0.01)
+    waits.TABLE.bound()
+"""
+        scripts = [f"{prelude}{textwrap.dedent(code)}\nsys.stdout.flush()\nos._exit(0)" for code in codes]
+        procs = [subprocess.Popen([sys.executable, "-c", script], env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for script in scripts]
+        try:
+            outs = [proc.communicate(timeout=120) for proc in procs]
+        finally:
+            for proc in procs:
+                proc.kill()
+            table = f"/dev/shm/mstar_sim_clock_{os.getuid()}_{node}"
+            if os.path.exists(table):
+                os.remove(table)
+    for proc, (_, err) in zip(procs, outs, strict=True):
+        assert proc.returncode == 0, err[-3000:]
+    return [out for out, _ in outs]
+
+
+def test_a_blocked_process_follows_the_deployments_time():
+    """A process with nothing to do but poll keeps up with a worker's jumps, in far less wall
+    time than the time it follows."""
+    worker, follower = run_deployment("""
+        barrier()
+        start = time.perf_counter()
+        clock.charge(2.0)
+        torch.cuda.synchronize()
+        print(time.perf_counter() - start)
+        time.sleep(0.05)  # the follower's last sleep ends with this one
+    """, """
+        barrier()
+        start = wall = time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC)
+        while time.perf_counter() - start[0] < 2.0:
+            time.sleep(0.01)
+        print(time.perf_counter() - start[0], time.clock_gettime(time.CLOCK_MONOTONIC) - start[1])
+    """)
+    moved, wall = map(float, follower.split())
+    assert 1.99 < float(worker) < 2.1 and 2.0 <= moved < 2.1 and wall < 1, (worker, moved, wall)
+
+
+def test_two_blocked_processes_move_together_to_the_earlier_deadline():
+    """Every process blocked: the earlier deadline moves them both. The later one, woken at that
+    moment by something the emulator can't see (a pipe), finds its clock there too."""
+    early, late = run_deployment("""
+        barrier()
+        start = time.perf_counter()
+        threading.Event().wait(0.3)
+        print(time.perf_counter() - start, time.perf_counter())
+        os.write(os.open(TMP + "/fifo", os.O_WRONLY), b"x")
+        time.sleep(0.2)  # stays a peer: one that dies wakes no mover, which then looks within 50 ms
+    """, """
+        import selectors
+        os.mkfifo(TMP + "/fifo")
+        fd = os.open(TMP + "/fifo", os.O_RDONLY | os.O_NONBLOCK)
+        selector = selectors.DefaultSelector()
+        selector.register(fd, selectors.EVENT_READ)
+        barrier()
+        selector.select(5.0)
+        print(time.perf_counter())
+    """)
+    span, moved = map(float, early.split())
+    assert 0.3 <= span < 0.4 and -0.001 < float(late) - moved < 0.05, (span, moved, late)  # (-0.001: 2 W)
+
+
+def test_a_fixed_rate_client_keeps_up_with_a_worker_a_message_is_in_flight_to():
+    """Round-3's deadlock: a message in flight to a running worker holds no one else back. The
+    client moves to each arrival as the worker's clock passes it, and the worker doesn't run
+    more than W past the client."""
+    worker, client = run_deployment("""
+        waits.TABLE.answer_to("test-worker")
+        barrier()
+        start = time.perf_counter()
+        ahead = 0.0
+        while time.perf_counter() - start < 0.3:
+            ahead = max(ahead, time.perf_counter() - waits.TABLE.bound())
+        print(time.perf_counter() - start, ahead)
+    """, """
+        barrier()
+        waits.TABLE.bound()
+        waits.TABLE.sent("test-worker")  # never taken: the worker doesn't poll
+        start = time.perf_counter()
+        for _ in range(30):  # 100 arrivals a second
+            time.sleep(0.01)
+        print(time.perf_counter() - start)
+    """)
+    span, ahead = map(float, worker.split())
+    assert 0.3 <= span < 0.5 and 0.3 <= float(client) < 0.5 and ahead < 0.002, (span, ahead, client)
+
+
+def test_a_collective_starts_at_the_latest_ranks_stream():
+    """Ranks reach a collective with their streams apart: it starts when the last stream gets
+    there, on every rank, and a host reading the result on either sees that."""
+    node = f"test-{os.getpid()}-collective"
+    out = run_sim("""
+        import tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
+        from mstar_sim import clock
+
+        def rank(r, path):
+            dist.init_process_group("nccl", init_method=f"file://{path}", rank=r, world_size=2)
+            torch.cuda.set_device(r)
+            x = torch.empty(1 << 14, device="cuda")
+            dist.barrier()
+            start = time.perf_counter()
+            if r == 0:
+                clock.charge(1.0)
+            dist.all_reduce(x)
+            torch.cuda.synchronize()
+            print(f"rank {r} {time.perf_counter() - start} {clock.DEFAULT.free_at}", flush=True)
+            dist.destroy_process_group()
+
+        if __name__ == "__main__":
+            mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=2)
+    """, MSTAR_SIM_NODE=node)
+    os.remove(f"/dev/shm/mstar_sim_clock_{os.getuid()}_{node}")
+    rows = [line.split() for line in out.splitlines() if line.startswith("rank")]
+    spans, ends = {r[1]: float(r[2]) for r in rows}, [float(r[3]) for r in rows]
+    assert len(rows) == 2 and 1.0 <= spans["0"] < 1.2 and abs(ends[0] - ends[1]) < 1e-6, out
 
 
 def test_timing_only_holds_shapes_not_values():

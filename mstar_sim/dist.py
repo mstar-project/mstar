@@ -111,7 +111,7 @@ def _waiting():
     clock stands still through it (:func:`mstar_sim.waits.blocked`)."""
     from mstar_sim import waits
 
-    with waits.blocked():
+    with waits.blocked(waits.MEET):
         yield
 
 
@@ -159,19 +159,28 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     """Meet the group's other ranks at a collective (``replay``: a graph's replay) and return
     every rank's descriptor. Blocks until they all come, as the GPU's kernel does
     (:func:`_watched`). A mismatch aborts (NCCL's behaviour there is undefined: a hang or
-    corrupt data, and a raise would be caught and served past)."""
+    corrupt data, and a raise would be caught and served past). The collective can't start
+    on any rank's stream before every rank's stream reaches it, so each leaves at the latest
+    of them."""
     ranks = dist.get_process_group_ranks(group)
     me = dist.get_rank()
     seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
-    gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
-    sent = torch.tensor(mine, dtype=torch.int64, device="cpu")
+    timeline = clock.current_timeline()
+    sent = torch.tensor([*mine, int(timeline.free_at * 1e9)], dtype=torch.int64, device="cpu")  # (a row is integers)
+    gathered = torch.empty(len(ranks) * len(sent), dtype=torch.int64, device="cpu")  # whatever the default
     with _waiting():
         # straight to the backend: torch's public function logs a failure through the group's
         # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
         _watched(lambda: group._allgather_base(gathered, sent).wait(), where, mine, replay)
         _let_go(group, gathered, sent)
     rows = gathered.view(len(ranks), -1).tolist()
+    free_at = [r.pop() / 1e9 for r in rows]
+    timeline.free_at = max(timeline.free_at, *free_at)
+    if not clock.FAST:
+        from mstar_sim import waits
+
+        waits.REPORT["meet_skew_s"] = max(waits.REPORT["meet_skew_s"], max(free_at) - min(free_at))
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
                         for r, d in zip(ranks, rows, strict=True))
@@ -191,15 +200,15 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
     (all of them with none to meet; none when captured)."""
     size = dist.get_world_size(group) if dist.is_initialized() else 1
     tape = clock.capturing()
-    if not clock.FAST:
-        clock.charge(cost.collective_seconds(family, size, nbytes, graph=tape is not None))
-    if desc is None or size == 1:
-        return -1 if tape is None else 0
-    group = group or dist.group.WORLD
-    if tape is not None:
-        tape.collectives.append((group, desc[:_VALUES]))
-        return 0
-    return functools.reduce(operator.and_, (r[_VALUES] for r in _meet(group, desc)))
+    seconds = 0.0 if clock.FAST else cost.collective_seconds(family, size, nbytes, graph=tape is not None)
+    if desc is None or size == 1 or tape is not None:
+        clock.charge(seconds)
+        if tape is not None and desc is not None and size > 1:
+            tape.collectives.append((group or dist.group.WORLD, desc[:_VALUES]))
+        return 0 if tape is not None else -1
+    rows = _meet(group or dist.group.WORLD, desc)
+    clock.charge(seconds)
+    return functools.reduce(operator.and_, (r[_VALUES] for r in rows))
 
 
 # --- point to point. A send's descriptor (:func:`row`, its ``op`` the tag its payload follows
