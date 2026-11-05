@@ -1120,17 +1120,19 @@ def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_sha
 
 def test_mla_attention_refuses_a_bucket_its_padded_own_tokens_take_past_the_planners_cap(monkeypatch):
     """A capture bucket of more tokens than rows (a packed one, ``force_prefill``) plans even one-token
-    rows as a prefill, on an own-token kernel padded to its bucket's tokens: here (64 heads, 8 rows,
-    65536 tokens, SP) past the FA planner's cap, which a step's own lengths would not reach. The
-    bucket is refused at capture, and a decode bucket of the same rows, which plans no own tokens,
-    is captured."""
+    rows as a prefill, on an own-token kernel padded to its bucket: under SP its zigzag share's
+    kernel has every query of the bucket over twice its rows and one more, which the context's plan
+    doesn't. At a cap the context's plan fits, the bucket is refused at capture for its own tokens,
+    and a decode bucket of the same rows, which plans none, is captured."""
     _fa_kernel(monkeypatch)
     attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
                             mla=True, num_qo_heads=64, flashinfer_backend="fa2")
-    rows, tokens = 8, 65536
-    lease = SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=tokens))
-    with pytest.raises(ValueError, match="capture bucket"):
-        attn._cg_wrapper(lease, "main", rows, force_prefill=True)
+    rows, tokens = 8, 16
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", fm.fa_work_items_ceiling(tokens, rows, 64, 132))
+    assert fm.fa_work_items_ceiling(tokens, 2 * rows + 1, 64, 132) > fm._FA_MAX_WORK_ITEMS
+    with pytest.raises(ValueError, match="own-token"):
+        attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=tokens)), "main", rows,
+                         force_prefill=True)
     attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=rows)), "main", rows)
 
 
