@@ -79,7 +79,8 @@ Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-c
   if Engine is not None:
       prepare = Engine.prepare_inputs
       def held(self, batch):
-          if batch.node_name == "LLM" and 7 in batch.request_ids:  # node X, request id N
+          # node X, and request N by its wire id (batch.request_ids are worker-local, recycled handles)
+          if batch.node_name == "LLM" and any(i.request_id == "N" for i in batch.per_request_info.values()):
               while not os.path.exists("/tmp/gate"):  # or time.sleep(T)
                   time.sleep(0.05)
           return prepare(self, batch)
