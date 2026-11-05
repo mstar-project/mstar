@@ -31,7 +31,7 @@ from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.context_parallel import merge
+from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
@@ -596,10 +596,12 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
             assert torch.isfinite(out[:n]).all()
         torch.testing.assert_close(out[:n].float(), case.want()[:, heads], **tol)
         if rows == PREFILL_ROWS and not captured:
-            # a first prefill: no row holds stored context on any rank, so every partial is masked
+            # a first prefill: no row holds stored context on any rank, so nothing is exchanged
             first = _Case.build(((0, 5), (0, 3)), device, dtype)
             _plan(attn, first)
+            exchanged = len(calls)
             torch.testing.assert_close(first.runner(attn, placement, heads)().float(), first.want()[:, heads], **tol)
+            assert len(calls) == exchanged, "a step with no stored context ran the exchange"
         everyone = [None] * world
         dist.all_gather_object(everyone, calls)
         assert calls and all(c == calls for c in everyone), everyone
@@ -702,6 +704,32 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     qo = np.cumsum([0, *(new for _, new in PREFILL_ROWS)]).tolist()
     want = torch.cat([_reference(q[a:b], k[a:b], v[a:b])[0] for a, b in itertools.pairwise(qo)])
     torch.testing.assert_close(merged[:n], want)
+
+
+def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
+    """A graph replays the collectives of its capture whatever a later step stores, so a captured
+    step of no stored context, as a capture step usually is, can't skip them."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    # the captured context wrapper stages its plan through a CUDA event; this needs only its partial
+    context = types.SimpleNamespace(
+        plan=lambda **kwargs: None,
+        run=lambda q, cache, return_lse: (torch.zeros_like(q), torch.full(q.shape[:2], -math.inf)),
+    )
+    monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
+    exchanged = []
+
+    def exchange(self, out, lse, valid):
+        exchanged.append(out)
+        return out[None], lse[None]
+
+    monkeypatch.setattr(ContextParallelWrapper, "_exchange_partials", exchange)
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    attn, placement = _cp_attention(joint, CPU, torch.float32)
+    case = _Case.build(((0, 5), (0, 3)), CPU, torch.float32)
+    _plan(attn, case, bucket=BucketKey("w", bs=2, num_tokens=8))
+    torch.testing.assert_close(case.runner(attn, placement)(), case.want())
+    assert len(exchanged) == 1
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):

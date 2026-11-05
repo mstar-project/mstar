@@ -144,6 +144,8 @@ class ContextParallelWrapper:
         self.new = new
         self._device = device
         self._qo_indptr_buf = None
+        # the planned step's rows hold no stored context, so it attends its own tokens alone (`plan`)
+        self._own_only = False
         # per query token, whether its row holds any of this rank's slots. A captured wrapper's
         # holds its bucket's every token (a row's at least, and the bucket's) and is never
         # reallocated, so a replay reads the address it was captured with
@@ -169,6 +171,12 @@ class ContextParallelWrapper:
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
+        # a step whose rows store no context (a first prefill) has no partial to exchange; from the
+        # logical indptrs, so every rank alike. A captured step exchanges whatever it stores, as its
+        # replays issue its capture's collectives
+        self._own_only = (
+            self.new is not None and not self._captured and int(context.paged_kv_indptr[-1]) == 0
+        )
         local, valid_rows = self.local_indptrs(self._placement, context, self._page_size)
         if kv_out.cpu_indptrs.paged_kv_indices.is_pinned() and not local.paged_kv_indices.is_pinned():
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
@@ -222,6 +230,9 @@ class ContextParallelWrapper:
                 "run is passed; this step has more than one token a row and got none"
             )
         new = None if self.new is None else self.new.run(q, k, v, return_lse=True)
+        if self._own_only:
+            # every partial would be masked (a first prefill): no exchange, no merge
+            return new[0].to(q.dtype)
         queries = self._exchange_queries(q)
         # over this rank's slots, with the rows holding any of them
         out, lse = self.context.run(queries, kv_cache_layer, return_lse=True)
