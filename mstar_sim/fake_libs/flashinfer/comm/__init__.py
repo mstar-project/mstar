@@ -30,13 +30,13 @@ def _missing(name: str):
 
 class AllReduceFusionWorkspace:
     """What a workspace is to its caller: its group's size and limits; and its ranks'
-    channel (``group``)."""
+    channel (``group``), made over ``parent``."""
 
     def __init__(self, backend, world_size: int, rank: int, max_token_num: int, hidden_dim: int, dtype,
-                 group=None):
+                 group=None, parent=None):
         self.backend, self.world_size, self.rank = backend, world_size, rank
         self.max_token_num, self.hidden_dim, self.dtype = max_token_num, hidden_dim, dtype
-        self.group = group
+        self.group, self.parent = group, parent
 
     def is_buffer_size_sufficient(self, tp_size: int, num_tokens: int, hidden_dim: int, dtype=None,
                                   use_oneshot=None) -> bool:
@@ -54,8 +54,9 @@ class AllReduceFusionWorkspace:
 def create_allreduce_fusion_workspace(backend="auto", world_size=1, rank=0, max_token_num=0, hidden_dim=0,
                                       dtype=torch.bfloat16, comm_backend=None, group=None, **kwargs):
     """Collective over ``group``'s ranks, as the real one is: their channel is made here."""
-    channel = _channel(group or dist.group.WORLD) if world_size > 1 else None
-    return AllReduceFusionWorkspace(backend, world_size, rank, max_token_num, hidden_dim, dtype, channel)
+    group = group or dist.group.WORLD
+    channel = _channel(group) if world_size > 1 else None
+    return AllReduceFusionWorkspace(backend, world_size, rank, max_token_num, hidden_dim, dtype, channel, group)
 
 
 def _channel(group):
@@ -63,15 +64,21 @@ def _channel(group):
     are (torch names a group by how many this process holds, which differs between ranks in
     different groups): named by ``group`` and its count of collectives after one, which the
     real one makes to swap its handles (gloo's own barrier, which raises at the timeout as that
-    exchange does); with ``group``'s timeout. torch knows only its ranks."""
+    exchange does); with ``group``'s timeout, which a fused call keeps it on (:func:`_timeout`).
+    torch knows only its ranks."""
     dist.barrier.__wrapped__(group=group)
     ranks = dist.get_process_group_ranks(group)
     store = dist.PrefixStore(f"mstar_sim/ar_fusion/{group.group_name}/{group._get_sequence_number_for_group()}",
                              dist.distributed_c10d._get_default_store())
-    channel = dist.ProcessGroupGloo(store, ranks.index(dist.get_rank()), len(ranks),
-                                    group._get_backend(torch.device("cpu")).options._timeout)
+    channel = dist.ProcessGroupGloo(store, ranks.index(dist.get_rank()), len(ranks), _timeout(group))
     dist.distributed_c10d._world.pg_group_ranks[channel] = {r: i for i, r in enumerate(ranks)}
     return channel
+
+
+def _timeout(group):
+    """``group``'s timeout now: mstar's ``restore_default_timeout`` shortens it after load, and
+    torch, which doesn't know the channel, doesn't shorten the channel's with it."""
+    return group._get_backend(torch.device("cpu")).options._timeout
 
 
 def _norm_cost(input, *args, **kwargs):
@@ -91,6 +98,7 @@ def allreduce_fusion(input, workspace, pattern=AllReduceFusionPattern.kARResidua
     from mstar_sim import dist as sim_dist
 
     if workspace.world_size > 1:
+        workspace.group._set_default_timeout(_timeout(workspace.parent))
         sim_dist.collective("all_reduce", workspace.group, input.numel() * input.element_size(), sim_dist.row(
             "AllReduceFusion", input.numel(), input.dtype, op=int(pattern), size=workspace.world_size))
     _norm(input, residual_out, norm_out, output)

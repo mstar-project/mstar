@@ -743,7 +743,11 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             spaces = [comm.create_allreduce_fusion_workspace(world_size=2, rank=r % 2, group=tp)] if r < 2 else []
             spaces.append(comm.create_allreduce_fusion_workspace(world_size=2, rank=r // 2, group=sp))
             fused = dict(pattern=comm.AllReduceFusionPattern.kAllReduce, output=torch.empty(8, 64, device="cuda"))
+            # with its group's timeout, which mstar shortens after load
+            import datetime
+            dist.distributed_c10d._set_pg_timeout(datetime.timedelta(minutes=7), sp)
             comm.allreduce_fusion(torch.empty(8, 64, device="cuda"), spaces[-1], **fused)
+            assert spaces[-1].group.options._timeout == datetime.timedelta(minutes=7)
             with torch.cuda.graph(graph := torch.cuda.CUDAGraph()):
                 comm.allreduce_fusion(torch.empty(8, 64, device="cuda"), spaces[-1], **fused)
                 dist.all_reduce(x, group=sp)
