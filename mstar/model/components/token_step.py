@@ -9,7 +9,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.model.submodule_base import ARNodeInputs, NodeInputs
+from mstar.model.submodule_base import ARNodeInputs, CarryPair, NodeInputs
 
 
 class TokenStepNode:
@@ -53,6 +53,15 @@ class TokenStepNode:
         # the base default, which subclasses may narrow: the engine caps decode at
         # its largest capture config (uncapped with accelerator graphs off)
         return None if graph_walk == self.DECODE_WALK else self.MAX_PREFILL_BATCH_SIZE
+
+    def repeat_carry(self, graph_walk: str, signals) -> dict[str, CarryPair]:
+        """The decode loop's token goes back in as ``text_inputs`` (``postprocess``),
+        which ``preprocess`` stages as ``input_ids``: a run carries it from the
+        sampled ``new_token`` there."""
+        pairs = super().repeat_carry(graph_walk, signals)
+        if "text_inputs" in pairs:
+            pairs["text_inputs"] = CarryPair("new_token", "input_ids")
+        return pairs
 
     def postprocess(
         self,

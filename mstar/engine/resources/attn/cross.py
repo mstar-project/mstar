@@ -141,6 +141,11 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        # the context doesn't grow and a replay's queries pack as its step's,
+        # so one plan serves every replay, whatever the kernel
+        return None
+
     def resident_refusal(self, key, streams) -> str | None:
         if self._query_kv_cache_name == self._kv_cache_name:
             return "a context in the query's own pool would be a second stream on one resident row"

@@ -2599,3 +2599,23 @@ def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_wal
     assert worker._steady_consumer_walks(speculation, 4) == 2
     worker._walk_drivers = {}
     assert worker._steady_consumer_walks(speculation, 4) == 4
+
+
+
+def test_a_token_step_node_carries_its_token_from_the_sample_to_its_input_ids():
+    """A decoder that feeds its token back as ``text_inputs`` (canary, canary-
+    qwen, qwen3-asr, whisper) carries it within a run as its preprocess stages
+    it, from the sampled ``new_token`` into ``input_ids``."""
+    from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
+    from mstar.model.submodule_base import CarryPair
+
+    sub = CanaryQwenLLMSubmodule.__new__(CanaryQwenLLMSubmodule)
+    torch.nn.Module.__init__(sub)
+    assert sub.repeat_carry("decode", {"text_inputs"}) == {"text_inputs": CarryPair("new_token", "input_ids")}
+
+
+def test_cross_attention_over_a_fixed_context_repeats():
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    assert cross.repeat_refusal(WALK) is None
