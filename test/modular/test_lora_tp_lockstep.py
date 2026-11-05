@@ -234,8 +234,8 @@ def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
     paths = _write_adapters(tmp_path, ("a1", "a2", "a3"))
     fast, slow = (LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
                                   decides=r == 0) for r in (0, 1))
-    gate, read = threading.Event(), slow.store._read
-    slow.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    gate, read = threading.Event(), slow.store.read
+    slow.store.read = lambda name, path, digest: gate.wait(10) and read(name, path, digest)
     for pool in (fast, slow):
         ingest(pool, "x", "a2")
         settle_reads(fast)
@@ -290,15 +290,15 @@ def test_no_rank_waits_on_a_retry_once_a_load_has_failed(tmp_path):
 def _fail_reads(pool: LoraAdapterPool, name: str, first: threading.Event, then: threading.Event) -> None:
     """``name``'s reads on ``pool`` fail: the first once ``first`` is set, any later once
     ``then`` is (or after 10 s)."""
-    read, tries = pool.store._read, []
+    read, tries = pool.store.read, []
 
-    def unreadable(adapter, path):
+    def unreadable(adapter, path, digest):
         if adapter != name:
-            return read(adapter, path)
+            return read(adapter, path, digest)
         tries.append(adapter)
         (first if len(tries) == 1 else then).wait(10)
         raise OSError(f"{adapter} is unreadable")
-    pool.store._read = unreadable
+    pool.store.read = unreadable
 
 
 # --- the worker's admit fence --------------------------------------------------------------
@@ -376,8 +376,8 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     assert not errors and v1 == v2 == "ok"
     for pool in ranks:
         pool.remove_request("h")
-    gate, read = threading.Event(), follower.store._read
-    follower.store._read = lambda name, path: (name != "a2" or gate.wait(10)) and read(name, path)
+    gate, read = threading.Event(), follower.store.read
+    follower.store.read = lambda name, path, digest: (name != "a2" or gate.wait(10)) and read(name, path, digest)
     for pool in ranks:
         ingest(pool, "rA", "a2")
         ingest(pool, "rB", "a3")
@@ -420,13 +420,13 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
     pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1),
                                  EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
     if rank == 1:
-        read = pool.store._read
+        read = pool.store.read
 
-        def flaky(name, path):
+        def flaky(name, path, digest):
             if name == "a2":
                 raise OSError("read error on rank 1 only")
-            return read(name, path)
-        pool.store._read = flaky
+            return read(name, path, digest)
+        pool.store.read = flaky
     for rid, adapter in (("ok", "a1"), ("bad", "a2")):
         ingest(pool, rid, adapter)
     result = {"agree": [_verdict(pool.admit(step([rid]), ctx([rid]))) for rid in ("ok", "bad")],
