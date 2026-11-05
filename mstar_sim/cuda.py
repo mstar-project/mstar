@@ -65,12 +65,12 @@ def current_device() -> int:
 
 
 def set_device(device) -> None:
-    _tls.device = _as_index(device)
+    _tls.device = device_index(device)
 
 
 class device:  # noqa: N801  (torch.cuda.device)
     def __init__(self, device):
-        self.idx = -1 if device is None else _as_index(device)
+        self.idx = -1 if device is None else device_index(device)
 
     def __enter__(self):
         self.prev = current_device()
@@ -82,14 +82,19 @@ class device:  # noqa: N801  (torch.cuda.device)
         return False
 
 
-def _as_index(device) -> int:
-    """A device argument's index: a bare ``"cuda"`` (or None) names the current device."""
+def device_index(device) -> int:
+    """A device argument's index: a bare ``"cuda"`` (or None) names the current device. An
+    index past the emulated devices is refused, as CUDA refuses it."""
     if device is None:
         return current_device()
-    if isinstance(device, int):
-        return device
-    index = torch.device(device).index
-    return current_device() if index is None else index
+    index = device if isinstance(device, int) else torch.device(device).index
+    if index is None:
+        return current_device()
+    if index >= device_count():
+        from mstar_sim.device import gpu_error
+
+        raise gpu_error(torch.AcceleratorError("CUDA error: invalid device ordinal"))
+    return index
 
 
 def get_device_name(device=None) -> str:
@@ -108,7 +113,7 @@ def get_device_properties(device=None):
         multi_processor_count=gpu.sm_count, is_integrated=False, is_multi_gpu_board=False,
         L2_cache_size=getattr(gpu, "l2_bytes", 50 << 20), warp_size=32,
         max_threads_per_multi_processor=2048, regs_per_multiprocessor=65536,
-        uuid=f"mstar-sim-{_as_index(device)}", pci_bus_id=_as_index(device), pci_device_id=0,
+        uuid=f"mstar-sim-{device_index(device)}", pci_bus_id=device_index(device), pci_device_id=0,
         pci_domain_id=0, gcnArchName="",
     )
 
@@ -118,7 +123,7 @@ def get_device_properties(device=None):
 
 def _used(device) -> list[int]:
     """``[current, peak]`` bytes of a simulated device's live tensors (their storages)."""
-    return memory.ALLOCATED.setdefault(_as_index(device), [0, 0])
+    return memory.ALLOCATED.setdefault(device_index(device), [0, 0])
 
 
 def memory_allocated(device=None) -> int:
@@ -132,17 +137,17 @@ def max_memory_allocated(device=None) -> int:
 def memory_reserved(device=None) -> int:
     """What the caching allocator holds from the card: every pool's high-water mark
     (``mstar_sim.memory.Pool``)."""
-    return memory.reserved(_as_index(device))
+    return memory.reserved(device_index(device))
 
 
 def max_memory_reserved(device=None) -> int:
-    return memory.RESERVED_PEAK.get(_as_index(device), 0)
+    return memory.RESERVED_PEAK.get(device_index(device), 0)
 
 
 def reset_peak_memory_stats(device=None) -> None:
     used = _used(device)
     used[1] = used[0]
-    memory.RESERVED_PEAK[_as_index(device)] = memory_reserved(device)
+    memory.RESERVED_PEAK[device_index(device)] = memory_reserved(device)
 
 
 def empty_cache() -> None:
@@ -161,11 +166,11 @@ _fraction: dict[int, float] = {}
 
 
 def set_per_process_memory_fraction(fraction: float, device=None) -> None:
-    _fraction[_as_index(device)] = fraction
+    _fraction[device_index(device)] = fraction
 
 
 def get_per_process_memory_fraction(device=None) -> float:
-    return _fraction.get(_as_index(device), 1.0)
+    return _fraction.get(device_index(device), 1.0)
 
 
 def memory_limit(index: int) -> int:
@@ -198,7 +203,7 @@ def _begin_allocate_to_pool(device, mempool_id, *_) -> None:
     """This thread's allocations on ``device`` go to the pool (a capture's stream filter, here
     its thread), until it ends."""
     with memory._track_lock:
-        p = memory.pool(_as_index(device), mempool_id)
+        p = memory.pool(device_index(device), mempool_id)
         p.graphs += 1
         p.recording = threading.get_ident()
 
@@ -207,7 +212,7 @@ def _end_allocate_to_pool(device, mempool_id) -> None:
     from mstar_sim.device import gpu_error
 
     with memory._track_lock:
-        p = memory.POOLS.get((_as_index(device), tuple(mempool_id)))
+        p = memory.POOLS.get((device_index(device), tuple(mempool_id)))
         if p is None or p.recording is None:
             raise gpu_error(RuntimeError(f"mstar_sim: pool {tuple(mempool_id)} is not recording"))
         p.recording = None
@@ -215,7 +220,7 @@ def _end_allocate_to_pool(device, mempool_id) -> None:
 
 def _release_pool(device, mempool_id) -> None:
     with memory._track_lock:
-        p = memory.POOLS.get((_as_index(device), tuple(mempool_id)))
+        p = memory.POOLS.get((device_index(device), tuple(mempool_id)))
         if p is not None:
             p.graphs -= 1
 
@@ -227,7 +232,7 @@ class Stream:
     """A stream of the emulated GPU: a :class:`clock.Timeline`."""
 
     def __init__(self, device=None, priority: int = 0, **_):
-        self.device = torch.device("cuda", _as_index(device) if device is not None else current_device())
+        self.device = torch.device("cuda", device_index(device) if device is not None else current_device())
         self.device_index = self.device.index
         self.device_type = "cuda"
         self.priority = priority
@@ -280,7 +285,7 @@ _defaults: dict[int, Stream] = {}
 
 
 def default_stream(device=None) -> Stream:
-    idx = _as_index(device)
+    idx = device_index(device)
     s = _defaults.get(idx)
     if s is None:
         s = _defaults[idx] = Stream(idx)
@@ -329,7 +334,7 @@ class Event:
         self.enable_timing = enable_timing
         self.t: float | None = None
         self.stamp: float | None = None
-        self.device = torch.device("cuda", current_device())
+        self.device = torch.device("cuda", device_index(device))
 
     def record(self, stream: Stream | None = None) -> None:
         _check_fault()
@@ -516,7 +521,7 @@ class Generator(_TorchGenerator):
     def __new__(cls, device="cpu"):
         dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
         gen = _TorchGenerator.__new__(cls, "cpu" if dev.type == "cuda" else dev)
-        gen._sim_device = torch.device("cuda", dev.index or 0) if dev.type == "cuda" else None
+        gen._sim_device = torch.device("cuda", device_index(dev)) if dev.type == "cuda" else None
         return gen
 
     @property

@@ -42,7 +42,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from mstar_sim import clock, memory
+from mstar_sim import clock, cuda, memory
 
 
 def tree_flatten(obj):
@@ -162,18 +162,6 @@ def is_cuda_device(device) -> bool:
     if isinstance(device, str):
         return device.split(":")[0] == "cuda"
     return False
-
-
-def _index(device) -> int:
-    if isinstance(device, str):
-        device = torch.device(device)
-    if isinstance(device, torch.device) and device.index is not None:
-        return device.index
-    if isinstance(device, int):
-        return device
-    from mstar_sim import cuda
-
-    return cuda.current_device()
 
 
 class SimTensor(torch.Tensor):
@@ -1069,7 +1057,10 @@ def _to(self, *args, **kwargs):
         opts["memory_format"] = memory_format
     if isinstance(self, SimTensor):
         if device is None or device.type == "cuda":
-            return _run(T.to, (self,), opts, self.device.index)  # a cast is a kernel, captured as one
+            index = self.device.index if device is None else cuda.device_index(device)
+            if index != self.device.index:  # a peer copy: the result is the other device's
+                opts["copy"] = True
+            return _run(T.to, (self,), opts, index)  # a cast is a kernel, captured as one
         if device.type == "cpu":
             _d2h(self)
             if not non_blocking:
@@ -1089,7 +1080,7 @@ def _to(self, *args, **kwargs):
         if data.device.type == "cpu":  # captured: reads its host buffer at each replay, not now
             clock.on_replay(lambda: data.copy_(self))
         clock.charge(_copy_seconds(data.numel() * data.element_size(), "h2d"))
-        return SimTensor(data, _index(device))
+        return SimTensor(data, cuda.device_index(device))
     if _is_meta(self) and (device is None or device.type in ("cpu", "meta")):
         # a header-only weight cast or moved on the host stays value-less
         return torch.empty_like(self, dtype=dtype or self.dtype, device=META)
@@ -1103,7 +1094,7 @@ def _d2h(src) -> None:
 
 
 def _cuda(self, device=None, non_blocking=False, memory_format=torch.preserve_format):
-    target = torch.device("cuda", _index(device if device is not None else "cuda"))
+    target = torch.device("cuda", cuda.device_index(device if device is not None else "cuda"))
     return _to(self, target, non_blocking=non_blocking)
 
 
@@ -1243,7 +1234,7 @@ def _emulated(fn, args, kwargs):
 def _create(func, args, kwargs, device):
     """A factory call on the cuda device: meta unless small (:func:`keeps_values`)."""
     check_fault()
-    index = _index(device)
+    index = cuda.device_index(device)
     target = CPU
     from_host = func in (torch.tensor, torch.as_tensor, torch.from_numpy)
     if from_host:

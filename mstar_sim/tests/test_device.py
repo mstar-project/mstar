@@ -56,6 +56,14 @@ def test_cuda_semantics():
             raise SystemExit("a cuda/cpu mix was accepted")
         except RuntimeError as e:
             assert "same device" in str(e)
+        assert x.to("cuda:1").device == torch.device("cuda", 1)  # a peer copy lands on the peer
+        for past in (lambda: torch.zeros(2, device="cuda:8"), lambda: x.to("cuda:8"),  # 8 emulated GPUs
+                     lambda: torch.cuda.set_device(8), lambda: torch.cuda.Stream(8)):
+            try:
+                past()
+                raise SystemExit("an index past the emulated devices was accepted")
+            except torch.AcceleratorError:
+                pass
         assert (x + torch.tensor(1.0)).is_cuda          # CPU scalars are fine
         assert x[torch.tensor([0, 2])].shape == (2, 8)  # so is a CPU index
         # indices CUDA accepts raise no device-side assert: negative ones where the kernel wraps
