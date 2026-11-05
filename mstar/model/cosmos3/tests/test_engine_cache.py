@@ -682,15 +682,18 @@ def _check_compile_vae(num_frames, tag):
     vae, config = model._build_vae(ctx["device"]), model.config
     walk = "video_gen" if num_frames > 1 else "image_gen"
     out_key = "video_output" if num_frames > 1 else "image_output"
-    had = os.environ.pop("COSMOS3_COMPILE_VAE", None)
+    had = os.environ.get("COSMOS3_COMPILE_VAE")
     try:
+        # Compile is on by default, so the eager arm turns it off explicitly.
+        os.environ["COSMOS3_COMPILE_VAE"] = "0"
         eager = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
+        assert not eager._decode_compiled
         img_eager = eager.forward(walk, None, latents=lat.clone())[out_key][0]
         os.environ["COSMOS3_COMPILE_VAE"] = "1"
         compiled = Cosmos3VAEDecoderSubmodule(vae=vae, config=config)
         img_comp = compiled.forward(walk, None, latents=lat.clone())[out_key][0]
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (skipped {tag} compile-VAE parity: VAE/compile unavailable: {exc})")
+    except ImportError as exc:
+        print(f"  (skipped {tag} compile-VAE parity: VAE unavailable: {exc})")
         return
     finally:
         if had is None:

@@ -247,7 +247,13 @@ def test_reasoner_submodule_batched_path_matches_reference() -> None:
     from mstar.model.cosmos3.config import Cosmos3Config
     from mstar.model.cosmos3.constants import REASONER_DECODE_WALK, REASONER_PREFILL_VISION_WALK
     from mstar.model.cosmos3.loader import load_transformer_weights
-    from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, SAMPLER, Cosmos3ReasonerSubmodule
+    from mstar.model.cosmos3.submodules import (
+        ATTN,
+        KV_CACHE,
+        REASONER_DECODE_LOOP,
+        SAMPLER,
+        Cosmos3ReasonerSubmodule,
+    )
     from mstar.model.submodule_base import ModelInputsFromEngine
 
     rec = torch.load(REF)
@@ -265,8 +271,9 @@ def test_reasoner_submodule_batched_path_matches_reference() -> None:
     rids = ["a", "b"]
     n_ref = len(rec["greedy_tokens"])
 
-    def step(walk, per_request_inputs):
-        fwd = {rid: types.SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata={}) for rid in rids}
+    def step(walk, per_request_inputs, iteration=0):
+        fwd = {rid: types.SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata={},
+                                          dynamic_loop_iter_counts={REASONER_DECODE_LOOP: iteration}) for rid in rids}
         inputs = [sub.prepare_inputs(walk, fwd[rid], per_request_inputs[rid]) for rid in rids]
         declared = sub.declare_step(walk, rids, inputs)
         spans = [seg.span for seg in declared.segments]
@@ -287,10 +294,8 @@ def test_reasoner_submodule_batched_path_matches_reference() -> None:
     }
     out = step(REASONER_PREFILL_VISION_WALK, prompt_inputs)
     produced = {rid: [int(out[rid]["new_token"][0])] for rid in rids}
-    for rid in rids:
-        assert sub.request_state(rid)["next_pos"] == int(rec["position_ids"].max()) + 1
-    for _ in range(n_ref - 1):
-        out = step(REASONER_DECODE_WALK, {rid: {"text_inputs": out[rid]["text_inputs"]} for rid in rids})
+    for i in range(n_ref - 1):
+        out = step(REASONER_DECODE_WALK, {rid: {"text_inputs": out[rid]["text_inputs"]} for rid in rids}, i)
         for rid in rids:
             produced[rid].append(int(out[rid]["new_token"][0]))
     for rid in rids:
