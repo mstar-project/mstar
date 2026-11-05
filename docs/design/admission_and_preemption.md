@@ -190,8 +190,9 @@ class KVManager:
     def drop(self, rid: str, tokens: int) -> int:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
-        evictable pages. Needs no host pool. tokens is what rid's rebuild
-        writes: its kept ids but the last, or the chunks its prompt ran."""
+        evictable pages. Needs no host pool. tokens is the slots rid's rebuild
+        writes: its kept ids but the last and the slots its host copies fill,
+        or the chunks its prompt ran."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
@@ -282,7 +283,7 @@ class RebuildPolicy:
 
 A model declares a policy per node (`Model.rebuild_policies`), and the worker checks it against the graphs at startup and reads off them what the node reads in each walk besides the ids. A node without one never drops a request.
 
-A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, and opens the rebuild in the worker's log. Readiness answers the request's decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.
+A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then has the KV lay the label out again to hold the slots its drop checked, and opens the rebuild over those slots in the worker's log. Readiness answers the request's decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.
 
 The rebuild runs one row per prefill step the request's layout lays out (`StreamLayout.steps`), in order, the last also writing the ids sampled since minus the last, as rows mid-prefill that nothing popped. Each row runs in its step's walk, cut by that walk's budget, and a walk the model doesn't chunk rebuilds whole. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
 
