@@ -44,7 +44,7 @@ def test_a_table_keeps_its_address_and_a_dropped_row_is_handed_on():
     assert rows.read("h", [0, "new", 2]).tolist() == [[0.0, 1.0], [8.0, 8.0], [4.0, 5.0]]
 
 
-def _mgmt(rows, loopback=None, row_signals=None, runner=None, world_size=1):
+def _mgmt(rows, loopback=None, row_signals=None, runner=None, world_size=1, step=True):
     submodule = SimpleNamespace(
         device_loopback=loopback,
         repeat_carry=lambda walk, signals: {s: CarryPair(f"{s}_out", s) for s in signals},
@@ -52,6 +52,7 @@ def _mgmt(rows, loopback=None, row_signals=None, runner=None, world_size=1):
     return SimpleNamespace(
         submodule=submodule, loopback_rows=rows, row_signals=row_signals or {}, accelerator_graph_runner=runner,
         joint_comm_group=SimpleNamespace(world_size=world_size),
+        template_steps={WALK: SimpleNamespace() if step else None},
     )
 
 
@@ -160,17 +161,23 @@ def _runner(shapes):
     return runner
 
 
-@pytest.mark.parametrize(("shapes", "world_size", "why"), [
-    ([(1, 4), (8, 4)], 1, None),
-    ([(1, 4), (8, 6)], 1, "runner: loop-back 'h' changes shape with the bucket"),
-    ([], 1, "runner: it has no capture"),
-    ([(1, 4)], 2, "deployment: it runs on more than one rank"),
-], ids=["fixed", "variable_shape", "no_capture", "tp"])
-def test_a_walk_keeps_a_loop_back_in_rows_only_at_a_fixed_shape_on_one_rank(shapes, world_size, why):
+@pytest.mark.parametrize(("shapes", "world_size", "step", "why"), [
+    ([(1, 4), (8, 4)], 1, True, None),
+    ([(1, 4), (8, 6)], 1, True, "runner: loop-back 'h' changes shape with the bucket"),
+    ([], 1, True, "runner: it has no capture"),
+    ([(1, 4)], 2, True, "deployment: it runs on more than one rank"),
+    # a DiT: nothing plans the rows, so its capture read the trash row (queue 17)
+    ([(1, 4)], 1, False, "node: it declares no step, so nothing places a row in the rows its capture reads"),
+], ids=["fixed", "variable_shape", "no_capture", "tp", "no_step"])
+def test_a_walk_keeps_a_loop_back_in_rows_only_at_a_fixed_shape_on_one_rank(shapes, world_size, step, why):
     engine = Engine.__new__(Engine)
-    mgmt = _mgmt(LoopbackRows(CPU), runner=_runner(shapes), world_size=world_size)
+    runner = _runner(shapes)
+    runner.template_step = lambda walk: mgmt.template_steps[walk]
+    mgmt = _mgmt(LoopbackRows(CPU), runner=runner, world_size=world_size, step=step)
     engine._submodules = {"n": mgmt}
-    engine._ask_rows("n", WALK, {"h"})
+    engine._ask_rows("n", WALK, {"h"}, runner)
+    # no step: its captures must not read rows at their head either
+    assert (WALK in mgmt.row_signals) is (step and world_size == 1)
     assert engine.rows_refusal("n", WALK) == why
     if why is None:
         assert mgmt.row_signals == {WALK: {"h": CarryPair("h_out", "h")}}

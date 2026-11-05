@@ -1004,7 +1004,7 @@ class Engine:
 
         for (node_name, walk), signals in kept_rows.items():
             if node_name in self._submodules:
-                self._ask_rows(node_name, walk, signals)
+                self._ask_rows(node_name, walk, signals, ag_runners.get(node_name))
         for node_name, submodule_mgmt in self._submodules.items():
             if submodule_mgmt.loopback_rows is not None:
                 ag_runners[node_name].bind_rows(
@@ -1809,12 +1809,16 @@ class Engine:
         loop, or None."""
         return self._submodules[node_name].accelerator_graph_runner.launch_refusal(graph_walk)
 
-    def _ask_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> None:
+    def _ask_rows(
+        self, node_name: str, graph_walk: str, signals: Collection[str], runner: "AcceleratorGraphRunner | None" = None,
+    ) -> None:
         """Before capture: keep each loop-back signal of this walk in the node's
         rows, beside a ``DeviceLoopback``'s, where it runs on one rank."""
         mgmt = self._submodules[node_name]
         if mgmt.loopback_rows is None or mgmt.joint_comm_group.world_size > 1:
             return
+        if runner is not None and runner.template_step(graph_walk) is None:
+            return  # nothing would place its rows for the captures to read (``rows_refusal`` says so)
         loopback = getattr(mgmt.submodule, "device_loopback", None)
         own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
         mgmt.row_signals[graph_walk] = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
@@ -1830,6 +1834,12 @@ class Engine:
         runner = mgmt.accelerator_graph_runner
         if runner is None:
             return "runner: the node captures no graphs"
+        steps = mgmt.template_steps
+        step = steps[graph_walk] if graph_walk in steps else runner.template_step(graph_walk)
+        if step is None:
+            # the rows' plan places each row's index for the capture's head and tail
+            mgmt.row_signals.pop(graph_walk, None)
+            return "node: it declares no step, so nothing places a row in the rows its capture reads"
         pairs = mgmt.row_signals.get(graph_walk, {})
         refusal = runner.row_refusal(graph_walk, {signal: pair.output for signal, pair in pairs.items()})
         if refusal is not None:
