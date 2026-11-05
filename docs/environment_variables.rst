@@ -326,7 +326,9 @@ Read by the ``mstar-server`` binary and its bridge
      - Path to the ``mstar-server`` binary. Fallback order:
        ``--rust-frontend-bin``, this variable, the running environment's
        scripts directory (where the Linux wheels install it), ``$PATH``, then
-       the in-repo ``rust/server/target/release`` build.
+       the in-repo ``rust/server/target/release`` build. In a checkout the
+       fallbacks skip a binary built from other sources, while this one is
+       used with a warning (``find_server_binary``).
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read

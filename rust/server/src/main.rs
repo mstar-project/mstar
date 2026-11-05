@@ -69,11 +69,29 @@ use utf8::Utf8Stream;
 
 #[tokio::main]
 async fn main() {
-    const USAGE: &str =
-        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]";
-    let model_name = std::env::args().nth(1).expect(USAGE);
+    const USAGE: &str = concat!(
+        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]\n",
+        "       mstar-server --source-hash",
+    );
+    // The content hashes of the rust/ and rust/server/ sources this binary was
+    // built from: the rlib's own, then build.rs's. find_server_binary reads
+    // them from the no-argument usage, since every mstar-server exits on no
+    // arguments while an older one would serve `--source-hash` as a model.
+    let sources = format!(
+        "{} {}",
+        mstar_rust::BUILD_SOURCE_HASH,
+        env!("MSTAR_SERVER_SOURCE_HASH")
+    );
+    let Some(model_name) = std::env::args().nth(1) else {
+        eprintln!("{USAGE}\nbuilt from sources {sources}");
+        std::process::exit(2);
+    };
     if model_name == "-h" || model_name == "--help" {
-        println!("{USAGE}");
+        println!("{USAGE}\nbuilt from sources {sources}");
+        return;
+    }
+    if model_name == "--source-hash" {
+        println!("{sources}");
         return;
     }
     let port: u16 = std::env::args()

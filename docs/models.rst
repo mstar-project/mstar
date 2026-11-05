@@ -732,6 +732,11 @@ CosyVoice3 notes
   float64).
   ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
   the estimator at the reference's precision instead, at lower throughput.
+- The flow's Euler solve is captured at startup as CUDA graphs, one per frame
+  bucket and batch size (``flow_capture_frame_buckets``,
+  ``flow_capture_batch_sizes``, ``flow_capture_batch_frames``), which takes GPU
+  memory and startup time. ``model_kwargs: {flow_capture_frame_buckets: []}``
+  captures none, and every solve runs eagerly.
 
 Qwen3-TTS notes
 ---------------
@@ -769,11 +774,11 @@ Qwen3-TTS notes
   pool. ``resources: {codec_state: {max_slots: N}}`` sizes it for N - 1
   streams (one slot is the pool's sink); 256 streams by default. Each chunk
   width is a CUDA-graph bucket captured for batch sizes 1 to 32 (densely: the
-  codec's cost is per row, so a padding row costs as much as a real one); the
-  scheduler batches each width apart, so a stream's small first chunks are not
-  padded to a full chunk's width or queued behind a batch of them. A voice
-  clone's stream leads with the reference's last 72 frames, decoded with the
-  first chunk to warm the state on the voice and trimmed from its audio.
+  codec's cost is per row, so a padding row costs as much as a real one). A
+  step takes ready chunks of any width and pads them to its widest, since a
+  step of its own for each width costs more than the padding. A voice clone's
+  stream leads with the reference's last 72 frames, decoded with the first
+  chunk to warm the state on the voice and trimmed from its audio.
   The SnakeBeta activations run as one fused kernel. A deployment sets the
   ramp and the steady chunk with ``model_kwargs: {codec_chunk_schedule: [1, 3,
   8, 16], codec_chunk_frames: 25}``. ``configs/qwen3tts_1p7b.yaml`` opens with
@@ -808,7 +813,15 @@ Qwen3-TTS notes
   unfused ops: the sampled residual codes can differ at near-ties. Each Talker
   keeps the sum it had before the two shared the component: Qwen3-TTS
   accumulates in the model dtype, rounding after every add (the reference sums
-  in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once.
+  in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With
+  ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more
+  SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
+  over runs the whole loop, sampling included, as one persistent kernel
+  (``mstar.model.qwen3_tts.components.depth_frame``). The kernel needs Triton
+  3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs
+  why and runs the loop. torchaudio has no build for torch 2.12, and decoding a
+  reference clip imports it, so a Base deployment that clones voices can't turn
+  the kernel on yet.
 - The Codec does not run beside the Talker on a side stream (``side_stream``,
   see :doc:`serving`): its windows read and write their streams' ``codec_state``
   rows, and the side lane only takes a node that holds no resources, since it
