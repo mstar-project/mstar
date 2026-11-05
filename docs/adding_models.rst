@@ -1684,7 +1684,7 @@ step with ``Resource.max_repeats``, for what only that step decides (free pages,
 penalty), and the step runs the smallest answer. Whatever it counts per step (stored lengths, positions,
 recurrent token counts) it counts with ``StepContext.run_span``, not the declared
 ``span``. What a replay reads that its capture doesn't advance moves in
-``Resource.next_replay``, between replays. Each per-iteration output of the node in its
+``Resource.replay_columns``, before each replay. Each per-iteration output of the node in its
 Loop (a client, streaming or accumulated edge) keeps a column per replay, which must be
 a row output of the capture; at STORE each row routes the iterations its stop kept, one
 item each, less an EOS iteration's item of a withheld output. A step that emits a count of

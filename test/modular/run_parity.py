@@ -34,12 +34,12 @@ def replay_run(
             for name, tensor in forward(**static).items():
                 outputs[name].copy_(tensor)
 
-    slot = SimpleNamespace(graph=Graph(), static_inputs=static, static_outputs=SimpleNamespace(
+    slot = SimpleNamespace(graph=Graph(), raw_launch=False, static_inputs=static, static_outputs=SimpleNamespace(
         check_stop_buffers={name: outputs[name] for name in stop_buffers}, output_spans=None,
         row_outputs={name: value for name, value in outputs.items() if not name.startswith("__")},
         packed_outputs={name: value for name, value in outputs.items() if name.startswith("__")},
     ))
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    stops, rows, _ = runner.repeat(None, carries, repeats, lambda: None, columns, iteration)
+    stops, rows, _ = runner.repeat(None, carries, repeats, (), columns, iteration)
     return stops, rows

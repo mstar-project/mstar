@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
@@ -22,6 +22,9 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
+
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +97,9 @@ class StepRunner:
             if type(self._resources[key]).publish is not Resource.publish
         ]
         # and the ones with something to do between the replays of a step that repeats
-        self._next_replay_order = [
+        self._replay_column_order = [
             key for key in self._order
-            if type(self._resources[key]).next_replay is not Resource.next_replay
+            if type(self._resources[key]).replay_columns is not Resource.replay_columns
         ]
         # Same for admit_retrieve, which check_ready drives per ready request
         # per scheduler scan — the hottest sweep here. The base returns
@@ -562,10 +565,13 @@ class StepRunner:
             ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
         ))
 
-    def next_replay(self, step: SubmoduleStep) -> None:
-        for key in self._next_replay_order:
+    def replay_columns(self, step: SubmoduleStep, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Every resource's ``Resource.replay_columns`` for this step."""
+        columns = []
+        for key in self._replay_column_order:
             if (resource_step := step.get(key)) is not None:
-                self._resources[key].next_replay(resource_step, step.ctx)
+                columns.extend(self._resources[key].replay_columns(resource_step, step.ctx, repeats))
+        return columns
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything

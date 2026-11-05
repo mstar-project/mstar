@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import torch
 
@@ -42,6 +43,14 @@ class XPUGraphPool(AcceleratorGraphPool):
 
     def on_success(self) -> None:
         self.failed_graph = None
+
+
+class RawLaunch(NamedTuple):
+    """The addresses a raw run of a graph goes through."""
+    graph_launch: int
+    memcpy_2d: int
+    exec: int
+    stream: int
 
 
 class AcceleratorGraphBackend(ABC):
@@ -100,6 +109,19 @@ class AcceleratorGraphBackend(ABC):
     @abstractmethod
     def recover_failed_capture(self, pool: AcceleratorGraphPool, stream: Any) -> None:
         pass
+
+    def launch_refusal(self) -> str | None:
+        """Why a graph can't be launched raw (``raw_launch``), or None."""
+        return f"{type(self).__name__} launches no raw graphs"
+
+    def raw_launch(self, graph: CapturedGraph) -> RawLaunch:
+        """What ``mstar_rust.launch_run`` needs to launch ``graph`` on the current stream."""
+        raise NotImplementedError(self.launch_refusal())
+
+    def advances_generator(self, graph: CapturedGraph) -> bool:
+        """Whether a replay of ``graph`` moves a registered RNG generator, which
+        a raw launch doesn't do: its draws would repeat. Replays it once."""
+        return False
 
     def conditional_refusal(self) -> str | None:
         """Why a capture can't hold a conditional node (``conditional``), or None."""
@@ -200,6 +222,30 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
+
+    def _runtime_entry(self, name: str) -> int:
+        """A libcudart entry point's address, by the soname of torch's CUDA
+        major, which reaches the copy torch already loaded."""
+        lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
+        return ctypes.cast(getattr(lib, name), ctypes.c_void_p).value
+
+    def launch_refusal(self) -> str | None:
+        if not torch.version.cuda or torch.version.hip is not None:
+            return "this torch has no CUDA runtime to launch through"
+        return None
+
+    def raw_launch(self, graph: CapturedGraph) -> RawLaunch:
+        return RawLaunch(
+            self._runtime_entry("cudaGraphLaunch"), self._runtime_entry("cudaMemcpy2DAsync"),
+            int(graph.raw_cuda_graph_exec()), int(self.current_stream().cuda_stream),
+        )
+
+    def advances_generator(self, graph: CapturedGraph) -> bool:
+        generator = torch.cuda.default_generators[self.device.index or 0]
+        before = generator.get_offset()
+        graph.replay()
+        self.synchronize()
+        return generator.get_offset() != before
 
     def conditional_refusal(self) -> str | None:
         # torch binds the IF node from 2.12, on CUDA 12.4 and up, never on ROCm

@@ -349,8 +349,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        its KV and recurrent state stay where its stop left them; it needs a resident walk.
        Both need a token stop, one rank, and a backend with conditional graph nodes (torch
        2.12 and up, CUDA 12.4 and up). At startup the worker logs one line per Loop walk with each capability
-       (``resident``, ``repeats``, ``rows``, ``device stop``) ``on``, ``off: not asked for``,
-       or ``off: <owner>: <reason>``. ``rows``: a node asked for
+       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``) ``on``,
+       ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
+       and copies go out from one Rust call with the GIL released; a capture that draws from
+       a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for
        resident planning or repeats keeps its fixed-shape loop-back values in device rows
        between steps (``mstar.engine.loopback_rows``), so a step whose every output stays on
        the device routes no tensor. A setting other than ``max`` on a node whose ``max`` is

@@ -9,6 +9,7 @@ set of resources plans the same requests on the host as the reference.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import random
 import sys
 from functools import partial
@@ -481,11 +482,44 @@ def test_a_step_with_no_capture_for_its_batch_runs_one_iteration(captured):
     assert batch.step_context.repeats == (4 if captured else 1)
 
 
-def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay():
+def _raw_backend(slot):
+    """A backend whose raw launch replays ``slot``'s graph and whose 2D copy
+    moves bytes on the host, through the C entry points the Rust loop calls;
+    and the calls it took, in order."""
+    from mstar.engine.accelerator_graph_backend import RawLaunch
+
+    calls = []
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def launch(graph_exec, stream):
+        assert (graph_exec, stream) == (1, 2)
+        calls.append("launch")
+        slot.graph.replay()
+        return 0
+
+    @ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+        ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+    )
+    def copy(dst, dst_pitch, src, src_pitch, width, height, kind, stream):
+        assert kind == 3 and stream == 2
+        calls.append("copy")
+        for row in range(height):
+            ctypes.memmove(dst + row * dst_pitch, src + row * src_pitch, width)
+        return 0
+
+    addresses = [ctypes.cast(fn, ctypes.c_void_p).value for fn in (launch, copy)]
+    backend = SimpleNamespace(raw_launch=lambda graph: RawLaunch(*addresses, 1, 2), keep=(launch, copy))
+    return backend, calls
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["host_loop", "rust_loop"])
+def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay(raw):
     """A replay overwrites its outputs and reads its static inputs, so a step
     that repeats hands each replay what the one before left of every
     loop-back signal (a token, a float embedding under another name, a long
-    counter) and keeps a column of each per-iteration output."""
+    counter) and keeps a column of each per-iteration output, whichever loop
+    launches it."""
     from mstar.model.submodule_base import CarryPair
 
     tokens, ids = torch.tensor([5, 7]), torch.zeros(2, 1, dtype=torch.long)
@@ -501,7 +535,7 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay()
             frames.copy_(tokens[:, None] * torch.tensor([1.0, -1.0]))
 
     slot = SimpleNamespace(
-        graph=Graph(), static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
+        graph=Graph(), raw_launch=raw, static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
         static_outputs=SimpleNamespace(
             check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
             row_outputs={"frame": frames, "embeds": embeds, "step": step}, output_spans=None, packed_outputs={},
@@ -513,13 +547,46 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay()
     }
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    wide, rows, _ = runner.repeat(None, carries, 3, lambda: None, ["frame"])
+    runner._graph_backend, calls = _raw_backend(slot)
+    wide, rows, _ = runner.repeat(None, carries, 3, (), ["frame"])
+    if raw:
+        # each replay's columns out, then the next one's carries in and its launch
+        assert calls == ["copy"] * 2 + (["copy"] * 3 + ["launch"] + ["copy"] * 2) * 2
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
     # the last replay's outputs, each from the replay before's
     assert embeds.reshape(-1).tolist() == [2.0, 6.0] and step.tolist() == [12, 22]
     # a per-iteration output keeps each replay's rows: [rows, replays, ...]
     assert rows["frame"].tolist() == [[[5, -5], [6, -6], [7, -7]], [[7, -7], [8, -8], [9, -9]]]
+
+
+def test_a_run_a_copy_of_which_casts_stays_on_the_hosts_loop():
+    from mstar.engine.accelerator_graph_runner import _launch_words
+
+    assert _launch_words([None, (torch.zeros(2), torch.zeros(2))]) is not None
+    assert _launch_words([None, (torch.zeros(2), torch.zeros(2, dtype=torch.long))]) is None
+
+
+def test_a_capture_that_draws_from_a_torch_generator_keeps_the_hosts_loop():
+    """A raw launch doesn't advance torch's generators, so its draws would repeat."""
+    slot = SimpleNamespace(graph=object(), raw_launch=False)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._buckets = {0: SimpleNamespace(config=SimpleNamespace(capture_graph_walk=WALK), slots=[slot])}
+    runner._graph_backend = SimpleNamespace(launch_refusal=lambda: None, advances_generator=lambda graph: True)
+    assert "torch generator" in runner.launch_refusal(WALK) and slot.raw_launch is False
+    runner._graph_backend.advances_generator = lambda graph: False
+    assert runner.launch_refusal(WALK) is None and slot.raw_launch is True
+    runner._graph_backend = SimpleNamespace(launch_refusal=lambda: "no runtime")
+    assert runner.launch_refusal(WALK) == "backend: no runtime"
+
+
+def test_a_decode_wrappers_lengths_move_one_a_replay_as_a_column():
+    wrapper = FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)
+    wrapper._paged_kv_last_page_len_buf = torch.tensor([3, 5, 9], dtype=torch.int32)
+    wrapper._replay_rows = 2
+    column, target = wrapper.replay_column(3)
+    assert column.tolist() == [[3, 4, 5], [5, 6, 7]] and column.dtype == torch.int32
+    assert target.data_ptr() == wrapper._paged_kv_last_page_len_buf.data_ptr() and len(target) == 2
 
 
 @pytest.mark.parametrize(("preprocess", "refused"), [
@@ -745,9 +812,9 @@ def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
     bucket = BucketKey(graph_walk=WALK, bs=1, num_tokens=1)
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._current_plan_states = {"main": FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)}
-    manager.next_replay(None, SimpleNamespace(
+    assert manager.replay_columns(None, SimpleNamespace(
         slot_lease=SlotLease(slot=0, bucket=bucket), resident=SimpleNamespace(host_plan_free={bucket}),
-    ))
+    ), 4) == []
 
 
 def test_cached_pages_are_room_for_a_step_that_repeats():
@@ -2685,7 +2752,7 @@ def test_a_run_stages_each_replays_iteration_input_before_it():
             seen.append(cond_in.tolist())
 
     slot = SimpleNamespace(
-        graph=Graph(), static_inputs={"cond": cond_in},
+        graph=Graph(), raw_launch=False, static_inputs={"cond": cond_in},
         static_outputs=SimpleNamespace(check_stop_buffers={"t": torch.zeros(2)}, row_outputs={}, output_spans=None),
     )
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
@@ -2693,7 +2760,7 @@ def test_a_run_stages_each_replays_iteration_input_before_it():
     columns = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     cond_in.copy_(columns[:, 0])  # the first replay's, staged with the step
     seen.append(cond_in.tolist())
-    runner.repeat(None, {}, 3, lambda: None, iteration={"cond": columns})
+    runner.repeat(None, {}, 3, iteration={"cond": columns})
     assert seen == [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
 
 

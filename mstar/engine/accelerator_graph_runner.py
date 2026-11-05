@@ -657,6 +657,40 @@ def output_named(outputs, name: str) -> torch.Tensor | None:
     return None
 
 
+def _copy_words(target: torch.Tensor, source: torch.Tensor) -> list[int] | None:
+    """``target.copy_(source)`` as a launch op's words: destination, its pitch,
+    source, its pitch, row width and rows, in bytes. None where that can't say
+    it: a cast, a broadcast, or rows that aren't contiguous."""
+    if target.shape != source.shape or target.dtype != source.dtype or target.numel() == 0:
+        return None
+    if target.is_contiguous() and source.is_contiguous():
+        size = target.numel() * target.element_size()
+        return [target.data_ptr(), size, source.data_ptr(), size, size, 1]
+    if target.dim() == 0 or not (target[0].is_contiguous() and source[0].is_contiguous()):
+        return None
+    item = target.element_size()
+    return [
+        target.data_ptr(), target.stride(0) * item, source.data_ptr(), source.stride(0) * item,
+        target[0].numel() * item, target.shape[0],
+    ]
+
+
+def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | None]) -> list[int] | None:
+    """``ops`` as ``mstar_rust.launch_run`` takes them, or None if one of them
+    can't be said (that run stays on the host's loop)."""
+    words: list[int] = []
+    for op in ops:
+        if op is None:
+            words.append(0)
+            continue
+        copy = _copy_words(*op)
+        if copy is None:
+            return None
+        words.append(1)
+        words.extend(copy)
+    return words
+
+
 def _probe_rows(
     inputs: Sequence[NodeInputs], carries: Mapping[str, CarryPair],
 ) -> tuple[list[NodeInputs], dict[str, list[torch.Tensor]]]:
@@ -701,6 +735,8 @@ class AcceleratorGraphSlot:
     config_idx: int
     # the run's stop marks, where the capture skips a replay whose rows all stopped
     device_stop: "DeviceStop | None" = None
+    # whether a run of it launches through ``mstar_rust.launch_run``
+    raw_launch: bool = False
 
 
 class DeviceStop:
@@ -1834,18 +1870,21 @@ class AcceleratorGraphRunner:
         return slot.static_outputs
 
     def repeat(
-        self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int, next_replay: Callable[[], None],
+        self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int,
+        replay_columns: Collection[tuple[torch.Tensor, torch.Tensor]] = (),
         columns: Collection[str] = (), iteration: Mapping[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """The rest of a step that repeats, after its first replay: before
         each replay, every loop-back signal's output is copied into the static
         input it feeds (``carries``), and each iteration input's column for
-        that replay into its own (``iteration``, ``[rows, repeats, ...]``). Returns the stop buffers, one value a
-        row each, and the row outputs named in ``columns``, ``[rows, ...]``
-        each, both with a column per replay (``[rows, repeats, ...]``): a
-        replay overwrites what the last one left, so each is copied out on the
-        stream before the next one. Third, the spans of the spanned ones
-        among ``columns`` (``[rows, repeats, 2]``)."""
+        that replay into its own (``iteration``, ``[rows, repeats, ...]``), and
+        the resources' into theirs (``replay_columns``, column then target).
+        Returns the stop buffers, one value a row each, and the row outputs
+        named in ``columns``, ``[rows, ...]`` each, both with a column per
+        replay (``[rows, repeats, ...]``): a replay overwrites what the last
+        one left, so each is copied out on the stream before the next one.
+        Third, the spans of the spanned ones among ``columns``
+        (``[rows, repeats, 2]``)."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
@@ -1861,21 +1900,54 @@ class AcceleratorGraphRunner:
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
         unique.update((id(t), t) for t in (*rows_out.values(), *spans_out.values()))
         wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
+        # the run, in order: a launch is None, a copy its target and source
+        ops: list[tuple[torch.Tensor, torch.Tensor] | None] = []
         for i in range(repeats):
             if i:
-                for source, target in copies:
-                    target.copy_(source.reshape(target.shape))
-                for column, target in stage:
-                    target.copy_(column[:, i].reshape(target.shape))
-                next_replay()
-                slot.graph.replay()
-            for key, tensor in unique.items():
-                wide[key][:, i].copy_(tensor)
+                ops.extend((target, source.reshape(target.shape)) for source, target in copies)
+                ops.extend((target, column[:, i].reshape(target.shape)) for column, target in stage)
+                ops.extend((target, column[:, i]) for column, target in replay_columns)
+                ops.append(None)
+            ops.extend((wide[key][:, i], tensor) for key, tensor in unique.items())
+        self._run(slot, ops)
         return (
             {key: wide[id(t)] for key, t in buffers.items()},
             {key: wide[id(t)] for key, t in rows_out.items()},
             {key: wide[id(t)] for key, t in spans_out.items()},
         )
+
+    def _run(self, slot: AcceleratorGraphSlot, ops: Sequence[tuple[torch.Tensor, torch.Tensor] | None]) -> None:
+        """A run's launches and copies, in order: from one Rust call with the
+        GIL released where it can (``mstar_rust.launch_run``), else here."""
+        words = _launch_words(ops) if slot.raw_launch else None
+        if words is not None:
+            import mstar_rust
+
+            mstar_rust.launch_run(*self._graph_backend.raw_launch(slot.graph), words)
+            return
+        for op in ops:
+            if op is None:
+                slot.graph.replay()
+            else:
+                op[0].copy_(op[1])
+
+    def launch_refusal(self, walk: str) -> str | None:
+        """After capture: why a run of ``walk`` can't launch from one Rust call,
+        or None. A raw launch doesn't move torch's generators, so a capture
+        that draws from one would repeat its draws (mstar's samplers pass
+        explicit seeds and offsets)."""
+        if (refusal := self._graph_backend.launch_refusal()) is not None:
+            return f"backend: {refusal}"
+        slots = [
+            bucket.slots for bucket in self._buckets.values() if bucket.config.capture_graph_walk == walk
+        ]
+        for bucket_slots in slots:
+            if self._graph_backend.advances_generator(bucket_slots[0].graph):
+                return "runner: its capture draws from a torch generator, which a raw launch doesn't advance"
+        for bucket_slots in slots:
+            for slot in bucket_slots:
+                slot.raw_launch = True
+        return None
 
     def carry_refusal(self, walk: str, carries: Mapping[str, CarryPair]) -> str | None:
         """Why a run of ``walk``'s captures can't carry each loop-back signal

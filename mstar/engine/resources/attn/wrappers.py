@@ -611,8 +611,10 @@ class FlashInferDecodeWrapper:
         last_page_len[:rows] -= repeats - 1
         return last_page_len
 
-    def next_replay(self) -> None:
-        self._paged_kv_last_page_len_buf[:self._replay_rows].add_(1)
+    def replay_column(self, repeats: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each replay's ``last_page_len``: one more than the replay before it."""
+        lengths = self._paged_kv_last_page_len_buf[:self._replay_rows]
+        return lengths.unsqueeze(1) + torch.arange(repeats, dtype=lengths.dtype, device=lengths.device), lengths
 
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the

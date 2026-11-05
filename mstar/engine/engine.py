@@ -1640,6 +1640,11 @@ class Engine:
             return "runner: the node captures no graphs"
         return mgmt.accelerator_graph_runner.device_stop_refusal(graph_walk)
 
+    def launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why a run of this walk stays on the host's launch
+        loop, or None."""
+        return self._submodules[node_name].accelerator_graph_runner.launch_refusal(graph_walk)
+
     def keep_loopback_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
         """Keep each loop-back signal of this walk (``signals``) in the node's
         loop-back rows, beside a ``DeviceLoopback``'s; why it can't, or None.
@@ -2445,7 +2450,7 @@ class Engine:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
                 stops, rows, spans = cg_runner.repeat(
                     lease, submodule_mgmt.carries[graph_walk], ctx.repeats,
-                    partial(self._runner.next_replay, step), columns, batch.iteration_columns,
+                    self._runner.replay_columns(step, ctx.repeats), columns, batch.iteration_columns,
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},

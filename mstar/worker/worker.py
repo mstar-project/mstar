@@ -3019,6 +3019,12 @@ class Worker:
         edges = self._step_repeats.edges[(node_name, graph_walk)]
         return self.engine_manager.get_engine(node_name).keep_loopback_rows(node_name, graph_walk, loop_back(edges))
 
+    def _launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why this walk's runs stay on the host's launch loop, or None."""
+        if not self._step_repeats.may_repeat(node_name, graph_walk):
+            return NOT_ASKED
+        return self.engine_manager.get_engine(node_name).launch_refusal(node_name, graph_walk)
+
     def _device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs don't skip a replay whose rows have all
         stopped, or None: asked by the node's ``device_stop``."""
@@ -5303,7 +5309,10 @@ class Worker:
             # after capture: an attention decides repeats from the kernels it captured
             self._step_repeats.settle(
                 self.engine_manager.engine.resident_refusal, self._repeat_refusal,
-                {"rows": self._rows_refusal, "device stop": self._device_stop_refusal},
+                {
+                    "rows": self._rows_refusal, "device stop": self._device_stop_refusal,
+                    "launch loop": self._launch_refusal,
+                },
             )
             self.streams.windows = self._step_repeats.windows()
 

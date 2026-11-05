@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch
+
     # `resident.py` imports `Resource`, which inherits from here
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
@@ -40,10 +42,11 @@ class ResidentHooks:
         only narrow."""
         return ANY_REPEATS
 
-    def next_replay(self, step, ctx) -> None:
-        """Queue, on the step's stream, what the next replay of a step that
-        repeats reads and its capture doesn't advance itself."""
-        return
+    def replay_columns(self, step, ctx, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """What each replay of a step that repeats reads and its capture doesn't
+        advance itself: ``(column, target)`` pairs, ``column[:, i]`` going into
+        ``target`` before replay i. Queued on the step's stream after its first."""
+        return []
 
     def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
         """Why a walk of a node holding this resource can't run on resident

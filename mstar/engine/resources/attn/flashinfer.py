@@ -115,7 +115,7 @@ class FlashInferManager(AttentionManager):
 
     def max_repeats(self, step, ctx) -> int:
         """A kernel that reads the tables sees each replay's lengths. So does one
-        planned for the step's last replay, whose lengths move in `next_replay`.
+        planned for the step's last replay, whose lengths move in `replay_columns`.
         Per bucket: each captured its own wrapper."""
         lease = ctx.slot_lease
         if ctx.resident is None or lease.bucket in ctx.resident.host_plan_free:
@@ -125,14 +125,15 @@ class FlashInferManager(AttentionManager):
         wrapper = self._cg_plan_states.get(key)
         return ANY_REPEATS if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move else 1
 
-    def next_replay(self, step, ctx) -> None:
+    def replay_columns(self, step, ctx, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         if ctx.resident is None:
-            return  # a host-planned step's lengths don't move
+            return []  # a host-planned step's lengths don't move
         if ctx.slot_lease.bucket in ctx.resident.host_plan_free:
-            return  # planned nothing, so what's held is an earlier step's
-        for wrapper in self._current_plan_states.values():
-            if isinstance(wrapper, FlashInferDecodeWrapper):
-                wrapper.next_replay()
+            return []  # planned nothing, so what's held is an earlier step's
+        return [
+            wrapper.replay_column(repeats) for wrapper in self._current_plan_states.values()
+            if isinstance(wrapper, FlashInferDecodeWrapper)
+        ]
 
     def resident_refusal(self, key, streams) -> str | None:
         if self._window_left >= 0:
