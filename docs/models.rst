@@ -1779,7 +1779,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
    DiT's joint attention on the engine's ragged resource; both are CUDA-graph replayable.
    The resource's kernel is the GPU's (:ref:`Cacheless attention (encoder towers)`): on B300 its table picks cuDNN for klein 4B, 9B and Z-Image, which
-   FlashInfer's captured FA2 path ran 3.4x slower; elsewhere it is FlashInfer.
+   FlashInfer's captured FA2 path ran about 4x slower; elsewhere it is FlashInfer.
    ``resources: {dit_attn: {backend: flashinfer}}`` keeps FlashInfer on any GPU.
 
 ``compile``

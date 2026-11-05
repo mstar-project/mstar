@@ -984,7 +984,7 @@ with no entry, a varlen layout, or an explicit ``backend`` / ``flashinfer_backen
 serving config keeps FlashInfer. ``python -m benchmark.kernels.sweep ragged_attention``
 writes the table (``benchmark/kernels/README.md``). On B300 (``sm_103``) the table picks
 cuDNN for the image DiTs: captured, FlashInfer's ``auto`` lands on its FA2 kernels there,
-3.4x slower at 4608 tokens.
+about 4x slower at 4608 tokens.
 
 BAGEL's SigLIP2 tower is the reference implementation. The spec stands alone, over the
 encoder node only, and names no cache:
