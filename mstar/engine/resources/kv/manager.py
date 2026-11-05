@@ -4714,9 +4714,11 @@ class KVManager(AttentionResource):
             if rid not in self._asks:
                 # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
                 return None
+            # read before `_need`, so that a snapshot filed between the two moves the counts past the mark
+            counts = self._index_counts()
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room or not self._admit(rid, pages, self.journal):
-                return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
+                return RoomMark(rid, node_name, graph_walk, published, room, *counts)
             return None
 
     def reserve_past(
@@ -4736,10 +4738,12 @@ class KVManager(AttentionResource):
         for prefix_chain in chains:
             self._root_chain(prefix_chain)
         with self._lock:
+            # before `_need`, as in `reserve`
+            counts = self._index_counts()
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
             room = self._room() - self._kept
             if pages > room:
-                return PassMark(room, *self._index_counts())
+                return PassMark(room, *counts)
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
             if not self._admit(rid, pages, self.journal, passed=True):
