@@ -585,6 +585,25 @@ def test_small_dev_shm_answers_every_statvfs_form():
     assert out.strip() == "ok"
 
 
+def test_mps_daemon_runs_its_lifecycle_on_the_drivers_stand_in(tmp_path):
+    """mstar's own MPS daemon, under the launcher: the control tool comes up, answers while
+    it runs, quits on ``quit``, and fails a command once it is gone."""
+    script = tmp_path / "mps.py"
+    script.write_text(textwrap.dedent("""
+        from mstar.conductor.mps import MpsDaemon
+        daemon = MpsDaemon()
+        daemon.start()
+        assert daemon._command("get_server_list")
+        proc = daemon._proc
+        daemon.stop()
+        assert proc.returncode == 0 and not daemon._command("get_server_list"), proc.returncode
+        print("ok")
+    """))
+    proc = subprocess.run([sys.executable, "-m", "mstar_sim", "--", str(script)], cwd=ROOT, capture_output=True,
+                          text=True, timeout=120, check=False, env=dict(os.environ, PYTHONPATH=ROOT))
+    assert proc.stdout.strip() == "ok", proc.stderr[-3000:]
+
+
 def test_memory_tracking_lock_is_reentrant():
     """A tensor freed by a garbage collection that runs while the tracker holds
     its lock releases its storage on the same thread: a plain lock deadlocks."""

@@ -49,6 +49,8 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
     if env.get("PYTHONPATH"):
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
+    # the driver's tools: nvidia-cuda-mps-control, for mstar's MPS daemon
+    env["PATH"] = os.pathsep.join([os.path.join(HERE, "_bin"), env.get("PATH", "")])
     return env
 
 

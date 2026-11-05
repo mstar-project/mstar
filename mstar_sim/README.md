@@ -46,7 +46,7 @@ Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_
 | Weights | Read from safetensors headers only; a model built on the CPU in a worker allocates nothing. | `patches.py` |
 | Kernel stand-ins | A `flashinfer` package, mstar's GDN and causal-conv kernels, Triton launches: each is one priced kernel that returns its outputs' shapes (`clock.kernel_fn`). | `fake_libs/`, `kernels.py`, `triton_launch.py` |
 | Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo. Ranks meet at each collective over GPU tensors, as NCCL's do, and a rank whose collective doesn't pair with its peers' (skipped, reordered, another size) aborts, printing every rank's; a captured graph meets once per group at each replay, on its whole collective sequence. Data moves only if every rank holds values; each collective is charged its NCCL time on every rank. | `dist.py` |
-| Bootstrap | A `sitecustomize` the launcher puts on `PYTHONPATH` installs the emulator in every process. | `_site/`, `install.py`, `__main__.py` |
+| Bootstrap | A `sitecustomize` the launcher puts on `PYTHONPATH` installs the emulator in every process. The launcher also puts the driver's `nvidia-cuda-mps-control` on `PATH`, a stand-in that runs mstar's MPS daemon lifecycle (`mps: true`). | `_site/`, `_bin/`, `install.py`, `__main__.py` |
 
 Prior art it follows: SGLang's simulator (real scheduler, predicted forward, fake tokens),
 AIConfigurator (measured op tables, utilization-space interpolation), Vidur (per-request
