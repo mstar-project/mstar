@@ -55,6 +55,24 @@ def _all_to_all_single(
     return recv
 
 
+# torch 2.13 renamed the into-tensor collectives to the *_single scheme.
+# Import-time selection keeps the fallback out of compiled call paths.
+_all_gather_single = getattr(dist, "all_gather_single", None)
+if _all_gather_single is None:
+    _all_gather_single = getattr(
+        getattr(dist, "distributed_c10d", None), "all_gather_single", None
+    )
+_all_gather_into_tensor = _all_gather_single or dist.all_gather_into_tensor
+
+
+def _barrier(group: dist.ProcessGroup | None = None) -> None:
+    """Barrier without torch 2.13's implicit-device warning on NCCL groups."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier(group=group)
+
+
 class ArFusionWorkspace(NamedTuple):
     """A fused all-reduce workspace of a ``CommGroup``: its id in
     ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
@@ -148,7 +166,7 @@ class CommGroup:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather
-        dist.all_gather_into_tensor(output_tensor, input_, group=self._device_pg())
+        _all_gather_into_tensor(output_tensor, input_, group=self._device_pg())
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -678,7 +696,7 @@ class WorkerParallelGroups:
         """
         if not self.any_parallelism:
             return
-        dist.barrier()
+        _barrier()
 
     def restore_default_timeout(self) -> None:
         """Give every group this rank holds torch's default timeout back."""
