@@ -41,6 +41,8 @@ from mstar.worker.micro_scheduler import (  # noqa: E402
     ScheduledBatch,
 )
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
+from mstar.worker.request_lifecycle import RequestLifecycle  # noqa: E402
+from mstar.worker.services import WorkerLayout  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
@@ -97,8 +99,7 @@ def _worker(scheduler, runtime, lockstep=None):
         _in_flight_rids=set(),
         _rows_by_lane={},
         chunk_loops=ChunkLoops(),
-        _is_tearing_down=lambda rid: False,
-        _teardowns_pending=lambda: False,
+        lifecycle=RequestLifecycle(layout=WorkerLayout()),
     )
     streams = StreamBufferManager(worker.request_state, worker.tensor_manager, [])
     streams.consumer_node = {STREAM: NODE}

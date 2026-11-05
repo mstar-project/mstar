@@ -140,7 +140,7 @@ def _run(
     for n in range(2 * sum(steps.values()) + 2):
         for rid in sorted(rid for rid in steps if arrive_at.get(rid, 0) == n):
             runtime.requests[rid] = None
-            sched.note_arrival(rid)
+            sched.lifecycle.add(rid, str(rid))
         runtime.ready |= {rid for rid in steps if ready_at[rid] == n}
         runtime.checked.clear()
         step = None
@@ -288,7 +288,7 @@ def test_a_refusal_under_turns_keeps_the_next_row_in_line_on_the_device():
     sched, state = _scheduler(runtime, TURNS)
     for rid in range(4):
         runtime.requests[rid] = None
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
         if rid < 3:
             _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
     runtime.ready |= {0, 1, 2, 3}
@@ -310,7 +310,7 @@ def test_a_refusal_under_arrival_takes_the_row_last_in_line():
     runtime = _Runtime()
     sched, _ = _scheduler(runtime, ARRIVAL)
     for rid in range(3):
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
         _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
 
     assert sched.last_in_line(NODE, WALK, [0, 1, 2]) == 1
@@ -361,11 +361,12 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     )
     bound(sched, state)
     for name in ("_pin_step_thread", "_init_engine_thread",
-                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
-                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
-                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+                 "_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
+                 "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
         setattr(w, name, stub)
+    for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, stub)
     w.lockstep.broadcast = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = lambda pending, consecutive, fair: (None, None)
@@ -385,7 +386,7 @@ def test_the_run_loop_counts_a_steps_turns_once_its_admit_takes_it(monkeypatch):
     sched, state = _scheduler(runtime, TURNS)
     for rid in (0, 1):
         runtime.requests[rid] = None
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     runtime.ready |= {0, 1}
 
     with pytest.raises(_StopLoopError):

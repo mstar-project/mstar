@@ -75,26 +75,28 @@ def _manager() -> KVManager:
 def _worker(runner: StepRunner) -> Worker:
     """The real ``_add_new_request``, with the engine cut down to its resources."""
     rids = RidTable()
-    w = make_worker(
-        _graph_runtime=SimpleNamespace(
-        add_request=lambda request_id, **kw: rids.intern(request_id),
-        get_rid_handle=rids.handle,
-        get_sharding_config=lambda rid: None,
-        register_stop_limits=lambda rid, info: None,
-    ),
-        request_state=RequestStateManager(),
-        scheduler=SimpleNamespace(note_arrival=lambda rid: None),
-        tensor_manager=SimpleNamespace(
+    request_state = RequestStateManager()
+    tensor_manager = SimpleNamespace(
         register_request=lambda rid, sharding: None,
         start_read_tensors=lambda rid, edges, graph_walk=None: [],
-    ),
-        engine_manager=SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}),
-        add_request=lambda rid, configs, info: runner.ingest_request(rid, configs),
-    ),
     )
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    w = make_worker(
+        _graph_runtime=SimpleNamespace(
+            add_request=lambda request_id, **kw: rids.intern(request_id),
+            get_rid_handle=rids.handle,
+            get_sharding_config=lambda rid: None,
+            register_stop_limits=lambda rid, info: None,
+        ),
+        request_state=request_state,
+        tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}),
+            add_request=lambda rid, configs, info: runner.ingest_request(rid, configs),
+        ),
+        streams=StreamBufferManager(request_state, tensor_manager, []),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
+    )
+    w.rids = rids
     return w
 
 
@@ -126,13 +128,13 @@ def _step(kv: KVManager, rid: int, span: int, walk: str) -> None:
 def test_a_second_partition_keeps_a_dropped_chain_dropped():
     kv = _manager()
     w = _worker(StepRunner({KV: kv}, node_resources={NODE: [KV]}))
-    w._add_new_request(_new_request("A", 2 * PAGE_SIZE))
-    rid = w._rid(WIRE)
+    w.ingest._add_new_request(_new_request("A", 2 * PAGE_SIZE))
+    rid = w.rids.handle(WIRE)
     # a walk the keys don't name writes the first page, so the chain ends
     _step(kv, rid, PAGE_SIZE, "image")
     assert kv._streams[rid]["main"].chain is None
 
-    w._add_new_request(_new_request("B", 2 * PAGE_SIZE))
+    w.ingest._add_new_request(_new_request("B", 2 * PAGE_SIZE))
     _step(kv, rid, PAGE_SIZE, WALK)
 
     assert kv._streams[rid]["main"].chain is None

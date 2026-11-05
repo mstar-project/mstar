@@ -167,7 +167,7 @@ def _evicting_worker(holders, sched=None, runtime=None):
     worker = _refusal_worker(sched, runtime)
     _engine(worker).holders.update(holders)
     for rid in holders:
-        worker.scheduler.note_arrival(rid)
+        worker.scheduler.lifecycle.add(rid, str(rid))
         worker.scheduler.note_ran(_sched_batch([rid]))
     return worker
 
@@ -210,12 +210,12 @@ def test_offloading_requeues_without_evicting():
 def test_allocation_failure_still_evicts():
     worker = _evicting_worker(["holder"])
     spared = []
-    worker._apply_pending_removes_safe_to_drop = spared.append
+    worker._teardown = spared.append
     worker._handle_admit_failure(
         *_batches(_alloc_failed()), referenced_rids=frozenset({"spec_rid"}),
     )
 
-    # the set has to reach the handler: it is what the teardown flush spares
+    # the set has to reach the teardown: it is what the teardown spares
     assert spared == [frozenset({"spec_rid"})]
     assert _engine(worker).offloaded == ["holder"]
     # exactly one push-back per request: the delegation must not double up
@@ -448,7 +448,7 @@ def _victim(worker, batch_ids, walk=SCHED_WALK):
     """Who a refused step of ``walk`` evicts."""
     scheduler = worker.scheduler
     return worker.admission._evict(
-        SCHED_NODE, batch_ids, scheduler.arrival, partial(scheduler.last_in_line, SCHED_NODE, walk),
+        SCHED_NODE, batch_ids, scheduler.lifecycle.arrivals, partial(scheduler.last_in_line, SCHED_NODE, walk),
     )
 
 
@@ -525,7 +525,7 @@ def test_a_row_that_never_ran_at_the_key_takes_its_place_in_line(order, victim):
     under TURNS it is first in line, and under ARRIVAL behind the row holding
     the step."""
     worker = _evicting_worker(["ran"], _scheduler(_SchedEngine(order=order)))
-    worker.scheduler.note_arrival("never_ran")
+    worker.scheduler.lifecycle.add("never_ran", "never_ran")
     _engine(worker).holders.add("never_ran")
 
     assert _victim(worker, {"r9"}) == victim
@@ -545,7 +545,7 @@ def _decode_waiters(order, ran):
     worker = _evicting_worker([], _scheduler(_SchedEngine(order=order)))
     holders = list(dict.fromkeys(rid for rid, _ in ran))
     for rid in holders:
-        worker.scheduler.note_arrival(rid)
+        worker.scheduler.lifecycle.add(rid, str(rid))
     for rid, walk in ran:
         worker.scheduler.note_ran(_sched_batch([rid], walk=walk))
     _engine(worker).holders.update(holders)
@@ -630,9 +630,9 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
     )
     bound(sched, runtime=manager.runtime)
     manager.runtime.combined_walk_of = sched.combined_walk_of
-    sched.failed_rids.add("failed")
+    sched.lifecycle.failed_rids.add("failed")
     sched.admission.hold(["held"])
-    sched.pending_removes = {"gone": None}
+    sched.lifecycle.pending_removes = {"gone": -1}
 
     assert not sched.could_refill(SCHED_NODE, SCHED_WALK, {"b0", "b1", "w0"})
     assert sched.could_refill(SCHED_NODE, SCHED_WALK, {"b0", "b1"}), "w0 waits to run"

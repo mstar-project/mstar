@@ -1626,13 +1626,13 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
         request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
         scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    for name in ("_await_admit_settled",
-                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
-                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
-                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+    for name in ("_await_admit_settled", "_teardown", "_report_failures", "_fail_requests",
+                 "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure",
                  "_thread_outputs_to_speculative", "_postprocess_batch"):
         setattr(w, name, stub)
+    for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, stub)
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._plans_ahead = lambda spec: True
