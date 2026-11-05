@@ -36,7 +36,15 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, BucketKey, ResourceStep, StepContext
+from mstar.engine.resources.step import (
+    ADMIT_OK,
+    ASKS,
+    AdmitOutcome,
+    AllocationFailed,
+    BucketKey,
+    ResourceStep,
+    StepContext,
+)
 from mstar.utils import knobs
 from mstar.utils.h2d import PinnedStager
 
@@ -86,6 +94,8 @@ class LoopbackRows(Resource):
         self._max_bs = 1
         self._tables: dict[str, torch.Tensor] = {}
         self._row_of: dict[Hashable, int] = {}
+        # a lockstep rank's requests that take a row at their first admit
+        self._waiting: set[Hashable] = set()
         self._free: list[int] = []
         # rows handed out so far, the trash row included
         self._rows = 1
@@ -146,11 +156,40 @@ class LoopbackRows(Resource):
     def free_rows(self) -> int:
         return len(self._free) + self.capacity + 1 - self._rows
 
+    def admit(self, step: LoopbackRowsStep, ctx: StepContext) -> AdmitOutcome:
+        """A rank of a lockstep instance, which never holds a request back on its
+        own, takes its step's rows here, as every rank does alike: a full table
+        refuses the admit (the step waits, as for KV pages) instead of failing
+        the request."""
+        if self._decides:
+            return ADMIT_OK
+        taken = []
+        with self._lock:
+            for segment in step.segments:
+                rid = segment.request_id
+                if rid not in self._waiting:
+                    continue  # it holds its row, or it is a capture's padding, which reads the trash row
+                if not self._free and self._rows > self.capacity:
+                    for held in taken:
+                        self._free.append(self._row_of.pop(held))
+                        self._waiting.add(held)
+                    self._last = None
+                    return AdmitOutcome(ok=False, reason=AllocationFailed(
+                        message=f"loop-back rows: all {self.capacity} are held (MSTAR_SAMPLER_SLOTS)",
+                        pages_short=1, label="rows", request_id=rid,
+                    ))
+                self._row_of[rid] = self._free.pop() if self._free else self._next_row()
+                taken.append(rid)
+            self._waiting.difference_update(taken)
+            self._last = None
+        return ADMIT_OK
+
     def ingest_request(self, rid: int, overrides=None) -> None:
         if not self._decides:
-            self.add(rid)
+            self._waiting.add(rid)
 
     def remove_request(self, rid: int) -> None:
+        self._waiting.discard(rid)
         self.drop(rid)
 
     def ask(self, rid: int, node_name: str, graph_walk: str) -> AdmitOutcome | None:

@@ -140,10 +140,24 @@ def test_a_request_waits_for_a_row_and_the_ranks_of_a_lockstep_node_never_do():
     assert mark == 0 and not rows.grew_since(mark)
     rows.remove_request(1)
     assert rows.grew_since(mark) and rows.reserve(2, "n", WALK, None) is None
+    # a lockstep rank never holds a request back on its own (the ranks would
+    # split); it takes rows at its step's admit, which every rank runs alike, and
+    # a full table refuses that admit rather than raising at ingest (review-r2 F4)
+    from mstar.engine.resources.loopback_rows import LoopbackRowsStep
+    from mstar.engine.resources.step import Segment
+
     lockstep = LoopbackRows(CPU, capacity=1, decides=False)
     assert lockstep.ask(1, "n", WALK) is None
-    lockstep.ingest_request(1)
-    assert lockstep.has_row(1)
+    for rid in (1, 2):
+        lockstep.ingest_request(rid)
+    ctx = SimpleNamespace(request_ids=(1,))
+    assert lockstep.admit(LoopbackRowsStep(segments=(Segment(1, "main", 1),)), ctx).ok and lockstep.has_row(1)
+    two = LoopbackRowsStep(segments=(Segment(1, "main", 1), Segment(2, "main", 1)))
+    refused = lockstep.admit(two, SimpleNamespace(request_ids=(1, 2)))
+    assert not refused.ok and not lockstep.has_row(2) and lockstep.has_row(1)
+    lockstep.remove_request(1)
+    alone = LoopbackRowsStep(segments=(Segment(2, "main", 1),))
+    assert lockstep.admit(alone, SimpleNamespace(request_ids=(2,))).ok and lockstep.has_row(2)
 
 
 def _runner(shapes):
