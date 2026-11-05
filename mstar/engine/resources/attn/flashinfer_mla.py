@@ -525,19 +525,20 @@ class FlashInferMLAManager(PlacedAttention):
     def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None, walk: str | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
         the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one of
-        ``walk`` when None): a decode step's context alone; any other step's, over a placed pool, its
-        context and own tokens (``rank_plans``), padded as the leased capture's wrapper pads them;
-        and under ``kv_gather``, where the step may split (``SequenceShard.may_split``; a leased one
-        doesn't), every partner's own queries (``SequenceShard.kv_gather_rank_plans``). Its kind
-        comes from the rule ``plan`` picks the wrapper by (``one_token_rows``)."""
+        ``walk`` when None): a decode step's context alone; any other step's what its storage's
+        strategy answers: over a placed pool its context and own tokens (``rank_plans``), padded as
+        the leased capture's wrapper pads them, and under ``kv_gather`` the shard's
+        (``SequenceShard.kv_gather_rank_plans``). Its kind comes from the rule ``plan`` picks the
+        wrapper by (``one_token_rows``)."""
         heads = self._wrapper_kwargs["num_qo_heads"]
         lease = None if ctx is None else ctx.slot_lease
         force_prefill = ctx is not None and ctx.force_prefill
-        walk = walk if ctx is None else ctx.graph_walk
-        gathers = self._placement is None and lease is None and self._shard.may_split(
-            walk, sum(n for row in rows for n in row.values()),
+        labels = {label for row in rows for label in row}
+        gathered = None if self._placement is not None else self._shard.kv_gather_rank_plans(
+            {label: [row[label] for row in rows if label in row] for label in labels}, heads,
+            walk if ctx is None else ctx.graph_walk,
         )
-        for label in {label for row in rows for label in row}:
+        for label in labels:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
             shape = None
             if lease is None:
@@ -547,13 +548,12 @@ class FlashInferMLAManager(PlacedAttention):
                 # the rows the label's wrapper was captured with, which its own-token part pads to
                 wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
                 shape = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
-            plans = [(qo, heads)]
             if decode:
-                pass
+                plans = [(qo, heads)]
             elif self._placement is not None:
                 plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, shape)
-            elif gathers:
-                plans = self._shard.kv_gather_rank_plans(qo, heads)
+            else:
+                plans = gathered[label]
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True

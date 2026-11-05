@@ -501,16 +501,28 @@ class SequenceShard(Resource):
             ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order)
         return SeqShardPlan(True, ranges)
 
-    def kv_gather_rank_plans(self, qo_indptr: np.ndarray, num_qo_heads: int) -> list[tuple[np.ndarray, int]]:
-        """Every plan a step of ``qo_indptr``'s rows (one packed label) may make on any rank under
-        ``kv_gather``, as ``(qo_indptr, query heads)`` (``ContextParallelWrapper.rank_plans``' form):
-        the whole step's, as it plans copied, and each rank's own queries where it splits, its piece
+    def kv_gather_rank_plans(
+        self, spans: Mapping[str, Sequence[int]], num_qo_heads: int, walk: str | None,
+    ) -> dict[str, list[tuple[np.ndarray, int]]]:
+        """Every plan an eager step of ``walk`` may make on any rank under ``kv_gather``, per label
+        of ``spans`` (each label's rows' queries, in step order), as ``(qo_indptr, query heads)``
+        (``ContextParallelWrapper.rank_plans``' form): the label's whole rows, as a copied step
+        plans them, and, where this shard may split the step (``may_split`` over its listed labels'
+        tokens, as ``_decide`` counts them) and lists the label, each rank's own queries, its piece
         of each row it holds any of (``SeqRange.row_pieces``). What an attention whose planner may
-        refuse on lengths bounds such a step by at admission, the same on every rank."""
-        r = SeqRange(self.group, tuple(sp_seq_split(int(qo_indptr[-1]), self.group.world_size)), None)
-        pieces = r.row_pieces(np.diff(qo_indptr).tolist())
-        own = [np.concatenate([[0], np.cumsum(piece[piece > 0])]) for piece in pieces]
-        return [(qo_indptr, num_qo_heads), *((plan, num_qo_heads) for plan in own)]
+        refuse on lengths bounds such a step by at admission, the same on every rank. A leased step
+        can't split here: its node captures no bucket a step may split in (``captures_bucket``),
+        and its tokens are at most its bucket's. Axis 0 only: ``AttentionSpec.split_step_refusals``
+        refuses kv_gather under an axis-1 shard at load."""
+        listed = {label: label_spans for label, label_spans in spans.items() if label in self.labels}
+        split = self.may_split(walk, sum(map(sum, listed.values())))
+        plans = {}
+        for label, label_spans in spans.items():
+            plans[label] = [(np.cumsum([0, *label_spans]), num_qo_heads)]
+            if split and label in listed:
+                pieces = self._range(list(label_spans)).row_pieces(label_spans)
+                plans[label] += [(np.concatenate([[0], np.cumsum(piece[piece > 0])]), num_qo_heads) for piece in pieces]
+        return plans
 
     def _range(self, spans: list[int]) -> SeqRange:
         world = self.group.world_size

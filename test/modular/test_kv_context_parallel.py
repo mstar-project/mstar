@@ -1845,12 +1845,15 @@ def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeyp
     attn.own_kernel = types.SimpleNamespace(build=lambda *args: _OneSlotPrefill())
     with pytest.raises(ValueError, match="OwnTokensKernel"):
         attn._cg_wrapper(SlotLease(2, bucket), "main", 2)
+
+
 def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partners_own_queries_fit(monkeypatch):
     """Under ``kv_gather`` (a pool stored by head, on SP ranks whose steps split) each rank plans its
     contiguous pieces of the step's rows, which can take the FA planner past its cap where the whole
     step fits: rows of 8 and 1 queries split 5 | 3, 1, and 16 heads put the step on two-tile
     clusters and partner 1 on one-tile ones. Admission counts them, as it does a placed pool's, and
-    only where the step may split: one the shard runs copied plans its whole rows alone."""
+    only where the step may split: one the shard runs copied, or a label it doesn't list (beside one
+    it splits, too), plans its whole rows alone."""
     _fa_kernel(monkeypatch)
     joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
     shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
@@ -1869,6 +1872,12 @@ def test_mla_attention_gathering_its_latents_admits_a_step_only_if_every_partner
     assert attn.admit(step, ctx).ok
     shard.min_tokens, shard.walks = 0, frozenset({"other"})
     assert attn.admit(step, ctx).ok
+    # a label the shard doesn't list: alone (the step has no listed tokens), and beside a listed one
+    # whose own pieces fit
+    shard.walks, shard.labels = None, ("listed",)
+    assert attn.admit(step, ctx).ok
+    beside = AttentionStep(segments=(*step.segments, Segment("r0", "listed", 5), Segment("r1", "listed", 5)))
+    assert attn.admit(beside, ctx).ok
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):

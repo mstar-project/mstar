@@ -322,7 +322,7 @@ def _cross() -> RaggedCrossAttentionSpec:
     return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
-def _mla_llm(q_heads=4) -> _Model:
+def _mla_llm(q_heads=4, axis=0) -> _Model:
     """A model whose ``llm`` attends an MLA pool, and splits its steps."""
     kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=q_heads, page_size=16,
@@ -330,7 +330,8 @@ def _mla_llm(q_heads=4) -> _Model:
     ))
     attn = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA,
                                                           sm_scale=0.1))
-    return _Model(specs=[kv, attn, _shard()], kv_labels={"kv": {"main": KVLabel()}})
+    return _Model(specs=[kv, attn, SeqShardSpec("shard", {"llm"}, ("main",), axis)],
+                  kv_labels={"kv": {"main": KVLabel()}})
 
 
 def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8) -> list[NodeResourceSpec]:
@@ -451,9 +452,13 @@ def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(
 
 def test_an_mla_node_splits_its_steps_by_gathering_its_latents(tmp_path):
     """Over an MLA pool stored by head the attention gathers the latents (kv_gather), so the pool's
-    one KV head doesn't refuse the split."""
+    one KV head doesn't refuse the split. kv_gather plans a packed row's contiguous pieces, which an
+    axis-1 shard doesn't give it, so that is refused before spawn rather than at its first split
+    step on every rank."""
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
     assert _validate(_mla_llm(), cfg).worker_graphs
+    _refused(_mla_llm(axis=1), cfg, r"attention 'attn' gathers a split step's keys into KV 'kv', .* node 'llm''s "
+             r"sequence shard splits each row \(axis 1\): declare the shard on axis 0")
 
 
 def _windowed_llm(window_layers=(1,)) -> _Model:
