@@ -1,4 +1,5 @@
-"""The LM's served resources (paged KV, FlashInfer attention, RoPE, samplers), driven without a server."""
+"""The LM's frames driven without a server: over dense attention, or the served resources (paged KV,
+FlashInfer attention, RoPE, samplers and the token cache pool)."""
 
 import socket
 from types import SimpleNamespace
@@ -6,6 +7,29 @@ from types import SimpleNamespace
 import torch
 
 from mstar.model.personaplex import config as cfg
+from mstar.model.personaplex.submodules import read_cache_rows, write_cache_rows
+
+
+class DenseFrames:
+    """One request's frames over dense attention (or any backend with ``advance``), holding its cache itself."""
+
+    def __init__(self, sub, backend):
+        self.sub, self.backend, self.rows = sub, backend, None
+
+    def conditioning(self, frames):
+        (frame,) = frames
+        self.sub.lm.temporal.forward_embeddings(frame.embeds, self.backend, text_logits=False)
+        self.backend.advance()
+        self.rows = type(frame.rows)(*(field.to(self.sub.get_device()) for field in frame.rows))
+
+    def generate(self, user, walk=cfg.GENERATE_WALK):
+        del walk
+        frame = self.sub.generate_frame(
+            self.rows, user, self.backend, lambda x: x.argmax(-1), lambda x, _step: x.argmax(-1)
+        )
+        self.backend.advance()
+        self.rows = frame.rows
+        return frame
 
 
 class ResourceBackend:
@@ -60,6 +84,25 @@ class ResourceBackend:
 
     def finish(self):
         self.runner.commit(self.step)
+
+    def conditioning(self, frames, request_ids=None):
+        """One conditioning step over ``frames``, one for each of ``request_ids``."""
+        self.begin(cfg.CONDITIONING_WALK, request_ids)
+        self.sub.lm.temporal.forward_embeddings(torch.cat([f.embeds for f in frames]), self.backend, text_logits=False)
+        device = self.sub.get_device()
+        rows = [torch.cat(parts).to(device) for parts in zip(*(f.rows for f in frames), strict=True)]
+        write_cache_rows(self.resources[cfg.LM_CACHE], type(frames[0].rows)(*rows))
+        self.finish()
+
+    def generate(self, user, walk=cfg.GENERATE_WALK, request_ids=None, sample_text=None, sample_depth=None):
+        """One generate step, reading and writing the rows' caches in the pool as the engine does."""
+        self.begin(walk, request_ids)
+        pool = self.resources[cfg.LM_CACHE]
+        frame = self.sub.generate_frame(read_cache_rows(pool), user, self.backend,
+                                        sample_text or self.sample_text, sample_depth or self.sample_depth)
+        write_cache_rows(pool, frame.rows)
+        self.finish()
+        return frame
 
     def add(self, rid):
         self.runner.ingest_request(rid, self.overrides)

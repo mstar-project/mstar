@@ -49,7 +49,7 @@ from safetensors.torch import load_file
 
 from benchmark.personaplex.controls import HalfSplitRope, candidates, first_reference_decision
 from benchmark.personaplex.decode import stream_decode
-from benchmark.personaplex.resources import ResourceBackend
+from benchmark.personaplex.resources import DenseFrames, ResourceBackend
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.mimi import load_mimi_codec
 from mstar.model.personaplex.components.temporal import DenseTemporalCache
@@ -264,19 +264,18 @@ def negative_control(sub, native, meta, static, ref_agent, ref_text):
     """Run M* with a realistic bug through the same exact-token comparison; it must report a mismatch."""
     stage("negative control: M* with RoPE over split halves, compared the same way")
     backend = HalfSplitRope(native.config.num_layers, native.config.rope_theta)
-    state, detected, frames = None, None, 0
+    driver, progress = DenseFrames(sub, backend), sub.start_conditioning(meta, static)
+    detected, frames = None, 0
     for index in range(meta["conditioning_frames"] + meta["num_user_frames"]):
-        walk = cfg.CONDITIONING_WALK if index < meta["conditioning_frames"] else cfg.GENERATE_WALK
-        frame = sub.prepare_frame(walk, meta, {**static, "lm_state": [] if state is None else [state]})
-        result = sub.run_frame(frame, backend, lambda x: x.argmax(-1), lambda x, i: x.argmax(-1))
-        backend.advance()
-        state, frames = result["lm_state"][0], index + 1
-        if walk == cfg.GENERATE_WALK:
-            j = index - meta["conditioning_frames"]
-            if not (torch.equal(result["agent_frame"][0], ref_agent[j])
-                    and torch.equal(result["text_frame"][0], ref_text[j])):
-                detected = j
-                break
+        frames = index + 1
+        if index < meta["conditioning_frames"]:
+            driver.conditioning([sub.conditioning_frame(progress, meta, static)])
+            continue
+        j = index - meta["conditioning_frames"]
+        result = driver.generate(static["user_audio_codes"][0][:, :, j])
+        if not (torch.equal(result.agent_frame, ref_agent[j]) and torch.equal(result.text_frame, ref_text[j])):
+            detected = j
+            break
     report["checks"]["negative_control"] = dict(
         perturbation="RoPE over split halves instead of adjacent pairs (dense attention otherwise unchanged)",
         detected=detected is not None,
@@ -346,9 +345,11 @@ def pipeline(ref, native):
     stage("production conditioning and generation, own user codes, no substitution")
     sub = LMSubmodule(native)
     static["user_audio_codes"] = [ours_user]
-    state = None
     backend = DenseTemporalCache(native.config.num_layers, native.config.rope_theta)
     resource = ResourceBackend(model, sub, ["real-checkpoint"]) if a.backend == "resources" else None
+    driver = resource or DenseFrames(sub, backend)
+    progress = sub.start_conditioning(meta, static)
+    rows = None
     records, agent, text = [], [], []
     total = meta["conditioning_frames"] + user_frames
     latest = {}
@@ -382,30 +383,27 @@ def pipeline(ref, native):
             latest["depth"] = []
             latest["depth_inputs"] = []
             walk = cfg.CONDITIONING_WALK if index < meta["conditioning_frames"] else cfg.GENERATE_WALK
-            frame = sub.prepare_frame(walk, meta, {**static, "lm_state": [] if state is None else [state]})
             expected = gen.records[index]
+            if walk == cfg.CONDITIONING_WALK:
+                result = sub.conditioning_frame(progress, meta, static)
+                driver.conditioning([result])
+            else:
+                result = driver.generate(ours_user[:, :, index - meta["conditioning_frames"]])
+            rows = result.rows
             record = {
                 "index": index,
                 "walk": walk,
-                "input_codes_equal": bool(torch.equal(frame.cache.model_input.cpu(), expected["input"])),
+                "input_codes_equal": bool(torch.equal(result.model_input.cpu(), expected["input"])),
             }
-            if resource:
-                resource.begin(walk)
-                result = sub.run_frame(frame, resource.backend, resource.sample_text, resource.sample_depth)
-                resource.finish()
-            else:
-                result = sub.run_frame(frame, backend, lambda x: x.argmax(-1), lambda x, i: x.argmax(-1))
-                backend.advance()
-            state = result["lm_state"][0]
             h = latest["hidden"].reshape(1, 1, -1)
             record["hidden"] = metrics(h, expected["hidden"])
             if walk == cfg.GENERATE_WALK:
                 record["text_logits"] = metrics(latest["text_logits"].reshape(1, 1, 1, -1), expected["text_logits"])
-                agent.append(result["agent_frame"][0])
-                text.append(result["text_frame"][0])
+                agent.append(result.agent_frame)
+                text.append(result.text_frame)
                 got = torch.cat((text[-1][:, None, None], agent[-1]), dim=1)
                 record["emitted_equal"] = bool(torch.equal(got.cpu(), expected["output"][:, :9]))
-                # M* stops after the last depth step it samples; NVIDIA runs all 16, so compare that prefix.
+                # M* runs the 8 agent depth steps; NVIDIA runs all 16, so compare that prefix.
                 depth_logits = torch.stack(latest["depth"], dim=1)
                 executed = depth_logits.shape[1]
                 record["depth_steps_executed"] = executed
@@ -499,12 +497,9 @@ def pipeline(ref, native):
         negative_control(sub, native, meta, static, ref_agent, ref_text)
     (out / "pipeline-events.json").write_text(json.dumps(records, indent=2))
     torch.save(actual_events, out / "mstar-events.pt")
-    from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
-
-    final_cache, _ = DelayedTokenCache.from_state_tensor(state)
-    report["checks"]["final_cache_equal"] = bool(torch.equal(final_cache.cache.cpu(), final_ref_cache))
-    report["checks"]["final_provided_equal"] = bool(torch.equal(final_cache.provided.cpu(), final_ref_provided))
-    report["checks"]["final_offset_equal"] = final_cache.offset == final_ref_offset
+    report["checks"]["final_cache_equal"] = bool(torch.equal(rows.tokens.cpu(), final_ref_cache))
+    report["checks"]["final_provided_equal"] = bool(torch.equal(rows.provided.cpu(), final_ref_provided))
+    report["checks"]["final_offset_equal"] = int(rows.offset[0]) == final_ref_offset
     report["checks"]["temporal_steps"] = total
     report["checks"]["input_step_mismatches"] = [r["index"] for r in records if not r["input_codes_equal"]]
     report["checks"]["output_frame_mismatches"] = [

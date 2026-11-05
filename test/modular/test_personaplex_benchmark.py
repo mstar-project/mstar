@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from benchmark.base import ModelType, PersonaPlex, RequestType, Status
 from benchmark.personaplex.dataset import LocalAudioDataset
@@ -357,3 +358,75 @@ class _FakeClient:
         self.alive = False
 
 
+def _tiny_lm_request(rid, seed):
+    from mstar.model.personaplex import config as cfg
+
+    generator = torch.Generator().manual_seed(seed)
+    static = {
+        "voice_embeddings": [torch.randn(1, 1, 1, 32, generator=generator)],
+        "voice_cache": [torch.randint(0, 2048, (1, 17, 4), generator=generator)],
+        "persona_tokens": [torch.randint(4, 32000, (2,), generator=generator)],
+        "user_audio_codes": [torch.randint(0, 2048, (1, 8, 3), generator=generator)],
+    }
+    meta = {"num_voice_embeddings": 1, "num_text_tokens": 2, "num_user_frames": 3, "num_samples": 3 * cfg.FRAME_SIZE,
+            "conditioning_frames": 1 + 2 * cfg.SILENCE_FRAMES + 2}
+    return dict(id=rid, meta=meta, static=static)
+
+
+@torch.no_grad()
+def test_batch_tool_finds_no_difference_between_identical_row_backends(monkeypatch):
+    """batch.py's loop over dense rows standing in for the served resources: alone and staggered must agree."""
+    from benchmark.personaplex.batch import compare, run
+    from benchmark.personaplex.resources import DenseFrames
+    from mstar.model.personaplex import config as cfg
+    from mstar.model.personaplex.components.temporal import DenseTemporalCache
+    from mstar.model.personaplex.submodules import LMSubmodule
+    from mstar.model.personaplex.weights import PersonaPlexLM
+
+    tiny = cfg.LMArchConfig(dim=32, num_heads=4, num_layers=2, ffn_hidden=40, depformer_dim=16, depformer_heads=2,
+                            depformer_layers=2, depformer_ffn_hidden=24)
+    torch.manual_seed(0)
+    sub = LMSubmodule(PersonaPlexLM(tiny).eval())
+
+    class Rows:
+        """The ResourceBackend calls batch.py makes, one DenseFrames per request."""
+
+        def __init__(self):
+            self.drivers = {}
+
+        def add(self, rid):
+            self.drivers[rid] = DenseFrames(sub, DenseTemporalCache(tiny.num_layers, tiny.rope_theta))
+
+        def remove(self, rid):
+            del self.drivers[rid]
+
+        def conditioning(self, frames, ids):
+            for frame, rid in zip(frames, ids, strict=True):
+                self.drivers[rid].conditioning([frame])
+
+        def sample_text(self, logits):
+            return logits.argmax(-1)
+
+        def sample_depth(self, logits, index):
+            return logits.argmax(-1)
+
+        def generate(self, user, walk, ids, sample_text, sample_depth):
+            out = []
+            for row, rid in enumerate(ids):
+                driver = self.drivers[rid]
+                frame = sub.generate_frame(driver.rows, user[row : row + 1], driver.backend, sample_text, sample_depth)
+                driver.backend.advance()
+                driver.rows = frame.rows
+                out.append(frame)
+            return type(out[0])(*(torch.cat(parts) if isinstance(parts[0], torch.Tensor) else parts
+                                  for parts in zip(*out, strict=True)))
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    requests = [_tiny_lm_request("a", 1), _tiny_lm_request("b", 2)]
+    solo = [run(sub, Rows(), [request], [0]) for request in requests]
+    emitted, choices, steps = run(sub, Rows(), requests, [0, 3])
+    assert {step["walk"] for step in steps} == {cfg.CONDITIONING_WALK, cfg.GENERATE_WALK}
+    for i in range(2):
+        assert len(emitted[i]) == 3 and emitted[i][0].shape == (1, 9, 1)
+        result = compare((solo[i][0][0], solo[i][1][0]), (emitted[i], choices[i]))
+        assert result["frames_different"] == 0 and result["first_decision"] is None

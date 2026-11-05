@@ -62,7 +62,7 @@ def run(sub, resource, requests, starts):
     batch size, walk and wall time (synchronized).
     """
     total = [r["meta"]["conditioning_frames"] + r["meta"]["num_user_frames"] for r in requests]
-    states = [None] * len(requests)
+    progress = [sub.start_conditioning(r["meta"], r["static"]) for r in requests]
     emitted = [[] for _ in requests]
     choices = [[] for _ in requests]
     steps = []
@@ -86,26 +86,30 @@ def run(sub, resource, requests, starts):
 
                 torch.cuda.synchronize()
                 began = time.perf_counter()
-                frames = [sub.prepare_frame(walk, requests[i]["meta"], {
-                    **requests[i]["static"], "lm_state": [] if states[i] is None else [states[i]],
-                }) for i in rows]
-                provided = torch.cat([f.cache.target_provided[:, :, 0] for f in frames])
-                resource.begin(walk, [requests[i]["id"] for i in rows])
-                outputs = sub.run_frames(
-                    frames, resource.backend,
-                    lambda logits: sample("text", None, resource.sample_text, logits),
-                    lambda logits, d: sample("depth", d, lambda x: resource.sample_depth(x, d), logits),
-                )
-                resource.finish()
+                ids = [requests[i]["id"] for i in rows]
+                if walk == cfg.CONDITIONING_WALK:
+                    resource.conditioning(
+                        [sub.conditioning_frame(progress[i], requests[i]["meta"], requests[i]["static"]) for i in rows],
+                        ids,
+                    )
+                else:
+                    user = torch.cat([
+                        requests[i]["static"]["user_audio_codes"][0][
+                            :, :, tick - starts[i] - requests[i]["meta"]["conditioning_frames"]]
+                        for i in rows])
+                    frame = resource.generate(
+                        user, walk, ids,
+                        lambda logits: sample("text", None, resource.sample_text, logits),
+                        lambda logits, d: sample("depth", d, lambda x: resource.sample_depth(x, d), logits),
+                    )
                 torch.cuda.synchronize()
                 steps.append(dict(walk=walk, batch=len(rows), ms=(time.perf_counter() - began) * 1000))
-                provided = provided.cpu()
-                for row, (i, output) in enumerate(zip(rows, outputs, strict=True)):
-                    states[i] = output["lm_state"][0]
-                    if walk != cfg.GENERATE_WALK:
-                        continue
-                    emitted[i].append(torch.cat((output["text_frame"][0][:, None, None], output["agent_frame"][0]),
-                                                dim=1).cpu())
+                if walk != cfg.GENERATE_WALK:
+                    continue
+                provided = frame.forced.cpu()
+                for row, i in enumerate(rows):
+                    emitted[i].append(torch.cat((frame.text_frame[row : row + 1][:, None, None],
+                                                 frame.agent_frame[row : row + 1]), dim=1).cpu())
                     choices[i].append({key: (candidates(logits[row : row + 1]), int(tokens[row]),
                                              bool(provided[row, 0 if key[0] == "text" else 1 + key[1]]))
                                        for key, (logits, tokens) in picks.items()})
