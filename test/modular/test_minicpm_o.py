@@ -190,6 +190,9 @@ def test_spoken_reply_text_fits_the_tts(model):
     # text replies are not capped
     assert "max_output_tokens" not in model.process_prompt(
         None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192).metadata
+
+
+@needs_ckpt
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     """The LLM's layout: one span over every prompt row (placeholders included),
     written by the prefill walk the request takes, then a row per decode step."""

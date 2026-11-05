@@ -208,6 +208,7 @@ def test_capture_runs_under_the_node_precision(monkeypatch):
 
     class _Region:
         any_graphs = False
+        eager_fallback = False
         dropped_shapes = ()
 
         def __init__(self, node):
