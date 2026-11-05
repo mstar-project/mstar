@@ -3165,6 +3165,10 @@ class Engine:
             default=Residency.RESIDENT,
         )
 
+    def in_step(self, node_name: str, request_id: int) -> bool:
+        """Whether a step or a read in flight holds the request's pages in a paged KV cache of the node."""
+        return any(kv.cache.in_step(request_id) for kv in self.paged_kv_caches() if node_name in kv.nodes)
+
     def newer_than(self, request_id: int) -> list[str] | None:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
@@ -3363,9 +3367,7 @@ class Engine:
                 if kind == MoveKind.EARMARK:
                     logger.debug("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
                                 move.pool, move.count, move.victims)
-            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and any(
-                kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes
-            ):
+            elif kind in (MoveKind.DROP, MoveKind.OFFLOAD) and self.in_step(node_name, rid):
                 logger.debug("Replay: %s's %s on %s waits for its step; %d moves still owed",
                              wire_rid, kind.name, node_name, len(delta))
                 return False

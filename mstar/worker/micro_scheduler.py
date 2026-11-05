@@ -1057,10 +1057,11 @@ class MicroScheduler:
         engine = self.engine_manager.get_engine(node_name)
         partition = request_state.get_partition_for_node(node_name)
         for rid in self.tp_rids(head):
-            # A row a step in flight holds is resident or rebuilding already, since a drop waits for the row's step.
+            # A row a step on the node holds is resident or rebuilding already, since a drop there waits only for that
+            # step.
             if (
-                rid != REMOVED_RID and rid not in self.in_flight_rids and not self.rebuilds.rebuilding(rid, node_name)
-                and engine.residency(node_name, rid) is Residency.DROPPED
+                rid != REMOVED_RID and not self.rebuilds.rebuilding(rid, node_name)
+                and engine.residency(node_name, rid) is Residency.DROPPED and not engine.in_step(node_name, rid)
             ):
                 self._start_rebuild(node_name, rid, request_state.get_fwd_info(rid, partition).graph_walk)
 

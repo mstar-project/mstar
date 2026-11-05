@@ -231,6 +231,7 @@ class _Engine:
     admit_request = Engine.admit_request
     offload_request = Engine.offload_request
     paged_kv_caches = Engine.paged_kv_caches
+    in_step = Engine.in_step
     _release_resident_slot = Engine._release_resident_slot
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request

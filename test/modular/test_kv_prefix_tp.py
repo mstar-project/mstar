@@ -110,7 +110,7 @@ class _Submodule:
 
 def _engine(kv: KVManager) -> Engine:
     engine = Engine.__new__(Engine)
-    engine._resources = {"kv": kv}
+    engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
     engine._runner = StepRunner(engine._resources, node_resources={NODE: ["kv"]})
     engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule(), resources=engine._resources)}
     engine._keyed_walks = {NODE: {WALK, IMAGE_WALK}}
