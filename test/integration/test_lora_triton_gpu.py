@@ -434,6 +434,7 @@ def test_experts_kernels_match_the_reference(tokens, top_k, stage):
     backend = ops.LoraOpsBackend()
     got = y0.to(torch.bfloat16)
     alignment = backend.align_experts(ids, num_ids)
+    assert alignment is not None, "the grouped kernel is not what would run"
     backend.apply_experts_(x.to(torch.bfloat16), got, a.to(torch.bfloat16), b.to(torch.bfloat16), ids, weight,
                            x_top_k, slices, alignment)
     check(got.float() - y0.to(torch.bfloat16).float(), want - y0, f"experts {stage}")

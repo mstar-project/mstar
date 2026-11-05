@@ -473,7 +473,7 @@ class _Deployment:
             if fail_on == worker_id:
                 def broken(name, path, digest):
                     raise OSError(f"{name}: cannot read /srv/secret on this rank")
-                pool.store.check = broken  # the worker's background read fails
+                pool.store.pinned_rank = broken  # the worker's background read fails
             w = self.workers[worker_id] = Worker.__new__(Worker)
             w.worker_id = worker_id
             w.engine_manager = SimpleNamespace(engine=SimpleNamespace(resources={LORA_RESOURCE_KEY: pool}))
@@ -555,8 +555,8 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
         ["worker_0", "worker_1"], send, clock=lambda: clock.now,
     )
     gate, store = threading.Event(), d.pools["worker_1"].store
-    check = store.check
-    store.check = lambda name, path, digest: (gate.wait(30), check(name, path, digest))[1]
+    pinned_rank = store.pinned_rank
+    store.pinned_rank = lambda name, path, digest: (gate.wait(30), pinned_rank(name, path, digest))[1]
     digest = adapter_digest(read_lora_file(paths["a1"])).hex()
     d.ops.load(LoadLoraAdapter(op_id="op1", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
     _finish_when_read(d.workers["worker_0"])

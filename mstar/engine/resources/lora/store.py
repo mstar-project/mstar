@@ -242,10 +242,11 @@ class LoraAdapterStore:
             self.put(adapter)
         return adapter
 
-    def check(self, name: str, path: str, digest: bytes) -> int:
+    def pinned_rank(self, name: str, path: str, digest: bytes) -> int:
         """``path``'s rank for this spec, read and held to ``digest`` as ``read`` does, with
         nothing staged: all a runtime load needs."""
-        return self._checked(name, path, digest)[2]
+        _, _, rank = self._checked(name, path, digest)
+        return rank
 
     def _checked(self, name: str, path: str, digest: bytes) -> tuple[LoraAdapter, list[str], int]:
         """``path`` read, its modules for this spec and its rank. ``digest`` is of the
