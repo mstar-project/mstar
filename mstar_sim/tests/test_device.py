@@ -921,11 +921,13 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 work.wait()
             assert theirs.tolist() == [1.0 - r] * 4 and late.tolist() == [3.0 - 3 * r] * 4
             assert not never_computed(theirs._data)
-            # a receive from any source takes its sender's frame and returns its rank
-            if r == 0:
-                dist.send(mine + 5, dst=1)
-            else:
-                assert dist.recv(theirs) == 0 and theirs.tolist() == [5.0] * 4
+            # NCCL has no receive from any source (gloo, which stands in for it, has)
+            for receive in (dist.recv, dist.irecv):
+                try:
+                    receive(theirs)
+                    raise SystemExit("a receive from any source was accepted")
+                except ValueError as e:
+                    assert "does not support recvAnysource" in str(e)
             # tags pair apart from the order they're posted in, even when only one payload moves
             a, b = torch.zeros(4, device="cuda"), torch.zeros(4, device="cuda")
             if r == 0:
@@ -990,7 +992,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             if r % 2:
                 dist.send(nxt, group_dst=0, group=tp)
             else:
-                assert dist.recv(prv, group=tp) == r + 1 and prv.tolist() == [r + 1.0] * 4
+                assert dist.recv(prv, group_src=1, group=tp) == r + 1 and prv.tolist() == [r + 1.0] * 4
             # on a group this rank isn't in nothing runs, and torch answers
             outside = tps[1 - r // 2]
             assert dist.irecv(prv, group_src=0, group=outside) is None

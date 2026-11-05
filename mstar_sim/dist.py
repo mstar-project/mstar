@@ -328,6 +328,8 @@ def _collective(name: str, family: str, primitive: str | None):
         group = a.get("group")
         if dist.distributed_c10d._rank_not_in_group(group):
             return real(*args, **kwargs)  # nothing runs on this rank: torch's own answer
+        if name in ("recv", "irecv") and a["src"] is None and a["group_src"] is None:
+            raise ValueError("ProcessGroupNCCL does not support recvAnysource")  # gloo's would serve it
         nbytes = max(t.numel() * t.element_size() for t in tensors)
         outputs = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
         root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
@@ -362,7 +364,7 @@ def _collective(name: str, family: str, primitive: str | None):
             return None if name == "send" else dist.get_global_rank(group or dist.group.WORLD, work._source_rank())
         moved = bool(values & HELD)
         work = _Done() if kwargs.get("async_op") or name in _RETURN_WORK else None
-        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names (any source: None)
+        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names
             work = (a["src"] if a["group_src"] is None
                     else dist.get_global_rank(group or dist.group.WORLD, a["group_src"]))
         if moved:

@@ -165,7 +165,7 @@ the roofline.
   `send`/`recv` (and `isend`/`irecv`) aren't met: a send posts its descriptor, then its data if it
   holds values, so what pairs on a gloo group pairs here. A receive keeps that data only if it
   holds values too, and aborts on a size or dtype that doesn't pair, or a sender that never comes,
-  as a collective does.
+  as a collective does. A receive from any source raises, as NCCL's does.
 - A skipped eager collective shifts its group's pairing, which shows at the next collective of
   another shape: between identical ones (per-layer all-reduces outside a graph) it is silent
   until then, as NCCL's corruption is. Inside a graph, the replay's sequence hash catches it.
