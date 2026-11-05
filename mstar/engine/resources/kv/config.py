@@ -225,7 +225,7 @@ class PagedKVConfig(KVConfig):
         resources share. The partners are the node's SP ranks when it has more than one, and
         otherwise the block of TP ranks holding this rank's KV head (`kv_head_replicas`).
         """
-        from mstar.engine.resources.context_parallel import ContextParallel
+        from mstar.engine.resources.context_parallel import SPPlacement, TPPlacement
 
         if not self.context_parallel:
             return None
@@ -235,12 +235,10 @@ class PagedKVConfig(KVConfig):
         self.groups = self.placed_groups(pool, size)
         if sp_size > 1:
             sp = joint.sp_group
-            return ContextParallel(size=size, index=sp.rank, group=sp, over_sp=True, partners=tuple(range(size)))
+            return SPPlacement(size=size, index=sp.rank, group=sp)
         tp = joint.tp_group
         first = tp.rank // size * size
-        return ContextParallel(
-            size=size, index=tp.rank % size, group=tp, over_sp=False, partners=tuple(range(first, first + size)),
-        )
+        return TPPlacement(size=size, index=tp.rank % size, group=tp, partners=tuple(range(first, first + size)))
 
     def placed_groups(self, pool: str, size: int) -> "tuple[KVGroup, ...]":
         """The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the
@@ -414,7 +412,8 @@ class PrefixSpan:
     ``length`` is how many slots the write fills and ``advance`` is how far it
     moves the position counter. ``digest`` is an item's digest, and None for
     ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end.
+    page up to the item's end. ``opens_step`` is False for a span the step of the
+    span before it writes too, in one row.
     """
     length: int
     advance: int
@@ -422,6 +421,7 @@ class PrefixSpan:
     scratch: int = 0
     digest: bytes | None = None
     end_key: bytes | None = None
+    opens_step: bool = True
 
 
 @dataclass

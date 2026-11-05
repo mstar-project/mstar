@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from flashinfer_reference import reference_attention
 
+from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
@@ -185,13 +186,14 @@ def _split_exchanges(rank, world, total, rows):
         return x[:, rank * per:(rank + 1) * per]
 
     gathers = []
-    gather_into = dist.all_gather_into_tensor
+    # `CommGroup.all_gather` calls the into-tensor gather it picked at import
+    gather_into = communication._all_gather_into_tensor
 
     def record(out, inp, *args, **kwargs):
         gathers.append(tuple(inp.shape))
         return gather_into(out, inp, *args, **kwargs)
 
-    dist.all_gather_into_tensor = record
+    communication._all_gather_into_tensor = record
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
     torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r=r), local(want))
@@ -214,7 +216,7 @@ def _split_exchanges(rank, world, total, rows):
     for got, expect in zip(written, (heads(k), heads(k)), strict=True):
         assert torch.equal(got, expect)
 
-    dist.all_gather_into_tensor = gather_into
+    communication._all_gather_into_tensor = gather_into
     everyone = [None] * world
     dist.all_gather_object(everyone, gathers)
     assert gathers and all(g == gathers for g in everyone), everyone

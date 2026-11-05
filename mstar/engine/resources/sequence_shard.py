@@ -501,6 +501,17 @@ class SequenceShard(Resource):
             ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order)
         return SeqShardPlan(True, ranges)
 
+    def kv_gather_rank_plans(self, qo_indptr: np.ndarray, num_qo_heads: int) -> list[tuple[np.ndarray, int]]:
+        """Every plan a step of ``qo_indptr``'s rows (one packed label) may make on any rank under
+        ``kv_gather``, as ``(qo_indptr, query heads)`` (``ContextParallelWrapper.rank_plans``' form):
+        the whole step's, as it plans copied, and each rank's own queries where it splits, its piece
+        of each row it holds any of (``SeqRange.row_pieces``). What an attention whose planner may
+        refuse on lengths bounds such a step by at admission, the same on every rank."""
+        r = SeqRange(self.group, tuple(sp_seq_split(int(qo_indptr[-1]), self.group.world_size)), None)
+        pieces = r.row_pieces(np.diff(qo_indptr).tolist())
+        own = [np.concatenate([[0], np.cumsum(piece[piece > 0])]) for piece in pieces]
+        return [(qo_indptr, num_qo_heads), *((plan, num_qo_heads) for plan in own)]
+
     def _range(self, spans: list[int]) -> SeqRange:
         world = self.group.world_size
         if self.axis == 0:

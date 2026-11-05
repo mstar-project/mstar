@@ -415,7 +415,8 @@ def test_admission_permit_is_held_through_streaming_body():
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        resp_a = urllib.request.urlopen(req_a, timeout=15)
+        # Bounds a hang only; a loaded runner can take over 15 s to the first delta.
+        resp_a = urllib.request.urlopen(req_a, timeout=60)
         # Not just any line: an SSE keep-alive comment would also be one.
         assert b"Hello" in resp_a.readline()  # first delta: A is being served
         # B: A holds the only permit, so B is refused with 503.
@@ -1253,4 +1254,5 @@ def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkey
     monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
     monkeypatch.setenv("PATH", str(elsewhere))
     monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
-    assert find_server_binary() == str(scripts / "mstar-server")
+    # Not a checkout's rust/, so the empty stand-ins are not run.
+    assert find_server_binary(rust_dir=tmp_path) == str(scripts / "mstar-server")

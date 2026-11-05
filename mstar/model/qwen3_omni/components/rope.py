@@ -78,7 +78,8 @@ def compute_3d_cos_sin(
     -------
     cos : torch.Tensor  shape ``(seq_len, head_dim)``
     sin : torch.Tensor  shape ``(seq_len, head_dim)``
-        Ready to be used with :func:`apply_interleaved_mrope`.
+        The rotate-half tables the Thinker's attention rotates q and k by
+        (``qk_norm_rope_table_kv_write``).
     """
     # position_ids_3d: (3, seq_len)  ->  (3, 1, seq_len)
     #   for matmul with inv_freq: (1, head_dim//2, 1)
@@ -97,11 +98,8 @@ def compute_3d_cos_sin(
     cos = (emb.cos() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
     sin = (emb.sin() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
 
-    # Cast back to the model dtype (e.g. bfloat16) so that the subsequent
-    # ``q * cos`` / ``k * cos`` multiplications inside apply_interleaved_mrope
-    # don't promote q/k to fp32 -- which would mismatch the paged KV cache
-    # dtype that FlashInfer's attention call expects.  HF does the same
-    # (modeling_qwen3_omni_moe.py:1329).
+    # Rounded to the model dtype (e.g. bfloat16), as HF rounds them
+    # (modeling_qwen3_omni_moe.py:1329), so the rotation reads the same tables.
     if target_dtype is not None:
         cos = cos.to(target_dtype)
         sin = sin.to(target_dtype)
@@ -148,56 +146,6 @@ def _apply_interleaved_mrope_freqs(
         freqs_t[..., idx] = freqs[dim, ..., idx]
 
     return freqs_t
-
-
-def apply_interleaved_mrope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply interleaved multimodal RoPE to query and key tensors.
-
-    This applies the standard rotate-half RoPE using cos/sin that have
-    *already* been interleaved via :func:`compute_3d_cos_sin`.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query tensor.  Typical shapes:
-        - ``(batch, heads, seq_len, head_dim)`` (``unsqueeze_dim=1`` is a no-op
-          when cos already has a heads broadcast dim, but the unsqueeze makes
-          ``(seq_len, head_dim)`` -> ``(1, seq_len, head_dim)`` broadcastable).
-        - ``(tokens, heads, head_dim)`` for disaggregated / packed inputs.
-    k : torch.Tensor
-        Key tensor, same layout as ``q`` but may have fewer heads (GQA).
-    cos : torch.Tensor
-        Cosine embeddings from :func:`compute_3d_cos_sin`.
-    sin : torch.Tensor
-        Sine embeddings from :func:`compute_3d_cos_sin`.
-    unsqueeze_dim : int
-        Dimension along which to unsqueeze cos/sin so they broadcast with
-        q/k.  Default 1 matches the HF convention for
-        ``(batch, heads, seq_len, head_dim)`` layout.
-
-    Returns
-    -------
-    q_embed, k_embed : torch.Tensor
-        Rotated query and key tensors, same shape and dtype as inputs.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims -- standard RoPE helper."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 # -----------------------------------------------------------------------
