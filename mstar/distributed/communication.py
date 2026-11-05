@@ -2,7 +2,7 @@ import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import urlparse
 
 import torch
@@ -12,6 +12,9 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from mstar.distributed.all_reduce import AllReduce
 from mstar.distributed.utils import resolve_dist_timeout
+
+if TYPE_CHECKING:
+    from mstar.distributed.ar_fusion import ARFusion
 
 
 def default_group_timeout(backend: str) -> timedelta:
@@ -73,9 +76,9 @@ def _barrier(group: dist.ProcessGroup | None = None) -> None:
 
 
 class ArFusionWorkspace(NamedTuple):
-    """A fused all-reduce workspace of a ``CommGroup``: its id in
-    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
-    ws_id: int
+    """A fused all-reduce strategy of a ``CommGroup`` (an ``ar_fusion.ARFusion``),
+    set up for inputs of up to ``max_tokens`` rows."""
+    fusion: "ARFusion"
     max_tokens: int
 
 
@@ -105,7 +108,7 @@ class CommGroup:
         # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
-        # (dtype, hidden) -> its fused all-reduce workspace; see ``init_allreduce_fusion``
+        # (dtype, hidden) -> its fused all-reduce strategy; see ``init_allreduce_fusion``
         self._ar_fusion: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
@@ -184,29 +187,43 @@ class CommGroup:
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
-        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs of ``dtype``. Returns whether it is available for them.
+        """Sets up the fused kernel behind ``allreduce_add_rmsnorm`` for up to
+        ``max_tokens`` rows of ``hidden`` in ``dtype`` (the platform's kernel may
+        take fewer, the rest stay unfused). Returns whether it's available.
 
-        Collective: every member calls it at load, in the same order with the
-        same arguments. The lockstep nodes of an instance share its group, so
-        it uses one workspace per ``(dtype, hidden)``. A larger ``max_tokens``
-        builds another if it can and leaves the old one allocated, outside torch's
-        allocator: 512 MiB per rank in each shape measured at TP2 on H200, with
-        the MNNVL backend FlashInfer 0.7.2's "auto" chose. Other inputs take the
-        group's ``all_reduce`` and a separate norm.
+        Collective like ``init_all_reduce``: every member calls it at load, in
+        the same order with the same arguments. The lockstep nodes of an
+        instance share its group, so it uses one strategy per ``(dtype,
+        hidden)``. A larger ``max_tokens`` builds another if it can and leaves
+        the old one allocated, outside torch's allocator: 512 MiB per rank in
+        each shape measured at TP2 on H200, with the MNNVL backend FlashInfer
+        0.7.2's "auto" chose. Other inputs take the group's ``all_reduce`` and
+        a separate norm.
         """
         if self.world_size == 1:
             return False
         have = self._ar_fusion.get((dtype, hidden))
         if have is not None and have.max_tokens >= max_tokens:
             return True
-        from mstar.distributed.ar_fusion import create_workspace
+        from mstar.distributed.ar_fusion import ARFusion
 
-        ws_id = create_workspace(self, max_tokens, hidden, dtype)
-        if ws_id is None:
+        fusion = ARFusion.new(self, hidden, dtype, max_tokens)
+        if fusion is None:
             return False
-        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens)
+        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(fusion, max_tokens)
         return True
+
+    def graph_capture(self):
+        """Scope for one graph capture that may contain ``allreduce_add_rmsnorm``
+        (see ``ar_fusion.GraphCaptureScope``). Every member enters it for every
+        capture, even one that fails."""
+        from mstar.distributed.ar_fusion import GraphCaptureScope, JointCaptureScope
+
+        scopes = [ws.fusion.graph_capture() for ws in self._ar_fusion.values()]
+        if not scopes:
+            return GraphCaptureScope()
+        # the strategies were built in one order on every rank, so their scopes finish in it
+        return scopes[0] if len(scopes) == 1 else JointCaptureScope(scopes)
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -216,11 +233,12 @@ class CommGroup:
         scaling by ``weight + weight_bias``. ``x`` is a row-parallel
         projection's partial sum (its linear skipped ``reduce_results``)."""
         ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
-        if (ws is not None and x.shape[0] <= ws.max_tokens
-                and x.is_contiguous() and residual.is_contiguous()):
+        if ws is not None and ws.fusion.accepts(x, residual, weight_bias):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
-            return allreduce_add_rmsnorm(x, residual, weight, eps, weight_bias, ws.ws_id)
+            return allreduce_add_rmsnorm(
+                x, residual, weight, eps, weight_bias, ws.fusion.ws_id,
+            )
         r = self.all_reduce(x) + residual
         v = r.float()
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
