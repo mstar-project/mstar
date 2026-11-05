@@ -87,6 +87,13 @@ def _http_error(r: requests.Response) -> Verdict:
     return Verdict(False, f"HTTP {r.status_code}: {r.text[:300]}")
 
 
+def _form_files(files):
+    """One (name, bytes) tuple, or a list of them for a request with several images."""
+    if not files:
+        return None
+    return [("files", f) for f in files] if isinstance(files, list) else {"files": files}
+
+
 def run_case(url: str, case: Case) -> Verdict:
     payload = case.build()
     if case.route == "chat":
@@ -99,7 +106,7 @@ def run_case(url: str, case: Case) -> Verdict:
     if case.route == "transcribe":
         r = requests.post(url + "/v1/audio/transcriptions", data=payload, files={"file": files}, timeout=900)
         return check_transcription_response(r.content, case.expect) if r.ok else _http_error(r)
-    r = requests.post(url + "/generate", data=payload, files={"files": files} if files else None, timeout=900)
+    r = requests.post(url + "/generate", data=payload, files=_form_files(files), timeout=900)
     if not r.ok:
         return _http_error(r)
     if case.route == "generate_stream":

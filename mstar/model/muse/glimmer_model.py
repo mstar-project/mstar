@@ -130,7 +130,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         # (windows, frames). Every replay plans for this many, so it is sized
         # to real prompts rather than the worst case: the top bucket's patches
         # in whole windows, four times over for partial edge windows and
-        # several images. A prompt with more runs the block loop eagerly
+        # several images. A step with more runs the block loop eagerly
         # (`PackedBlockLoopEncoder._fits_capture`); YAML can raise it.
         from mstar.model.muse.submodules import VisionEncoderSubmodule
 
@@ -174,7 +174,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                     num_qo_heads=vision.num_attention_heads,
                     num_kv_heads=vision.num_attention_heads,
                     head_dim=vision.head_dim,
-                    max_segments_per_request=max_segments,
+                    max_segments_per_step=max_segments,
                 ),
             ),
         ]

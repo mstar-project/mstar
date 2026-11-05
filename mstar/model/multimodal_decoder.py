@@ -120,6 +120,7 @@ class MultimodalDecoderModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+    INTERNAL_KWARGS = (MEDIA_LAYOUT,)
     # in errors and logs
     NAME: str
     # what the API and conductor processes download: enough to build the

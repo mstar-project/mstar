@@ -862,6 +862,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "mstar-rust",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_bytes",

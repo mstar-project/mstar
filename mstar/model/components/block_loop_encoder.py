@@ -1,12 +1,11 @@
 """A packed encoder node whose block loop replays as a captured region.
 
-`PackedBlockLoopEncoder` takes one prompt per step, every image of it packed
-into one call, and replays the tower's block loop as a piecewise region per
-patch bucket; patch embed and the projection run eagerly around it (the
-projection usually changes the row count, which a region's output view
-cannot express). Eager, a ViT tower is launch-bound (~500 kernels, ~4 ms of
-GPU work in a ~20 ms forward on Qwen3.5 9B), and one prompt per replay beats
-batching them.
+`PackedBlockLoopEncoder` packs a step's requests, every image of each, into
+one call, and replays the tower's block loop as a piecewise region per patch
+bucket, the whole step as one row; patch embed and the projection run eagerly
+around it (the projection usually changes the row count, which a region's
+output view cannot express). Eager, a ViT tower is launch-bound (~500
+kernels, ~4 ms of GPU work in a ~20 ms forward on Qwen3.5 9B).
 
 A model writes ``prepare_inputs``: the grid maths over `grids` (host values
 from the walk's ``MEDIA_LAYOUT``, so no device tensor is read), returning ``NodeInputs``
@@ -28,8 +27,10 @@ declared under ``mstar.model.keys.VISION_ATTN``. The node sends its
 `MediaEncoder`'s ``output``.
 
 A replay's attention plan holds at most the resource's
-``max_segments_per_request`` segments under each label; a prompt with more
-takes no lease and runs the block loop eagerly, however few its patches.
+``max_segments_per_step`` segments under each label. A batch that would
+overflow it or the top patch bucket runs its requests one at a time instead,
+each replaying if it fits alone; a request too large alone runs the block
+loop eagerly, however few its patches.
 """
 
 from collections.abc import Mapping, Sequence
@@ -57,8 +58,12 @@ VISION_BLOCK_LOOP = "vision_block_loop"
 
 
 class PackedBlockLoopEncoder(NodeSubmodule):
-    # Patch-count buckets, one prompt per replay; a larger prompt runs eagerly.
+    # Patch-count buckets of one replay; a larger step runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    # Requests per encoder step. Above one, every tensor of ``tensor_inputs``
+    # must pack by concatenation, and ``config`` has ``spatial_merge_size``,
+    # which cuts the output back apart.
+    MAX_BATCH_SIZE = 1
     # The ragged layouts a step plans over its patches, one label each.
     SEGMENT_LABELS: tuple[str, ...] = ("main",)
 
@@ -105,17 +110,21 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         ])
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
+        # packed, the requests must fit one replay together. Applied with the
+        # block loop uncaptured too (capture off, or a node without the
+        # runner), where it only splits a large step into per-request runs.
+        return self._fits_capture(model_inputs)
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # one request a step, so it can take the captured block loop
-        return 1
+        return self.MAX_BATCH_SIZE
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        """The block loop, one prompt per replay, by patch-count bucket."""
+        """The block loop, one replay per step, by patch-count bucket. Batch
+        size 1: a replay is the whole step as one row, every request's
+        segments in it."""
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
@@ -142,6 +151,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
                 lease_before_step=True,
+                one_row_per_step=True,
                 can_lease=self._fits_capture,
                 total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
                 capture_batch_sizes=[1],
@@ -149,13 +159,21 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         }
 
     def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
-        """Whether the batch's segments fit a replay's attention plan under
-        every label: the resource's per-request ceiling, read from it so a
-        YAML override holds."""
-        per_request = self.node_resources[VISION_ATTN].max_segments_per_request
-        return all(
-            sum(len(inp.resource_step_info[label]) for inp in inputs) <= per_request * len(inputs)
-            for label in self.SEGMENT_LABELS
+        """Whether the batch fits one replay (`_fits_replay`), under every
+        label."""
+        return self._fits_replay(
+            sum(inp.input_seq_len for inp in inputs),
+            max(sum(len(inp.resource_step_info[label]) for inp in inputs) for label in self.SEGMENT_LABELS),
+        )
+
+    def _fits_replay(self, patches: int, segments: int) -> bool:
+        """Whether a step of this many patches and attention segments fits one
+        replay: the top patch bucket, and the attention plan's per-step
+        segment ceiling, read from the resource so a YAML override holds."""
+        # the whole step replays as one row (`one_row_per_step`)
+        return (
+            patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1]
+            and segments <= self.node_resources[VISION_ATTN].max_segments_per_step
         )
 
     def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
@@ -172,7 +190,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         sin: torch.Tensor,
         segment_lengths: Mapping[str, Sequence[int]],
     ) -> torch.Tensor | None:
-        """The block loop replayed once per prompt, or None if not leased."""
+        """The block loop replayed once for the whole step, or None if not leased."""
         if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         spans = {label: list(segment_lengths[label]) for label in self.SEGMENT_LABELS}
@@ -180,9 +198,8 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         # the schedule a queued replay still reads
         return engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
-            request_ids=[engine_inputs.request_ids[0]],
+            request_ids=engine_inputs.request_ids,
             seq_lens=spans[self.SEGMENT_LABELS[-1]],
-            real_bs=1,
             label_seq_lens=spans,
         ).get_view("hidden")
 
@@ -192,19 +209,25 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, Any]:
-        """The batch's one request (see `max_batch_size`), its images packed
-        in `declare_step`'s segment order."""
-        (inp,) = inputs
+        """Every request's images packed end to end, in `declare_step`'s
+        segment order."""
         device = self.get_device()
 
-        def to_device(t: torch.Tensor) -> torch.Tensor:
+        def packed(name: str) -> torch.Tensor:
+            parts = [inp.tensor_inputs[name] for inp in inputs]
+            t = parts[0] if len(parts) == 1 else torch.cat(parts)
             # from pinned memory, so the copy does not block the host
             if t.device.type == "cpu" and device.type != "cpu":
                 t = t.pin_memory()
             return t.to(device, non_blocking=True)
 
-        out: dict[str, Any] = {name: to_device(t) for name, t in inp.tensor_inputs.items()}
-        out["segment_lengths"] = inp.resource_step_info
+        out: dict[str, Any] = {name: packed(name) for name in inputs[0].tensor_inputs}
+        out["segment_lengths"] = {
+            label: [n for inp in inputs for n in inp.resource_step_info[label]]
+            for label in self.SEGMENT_LABELS
+        }
+        # patches per request, to cut the output back apart
+        out["row_patches"] = tuple(inp.input_seq_len for inp in inputs)
         return out
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -216,6 +239,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         segment_lengths: Mapping[str, Sequence[int]],
+        row_patches: tuple[int, ...] = (),
         **tensors: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
         # one call for every image; the ragged kernel's segments keep them apart
@@ -224,4 +248,17 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         if encoded is None:
             encoded = self.model.encode(hidden, cos, sin)
         embeds = self.model.project(encoded, **tensors)
-        return {engine_inputs.request_ids[0]: {self.output: [embeds]}}
+        return self._split_rows(engine_inputs.request_ids, embeds, row_patches)
+
+    def _split_rows(
+        self, request_ids: list[str], embeds: torch.Tensor, row_patches: tuple[int, ...],
+    ) -> dict[str, NameToTensorList]:
+        """Each request's slice of the packed output."""
+        if len(request_ids) == 1:
+            return {request_ids[0]: {self.output: [embeds]}}
+        out, start = {}, 0
+        for rid, patches in zip(request_ids, row_patches, strict=True):
+            n = patches // self.config.spatial_merge_size ** 2
+            out[rid] = {self.output: [embeds[start:start + n]]}
+            start += n
+        return out

@@ -169,10 +169,7 @@ def test_audio_windows_match_hf(audio_pair):
     hf, sub, ragged = audio_pair
     # under one window, about one, and several (a window is 200 frames here)
     feats = [torch.randn(AUDIO["num_mel_bins"], n) for n in (150, 230, 905)]
-    rows = [
-        sub.prepare_inputs("prefill_audio", _fwd(), {"audio_features": [f], "audio_seqlens": [torch.tensor([n])]})
-        for f, n in zip(feats, (150, 230, 905), strict=True)
-    ]
+    rows = [sub.prepare_inputs("prefill_audio", _fwd(), {"audio_features": [f]}) for f in feats]
     step = sub.declare_step("prefill_audio", ["a", "b", "c"], rows)
     window = sub.encoder.config
     assert step.steps[AUDIO_ATTN].causal is False

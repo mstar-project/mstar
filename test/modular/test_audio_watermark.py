@@ -8,6 +8,7 @@ and runs only when they are already in AudioSeal's cache.
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import sys
 from hashlib import sha1
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 
 import pytest
 import torch
+from packaging.version import Version
 
 from mstar.engine.engine import Engine
 from mstar.model.audio_watermark import (
@@ -220,15 +222,21 @@ def test_an_utterance_ending_mid_frame_differs_from_the_library_in_its_last_fram
     torch.testing.assert_close(streamed[:whole], _library_offline(wmk, audio)[:whole], atol=1e-6, rtol=0)
 
 
-def test_library_streaming_context_does_not_carry_history():
-    """Why the module keeps the state itself (upstream issue #105)."""
+def test_library_streaming_context_carries_history_from_0_2_1():
+    """AudioSeal 0.2.0's ``streaming()`` drops the history between chunks
+    (upstream issue #105), why the module first kept the state itself. 0.2.1
+    fixed it, and its stream matches the offline watermark like ours does."""
     wmk = _watermarker()
     audio = _speechlike(2560, seed=2)
     message = torch.tensor([wmk.config.message_bits()])
     with torch.no_grad(), wmk._no_compile(), wmk.generator.streaming(1):
         parts = [wmk.generator(audio[i:i + 640].view(1, 1, -1), message=message) for i in range(0, 2560, 640)]
     naive = torch.cat([p.view(-1) for p in parts])
-    assert (naive - _library_offline(wmk, audio)).abs().max() > 1e-4
+    offline = _library_offline(wmk, audio)
+    if Version(importlib.metadata.version("audioseal")) < Version("0.2.1"):
+        assert (naive - offline).abs().max() > 1e-4
+    else:
+        torch.testing.assert_close(naive, offline, atol=1e-6, rtol=0)
 
 
 def test_streams_batch_without_mixing():

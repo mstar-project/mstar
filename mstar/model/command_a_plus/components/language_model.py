@@ -147,6 +147,14 @@ class CommandAPlusAttention(ParallelAttention):
 class CommandAPlusDecoderLayer(nn.Module):
     """Parallel residual block: x + Attention(LN(x)) + MoE(LN(x))."""
 
+    # once fused (``fuse_weights``, on CUDA) ``fused_branches`` runs these as slices of its GEMMs
+    lora_unservable = dict.fromkeys(
+        ("self_attn.qkv_proj", "self_attn.o_proj",
+         "mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"),
+        "fused into the decoder layer's GEMMs at load on CUDA (fuse_weights); refused on every "
+        "device so the spec does not depend on it",
+    )
+
     def __init__(
         self,
         config: CommandAPlusTextConfig,
@@ -302,12 +310,8 @@ class CommandAPlusLanguageModel(nn.Module):
             # A replicated table makes the lookup a plain gather. The sharded
             # lookup all-reduces rows that are zero on every other rank, so the
             # result is bit-identical.
-            shard = self.embed_tokens.weight.data
-            self._replicated_embedding = torch.empty(
-                (shard.shape[0] * group.world_size, shard.shape[1]), dtype=shard.dtype, device=shard.device,
-            )
-            torch.distributed.all_gather_into_tensor(
-                self._replicated_embedding, shard.contiguous(), group=group.device_group,
+            self._replicated_embedding = group.all_gather(
+                self.embed_tokens.weight.data.contiguous(), dim=0,
             )
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:

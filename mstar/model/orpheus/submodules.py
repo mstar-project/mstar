@@ -24,7 +24,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -35,12 +35,20 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    StopKind,
-    StopPolicy,
+    TokenStop,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
+
+
+def token_stop(stop_token_id: int) -> TokenStop:
+    """The decode loop's stop id, checked by the graph runtime on every walk;
+    the loop's cap is the token budget."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER,
+        runtime_check=True,
+    )
 
 
 class OrpheusLLMSubmodule(ARNodeSubmodule):
@@ -62,6 +70,11 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
         self.config = config
+        self.token_stop = token_stop(config.stop_token_id)
+        # The LM head computes the custom-token rows alone and reads -inf for
+        # the text rows (``output_start``), so the stop token must be one of them.
+        if config.stop_token_id < config.custom_token_base_id:
+            raise ValueError("Orpheus's stop token must be a custom token")
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
@@ -236,28 +249,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
-    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy]:
-        # check_stop's EOS / token-budget test, on every walk
-        return {"decode_loop": StopPolicy(
-            StopKind.AR, token_signal="new_token", eos_tokens=(self.config.stop_token_id,), sampler=SAMPLER,
-        )}
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        eos_token_id = self.config.stop_token_id
-        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"decode_loop"}
-        return set()
-
-
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz streaming decoder submodule.
 
@@ -269,10 +260,15 @@ class SNACDecoderSubmodule(NodeSubmodule):
     the last whole frame.
 
     Batched: windows of one size decode in one SNAC forward, and every size
-    a stream can produce has a capture. The scheduler batches each size
-    apart (``split_batches_by_capture_key``), because the decoder is not
-    causal and padding would change the frames next to it; a batch that
-    mixes sizes anyway decodes each size apart, eagerly.
+    a stream can produce has a capture. A window whose own frames start
+    ``SNAC_LEFT_REACH_FRAMES`` or more in decodes them the same with anything
+    prepended, so it is padded on the left to the widest window
+    (``_left_pad``) and a stream's later windows share one size (all but the
+    first two, with the default geometry). A window that starts closer keeps
+    its own size: the decoder is not causal, and padding that near would
+    change the frames it emits.
+    The scheduler batches each size apart (``split_batches_by_capture_key``);
+    a batch that mixes sizes anyway decodes each size apart, eagerly.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
@@ -290,11 +286,14 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.idx_2356 = torch.tensor([2, 3, 5, 6], dtype=torch.long, device=device)
         self.config = config
         self.windows = config.snac_window_frames()
+        self.widest = max(self.windows)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """One capture per window size a stream can produce, final flushes included.
+        """One capture per window size ``snac_window_frames`` lists, final
+        flushes included. That over-covers: sizes that occur only past the left
+        reach are padded to the widest and never replay.
 
         Not compiled, like the eager path (``disable_torch_compile``): the
         captured and eager decodes of a stream then run the same kernels, and
@@ -353,11 +352,27 @@ class SNACDecoderSubmodule(NodeSubmodule):
         if frames == 0:
             # a stream shorter than one frame: decode a silent frame, emit nothing
             codes = torch.zeros((1, tpf), dtype=tokens.dtype, device=tokens.device)
+        pad = self._left_pad(frames, start)
+        if pad:
+            codes = torch.cat([codes.new_zeros((pad, tpf)), codes])
+            start, end = start + pad, end + pad
         return ARNodeInputs(
             input_ids=codes,
             input_seq_len=1,
             kwargs={"start": start, "end": end},
         )
+
+    def _left_pad(self, frames: int, start: int) -> int:
+        """Frames of padding that widen a window to the widest one, on the left.
+
+        A window whose own audio starts ``SNAC_LEFT_REACH_FRAMES`` frames in
+        decodes the same audio for it whatever lies further left, so those
+        windows (all but a stream's first ones) are padded to the widest window
+        and share its batches instead of a step per window size.
+        """
+        if frames == 0 or start < SNAC_LEFT_REACH_FRAMES:
+            return 0
+        return self.widest - frames
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
@@ -373,16 +388,20 @@ class SNACDecoderSubmodule(NodeSubmodule):
         per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
         **kwargs: Any,
     ) -> Any:
-        """The batch's window size in frames when all its windows share one."""
+        """The batch's window size in frames, as ``prepare_inputs`` pads it,
+        when all its windows share one."""
         del graph_walk, kwargs
         per_request_input_metadata = per_request_input_metadata or {}
+        tpf = self.config.tokens_per_frame
         frames = set()
         for request_id in per_request_info:
             chunk = self._stream_chunk(per_request_input_metadata.get(request_id))
             if chunk is None:
                 return None
+            own = chunk.num_items // tpf
+            start = max(chunk.context_items // tpf - self.config.snac_right_context_frames, 0)
             # prepare_inputs decodes a stream shorter than a frame as one frame
-            frames.add(max(chunk.num_items // self.config.tokens_per_frame, 1))
+            frames.add(max(own, 1) + self._left_pad(own, start))
         return frames.pop() if len(frames) == 1 else None
 
     def preprocess(

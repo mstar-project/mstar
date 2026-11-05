@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.loader.base import _apply_stacked
+from mstar.model.loader.base import apply_stacked
 from mstar.model.muse.components.text import (
     GatedQKVParallelLinear,
     MuseGlimmerForCausalLM,
@@ -439,7 +439,7 @@ def test_every_text_parameter_has_a_checkpoint_tensor(ckpt_dir):
         model = MuseGlimmerForCausalLM(MuseGlimmerConfig.from_hf(ckpt_dir))
     targets = {}
     for name in _checkpoint_text_names(N_LAYERS):
-        target, shard = _apply_stacked(text_name_remapper(name), _STACKED_PARAMS)
+        target, shard = apply_stacked(text_name_remapper(name), _STACKED_PARAMS)
         targets.setdefault(target, set()).add(shard)
     params = {n for n, _ in model.named_parameters()}
     assert params == set(targets)
@@ -466,7 +466,7 @@ def test_every_vision_parameter_has_a_checkpoint_tensor():
             names += [f"model.vision_tower.layers.{i}.{mod}.{p}" for p in ("weight", "bias")]
     targets: dict[str, set] = {}
     for name in names:
-        target, shard = _apply_stacked(vision_name_remapper(name), _VISION_STACKED)
+        target, shard = apply_stacked(vision_name_remapper(name), _VISION_STACKED)
         targets.setdefault(target, set()).add(shard)
     assert set(targets) == {n for n, _ in tower.named_parameters()}
     # the split q/k/v land in the shared block's one fused projection

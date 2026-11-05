@@ -23,6 +23,7 @@ from mstar.engine.resources.attn.config import (
     derive_kv_groups,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.kv.config import (
     DEFAULT_PAGE_SIZE,
@@ -129,8 +130,10 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertEqual(plain.fingerprint(), AttentionManager.fingerprint(plain))
 
     def test_mixed_wrapper_hands_the_scale_to_both_halves(self):
+        workspaces = WorkspacePool(torch.device("cpu"), size_mb=1)
         mixed = wrappers.FlashInferMixedWrapper(
-            decode_workspace=None, prefill_workspace=None, num_qo_heads=4, num_kv_heads=2,
+            decode_workspace=workspaces.get("decode"), prefill_workspace=workspaces.get("prefill"),
+            num_qo_heads=4, num_kv_heads=2,
             head_dim=128, page_size=16, batch_size=2, max_total_tokens=8, max_num_pages=8,
             max_prefill_rows=1, device=torch.device("cpu"), sm_scale=0.5,
         )
@@ -500,10 +503,10 @@ class SlidingWindowGPU(unittest.TestCase):
         lengths, queries, scale = [20, 13], [1, 9], 3.87 / 128 ** 0.5
         indptrs = context(lengths, queries).plan_results["kv"]["main"].cpu_indptrs
         real = sum(queries)
-        workspace = lambda: torch.empty(32 << 20, dtype=torch.uint8, device="cuda")  # noqa: E731
+        workspaces = WorkspacePool(torch.device("cuda"), size_mb=32)
         mixed = wrappers.FlashInferMixedWrapper(
-            decode_workspace=workspace(), prefill_workspace=workspace(), num_qo_heads=4,
-            num_kv_heads=2, head_dim=128, page_size=16, batch_size=2, max_total_tokens=real + 7,
+            decode_workspace=workspaces.get("decode"), prefill_workspace=workspaces.get("prefill"),
+            num_qo_heads=4, num_kv_heads=2, head_dim=128, page_size=16, batch_size=2, max_total_tokens=real + 7,
             max_num_pages=16, max_prefill_rows=1, device=torch.device("cuda"), sm_scale=scale,
         )
         mixed.plan(

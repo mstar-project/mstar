@@ -36,7 +36,6 @@ Constraints it has to keep:
 
 - **Per-peer order.** Messages from one peer are handled in arrival order, and a parked message replays before later ones for the same request.
 - **Lockstep** (invariant 11). A follower handles control messages in rank 0's order; anything the inbox decides must be derived from replicated state or replayed, never from per-rank timing.
-- **Both runtimes** (invariant 5). The Python runtime gets the same begin / resume API over today's handlers, and parity tests drive both with the same message streams, as `test_stream_completion_order.py` does for EDGE_ITEMS.
 - **Handles stay local** (invariant 14). Translation happens inside the inbox; nothing it returns carries another worker's handle.
 
 ## Staging
