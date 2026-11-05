@@ -207,7 +207,8 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, frames]``, one per latent frame; returns
+        """``timestep`` ``[B, frames]``, one per latent frame (under SP, one per
+        run of a frame's tokens on this rank: ``Wan22DiT.forward``); returns
         ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
         batch, frames = timestep.shape
@@ -246,8 +247,9 @@ class Wan22DiTBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         self_attend: Attend = joint_attention,
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, frames, 6, dim] -> six [B, frames, dim] fp32
-        # tensors, each applied to all of a frame's tokens.
+        # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
+        # applied to one of G equal groups of tokens: a frame, or under SP a run
+        # of a frame's tokens.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
         ).unbind(2)
@@ -264,10 +266,10 @@ class Wan22DiTBlock(nn.Module):
             hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
         )
         ff_output = gelu_tanh_ffn(norm_hidden, self.ffn)
-        frames = timestep_proj.shape[1]
+        groups = timestep_proj.shape[1]
         return (
-            hidden_states.unflatten(1, (frames, -1)).float()
-            + ff_output.unflatten(1, (frames, -1)).float() * c_gate_msa.unsqueeze(2)
+            hidden_states.unflatten(1, (groups, -1)).float()
+            + ff_output.unflatten(1, (groups, -1)).float() * c_gate_msa.unsqueeze(2)
         ).type_as(hidden_states).flatten(1, 2)
 
 
@@ -359,11 +361,16 @@ class Wan22DiT(nn.Module):
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
-        sp = SeqParallel(self.sp_group, sp_seq_split(hidden_states.shape[1], self.sp_group.world_size))
+        sizes = sp_seq_split(hidden_states.shape[1], self.sp_group.world_size)
+        sp = SeqParallel(self.sp_group, sizes)
         if self.sp_group.world_size > 1:
-            # a rank's tokens need not be whole frames, so it modulates per token
-            timestep = timestep.repeat_interleave(hidden_states.shape[1] // grid[0], dim=1)
-        hidden_states, timestep = sp.scatter(hidden_states), sp.scatter(timestep)
+            # a rank's tokens need not be whole frames, so it modulates per run of
+            # tokens: the longest run that tiles a frame and every rank's share
+            per_frame = hidden_states.shape[1] // grid[0]
+            run = math.gcd(per_frame, *sizes)
+            runs = SeqParallel(self.sp_group, [n // run for n in sizes])
+            timestep = runs.scatter(timestep.repeat_interleave(per_frame // run, dim=1))
+        hidden_states = sp.scatter(hidden_states)
         rotary_emb = tuple(sp.scatter(t, dim=0) for t in rotary_emb)  # [S, D] tables
         self_attend = functools.partial(sp.attend, run=functools.partial(joint_attention, ragged=self_attn_fn))
 
@@ -375,7 +382,7 @@ class Wan22DiT(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attend)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
-        # bf16 temb promotes, per frame), then project and unpatchify.
+        # bf16 temb promotes, per group of tokens), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
         hidden_states = sp.gather(self.proj_out(hidden_states))

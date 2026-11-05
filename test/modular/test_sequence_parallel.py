@@ -172,11 +172,12 @@ def _wan_dit(rank, world, grid, out_path):
         torch.save(out, out_path)
 
 
-@pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6)], ids=["even", "uneven"])
+@pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6), (3, 4, 6)], ids=["even", "uneven", "runs"])
 def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
     """Each SP rank keeps its slice of the tokens, their RoPE and their
-    frames' timesteps, and the gathered output is the one-rank DiT's (8 and 9
-    tokens: an even and an uneven split over two ranks, the uneven one cutting
-    a frame)."""
+    frames' timesteps, and the gathered output is the one-rank DiT's. Over two
+    ranks, 8 tokens split on whole frames, 9 cut a frame (modulation per
+    token), and 18 split 9/9 cut a frame of 6 (modulation per half
+    frame)."""
     _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
     torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))
