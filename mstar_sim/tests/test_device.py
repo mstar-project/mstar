@@ -411,6 +411,16 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             raise SystemExit("CUDA-core decode took a fixed split")
         except ValueError as e:
             assert "tensor core decode" in str(e), e
+        # a plan's Python is the emulator's time, not the host's: FlashInfer's own is a C++ loop
+        import time
+        from mstar_sim import clock
+        batch = torch.arange(257, dtype=torch.int32)
+        counted, began = clock.STATS["host_compute"], time.perf_counter()
+        get_batch_prefill_module("fa2").plan(
+            torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), None, None, batch, batch * 64,
+            torch.full((256,), 1024, dtype=torch.int32), 256, 256, 8, 8, 16, False, 64, 64, True, -1, -1, False, 0, 0)
+        elapsed = time.perf_counter() - began
+        assert clock.STATS["host_compute"] - counted > elapsed / 2, (clock.STATS, elapsed)
         # what FlashInfer's plan refuses: a group size with no kernel, a negative length, and
         # several queries a row where the kernels take one
         one_row = torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32)

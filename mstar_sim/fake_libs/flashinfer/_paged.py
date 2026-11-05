@@ -165,6 +165,7 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
     else:
         tile = _cta_tile_q(sum(packed) // max(batch, 1), head_dim_vo, head_dim_qk)
         tiles_q = sum(_ceil(p, tile) for p in packed)
+    q_tiles = [_ceil(p, tile) for p in packed]
     effective = [min(_ceil(window_left + tile, page_size), n) if window_left >= 0 else n for n in kv_len]
     split, chunk = False, None
     if not disable_split_kv and fixed_split_size > 0:
@@ -174,7 +175,7 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
         low, high = max(128 // page_size, 1), longest
         while low < high:
             mid = (low + high) // 2
-            tiles = sum(_ceil(p, tile) * _ceil(max(n, 1), mid) for p, n in zip(packed, effective, strict=True))
+            tiles = sum(t * _ceil(max(n, 1), mid) for t, n in zip(q_tiles, effective, strict=True))
             if tiles > max_batch_if_split:
                 low = mid + 1
             else:
@@ -183,7 +184,7 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
     chunks = [1 if chunk is None else _ceil(max(n, 1), chunk) for n in effective]
     if fixed_split_size > 0 and not disable_split_kv:
         split = split or any(c > 1 for c in chunks)
-    new_batch = sum(_ceil(p, tile) * c for p, c in zip(packed, chunks, strict=True))
+    new_batch = sum(t * c for t, c in zip(q_tiles, chunks, strict=True))
     padded = max(max_batch_if_split, tiles_q) if cuda_graph else new_batch
     if new_batch > padded:
         raise gpu_error(RuntimeError(
@@ -304,6 +305,7 @@ class PrefillPlanner:
                                    head_dim_vo)
         return []  # another backend's planner (cudnn, trtllm-gen) isn't laid out
 
+    @clock.computing()
     def plan(self, float_workspace, int_workspace, pinned_int_workspace, qo_indptr, kv_indptr, kv_len_arr,
              total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,
              head_dim_qk, head_dim_vo, causal, window_left, *fa2_args) -> list[int]:
@@ -332,6 +334,7 @@ class DecodePlanner:
     def __init__(self, wrapper):
         self._wrapper = wrapper
 
+    @clock.computing()
     def plan(self, float_workspace, int_workspace, pinned_int_workspace, indptr, batch_size, num_qo_heads,
              num_kv_heads, page_size, enable_cuda_graph, window_left, logits_soft_cap, head_dim_qk,
              head_dim_vo, empty_q_data, empty_kv_data) -> list[int]:
