@@ -127,11 +127,12 @@ def _missing_from_stand_in(excinfo) -> str | None:
 _EMULATOR = "/mstar_sim/"
 
 
-def _dynamo_without_the_gpu(excinfo) -> str | None:
-    """Dynamo tracing a device (a test's own ``torch._dynamo.explain``) asks CPU torch's
-    accelerator API, which the emulated GPU isn't behind: ``torch.compile`` runs eagerly."""
+def _accelerator_without_the_gpu(excinfo) -> str | None:
+    """A caller of CPU torch's accelerator API, which the emulated GPU isn't behind: Dynamo
+    tracing a device (a test's own ``torch._dynamo.explain``; ``torch.compile`` runs eagerly),
+    or a ``torch.accelerator`` call the emulator doesn't reach."""
     if "Cannot access accelerator device when none is available" in excinfo.exconly():
-        return "torch._dynamo (it sees CPU torch's accelerator, not the emulated GPU)"
+        return "torch.accelerator (CPU torch's, not the emulated GPU)"
     return None
 
 
@@ -191,7 +192,7 @@ def pytest_runtest_makereport(item, call):
         report.longrepr = (str(item.path), item.location[1] or 0, "Skipped: needs the Hugging Face Hub (offline)")
         return
     where = (lacks or _raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
-             or _dynamo_without_the_gpu(call.excinfo))
+             or _accelerator_without_the_gpu(call.excinfo))
     if where:
         GAPS.append((item.nodeid, f"{where}: {call.excinfo.exconly()[:160]}"))
         report.outcome = "skipped"
