@@ -13,6 +13,7 @@ So the oldest request always gets its page and finishes.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -100,15 +101,15 @@ def _queue(kv) -> list[str]:
     return _runner(kv)._admission._queues["kv"]
 
 
-def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
+def _step(kv, rid: str, tokens: int, label: str = "main", walk: str = WALK) -> AdmitOutcome:
     """One step of ``tokens`` for ``rid``, committed when it is admitted."""
-    step = KVStep(segments=(Segment(rid, "main", tokens),))
-    outcome = kv.admit(step, _ctx(rid))
+    step, ctx = KVStep(segments=(Segment(rid, label, tokens),)), replace(_ctx(rid), graph_walk=walk)
+    outcome = kv.admit(step, ctx)
     if outcome.ok:
-        kv.plan(step, _ctx(rid))
-        kv.commit(step, _ctx(rid))
+        kv.plan(step, ctx)
+        kv.commit(step, ctx)
     else:
-        kv.rollback_admit(step, _ctx(rid))
+        kv.rollback_admit(step, ctx)
     return outcome
 
 
@@ -861,6 +862,35 @@ def test_a_request_the_full_host_cant_cover_turns_guaranteed_at_that_page_and_is
     assert kv._cpu_pool.guaranteed == 1 and "no room to set aside for r's move" in caplog.text
     for _ in range(3):
         assert _step(kv, "r", PAGE_SIZE).ok, "r turned guaranteed without reserving what it grows into"
+
+
+def test_a_request_the_full_host_turns_guaranteed_before_it_adopts_its_lease_grows_within_its_allotment():
+    """`_cover_move` left the lease's lent pages out of the allotment it guaranteed, and `_adopt` took them off again,
+    so x took room g's guarantee covered."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(4)
+    tokens = list(range(3 * PAGE_SIZE))
+    _running(kv, "h", 2, arrival=0, keyed=tokens[:2 * PAGE_SIZE])
+    main = StreamLayout(spans=(PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, WALK),), growth=(("decode", 1),), keyed_spans=1)
+    other = StreamLayout(spans=(PrefixSpan(PAGE_SIZE, PAGE_SIZE, "other"),), growth=(("decode", 1),))
+    _runner(kv).ingest_request("g", {"kv": KVReqConfig(
+        prefix_keys={"main": _keys(tokens)}, kv_layout={"main": main, "other": other},
+        needed_labels_per_node_walk={(NODE, WALK): ["main"], (NODE, "other"): ["other"]},
+        loop_caps={"decode": 2 * PAGE_SIZE}, rebuildable=False,
+    )}, 1)
+    assert _ready(kv, "g")
+    inputs = ARNodeInputs(input_seq_len=3 * PAGE_SIZE)
+    kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
+    assert kv._streams["g"]["main"].lent == set(kv._streams["g"]["main"].lease)
+    # the third page is one the host can't cover
+    for _ in range(3):
+        assert _step(kv, "g", PAGE_SIZE, label="other", walk="other").ok
+    assert "g" in kv._guaranteed
+    assert _step(kv, "g", PAGE_SIZE).ok
+    _running(kv, "x", kv._room(), arrival=2)
+
+    for _ in range(2):
+        assert _step(kv, "g", PAGE_SIZE).ok, "g ran short of pages its guarantee covered"
 
 
 def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_footprint_and_can_still_move():
