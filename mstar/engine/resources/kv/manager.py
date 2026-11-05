@@ -5275,9 +5275,10 @@ class KVManager(AttentionResource):
                 if new_pages is None:
                     available = self._allowance(request_id)
                     pages_short = short or num_new_pages - available
-                    if self._decides:
+                    if self._decides and not undoable:
                         # The grant needed the room and `pages_short` past the allotment, which for a guarantee
-                        # `_cover_move` found short is every page the request grows into.
+                        # `_cover_move` found short is every page the request grows into. A refused pre-admit ran
+                        # short of nothing, since exec admits the step again and may evict.
                         room = self._room()
                         self._ran_short[request_id] = ShortGrant(room, room + pages_short)
                     return AllocResult(
