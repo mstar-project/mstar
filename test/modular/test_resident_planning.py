@@ -3028,3 +3028,73 @@ def test_cross_attention_over_a_fixed_context_repeats():
 
     cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
     assert cross.repeat_refusal(WALK) is None
+
+
+def _cut(table, pad, start, repeats):
+    """The column a row's table gives from ``start``: past its end, the pad's rows,
+    then the pad's last row over and over."""
+    rows = torch.cat([table, pad]) if pad is not None else table
+    at = [min(i, rows.shape[0] - 1) for i in range(start, start + repeats)]
+    return rows[at]
+
+
+@pytest.mark.parametrize("repeats", [1, 4])
+def test_iteration_inputs_cut_each_row_from_its_padded_table_once(repeats):
+    """Inside the table, across into a state pad, past the pad, a constant pad,
+    an empty table, an offset, a padding row; a pad-less read past the end
+    raises; a reassigned source is cut anew; a column keeps its table's dtype;
+    and once the tables are made a step's work doesn't grow with its rows."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from mstar.model.submodule_base import PerRequestState, iteration_columns
+
+    class Node:
+        ITERATION_INPUTS = {
+            "cond": IterationInput("trailing", shape=(2,), pad="pad", capture_fill=-1.0),
+            "floor": IterationInput("floor", pad=False, capture_fill=True, dtype=torch.bool),
+            "t": IterationInput("ts", pad=None, offset=1, dtype=torch.long),
+        }
+
+        def __init__(self):
+            self.request_states = {}
+
+    node = Node()
+    for rid, (n, floor) in enumerate([(5, 3), (2, 0)], start=1):
+        state = node.request_states[rid] = PerRequestState()
+        state.add("trailing", torch.arange(2.0 * n).reshape(n, 2) + 100 * rid)
+        state.add("pad", torch.tensor([[-7.0, -8.0], [-9.0, -10.0]]))
+        state.add("floor", torch.ones(floor, dtype=torch.bool))
+        state.add("ts", torch.arange(40))
+    pad = torch.tensor([[-7.0, -8.0], [-9.0, -10.0]])
+    for ks in ([0, 0], [3, 1], [6, 2], [30, 30]):
+        out = iteration_columns(node, [(1, ks[0]), (2, ks[1]), None], repeats, CPU)
+        for i, rid in enumerate((1, 2)):
+            state = node.request_states[rid]
+            assert torch.equal(out["cond"][i], _cut(state["trailing"], pad, ks[i], repeats))
+            assert torch.equal(out["floor"][i], _cut(state["floor"], torch.zeros(1, dtype=torch.bool), ks[i], repeats))
+            assert torch.equal(out["t"][i], state["ts"][ks[i] + 1:ks[i] + 1 + repeats])
+        assert (out["cond"][2] == -1).all() and out["floor"][2].all()
+        assert out["t"].dtype == torch.long and out["floor"].dtype == torch.bool
+    with pytest.raises(ValueError, match="reads past"):
+        iteration_columns(node, [(1, 39)], repeats, CPU)
+    node.request_states[1].add("trailing", torch.zeros(5, 2))  # a walk change reassigns its source
+    assert iteration_columns(node, [(1, 0)], repeats, CPU)["cond"][0].abs().sum() == 0
+
+    class Ops(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.kernels = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if not func._schema.name.startswith(("aten::slice", "aten::view", "aten::reshape", "aten::_reshape",
+                                                  "aten::alias", "aten::unsqueeze", "aten::expand")):
+                self.kernels += 1
+            return func(*args, **(kwargs or {}))
+
+    counts = []
+    for rows in ([(1, 2)], [(1, 2), (2, 2), None, None]):
+        iteration_columns(node, rows, repeats, CPU)  # the tables are made once
+        with Ops() as ops:
+            iteration_columns(node, rows, repeats, CPU)
+        counts.append(ops.kernels)
+    assert counts[0] == counts[1] - 3, "only a padding row's fill (once a spec) grows with the rows"
