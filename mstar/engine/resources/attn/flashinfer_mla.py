@@ -464,16 +464,15 @@ class FlashInferMLAManager(AttentionManager):
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
-        # a step of one query a row (decode) is about a work item a row, far under the cap
-        if self._fa_sm_count is None or all(segment.span == 1 for segment in step.segments):
+        if self._fa_sm_count is None:
             return ADMIT_OK
         # request -> label -> its queries this step
         rows: dict[str, dict[str, int]] = {}
         for segment in step.segments:
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
-        # a captured step's own-token plans are padded to its bucket's tokens, and bounded so at plan
-        if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens):
+        # bounded as the step's wrappers plan it: a captured one's own-token plans are padded to its bucket
+        if self._fits(spans, ctx):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
                 f"context-parallel KV pool {self._kv_cache_name!r}"
@@ -499,15 +498,27 @@ class FlashInferMLAManager(AttentionManager):
             rows_sized=len(real),
         ))
 
-    def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None) -> bool:
+    def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
-        the FA planner's work-item cap: its context's, and under SP placement every partner's
-        zigzag share of its own tokens, padded as a capture of ``captured_tokens`` pads it."""
+        the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one
+        when None): a decode step's context alone, any other step's context and own tokens
+        (``rank_plans``), padded as the leased capture's wrapper pads them. Its kind comes from the
+        rule ``plan`` picks the wrapper by (``one_token_rows``)."""
         heads = self._wrapper_kwargs["num_qo_heads"]
+        lease = None if ctx is None else ctx.slot_lease
+        force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            plans = self._placed.rank_plans(self._placement, qo, captured_tokens)
-            if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
+            captured = None
+            if lease is None:
+                decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
+            else:
+                decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
+                # the rows the label's wrapper was captured with, which its own-token part pads to
+                wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
+                captured = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
+            plans = [(qo, heads)] if decode else self._placed.rank_plans(self._placement, qo, heads, captured)
+            if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
 

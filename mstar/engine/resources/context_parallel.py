@@ -173,6 +173,8 @@ class ContextParallelWrapper(ABC):
         # per query token, whether its row holds any of this rank's slots. A captured wrapper's
         # holds its bucket's every token (a row's at least, and the bucket's) and is never
         # reallocated, so a replay reads the address it was captured with
+        # the rows a captured wrapper was built for, which its own-token part pads to (`rank_plans`)
+        self.captured_rows = batch_size
         captured_tokens = max(batch_size or 0, max_total_tokens or 0)
         self._captured = captured_tokens > 0
         self._valid = torch.zeros(captured_tokens, dtype=torch.bool, device=device) if self._captured else None
@@ -255,10 +257,14 @@ class ContextParallelWrapper(ABC):
 
     @staticmethod
     @abstractmethod
-    def rank_plans(placement: ContextParallel, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
-        """The ``qo_indptr`` of every plan a step of ``qo_indptr``'s rows makes on some rank of the
-        placement, whose lengths differ by rank, padded as a capture of ``captured_tokens`` pads
-        them: what admission bounds, so every rank refuses alike."""
+    def rank_plans(
+        placement: ContextParallel, qo_indptr: np.ndarray, num_qo_heads: int, captured: tuple[int, int] | None,
+    ) -> list[tuple[np.ndarray, int]]:
+        """Every plan a multi-token step of ``qo_indptr``'s rows makes on any rank of the
+        placement, as ``(qo_indptr, query heads)``: the context's at the local geometry's
+        ``num_qo_heads``, and the own tokens'. A wrapper captured for ``(rows, tokens)``
+        (``captured_rows`` and its bucket's tokens) pads them as it plans them. What admission
+        bounds a planner's refusals by, the same on every rank."""
 
     def attend(
         self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
@@ -326,9 +332,9 @@ class TPContextParallelWrapper(ContextParallelWrapper):
         return backend._own_tokens_wrapper(workspace, kwargs, max_total_tokens)
 
     @staticmethod
-    def rank_plans(placement: TPPlacement, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
-        # the own tokens' plan has the same lengths on every rank
-        return [qo_indptr]
+    def rank_plans(placement, qo_indptr, num_qo_heads, captured):
+        # the own tokens, whole, at this rank's own heads: the same lengths on every rank
+        return [(qo_indptr, num_qo_heads), (qo_indptr, num_qo_heads // placement.size)]
 
     @staticmethod
     def cap_hint(placement: TPPlacement) -> str:
@@ -403,13 +409,13 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         return ZigzagWrapper(placement, kernel, backend._device, queries, tokens, check=backend._plan_check)
 
     @staticmethod
-    def rank_plans(placement: SPPlacement, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
-        # and every partner's zigzag share of the own tokens, which differ by rank
+    def rank_plans(placement, qo_indptr, num_qo_heads, captured):
+        # and every partner's zigzag share of the own tokens, which differ by rank, at the same heads
         shares = [zigzag_share(qo_indptr, placement.size, index) for index in range(placement.size)]
-        if captured_tokens is not None:
-            shape = zigzag_capture(placement.size, len(qo_indptr) - 1, captured_tokens)
+        if captured is not None:
+            shape = zigzag_capture(placement.size, *captured)
             shares = [OneSlotPages.padded(share, *shape) for share in shares]
-        return [qo_indptr, *shares]
+        return [(plan, num_qo_heads) for plan in (qo_indptr, *shares)]
 
     @staticmethod
     def cap_hint(placement: SPPlacement) -> str:
@@ -582,8 +588,10 @@ class ZigzagWrapper:
         step = qo_indptr.numpy()
         if self._check is not None:
             # every partner's share, as its kernel plans it
-            captured = self._bucket_tokens or None
-            for index, share in enumerate(SPContextParallelWrapper.rank_plans(self._placement, step, captured)[1:]):
+            for index in range(self._placement.size):
+                share = zigzag_share(step, self._placement.size, index)
+                if self._bucket_tokens:
+                    share = OneSlotPages.padded(share, *self.kernel._captured)
                 if len(share) > 1:
                     self._check(f"partner {index}'s own tokens", share)
         tokens, rows = zigzag_rows(step, self._placement.size, self._placement.index, causal)

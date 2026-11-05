@@ -985,7 +985,9 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
                       capture=False)
 
     def bound(rows):
-        return fm.fa_work_items_bound(np.cumsum([0, *rows]), attn._wrapper_kwargs["num_qo_heads"], 132)
+        # the context's plan at every partner's heads and the own tokens' at this rank's
+        heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.cumsum([0, *rows])
+        return max(fm.fa_work_items_bound(qo, h, 132) for h in (heads, heads // P))
 
     def admit(cap):
         monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
@@ -998,6 +1000,14 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
     refused = admit(min(bound([span]) for span in spans) - 1).reason
     assert isinstance(refused, AdmitRuntimeError) and refused.request_ids == {"r0", "r1", "r2", "r3"}
 
+    # the own tokens' plan at this rank's heads can pass the cap where the context's at every
+    # partner's doesn't (a smaller query tile): admission bounds it too
+    step = AttentionStep(segments=(Segment("r0", "main", 30),))
+    ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
+    heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.array([0, 30])
+    assert fm.fa_work_items_bound(qo, heads // P, 132) > fm.fa_work_items_bound(qo, heads, 132)
+    assert not admit(fm.fa_work_items_bound(qo, heads, 132)).ok
+
     # a capture's span-0 padding rows lower the planner's queries per row, which can halve its tile:
     # the retry is sized by the real rows, never blaming a padding row (which would re-form the step)
     spans, pad = (40, 30), 8
@@ -1005,8 +1015,9 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
                          + tuple(Segment(-1 - i, "main", 0) for i in range(pad)))
     ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
     ctx.set_padded_rids(tuple(seg.request_id for seg in step.segments))
-    assert bound([*spans, *[0] * pad]) > bound(spans)
-    refused = admit(bound(spans)).reason
+    cap = max(bound([span]) for span in spans)
+    assert bound([*spans, *[0] * pad]) > cap >= bound(spans)
+    refused = admit(cap).reason
     assert isinstance(refused, AllocationFailed)
     assert (refused.rows_fit, refused.rows_sized, refused.request_id) == (1, 2, "r1")
 
@@ -1049,6 +1060,30 @@ def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_sha
     assert max(fm.fa_work_items_bound(zigzag_share(qo, P, index), heads, 132) for index in range(P)) > context
     monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", context)
     assert isinstance(attn.admit(step, ctx).reason, AllocationFailed)
+
+
+def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its_wrapper_plans_it(monkeypatch):
+    """A capture bucket of more tokens than rows (a packed one, ``force_prefill``) plans one-token rows
+    as a prefill, on the zigzag share padded to its bucket's tokens, so admission bounds it so too:
+    here the padded shares take the FA planner past its cap (64 heads, a 65536-token bucket of 8
+    rows), where a decode bucket's plan would not. Admitted, every rank would plan it, and the
+    planner could refuse it on one alone."""
+    _fa_kernel(monkeypatch)
+    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
+                            mla=True, num_qo_heads=64, flashinfer_backend="fa2")
+    rows, tokens = 8, 65536
+    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", 1) for i in range(rows)))
+
+    def ctx(num_tokens, force_prefill):
+        bucket = BucketKey(graph_walk="w", bs=rows, num_tokens=num_tokens)
+        return StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
+                           capture=False, slot_lease=SlotLease(0, bucket), force_prefill=force_prefill)
+
+    qo = np.arange(rows + 1)
+    padded = OneSlotPages.padded(zigzag_share(qo, P, 0), *zigzag_capture(P, rows, tokens))
+    assert fm.fa_work_items_bound(padded, 64, 132) > fm._FA_MAX_WORK_ITEMS >= fm.fa_work_items_bound(qo, 64, 132)
+    assert attn.admit(step, ctx(rows, force_prefill=False)).ok
+    assert not attn.admit(step, ctx(tokens, force_prefill=True)).ok
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):
