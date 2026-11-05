@@ -663,8 +663,8 @@ class RopeManager(PositionManager):
             raise ValueError(f"fused RoPE is built from the PositionConfig; this call overrides {differ}")
 
     def _apply_qk_fused(
-        self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, q: torch.Tensor, k: torch.Tensor | None, pos_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Non-interleaved RoPE in float32 over the cached table, returned in the
         inputs' dtype (as FlashInfer's kernel computes and stores it)."""
         half = self._fused_rotary_dim // 2
