@@ -183,9 +183,10 @@ def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
     assert out.strip() == "ok"
 
 
-def test_hub_range_reads_refuse_a_reply_that_ignored_the_range(monkeypatch):
+def test_hub_range_reads_refuse_a_reply_that_ignored_the_range(monkeypatch, tmp_path):
     """A mirror that ignores ``Range`` answers 200 with the whole file, whose first bytes
-    would be written as the range's."""
+    would be written as the range's. That fails the copy: it isn't a file that isn't ONNX,
+    which the copy would skip."""
     import huggingface_hub
 
     from mstar_sim import checkpoint
@@ -194,8 +195,8 @@ def test_hub_range_reads_refuse_a_reply_that_ignored_the_range(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "get_session", lambda: types.SimpleNamespace(get=lambda *a, **k: reply))
     hub = object.__new__(checkpoint._HubSource)
     hub.name, hub.revision = "org/model", "main"
-    with pytest.raises(ValueError):
-        hub.ranges("model.safetensors", [(8, 16)])
+    with pytest.raises(OSError):
+        checkpoint._shapes_only_onnx(hub, "model.onnx", 1 << 20, tmp_path / "model.onnx")
 
 
 def test_hf_cache_copy_refuses_a_local_directory(tmp_path):

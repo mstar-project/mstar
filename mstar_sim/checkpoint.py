@@ -102,8 +102,8 @@ class _HubSource:
             reply = get_session().get(url, headers={**headers, "Range": f"bytes={span[0]}-{span[1] - 1}"})
             hf_raise_for_status(reply)
             if reply.status_code != 206 or len(reply.content) != span[1] - span[0]:
-                raise ValueError(f"{url}: bytes {span[0]}-{span[1] - 1} came back as {reply.status_code} with "
-                                 f"{len(reply.content)} bytes: does the endpoint (HF_ENDPOINT) honour Range?")
+                raise OSError(f"{url}: bytes {span[0]}-{span[1] - 1} came back as {reply.status_code} with "
+                              f"{len(reply.content)} bytes: does the endpoint (HF_ENDPOINT) honour Range?")
             return reply.content
 
         with ThreadPoolExecutor(16) as pool:
