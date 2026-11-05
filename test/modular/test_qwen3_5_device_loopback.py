@@ -188,7 +188,10 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sampler.sample = lambda rids, logits: torch.tensor(rids)
     sub = _sub(sampler, rows=(1, 2))
-    sub.kv = SimpleNamespace(label="main", positions=SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20])))
+    sub.kv = SimpleNamespace(
+        _check_open=lambda call: None, label="main",
+        positions=SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20])),
+    )
     sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
