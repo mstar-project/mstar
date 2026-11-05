@@ -10,6 +10,7 @@ import os
 import sys
 import types
 from dataclasses import dataclass, replace
+from unittest import mock
 
 sys.path.insert(0, ".")
 
@@ -18,7 +19,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from packaging.version import Version
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT
 from test_kv_prefix_lease import _StubTransfer
 from test_kv_prefix_tp import WALKS, _ctx, _follow, _ingest, _send, _step, _tokens
@@ -27,9 +27,10 @@ from test_startup_graph_validation import _qwen3_5
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
 from mstar.engine import engine as engine_mod
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn import flashinfer as fi_mod
-from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.wrappers import PagedKernel
@@ -38,12 +39,11 @@ from mstar.engine.resources.context_parallel import (
     OneSlotPages,
     OwnTokensKernel,
     SPPlacement,
+    TPContextParallelWrapper,
     ZigzagWrapper,
-    local_indptrs,
     merge,
     zigzag_capture,
     zigzag_rows,
-    zigzag_share,
 )
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
@@ -52,15 +52,9 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides
-from mstar.engine.resources.step import (
-    AdmitRuntimeError,
-    AllocationFailed,
-    BucketKey,
-    Segment,
-    SlotLease,
-    StepContext,
-)
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE
+from mstar.model.submodule_base import NodeInputs
 
 P = 2
 CPU = torch.device("cpu")
@@ -246,24 +240,15 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
 ):
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
-    # Qwen3.5's own declarations (dummy shapes) with its pool placed, as on SP ranks; then an MLA
-    # pool with its attention (GLM-5.x without DSA), and a dependent without support
+    # Qwen3.5's own declarations (dummy shapes) with its pool placed, as on SP ranks, and a
+    # dependent without support
     specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
     apply_yaml_overrides(specs, {"resources": {
         KV_CACHE: {"context_parallel": True, "max_num_pages": 8}, GDN_STATE: {"max_slots": 4},
     }})
     kv_spec, = (spec for spec in specs if spec.resource_key == KV_CACHE)
     heads = (kv_spec.config.num_kv_heads, kv_spec.config.num_qo_heads)
-    specs += [
-        KVSpec(resource_key="mla_kv", nodes={NODE}, config=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=LATENT, max_seq_len=256, num_qo_heads=4, max_num_pages=8,
-            page_size=PAGE_SIZE, context_parallel=True, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE,
-        )),
-        AttentionSpec(resource_key="mla_attn", nodes={NODE}, config=AttentionConfig(
-            kv_cache="mla_kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5,
-        )),
-        _DependentSpec(resource_key="dependent", nodes={NODE}, supports=supports),
-    ]
+    specs.append(_DependentSpec(resource_key="dependent", nodes={NODE}, supports=supports))
     engine = Engine(graph_runtime=None)
     load = lambda: engine.load_model(  # noqa: E731
         {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
@@ -287,6 +272,25 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
         AttentionManager.build(
             AttentionSpec(resource_key="attn2", nodes={NODE}, config=AttentionConfig(kv_cache=KV_CACHE)),
             replace(unplaced, dependencies={KV_CACHE: kv_spec}),
+        )
+
+
+def test_mla_attention_over_a_placed_pool_is_refused_at_load():
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    groups.add_sp(NODE, _group(0, P))
+    latent = dict(head_dim=576, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64)
+    specs = [
+        KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, max_seq_len=256, num_qo_heads=4, max_num_pages=8, page_size=PAGE_SIZE,
+            context_parallel=True, **latent,
+        )),
+        AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(
+            kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1,
+        )),
+    ]
+    with pytest.raises(ValueError, match="'attn' .FlashInferMLAManager. does not support context parallelism.*'kv'"):
+        Engine(graph_runtime=None).load_model(
+            {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
 
 
@@ -314,9 +318,6 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(monkeypat
 # --- attention over a placed pool -------------------------------------------------------------
 
 HEAD_DIM, Q_HEADS, CP_PAGE = 64, 4, 4
-# MLA: the latent [ckv | kpe], in the one shape FlashInfer's MLA kernel takes
-CKV, KPE = 512, 64
-LATENT = CKV + KPE
 # (stored context, new tokens) per row. Prefill: a row with no context, one whose 1-token
 # context only rank 0 holds, and contexts ending on a page whose one token rank 1 lacks.
 PREFILL_ROWS = ((0, 5), (1, 3), (5, 2), (6, 1))
@@ -424,33 +425,30 @@ def _reference_flashinfer() -> types.ModuleType:
 
 @dataclass
 class _Case:
-    """One step's KV plan, the logical keys of its rows, and its queries. Under MLA a key is the
-    latent, which is also its value (the output being the ``ckv`` part)."""
+    """One step's KV plan, the logical keys of its rows, and its queries."""
     plan: KVPlanOutputs
-    keys: list[torch.Tensor]       # per row, every position's [2, 1, D] K and V, or [LATENT]
-    q: torch.Tensor                # [N, Q_HEADS, D or LATENT]
+    keys: list[torch.Tensor]       # per row, every position's [2, 1, D] K and V
+    q: torch.Tensor                # [N, Q_HEADS, D]
     rows: tuple[tuple[int, int], ...]
-    mla: bool
 
     @classmethod
-    def build(cls, rows, device, dtype, mla=False, padding: tuple[int, int] = (0, 0)) -> _Case:
+    def build(cls, rows, device, dtype, padding: tuple[int, int] = (0, 0)) -> _Case:
         """``padding``: ``(rows, span)`` of a replay's padding rows after ``rows``, on SINK_PAGE as
         `KVManager` plans them; their tokens follow the step's in ``inputs``."""
         gen = torch.Generator().manual_seed(0)
         views, keys, page = [], [], 1
-        key_shape, width = ((LATENT,), LATENT) if mla else ((2, 1, HEAD_DIM), HEAD_DIM)
         for i, (context, new) in enumerate(rows):
             length = context + new
             pages = list(range(page, page + -(-length // CP_PAGE)))
             page += len(pages)
             views.append(SequenceView(f"r{i}", "main", pages, length, new))
-            keys.append(torch.randn(length, *key_shape, generator=gen).to(device, dtype))
-        q = torch.randn(sum(new for _, new in rows), Q_HEADS, width, generator=gen).to(device, dtype)
+            keys.append(torch.randn(length, 2, 1, HEAD_DIM, generator=gen).to(device, dtype))
+        q = torch.randn(sum(new for _, new in rows), Q_HEADS, HEAD_DIM, generator=gen).to(device, dtype)
         span = padding[1]
         views += [SequenceView(f"pad{i}", "main", [SINK_PAGE] * -(-span // CP_PAGE), span, span)
                   for i in range(padding[0])]
         indptrs = build_paged_indptrs(views, CP_PAGE)
-        return cls(KVPlanOutputs({"main": KVPlanOutput(indptrs, views)}), keys, q, rows, mla)
+        return cls(KVPlanOutputs({"main": KVPlanOutput(indptrs, views)}), keys, q, rows)
 
     @property
     def views(self) -> list[SequenceView]:
@@ -462,48 +460,36 @@ class _Case:
         physical place, NaN elsewhere (SINK_PAGE included)."""
         slots = CP_PAGE // placement.size
         pages = max(pages, max(view.page_idxs[-1] for view in self.views) + 1)
-        shape = (pages, slots, LATENT) if self.mla else (pages, 2, slots, 1, HEAD_DIM)
-        cache = torch.full(shape, math.nan, device=self.q.device, dtype=self.q.dtype)
+        cache = torch.full((pages, 2, slots, 1, HEAD_DIM), math.nan, device=self.q.device, dtype=self.q.dtype)
         for view, kv in zip(self.views, self.keys, strict=True):
             for pos in range(view.length):
                 offset = pos % CP_PAGE
                 if offset % placement.size == placement.index:
                     page, slot = view.page_idxs[pos // CP_PAGE], offset // placement.size
-                    (cache[page, slot] if self.mla else cache[page, :, slot]).copy_(kv[pos])
+                    cache[page, :, slot].copy_(kv[pos])
         return cache
 
-    def queries(self, heads=slice(None)) -> tuple[torch.Tensor, ...]:
-        """The query ``run`` takes for ``heads``: ``(q,)``, or under MLA ``(q_nope, q_pe)``."""
-        q = self.q[:, heads]
-        return (q[..., :CKV].contiguous(), q[..., CKV:].contiguous()) if self.mla else (q.contiguous(),)
-
-    def new_keys(self) -> tuple[torch.Tensor, ...]:
-        """The step's own tokens' keys as the layer passes them to ``run``: K and V ``[N, 1, D]``,
-        or under MLA the latents ``[N, LATENT]``."""
+    def new_keys(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's own tokens' K and V ``[N, 1, D]``, as the layer passes them to ``run``."""
         new = torch.cat([kv[context:] for kv, (context, _) in zip(self.keys, self.rows, strict=True)])
-        return (new,) if self.mla else (new[:, 0], new[:, 1])
+        return new[:, 0], new[:, 1]
 
     def inputs(self, placement, heads=slice(None), keys=True, pad=0, pages=0) -> list[torch.Tensor | None]:
-        """What ``runner`` passes ``attn.run``: the query parts, the new keys (None without
-        ``keys``) and this rank's cache (``cache``). ``pad`` NaN tokens follow the step's, as the
-        padding rows of a captured bucket larger than the step hold whatever the model's layers
-        left there."""
-        q, new = self.queries(heads), self.new_keys()
+        """What ``runner`` passes ``attn.run``: the query, the new keys (None without ``keys``) and
+        this rank's cache (``cache``). ``pad`` NaN tokens follow the step's, as the padding rows of a
+        captured bucket larger than the step hold whatever the model's layers left there."""
+        q, k, v = self.q[:, heads].contiguous(), *self.new_keys()
         if not keys:
-            new = (None,) * len(new)
+            k = v = None
         if pad:
-            q, new = (tuple(torch.cat([t, t.new_full((pad, *t.shape[1:]), math.nan)]) for t in parts)
-                      for parts in (q, new))
-        return [*q, *new, self.cache(placement, pages)]
+            q, k, v = (torch.cat([t, t.new_full((pad, *t.shape[1:]), math.nan)]) for t in (q, k, v))
+        return [q, k, v, self.cache(placement, pages)]
 
     def runner(self, attn, placement, heads=slice(None), keys=True, pad=0, inputs=None):
         """``attn.run`` for ``heads`` as a call whose ``inputs`` are built once (so it can be
         captured), by default ``self.inputs(placement, heads, keys, pad)``."""
         if inputs is None:
             inputs = self.inputs(placement, heads, keys, pad)
-        if self.mla:
-            q_nope, q_pe, latent, cache = inputs
-            return lambda: attn.run(q_nope, "main", kv_cache_layer=cache, k=latent, q_pe=q_pe)
         q, k, v, cache = inputs
         return lambda: attn.run(q, "main", kv_cache_layer=cache, k=k, v=v)
 
@@ -511,26 +497,18 @@ class _Case:
         outs = []
         qo = 0
         for kv, (_, new) in zip(self.keys, self.rows, strict=True):
-            k, v = (kv[:, None], kv[:, None]) if self.mla else (kv[:, 0], kv[:, 1])
-            out = _reference(self.q[qo:qo + new], k, v, causal)[0]
-            outs.append(out[..., :CKV] if self.mla else out)
+            outs.append(_reference(self.q[qo:qo + new], kv[:, 0], kv[:, 1], causal)[0])
             qo += new
         return torch.cat(outs)
 
 
 def _cp_attention(
-    joint: JointGroups, device: torch.device, dtype: torch.dtype, mla=False, num_kv_heads=1, num_qo_heads=Q_HEADS,
-    **attention,
+    joint: JointGroups, device: torch.device, dtype: torch.dtype, **attention,
 ):
-    """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool, and this
-    rank's placement."""
-    layout = dict(head_dim=HEAD_DIM)
-    if mla:
-        layout = dict(head_dim=LATENT, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE)
-        attention.update(backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5)
+    """A ``FlashInferManager`` over a placed pool, and this rank's placement."""
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
-        num_layers=1, num_kv_heads=num_kv_heads, max_seq_len=64, num_qo_heads=num_qo_heads,
-        max_num_pages=16, page_size=CP_PAGE, context_parallel=True, **layout,
+        num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+        max_num_pages=16, page_size=CP_PAGE, context_parallel=True,
     ))
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies={"kv": kv},
@@ -556,7 +534,7 @@ def _plan(attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, cap
     attn.plan(AttentionStep(**step), ctx)
 
 
-def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False, padding=(0, 0), causal=True):
+def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padding=(0, 0), causal=True):
     """One rank of a ``world``-rank placement running ``rows`` through ``FlashInferManager.run``
     against one rank attending every key; every rank issues the same collectives, same shapes.
     ``captured`` (NCCL only) does what production does for a graph bucket: captures ``run`` with
@@ -564,7 +542,6 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
     replays it. ``padding``: ``(rows, span)`` of the replay's padding rows, which make its bucket
     larger than the step: on SINK_PAGE as `KVManager` plans them, and NaN in their queries, keys
     and the sink. ``causal`` is the step's."""
-    # FlashInfer's MLA plan needs ~17 MB on a GPU
     os.environ["MSTAR_WORKSPACE_BUFFER_MB"] = "64" if backend == "nccl" else "1"
     dist.init_process_group(backend, init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
@@ -588,10 +565,10 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
         joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group) if over_sp
                  else JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
         dtype = torch.bfloat16 if cuda else torch.float32
-        attn, placement = _cp_attention(joint, device, dtype, mla=mla)
-        case = _Case.build(rows, device, dtype, mla, padding)
+        attn, placement = _cp_attention(joint, device, dtype)
+        case = _Case.build(rows, device, dtype, padding)
         # the slot plans the other kind of step first
-        _plan(attn, _Case.build(DECODE_ROWS if rows == PREFILL_ROWS else PREFILL_ROWS, device, dtype, mla))
+        _plan(attn, _Case.build(DECODE_ROWS if rows == PREFILL_ROWS else PREFILL_ROWS, device, dtype))
         # a captured prefill's bucket holds 8 tokens past the step's rows, its padding rows' included
         n = case.q.shape[0]
         tail = 8 if captured and rows == PREFILL_ROWS else 0
@@ -601,7 +578,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
         # the bucket's capture step: the step with the bucket's every row and token, the padding rows
         # on the sink (FlashInfer's run refuses a q of another length than its plan; a replay runs none)
         extended = (*rows[:-1], (rows[-1][0], rows[-1][1] + tail))
-        full = _Case.build(extended, device, dtype, mla, padding) if pad else case
+        full = _Case.build(extended, device, dtype, padding) if pad else case
         _plan(attn, full, bucket=bucket, capture=captured, causal=causal)
         # a one-token-a-row step attends the pages alone, so a fused KV-write kernel can serve it
         assert attn.reads_step_kv() == (rows == PREFILL_ROWS)
@@ -625,19 +602,22 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
             out.fill_(math.nan)
             graph.replay()
             torch.cuda.synchronize()
-        if rows == PREFILL_ROWS and not mla:
-            # a GQA prefill's padding merges to 0: its own-token part plans the real rows alone
+        if rows == PREFILL_ROWS:
+            # a prefill's padding merges to 0: its own-token part plans the real rows alone
             assert torch.isfinite(out).all() and not out[n:].any()
         else:
-            # a padding row's output may be NaN (a padded decode's row attends the NaN sink, MLA's
-            # own-token part attends a padding row's NaN latents); a real row's may not
+            # a padding row's output may be NaN (a padded decode's row attends the NaN sink); a real
+            # row's may not
             assert torch.isfinite(out[:n]).all()
         torch.testing.assert_close(out[:n].float(), case.want(causal)[:, heads], **tol)
         if rows == PREFILL_ROWS and not captured:
-            # a first prefill: no row holds stored context on any rank, so every partial is masked
-            first = _Case.build(((0, 5), (0, 3)), device, dtype, mla)
+            # a first prefill: no row holds stored context on any rank, so TP exchanges nothing and
+            # SP gathers its partners' shares of the own tokens alone
+            first = _Case.build(((0, 5), (0, 3)), device, dtype)
             _plan(attn, first)
+            exchanged = len(calls)
             torch.testing.assert_close(first.runner(attn, placement, heads)().float(), first.want()[:, heads], **tol)
+            assert len(calls) == exchanged + over_sp, "a step with no stored context ran the exchange"
         everyone = [None] * world
         dist.all_gather_object(everyone, calls)
         assert calls and all(c == calls for c in everyone), everyone
@@ -646,8 +626,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
             # a live graph holds its captured NCCL work, and destroy waits on it
             graph.reset()
         # clear our reference so destroy drops the group's last one and joins gloo's threads,
-        # whatever else holds the group (here, a cycle through the MLA manager's bound work-item
-        # check); ranks were seen to abort at exit without this
+        # whatever else holds the group; ranks were seen to abort at exit without this
         group.device_group = None
         dist.destroy_process_group()
 
@@ -713,10 +692,12 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: whole_only())
     with pytest.raises(ValueError, match="whole rows"):
         attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs))
-    # a kernel that says it is sized for other than the capture it was built for
-    monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: _GatheredKeys())
-    with pytest.raises(ValueError, match="says it is sized for"):
-        attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs, batch_size=2), 16)
+    # a kernel that says it is sized for other than the capture it was built for, or for none
+    other = zigzag_capture(P, 1, 8)
+    for built, says in ((16, None), (16, other), (None, other)):
+        monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args, says=says: _GatheredKeys(says))
+        with pytest.raises(ValueError, match="says it is sized for"):
+            attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs, batch_size=2), built)
 
 
 class _GatheredKeys(OwnTokensKernel):
@@ -728,8 +709,7 @@ class _GatheredKeys(OwnTokensKernel):
     def plan(self, rows, causal):
         self.rows, self.causal = rows, causal
 
-    def run(self, queries, keys):
-        (q,), (k, v) = queries, keys
+    def run(self, q, k, v):
         qo, kv, tokens = self.rows
         parts = [
             _reference(q[a:b], k[tokens[c:d]], v[tokens[c:d]], self.causal)
@@ -763,7 +743,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
         shares = []
         for wrapper in wrappers:
             wrapper.plan(qo, causal=causal)
-            shares.append(wrapper.run((q,), (k, v)))
+            shares.append(wrapper.run(q, k, v))
         assert [(w._gather.data_ptr(), w._scatter.data_ptr()) for w in wrappers] == addresses
         got = merge(torch.stack([out for out, _ in shares]), torch.stack([lse for _, lse in shares]))
         assert torch.isfinite(got).all() and not got[int(qo[-1]):].any()
@@ -804,36 +784,19 @@ def test_a_pool_that_keeps_a_sliding_window_is_refused_a_placement():
         config.place(joint, "kv")
 
 
-# the MLA case on CPU runs the MLA wrapper's own torch fallback, which these rows check the same way
-LAYOUTS = pytest.mark.parametrize("mla", [False, True], ids=["gqa", "mla"])
-
-
-def _flashinfer(mla: bool) -> None:
-    """Skips without FlashInfer, and for MLA on a FlashInfer a placed pool refuses at bind."""
-    flashinfer = pytest.importorskip("flashinfer")
-    if mla and Version(flashinfer.__version__).public != fm._FA_PLANNER_VERSION:
-        pytest.skip(
-            f"needs FlashInfer {fm._FA_PLANNER_VERSION}: a placed MLA pool refuses {flashinfer.__version__} at bind"
-        )
-
-
 # a step that isn't causal (BAGEL's image generation, say) attends every token of its rows
 STEPS = pytest.mark.parametrize("rows, causal", [
     (PREFILL_ROWS, True), (PREFILL_ROWS, False), (DECODE_ROWS, True),
 ], ids=["prefill", "prefill-noncausal", "decode"])
 
 
-@LAYOUTS
 @STEPS
 @pytest.mark.parametrize("over_sp", [False, True], ids=["tp", "sp"])
-def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(tmp_path, over_sp, rows, causal, mla):
-    mp.spawn(
-        _over_ranks, args=(P, "gloo", str(tmp_path / "store"), over_sp, rows, mla, False, (0, 0), causal), nprocs=P,
-    )
+def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(tmp_path, over_sp, rows, causal):
+    mp.spawn(_over_ranks, args=(P, "gloo", str(tmp_path / "store"), over_sp, rows, False, (0, 0), causal), nprocs=P)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-@LAYOUTS
 @pytest.mark.parametrize("captured, padding", [
     (False, None), (True, None),
     # a bucket of more rows than the step: padding rows of 2 tokens (a decode's of 1), and of none
@@ -841,8 +804,8 @@ def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(
 ], ids=["eager", "captured", "captured-padding-rows", "captured-span-0-rows"])
 @STEPS
 @pytest.mark.parametrize("over_sp", [False, True], ids=["tp", "sp"])
-def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, causal, captured, padding, mla):
-    _flashinfer(mla)
+def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, causal, captured, padding):
+    pytest.importorskip("flashinfer")
     if padding is None:
         padding = (0, 0)
     elif rows == DECODE_ROWS:
@@ -852,10 +815,7 @@ def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, causal,
         padding = (2, 1)
     else:
         padding = (2, padding)
-    mp.spawn(
-        _over_ranks, args=(P, "nccl", str(tmp_path / "store"), over_sp, rows, mla, captured, padding, causal),
-        nprocs=P,
-    )
+    mp.spawn(_over_ranks, args=(P, "nccl", str(tmp_path / "store"), over_sp, rows, captured, padding, causal), nprocs=P)
 
 
 # a replay's padding rows after the step's, as `KVManager` plans them: none (the bucket's tokens past
@@ -864,7 +824,7 @@ def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, causal,
 def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypatch, padding):
     """The own-token part of a bucket larger than its step: the kernel writes only the planned rows,
     and the padding's context partials are masked (out 0, lse -inf). So only the part's own out 0
-    and lse -inf past its plan keep the padding finite (``_over_ranks`` checks it on GPU for GQA). The
+    and lse -inf past its plan keep the padding finite (``_over_ranks`` checks it on GPU). The
     padding's keys are whatever the model's layers left in those rows, NaN included, and the kernel
     reads keys past each row's end (FA3), so the part plans the real rows alone and zeroes every key
     past them, the padding rows' included."""
@@ -880,12 +840,69 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     _plan(attn, case, bucket=BucketKey("w", bs=len(PREFILL_ROWS) + padding[0], num_tokens=n + pad))
     # this rank's query heads, which its own tokens attend for alone
     q, k, v, _ = case.inputs(placement, heads=slice(0, Q_HEADS // P), pad=pad)
-    out, lse = attn._current_plan_states["main"].new.run((q,), (k, v))
+    out, lse = attn._current_plan_states["main"].new.run(q, k, v)
     merged = merge(torch.stack([torch.zeros_like(out), out]), torch.stack([torch.full_like(lse, -math.inf), lse]))
     assert torch.isfinite(merged).all() and not merged[n:].any()
     qo = np.cumsum([0, *(new for _, new in PREFILL_ROWS)]).tolist()
     want = torch.cat([_reference(q[a:b], k[a:b], v[a:b])[0] for a, b in itertools.pairwise(qo)])
     torch.testing.assert_close(merged[:n], want)
+
+
+def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
+    """A graph replays the collectives of its capture whatever a later step stores, so a captured
+    step of no stored context, as a capture step usually is, can't skip them."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    # the captured context wrapper stages its plan through a CUDA event; this needs only its partial
+
+    class Context(_IdleContext):
+        def run(self, q, cache, return_lse):
+            return torch.zeros_like(q), torch.full(q.shape[:2], -math.inf)
+
+    monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: Context())
+    exchanged = []
+
+    def exchange(self, out, lse, valid):
+        exchanged.append(out)
+        return out[None], lse[None]
+
+    monkeypatch.setattr(TPContextParallelWrapper, "_exchange_queries", lambda self, q: q)
+    monkeypatch.setattr(TPContextParallelWrapper, "_exchange_partials", exchange)
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    attn, placement = _cp_attention(joint, CPU, torch.float32)
+    case = _Case.build(((0, 5), (0, 3)), CPU, torch.float32)
+    _plan(attn, case, bucket=BucketKey("w", bs=2, num_tokens=8))
+    heads = slice(0, Q_HEADS // P)
+    torch.testing.assert_close(case.runner(attn, placement, heads)(), case.want()[:, heads])
+    assert len(exchanged) == 1
+
+
+@pytest.mark.parametrize("batch_sizes, multiplier", [([1, 2], 1), ([1], 2)], ids=["padded", "one_row"])
+def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_can_pad(batch_sizes, multiplier):
+    """A combined plan is label-major (cond's rows, then uncond's), so a replay's padding rows sit
+    between real ones, which attention over a placed pool can't plan (Chatterbox T3 with CFG). The
+    capture's own declaration decides, as Cosmos3's prefill combines labels with no token multiplier;
+    a capture of one row never pads."""
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+        capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
+    )
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
+    ).place(joint, "kv"))
+    step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
+    runner = AcceleratorGraphRunner(
+        submodule_name="t3", resources={"kv": kv}, step_runner=mock.Mock(), device=CPU, autocast_dtype=None,
+        submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config],
+                                        declare_step=lambda **kwargs: step),
+        joint_comm_group=joint, num_slots=1, head_shards=1,
+    )
+    if len(batch_sizes) == 1:
+        assert runner.prepare_for_capture()
+        return
+    with pytest.raises(ValueError, match=r"t3: the capture of 'decode' at batch size 2 combines labels.*\['kv'\]"):
+        runner.prepare_for_capture()
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):
@@ -940,258 +957,3 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
     attn, _ = _cp_attention(joint, CPU, torch.float32, decode_tensor_cores=False)
     _plan(attn, _Case.build(DECODE_ROWS, CPU, torch.float32))
     assert attn._current_plan_states["main"].context.attn_wrapper.use_tensor_cores
-
-
-def test_mla_attention_refuses_a_context_only_step_over_a_placed_pool():
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True)
-    with pytest.raises(ValueError, match="context_only step over a context-parallel KV pool"):
-        _plan(attn, _Case.build(PREFILL_ROWS, CPU, torch.float32, mla=True), context_only=True)
-
-
-def _fa_kernel(monkeypatch, version: str = fm._FA_PLANNER_VERSION) -> None:
-    """The MLA manager plans as if FlashInfer ``version``'s FA kernel served it; on CPU its
-    wrappers still plan the torch fallback."""
-    monkeypatch.setattr(fm, "_sm_count", lambda device: 132)
-    monkeypatch.setattr(fm.FlashInferMLAManager, "uses_kernel", property(lambda self: True))
-    monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace(__version__=version))
-
-
-def _emulate_fa_planner(monkeypatch, refuses) -> None:
-    """FlashInfer's FA MLA planner on the MLA wrapper, refusing a plan of its own lengths when
-    ``refuses(q_lens, kv_lens, heads, causal)`` says so."""
-    _fa_kernel(monkeypatch)
-    plan = fm.FlashInferMLAWrapper.plan
-
-    def planner(self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, causal=True, **kwargs):
-        pages = np.diff(paged_kv_indptr.numpy())
-        kv_lens = np.where(pages > 0, (pages - 1) * self.page_size + paged_kv_last_page_len.numpy(), 0)
-        if refuses(np.diff(qo_indptr.numpy()), kv_lens, self.num_qo_heads, causal):
-            raise ValueError("FlashInfer's planner refused")
-        plan(self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, causal=causal, **kwargs)
-
-    monkeypatch.setattr(fm.FlashInferMLAWrapper, "plan", planner)
-
-
-def _admitted(ranks, case) -> list[bool]:
-    """Per rank, whether it admits ``case``, planning it where it does: FlashInfer's planner (as
-    emulated) never refuses what admission let through."""
-    views = case.plan["main"].views
-    step = AttentionStep(segments=tuple(Segment(v.request_id, "main", v.to_compute) for v in views))
-    ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False)
-    decisions = []
-    for attn in ranks:
-        decisions.append(attn.admit(step, ctx).ok)
-        if decisions[-1]:
-            _plan(attn, case)
-    return decisions
-
-
-def _fa_work_items(q_lens, kv_lens, heads) -> int:
-    """A count FlashInfer's FA MLA planner could reach on these lengths: its query tiles, and up to
-    one KV split a cluster past them, how many read off the KV lengths, which differ by rank."""
-    if not len(q_lens):
-        return 0
-    cluster = 2 if q_lens.sum() * heads // len(q_lens) > 64 else 1
-    tiles = int(((q_lens * heads + 64 * cluster - 1) // (64 * cluster)).sum())
-    return tiles + min(132 // cluster, int(kv_lens.sum()) % (132 // cluster + 1))
-
-
-# under SP placement the long row's chunks plan on a smaller query tile than the step's, so a
-# partner's share can pass the bound on the context's queries; and these two shares' bounds differ,
-# so a rank checking its own share alone would decide differently from its partner
-@pytest.mark.parametrize("over_sp, rows", [(False, PREFILL_ROWS), (True, ((0, 1), (3, 56)))], ids=["tp", "sp"])
-def test_mla_ranks_refuse_the_same_steps_past_the_fa_planners_work_item_cap(monkeypatch, over_sp, rows):
-    """FlashInfer's FA MLA planner counts the lengths each rank plans, which differ over a placed
-    pool (its context slots, and under SP placement its zigzag share of the own tokens), so its own
-    refusal could come on one rank alone and hang the others in the exchange. Admission refuses
-    first, the same steps on every rank whatever the cap, and the planner never refuses a step it
-    admits."""
-    case = _Case.build(rows, CPU, torch.float32, mla=True)
-    with monkeypatch.context() as m:
-        _emulate_fa_planner(m, lambda q, kv, heads, causal: _fa_work_items(q, kv, heads) > fm._FA_MAX_WORK_ITEMS)
-        joint = [JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P)) if over_sp
-                 else JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial()) for rank in range(P)]
-        ranks = [_cp_attention(j, CPU, torch.float32, mla=True, flashinfer_backend="fa2") for j in joint]
-        # the context lengths each rank plans
-        indptrs = case.plan["main"].cpu_indptrs
-        lens = [
-            local_indptrs(place, indptrs.context_only(CP_PAGE), CP_PAGE)[0].kv_lens.tolist() for _, place in ranks
-        ]
-        assert lens[0] != lens[1]
-        decisions = []
-        for cap in range(1, 400):
-            m.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
-            decisions.append(_admitted([attn for attn, _ in ranks], case))
-        assert all(a == b for a, b in decisions) and {a for a, _ in decisions} == {False, True}
-    # the torch fallback runs no FA planner, so nothing is refused for it
-    monkeypatch.setattr(fm, "_sm_count", lambda device: 132)
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", 1)
-    _plan(_cp_attention(JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), CPU, torch.float32,
-                        mla=True, flashinfer_backend="fa2")[0], case)
-
-
-def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_worker_retries_it_smaller(
-    monkeypatch,
-):
-    """A busy step that could take the FA planner past its cap is refused at admit, sized by the
-    requests that fit, rather than failing its whole batch at plan; a request that can't fit alone
-    is refused terminally, and alone."""
-    _fa_kernel(monkeypatch)
-    attn, _ = _cp_attention(JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), CPU, torch.float32,
-                            mla=True, flashinfer_backend="fa2")
-    spans = (5, 3, 2, 1)
-    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
-    ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
-                      capture=False)
-
-    def bound(rows):
-        # the context's plan at every partner's heads and the own tokens' at this rank's
-        heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.cumsum([0, *rows])
-        return max(fm.fa_work_items_bound(qo, h, 132) for h in (heads, heads // P))
-
-    def admit(cap):
-        monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
-        return attn.admit(step, ctx)
-
-    assert admit(bound(spans)).ok
-    refused = admit(bound(spans[:2])).reason
-    assert isinstance(refused, AllocationFailed)
-    assert (refused.rows_fit, refused.rows_fit_alone, refused.rows_sized, refused.request_id) == (2, 2, 4, "r2")
-    refused = admit(min(bound([span]) for span in spans) - 1).reason
-    assert isinstance(refused, AdmitRuntimeError) and refused.request_ids == {"r0", "r1", "r2", "r3"}
-
-    # the own tokens' plan at this rank's heads can pass the cap where the context's at every
-    # partner's doesn't (a smaller query tile): admission bounds it too
-    step = AttentionStep(segments=(Segment("r0", "main", 30),))
-    ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
-    heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.array([0, 30])
-    assert fm.fa_work_items_bound(qo, heads // P, 132) > fm.fa_work_items_bound(qo, heads, 132)
-    assert not admit(fm.fa_work_items_bound(qo, heads, 132)).ok
-
-
-@pytest.mark.parametrize("rows, tokens", [(((0, 1), (3, 56)), 64), (DECODE_ROWS, 3)], ids=["prefill", "decode"])
-def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuses(monkeypatch, rows, tokens):
-    """A captured bucket's plans are bounded once, at capture: the context's at its rows and tokens,
-    and its own-token kernel's padded to the bucket (a row of the spare queries, then empty rows),
-    whatever the step. A bucket the planner could refuse a plan of is refused at capture, so it
-    never refuses a step leased to a captured bucket, where it couldn't be retried."""
-    # a planner refusing every plan whose bound passes the cap
-    _emulate_fa_planner(monkeypatch, lambda q, kv, heads, causal: fm.fa_work_items_bound(
-        np.concatenate([[0], np.cumsum(q)]), heads, 132) > fm._FA_MAX_WORK_ITEMS)
-    case = _Case.build(rows, CPU, torch.float32, mla=True)
-    views = case.plan["main"].views
-    step = AttentionStep(segments=tuple(Segment(v.request_id, "main", v.to_compute) for v in views))
-    outcomes = set()
-    for over_sp in (False, True):
-        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)) if over_sp
-                 else JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()))
-        attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, flashinfer_backend="fa2")
-        bucket = BucketKey(graph_walk="w", bs=len(rows), num_tokens=tokens)
-        ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False,
-                          slot_lease=SlotLease(0, bucket))
-        for cap in range(1, 400):
-            monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
-            attn._cg_plan_states.clear()
-            try:
-                attn._cg_wrapper(SlotLease(0, bucket), "main", len(rows))
-            except ValueError as refused:
-                assert "capture bucket" in str(refused)
-                outcomes.add("capture refused")
-                continue
-            assert attn.admit(step, ctx).ok
-            _plan(attn, case, bucket=bucket)
-            outcomes.add("planned")
-    assert outcomes == {"capture refused", "planned"}
-
-
-def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_share_fits(monkeypatch):
-    """Under SP placement each rank plans its own zigzag share of the step's own tokens, whose short
-    chunks can take the FA planner past its cap where the context fits; admission counts them all."""
-    _fa_kernel(monkeypatch)
-    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
-                            mla=True, flashinfer_backend="fa2")
-    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", 2 * P) for i in range(4)))
-    ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
-                      capture=False)
-    heads = attn._wrapper_kwargs["num_qo_heads"]
-    qo = np.cumsum([0, *(seg.span for seg in step.segments)])
-    context = fm.fa_work_items_bound(qo, heads, 132)
-    assert max(fm.fa_work_items_bound(zigzag_share(qo, P, index), heads, 132) for index in range(P)) > context
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", context)
-    assert isinstance(attn.admit(step, ctx).reason, AllocationFailed)
-
-
-def test_mla_attention_refuses_a_bucket_its_padded_own_tokens_take_past_the_planners_cap(monkeypatch):
-    """A capture bucket of more tokens than rows (a packed one, ``force_prefill``) plans even one-token
-    rows as a prefill, on an own-token kernel padded to its bucket: under SP its zigzag share's
-    kernel has every query of the bucket over twice its rows and one more, which the context's plan
-    doesn't. At a cap the context's plan fits, the bucket is refused at capture for its own tokens,
-    and a decode bucket of the same rows, which plans none, is captured."""
-    _fa_kernel(monkeypatch)
-    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
-                            mla=True, num_qo_heads=64, flashinfer_backend="fa2")
-    rows, tokens = 8, 16
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", fm.fa_work_items_ceiling(tokens, rows, 64, 132))
-    assert fm.fa_work_items_ceiling(tokens, 2 * rows + 1, 64, 132) > fm._FA_MAX_WORK_ITEMS
-    with pytest.raises(ValueError, match="own-token"):
-        attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=tokens)), "main", rows,
-                         force_prefill=True)
-    attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=rows)), "main", rows)
-
-
-def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):
-    """A decode step's context is planned at every partner's heads, a count bind doesn't check, and
-    over each rank's own KV lengths, so FA's causal tile-bound check could refuse it on one rank
-    alone. Planned non-causal, it never meets the check."""
-    # the check refuses a causal row whose keys start before its query, at some head counts
-    _emulate_fa_planner(monkeypatch, lambda q, kv, heads, causal: causal and bool((kv > q).any()))
-    case = _Case.build(DECODE_ROWS, CPU, torch.float32, mla=True)
-    for rank in range(P):
-        joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
-        _plan(_cp_attention(joint, CPU, torch.float32, mla=True, flashinfer_backend="fa2")[0], case)
-
-
-@pytest.mark.parametrize("version, heads, refused", [
-    ("0.7.3", Q_HEADS, r"FlashInfer 0\.7\.3 is installed"),
-    # a local build of the release
-    (f"{fm._FA_PLANNER_VERSION}+cu130", Q_HEADS, None),
-    # TP 2 shards the heads: 20 a rank
-    (fm._FA_PLANNER_VERSION, 40, "causal tile-bound check can refuse a step at 20 query heads"),
-    (fm._FA_PLANNER_VERSION, 128, None),
-])
-def test_mla_attention_over_a_placed_pool_refuses_at_bind_a_flashinfer_or_head_count_its_fa_planner_may_refuse(
-    monkeypatch, version, heads, refused,
-):
-    _fa_kernel(monkeypatch, version)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    if refused is None:
-        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
-        return
-    with pytest.raises(ValueError, match=refused):
-        _cp_attention(joint, CPU, torch.float32, mla=True, num_qo_heads=heads, flashinfer_backend="fa2")
-
-
-def test_the_fa_work_item_bound_holds_flashinfers_own_count():
-    """The refusal above is rank-symmetric only while ``fa_work_items_bound`` is at least what the
-    installed FlashInfer's planner counts on any rank's KV lengths, and past the cap wherever that
-    planner refuses."""
-    _flashinfer(mla=True)
-    from flashinfer.mla._batch_mla._backends import _fa_common as fa
-
-    gen = torch.Generator().manual_seed(0)
-    for _ in range(3000):
-        rows = int(torch.randint(1, 6, (), generator=gen))
-        q = torch.randint(1, 300, (rows,), generator=gen)
-        kv = q + torch.randint(0, 20000, (rows,), generator=gen)
-        heads = (8, 16, 20, 40, 64, 128)[int(torch.randint(6, (), generator=gen))]
-        sm = (78, 132)[int(torch.randint(2, (), generator=gen))]
-        bound = fm.fa_work_items_bound(torch.cat([torch.zeros(1, dtype=q.dtype), q.cumsum(0)]), heads, sm)
-        for causal in (False, True):
-            try:
-                count = fa._fa_plan_work_count(q.tolist(), kv.tolist(), heads, sm, causal)
-            except fa._BackendPlanUnsupportedError:
-                # its query tiles alone are past its cap, so ours refuses the step too
-                assert bound > fm._FA_MAX_WORK_ITEMS
-                continue
-            assert count <= bound, (q.tolist(), kv.tolist(), heads, sm, causal)

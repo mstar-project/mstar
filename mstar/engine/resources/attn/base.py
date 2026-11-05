@@ -401,12 +401,10 @@ class PlacedAttention(AttentionManager):
 
     @torch.compiler.disable
     def _attend_placed(
-        self, label: str, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """``run`` over a placed pool, ``queries`` and ``new_keys`` as this backend's ``run`` takes
-        them (``ContextParallelWrapper.attend``)."""
-        return self._current_plan_states[label].attend(queries, kv_cache_layer, new_keys)
+        """``run`` over a placed pool (``ContextParallelWrapper.attend``)."""
+        return self._current_plan_states[label].attend(q, kv_cache_layer, k, v)
 
 
 class PlanCacheKey(NamedTuple):

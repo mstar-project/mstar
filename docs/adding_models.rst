@@ -2425,14 +2425,15 @@ page. Attention runs on each rank's slots and merges the partials across the par
 (``mstar/engine/resources/context_parallel.py``). The model declares nothing.
 
 - **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,
-  ``P = tp / num_kv_heads`` (``tp`` for MLA's one latent), so TP must be a larger multiple of
-  the KV heads. They are the contiguous blocks ``kv_head_replicas``
+  ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the contiguous blocks ``kv_head_replicas``
   (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
-  shards K and V itself must match. Each layer exchanges queries and partials over the TP group.
+  shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
+  though an eager step with no stored context attends its own tokens alone, with no exchange.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone
   and the node loads without its SP group, so every layer but attention runs replicated across
   SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
-  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials.
+  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials;
+  that same eager step attends no slots and gathers its own tokens' shares alone.
   Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), as for the model's own SP, so
   SP mode prefills a prompt in one step; chunking an SP-placed pool's prompts is not supported yet.
   TP mode chunks prompts as without placement.
@@ -2441,33 +2442,23 @@ A page's tokens (``page_size``, 128 when it is unset) must be divisible by ``P``
 checks these rules against ``node_groups`` before it starts a worker. ``max_num_pages`` counts
 logical pages, so raise it by ``P`` to use the memory placement frees (the pool logs its bytes per
 rank). Every resource over the pool must support it, or loading fails naming the one that doesn't.
-FlashInfer attention (``flashinfer``, ``flashinfer_mla``) with ``flashinfer_backend`` ``auto``,
-``fa2`` or ``fa3`` (``auto`` runs as ``fa2`` from SM100 on ``flashinfer``), RoPE positions and
-the recurrent state pool (GDN, KDA; the same state on every SP partner) do; dense, flex and XPU
-attention, cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't
-set the key. A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and
-a node over one plans on the host rather than resident (``resident_planning``).
+FlashInfer attention (``flashinfer``) with ``flashinfer_backend`` ``auto``, ``fa2`` or ``fa3``
+(``auto`` runs as ``fa2`` from SM100), RoPE positions and the recurrent state pool (GDN, KDA; the
+same state on every SP partner) do; dense, flex, XPU and MLA (``flashinfer_mla``) attention,
+cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
+A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
+one plans on the host rather than resident (``resident_planning``). A node that captures a step
+combining labels into one plan (``KVStep.combined_labels``, as classifier-free guidance does) at a
+batch size above 1 is refused at load: a replay's padding rows would sit between its real ones.
 
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
-and its own tokens from the ``k`` and ``v`` the layer passes ``run`` (MLA's latents as ``k``), so
-a layer that calls ``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention``
-do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first and rotates it
+and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
+``attn.run`` itself passes them (``AttentionCallable`` does). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first and rotates it
 when the step attends it (``AttentionCallable.norm_rope_attend``). In SP mode, rank ``r`` attends only the step's
 own tokens in *zigzag* chunks ``r`` and ``2P - 1 - r`` of each row's ``2P`` (``zigzag_rows``),
 which shares the causal work about evenly on rows of ``2P`` tokens or more; it merges them into
 its context partial before the gather.
-
-MLA plans on FA3 (Hopper) or FA2 and refuses a ``context_only`` step. That planner caps a plan's
-work items, which TP mode reaches ``P`` times sooner, and counts each rank's own KV lengths, so
-admission refuses a step whose bound from its query lengths alone passes the cap (its own tokens'
-plans included, in SP mode every partner's zigzag share), on every rank alike, and the worker
-retries it with the requests that fit (a prompt past the cap alone fails). A capture bucket whose
-plans, padded to the bucket, could pass the cap is refused at load: capture smaller buckets
-(GLM-5.2's are far under it). The bound copies
-FlashInfer 0.7.2's rules, so another FlashInfer is refused at load, as is a per-rank head count
-that doesn't divide 64 (the planner's causal tile check). GLM-5.2 with ``dsa_long_context`` off
-loads under ``context_parallel``.
 
 .. note::
 

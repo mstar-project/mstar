@@ -149,10 +149,9 @@ class PagedKernel(ABC):
         ``causal``."""
 
     @abstractmethod
-    def run(self, *parts: torch.Tensor, return_lse: bool = False):
-        """The planned attention: ``parts`` are the query parts (each ``[N, H, *]``: ``q``, or
-        MLA's ``q_nope`` and ``q_pe``), then the paged layer the keys are read from. Returns
-        ``out``, and with ``return_lse`` also the natural-log lse ``[N, H]`` fp32."""
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False):
+        """The planned attention of ``q`` ``[N, H, D]`` over the paged layer ``kv_cache_layer``.
+        Returns ``out``, and with ``return_lse`` also the natural-log lse ``[N, H]`` fp32."""
 
 
 class FlashInferPrefillWrapper(PagedKernel):

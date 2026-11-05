@@ -410,7 +410,7 @@ class FlashInferManager(PlacedAttention):
         if label is None:
             label = self._default_label
         if self._placement is not None:
-            return self._attend_placed(label, (q,), kv_cache_layer, (k, v))
+            return self._attend_placed(label, q, kv_cache_layer, k, v)
         return self._attend(q, label, kv_cache_layer, layer_idx)
 
     @torch.compiler.disable
@@ -445,8 +445,8 @@ class _WholeRows(OwnTokensKernel):
     def plan(self, rows: KeyRows, causal: bool) -> None:
         self._ragged.plan(torch.from_numpy(rows.qo_indptr.astype(np.int32)), causal=causal)
 
-    def run(self, queries, keys):
-        return self._ragged.run(*queries, *keys, return_lse=True)
+    def run(self, q, k, v):
+        return self._ragged.run(q, k, v, return_lse=True)
 
     def forget_plan(self) -> None:
         # it skips a layout it already holds (`_RaggedPrefillBase.forget_plan`)

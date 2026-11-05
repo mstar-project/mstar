@@ -176,26 +176,19 @@ class OwnTokensKernel(ABC):
         """Plans ``rows``; ``causal`` aligns each row's queries to the end of its keys."""
 
     @abstractmethod
-    def run(
-        self, queries: tuple[torch.Tensor, ...], keys: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(out, lse)`` (lse natural-log fp32) of the planned rows' ``queries``, in plan order,
-        over the step's ``keys``: query parts and keys as the backend's ``run`` takes them. A row for
-        every query passed; one past the plan (a captured bucket's padding) holds whatever the
-        kernel left, which reaches no real row."""
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, lse)`` (lse natural-log fp32) of the planned rows' queries ``q``, in plan order,
+        over the step's keys ``k`` and ``v``. A row for every query passed; one past the plan (a
+        captured bucket's padding) holds whatever the kernel left, which reaches no real row."""
 
     def forget_plan(self) -> None:  # noqa: B027 - a kernel that skips a layout it holds replans
         """Every ``plan`` plans the kernel, so there is nothing to forget."""
 
 
-def one_slot_pages(*keys: torch.Tensor):
-    """A step's own keys as a paged kernel's layer of one-slot pages, page ``i`` token ``i``: MLA's
-    latents ``[N, latent]``, or K and V ``[N, H, D]`` as FlashInfer's paged ``(k, v)``. Views,
-    unless K's and V's strides differ, for which FA2 runs a kernel of its own that a capture would
-    have to prewarm."""
-    if len(keys) == 1:
-        return keys[0].unsqueeze(1)
-    k, v = keys
+def one_slot_pages(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """A step's own keys ``[N, H, D]`` as a paged kernel's ``(k, v)`` layer of one-slot pages, page
+    ``i`` token ``i``. Views, unless K's and V's strides differ, for which FA2 runs a kernel of its
+    own that a capture would have to prewarm."""
     if k.stride() != v.stride():
         k, v = k.contiguous(), v.contiguous()
     return k.unsqueeze(1), v.unsqueeze(1)
@@ -228,8 +221,8 @@ class OneSlotPages(OwnTokensKernel):
             causal=causal, dtype=self._dtype,
         )
 
-    def run(self, queries, keys):
-        return self.kernel.run(*queries, one_slot_pages(*keys), return_lse=True)
+    def run(self, q, k, v):
+        return self.kernel.run(q, one_slot_pages(k, v), return_lse=True)
 
 
 class ContextParallelWrapper(ABC):
@@ -238,12 +231,7 @@ class ContextParallelWrapper(ABC):
     does (``TPContextParallelWrapper``, ``SPContextParallelWrapper``). A one-token-a-row step
     attends the pages after its write (``new`` None); any other step attends its stored context
     (not causal) on ``context`` and its own tokens, from the keys the layer passes to ``run``, on
-    ``new``. ``page_size`` is the logical one.
-
-    A plan's lengths differ by rank, so a planner that refuses on lengths could refuse on one rank
-    of the lockstep instance alone. The backend refuses, on every rank alike and before anything is
-    planned, an eager step whose plans it may (admission, ``rank_plans``) and a captured bucket whose
-    every plan it may (at capture, from the kernels' fixed sizes)."""
+    ``new``. ``page_size`` is the logical one."""
 
     def __init__(
         self,
@@ -262,6 +250,8 @@ class ContextParallelWrapper(ABC):
         self.new = new
         self._device = device
         self._qo_indptr_buf = None
+        # the planned step's rows hold no stored context, so it attends its own tokens alone (`plan`)
+        self._own_only = False
         # per query token, whether its row holds any of this rank's slots. A captured wrapper's
         # holds its bucket's every token (a row's at least, and the bucket's) and is never
         # reallocated, so a replay reads the address it was captured with
@@ -284,21 +274,25 @@ class ContextParallelWrapper(ABC):
         so the padding's queries come out 0, lse -inf, and its keys lie past the plan: FA3's ragged
         kernel (FlashInfer's TP own tokens) reads keys past a row's end to its KV tile's, where
         ``run`` zeroes them, so a NaN the model's layers left in a padding row's keys would
-        otherwise reach the real rows before it. (FlashInfer passes them; MLA's own tokens read
-        each row's own pages alone.)"""
+        otherwise reach the real rows before it."""
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
             qo = context.qo_indptr
             own = None if real_rows is None else _leading_rows(kv_out, real_rows)
             self._plan_own(qo if own is None else qo[: own + 1], causal)
+        # a step whose rows store no context (a first prefill) has no partial to attend; from the
+        # logical indptrs, so every rank alike. A captured step attends whatever it stores, as its
+        # replays issue its capture's collectives
+        self._own_only = (
+            self.new is not None and not self._captured and int(context.paged_kv_indptr[-1]) == 0
+        )
         local, valid_rows = local_indptrs(self._placement, context, self._page_size)
         if kv_out.cpu_indptrs.paged_kv_indices.is_pinned() and not local.paged_kv_indices.is_pinned():
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
             # FlashInfer copies them asynchronously on every rank alike, whichever rows a rank trims
             local = local._replace(paged_kv_indices=self._pin(local.paged_kv_indices))
-        # not causal whatever the step: every query sees all of it (a one-token row's own key
-        # included), and FA MLA's causal tile check reads each rank's KV lengths
+        # not causal whatever the step: every query sees all of it (a one-token row's own key included)
         try:
             self.context.plan(causal=False, dtype=self._dtype, **local.to_kwargs_dict())
         finally:
@@ -345,49 +339,30 @@ class ContextParallelWrapper(ABC):
         """The part a multi-token step attends its own tokens on, from the backend's ``kernels``
         (``_plan_own`` plans it, ``_merged_over_ranks`` runs it)."""
 
-    @staticmethod
-    @abstractmethod
-    def rank_plans(
-        placement: ContextParallel, qo_indptr: np.ndarray, num_qo_heads: int,
-    ) -> list[tuple[np.ndarray, int]]:
-        """Every plan a multi-token step of ``qo_indptr``'s rows makes on any rank of the placement,
-        as ``(qo_indptr, query heads)``: the context's at the local geometry's ``num_qo_heads``, and
-        the own tokens'. What admission bounds an eager step's planner refusals by, the same on every
-        rank; a captured bucket's plans are bounded at capture."""
-
     @abstractmethod
     def _plan_own(self, qo_indptr: torch.Tensor, causal: bool) -> None:
         """Plans the own-token part for the rows ``qo_indptr`` lays out."""
 
-    @staticmethod
-    def cap_hint(placement: ContextParallel) -> str:
-        """Why a planner's work cap comes sooner under this placement, for a refusal's message."""
-        return ""
-
     def attend(
-        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``queries``
-        and ``new_keys`` are the query parts (each ``[N, H, *]``) and the step's own keys as this
-        backend's ``run`` takes them (``new_keys`` read only on a step that isn't one token a row).
-        Every rank runs the same collectives."""
-        if self.new is not None and any(key is None for key in new_keys):
+        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``q``
+        ``[N, H, D]``, and the step's own keys as this backend's ``run`` takes them (read only on a
+        step that isn't one token a row). Every rank runs the same collectives."""
+        if self.new is not None and (k is None or v is None):
             raise ValueError(
-                "attention over a context-parallel KV pool attends a step's own tokens from the keys "
-                "run is passed (k and v, or MLA's latents as k); this step has more than one token "
-                "a row and got none"
+                "attention over a context-parallel KV pool attends a step's own tokens from the k and v "
+                "run is passed; this step has more than one token a row and got none"
             )
-        keys = None if self.new is None else new_keys
-        return self._merged_over_ranks(queries, kv_cache_layer, keys).to(queries[0].dtype)
+        new = None if self.new is None else self.new.run(q, k, v)
+        return self._merged_over_ranks(q, kv_cache_layer, new).to(q.dtype)
 
     @abstractmethod
     def _merged_over_ranks(
-        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        keys: tuple[torch.Tensor, ...] | None,
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, new: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
-        """This rank's slots' partial for ``queries``, exchanged with the partners' and merged with
-        the own tokens' attention from ``keys`` (None for a one-token-a-row step)."""
+        """This rank's slots' partial for ``q``, exchanged with the partners' and merged with the
+        own tokens' ``(out, lse)`` (None for a one-token-a-row step)."""
 
     def forget_plan(self) -> None:
         """Replan the own-token wrapper on the next ``plan`` whatever its layout, for a dropped
@@ -434,41 +409,33 @@ class TPContextParallelWrapper(ContextParallelWrapper):
             captured = ShareCapture((kwargs.get("batch_size") or 0) + 1, max_total_tokens, max_total_tokens)
         return _own_tokens_kernel(kernels, workspace, kwargs, captured, whole=True)
 
-    @staticmethod
-    def rank_plans(placement, qo_indptr, num_qo_heads):
-        # the own tokens, whole, at this rank's own heads: the same lengths on every rank
-        return [(qo_indptr, num_qo_heads), (qo_indptr, num_qo_heads // placement.size)]
-
     def _plan_own(self, qo_indptr, causal):
         self.new.plan(KeyRows.whole(qo_indptr.numpy()), causal)
 
-    @staticmethod
-    def cap_hint(placement: TPPlacement) -> str:
-        return (f" Under TP placement each rank plans every partner's query heads, so a step reaches the cap "
-                f"{placement.size}x sooner; placing positions over SP ranks avoids that.")
-
-    def _merged_over_ranks(self, queries, kv_cache_layer, keys):
-        new = None if keys is None else self.new.run(queries, keys)
-        parts = self._exchange_queries(queries)
+    def _merged_over_ranks(self, q, kv_cache_layer, new):
+        if self._own_only:
+            # every partial would be masked (a first prefill): no exchange, no merge
+            return new[0]
+        queries = self._exchange_queries(q)
         # over this rank's slots, with the rows holding any of them
-        out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
-        outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
+        out, lse = self.context.run(queries, kv_cache_layer, return_lse=True)
+        outs, lses = self._exchange_partials(out, lse, self._valid[: queries.shape[0]])
         if new is None:
             return merge(outs, lses)
         # the own tokens' part beside the partners', with no copy of theirs
         return merge([*outs, new[0]], torch.cat([lses, new[1].float()[None]]))
 
-    def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``): every
-        partner's, ``[N, P * H, *]`` partner-major, the parts sent as one tensor."""
+    def _exchange_queries(self, q: torch.Tensor) -> torch.Tensor:
+        """The queries this rank attends its slots for, from its own ``[N, H, D]``: every partner's,
+        ``[N, P * H, D]`` partner-major."""
         placement = self._placement
-        q = (queries[0] if len(queries) == 1 else torch.cat(queries, dim=-1)).unsqueeze(0)
+        q = q.unsqueeze(0)
         if placement.size == placement.group.world_size:
-            # every rank of the group is a partner (MLA's always are): the same block goes to each
+            # every rank of the group is a partner: the same block goes to each
             q = placement.group.all_gather(q.contiguous(), dim=0)
         else:
             q = placement.group.to_partners(q.expand(placement.size, *q.shape[1:]), placement.partners)
-        return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
+        return q.transpose(0, 1).flatten(1, 2)
 
     def _exchange_partials(
         self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,
@@ -500,26 +467,23 @@ class SPContextParallelWrapper(ContextParallelWrapper):
             captured = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
         return ZigzagWrapper(placement, _own_tokens_kernel(kernels, workspace, kwargs, captured, whole=False), device)
 
-    @staticmethod
-    def rank_plans(placement, qo_indptr, num_qo_heads):
-        # and every partner's zigzag share of the own tokens, which differ by rank, at the same heads
-        shares = [zigzag_share(qo_indptr, placement.size, index) for index in range(placement.size)]
-        return [(plan, num_qo_heads) for plan in (qo_indptr, *shares)]
-
     def _plan_own(self, qo_indptr, causal):
         self.new.plan(qo_indptr, causal=causal)
 
-    def _merged_over_ranks(self, queries, kv_cache_layer, keys):
-        new = None if keys is None else self.new.run(queries, keys)
+    def _merged_over_ranks(self, q, kv_cache_layer, new):
+        group = self._placement.group
+        if self._own_only:
+            # no partial to merge (a first prefill), but a rank holds its own share alone
+            return gather_merge(group, *new)
         # this rank's slots' partial merged with its share of the own tokens, rounded back to the
         # partial's dtype for the one gather: one rounding more than TP placement's, at the floor a
         # bf16 partial carries already; gathering the fp32 merge would double the gather's bytes
-        out, lse = self.context.run(*queries, kv_cache_layer, return_lse=True)
-        out, lse = _masked(out, lse, self._valid[: queries[0].shape[0]])
+        out, lse = self.context.run(q, kv_cache_layer, return_lse=True)
+        out, lse = _masked(out, lse, self._valid[: q.shape[0]])
         if new is not None:
             merged, lse = merge_lse((out, new[0]), torch.stack([lse, new[1]]))
             out = merged.to(out.dtype)
-        return gather_merge(self._placement.group, out, lse)
+        return gather_merge(group, out, lse)
 
 
 def _own_tokens_kernel(kernels, workspace, kwargs, captured: ShareCapture | None, whole: bool) -> OwnTokensKernel:
@@ -544,13 +508,6 @@ def zigzag_rows(qo_indptr: np.ndarray, size: int, index: int, causal: bool = Tru
     _, tokens = token_runs(row + first, end - first)
     kv, kv_tokens = token_runs(row, kv_end)
     return tokens, KeyRows(np.concatenate([[0], np.cumsum(end - first)]), kv, kv_tokens)
-
-
-def zigzag_share(qo_indptr: np.ndarray, size: int, index: int) -> np.ndarray:
-    """The ``qo_indptr`` of rank ``index`` of ``size``'s zigzag chunks of the rows ``qo_indptr`` lays
-    out, before a capture's padding."""
-    _, first, end, _ = _zigzag_chunks(qo_indptr, size, index, causal=True)
-    return np.concatenate([[0], np.cumsum(end - first)])
 
 
 def zigzag_capture(size: int, rows: int, tokens: int) -> ShareCapture:
@@ -623,23 +580,16 @@ class ZigzagWrapper:
     def forget_plan(self) -> None:
         self.kernel.forget_plan()
 
-    @property
-    def captured(self) -> ShareCapture | None:
-        """What its kernel is sized for."""
-        return self.kernel.captured
-
-    def run(
-        self, queries: tuple[torch.Tensor, ...], keys: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """This rank's share of the own tokens' ``(out, lse)`` for every token of the step."""
-        n, heads = queries[0].shape[:2]
+        n, heads = q.shape[:2]
         assert n >= self._step_tokens, f"{n} query tokens for a plan of {self._step_tokens}"
         # one row past the bucket's (an eager step's), for padding queries to land in
         rows = (self._bucket_tokens or n) + 1
-        out = queries[0].new_zeros(rows, heads, queries[0].shape[-1])
-        lse = torch.full((rows, heads), -math.inf, dtype=torch.float32, device=queries[0].device)
+        out = q.new_zeros(rows, heads, q.shape[-1])
+        lse = torch.full((rows, heads), -math.inf, dtype=torch.float32, device=q.device)
         if self._gather is not None:
-            got, got_lse = self.kernel.run(tuple(q.index_select(0, self._gather) for q in queries), keys)
+            got, got_lse = self.kernel.run(q.index_select(0, self._gather), k, v)
             out.index_copy_(0, self._scatter, got.to(out.dtype))
             lse.index_copy_(0, self._scatter, got_lse.float())
         return out[:n], lse[:n]
