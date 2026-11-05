@@ -614,19 +614,22 @@ def _shaped_by_never_computed(func, args) -> bool:
 
 def _passes_on_other_values(func, args, kwargs) -> bool:
     """Whether what an aten op refused was its never-computed operands' values, not their
-    shapes or dtypes: it passes with other values in their place. An op that these values
-    break too (a Cholesky of random ones) reads as refusing shapes, the loud side."""
-    def other(x):
-        if not isinstance(x, torch.Tensor) or not never_computed(x):
-            return x
-        return torch.rand_like(x) if _floating(x) else torch.zeros_like(x)
+    shapes or dtypes: it passes with other values in their place. A float takes random
+    values; an integer, which already reads as zeros, tries zeros (a clean ``info``), then
+    ones (a divisor). An op that these values break too (a Cholesky of random ones) reads
+    as refusing shapes, the loud side."""
+    for fill in (0, 1):
+        def other(x, fill=fill):
+            if not isinstance(x, torch.Tensor) or not never_computed(x):
+                return x
+            return torch.rand_like(x) if _floating(x) else torch.full_like(x, fill)
 
-    args, kwargs = tree_map(other, (args, kwargs))
-    try:
-        func(*args, **kwargs)
-    except RuntimeError:
-        return False
-    return True
+        try:
+            func(*tree_map(other, args), **tree_map(other, kwargs))
+        except RuntimeError:
+            continue
+        return True
+    return False
 
 
 def _kept_op(func, args, kwargs):

@@ -732,6 +732,10 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
         def test_torch_refuses_a_singular_matrix_of_a_stand_ins_zeros():
             import flashinfer
             torch.inverse(flashinfer.top_k_renorm_probs(torch.ones(4, 4, device="cuda"), 1))
+        def test_torch_refuses_an_integer_divide_by_a_stand_ins_zeros():
+            import flashinfer
+            zeros = flashinfer.top_k_renorm_probs(torch.ones(4, 4, device="cuda"), 1).long()
+            torch.full((4, 4), 8, device="cuda") // zeros
         def test_shape_mistake_on_a_stand_ins_output():
             import flashinfer
             flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1) + torch.ones(3, device="cuda")
@@ -777,6 +781,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_mstars_own_raise_after_a_never_computed_mask": "FAILED",
                         "test_torch_refuses_a_stand_ins_zeros": "XFAIL",
                         "test_torch_refuses_a_singular_matrix_of_a_stand_ins_zeros": "XFAIL",
+                        "test_torch_refuses_an_integer_divide_by_a_stand_ins_zeros": "XFAIL",
                         "test_shape_mistake_on_a_stand_ins_output": "FAILED",
                         "test_dtype_mistake_on_a_stand_ins_output": "FAILED",
                         "test_cpu_kernel_limit": "XFAIL",
