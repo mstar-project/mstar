@@ -19,6 +19,8 @@ from benchmark.eval.e2e import compare, hosts, stress, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.e2e.stress import Arm, Refs, Reply  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus")
+
 RUN = {"id": "r", "base": {"label": "main", "sha": "a" * 40}, "head": {"label": "PR #1", "sha": "b" * 40},
        "gpu": "h200", "models": ["fake"]}
 

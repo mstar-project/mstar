@@ -166,7 +166,7 @@ Counter. Prompt tokens looked up in the prefix cache, once per request (its whol
 Counter. Tokens the prefix cache already held at that lookup. The hit rate is `rate(mstar_prefix_cache_hit_tokens_total[5m])` divided by `rate(mstar_prefix_cache_query_tokens_total[5m])`. For Qwen3.5 these are the KV cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool cuts to 0 still counts.
 
 `mstar_kv_preemptions_total{model_name, component}` <br />
-Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short of KV pages, on a single rank. Their pages go to the request that ran short.
+Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves itself to the host to wait.
 
 `mstar_kv_drops_total{model_name, component}` <br />
 Counter. Chosen requests whose KV was dropped. A request leaves before its drop when its client goes away.

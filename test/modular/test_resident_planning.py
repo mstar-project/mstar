@@ -1141,7 +1141,7 @@ def _offload_engine(resources, planner):
     engine._submodules = {"n": SimpleNamespace(resources=resources, resident=planner)}
     engine._graph_runtime = SimpleNamespace(get_rid_string=str, get_rid_handle=int)
     # these requests were taken in by their resources alone, so no admission queue holds them
-    engine._runner = SimpleNamespace(readmit=lambda rid, node: None)
+    engine._runner = SimpleNamespace(readmit=lambda rid, node, queued: None)
     return engine
 
 
