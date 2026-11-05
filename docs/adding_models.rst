@@ -1283,7 +1283,8 @@ placed exactly as weights are.
   adapter; a replay's plan writes each row's slot into the buffers that capture
   recorded, so a captured graph serves any mix of adapters without recapture. The
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
-  latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
+  latter declares the ``y`` it writes), and an experts target's grouped GEMMs are one
+  more, ``mstar::lora_experts_apply_``, so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
   the slot count alone.
 - **dtype.** The slot weights take the nodes' compute dtype (the serving config's
