@@ -3884,6 +3884,7 @@ class KVManager(AttentionResource):
                 self._vacate(rid, room)
             else:
                 self._recount(rid)
+                self._settle(rid, self._room() - room)
             return freed, {claim.label for claim in moved}
 
     def _reusable(self, page: int) -> bool:
