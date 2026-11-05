@@ -452,7 +452,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     engine._submodules = {"dit": SimpleNamespace(
         submodule=SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset), resources={},
         joint_comm_group=None, num_slots=2,
-        fp32_precision=None, node_dtype=None, lora_pools=(),
+        fp32_precision=None, node_dtype=None, idle_keys=(),
     )}
     monkeypatch.setattr(engine_mod, "AcceleratorGraphRunner", _Runner)
     monkeypatch.setattr(engine, "_compile_regions", lambda: None, raising=False)

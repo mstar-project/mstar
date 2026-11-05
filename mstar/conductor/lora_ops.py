@@ -59,12 +59,13 @@ class LoraAdapterOps:
 
     ``spec`` is a LoRA pool's spec, whose runtime-update settings every pool shares (None
     for a deployment without LoRA); ``workers`` are the workers hosting the pools' nodes;
-    ``send(peer, message)`` is the conductor's communicator; ``clock`` its monotonic time.
+    ``send(peer, message)`` is the conductor's communicator;
+    ``clock`` its clock (``time.perf_counter``, as its other timed checks).
     """
 
     def __init__(
         self, spec: LoraSpec | None, workers: list[str], send: Callable[[str, object], None],
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.perf_counter,
     ):
         self._spec = spec
         self._workers = list(workers)
@@ -119,6 +120,11 @@ class LoraAdapterOps:
         if any(op.body.lora_name == name for op in self._pending.values()):
             return 409, f"a load or unload of LoRA adapter '{name}' is already in progress"
         return None
+
+    def next_deadline(self) -> float | None:
+        """When ``expire`` next has something to give up on, on ``clock``; None with
+        nothing pending."""
+        return min((op.deadline for op in self._pending.values()), default=None)
 
     def expire(self) -> None:
         """Give up on the operations some worker has not answered within
