@@ -2302,11 +2302,14 @@ class Engine:
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
                 )
-            except Exception:
-                logger.debug(
-                    "batched check_stop failed (node=%s); checking per request",
-                    batch.node_name, exc_info=True,
+            except Exception as error:
+                # a raise is a bug in the submodule, which the per-request
+                # path below would otherwise hide
+                logger.warning(
+                    "batched check_stop failed (node=%s): %r; checking per request",
+                    batch.node_name, error,
                 )
+                logger.debug("batched check_stop traceback", exc_info=True)
                 batched = None
             if isinstance(batched, BatchedStopCheck):
                 if batched.withheld:
