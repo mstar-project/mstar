@@ -140,24 +140,29 @@ def test_a_request_waits_for_a_row_and_the_ranks_of_a_lockstep_node_never_do():
     assert mark == 0 and not rows.grew_since(mark)
     rows.remove_request(1)
     assert rows.grew_since(mark) and rows.reserve(2, "n", WALK, None) is None
-    # a lockstep rank never holds a request back on its own (the ranks would
-    # split); it takes rows at its step's admit, which every rank runs alike, and
-    # a full table refuses that admit rather than raising at ingest (review-r2 F4)
-    from mstar.engine.resources.loopback_rows import LoopbackRowsStep
-    from mstar.engine.resources.step import Segment
 
-    lockstep = LoopbackRows(CPU, capacity=1, decides=False)
-    assert lockstep.ask(1, "n", WALK) is None
-    for rid in (1, 2):
-        lockstep.ingest_request(rid)
-    ctx = SimpleNamespace(request_ids=(1,))
-    assert lockstep.admit(LoopbackRowsStep(segments=(Segment(1, "main", 1),)), ctx).ok and lockstep.has_row(1)
-    two = LoopbackRowsStep(segments=(Segment(1, "main", 1), Segment(2, "main", 1)))
-    refused = lockstep.admit(two, SimpleNamespace(request_ids=(1, 2)))
-    assert not refused.ok and not lockstep.has_row(2) and lockstep.has_row(1)
-    lockstep.remove_request(1)
-    alone = LoopbackRowsStep(segments=(Segment(2, "main", 1),))
-    assert lockstep.admit(alone, SimpleNamespace(request_ids=(2,))).ok and lockstep.has_row(2)
+
+def test_a_rank_with_no_free_row_parks_a_request_another_rank_already_runs():
+    """Under TP each rank frees a row at its own REMOVE, so one can be full while
+    another's step has started: it waits for its own REMOVE at Admission, as the
+    sampler does, and never refuses a step (review-r3 F1). Ingest takes nothing,
+    and a capture's padding reads the trash row."""
+    info = SimpleNamespace(device=CPU, joint_comm_group=SimpleNamespace(world_size=2))
+    leader, follower = LoopbackRows.build(None, info), LoopbackRows.build(None, info)
+    for rank in (leader, follower):
+        rank.capacity = 1
+        rank.ingest_request(1, None)
+        assert rank.reserve(1, "n", WALK, None) is None
+        rank.ingest_request(2, None)
+        rank.ingest_capture_row(-1)
+        assert not rank.has_row(2) and not rank.has_row(-1)
+    leader.remove_request(1)
+    assert leader.reserve(2, "n", WALK, None) is None
+    assert follower.ask(2, "n", WALK) is not None
+    mark = follower.reserve(2, "n", WALK, None)
+    assert mark == 0, "it parks"
+    follower.remove_request(1)
+    assert follower.grew_since(mark) and follower.reserve(2, "n", WALK, None) is None
 
 
 def _runner(shapes):
