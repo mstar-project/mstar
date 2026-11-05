@@ -116,6 +116,14 @@ the event loop and transport threads. On a 192-core H200 host the cap matched
 models, where the default pool lost 4-9 % (up to 29 % with the server pinned
 to 16 cores), so no launch setting is needed.
 
+``whisper_large_v3_turbo.yaml`` and ``qwen3_asr.yaml`` set ``knobs: step_threads: serial``.
+ASR's GPU and plan threads overlap no CPU work to speak of (with the clock held,
+threaded, turn-taking and serial run within 2 %; Turbo at concurrency 1 loses
+5 % in serial), and on a ``schedutil`` host work split across threads stays near
+the lowest clock. One thread stays busy enough for the governor to raise it:
+Turbo gained 59 % and 67 % at concurrency 4 and 16, Qwen3-ASR 77 % and 63 %, on
+one H200 with client-cut 30 s windows and no pinning.
+
 A transcription moves its audio, encoder states and output tokens as many small
 tensors. The SHM transport places them in the shared-memory arena's
 preallocated segments; the file per tensor it used before cost throughput.

@@ -19,6 +19,8 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 | Side stream | D2H copies for `check_stop` pre-materialization |
 | `SideStepLane` stream | A side lane's steps (`side_stream: true` on a node group), launched from the GPU thread between two chain steps; its windows collate there on the main thread |
 
+`knobs: step_threads: serial` runs the GPU and plan threads' work on the main thread, through `InlineExecutor`: `submit` returns a finished future, so the stages below keep their order and their waits find everything set. Host work then overlaps the GPU only. It is refused with lockstep-parallel nodes or a side lane.
+
 Knobs: **`MSTAR_TP_ASYNC_SCHED` is `1`, so lockstep-parallel (TP/SP) nodes speculate too.** `0` runs them serially, which is still a supported path: a change that only works with speculation on needs testing with it off as well. It also takes a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
 
 The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SPEC_PEEK_FOR_FAIRNESS`, `MSTAR_LAUNCH_WAIT_MS`, `MSTAR_ENGINE_STEP_SYNC`, `MSTAR_FORWARD_SIDE_STREAM`. Defaults for all of these are in [docs/environment_variables.rst](../../../docs/environment_variables.rst); check it rather than assuming. Per-node opt-out from async scheduling entirely: `enable_async_scheduling=False` on the `GraphNode`.

@@ -19,6 +19,7 @@ KNOBS: dict[str, str] = {
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
+    "step_threads": "MSTAR_STEP_THREADS",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
@@ -51,6 +52,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _idle_hold_value(value)
         elif key == "resident_planning":
             out[key] = _resident_planning_value(value)
+        elif key == "step_threads":
+            out[key] = _step_threads_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -60,6 +63,13 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _step_threads_value(value: object) -> str:
+    text = str(value).strip().lower()
+    if text in ("threaded", "serial"):
+        return text
+    raise ValueError(f"`knobs: step_threads` must be threaded or serial, got {value!r}")
 
 
 def _resident_planning_value(value: object) -> str:
@@ -211,6 +221,15 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def step_threads() -> str:
+    """``step_threads`` / ``MSTAR_STEP_THREADS`` (default ``threaded``): where a
+    worker runs a step's host work. ``threaded`` uses its GPU and plan threads;
+    ``serial`` runs that work on the main thread, keeping CPU-GPU overlap and
+    giving up CPU-CPU overlap, which the GIL mostly denies a Python-heavy step
+    anyway."""
+    return _step_threads_value(_setting("step_threads", "threaded"))
 
 
 def step_thread_core() -> str | int:
