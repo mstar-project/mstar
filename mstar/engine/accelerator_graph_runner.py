@@ -26,7 +26,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseConfigType,
 )
 from mstar.engine.node_dtype import node_scope
-from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK
@@ -123,6 +123,19 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     if step is None:
         return []
     return sorted(key for key in step.steps if not resources[key].can_capture())
+
+
+def placed_combined_pools(step, resources: Mapping[str, Resource]) -> list[str]:
+    """The context-parallel KV pools the declared step combines labels over. A combined plan is
+    label-major, so a replay's padding rows sit between real ones, and attention over a placed pool
+    plans them only after the real rows."""
+    if step is None:
+        return []
+    return sorted(
+        key for key, resource_step in step.steps.items()
+        if isinstance(resource_step, KVStep) and resource_step.combined_labels
+        and resources[key].placement is not None
+    )
 
 
 @contextmanager
@@ -868,6 +881,14 @@ class AcceleratorGraphRunner:
                         spec.config_idx, self._submodule_name, blocked,
                     )
                     blocked_configs.add(spec.config_idx)
+                # the config's widest capture, as the specs run widest first; one row never pads
+                elif spec.bs > 1 and (pools := placed_combined_pools(step, self._resources)):
+                    raise ValueError(
+                        f"{self._submodule_name}: the capture of {spec.bucket.graph_walk!r} at batch size "
+                        f"{spec.bs} combines labels into one plan, whose padding rows attention over "
+                        f"context-parallel KV pools {pools} can't plan: capture it at batch size 1 only, "
+                        "or turn context_parallel off"
+                    )
             self._blocked_buckets = list(dict.fromkeys(
                 spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs
             ))
