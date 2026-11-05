@@ -63,11 +63,11 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
 
 
 def _resident_planning_value(value: object) -> str:
-    # yaml reads a bare ``off`` as False
-    text = "off" if value is False else str(value).strip().lower()
-    if text in ("auto", "off"):
+    # yaml reads a bare ``on`` / ``off`` as a bool
+    text = ("on" if value else "off") if isinstance(value, bool) else str(value).strip().lower()
+    if text in ("on", "off"):
         return text
-    raise ValueError(f"`knobs: resident_planning` must be auto or off, got {value!r}")
+    raise ValueError(f"`knobs: resident_planning` must be on or off, got {value!r}")
 
 
 def _step_thread_core_value(value: object) -> str:
@@ -241,12 +241,11 @@ def idle_hold() -> str:
         return value
     raise ValueError(f"MSTAR_IDLE_HOLD must be qos or off, got {value!r}")
 def resident_planning() -> str:
-    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
-    a captured decode step reads its rows off per-request tables held on the
-    device instead of having them rebuilt on the plan thread
-    (``mstar.engine.resources.resident``). ``auto`` turns it on for each walk
-    that runs a node in a Loop where every owner of a fact it needs agrees
-    (its capture, its declared step, each resource, its ``preprocess``), and
-    logs one line per such walk at startup; ``off`` keeps the host plan
-    everywhere."""
-    return _resident_planning_value(_setting("resident_planning", "auto"))
+    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``off``):
+    ``on`` has a captured step read its rows off per-request tables held on
+    the device instead of having them rebuilt on the plan thread
+    (``mstar.engine.resources.resident``), on each walk that runs a node in a
+    Loop where every owner of a fact it needs agrees (its capture, its declared
+    step, each resource, its ``preprocess``); one line per such walk at startup
+    says which. ``off`` keeps the host plan everywhere."""
+    return _resident_planning_value(_setting("resident_planning", "off"))

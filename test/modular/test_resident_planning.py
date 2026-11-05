@@ -46,15 +46,28 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
+from mstar.graph.base import EdgeKind, LoopEdges  # noqa: E402
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.step_repeats import StepRepeats  # noqa: E402
+from mstar.worker.step_repeats import RepeatConfig, StepRepeats, parse_step_repeats  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
 CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _resident_planning_on(monkeypatch):
+    """Resident planning is opt-in; these tests are of a deployment that asks."""
+    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "on")
+
+
+def _repeats(limit: int, nodes="n") -> StepRepeats:
+    """Repeats up to ``limit`` asked of each of ``nodes``' WALK, a token loop."""
+    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK})
+    return StepRepeats({n: RepeatConfig(max=limit) for n in nodes}, {(n, WALK): edges for n in nodes})
 
 
 def _walk(*keys: str, reads: tuple[str, ...] = ()) -> dict:
@@ -326,7 +339,7 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         ),
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
-    repeats = StepRepeats(8, [("n", WALK)])
+    repeats = _repeats(8)
     repeats.settle(lambda *key: None, lambda *key: None)
     assert repeats.ceiling(speculation, in_chain, lambda: room) == want
 
@@ -350,13 +363,56 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
         ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
     )}
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
-        StepRepeats(limit, [(n, WALK) for n in "abc"]).settle(engine.resident_refusal, engine.repeat_refusal)
+        _repeats(limit, "abc").settle(engine.resident_refusal, engine.repeat_refusal)
     lines = {line.split(":", 1)[0]: line for line in caplog.messages}
-    want = "resident | repeats up to 4" if limit > 1 else "resident | runs once: max_step_repeats is 1"
+    want = "resident on | repeats on, up to 4" if limit > 1 else "resident on | repeats off: not asked for"
     assert lines[f"a/{WALK}"].endswith(want)
     if limit > 1:
-        assert lines[f"b/{WALK}"].endswith("runs once: resource 'pool': ResidentHooks keeps no per-replay support")
-    assert lines[f"c/{WALK}"].startswith(f"c/{WALK}: host-planned: resource 'kv': why | runs once")
+        assert lines[f"b/{WALK}"].endswith("repeats off: resource 'pool': ResidentHooks keeps no per-replay support")
+    assert lines[f"c/{WALK}"].startswith(f"c/{WALK}: resident off: resource 'kv': why | repeats off")
+
+
+def _token_loop(*extra_outputs, streamed=()):
+    """Loop "loop" over node "n", whose token "t" loops back and goes to the
+    client, beside a constant input "cond" and a Loop output "latent"."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    node = GraphNode(name="n", input_names={"t", "cond", *streamed}, outputs=[
+        GraphEdge("n", "t"), GraphEdge(EMIT_TO_CLIENT, "t"), GraphEdge("vae", "latent"), *extra_outputs,
+    ])
+    node._register_streaming(set(streamed))
+    return Loop(section=node, max_iters=8, outputs=[GraphEdge("vae", "latent")], name="loop")
+
+
+def test_each_edge_of_a_loop_has_its_own_kind():
+    """The kind is the edge's, not the signal's: "t" loops back and goes to the
+    client at once."""
+    from mstar.graph.base import loop_edges
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    edges = loop_edges(_token_loop(), "n")
+    assert edges.loop == "loop"
+    assert edges.inputs == {"t": EdgeKind.LOOP_BACK, "cond": EdgeKind.CONSTANT}
+    assert edges.outputs == {
+        ("t", "n"): EdgeKind.LOOP_BACK, ("t", EMIT_TO_CLIENT): EdgeKind.PER_ITERATION,
+        ("latent", "vae"): EdgeKind.TERMINAL,
+    }
+    assert loop_edges(_token_loop(), "absent") is None
+
+
+@pytest.mark.parametrize(("loop", "carried", "columns", "why"), [
+    (_token_loop(), {"t"}, {"t"}, None),
+    (_token_loop(), set(), {"t"}, "runner: its loop-back 't' -> 'n' isn't carried on the device"),
+    (_token_loop(), {"t"}, set(), "graph runtime: 't' -> 'emit_to_client' takes each iteration's value"),
+    (_token_loop(streamed=("chunk",)), {"t"}, {"t"}, "stream buffer: its input 'chunk' is streamed"),
+], ids=["served", "uncarried", "client_without_column", "streamed"])
+def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, carried, columns, why):
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    refusal = edge_refusal(loop_edges(loop, "n"), carried, columns)
+    assert refusal is None if why is None else refusal.startswith(why)
 
 
 class _CudaCoreDecode(FlashInferDecodeWrapper):
@@ -399,10 +455,20 @@ def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, 
     assert (resource().repeat_refusal() is not None) is refuses
 
 
-@pytest.mark.parametrize("limit", [2.5, True, "4", 0])
-def test_a_repeat_limit_that_isnt_a_positive_integer_is_refused(limit):
-    with pytest.raises(ValueError, match="max_step_repeats"):
-        StepRepeats(limit, [])
+@pytest.mark.parametrize(("block", "why"), [
+    *(({"n": {"max": limit}}, "integer of at least 1") for limit in (2.5, True, "4", 0)),
+    ({"n": {"max": 2, "maxx": 3}}, "not settings"),
+    ({"m": {"max": 2}}, "not nodes of the model"),
+    ({"n": 4}, "must be a mapping"),
+])
+def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
+    with pytest.raises(ValueError, match=why):
+        parse_step_repeats(block, {"n"})
+
+
+def test_each_node_asks_for_its_own_repeats():
+    configs = parse_step_repeats({"thinker": {"max": 4}, "talker": {"max": 1}}, {"thinker", "talker", "codec"})
+    assert configs == {"thinker": RepeatConfig(max=4), "talker": RepeatConfig()}
 
 
 def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
@@ -434,7 +500,7 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
     ctx = SimpleNamespace(repeats=1)
     worker = Worker.__new__(Worker)
-    worker._step_repeats = StepRepeats(8, [("n", WALK)])
+    worker._step_repeats = _repeats(8)
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
@@ -2074,9 +2140,9 @@ def test_the_engine_puts_a_loop_walk_on_resident_tables_with_nothing_declared():
 
 
 @pytest.mark.parametrize(("knob", "runner", "resources", "why"), [
-    ("off", _capture_runner(), ("kv",), "resident_planning is off"),
-    ("auto", _capture_runner(refusal="it has no batched capture"), ("kv",), "no batched capture"),
-    ("auto", _capture_runner(), ("kv", "other"), "_Spare keeps no resident table"),
+    ("off", _capture_runner(), ("kv",), "not asked for"),
+    ("on", _capture_runner(refusal="it has no batched capture"), ("kv",), "runner: it has no batched capture"),
+    ("on", _capture_runner(), ("kv", "other"), "_Spare keeps no resident table"),
 ], ids=["knob", "capture", "resource"])
 def test_a_refused_walk_stays_on_the_host_and_says_why(monkeypatch, knob, runner, resources, why):
     monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", knob)
@@ -2236,21 +2302,21 @@ def test_a_capture_runner_answers_for_the_walks_it_captures():
 
 # ---- the knob ----
 
-def test_the_knob_takes_auto_and_off():
-    assert knobs.check({"resident_planning": "auto"}) == {"resident_planning": "auto"}
+def test_the_knob_takes_on_and_off():
+    assert knobs.check({"resident_planning": "on"}) == {"resident_planning": "on"}
+    # yaml reads a bare on/off as a bool
+    assert knobs.check({"resident_planning": True}) == {"resident_planning": "on"}
     assert knobs.check({"resident_planning": False}) == {"resident_planning": "off"}
-    with pytest.raises(ValueError, match="auto or off"):
-        knobs.check({"resident_planning": "maybe"})
-    with pytest.raises(ValueError, match="auto or off"):
-        knobs.check({"resident_planning": True})
+    with pytest.raises(ValueError, match="on or off"):
+        knobs.check({"resident_planning": "auto"})
 
 
-def test_the_knob_defaults_to_auto(monkeypatch):
+def test_resident_planning_is_off_unless_asked_for(monkeypatch):
     monkeypatch.delenv("MSTAR_RESIDENT_PLANNING", raising=False)
     knobs.configure(None)
-    assert knobs.resident_planning() == "auto"
-    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
     assert knobs.resident_planning() == "off"
+    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "on")
+    assert knobs.resident_planning() == "on"
 
 
 def test_the_slot_count_is_no_knob():

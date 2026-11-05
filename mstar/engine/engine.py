@@ -46,7 +46,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.resident import ResidentPlanner, build_planner, watch_table_reads
+from mstar.engine.resources.resident import NOT_ASKED, ResidentPlanner, build_planner, watch_table_reads
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -734,7 +734,7 @@ class Engine:
         submodule_mgmt = self._submodules[node_name]
         refusals = submodule_mgmt.resident_refusals
         if knobs.resident_planning() == "off":
-            refusals.update(dict.fromkeys(looped, "resident_planning is off"))
+            refusals.update(dict.fromkeys(looped, NOT_ASKED))
             return
         steps = {}
         for walk in sorted(looped):
@@ -742,13 +742,13 @@ class Engine:
             if refusal is None:
                 steps[walk] = runner.template_step(walk)
             else:
-                refusals[walk] = refusal
+                refusals[walk] = f"runner: {refusal}"
 
         def probe(walk: str) -> str | None:
             # a resident step's tables fill these in its graph, after its preprocess
             with watch_table_reads() as reads:
                 runner.prepare_template(walk)
-            return f"its captured preprocess reads {reads[0]}, which the graph fills after it" if reads else None
+            return f"node: its captured preprocess reads {reads[0]}, which the graph fills after it" if reads else None
 
         if not steps:
             return
@@ -2876,13 +2876,13 @@ class Engine:
         None if it may: the deployment, the walk's step and every resource of
         the node each answer. After capture, which some resources decide at."""
         if self.resident_refusal(node_name, graph_walk) is not None:
-            return "it doesn't run on resident tables"
+            return "engine: it plans on the host"
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
-            return "it runs on more than one rank"
+            return "deployment: it runs on more than one rank"
         if mgmt.submodule.repeat_carry(graph_walk) is None:
-            return "its submodule names nothing that carries a replay's token on"
+            return "node: it names nothing that carries a replay's token on"
         for key, resource in mgmt.resources.items():
             if (refusal := resource.repeat_refusal()) is not None:
                 return f"resource {key!r}: {refusal}"

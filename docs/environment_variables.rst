@@ -653,8 +653,8 @@ Worker scheduling
        shorter decode step), at the cost of holding at most that many young
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
    * - ``MSTAR_RESIDENT_PLANNING``
-     - config's ``knobs: resident_planning``, else ``auto``
-     - ``auto`` runs a node's captured steps off per-request tables on the
+     - config's ``knobs: resident_planning``, else ``off``
+     - ``on`` runs a node's captured steps off per-request tables on the
        device for each walk that runs the node in a Loop, where its capture,
        its declared step, its ``preprocess`` and every resource of the node
        (``Resource.resident_refusal``) agree; the worker logs one line per

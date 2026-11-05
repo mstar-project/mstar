@@ -102,7 +102,7 @@ class DeviceLoopback(NamedTuple):
     synchronous host-to-device copy per step, which a node that reads its
     tokens on the host would pay for nothing.
 
-    It is also what carries a step that repeats (``max_step_repeats``) from one
+    It is also what carries a step that repeats (``step_repeats``) from one
     replay to the next (``repeat_carry``), and only the token moves between
     replays. So every other input of the walk must be the same each iteration:
     ``preprocess`` stages no per-iteration value, ``step_metadata`` included.

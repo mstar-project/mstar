@@ -127,7 +127,7 @@ from mstar.worker.speculation import (
     SpeculationContext,
     SpeculationPreparer,
 )
-from mstar.worker.step_repeats import StepRepeats
+from mstar.worker.step_repeats import StepRepeats, edge_refusal, parse_step_repeats, walk_edges
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -627,10 +627,6 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
-        streamed = {
-            (node, walk) for wg in my_worker_graphs for node, graph_node in wg.section.get_nodes().items()
-            if graph_node.consumes_stream for walk in wg.graph_walks
-        }
         self.chunk_loops = ChunkLoops.from_graphs(
             my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
             model.chunking_policy_of() if model is not None else {},
@@ -874,9 +870,15 @@ class Worker:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
+        walk_graphs = model.get_graph_walk_graphs() if model else {}
         self._step_repeats = StepRepeats(
-            (model_config or {}).get("max_step_repeats", 1),
-            {(node, walk) for walk, node in self._innermost_loop_by_node if (node, walk) in my_walks}, streamed,
+            parse_step_repeats(
+                (model_config or {}).get("step_repeats"),
+                {node for section in walk_graphs.values() for node in section.get_nodes()},
+            ),
+            walk_edges(
+                walk_graphs, [(node, walk) for walk, node in self._innermost_loop_by_node if (node, walk) in my_walks],
+            ),
         )
 
         if status_interval_s is not None:
@@ -2902,7 +2904,7 @@ class Worker:
     def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
         """Ask for as many iterations as the step can have; its resources narrow
         it at admit (`_await_admit_settled` takes the answer)."""
-        if self._step_repeats is None or self._step_repeats.limit == 1:
+        if self._step_repeats is None or not self._step_repeats.asked:
             return
         batch = speculation.scheduled_batch
         speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
@@ -2918,12 +2920,15 @@ class Worker:
         something about its rows has to reach the host every iteration."""
         engine = self.engine_manager.get_engine(node_name)
         if self._stop_token_signal.get((node_name, graph_walk)) is None:
-            return "the runtime doesn't check its stop: it declares no token stop"
-        if not self._all_on_device(
-            engine, node_name, graph_walk, self._graph_runtime.get_output_signals(node_name, graph_walk),
-        ):
-            return "it routes outputs off the device"
-        return engine.repeat_refusal(node_name, graph_walk)
+            return "node: the runtime doesn't check its stop: it declares no token stop"
+        # the client's copy of a token rides the step's token column
+        inline = self._graph_runtime.supports_inline_emit
+        columns = engine.inline_client_signals(node_name, graph_walk) if inline else {}
+        refusal = edge_refusal(
+            self._step_repeats.edges[(node_name, graph_walk)],
+            engine.device_loopback_signals(node_name, graph_walk), columns,
+        )
+        return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk)
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):

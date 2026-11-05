@@ -696,6 +696,10 @@ def _segments(key: str, step: SubmoduleStep) -> list:
     return list((resource_step.segments if resource_step is not None else None) or step.segments or ())
 
 
+# a capability's verdict when the serving config doesn't ask for it
+NOT_ASKED = "not asked for"
+
+
 def build_planner(
     node: str, steps: Mapping[str, SubmoduleStep | None], resources: Mapping[str, Resource],
     resource_nodes: Mapping[str, Collection[str]], device: torch.device,
@@ -707,17 +711,19 @@ def build_planner(
     passed the others. Every resource of the node must be able to, since a
     capture is one graph: one host-planned resource would need the row a
     resident step no longer stages."""
-    refusal = None if resources else "no resource of it keeps a table"
+    refusal = None if resources else "node: no resource of it keeps a table"
     for key in resources:
         if refusal is None and len(resource_nodes.get(key, ())) > 1:
-            refusal = f"resource {key!r} is shared by nodes {sorted(resource_nodes[key])}"
+            refusal = f"resource {key!r}: it is shared by nodes {sorted(resource_nodes[key])}"
     if refusal is not None:
         return None, dict.fromkeys(steps, refusal)
     refusals: dict[str, str] = {}
     walks: dict[str, dict[str, ResidentStream]] = {}
     for walk, step in steps.items():
         refusal = step_refusal(resources, step)
-        if refusal is None:
+        if refusal is not None:
+            refusal = f"node: {refusal}"
+        else:
             streams = declared_streams(resources, step)
             refusal = next((
                 f"resource {key!r}: {why}" for key, resource in resources.items()

@@ -1646,9 +1646,10 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
-A walk that runs a node inside a ``Loop`` runs its captured steps off per-request tables
-on the device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``),
-with nothing for the model to declare. The engine decides at load, before capture, from
+With ``knobs: resident_planning: on`` in the serving config, a walk that runs a node
+inside a ``Loop`` runs its captured steps off per-request tables on the device instead of
+a plan rebuilt per step (``mstar/engine/resources/resident.py``), with nothing for the
+model to declare. The engine decides at load, before capture, from
 what each owner already says: the walk has a batched capture; the step its widest capture
 declares has, for each resource, one stream that takes one token per row, or one it only
 reads at span 0 (a cross-attention context), with no forks, retention or sink; every
@@ -1656,9 +1657,8 @@ resource of the node answers ``Resource.resident_refusal`` with None and none is
 with another node; and its captured ``preprocess`` reads no buffer the graph fills (an
 accessor of one, such as ``RopeManager.pos_ids``, calls ``resident.table_read``). Each KV
 pool of the node keeps its own block table and lengths; positions read the pool their
-``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying whether
-it is resident and repeats, or which owner refused; ``knobs: resident_planning: off``
-turns it off. A resident ``preprocess`` that reads such a buffer on a branch the capture
+``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying, for each
+capability, ``on``, ``off: not asked for`` or ``off: <owner>: <reason>``. A resident ``preprocess`` that reads such a buffer on a branch the capture
 didn't take stops the worker, and so does a row that declares other streams than its walk's
 capture: the tables advance every row on the walk's streams. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
@@ -1666,12 +1666,13 @@ own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become
 of the row, so a resident step stages none of them, while the RNG offset, the last token
 and the repetition-penalty mask stay by the sampler's own row of each request.
 
-A resident step can also stand for several iterations of its Loop (``max_step_repeats``
-in the serving config): the host plans once and the capture replays, the token carried
+A resident step can also stand for several iterations of its Loop (``step_repeats``
+per node in the serving config): the host plans once and the capture replays, the token carried
 from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Whether
 a walk may repeat is settled once, after capture, and the worker logs it per walk with the
-reason when it can't: the walk must be resident, read no streamed input, have a runtime
-token stop and its outputs on the device, run on one rank, and every resource of the node must answer
+reason when it can't: the walk must be resident, have a runtime token stop, run on one rank, and each of
+its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,
+per-iteration or terminal) must be one a run serves, and every resource of the node must answer
 ``Resource.repeat_refusal`` with None. The default refuses, so a resource takes part only
 once it says how far its capture advances itself. At admit each resource can narrow a
 step with ``Resource.max_repeats``, for what only that step decides (free pages, a live

@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import NamedTuple
 from uuid import uuid4
 
 import torch
@@ -728,6 +730,55 @@ def self_triggered(entity: "GraphNode | Loop") -> bool:
         node.consumes_stream and node.input_names <= node._streaming_inputs
         for node in entity.get_nodes().values()
     )
+
+
+class EdgeKind(Enum):
+    """How an edge of a node inside a Loop behaves over the Loop's iterations,
+    which is what a step standing for several iterations has to do with it."""
+    # an input that is the same every iteration
+    CONSTANT = "constant"
+    # made by one iteration on device, read by the next
+    LOOP_BACK = "loop-back"
+    # a different value every iteration: an input streamed in, or an output to
+    # the client, a stream, an accumulated output or the Loop's next node
+    PER_ITERATION = "per-iteration"
+    # a Loop output: only the last iteration's value leaves
+    TERMINAL = "terminal"
+
+
+class LoopEdges(NamedTuple):
+    """Every edge of one node in its innermost Loop, by kind."""
+    loop: str
+    # input name -> kind
+    inputs: dict[str, EdgeKind]
+    # (signal, destination) -> kind
+    outputs: dict[tuple[str, str], EdgeKind]
+
+
+def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
+    """The kinds of ``node_name``'s edges in its innermost Loop in ``section``,
+    or None outside any Loop. The kind belongs to the edge: one signal can loop
+    back and go to the client at once."""
+    loops = [loop for loop in section.get_loops().values() if node_name in loop.get_nodes()]
+    inner = next((loop for loop in loops if not set(loop.section.get_loops()) & {lp.name for lp in loops}), None)
+    if inner is None:
+        return None
+    node = inner.get_nodes()[node_name]
+    back = inner._loop_back_inputs or set()
+    terminal = {edge.name for edge in inner.outputs}
+    inputs = {
+        name: EdgeKind.LOOP_BACK if (name, node_name) in back
+        else EdgeKind.PER_ITERATION if name in node._streaming_inputs
+        else EdgeKind.CONSTANT
+        for name in node.input_names
+    }
+    outputs = {
+        (edge.name, edge.next_node): EdgeKind.LOOP_BACK if (edge.name, edge.next_node) in back
+        else EdgeKind.TERMINAL if edge.name in terminal
+        else EdgeKind.PER_ITERATION
+        for edge in node.outputs
+    }
+    return LoopEdges(inner.name, inputs, outputs)
 
 
 class GraphStateRegistry(ABC):

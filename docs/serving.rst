@@ -326,20 +326,25 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        pays no scheduling gap between chunks; other ready work still goes first after
        every prompt step. Off, the next chunk waits for the current one to land. Naming
        a node or walk the model does not chunk fails loading.
-   * - ``max_step_repeats``
-     - *(optional, default 1)* The most iterations of a decode Loop one step may stand for,
-       an integer. The host plans once, the captured graph replays that many times, and
-       stops are read when the step lands. The next step is already running by then, so a
-       row that stops inside a step runs up to 2N-1 iterations past its stop, against 1
-       at N=1. A step repeats only inside a speculated chain (async scheduling on), with
-       no new rows, on one rank, for a Loop on resident tables that reads no streamed
-       input, with a declared token stop and its outputs on the device, and at most a KV
-       page's worth of iterations. Its resources can refuse the walk
-       (``Resource.repeat_refusal``): FlashInfer decode other than tensor-core (CUDA-core,
-       fa3, cuDNN), a sampler with a repetition window, loop-back state or no in-graph
-       scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
-       the node while a request with a repetition penalty or log-probs is live. At startup
-       the worker logs, per walk, that it repeats or why it can't.
+   * - ``step_repeats``
+     - *(optional)* Per node, the settings for steps that stand for several iterations
+       of a Loop: ``{<node>: {max: <int>}}``. ``max`` (default 1) is the most iterations
+       one step may stand for. The host plans once, the captured graph replays that many
+       times, and stops are read when the step lands. The next step is already running by
+       then, so a row that stops inside a step runs up to 2N-1 iterations past its stop,
+       against 1 at N=1. A step repeats only inside a speculated chain (async scheduling
+       on), with no new rows, on one rank, for a Loop walk on resident tables with a
+       declared token stop, and at most a KV page's worth of iterations. Each edge of the
+       node in its Loop must be one a run serves: a loop-back carried on the device, a
+       constant input, a Loop output, or the client's copy of the token. Its resources
+       can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode other than
+       tensor-core (CUDA-core, fa3, cuDNN), a sampler with a repetition window, loop-back
+       state or no in-graph scatter. They can narrow a step to 1
+       (``Resource.max_repeats``), for every step on the node while a request with a
+       repetition penalty or log-probs is live. At startup the worker logs one line per
+       Loop walk with each capability ``on``, ``off: not asked for``, or
+       ``off: <owner>: <reason>``. A setting other than ``max`` on a node whose ``max`` is
+       1, a name that is no node of the model, and an unknown setting fail loading.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
@@ -409,7 +414,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
        ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
        ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
-       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
+       ``off``, the default, or ``on``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
