@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -84,6 +84,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    CarryPair,
     DeviceLoopback,
     InputMetadata,
     InputSeqLenInfo,
@@ -1638,6 +1639,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             "input_embeds": input_embeds,
             **extra_args
         }
+
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
+        pairs = super().repeat_carry(graph_walk, signals)
+        # the forward reads the codec embedding sum as ``input_embeds``
+        if "talker_input_embeds" in pairs:
+            pairs["talker_input_embeds"] = CarryPair("talker_input_embeds", "input_embeds")
+        return pairs
 
     def _add_text_conditioning(
         self, input_embeds: torch.Tensor, text_raw: torch.Tensor | None,

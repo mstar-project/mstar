@@ -129,3 +129,21 @@ def test_the_omni_talker_withholds_its_codec_eos_frame_through_its_token_stop():
     (policy,) = sub.get_stop_policies("talker_decode").values()
     assert policy.eos_tokens == {config.talker.codec_eos_token_id}
     assert policy.withhold == ("codec_tokens",)
+
+
+def test_the_omni_talker_carries_its_codec_embedding_into_the_input_its_preprocess_feeds():
+    """A run carries ``talker_input_embeds`` between replays into the static
+    input the forward reads, which ``preprocess`` names ``input_embeds``."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.model = SimpleNamespace(text_projection=SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.zeros(1))))
+    sub.get_device = lambda: torch.device("cpu")
+    row = ARNodeInputs(input_embeds=torch.ones(1, 4), input_seq_len=1, tensor_inputs={"text_raw": torch.ones(1, 4)})
+    pair = sub.repeat_carry("talker_decode", {"talker_input_embeds"})["talker_input_embeds"]
+    assert pair.output == "talker_input_embeds"
+    assert torch.equal(sub.preprocess("talker_decode", None, [row])[pair.input], row.input_embeds)
