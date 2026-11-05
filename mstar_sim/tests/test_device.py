@@ -397,6 +397,14 @@ def test_timing_only_holds_shapes_not_values():
         for make in (torch.zeros_like, torch.ones_like, lambda t: torch.full_like(t, 2.0), lambda t: t.new_zeros(2),
                      lambda t: t.new_ones(2), lambda t: t.new_full((2,), 2.0)):
             assert not never_computed(make(stand_in())._data), make
+        # an op that refused a stand-in's values leaves what it writes as no kernel computed
+        out = row.new_full((2, 1), 99)
+        try:
+            torch.multinomial(stand_in() * 0, 1, out=out)
+        except RuntimeError:
+            assert never_computed(out._data)
+        else:
+            raise AssertionError("multinomial of zeros passed")
         # a computed mask selects its rows of a value-less tensor, each mask its own
         rows = torch.empty(8192, 16, device="cuda")
         for step in (2, 4):

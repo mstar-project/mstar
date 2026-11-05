@@ -640,7 +640,11 @@ def _kept_op(func, args, kwargs):
     try:
         out = func(*args, **kwargs)
     except RuntimeError:
-        VALUE_SHAPES[0] += never and _passes_on_other_values(func, args, kwargs)  # torch judged no kernel's values
+        if never and _passes_on_other_values(func, args, kwargs):  # torch judged no kernel's values
+            VALUE_SHAPES[0] += 1
+            for t in _written(func, args, kwargs):  # what a GPU would have left there
+                if isinstance(t, torch.Tensor):
+                    set_never_computed(t)
         raise
     for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
         if isinstance(t, torch.Tensor) and t.device.type == "cpu":
