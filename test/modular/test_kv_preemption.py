@@ -1008,6 +1008,30 @@ def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_foo
     )
 
 
+def test_a_waiting_request_the_full_host_turns_guaranteed_moves_more_newer_requests_for_its_footprint():
+    """p asks the host to set room aside for its prompt only once z2's drop has made room for that prompt. The host
+    has none, so p turns guaranteed and asks for its whole footprint, which z2's pages don't cover."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(1)
+    _running(kv, "o", 2, arrival=0)
+    _running(kv, "z1", 4, arrival=2)
+    _running(kv, "z2", 4, arrival=3)
+    # z1 waits for more than z2's drop frees, so its return doesn't take that room first
+    for rid, tokens in (("z2", 1), ("z1", 5 * PAGE_SIZE)):
+        short = _step(kv, rid, tokens).reason.pages_short
+        assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "p", 2, arrival=1, rebuildable=False)
+    assert not _ready(kv, "p")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2"]
+    _drop(kv, "z2")
+    assert "p" in kv._guaranteed and not _admitted(kv, "p")
+
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z1"], "p waited for good once it turned guaranteed"
+    _drop(kv, "z1")
+    assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
+
+
 class _StubHostRefusingB(host._HostPool):
     """Refuses stream ``b``, as a host whose room runs out partway through a move does."""
 

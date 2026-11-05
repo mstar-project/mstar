@@ -279,7 +279,8 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
 
 
-def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
+@pytest.mark.parametrize("guaranteed", [False, True])
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed):
     """z ran short with nothing newer to move and waits holding its pages. p, older, asks only afterwards, as a
     request held in an encoder does, and doesn't fit. z runs no step that could run short again, so nothing moved
     it and both waited for good."""
@@ -289,7 +290,8 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     _running(kv, "z", 6, arrival=2)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
     _runner(kv).readmit("z", NODE)
-    _request(kv, "p", 5, arrival=1)
+    # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
+    _request(kv, "p", 1 if guaranteed else 5, arrival=1, guaranteed=guaranteed)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     w = _worker(kv)
 
