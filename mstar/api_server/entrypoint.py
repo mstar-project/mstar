@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from mstar.api_server import media_io
+from mstar.api_server import media_io, ws_frames
 from mstar.api_server.auth import (
     API_KEY_ENV,
     APIKeyGuard,
@@ -2072,10 +2072,11 @@ def _decode_ws_files(
     files: list | None, upload_dir: Path,
 ) -> tuple[dict[str, list[str]], list[PromptPart]]:
     """Persist a websocket message's media (``{"name", "data"}`` entries;
-    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
-    the upload dir, grouped by the modality of each file name, the way the
-    multipart ``/generate`` route does. A message rejected halfway leaves no
-    files behind."""
+    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame, or a
+    ``SavedUpload`` a large frame's parse already saved) under the upload dir,
+    grouped by the modality of each file name, the way the multipart
+    ``/generate`` route does. A message rejected halfway leaves no files
+    behind."""
     if files is not None and not isinstance(files, list):
         raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
@@ -2090,15 +2091,10 @@ def _decode_ws_files(
             if modality == "unknown":
                 raise ValueError(f"Cannot determine modality for file: {name}")
             data = entry.get("data")
-            if isinstance(data, str):
-                # the decoder the data-URL paths use: unpadded or wrapped
-                # base64 is fine, a bad alphabet is the client's error
-                data = media_io._decode_base64_payload(data)
-            if not isinstance(data, (bytes, bytearray)):
-                raise ValueError(f"file {name!r} carries no data")
-            base = os.path.basename(name) or "upload"
-            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            save_path = (
+                Path(data.claim()) if isinstance(data, ws_frames.SavedUpload)
+                else ws_frames.save_entry(name, data, upload_dir)
+            )
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
@@ -2106,6 +2102,9 @@ def _decode_ws_files(
     except Exception:
         for path in saved:
             path.unlink(missing_ok=True)
+        for entry in files or []:  # the ones not reached
+            if isinstance(entry, dict) and isinstance(entry.get("data"), ws_frames.SavedUpload):
+                Path(entry["data"].claim()).unlink(missing_ok=True)
         raise
     return file_paths, parts
 
@@ -2486,17 +2485,22 @@ async def generate_ws(websocket: WebSocket):
     previous_turn: asyncio.Future | None = None
     try:
         while True:
+            # not kept while the socket idles: a refused message's saved files go with it
+            frame = message = None
             frame = await websocket.receive()
             if frame.get("type") == "websocket.disconnect":
                 break
             binary = frame.get("bytes") is not None
             try:
-                if binary:
-                    message = msgpack.unpackb(frame["bytes"], raw=False)
-                else:
-                    message = json.loads(frame.get("text") or "")
+                message = await ws_frames.parse_frame(
+                    frame["bytes"] if binary else frame.get("text") or "", api_server.upload_dir,
+                )
+            except OSError as exc:  # the server's side of a large frame, not the frame
+                text, _ = client_error_text(exc, "generate/ws frame hand-off failed", log=logger, type_name=False)
+                reply({"request_id": None, "error": text, "status": 500}, binary)
+                continue
             except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
-                reply({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                reply({"request_id": None, "error": f"undecodable frame: {scrub_paths(str(exc))}"}, binary)
                 continue
             if not isinstance(message, dict):
                 reply({"request_id": None, "error": "message must be an object"}, binary)
@@ -3070,6 +3074,7 @@ def main(argv: list[str] | None = None):
                 server.should_exit = True
 
             api_server.set_on_fatal(_stop_server)
+            ws_frames.start()
             server.run()
             if not server.started:
                 exit_code = 3  # uvicorn.run()'s own code for a server that never came up
@@ -3086,6 +3091,7 @@ def main(argv: list[str] | None = None):
             shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
+        ws_frames.stop()
         _shutdown_conductor_process(conductor_proc)
     # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
     if api_server.fatal_error is not None:
