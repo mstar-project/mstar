@@ -2502,8 +2502,10 @@ Splitting is declared in four places:
   run, ``requires_kv_write`` False), a ragged one through its ``run``. A layer that writes
   through ``write_target`` or calls ``attn.run`` itself raises on a split label, since it would
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
-  pass the TP heads where the pool holds this rank's slice; a layer that fuses its K/V write
-  (``Qwen3Attention``) calls ``AttentionCallable`` instead wherever the attention ``splits``. A cacheless self-attention that may see split tokens declares
+  pass the TP heads where the pool holds this rank's slice. ``AttentionCallable.norm_rope_attend``
+  and ``norm_rope_table_attend``, which fuse the K/V write into the norm/RoPE kernel, skip the fused
+  write and go through the exchange wherever the attention ``splits``. A cacheless self-attention
+  that may see split tokens declares
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
   on a node with no ``SeqShardSpec``, or one whose sequence shard never splits
   (``SeqShardSpec.splits``), so one declaration serves every deployment shape.
