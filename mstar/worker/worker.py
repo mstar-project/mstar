@@ -3746,11 +3746,10 @@ class Worker:
                     break
                 if input_name in wide:
                     # a signal that also leaves the Loop: a run kept it a column an
-                    # iteration, of which the loop-back reads the last
-                    copies = self._run_copies(tensors[0])
-                    tensors = [run_item(tensor, -1, copies) for tensor in tensors]
-                    if copies is not None:
-                        copies.synchronize()
+                    # iteration, of which the loop-back reads the last (a short
+                    # run's repeat its last, ``DeviceRun.results``); copied on the
+                    # current stream, which N's work is on, so it reads what N wrote
+                    tensors = [run_item(tensor, -1) for tensor in tensors]
                 speculation.node_batch.per_request_input_tensors[rid][input_name] \
                     = list(tensors)
             if ok:
