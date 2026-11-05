@@ -8,10 +8,10 @@ tensor, and every one of its ~15 field NAMES goes on the wire again -- msgpack
 has no string memo where pickle has one -- so both size and time go the other
 way, and they diverge with the tensor count.
 
-Whoever encodes in Python pays this: the whole Python runtime path, and the
-api server's data worker on every RESULT_TENSORS. The point of the Rust stack
-is that the sender stops being Python, so this measures what is still on the
-Python side rather than a cost the design intends to keep.
+Whoever encodes in Python pays this: the api server's data worker on every
+RESULT_TENSORS, for one. The point of the Rust stack is that the sender stops
+being Python, so this measures what is still on the Python side rather than a
+cost the design intends to keep.
 
     python benchmark/wire_codec.py
     python benchmark/wire_codec.py --edges 1,8,64,256 --iters 1000

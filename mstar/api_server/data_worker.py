@@ -47,8 +47,19 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
-from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.lora.identity import AdapterPrefixRoots
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.model.base import (
+    ClientChunk,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    keyed_labels,
+    names_checkpoint,
+    serving_resources,
+)
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -199,8 +210,7 @@ def _preprocess_loop(**kwargs):
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
     YAML has been applied."""
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, model_config)
+    specs = serving_resources(model, model_config)
     groups = [
         (group["ranks"], math.prod(node_group_axis_sizes(group).values()), group["node_names"])
         for group in model_config.get("node_groups") or []
@@ -210,6 +220,26 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
         spec.resource_key: spec.config.tokens_per_page for spec in specs
         if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
+
+
+def adapter_prefix_roots(
+    model: Model | None, model_config: dict | None,
+    digests: dict[str, bytes] | None = None,
+) -> AdapterPrefixRoots | None:
+    """The roots the deployment's LoRA adapters key their prompts under.
+
+    None when the deployment keys no label or serves no adapter. Otherwise each adapter
+    is keyed under its digest in ``digests`` (the API server's startup check) or read
+    once, here, so its digest names the weights as they were when it was registered and
+    no request pays for reading it.
+    """
+    if model is None or not model_config or not keyed_labels(model):
+        return None
+    # LoRA first: a deployment without it leaves its `resources:` block to the conductor
+    lora = lora_specs(model, model_config)
+    if not lora or not _kv_page_sizes(model, model_config):
+        return None
+    return AdapterPrefixRoots.read(lora[0], digests)
 
 
 class ResultQueue(queue.Queue):
@@ -250,9 +280,17 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
+        adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
+        """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
+        server's startup check read them."""
         check_media_limits()
+        # Here, before the thread starts: the thread reads it as it starts, and
+        # a value it cannot take would end the thread with every request waiting.
+        workers = (model_config or {}).get("preprocess_workers")
+        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -301,6 +339,9 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
+        # the serving config's adapters' prefix-cache roots
+        self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
+
         self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
@@ -322,6 +363,7 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
+                adapter_roots=self.adapter_prefix_roots,
                 is_pending=is_pending,
             )
         )
@@ -567,6 +609,18 @@ class RequestOutputState:
     frame_index: int = 0
 
 
+class EncodedOutput(NamedTuple):
+    """An output encoded on the pool, waiting for the data worker to queue its chunk."""
+    future: Future  # of ``(bytes, seconds in Model.postprocess)``
+    request_id: str
+    state: RequestOutputState
+    sequence: int
+    modality: str
+    metadata: dict
+    uuid: int
+    read_time: float | None  # with ``enable_prof``: when the tensor's read began
+
+
 class HeldItems(NamedTuple):
     """Client stream items stored before their call's route arrived."""
 
@@ -619,6 +673,8 @@ class PreprocessWorkerThread:
     worker_metrics_requested: threading.Event | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
+    # class-level so a thread built without __init__ stamps no read times
+    enable_prof = False
     # None (no model that declares it, one CPU's worth of workers, or a thread
     # built without __init__) prepares every request inline
     _prepare_pool: ThreadPool | None = None
@@ -648,8 +704,10 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
+        adapter_roots: AdapterPrefixRoots | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
+        self._adapter_roots = adapter_roots
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -728,7 +786,7 @@ class PreprocessWorkerThread:
         )
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
-        self._encoded: deque = deque()
+        self._encoded: deque[EncodedOutput] = deque()
         self._prepare_workers = self._num_prepare_workers()
         if self._prepare_workers > 1:
             self._prepare_pool = ThreadPool(
@@ -842,15 +900,15 @@ class PreprocessWorkerThread:
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
-        # image_grid_thw, audio_features from the raw tensors
-        # loaded above).  process_prompt receives the raw multimodal tensors
+        # image_grid_thw and audio_features from the raw tensors loaded
+        # above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -879,6 +937,7 @@ class PreprocessWorkerThread:
             if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
+                    adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -1159,15 +1218,27 @@ class PreprocessWorkerThread:
     def _prefix_keys(
         self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
+        adapter: str | None = None,
     ) -> dict:
         """Key each page of every label's keyed spans, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
         page, and the output tensor each label's sampled ids arrive in. The keys
-        are unrooted. Each keyed span's row in ``rows`` gains its digest and end key.
+        are not rooted in the process (the engine does that). Each keyed span's row
+        in ``rows`` gains its digest and end key. The chains of a request on a LoRA
+        adapter hang from the adapter's root, which is also sent as ``prefix_root``;
+        a base request's hang from the empty root, as before LoRA.
         """
         if not self._keyed_labels:
             return {}
+        root = b""
+        if adapter is not None:
+            roots = self._adapter_roots
+            root = roots.root(adapter) if roots is not None else None
+            if root is None:
+                # under the empty root its pages would serve the base model; the
+                # conductor refuses an adapter it does not serve in any case
+                return {"prefix_cache": False}
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
         decode: dict[str, dict[str, str]] = {}
@@ -1192,7 +1263,7 @@ class PreprocessWorkerThread:
                 pages, items = self._page_layout(
                     kv_label.keys, keyed, digests, tensors, page_size,
                 )
-                page_keys = chain(pages, items)
+                page_keys = chain(pages, items, root=root)
                 keys.setdefault(resource_key, {})[label] = page_keys
                 total = sum(span.length for span in keyed)
                 tails.setdefault(resource_key, {})[label] = (
@@ -1203,9 +1274,9 @@ class PreprocessWorkerThread:
                 for row, span, digest in zip(span_rows, keyed, digests, strict=True):
                     at += span.length
                     page, end = divmod(at, page_size)
-                    row += [digest, end_key(
-                        page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
-                    ) if digest is not None and end else None]
+                    row[4:6] = digest, end_key(
+                        page_keys[page - 1] if page else root, pages[page], items.get(page, ()), end,
+                    ) if digest is not None and end else None
                 if kv_label.keys.growth:
                     decode.setdefault(resource_key, {})[label] = kv_label.keys.tensor
         if not keys:
@@ -1213,6 +1284,8 @@ class PreprocessWorkerThread:
         kwargs = {"prefix_keys": keys, "prefix_tail": tails}
         if decode:
             kwargs["prefix_decode"] = decode
+        if root:
+            kwargs["prefix_root"] = root
         return kwargs
 
     def _page_layout(
@@ -1428,6 +1501,9 @@ class PreprocessWorkerThread:
             values = [values[i] for i in keep]
             logprobs = logprobs and [logprobs[i] for i in keep]
         kwargs = self.request_model_kwargs
+        # one step's values share one call, split evenly across its rows; on
+        # a failed call a row is also charged its own retry
+        start = time.perf_counter() if self.enable_prof else None
         try:
             datas = self.model.postprocess_inline(
                 values, item.modality, [kwargs.get(rid) for rid in rids],
@@ -1435,6 +1511,8 @@ class PreprocessWorkerThread:
         except Exception:  # noqa: BLE001 — retried row by row below
             # so a failure fails only the request it belongs to
             datas = None
+        share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
+        postprocess_s = share
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1444,9 +1522,12 @@ class PreprocessWorkerThread:
             state.next_sequence += 1
             try:
                 if datas is None:
+                    row_start = time.perf_counter() if start is not None else None
                     data = self.model.postprocess_inline(
                         [values[i]], item.modality, [kwargs.get(request_id)],
                     )[0]
+                    if row_start is not None:
+                        postprocess_s = share + time.perf_counter() - row_start
                 else:
                     data = datas[i]
                 metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
@@ -1455,7 +1536,10 @@ class PreprocessWorkerThread:
                 self._queue_completed_output(
                     request_id,
                     sequence,
-                    ResultChunk(request_id=request_id, modality=item.modality, data=data, metadata=metadata),
+                    ResultChunk(
+                        request_id=request_id, modality=item.modality, data=data, metadata=metadata,
+                        postprocess_s=postprocess_s,
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
@@ -1520,13 +1604,17 @@ class PreprocessWorkerThread:
 
     def _postprocess_inline(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        read_time: float | None = None,
     ) -> None:
+        """``read_time``: when the tensor's read began, with ``enable_prof``."""
         if self.enable_nvtx:
             profiler.range_push(f"dataworker.postprocess.{modality}")
+        start = time.perf_counter() if read_time is not None else None
         postprocessed = self.model.postprocess(
             tensor, modality,
             request_kwargs=self.request_model_kwargs.get(request_id),
         )
+        postprocess_s = time.perf_counter() - start if start is not None else 0.0
         if self.enable_nvtx:
             profiler.range_pop()
             profiler.mark(
@@ -1579,6 +1667,8 @@ class PreprocessWorkerThread:
                 modality=modality,
                 data=postprocessed,
                 metadata=chunk_metadata,
+                read_time=read_time,
+                postprocess_s=postprocess_s,
             ),
         )
         if self.enable_nvtx:
@@ -1586,6 +1676,7 @@ class PreprocessWorkerThread:
 
     def _submit_encode(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        read_time: float | None = None,
     ) -> None:
         """Encode on the pool; :meth:`_release_encoded` queues the chunk. The
         transport keeps its reference to ``tensor`` until then."""
@@ -1596,19 +1687,24 @@ class PreprocessWorkerThread:
         )
         # registered before the wakeup's, so the entry is queued when the thread wakes
         future.add_done_callback(lambda done: self._encoded.append(
-            (done, request_id, state, sequence, modality, metadata, uuid),
+            EncodedOutput(done, request_id, state, sequence, modality, metadata, uuid, read_time),
         ))
         if self.wakeup is not None:
             self.wakeup.register_future(future)
 
-    def _encode(self, tensor: torch.Tensor, modality: str, request_kwargs: dict | None) -> bytes:
-        if not self.enable_nvtx:
-            return self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
-        profiler.range_push(f"dataworker.encode.{modality}")
+    def _encode(
+        self, tensor: torch.Tensor, modality: str, request_kwargs: dict | None,
+    ) -> tuple[bytes, float]:
+        """The encoded bytes, and the seconds ``Model.postprocess`` took."""
+        if self.enable_nvtx:
+            profiler.range_push(f"dataworker.encode.{modality}")
+        start = time.perf_counter()
         try:
-            return self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
+            data = self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
         finally:
-            profiler.range_pop()
+            if self.enable_nvtx:
+                profiler.range_pop()
+        return data, time.perf_counter() - start
 
     def _release_encoded(self) -> bool:
         """Queue each finished encode's chunk in its request's output order."""
@@ -1616,21 +1712,25 @@ class PreprocessWorkerThread:
         if not encoded:
             return False
         while encoded:
-            future, request_id, state, sequence, modality, metadata, uuid = encoded.popleft()
-            self.tensor_manager.dereference(uuid)
+            out = encoded.popleft()
+            self.tensor_manager.dereference(out.uuid)
             # The request was torn down while this encoded, or its rid reused since.
-            if self.request_output_state.get(request_id) is not state:
+            if self.request_output_state.get(out.request_id) is not out.state:
                 continue
             try:
-                data = future.result()
+                data, postprocess_s = out.future.result()
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
-                    request_id, exc, f"{modality} output postprocessing", sequence=sequence,
+                    out.request_id, exc, f"{out.modality} output postprocessing", sequence=out.sequence,
                 )
                 continue
             self._queue_completed_output(
-                request_id, sequence,
-                ResultChunk(request_id=request_id, modality=modality, data=data, metadata=metadata),
+                out.request_id, out.sequence,
+                ResultChunk(
+                    request_id=out.request_id, modality=out.modality, data=data, metadata=out.metadata,
+                    read_time=out.read_time,
+                    postprocess_s=postprocess_s if out.read_time is not None else 0.0,
+                ),
             )
         return True
 
@@ -1666,14 +1766,17 @@ class PreprocessWorkerThread:
                         )
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
+                        read_time = time.perf_counter() if self.enable_prof else None
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         if self.enable_nvtx:
                             profiler.range_pop()
                         if self._encode_pool is not None and pooled_output(modality, loop_indices):
-                            self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor)
+                            self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor, read_time)
                             pooled = True
                         else:
-                            self._postprocess_inline(request_id, sequence, modality, tensor_info.uuid, tensor)
+                            self._postprocess_inline(
+                                request_id, sequence, modality, tensor_info.uuid, tensor, read_time,
+                            )
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",

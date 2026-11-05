@@ -179,6 +179,11 @@ class _Subsampling(nn.Module):
                 nn.ReLU(),
             ]
         self.layers = nn.ModuleList(layers)
+        # refused on every device so the spec does not depend on the path
+        self.lora_unservable = {
+            f"layers.{i}": "run as F.conv2d over its weight on the Triton path (bias_relu_mask_)"
+            for i in range(len(layers) - 1) if isinstance(layers[i + 1], nn.ReLU)
+        }
         freq = config.num_mel_bins
         for _ in range(config.num_subsampling_layers):
             freq = _conv_out_len(freq, k, s, config.causal)
@@ -241,6 +246,8 @@ class RelPositionAttention(nn.Module):
     A stream step attends its new frames in the bounded KV ``kv_key`` names
     instead, which keeps each stream's window of keys and values, with the
     distances it can see projected once, at bind (``band``)."""
+
+    lora_unservable = {"relative_k_proj": "projects position encodings, not the step's tokens (a stream's at bind)"}
 
     def __init__(self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None):
         super().__init__()

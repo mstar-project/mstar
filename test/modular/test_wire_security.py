@@ -194,47 +194,36 @@ def test_deeply_nested_extensions_drop_only_their_frame():
     assert [m.body.request_id for m in decode_each(WireCodec, [good, deep, good], "test")] == ["r", "r"]
 
 
-@pytest.mark.parametrize("transport", ["python", "rust"])
 @pytest.mark.parametrize("protocol", ["IPC", "TCP"])
 @pytest.mark.parametrize("path", ["opaque", "metadata", "nested"])
 def test_socket_receiver_rejects_callable_and_delivers_healthy_messages(
-    transport, protocol, path, tmp_path, monkeypatch,
+    protocol, path, tmp_path, monkeypatch,
 ):
-    import zmq
-
-    from mstar.communication.communicator import BaseCommunicator, ZMQCommunicator
+    from mstar.communication.communicator import BaseCommunicator
+    from mstar.communication.rust_communicator import RustZMQCommunicator
 
     monkeypatch.setenv("MSTAR_ZMQ_TRANSPORT", protocol)
     monkeypatch.setenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
-    if transport == "rust":
-        pytest.importorskip("mstar_rust")
-        from mstar.communication.rust_communicator import RustZMQCommunicator
-
-        cls = RustZMQCommunicator
-    else:
-        cls = ZMQCommunicator
     if protocol == "TCP":
-        with socket.socket() as port_probe:
-            port_probe.bind(("127.0.0.1", 0))
-            port = port_probe.getsockname()[1]
-        monkeypatch.setattr(BaseCommunicator, "_tcp_port", staticmethod(lambda _: port))
-    receiver = cls("receiver", push_ids=[], ipc_socket_path_prefix=str(tmp_path), codec=WireCodec)
-    sender = zmq.Context.instance().socket(zmq.PUSH)
-    sender.setsockopt(zmq.SNDTIMEO, 1000)
-    sender.connect(receiver._endpoint("receiver"))
+        with socket.socket() as receiver_port, socket.socket() as sender_port:
+            receiver_port.bind(("127.0.0.1", 0))
+            sender_port.bind(("127.0.0.1", 0))
+            ports = {"receiver": receiver_port.getsockname()[1], "sender": sender_port.getsockname()[1]}
+        monkeypatch.setattr(BaseCommunicator, "_tcp_port", staticmethod(lambda entity: ports[entity]))
+    receiver = RustZMQCommunicator("receiver", push_ids=[], ipc_socket_path_prefix=str(tmp_path), codec=WireCodec)
+    sender = RustZMQCommunicator("sender", push_ids=["receiver"], ipc_socket_path_prefix=str(tmp_path))
     _, rejected = _frame(path)
     good = WireCodec.encode(_request())
     _CALLS.clear()
-    try:
-        for frame in (good, rejected, good):
-            sender.send(frame)
-        decoded = []
+    for frame in (good, rejected, good):
+        # try_send_bytes puts the frame on the wire as it is, no codec
         deadline = time.monotonic() + 3
-        while len(decoded) < 2 and time.monotonic() < deadline:
-            decoded.extend(receiver.get_all_new_messages(blocking=True, timeout_s=0.1))
-        assert _CALLS == []
-        assert [message.body.request_id for message in decoded] == ["r", "r"]
-    finally:
-        sender.close(linger=0)
-        if transport == "python":
-            receiver.pull_socket.close(linger=0)
+        while not sender.try_send_bytes("receiver", frame):
+            assert time.monotonic() < deadline, "the receiver never took the frame"
+            time.sleep(0.01)
+    decoded = []
+    deadline = time.monotonic() + 3
+    while len(decoded) < 2 and time.monotonic() < deadline:
+        decoded.extend(receiver.get_all_new_messages(blocking=True, timeout_s=0.1))
+    assert _CALLS == []
+    assert [message.body.request_id for message in decoded] == ["r", "r"]

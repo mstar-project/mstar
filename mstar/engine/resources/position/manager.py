@@ -4,6 +4,7 @@ has ownership of per-(request,label) position counter"""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -28,7 +29,15 @@ from mstar.engine.resources.position.config import (
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
+from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import (
+        CapturedResidentStep,
+        ResidentPlanner,
+        ResidentWrites,
+    )
 
 
 @dataclass
@@ -198,8 +207,7 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        # setdefault: a worker serving two partitions ingests the rid twice
-        self._counters.setdefault(rid, {})
+        self._counters[rid] = {}
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
@@ -303,6 +311,9 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # the replay fills the slot's buffer from the tables itself
+            return self._current_pos_ids
         if self._preplanned:
             # staged a step early against this same step's KV plan
             self._current_pos_ids = self._preplan_pos_ids
@@ -346,6 +357,39 @@ class RopeManager(PositionManager):
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
+
+    # Resident planning: a stream's position runs ahead of its stored length by a
+    # fixed amount between host-planned steps, so a row keeps that offset
+
+    def resident_refusal(self) -> str | None:
+        if self._config.scheme != PosScheme.SEQUENTIAL:
+            return f"position scheme {self._config.scheme} doesn't advance with the stream"
+        return None
+
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        self._resident_store = planner
+        self._resident_key = key
+        self._resident_delta = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        # the KV pool binds ahead of this, its dependent, and sets its length first
+        label = writes.streams[self._resident_key].label
+        row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
+        if own.label != pool.label or own.reads or pool.reads:
+            # the offset holds only while both advance a token a step, as one stream
+            raise ValueError(
+                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
+                "a resident step's positions advance with the stream their KV cache appends to"
+            )
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
+        table = self._resident_delta
+        gather_column(
+            self._resident_store.store, step.slots, table.stride, table.col,
+            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
+        )
 
     def commit(self, step: PositionStep, ctx: StepContext):
         all_counters = self._counters
