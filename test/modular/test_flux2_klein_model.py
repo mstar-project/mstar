@@ -622,7 +622,7 @@ def test_the_dit_recompile_limit_holds_on_an_executor_thread_started_after_warmu
     monkeypatch.setattr(torch, "compile", counting_compile)
     monkeypatch.setenv("MSTAR_RECOMPILE_LIMIT", "8")
     module = torch.nn.Linear(2, 2)
-    # nn.Linear.forward's code is shared by the process: no other test's cache entries count
+    # the compiled frame is Dynamo's shared wrap_inline wrapper: no other test's cache entries count
     torch._dynamo.reset()
     try:
         with dynamo_config.patch(recompile_limit=8):  # restores by assignment (see the test above)
