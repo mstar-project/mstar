@@ -160,7 +160,7 @@ def _leader_speculation(final: bool):
 
 def _follower_speculation(final: bool):
     head = SimpleNamespace(
-        speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
+        speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK, repeats=1,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
         chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )

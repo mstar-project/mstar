@@ -2021,10 +2021,12 @@ class Worker:
 
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: ExecutingBatch,
-        *, speculative: bool = False, spec_from_seq: int = -1, from_repeats: int = 0,
+        *, speculative: bool = False, spec_from_seq: int = -1, spec_from: PendingBatch | None = None,
     ) -> int:
         """Broadcast this batch as a ``ScheduleTPNode``. Returns its seq, or
-        ``-1`` when this worker does not lead the node (nothing sent)."""
+        ``-1`` when this worker does not lead the node (nothing sent).
+        ``spec_from``: the step it speculates from, whose settled count rides
+        along (``from_repeats``)."""
         if node_batch.node_name not in self.parallel_nodes or \
                 node_batch.node_name not in self.parallel_leader_nodes:
             return -1
@@ -2088,7 +2090,7 @@ class Worker:
                         chunk_totals=chunk_totals,
                         chunk_strides=chunk_strides,
                         repeats=ctx.repeats,
-                        from_repeats=from_repeats,
+                        from_repeats=0 if spec_from is None else spec_from.batch.repeats,
                     )
                 )
             )
@@ -5451,7 +5453,7 @@ class Worker:
                     # followers build it during theirs (-1: not parallel).
                     speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
                         speculation.node_batch,
-                        speculative=True, spec_from_seq=pending.tp_seq, from_repeats=pending.batch.repeats,
+                        speculative=True, spec_from_seq=pending.tp_seq, spec_from=pending,
                     )
             if self._tp_lead_needs_marker(pending, speculation):
                 self._broadcast_tp_nospec(pending)
