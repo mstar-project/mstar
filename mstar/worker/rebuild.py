@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
+
+logger = logging.getLogger(__name__)
 
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
@@ -209,6 +212,12 @@ class Rebuilds:
         self._allowance = StepAllowance() if allowance is None else allowance
         # the copies to the host not yet started, oldest first
         self._queued: deque[QueuedCopy] = deque()
+        # nodes that have logged a request the pool couldn't hold
+        self._logged_full: set[str] = set()
+
+    @property
+    def pool(self) -> HostPool | None:
+        return self._pool
 
     @property
     def nodes(self) -> frozenset[str]:
@@ -243,11 +252,21 @@ class Rebuilds:
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if dtype is None and any(span.kind != SpanKind.IDS for span in spans):
             return None
-        return self._pool.take(sum(
+        nbytes = sum(
             aligned(span.length * torch.long.itemsize) if span.kind == SpanKind.IDS
             else span.length * width[span.walk] * dtype.itemsize
             for span in spans
-        ))
+        )
+        piece = self._pool.take(nbytes)
+        if piece is None and node not in self._logged_full:
+            self._logged_full.add(node)
+            logger.warning(
+                "%s: the rebuild host pool has no room for the %d bytes a request's ids and host copies take, with %d "
+                "of %d bytes in use, so the request can't be dropped there. Only the first on each node is logged, "
+                "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
+                node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
+            )
+        return piece
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -485,12 +504,10 @@ class Rebuilds:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
-        """Open ``rid``'s rebuild on ``node``, one row per prefill step from its records, and return what it writes
-        past its layout. A prompt ``prefilling`` its step in progress reruns that step's chunks last, and changes
-        nothing the layout says, so this returns None for it."""
-        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
-        kept = self._kept[node][rid]
+    def _plan(self, kept: KeptIds, prefilling: Prefilling | None) -> list[PlannedRow]:
+        """The rows of a rebuild from ``kept``: one per prefill step recorded before the one in progress, from its
+        record, then the chunks its prompt was ``prefilling`` ran. With no step in progress, one per prefill step
+        its layout lays out, the last also writing every sample but the newest."""
         records = kept.records if prefilling is None else kept.records[:-1]
         rows = [
             PlannedRow(row.walk, row.length, row.length, record)
@@ -501,7 +518,19 @@ class Rebuilds:
         else:
             grown = len(kept.sampled) - 1
             rows[-1] = rows[-1]._replace(total=rows[-1].total + grown, length=rows[-1].length + grown)
-        self._cursors[(node, rid)] = RebuildCursor(tuple(rows), kept.sampled)
+        return rows
+
+    def tokens(self, rid: int, node: str, prefilling: Prefilling | None) -> int:
+        """How many slots ``rid``'s rebuild on ``node`` writes, over every row `start` opens it with."""
+        return sum(row.total for row in self._plan(self._kept[node][rid], prefilling))
+
+    def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
+        """Open ``rid``'s rebuild on ``node`` over the slots `tokens` counts, which its drop checked, and return
+        what it writes past its layout. A prompt ``prefilling`` its step in progress reruns that step's chunks
+        last, and changes nothing the layout says, so this returns None for it."""
+        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        kept = self._kept[node][rid]
+        self._cursors[(node, rid)] = RebuildCursor(tuple(self._plan(kept, prefilling)), kept.sampled)
         if prefilling is not None:
             return None
         rebuild, kept.laid_out = Rebuild(kept.sampled[kept.laid_out:]), len(kept.sampled) - 1

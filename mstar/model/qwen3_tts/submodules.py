@@ -38,7 +38,7 @@ import itertools
 import logging
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -60,6 +60,7 @@ from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.qwen3_tts.components import depth_frame
 from mstar.model.qwen3_tts.components.incremental_codec import IncrementalDecoder, codec_state_blocks
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
@@ -96,6 +97,9 @@ from mstar.model.submodule_base import (
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 from mstar.utils.h2d import PinnedStager
+
+if TYPE_CHECKING:
+    from mstar.model.qwen3_tts.components.depth_frame.frame import DepthFrame
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
@@ -166,6 +170,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         talker_model: Qwen3TTSTalkerModel,
         code_predictor: ResidualCodePredictor,
         config: Qwen3TTSModelConfig,
+        depth_kernel: bool = False,
     ) -> None:
         super().__init__()
         self.model = talker_model
@@ -189,6 +194,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._fixed_embeds: dict[tuple, torch.Tensor] = {}
         # zero text condition for a mixed step's prompt rows, sliced per row
         self._zero_rows: torch.Tensor | None = None
+
+        self._depth_frame: DepthFrame | None = None
+        if depth_kernel:
+            self._depth_frame = depth_frame.build(code_predictor, talker_model.model.codec_embedding.weight)
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -634,16 +643,37 @@ class TalkerSubmodule(ARNodeSubmodule):
         if piecewise is not None:
             all_codes, codec_embed_sum = piecewise
         else:
-            all_codes, codec_embed_sum = self._depth_loop(
-                last_hidden, layer0_codes,
-                lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
-            )
+            all_codes, codec_embed_sum = self._run_depth(last_hidden, layer0_codes, code_pred_sampler, request_ids)
 
         return {
             "talker_input_embeds": codec_embed_sum,
             "codec_tokens": all_codes,
             "layer0_codes": layer0_codes,
         }
+
+    def _run_depth(
+        self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor, sampler: SamplerResource, request_ids: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`_depth_loop`'s outputs, from the frame kernel when it holds the rows and can draw as ``sampler`` would."""
+        frame, batch_size = self._depth_frame, layer0_codes.shape[0]
+        draw = sampler.fused_draw_args() if frame is not None and batch_size <= frame.max_rows else None
+        if draw is None:
+            return self._depth_loop(
+                last_hidden, layer0_codes, lambda cp_logits: sampler.sample(request_ids, cp_logits),
+            )
+        talker_table = self.model.model.codec_embedding.weight
+        all_codes = torch.empty(
+            batch_size, self.code_predictor.num_code_groups, dtype=torch.long, device=layer0_codes.device,
+        )
+        codec_embed_sum = torch.empty(
+            batch_size, talker_table.shape[1], dtype=talker_table.dtype, device=layer0_codes.device
+        )
+        frame.run(
+            last_hidden, layer0_codes, frame.kv_cache, frame.positions, frame.partials,
+            all_codes, codec_embed_sum, draw,
+        )
+        sampler.advance_offsets(self.code_predictor.num_code_groups - 1)
+        return all_codes, codec_embed_sum
 
     def _depth_loop(
         self,
@@ -672,10 +702,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         hoisted out as a static input.
         """
         code_pred_sampler: SamplerResource = call.resources[CODE_PRED_SAMPLER]
-        request_ids = call.engine_inputs.request_ids
-        all_codes, codec_embed_sum = self._depth_loop(
-            call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"],
-            lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
+        all_codes, codec_embed_sum = self._run_depth(
+            call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"], code_pred_sampler,
+            call.engine_inputs.request_ids,
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 
@@ -957,9 +986,10 @@ class CodecSubmodule(ARNodeSubmodule):
     (``IncrementalDecoder``): it lives in the ``CODEC_STATE`` recurrent pool,
     each step gathering its rows' state and scattering the new state back.
 
-    Each distinct chunk width is a CUDA-graph bucket; a shorter chunk (the
-    terminal flush, a clone's first) is zero-padded to the next bucket and its
-    real length rides with it.
+    Each distinct chunk width is a CUDA-graph bucket. A step takes ready
+    chunks of any width and pads them to its widest, and each chunk's real
+    length rides with it. A padded ramp chunk costs less than the step it
+    would otherwise take on its own.
     """
 
     # the decoder runs in its own dtype (``codec_dtype``), and only the
@@ -1246,17 +1276,6 @@ class CodecSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
         return self.MAX_BATCH_SIZE
-
-    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
-        """Batch each chunk width apart.
-
-        A mixed batch pads every row to its widest chunk, and the codec's cost
-        is per padded frame: a ramp chunk batched with a full one decodes
-        ``chunk_frames`` frames instead of a few. Kept apart, the small ramp
-        chunks, a stream's first audio among them, also do not wait behind a
-        batch of full chunks.
-        """
-        return graph_walk == "codec_chunk"
 
     def cg_key_info(
         self,

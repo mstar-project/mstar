@@ -1902,7 +1902,8 @@ class MicroScheduler:
                 total = cached + row_tokens[rid]
                 end = cached + chunk_tokens.get(rid, row_tokens[rid])
                 batch.chunk_ranges[rid] = ChunkRange(cached, end, total, end)
-                self.chunk_started[key] = next(self._chunk_starts)
+                if rid not in prefills or key not in self.chunk_started:
+                    self.chunk_started[key] = next(self._chunk_starts)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
             elif rid not in prefills:

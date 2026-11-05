@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency, ResourceReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
 from mstar.engine.resources.kv.transfer import (
@@ -215,6 +215,25 @@ def _make_graph_runtime(
         bookkeeping=bookkeeping,
         communicator=communicator,
         **kwargs,
+    )
+
+
+def _make_rebuilds(
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
+    device: torch.device, engine: Engine,
+) -> Rebuilds:
+    """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
+    graphs = model.get_graph_walk_graphs() if model is not None else {}
+    policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
+    # A lockstep node's KV refuses every drop, so its requests keep no ids.
+    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
+    host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+    if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
+        host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
+    return Rebuilds(
+        policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
+        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
     )
 
 
@@ -774,20 +793,8 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        # What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this
-        # worker runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
-        graphs = model.get_graph_walk_graphs() if model is not None else {}
-        policies = {} if model is None else policies_run_here(
-            model.rebuild_policies(), graphs, my_walks, self.parallel_nodes,
-        )
-        host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-        if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
-            host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
-        self._rebuilds = Rebuilds(
-            policies, graphs,
-            HostPool(host_mb << 20, self.device) if host_mb and policies else None,
-            self.engine_manager.engine.host_allowance,
-            {node: dtype for node in policies if (dtype := self.engine_manager.engine.node_dtype(node)) is not None},
+        self._rebuilds = _make_rebuilds(
+            model, model_config, my_walks, self.parallel_nodes, self.device, self.engine_manager.engine,
         )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
@@ -914,7 +921,7 @@ class Worker:
         leads and the tensors every rank reads."""
         return WorkerMetrics(
             self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
-            self.engine_manager.engine, self.scheduler,
+            self.engine_manager.engine, self.scheduler, self._rebuilds,
             send=lambda status: self.communicator.send("conductor", ConductorMessage(
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),

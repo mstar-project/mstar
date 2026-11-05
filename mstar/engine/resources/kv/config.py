@@ -393,7 +393,7 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # `unpausable`: the request streams an output that can't pause, set by the conductor.
     # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
-    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    # A pool that decides admission reads both at the request's first `KVManager.ask` and at its admission.
     unpausable: bool = False
     rebuildable: bool = True
 
@@ -780,9 +780,10 @@ class StreamLayout:
             start = end
         return tuple(steps)
 
-    def rebuilt(self, grown: int) -> "StreamLayout":
-        """This layout once a rebuild has written ``grown`` ids sampled since it was laid out at the end of its
-        last span, which `rebuild_refusal` requires to be ids."""
+    def rebuilt(self, slots: int) -> "StreamLayout":
+        """This layout once a rebuild has written ``slots`` slots into it: the last span, which `rebuild_refusal`
+        requires to be ids, grows by the slots past the layout, the ids sampled since it was laid out."""
+        grown = slots - sum(span.length for span in self.spans)
         *spans, last = self.spans
         return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 
