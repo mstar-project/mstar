@@ -308,11 +308,11 @@ class RecurrentStateConfig:
             raise ValueError("a recurrent state pool must declare a block")
         if not self.labels:
             raise ValueError("a recurrent state pool must declare a label")
-        # No layer reads a pool with no layers, so its blocks can have an empty axis.
-        if self.num_layers:
-            for name, block in self.blocks.items():
-                if any(dim < 1 for dim in block.shape):
-                    raise ValueError(f"blocks[{name!r}].shape={block.shape} must not have an empty axis")
+        for name, block in self.blocks.items():
+            # Only a per-layer block of a pool with no layers is never read, so only it may hold an axis of 0.
+            smallest = 1 if self.num_layers or not block.per_layer else 0
+            if any(dim < smallest for dim in block.shape):
+                raise ValueError(f"blocks[{name!r}].shape={block.shape} must have no axis below {smallest}")
         self.check_slots()
 
     def check_slots(self) -> None:
