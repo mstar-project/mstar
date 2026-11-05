@@ -796,11 +796,11 @@ class Worker:
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
             batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
-        node_lanes = self.engine_manager.node_lanes
-        if node_lanes:
-            self.scheduler.lane_of = dict(node_lanes)
-            self._lanes = tuple(Lane(self, lane) for lane in sorted(set(node_lanes.values())))
-            logger.info("Worker %s: node -> lane beside the chain %s", worker_id, node_lanes)
+        walk_lanes = {key: lane for key, lane in self.engine_manager.walk_lanes.items() if lane}
+        if walk_lanes:
+            self.scheduler.lane_of = walk_lanes
+            self._lanes = tuple(Lane(self, lane) for lane in sorted(set(walk_lanes.values())))
+            logger.info("Worker %s: (node, walk) -> lane beside the chain %s", worker_id, walk_lanes)
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
@@ -2586,7 +2586,8 @@ class Worker:
                 outputs = engine.exec_and_postprocess(node_batch)
             laps.skip()
             if execution_stream is not None:
-                self._stage_host_rows(outputs, self.scheduler.lane_of.get(batch.node_name, CHAIN_LANE))
+                lane = self.scheduler.lane_of.get((batch.node_name, batch.graph_walk), CHAIN_LANE)
+                self._stage_host_rows(outputs, lane)
                 laps.lap("stage_host_rows")
                 event = torch.Event(device=self.device)
                 event.record(execution_stream)

@@ -173,15 +173,15 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
 
 
 @pytest.mark.parametrize("config, placed", [
-    ("qwen3tts.yaml", {"Codec": 1}),
-    ("qwen3tts_1p7b.yaml", {"Codec": 1}),
-    ("qwen3tts_base.yaml", {"Codec": 1}),
-    ("qwen3tts_voicedesign.yaml", {"Codec": 1}),
-    ("qwen3tts_1p7b_split.yaml", {}),
+    ("qwen3tts.yaml", {"Codec"}),
+    ("qwen3tts_1p7b.yaml", {"Codec"}),
+    ("qwen3tts_base.yaml", {"Codec"}),
+    ("qwen3tts_voicedesign.yaml", {"Codec"}),
+    ("qwen3tts_1p7b_split.yaml", set()),
 ])
 def test_the_codec_runs_on_a_lane_beside_the_talker_where_the_config_asks(config, placed):
     from mstar.distributed.communication import WorkerParallelGroups
-    from mstar.worker.engine_manager import _refuse_unservable_lanes, node_lanes
+    from mstar.worker.engine_manager import _refuse_unservable_lanes, walk_lanes
 
     model = _make_model()
     groups = yaml.safe_load((CONFIG_PATH.parent / config).read_text(encoding="utf-8"))["node_groups"]
@@ -191,10 +191,12 @@ def test_the_codec_runs_on_a_lane_beside_the_talker_where_the_config_asks(config
         if "Codec" not in nodes:
             continue
         lanes = _refuse_unservable_lanes(
-            {n: codec if n == "Codec" else object() for n in nodes}, model, nodes, node_lanes(groups),
-            WorkerParallelGroups(num_workers=1, global_rank=0), True,
+            {n: codec if n == "Codec" else object() for n in nodes}, model, nodes, walk_lanes(groups, {
+                node: {walk for walk, graph in model.get_graph_walk_graphs().items() if node in graph.get_nodes()}
+                for node in nodes
+            }), WorkerParallelGroups(num_workers=1, global_rank=0), True,
         )
-        assert lanes == placed
+        assert {node for (node, _), lane in lanes.items() if lane} == placed
 
 
 def test_the_codecs_lane_holds_every_resource_the_codec_declares():

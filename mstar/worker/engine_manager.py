@@ -124,11 +124,13 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
-def node_lanes(node_groups: list[dict]) -> dict[str, int]:
-    """The lane each node runs on, from its node groups' ``lane`` (0, the
-    chain, where unset); only nodes off the chain are listed. A node listed by
-    several groups, one per graph walk, must get the same lane from each."""
-    asked: dict[str, int] = {}
+def walk_lanes(node_groups: list[dict], walks: Mapping[str, Collection[str]]) -> dict[tuple[str, str], int]:
+    """The lane each (node, walk) runs on, from its node groups' ``lane`` (0,
+    the chain, where unset); a group without ``graph_walks`` places every walk
+    of ``walks`` (node -> its walks) of its nodes. Listed: every walk of each
+    node with a walk off the chain. A walk placed by two groups must get the
+    same lane from each."""
+    asked: dict[tuple[str, str], int] = {}
     for group in node_groups:
         if "side_stream" in group:
             raise ValueError("side_stream was replaced by lane: <id>; lane: 1 puts the node beside the chain")
@@ -136,52 +138,55 @@ def node_lanes(node_groups: list[dict]) -> dict[str, int]:
         if not isinstance(lane, int) or isinstance(lane, bool) or lane < 0:
             raise ValueError(f"lane takes a lane id, 0 (the chain) or more, not {lane!r}")
         for node in group["node_names"]:
-            if asked.setdefault(node, lane) != lane:
-                raise ValueError(f"node {node!r} gets different lanes from two node_groups")
-    return {node: lane for node, lane in asked.items() if lane}
+            for walk in group.get("graph_walks") or sorted(walks.get(node, ())):
+                if asked.setdefault((node, walk), lane) != lane:
+                    raise ValueError(f"walk {walk!r} of node {node!r} gets different lanes from two node_groups")
+    off = {node for (node, _), lane in asked.items() if lane}
+    return {key: lane for key, lane in asked.items() if key[0] in off}
 
 
 def _refuse_unservable_lanes(
-    submodules: dict, model: Model, node_names: Collection[str], lanes: Mapping[str, int],
+    submodules: dict, model: Model, node_names: Collection[str], lanes: Mapping[tuple[str, str], int],
     parallel_groups: WorkerParallelGroups, graph_backend: bool,
-) -> dict[str, int]:
-    """Of ``lanes``, the nodes this worker runs beside its chain
-    (``mstar.worker.lanes``), or a ``ValueError`` naming why one can't be.
+) -> dict[tuple[str, str], int]:
+    """Of ``lanes`` (`walk_lanes`), the walks of this worker's nodes, with
+    which of them run beside its chain (``mstar.worker.lanes``), or a
+    ``ValueError`` naming why one can't.
 
-    A step off the chain runs its node's walks, every one of them, on the
-    node's lane: admitted and planned inline on the GPU thread, never
-    speculated, planned ahead or lockstep, landing between two chain steps.
-    So such a node needs a chain beside it, a graph backend's stream,
-    rank-local timing, and walks of its own that no chain speculation reaches
-    into. Which resources it may hold is the
-    engine's to decide (``Engine._lane_contexts``).
+    A step off the chain runs on its walk's lane: admitted and planned inline
+    on the GPU thread, never speculated, planned ahead or lockstep, landing
+    between two chain steps. So such a walk needs a chain beside it, a graph
+    backend's stream, rank-local timing, and a graph of its own that no chain
+    speculation reaches into. Which resources it may hold is the engine's to
+    decide (``Engine._lane_contexts``).
     """
     walks = model.get_graph_walk_graphs()
     combined = model.combined_walk_of()
-    placed = {name: lane for name, lane in lanes.items() if name in submodules}
-    if placed and set(node_names) <= set(placed):
-        raise ValueError(f"{type(model).__name__}: every node on this worker ({sorted(placed)}) is off "
+    placed = {key: lane for key, lane in lanes.items() if key[0] in submodules}
+    off = {node for (node, _), lane in placed.items() if lane}
+    if off and not any(
+        node not in off or any(lane == 0 for (n, _), lane in placed.items() if n == node) for node in node_names
+    ):
+        raise ValueError(f"{type(model).__name__}: every node on this worker ({sorted(off)}) is off "
                          "the chain (lane 0); there is no chain to run beside")
-    for name, lane in sorted(placed.items()):
-        submodule = submodules[name]
+    for (name, walk), lane in sorted(placed.items()):
+        if not lane:
+            continue
 
-        def refuse(reason: str, name=name, lane=lane) -> ValueError:
-            return ValueError(f"{type(model).__name__}: {name!r} is placed on lane {lane}, but {reason}")
+        def refuse(reason: str, name=name, walk=walk, lane=lane) -> ValueError:
+            return ValueError(f"{type(model).__name__}: {name!r} walk {walk!r} is placed on lane {lane}, "
+                              f"but {reason}")
 
         if parallel_groups.get_instance_world_size_for_node(name) > 1:
             raise refuse("it runs tensor or sequence parallel: when a step off the chain lands is per "
                          "rank, and every rank of a lockstep instance has to agree on it")
         if not graph_backend:
             raise refuse("its device has no accelerator-graph backend (CUDA or XPU) to give it a stream")
-        for walk, graph in sorted(walks.items()):
-            if name not in graph.get_nodes():
-                continue
-            if not isinstance(graph, GraphNode):
-                raise refuse(f"walk {walk!r} runs other nodes or a loop around it, which the chain "
-                             "would speculate into")
-            if (name, walk) in combined:
-                raise refuse(f"walk {walk!r} is part of combined walk {combined[name, walk]!r}, "
-                             "which the chain schedules")
+        graph = walks.get(walk)
+        if graph is not None and not isinstance(graph, GraphNode):
+            raise refuse("it runs other nodes or a loop around it, which the chain would speculate into")
+        if (name, walk) in combined:
+            raise refuse(f"it is part of combined walk {combined[name, walk]!r}, which the chain schedules")
     return placed
 
 
@@ -240,9 +245,10 @@ class EngineManager:
     """
     engine: Engine
     node_names: set[str] = field(default_factory=set)
-    # node -> the lane it runs on, for nodes off the chain, as ``build``
-    # decided from the config's ``lane`` (see ``_refuse_unservable_lanes``)
-    node_lanes: dict[str, int] = field(default_factory=dict)
+    # (node, walk) -> the lane it runs on, for every walk of a node with one
+    # off the chain, as ``build`` decided from the config's ``lane`` (see
+    # ``_refuse_unservable_lanes``)
+    walk_lanes: dict[tuple[str, str], int] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -305,7 +311,10 @@ class EngineManager:
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
         lanes = _refuse_unservable_lanes(
-            submodules, model, node_names, node_lanes(model_config["node_groups"]),
+            submodules, model, node_names, walk_lanes(model_config["node_groups"], {
+                node: {walk for walk, graph in model.get_graph_walk_graphs().items() if node in graph.get_nodes()}
+                for node in submodules
+            }),
             # a lane's stream comes from the graph backend (``Engine.on_lane``)
             parallel_groups, (device_capability or DeviceCapability.of(device)).graph_backend is not None,
         )
@@ -318,7 +327,7 @@ class EngineManager:
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
-            node_lanes=lanes,
+            walk_lanes=lanes,
         )
         engine.load_model(
             submodules,
@@ -349,7 +358,7 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), node_lanes=lanes)
+        return cls(engine=engine, node_names=set(node_names), walk_lanes=lanes)
 
     def warmup_all(
         self, looped: Collection[tuple[str, str]] = (),

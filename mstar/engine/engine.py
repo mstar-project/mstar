@@ -154,6 +154,15 @@ def _outside_steps(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+def node_lanes_of(walk_lanes: Mapping[tuple[str, str], int]) -> dict[str, int]:
+    """node -> the one lane off the chain every walk of it in ``walk_lanes``
+    runs on; a node with any walk on the chain, or on two lanes, is left out."""
+    lanes: dict[str, set[int]] = {}
+    for (node, _), lane in walk_lanes.items():
+        lanes.setdefault(node, set()).add(lane)
+    return {node: next(iter(held)) for node, held in lanes.items() if len(held) == 1 and 0 not in held}
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -616,6 +625,7 @@ class ExecutingBatch:
 class Engine:
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
+    _walk_lanes: Mapping[tuple[str, str], int] = MappingProxyType({})
     _node_lanes: Mapping[str, int] = MappingProxyType({})
     _stage_lock: "threading.Lock | None" = None
     # (node, walk) -> the Loop it runs in; set at warmup
@@ -636,18 +646,21 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
-        node_lanes: Mapping[str, int] | None = None,
+        walk_lanes: Mapping[tuple[str, str], int] | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
-        # the lanes off the chain, as ``EngineManager.build`` placed them
-        self._node_lanes = dict(node_lanes or {})
+        # (node, walk) -> its lane, as ``EngineManager.build`` placed them
+        self._walk_lanes = dict(walk_lanes or {})
+        # node -> the one lane off the chain every walk of it runs on; a node
+        # with walks on the chain is the chain's, whatever its other walks
+        self._node_lanes = node_lanes_of(self._walk_lanes)
         # the plan thread's stage of the chain's next step, against a step off the
         # chain that plans the same resources on the GPU thread (``_beside_chain``)
-        self._stage_lock = threading.Lock() if self._node_lanes else None
+        self._stage_lock = threading.Lock() if any(self._walk_lanes.values()) else None
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -757,7 +770,8 @@ class Engine:
         self._loopback_steps: dict[int, tuple[str, str]] = {}
         # one stream per lane off the chain, made once; everything a lane issues goes on it (``on_lane``)
         self._lane_streams = {
-            lane: self.device_capability.graph_backend.new_stream() for lane in sorted(set(self._node_lanes.values()))
+            lane: self.device_capability.graph_backend.new_stream()
+            for lane in sorted(set(self._walk_lanes.values()) - {0})
         }
         self._runner = StepRunner(
             self._resources,
@@ -2797,7 +2811,7 @@ class Engine:
         ``prepare_inputs`` and the stop check stay outside — the worker has to
         place those itself.
         """
-        beside = self._stage_lock is not None and self._beside_chain(batch.node_name)
+        beside = self._stage_lock is not None and self._beside_chain(batch.node_name, batch.graph_walk)
         with self._stage_lock if beside else nullcontext():
             outputs = self.exec(batch)
         laps = PhaseLaps("engine.")
@@ -3542,12 +3556,12 @@ class Engine:
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
-        if self._beside_chain(batch.node_name):
+        if self._walk_lanes and self._beside_chain(batch.node_name, batch.graph_walk):
             # The chain holds its rotation of slots (a run in flight, the next
             # step staged), and every per-step buffer is keyed by slot: a step
             # beside it takes a slot of its lane's, past the rotation, and runs
             # eager, never on a slot's captures.
-            batch.set_slot(submodule_mgmt.num_slots + self._node_lanes[batch.node_name] - 1)
+            batch.set_slot(submodule_mgmt.num_slots + self._walk_lanes[batch.node_name, batch.graph_walk] - 1)
             batch.step_context.repeats = 1
             return None
         if batch.slot is None:
@@ -3651,15 +3665,19 @@ class Engine:
         with self._stage_lock or nullcontext():
             return self._pre_plan_staged(batch, submodule_mgmt, cg_runner, lease)
 
-    def _beside_chain(self, node_name: str) -> bool:
-        """Whether a step of this node runs off the chain on resources the
-        chain plans too: its admit, plan and commit then must not overlap the
-        plan thread staging the chain's next step on them (``_stage_lock``).
-        Its arrival drops that stage, as any step the stage wasn't for does."""
-        if not self._node_lanes.get(node_name):
+    def _beside_chain(self, node_name: str, graph_walk: str) -> bool:
+        """Whether a step of this walk runs off the chain on what the chain
+        uses too: resources the chain plans, whose admit, plan and commit then
+        must not overlap the plan thread staging the chain's next step on them
+        (``_stage_lock``), or a node whose captures are the chain's. Its
+        arrival drops that stage, as any step the stage wasn't for does."""
+        lane = self._walk_lanes.get((node_name, graph_walk), 0)
+        if not lane:
             return False
         held = self._runner.lane_held
-        return any(key not in held for key in self._submodules[node_name].resources)
+        return self._node_lanes.get(node_name) != lane or any(
+            key not in held for key in self._submodules[node_name].resources
+        )
 
     def _pre_plan_staged(self, batch: ExecutingBatch, submodule_mgmt, cg_runner, lease) -> bool:
         if self._enable_nvtx:

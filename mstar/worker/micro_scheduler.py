@@ -430,10 +430,10 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # node -> the lane its steps run on, for nodes off the chain: a lane
+        # (node, walk) -> the lane its steps run on, for walks off the chain: a lane
         # schedules only its own nodes' keys (``get_next_batch``), so the chain
         # neither runs nor yields to another lane's
-        self.lane_of: dict[str, int] = {}
+        self.lane_of: dict[tuple[str, str], int] = {}
         # (node, walk) -> whether its speculation chain merges the other walks
         # of its combined walk: the config's settings, then each default as
         # `speculation_mixes` first decides it
@@ -1150,8 +1150,8 @@ class MicroScheduler:
         return None
 
     def _lane(self, key: tuple[str, str]) -> int:
-        """The lane of a (node, walk) key: its node's, whatever the walk."""
-        return self.lane_of.get(key[0], CHAIN_LANE)
+        """The lane of a (node, walk) key."""
+        return self.lane_of.get(key, CHAIN_LANE)
 
     def _left_to_its_chain(
         self, key: tuple[str, str], exclude_key: tuple[str, str] | None,

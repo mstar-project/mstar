@@ -2027,23 +2027,26 @@ other walk of the combined walk must be one token per row.
 
 **Steps beside the chain.** A worker's main loop runs one chain of steps (lane 0), and any
 step on it costs a pass of the loop and holds the next one behind its kernels. A node that
-shares a worker with a heavier one can run on another lane instead: a deployment sets
-``lane: <id>`` on the node's group (see :doc:`serving`), and the model declares nothing.
+shares a worker with a heavier one can run on another lane instead, or one walk of a node
+(a prompt walk beside its decode): a deployment sets ``lane: <id>`` on the group (see
+:doc:`serving`), and the model declares nothing.
 Such a step neither takes a turn on the chain nor makes it yield, runs on its lane's
 stream, and the windows that come ready while it runs batch into the next one (see
 ``mstar/worker/lanes.py``). The lane's graphs capture on its stream, since graphs captured
 on one stream must not overlap. It suits stream-fed walks that nothing on the chain reads,
 such as a codec's. Where the config asks, ``EngineManager.build`` refuses what a lane can't
 serve, since a step off the chain is neither speculated nor planned ahead and lands between
-two chain steps: a TP or SP node, a worker with nothing left on the chain, a device without
-an accelerator-graph backend (CUDA or XPU), resident walks while resident planning is on,
-and a walk of the node that has other nodes or a loop in it, sits in a combined walk, or
-has output spans or a stop check.
+two chain steps: a walk of a TP or SP node, a worker with nothing left on the chain, a
+device without an accelerator-graph backend (CUDA or XPU), and a lane walk that has other
+nodes or a loop in it or sits in a combined walk. Each lane stages its host rows (stop
+buffers, output spans) through a ring of its own.
 The engine then gives the lane the resources only its nodes declare, of any kind, and
 refuses one that another lane's node (or another worker's) declares too, that depends on
-another lane's, that keeps a prefix cache, whose state the main thread moves outside the
+another lane's, that keeps a prefix cache, or whose state the main thread moves outside the
 step (``Resource.journals_resident_moves``: eviction, prefix leases, page trails, as the
-paged KV cache's), or that stages host rows (a sampler). The lane admits, plans and commits
+paged KV cache's). A node with a walk on the chain keeps its resources and captures the
+chain's; its lane walk's steps run eager on a slot of their own and wait out the chain's
+plan-ahead (``Engine._beside_chain``). The lane admits, plans and commits
 its resources itself, on its stream, and every call into them from outside the step
 (ingest, readiness, output copies, publishing, teardown) runs on that stream too. Nothing
 fences those calls, made on the main thread, against the lane's admit and plan on the GPU
