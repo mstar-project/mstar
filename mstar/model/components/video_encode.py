@@ -6,13 +6,13 @@ alternates the two: the encoder's threads wait while a frame converts, and the
 conversion waits while a frame is handed over. Here one thread of the call's
 own converts the frames, in order, a few ahead of the encoder, with the
 conversion ``stream.encode`` makes (the stream's size and format, default
-interpolation and colorspace), and the encoder gets frames already in its
-format, which it takes as they are. The muxed bytes are the ones the plain loop
-writes.
+interpolation and colorspace), so the encoder gets the frames the plain loop
+would have handed it, already in its format, and takes them as they are.
 
 libx264 with threads and a lookahead (its defaults) can write different bytes
-for the same clip from one run to the next; settings without one of the two
-(``preset=ultrafast``, or ``threads=1``) write the same bytes every time.
+for the same clip from one run to the next, plain loop or not; settings without
+one of the two (``preset=ultrafast``, or ``threads=1``) write the same bytes
+every time.
 """
 from __future__ import annotations
 
@@ -25,9 +25,9 @@ import numpy as np
 
 from mstar.utils.threads import ThreadPool
 
-# Frames converted ahead of the encoder. Enough to cover a frame that converts
-# slowly; bounded so that a clip the encoder falls behind on isn't held a second
-# time, converted (a 121-frame 544x960 clip is 95 MB in yuv420p).
+# Frames converted ahead of the encoder: enough to keep it fed, and few enough
+# that a clip the encoder falls behind on isn't held a second time, converted
+# (a 121-frame 544x960 clip is 95 MB in yuv420p).
 LOOKAHEAD = 4
 
 
