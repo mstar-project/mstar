@@ -2793,6 +2793,8 @@ def test_a_repeating_step_that_reads_the_loop_counter_stops_the_worker(repeats):
 
 
 def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_repeating():
+    """Probed too where the capture also serves another walk (V-JEPA2's
+    rollouts), which keeps the walk off resident tables but not from repeating."""
     from mstar.engine.accelerator_graph_runner import CaptureTemplate
     from mstar.engine.engine import Engine
 
@@ -2803,7 +2805,8 @@ def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_r
     rows = [SimpleNamespace(tensor_inputs={})]
     template_info = {-1: SimpleNamespace(dynamic_loop_iter_counts={})}
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    runner.resident_refusal = lambda walk: None
+    runner.batched_refusal = lambda walk: None
+    runner.resident_refusal = lambda walk: "its capture also replays other walks"
     runner.template_step = lambda walk: None
     runner._widest = lambda walk: SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk))
     runner._template = lambda spec: CaptureTemplate(

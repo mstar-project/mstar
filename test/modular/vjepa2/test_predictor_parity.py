@@ -41,6 +41,30 @@ def _tiny_config() -> VJepa2Config:
     )
 
 
+def test_mask_tokens_match_the_reference_without_reading_a_mask_back():
+    """The reference repeats the mask token up to the target mask's largest
+    index, then gathers; sizing by a device value is a host read, which fails a
+    CUDA graph capture. Same tokens, with no value read back."""
+    from mstar.model.vjepa2.components.vit_encoder import apply_masks
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    emb = VJEPA2PredictorEmbeddings(config).eval()
+    torch.nn.init.normal_(emb.mask_tokens)
+    b, n = 2, config.num_patches
+    hidden = torch.randn(b, n, config.hidden_size)
+    context = [torch.arange(n // 2).unsqueeze(0).repeat(b, 1)]
+    target = [torch.arange(n // 2, n).unsqueeze(0).repeat(b, 1)]
+    with torch.no_grad():
+        embeddings, _ = emb(hidden, context, target)
+        token = emb.mask_tokens[1]
+        reference = apply_masks(token.repeat(b, int(target[0].max()) + 1, 1), target)
+    assert torch.equal(embeddings[:, n:], reference)
+    # on the meta device no value can be read back, as in a capture
+    meta = [[m.to("meta") for m in masks] for masks in (context, target)]
+    assert emb.to("meta")(hidden.to("meta"), *meta)[0].shape == embeddings.shape
+
+
 def test_predictor_output_shape_full_mask():
     """With full context and full target mask, predictor emits one hidden per target patch."""
     torch.manual_seed(0)

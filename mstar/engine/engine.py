@@ -3250,7 +3250,7 @@ class Engine:
         loop-back signal to the forward unchanged, which a run skips between
         replays (``AcceleratorGraphRunner.prepare_template``)."""
         mgmt = self._submodules[node_name]
-        if runner.resident_refusal(walk) is not None:
+        if runner.batched_refusal(walk) is not None:
             return  # no batched capture of it: its steps never repeat
         mgmt.template_steps[walk] = runner.template_step(walk)
         with watch_table_reads() as reads:
@@ -3273,7 +3273,7 @@ class Engine:
         if self.resident_refusal(node_name, graph_walk) is not None:
             if graph_walk not in mgmt.template_steps:
                 # no batched capture of it was probed
-                why = "it has no capture" if runner is None else runner.resident_refusal(graph_walk)
+                why = "it has no capture" if runner is None else runner.batched_refusal(graph_walk)
                 return f"runner: {why or 'its captures were not probed'}"
             # None: the step touches no resource, so there is nothing to plan
             host_planned, host_step = True, mgmt.template_steps[graph_walk]

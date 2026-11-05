@@ -904,19 +904,26 @@ class AcceleratorGraphRunner:
         """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
         self._resident = planner
 
-    def resident_refusal(self, walk: str) -> str | None:
-        """Why the captures of ``walk`` can't run it on resident tables, or
-        None. After `prepare_for_capture`."""
+    def batched_refusal(self, walk: str) -> str | None:
+        """Why no batched capture of ``walk`` runs its steps, or None. After
+        `prepare_for_capture`."""
         if self._graph_backend is None or not self._graph_backend.is_available():
             return "its device captures no graphs"
         configs = [c for c in self._capture_configs if c.capture_graph_walk == walk]
         if not any(not _is_packed(c) for c in configs):
             return "it has no batched capture"
-        if any(set(c.replay_graph_walks) - {walk} for c in configs):
-            # one graph would serve walks with and without the tables
-            return "its capture also replays other walks"
         if not any(spec.bucket.graph_walk == walk for spec in self.prepare_for_capture()):
             return "every capture of it was dropped"
+        return None
+
+    def resident_refusal(self, walk: str) -> str | None:
+        """Why the captures of ``walk`` can't run it on resident tables, or
+        None. After `prepare_for_capture`."""
+        if (refusal := self.batched_refusal(walk)) is not None:
+            return refusal
+        if any(set(c.replay_graph_walks) - {walk} for c in self._capture_configs if c.capture_graph_walk == walk):
+            # one graph would serve walks with and without the tables
+            return "its capture also replays other walks"
         return None
 
     def template_step(self, walk: str) -> SubmoduleStep | None:
