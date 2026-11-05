@@ -342,7 +342,7 @@ Omnilingual ASR notes
   fairseq2).
 
 Ripple-65B (``ripple_65b``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: bash
 
