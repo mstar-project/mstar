@@ -287,6 +287,15 @@ class KPoolDSA(Resource):
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
         # `dependency` hands back the SPEC; its `.config` is the KV config (shard is idempotent)
         kv_config = info.dependency(spec.config.kv_cache).config
+        planes = kv_config.aux_planes.get(INDEX_PLANES)
+        if planes is None:
+            raise ValueError(f"DSA keeps its index keys on {spec.config.kv_cache}'s pages: "
+                             f"declare its aux_planes[{INDEX_PLANES!r}]")
+        d = spec.config.index_head_dim
+        if d is None or planes.width != 3 * d:
+            # a row is [key | gate | key of the pool ending there]
+            raise ValueError(f"DSA's {INDEX_PLANES} rows are 3 x index_head_dim ({d}) wide; "
+                             f"{spec.config.kv_cache} declares {planes.width}")
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         return cls(spec.config, kv_config, info.device)

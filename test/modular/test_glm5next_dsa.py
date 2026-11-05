@@ -26,7 +26,7 @@ from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import ATTN, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -424,15 +424,16 @@ def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, versio
         cfg.check_long_context()
 
 
-def test_a_non_bf16_cache_captures_nothing_in_long_mode():
-    """The DSA kernels take a bf16 cache; the torch paths sync with the host, so no capture."""
+def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the node refuses it when it binds rather than serving slow."""
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = Glm5NextModelConfig.reduced_long_context()
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    sub.node_resources = {ATTN: types.SimpleNamespace(uses_kernel=True),
-                          KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
-    assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
-    assert sub._prefill_captured is False
+    cache = types.SimpleNamespace(dtype=torch.float16, device=torch.device("cuda"))
+    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=128),
+                               layer_view=lambda *a: cache)
+    with pytest.raises(ValueError, match="bf16"):
+        sub.bind_node_resources({KV_CACHE: kv})
 
 
 def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
@@ -468,12 +469,12 @@ def _kv_spec(planes=None):
         qk_rope_head_dim=16, aux_planes=planes))
 
 
-def _resource(planes=None):
+def _resource(planes=None, index_head_dim=_D):
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.dsa.config import DSAConfig, DSASpec
 
     spec = DSASpec(resource_key="dsa", nodes={"LLM"}, config=DSAConfig(
-        kv_cache=_KV, topk=8, kpool=4, sm_scale=0.1))
+        kv_cache=_KV, topk=8, kpool=4, sm_scale=0.1, index_head_dim=index_head_dim))
     return build_resource(spec, EngineResourceInfo(
         device=torch.device("cpu"), dependencies={_KV: _kv_spec(planes)}))
 
@@ -495,6 +496,17 @@ def _kv_step(walk, pages, lengths, to_compute, lease=None, is_preplan=False) -> 
                       plan_results={_KV: {"main": plan}}, slot_lease=lease)
     ctx.is_preplan = is_preplan
     return ctx
+
+
+@pytest.mark.parametrize("planes, head_dim, match", [
+    ({}, _D, "aux_planes"),
+    (None, _D + 1, "3 x index_head_dim"),
+    (None, None, "3 x index_head_dim"),
+])
+def test_a_kpool_dsa_over_planes_it_cannot_hold_is_refused_at_build(planes, head_dim, match):
+    """A missing or mis-sized INDEX_PLANES booted, then failed on the first prefill."""
+    with pytest.raises(ValueError, match=match):
+        _resource(planes, head_dim)
 
 
 def test_a_declared_step_plans_its_rows_from_the_kv_plan():

@@ -26,6 +26,8 @@ class DSAConfig:
     kpool: int = 1
     # the absorbed MLA's softmax scale, for the sparse-attention plans kpool.py makes
     sm_scale: float | None = None
+    # kpool > 1: the indexer's key width; an INDEX_PLANES row is three of them wide
+    index_head_dim: int | None = None
 
 
 @dataclass

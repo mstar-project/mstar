@@ -142,6 +142,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
+            cache = resources[KV_CACHE].layer_view() if self.config.dsa_long_context else None
+            if cache is not None and cache.device.type == "cuda" and cache.dtype != torch.bfloat16:
+                # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
+                raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
+                                 f"{cache.dtype}: set the node's dtype to bfloat16")
         buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
         if self.config.dsa_long_context and self.config.prefill_graphs and (
                 max(buckets) > sparse_mla.MAX_ROWS):
@@ -219,14 +224,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: MLA is on the SDPA fallback, which cannot be "
                 "captured; decode runs eager"
             )
-            return []
-        kv = self.node_resources.get(KV_CACHE)
-        if (self.config.dsa_long_context and device.type == "cuda" and kv is not None
-                and kv.layer_view().dtype != torch.bfloat16):
-            # the DSA kernels take a bf16 cache; the torch paths sync with the host
-            logger.warning("glm5_next: dsa_long_context on a %s cache cannot be captured; "
-                           "decode runs eager", kv.layer_view().dtype)
-            self._prefill_captured = False
             return []
         max_slots = self._kda_max_slots()
         batch_sizes = [
