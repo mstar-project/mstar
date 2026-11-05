@@ -131,7 +131,9 @@ pytestmark = [
 @pytest.fixture(scope="module", autouse=True)
 def full_fp32():
     """Importing mstar.engine turns TF32 on for the whole process, and TF32 drifts the
-    two 40-layer encoders apart (max abs 1.42 on an H100, #993); compare in full fp32."""
+    two 40-layer encoders apart (max abs 1.42 on an H100, #993); compare in full fp32.
+    This pins the port, not the served numerics: the server runs these nodes in bf16
+    (the model's autocast dtype), where TF32 or full fp32 matmuls give identical output."""
     with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=False)):
         yield
 
