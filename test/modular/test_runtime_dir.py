@@ -42,7 +42,8 @@ def bad_dir(request, tmp_path, monkeypatch):
     elif request.param == "not_a_dir":
         path.write_bytes(b"not a dir")
     else:
-        path.mkdir(mode=0o775)
+        path.mkdir()
+        path.chmod(0o775)  # as an earlier release left it; chmod, so not the umask's
         uid = os.geteuid()
         monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     return f"{path}/"
@@ -197,25 +198,33 @@ def test_a_dir_another_uid_owns_is_refused_without_being_chmoded(tmp_path, monke
     """The owner is read from the descriptor the chmod would use, so the chmod
     can never reach a directory that is not ours: no stat-then-chmod window."""
     path = tmp_path / "theirs"
-    path.mkdir(mode=0o775)
+    path.mkdir()
+    # chmod, not mkdir's mode argument: that one is masked by the ambient umask,
+    # so the mode asserted below would be the test host's, not a chosen one
+    path.chmod(0o775)
+    before = _mode(path)
     uid = os.geteuid()
     monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     with pytest.raises(PermissionError, match=f"owned by uid {uid}"):
         ensure_private_dir(path)
-    assert _mode(path) == 0o775
+    assert _mode(path) == before
 
 
 def test_a_symlink_to_a_dir_we_own_is_refused_without_tightening_its_target(tmp_path):
     """``O_DIRECTORY | O_NOFOLLOW`` never opens through the name, so the target
     is not chmoded even though it would be accepted under its own name."""
     target = tmp_path / "target"
-    target.mkdir(mode=0o775)
+    target.mkdir()
+    # chmod, not mkdir's mode argument, for the reason above
+    target.chmod(0o775)
+    before = _mode(target)
     link = tmp_path / "link"
     link.symlink_to(target)
     for path in (str(link), f"{link}/"):
         with pytest.raises(PermissionError, match="it is a symlink"):
             ensure_private_dir(path)
-    assert _mode(target) == 0o775
+    assert _mode(target) == before
+    # and it is only the name that was refused: the target passes on its own
     assert ensure_private_dir(target) == target and _mode(target) == 0o700
 
 
@@ -523,7 +532,8 @@ def swapped_upload_dir(request, tmp_path, monkeypatch):
     elif request.param == "not_a_dir":
         path.write_bytes(b"not a dir")
     else:
-        path.mkdir(mode=0o775)
+        path.mkdir()
+        path.chmod(0o775)  # chmod, so not the umask's
         uid = os.geteuid()
         monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     return path, target
