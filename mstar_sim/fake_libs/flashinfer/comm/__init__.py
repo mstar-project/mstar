@@ -62,8 +62,9 @@ def _channel(group):
     """A gloo group of ``group``'s ranks, kept out of torch's registry as the real IPC buffers
     are (torch names a group by how many this process holds, which differs between ranks in
     different groups): named by ``group`` and its count of collectives after one, which the
-    real one makes to swap its handles; with ``group``'s timeout. torch knows only its ranks."""
-    dist.barrier(group=group)
+    real one makes to swap its handles (gloo's own barrier, which raises at the timeout as that
+    exchange does); with ``group``'s timeout. torch knows only its ranks."""
+    dist.barrier.__wrapped__(group=group)
     ranks = dist.get_process_group_ranks(group)
     store = dist.PrefixStore(f"mstar_sim/ar_fusion/{group.group_name}/{group._get_sequence_number_for_group()}",
                              dist.distributed_c10d._get_default_store())

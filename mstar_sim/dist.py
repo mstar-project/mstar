@@ -257,8 +257,8 @@ def _collective(name: str, family: str, primitive: str | None):
 
 def _barrier(group=None, async_op=False, device_ids=None):
     """A barrier meets as a collective (a meet is a barrier): NCCL's, a one-element all-reduce
-    on a device group, pairs against its peers' collectives; on a host group it waits as
-    gloo's does, aborting at the group's timeout where gloo's raises."""
+    on a device group, pairs against its peers' collectives. mstar's barriers are on device
+    groups; the fused-AR stand-in's, on a host group, is gloo's own (``__wrapped__``)."""
     if dist.get_world_size(group) > 1:
         _meet(group or dist.group.WORLD, row("Barrier", size=dist.get_world_size(group)))
     return _Done() if async_op else None
