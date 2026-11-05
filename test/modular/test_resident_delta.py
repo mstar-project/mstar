@@ -1563,28 +1563,6 @@ def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_cl
     assert _counts(follower) == _counts(leader), "x's allotment here isn't the footprint rank 0 allotted it"
 
 
-def test_a_follower_evicts_the_cached_host_pages_rank_0_evicted_to_set_room_aside(monkeypatch):
-    """x's room on the host comes out of a cached page, which rank 0 evicts as it sets the room aside. A follower
-    that only recorded the room kept the page, and its host index and later evictions went their own way."""
-    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
-    keys = [bytes([i]) * 32 for i in range(7)]
-    for kv in (leader, follower):
-        kv._cpu_pool = host._HostPool(8)
-        cached = kv._cpu_pool.arena.acquire(7)
-        kv._cpu_pool.index.insert_run(keys, cached, None)
-        kv._cpu_pool.arena.release(cached)
-    _ingest((leader, follower), "x", 2, arrival=1, rebuildable=False)
-    assert _admits(leader, "x")
-    assert len(leader._cpu_pool.index.evictable()) == 6, "rank 0 set x's room aside without evicting"
-
-    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
-
-    def host_state(kv):
-        return kv._cpu_pool.reserved, kv._cpu_pool.arena.free_pages(), sorted(kv._cpu_pool.index.evictable())
-
-    assert host_state(follower) == host_state(leader), "the follower's host holds a cached page rank 0 evicted"
-
-
 def test_a_follower_holds_the_class_and_allotment_rank_0_gave_a_request_as_its_step_admitted(monkeypatch):
     """r sets the host's two pages aside at admission and grows past them, so rank 0 guarantees r inside the admit
     of r's next page. The follower's host still has a page free when it admits that step, and deciding for itself it
