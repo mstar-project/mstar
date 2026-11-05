@@ -233,3 +233,17 @@ def test_a_run_cuts_each_replays_item_to_its_own_span():
     to its own, and an empty one routes nothing."""
     spans = [[[0, 1], [0, 1]], [[0, 1], [1, 1]]]  # DROP's second replay is empty
     assert _cut(2, [[1, 2], [3, 4]], spans=spans) == {KEEP: [0, 1], DROP: [10]}
+
+
+def test_a_runs_column_hands_on_a_tensor_of_its_own():
+    """A row's iteration, ``column[:, i]``, is a view with a stride of the
+    run's width even at one element, where ``contiguous`` leaves it as it is:
+    a routed edge's byte view refused it (Canary at N=4), and the step after
+    the run took the whole row (Orpheus)."""
+    from mstar.communication.tensors import _serialize_tensor
+    from mstar.worker.worker import run_item
+
+    column = torch.tensor([[5, 6, 7, 8]])
+    item = run_item(column, 2)
+    assert item.tolist() == [7] and item.stride() == (1,)
+    assert _serialize_tensor(item) == _serialize_tensor(torch.tensor([7]))

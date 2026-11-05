@@ -334,6 +334,13 @@ _HOST_ROWS_RING = 4
 _HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_RING))
 
 
+def run_item(column: torch.Tensor, iteration: int) -> torch.Tensor:
+    """One iteration of a row's column of a step that repeated, as what leaves
+    the step: a tensor of its own. A view keeps the run's stride, which
+    ``contiguous`` keeps too on one element, and a byte view refuses."""
+    return column[:, iteration].clone(memory_format=torch.contiguous_format)
+
+
 def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
     """Host buffer ``name``'s first value per row, a view; None without one."""
     buf = None if host_rows is None else host_rows.buffers.get(name)
@@ -3479,7 +3486,7 @@ class Worker:
                 if input_name in wide:
                     # a signal that also leaves the Loop: a run kept it a column an
                     # iteration, of which the loop-back reads the last
-                    tensors = [tensor[:, -1] for tensor in tensors]
+                    tensors = [run_item(tensor, -1) for tensor in tensors]
                 speculation.node_batch.per_request_input_tensors[rid][input_name] \
                     = list(tensors)
             if ok:
@@ -4344,7 +4351,7 @@ class Worker:
                 for i in range(kept):
                     if name in withhold and (rid, i) in withheld:
                         continue
-                    replay = column[:, i] if width > 1 else column
+                    replay = run_item(column, i) if width > 1 else column
                     if name in span_of:
                         start, end = span_of[name][rid][i]
                         if end <= start:
