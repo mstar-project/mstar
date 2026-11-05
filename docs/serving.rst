@@ -601,7 +601,7 @@ group runs that node's steps on a lane of their own instead of the worker's main
 they take no turn on it, run on a second CUDA stream beside its steps, and whatever
 comes ready meanwhile batches into the next one. It applies to the walks the node's
 submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
-``codec_chunk``, and the colocated Qwen3-TTS configs set the field), and keeps both nodes on one
+``codec_chunk``; no shipped config sets the field, see :doc:`models` for why), and keeps both nodes on one
 worker and one CUDA context, unlike a split with MPS. The lane admits and plans a
 recurrent state pool of the node's own (the Codec's ``codec_state``); a slot the pool
 can't give yet makes the stream wait, as on the chain. Startup fails with a
