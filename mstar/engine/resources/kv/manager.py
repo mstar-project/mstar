@@ -4729,7 +4729,8 @@ class KVManager(AttentionResource):
             self._streams[s.request_id][s.label].stored_len for s in step.segments
             if s.label in self._streams.get(s.request_id, ())
         ), default=0)
-        reach = min(-(-self.config.max_seq_len // page_size), self.config.request_pages) * page_size
+        # past max_seq_len a position has no row in a table sized by it, whatever the pages hold
+        reach = min(self.config.max_seq_len, self.config.request_pages * page_size)
         return max(1, min(page_size, reach - longest - ctx.repeats))
 
     def resident_refusal(self, key, streams) -> str | None:

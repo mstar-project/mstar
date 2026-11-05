@@ -943,6 +943,10 @@ def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
     kv._streams[1]["main"].stored_len = 10 * PAGE
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 1
+    # nor past max_seq_len inside its last page: a learned position table ends there (review-r2 F14)
+    kv.config.max_seq_len = 10 * PAGE - 3
+    kv._streams[1]["main"].stored_len = 10 * PAGE - 8
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
 
 
 def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
