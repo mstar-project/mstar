@@ -56,10 +56,10 @@ class Preemption:
 
     def preempt(self, node_batch: ExecutingBatch) -> bool:
         """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
-        drop it, or queue the request for its shortage when no move covers it, and return True. Return False, so
-        the offload and the hold run, when the failed resource isn't a paged KV cache, when the node rebuilds no
-        request here and the cache has no host pool or isn't the node's only one, or when `KVManager.preempt`
-        returns None."""
+        drop it, or, when no move covers the shortage, move the request itself to the host or queue it for its
+        shortage, and return True. Return False, so the offload and the hold run, when the failed resource isn't a
+        paged KV cache, when the node rebuilds no request here and the cache has no host pool or isn't the node's
+        only one, or when `KVManager.preempt` returns None."""
         kv = self._caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
         if kv is None or not self._moves(kv, node_name):
@@ -71,7 +71,7 @@ class Preemption:
             return False
         if victims.waits:
             for node in kv.nodes:
-                self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
+                self._engine_manager.get_engine(node).readmit_request(node, reason.request_id, queued=False)
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
                 "KV short on node=%s walk=%s: %s waits for %d pages past its allotment, since moving "
@@ -83,19 +83,22 @@ class Preemption:
         return True
 
     def make_room(self) -> None:
-        """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused, as
-        `KVManager.make_room` chooses them. No step of theirs runs short to move them, since none of them runs."""
-        if not self._caches:
+        """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused
+        that such moves can let in, as `KVManager.make_room` chooses them. No step of theirs runs short to move
+        them, since none of them runs. An older request stuck on something no move frees, another resource or a
+        pool that doesn't move, holds up no younger one."""
+        if not any(kv.cache.any_parked() for kv in self._caches.values()):
             return
         engine = self._engine_manager.engine
-        refusal = engine.oldest_refusal()
-        kv = None if refusal is None else self._caches.get(refusal.key)
-        if kv is None or not self._moves(kv, refusal.mark.node_name):
-            return
-        newer = engine.newer_than(refusal.rid)
-        victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
-        if victims is not None:
-            self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+        for refusal in engine.refusals():
+            kv = self._caches.get(refusal.key)
+            if kv is None or not self._moves(kv, refusal.mark.node_name):
+                continue
+            newer = engine.newer_than(refusal.rid)
+            victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
+            if victims is not None:
+                self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+                return
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""
@@ -191,7 +194,7 @@ class Preemption:
                 )
         for rid in victims.to_ask:
             for node_name in kv.nodes:
-                self._engine_manager.get_engine(node_name).readmit_request(node_name, rid)
+                self._engine_manager.get_engine(node_name).readmit_request(node_name, rid, queued=True)
                 self._log(
                     self._moves_logged, node_name,
                     "KV short on node=%s: %s, holding no page of its own, gave back its allotment for %s, "

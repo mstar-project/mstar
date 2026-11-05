@@ -364,10 +364,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
        graphs is served by (the replicas the conductor picks from; a node group no
-       walk places adds none), so every replica warms. When some worker graph has
-       fewer replicas than that, such as one DiT instance beside a replicated VAE,
-       the entry first runs once alone, so that graph also warms its one-request
-       shape before the copies reach it together. A malformed or failing warmup
+       walk places adds none). The conductor's pick (least loaded, ties to the
+       replica picked longest ago) puts a group's copies on every one of its
+       replicas in whatever order they finish, so every replica warms. When some
+       worker graph has fewer replicas than that, such as one DiT instance beside a
+       replicated VAE, the entry first runs once alone, so that graph also warms its
+       one-request shape before the copies reach it together. A malformed or failing warmup
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
@@ -465,14 +467,16 @@ prompt, so a decode step can find no page outside the reservations. The worker t
 from the newest requests, those that arrived after the request that ran short, until they cover
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
 its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
-ran short gets the pages freed, up to its shortage, and waits holding its pages when the newer
-requests can't cover it. A request on the host, a dropped request and one waiting for pages wait
-outside the queue, so a new prompt that fits still starts. They are tried oldest first, before
-the queue. The oldest waiting request that doesn't fit moves newer requests that wait holding
-pages, to the host or by a drop as above. A request on the host returns once its pages and one
-more page fit, and its pages are then copied back. A dropped request returns once its prompt, or
-its history and one more page if that is larger, fits, then recomputes its KV in prefill chunks
-cut by its walk's chunk budget. A request that streams an output in
+ran short gets the pages freed, up to its shortage. When the newer requests can't cover it, it
+moves to the host if the host pool can hold all of its pages, and otherwise waits holding its
+pages. A request on the host and one waiting for pages wait outside the queue, so a new prompt
+that fits still starts. They are tried oldest first, before the queue. A dropped request waits
+in the queue at its arrival, so newer prompts can't keep passing it. The oldest waiting request
+that moves can let in moves newer requests that wait holding pages, to the host or by a drop as
+above. A request on the host returns once its pages and one more page fit, or every page its
+grant needed when it moved itself, and its pages are then copied back. A dropped request returns
+once its prompt, or its history and one more page if that is larger, fits, then recomputes its KV
+in prefill chunks cut by its walk's chunk budget. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
 are never preempted mid-stream. A request no drop can free, because it holds KV made from media
@@ -572,8 +576,9 @@ replica. The conductor picks it per request, at ingest, as the replica with the 
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
 ingest), plus the price of what the conductor predicts about the request there. Ties go
-at random. Every term is in request-equivalents. Groups whose replicas sit on the same
-ranks, replica for replica, take one pick together.
+to the replica picked longest ago, so requests that never overlap still take turns. Every
+term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
+replica, take one pick together.
 
 Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
 KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``

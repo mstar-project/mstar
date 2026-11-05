@@ -254,7 +254,8 @@ class _Engine:
             "node": SimpleNamespace(resources={"kv": self.resource}, resident=None)
         }
         self._runner = SimpleNamespace(
-            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None, readmit=lambda *args: None,
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
+            readmit=lambda *args, queued: None,
         )
         self._resident_delta = OffloadDelta.new() if role == "leader" else None
         self._tp_leader_nodes = {"node"} if role == "leader" else set()
@@ -1334,6 +1335,14 @@ def _preempt(kv, rid: str, droppable: bool):
     return kv.preempt(rid, 1, _ENGINES[id(kv)]._runner.newer_than(rid), lambda other: droppable)
 
 
+def _waits(kv, rid: str) -> None:
+    """``rid`` runs short on rank 0 with nothing newer to move. A step of its own is in flight on another node, so it
+    can't move itself to the host, and it waits holding its pages."""
+    kv._streams[rid]["main"].step_in_flight = True
+    assert _preempt(kv, rid, droppable=False).waits
+    kv._streams[rid]["main"].step_in_flight = False
+
+
 # v's rebuild: its 5-page prompt and the id its next decode reads
 _REBUILD = Rebuild("prefill", [0] * (5 * PAGE_SIZE + 1))
 
@@ -1725,11 +1734,14 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
 
 
 def _make_room(kv, droppable: bool = False):
-    """Rank 0's choice of victims for the oldest waiting request its runner refused, droppable only if
-    ``droppable``."""
+    """Rank 0's choice of victims for the oldest waiting request its runner refused that moves can let in,
+    droppable only if ``droppable``."""
     runner = _ENGINES[id(kv)]._runner
-    refusal = runner.oldest_refusal()
-    return kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
+    for refusal in runner.refusals():
+        victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
+        if victims is not None:
+            return victims
+    return None
 
 
 @pytest.mark.parametrize("rebuildable", [True, False])
@@ -1748,8 +1760,8 @@ def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_as_the_move_
     for rid, tokens in (("f", 3 * PAGE_SIZE), ("v", 4 * PAGE_SIZE), ("v", 3 * PAGE_SIZE)):
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
-    assert _preempt(leader, "v", droppable=False).waits
-    lead.readmit_request(NODE, "v")
+    _waits(leader, "v")
+    lead.readmit_request(NODE, "v", queued=False)
     _ingest((leader, follower), "o", 2, arrival=2, rebuildable=rebuildable)
     assert not _admits(leader, "o")
 
@@ -1784,12 +1796,12 @@ def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_mov
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     assert not _step(leader, "o", PAGE_SIZE).ok and not _step(follower, "o", PAGE_SIZE).ok
     leader._streams["v"]["main"].step_in_flight = True
-    assert _preempt(leader, "o", droppable=False).waits
+    _waits(leader, "o")
     leader._streams["v"]["main"].step_in_flight = False
-    lead.readmit_request(NODE, "o")
+    lead.readmit_request(NODE, "o", queued=False)
     assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
-    assert _preempt(leader, "v", droppable=False).waits
-    lead.readmit_request(NODE, "v")
+    _waits(leader, "v")
+    lead.readmit_request(NODE, "v", queued=False)
     assert not _admits(leader, "o")
 
     assert _make_room(leader).to_host == ["v"]
@@ -1816,12 +1828,12 @@ def _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable: bool):
         assert _step(leader, rid, pages * PAGE_SIZE).ok and _step(follower, rid, pages * PAGE_SIZE).ok
     assert not _step(leader, "v1", 1).ok and not _step(follower, "v1", 1).ok
     leader._streams["v2"]["main"].step_in_flight = True
-    assert _preempt(leader, "v1", droppable=False).waits
+    _waits(leader, "v1")
     leader._streams["v2"]["main"].step_in_flight = False
-    lead.readmit_request(NODE, "v1")
+    lead.readmit_request(NODE, "v1", queued=False)
     assert not _step(leader, "v2", 1).ok and not _step(follower, "v2", 1).ok
-    assert _preempt(leader, "v2", droppable=False).waits
-    lead.readmit_request(NODE, "v2")
+    _waits(leader, "v2")
+    lead.readmit_request(NODE, "v2", queued=False)
     _ingest((leader, follower), "o", 2, arrival=1, rebuildable=rebuildable)
     assert not _admits(leader, "o")
     victims = _make_room(leader, droppable=True)

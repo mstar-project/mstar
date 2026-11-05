@@ -300,7 +300,8 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 
 ``mstar_kv_preemptions_total{model_name, component}``
    Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short
-   of KV pages, on a single rank. Their pages go to the request that ran short.
+   of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves
+   itself to the host to wait.
 
 ``mstar_kv_drops_total{model_name, component}``
    Counter. Chosen requests whose KV was dropped. A request leaves before its drop when

@@ -2294,7 +2294,8 @@ class MicroScheduler:
 
         for engine in {*map(self.engine_manager.get_engine, self.parked)}:
             for node_name, rid in engine.admit_waiting(published_of):
-                self.parked[node_name].discard(rid)
+                # a request asked again on each node of its pool may have parked on only one of them
+                self.parked.get(node_name, set()).discard(rid)
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
