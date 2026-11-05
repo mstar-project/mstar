@@ -24,10 +24,10 @@ from mstar.engine.resources.attn.base import (
     one_token_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import PagedKernel, WholeRowsKernel
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel, one_slot_pages
+from mstar.engine.resources.context_parallel import one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -320,15 +320,9 @@ class FlashInferMLAManager(PlacedAttention):
             # it defaulted to the one latent KV head, and the kernel planned a single head
             raise ValueError(f"MLA attention over {kv_cache!r} needs the cache's num_qo_heads, "
                              "the model's query heads")
-        self._kv_cache_name = kv_cache
-        self._device = device
-        self._dtype = dtype
-        self._kv_config = kv_config
-        self._current_plan_states: dict[str, FlashInferMLAWrapper] = {}
+        super().__init__(kv_cache, device, dtype, kv_config)
         self._eager_plan_states: dict[EagerSlotKey, FlashInferMLAWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, FlashInferMLAWrapper] = {}
-        self._preplan_states: dict[str, FlashInferMLAWrapper] = {}
-        self._preplanned = False
         if sm_scale is None:
             raise ValueError(
                 "AttentionConfig.sm_scale must be set for MLA: the kernel scores the absorbed "
@@ -344,14 +338,12 @@ class FlashInferMLAManager(PlacedAttention):
             device=device,
             backend=backend,
         )
-        self._workspaces = WorkspacePool(device, owner=kv_cache)
         # over a placed pool on the FA planner (the kernel in use), the device's SMs, for its work-item cap
         self._fa_sm_count: int | None = None
 
-    def _bind_placement(self, placement: ContextParallel) -> None:
+    def _bind_placement(self, geometry: dict[str, int]) -> None:
         # the latent is every TP rank's, so under TP placement it is attended for every partner's heads
-        cfg = self._kv_config
-        self._wrapper_kwargs.update(self._placed.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads))
+        self._wrapper_kwargs.update(geometry)
         # the merge reads the natural-log lse fa2 and fa3 are known to return (`AttentionManager.build`
         # refuses the others); under auto a plan they refuse would fall through to another backend
         if self._wrapper_kwargs["backend"] == "auto" and torch.device(self._device).type == "cuda":
@@ -466,7 +458,7 @@ class FlashInferMLAManager(PlacedAttention):
         for segment in step.segments:
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
-        # bounded as the step's wrappers plan it: a captured one's own-token plans are padded to its bucket
+        # bounded as the step's wrappers plan it, a captured one's own-token plans padded
         if self._fits(spans, ctx):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \

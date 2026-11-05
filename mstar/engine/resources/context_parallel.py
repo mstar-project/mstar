@@ -108,16 +108,6 @@ def local_indptrs(placement: ContextParallel, indptrs: PagedIndptrs, page_size: 
     ), valid
 
 
-def _check_kernel(kernel, contract: str):
-    """``kernel``, refused at construction unless it subclasses the ``attn.wrappers`` ``contract``
-    (imported here: placement validation reads this module without attention's kernels)."""
-    from mstar.engine.resources.attn import wrappers
-
-    if not isinstance(kernel, getattr(wrappers, contract)):
-        raise ValueError(f"attention over a placed pool needs a {contract}, not a {type(kernel).__name__}")
-    return kernel
-
-
 def _masked(out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """A partial over this rank's slots with each query row ``valid`` (``[N]``) marks as holding none
     of them set to out 0, lse -inf, whatever the kernel left there (a select, so a NaN cannot
@@ -282,7 +272,6 @@ class ContextParallelWrapper(ABC):
         batch_size: int | None = None,
         max_total_tokens: int | None = None,
     ):
-        _check_kernel(context, "PagedKernel")
         self._placement, self._page_size, self._dtype = placement, page_size, dtype
         self.context = context
         # None for a one-token-a-row step
@@ -426,7 +415,7 @@ class ContextParallelWrapper(ABC):
 
     @property
     def reads_step_kv(self) -> bool:
-        """Whether the step attends the keys ``run`` is passed (``AttentionManager.reads_step_kv``):
+        """Whether the step attends the keys ``run`` is passed (``PlacedAttention.reads_step_kv``):
         any step but one token a row."""
         return self.new is not None
 
@@ -457,7 +446,7 @@ class TPContextParallelWrapper(ContextParallelWrapper):
 
     @classmethod
     def own_tokens(cls, kernels, placement, device, dtype, workspace, kwargs, max_total_tokens):
-        return _check_kernel(kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens), "WholeRowsKernel")
+        return kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens)
 
     @classmethod
     def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, capture_shape):
@@ -521,11 +510,11 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         captured = None
         if max_total_tokens:
             captured = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
-        kernel = kernels.own_kernel.build(kernels, workspace, kwargs, dtype, captured)
-        if kernel.captured != captured:
+        share = ZigzagWrapper(placement, kernels.own_kernel.build(kernels, workspace, kwargs, dtype, captured), device)
+        if share.kernel.captured != captured:
             # the share's fixed buffers are sized from it, and a replay reads their addresses
-            raise ValueError(f"{type(kernel).__name__} was built for {captured} and holds {kernel.captured}")
-        return ZigzagWrapper(placement, kernel, device)
+            raise ValueError(f"{type(share.kernel).__name__} was built for {captured}, not {share.kernel.captured}")
+        return share
 
     @classmethod
     def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, capture_shape):

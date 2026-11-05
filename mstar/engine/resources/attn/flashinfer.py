@@ -14,7 +14,7 @@ from mstar.engine.resources.attn.base import (
     one_token_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
-from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
@@ -24,7 +24,6 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
@@ -54,11 +53,9 @@ class FlashInferManager(PlacedAttention):
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
     ):
-        self._kv_cache_name = kv_cache
+        super().__init__(kv_cache, device, dtype, kv_config)
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
-        self._device = device
-        self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
         self._window_left = -1 if sliding_window is None else sliding_window - 1
         # The index of the group of the pool's layers this reads (`PagedKVConfig.groups`): the
@@ -72,18 +69,11 @@ class FlashInferManager(PlacedAttention):
         if len(groups) > 1:
             self._layers = frozenset(layers or self._group.layers)
 
-        # label to plan state
-        self._current_plan_states: dict[str, AttentionWrapper] = {}
-
         # persistent, because constructing one allocates FlashInfer's own
         # workspaces and is far from free per step
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
-        self._preplan_states: dict[str, AttentionWrapper] = {}
-        self._preplanned = False
-
-        self._kv_config = kv_config
         check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
@@ -100,12 +90,9 @@ class FlashInferManager(PlacedAttention):
             and fmha_decode_applies(device)
         )
 
-        self._workspaces = WorkspacePool(device, owner=kv_cache)
 
-    def _bind_placement(self, placement: ContextParallel) -> None:
-        cfg = self._kv_config
-        geometry = self._placed.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads)
-        if geometry["num_qo_heads"] != cfg.num_qo_heads and not self._decode_tensor_cores:
+    def _bind_placement(self, geometry: dict[str, int]) -> None:
+        if geometry["num_qo_heads"] != self._kv_config.num_qo_heads and not self._decode_tensor_cores:
             # a rank attending every partner's query heads over its one KV head (TP placement) forms
             # a GQA group FlashInfer's CUDA-core decode can have no kernel for
             self._decode_tensor_cores = True
@@ -129,6 +116,7 @@ class FlashInferManager(PlacedAttention):
                     self._kv_cache_name,
                 )
         self._wrapper_kv_kwargs.update(geometry)
+        cfg = self._kv_config
         self._new_kwargs = dict(
             num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,

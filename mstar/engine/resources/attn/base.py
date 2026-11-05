@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -26,6 +27,7 @@ from mstar.engine.resources.context_parallel import (
     SPPlacement,
     TPContextParallelWrapper,
     TPPlacement,
+    ZigzagWrapper,
 )
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
@@ -303,9 +305,7 @@ class PlacedAttention(AttentionManager):
     """What a backend supplies to attend a placed pool, the one object placed attention builds its
     kernels from: its paged kernel, its whole-rows kernel, and the kernel a share of the own tokens
     runs on, a paged backend's one-slot pages unless it says otherwise. The rest (the split of the
-    own tokens, the exchanges, the merge) is ``ContextParallelWrapper``'s. A backend sets
-    ``_workspaces``, ``_kv_config``, ``_dtype`` and ``_device``, which the wrappers are built with,
-    and keeps its plans in ``_current_plan_states`` and ``_preplan_states``."""
+    own tokens, the exchanges, the merge) is ``ContextParallelWrapper``'s."""
 
     supports_context_parallel = True
     own_kernel: "type[OwnTokensKernel]" = OneSlotPages
@@ -313,18 +313,26 @@ class PlacedAttention(AttentionManager):
     _placement: "ContextParallel | None" = None
     _placed: "type[ContextParallelWrapper] | None" = None
 
+    def __init__(self, kv_cache: str, device: torch.device, dtype: torch.dtype, kv_config: KVConfig):
+        self._kv_cache_name, self._device, self._dtype, self._kv_config = kv_cache, device, dtype, kv_config
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
+        # label to the wrapper it attends on, this step's and a step planned ahead's
+        self._current_plan_states: dict = {}
+        self._preplan_states: dict = {}
+        self._preplanned = False
+
     def bind_dependencies(self, resources) -> None:
         placement = resources[self._kv_cache_name].placement
         if placement is not None:
             self._placement = placement
             wrappers = {SPPlacement: SPContextParallelWrapper, TPPlacement: TPContextParallelWrapper}
             self._placed = wrappers[type(placement)]
-            self._bind_placement(placement)
+            cfg = self._kv_config
+            self._bind_placement(self._placed.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads))
 
     @abstractmethod
-    def _bind_placement(self, placement: "ContextParallel") -> None:
-        """This rank's share of the pool: the wrappers' arguments take the placed geometry
-        (``local_geometry``)."""
+    def _bind_placement(self, geometry: dict[str, int]) -> None:
+        """Takes on this rank's ``page_size`` and ``num_qo_heads`` over the pool."""
 
     @abstractmethod
     def paged_kernel(
@@ -356,6 +364,11 @@ class PlacedAttention(AttentionManager):
         new = None if decode else self._placed.own_tokens(
             self, self._placement, self._device, self._dtype, workspace, kwargs, max_total_tokens,
         )
+        if not isinstance(context, PagedKernel) or not isinstance(new, (WholeRowsKernel, ZigzagWrapper, type(None))):
+            raise ValueError(
+                f"attention over a placed pool takes a PagedKernel and a WholeRowsKernel or ZigzagWrapper, "
+                f"not a {type(context).__name__} and a {type(new).__name__}"
+            )
         return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens,

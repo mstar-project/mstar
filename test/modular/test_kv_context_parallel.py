@@ -37,7 +37,6 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
     OwnTokensKernel,
-    SPContextParallelWrapper,
     SPPlacement,
     ZigzagWrapper,
     local_indptrs,
@@ -693,31 +692,68 @@ class _OneSlotPrefill(PagedKernel):
         return torch.cat([out for out, _ in parts]), torch.cat([lse for _, lse in parts])
 
 
-def test_placed_attention_refuses_a_kernel_outside_its_contract():
+def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     """A backend's kernels are checked when they are built, not when a step first runs them."""
-    placement = SPPlacement(P, 0, CommGroup.trivial())
-    with pytest.raises(TypeError, match="abstract"):
-        type("NoRun", (PagedKernel,), {"plan": lambda self, **kwargs: None})()
+    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    attn, _ = _cp_attention(JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()), CPU, torch.float32)
+    kwargs = dict(attn._wrapper_kv_kwargs)
+    good = attn.paged_kernel
+    monkeypatch.setattr(attn, "paged_kernel", lambda *args: types.SimpleNamespace())
     with pytest.raises(ValueError, match="PagedKernel"):
-        SPContextParallelWrapper(placement, CP_PAGE, torch.float32, types.SimpleNamespace(), None, CPU)
+        attn._context_parallel_wrapper("main", 0, False, kwargs)
+    monkeypatch.setattr(attn, "paged_kernel", good)
+    monkeypatch.setattr(attn, "whole_rows_kernel", lambda *args: types.SimpleNamespace())
+    with pytest.raises(ValueError, match="WholeRowsKernel"):
+        attn._context_parallel_wrapper("main", 0, False, kwargs)
     with pytest.raises(ValueError, match="OwnTokensKernel"):
-        ZigzagWrapper(placement, _OneSlotPrefill(), CPU)
+        ZigzagWrapper(SPPlacement(P, 0, CommGroup.trivial()), _OneSlotPrefill(), CPU)
+
+
+class _GatheredKeys(OwnTokensKernel):
+    """A kernel with no pages: each row's keys gathered by their token ids, one copy of them."""
+
+    def __init__(self, captured=None):
+        self.captured = captured
+
+    @classmethod
+    def build(cls, kernels, workspace, kwargs, dtype, captured):
+        return cls(captured)
+
+    @staticmethod
+    def padded(qo_indptr, captured):
+        return qo_indptr
+
+    def plan(self, rows, causal):
+        self.rows, self.causal = rows, causal
+
+    def run(self, queries, keys):
+        (q,), (k, v) = queries, keys
+        qo, kv, tokens = self.rows
+        parts = [
+            _reference(q[a:b], k[tokens[c:d]], v[tokens[c:d]], self.causal)
+            for (a, b), (c, d) in zip(itertools.pairwise(qo.tolist()), itertools.pairwise(kv.tolist()), strict=True)
+        ]
+        # a captured kernel's queries past its plan's: the wrapper drops them
+        spare = q.shape[0] - int(qo[-1])
+        outs = [out for out, _ in parts] + [q.new_zeros(spare, *q.shape[1:])]
+        lses = [lse for _, lse in parts] + [q.new_full((spare, q.shape[1]), -math.inf)]
+        return torch.cat(outs), torch.cat(lses)
 
 
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
-def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_larger_bucket(causal):
+@pytest.mark.parametrize("kernel", [
+    lambda captured: OneSlotPages(_OneSlotPrefill(), torch.float32, captured), _GatheredKeys,
+], ids=["one-slot-pages", "no-pages"])
+def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_larger_bucket(causal, kernel):
     """SP partners' zigzag shares of a step's own tokens on wrappers captured for a bucket larger
     than the step, planned for one step and then another (with a zero-length padding row, as the
     graph runner pads): each plan writes the buffers a replay reads, the bucket's padding tokens
-    merge to 0, and the real ones to their rows' attention."""
+    merge to 0, and the real ones to their rows' attention, on a paged kernel or on one without
+    pages."""
     rows, tokens = 3, 16
     captured = zigzag_capture(P, rows, tokens)
-    wrappers = [
-        ZigzagWrapper(
-            SPPlacement(P, index, CommGroup.trivial()), OneSlotPages(_OneSlotPrefill(), torch.float32, captured), CPU,
-        )
-        for index in range(P)
-    ]
+    wrappers = [ZigzagWrapper(SPPlacement(P, index, CommGroup.trivial()), kernel(captured), CPU) for index in range(P)]
     addresses = [(w._gather.data_ptr(), w._scatter.data_ptr()) for w in wrappers]
     gen = torch.Generator().manual_seed(0)
     for lens in ((5, 3, 1), (2, 7, 0)):
@@ -1116,14 +1152,14 @@ def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its
 
 def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was_captured_with(monkeypatch):
     """A leased step's own-token plans are padded to the rows its label's wrapper was captured with,
-    more than the step's or the bucket's where a request has no segment in the label, and a
-    capture's empty rows raise the planner's bound: admission bounds that plan, not one padded to
-    the step's rows."""
+    fewer than the bucket's where a capture's request has no segment in the label and more than a
+    step's that holds fewer, and a capture's empty rows raise the planner's bound: admission bounds
+    that plan, not one padded to the step's rows or the bucket's."""
     _fa_kernel(monkeypatch)
     attn, placement = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU,
                                     torch.float32, mla=True, flashinfer_backend="fa2")
-    tokens, spans, captured_rows = 64, (5, 9), 8
-    bucket = BucketKey(graph_walk="w", bs=4, num_tokens=tokens)
+    tokens, spans, captured_rows = 64, (1, 4), 4
+    bucket = BucketKey(graph_walk="w", bs=16, num_tokens=tokens)
     attn._cg_wrapper(SlotLease(0, bucket), "main", captured_rows)
     step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
     ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
@@ -1134,53 +1170,39 @@ def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was
         plans = attn._placed.rank_plans(placement, qo, heads, attn.own_kernel, (rows, tokens))
         return max(fm.fa_work_items_bound(plan, h, 132) for plan, h in plans)
 
-    assert bound(captured_rows) > max(bound(len(spans)), bound(bucket.bs))
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", max(bound(len(spans)), bound(bucket.bs)))
+    assert bound(len(spans)) < bound(captured_rows) < bound(bucket.bs)
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(len(spans)))
     assert not attn.admit(step, ctx).ok
     monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(captured_rows))
     assert attn.admit(step, ctx).ok
 
 
 def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeypatch):
-    """``own_kernel`` is where a backend whose keys aren't one-slot pages plugs in: its share runs on
-    the kernel, sized by its capture, admission bounds its padding, and one that drops its capture,
-    which a replay's fixed buffers are sized from, is refused when it is built."""
+    """``own_kernel`` is where a backend whose keys aren't one-slot pages plugs in: the share is built
+    on it, admission bounds its padding, and one that drops its capture, which a replay's fixed
+    buffers are sized from, is refused when it is built."""
     _fa_kernel(monkeypatch)
-    calls = []
+    padded = []
 
-    class Ragged(OwnTokensKernel):
-        def __init__(self, captured):
-            self.captured = captured
-
-        @classmethod
-        def build(cls, kernels, workspace, kwargs, dtype, captured):
-            calls.append("build")
-            return cls(captured)
-
+    class Counting(_GatheredKeys):
         @staticmethod
         def padded(qo_indptr, captured):
-            calls.append("padded")
+            padded.append(captured)
             return qo_indptr
 
-        def plan(self, rows, causal):
-            pass
-
-        def run(self, queries, keys):
-            raise AssertionError("nothing runs here")
-
-    class Forgetful(Ragged):
+    class Forgetful(_GatheredKeys):
         def __init__(self, captured):
-            self.captured = None
+            super().__init__(None)
 
     attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
                             mla=True, flashinfer_backend="fa2")
     bucket = BucketKey(graph_walk="w", bs=2, num_tokens=64)
-    attn.own_kernel = Ragged
-    assert isinstance(attn._cg_wrapper(SlotLease(0, bucket), "main", 2).new.kernel, Ragged)
+    attn.own_kernel = Counting
+    assert isinstance(attn._cg_wrapper(SlotLease(0, bucket), "main", 2).new.kernel, Counting)
     step = AttentionStep(segments=(Segment("r0", "main", 5), Segment("r1", "main", 9)))
     ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False,
                       slot_lease=SlotLease(0, bucket))
-    assert attn.admit(step, ctx).ok and calls == ["build", "padded", "padded"]
+    assert attn.admit(step, ctx).ok and padded == [zigzag_capture(P, 2, 64)] * P
     attn.own_kernel = Forgetful
     with pytest.raises(ValueError, match="built for"):
         attn._cg_wrapper(SlotLease(1, bucket), "main", 2)
