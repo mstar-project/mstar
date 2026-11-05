@@ -179,7 +179,7 @@ the roofline.
 - The FlashInfer stand-in sizes the CUDA-core decode kernel's grid without its register count
   (a fact of the compiled kernel, which varies with the box's nvcc), so a mixed wrapper's decode
   workspace can come out larger than a GPU's, never smaller. A decode kernel past 48 KiB of shared
-  memory (head dim 512) has no stand-in: its grid on a GPU depends on whether a run came first. MLA plans as fa2/fa3's planner does on any GPU, and a backend other than
+  memory (head dim 512 at group 1 or 16 with 2-byte KV) has no stand-in: its grid on a GPU depends on whether a run came first. MLA plans as fa2/fa3's planner does on any GPU, and a backend other than
   fa2 and fa3 asks for no workspace. `auto` chooses between fa2 and fa3 as FlashInfer does; on
   Blackwell a ragged `auto` stays fa2 here, where FlashInfer can upgrade it to cudnn or cutlass.
   Decode `auto` never moves to cuDNN here, where FlashInfer's can on SM100/SM103: tensor-core

@@ -248,8 +248,9 @@ def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_head
     """What FlashInfer's CUDA-core decode planner (``DecodePlanImpl`` over its work
     estimation) allocates for ``kv`` pages per request. The grid it sizes for is the decode
     kernel's occupancy (:func:`blocks_per_sm`) without its register count, a fact of the
-    compiled kernel, so its grid can only come out larger than a GPU's. A kernel past the 48 KiB a block gets before opting in (head dim 512)
-    has no stand-in: its grid on a GPU depends on whether a run came before the plan."""
+    compiled kernel, so its grid can only come out larger than a GPU's. A kernel past the
+    48 KiB a block gets before opting in (head dim 512 at group 1 or 16 with 2-byte KV) has no
+    stand-in: its grid on a GPU depends on whether a run came before the plan."""
     gqa = num_qo_heads // num_kv_heads
     if gqa not in (1, 2, 3, 4, 6, 8, 16):  # the group sizes its kernels are built for
         raise gpu_error(RuntimeError(f"Unsupported group_size: {gqa}"))
