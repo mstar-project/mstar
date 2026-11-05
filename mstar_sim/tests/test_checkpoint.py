@@ -9,7 +9,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from mstar_sim.checkpoint import main, synthesize
+from mstar_sim.checkpoint import SMALL_WEIGHT_FILE, main, synthesize
 from mstar_sim.tests.test_device import run_sim
 
 
@@ -102,6 +102,21 @@ def test_a_checkpoint_of_torch_and_onnx_weights_copies_shapes_only(tmp_path):
     onnx = read_onnx(copy)
     assert onnx.tensors["w"].shape == big and onnx.tensors["scale"].tolist() == [0.5, 2.0]
     assert [node.op_type for node in onnx.nodes] == ["MatMul"]
+    assert any("speech_tokenizer.onnx" in note for note in manifest["notes"])  # holes read as zeros: said so
+
+
+def test_an_onnx_model_the_host_could_run_stays_real(tmp_path):
+    """An ``.onnx`` under ``MAX_ASSET_BYTES`` (Smart Turn, which onnxruntime runs on the host) is
+    copied as it is, as any asset."""
+    src = tmp_path / "src"
+    src.mkdir()
+    payload = bytes(range(256)) * (SMALL_WEIGHT_FILE // 256 + 4096)  # past the small file size
+    (src / "smart_turn.onnx").write_bytes(_protobuf((1, 8), (7, _protobuf((5, _protobuf(
+        (1, len(payload)), (2, 2), (8, b"w"), (9, payload)))))))
+    save_file({"w": torch.zeros(4)}, str(src / "weights.safetensors"))
+    manifest = synthesize(str(src), tmp_path / "out")
+    assert (tmp_path / "out" / "smart_turn.onnx").read_bytes() == (src / "smart_turn.onnx").read_bytes()
+    assert manifest["notes"] == []
 
 
 def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):

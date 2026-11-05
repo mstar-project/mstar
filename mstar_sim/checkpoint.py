@@ -7,8 +7,8 @@ directory) and writes each file as its header, verbatim, over a sparse
 ``SMALL_WEIGHT`` elements: norms, scales, a rotary table's inputs), next to
 copies of the configs, tokenizer and other small files. Weights in other formats
 are copied shapes-only too: a ``torch.load`` file saved again with its large
-tensors value-less, an ONNX model byte for byte over a hole where its large
-initializers' data was. Every model's own loader
+tensors value-less, an ONNX model over ``MAX_ASSET_BYTES`` byte for byte over a hole
+where its large initializers' data was. Every model's own loader
 reads it unchanged; the simulator reads the small tensors for real and the rest
 from the headers only (``mstar_sim.patches.header_only_weights``), so a model of
 any size costs a few MB of disk.
@@ -43,6 +43,7 @@ VERSION = 4
 SMALL_WEIGHT = 1 << 16
 # small tensors' byte ranges closer than this are fetched from the Hub as one
 _MERGE_GAP = 1 << 20
+# any other file this small is copied whole, an ONNX model the host may run (Smart Turn) included
 MAX_ASSET_BYTES = 50 * 2**20
 # weight formats that duplicate the safetensors; never copied next to them
 _DUPLICATE_WEIGHTS = ("*.bin", "*.h5", "*.msgpack", "*.gguf", "*.pt", "*.pth")
@@ -242,12 +243,14 @@ def _build(src, out: Path) -> dict:
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(src, rel, out / rel)
-        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin", ".onnx")) and not _weight_copy(
-                rel, src.files):
+        elif (size > (MAX_ASSET_BYTES if rel.endswith(".onnx") else SMALL_WEIGHT_FILE)
+              and rel.endswith((".pt", ".pth", ".bin", ".onnx")) and not _weight_copy(rel, src.files)):
             shapes_only = _shapes_only_onnx if rel.endswith(".onnx") else _shapes_only_torch_file
             count = shapes_only(src.fetch(rel), out / rel)
             if count is None:
                 notes.append(f"skipped {rel}: not a plain tensor file or ONNX model")
+            elif rel.endswith(".onnx"):
+                notes.append(f"{rel}: its large weights read as zeros, so a runtime would run it on them")
             params += count or 0
         elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
                 fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS)):
