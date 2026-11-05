@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -281,11 +281,12 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         self.config = config
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token",
-            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER, walk=DECODE_WALK,
         )
-        # The decode walk reads its last token off the node's loop-back rows and
-        # its timestamp rule state from the sampler's declared loop-back state
-        # beside it (`device_loopback_signals`).
+        # word-timestamp rows still decoding, whose tokens the align walk reads
+        self._transcribing: set[int] = set()
+        # The decode walk reads its last token and its timestamp rule state
+        # off the node's loop-back rows.
         self.device_loopback = DeviceLoopback(
             walk=DECODE_WALK, signal="text_inputs", buffer="new_token", states=(TS_RULES,),
         )
@@ -717,23 +718,41 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
-    def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (EOS) on a decode row's token; a prompt
-        walk's token never stops the loop. Either way the token
-        is kept for the align walk first."""
-        if info.graph_walk != DECODE_WALK:
-            self._record_prompt_token(info, token)
-            return False
-        self._record(info, token)
-        if not super()._token_stops(request_id, token, info):
-            return False
-        self.request_state(info.rid_handle).add("stopped", True)
-        return True
+    def cleanup_request(self, request_id: str):
+        self._transcribing.discard(request_id)
+        super().cleanup_request(request_id)
+
+    def token_rows(self, graph_walk: str, request_ids: Sequence[int]) -> Sequence[int]:
+        # a prompt walk's token starts the transcript; a decode row's extends it
+        if graph_walk != DECODE_WALK:
+            return request_ids
+        return [rid for rid in request_ids if rid in self._transcribing] if self._transcribing else ()
+
+    def record_tokens(
+        self, graph_walk: str, tokens: Mapping[int, Sequence[int]], infos: Mapping[int, CurrentForwardPassInfo],
+    ) -> None:
+        """Keep each row's tokens for the align walk (the loop doesn't persist
+        them). Nothing past the one that stops its loop: a speculated step, or
+        the rest of a run, ran on past it."""
+        for rid, row in tokens.items():
+            info = infos[rid]
+            if graph_walk != DECODE_WALK:
+                self._record_prompt_token(info, row[0])
+                continue
+            state = self.request_state(info.rid_handle)
+            if state.get("stopped", False):
+                continue
+            for token in row:
+                state.get("decoded").append(token)
+                if self._token_stops(rid, token, info):
+                    state.add("stopped", True)
+                    self._transcribing.discard(rid)
+                    break
 
     def _record_prompt_token(self, info: CurrentForwardPassInfo, token: int) -> None:
         """For a word-timestamp request, keep what the align walk needs off a
         prompt walk's host token: the detected language, or the first
-        transcript token, which starts the transcript ``_record`` extends."""
+        transcript token, which starts the transcript ``record_tokens`` extends."""
         # Interim: the transcript lives in request state until the decode
         # loop's outputs reach the align walk directly.
         if not info.step_metadata.get("word_timestamps"):
@@ -743,20 +762,5 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             state.add("language", token)
         else:
             state.add("decoded", [token])
-
-    def _record(self, info: CurrentForwardPassInfo, token: int) -> None:
-        """Keep a decode step's token for the align walk (the loop no longer
-        persists them), if the request has a transcript started. Nothing after
-        the step that stopped the loop: a speculative step past it must not
-        extend the transcript. Once per step: when the batched stop check
-        raises partway, the engine re-runs it per request, and a step whose
-        token is already in (after the prompt's, one per earlier iteration) is
-        not appended again."""
-        state = self.request_state(info.rid_handle)
-        decoded = state.get("decoded", None)
-        if (
-            decoded is not None and not state.get("stopped", False)
-            and len(decoded) == 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
-        ):
-            decoded.append(token)
+            self._transcribing.add(info.rid_handle)
 

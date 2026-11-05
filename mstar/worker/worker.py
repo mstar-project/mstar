@@ -483,6 +483,8 @@ class Worker:
 
     # (node, walk) -> its stop policy that withholds outputs; set at load
     _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
+    # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
+    _token_readers: frozenset[str] = frozenset()
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -3993,6 +3995,8 @@ class Worker:
         # Main loop only: the runtime holds `&mut self` across its GIL
         # release, so a concurrent caller gets "Already mutably borrowed"
         # rather than blocking.
+        if host_rows is not None and batch_N.node_name in self._token_readers:
+            engine.record_tokens(batch_N.node_batch, batch_N.batch.rids_by_walk(), host_rows)
         rt = self._graph_runtime
         _t_rt = _time.perf_counter() if self._phase_period else 0.0
         step = rt.begin_postprocess(request)
@@ -4207,6 +4211,9 @@ class Worker:
         # (node, walk) -> the token signal its policies read, or None
         self._stop_token_signal: dict[tuple[str, str], str | None] = {}
         self._withholding = {}
+        self._token_readers = frozenset(
+            node for node, _ in walks if self.engine_manager.get_engine(node).reads_tokens(node)
+        )
         for node, walk in sorted(walks):
             policies = self.engine_manager.get_engine(node).get_stop_policies(node, walk)
             if policies is None:

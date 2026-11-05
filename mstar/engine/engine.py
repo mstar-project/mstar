@@ -2579,6 +2579,26 @@ class Engine:
         laps.lap("tail")
         return outputs
 
+    def reads_tokens(self, node_name: str) -> bool:
+        """Whether the node keeps its landed tokens (``NodeSubmodule.record_tokens``)."""
+        mgmt = self._submodules.get(node_name)
+        return mgmt is not None and type(mgmt.submodule).record_tokens is not NodeSubmodule.record_tokens
+
+    def record_tokens(self, batch: ExecutingBatch, walk_rids: Mapping[str, Sequence[int]], host_rows: HostRows) -> None:
+        """Hand the node the host tokens of the rows it reads them for."""
+        submodule = self._submodules[batch.node_name].submodule
+        buffer = host_rows.buffers[submodule.token_stop.buffer]
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        tokens = None
+        for walk, rids in walk_rids.items():
+            wanted = submodule.token_rows(walk, [rid for rid in rids if rid in row_of])
+            if wanted:
+                if tokens is None:
+                    tokens = buffer.reshape(buffer.shape[0], -1).tolist()
+                submodule.record_tokens(
+                    walk, {rid: tokens[row_of[rid]] for rid in wanted}, batch.per_request_info_wrapped,
+                )
+
     def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
         """The node's declared stop policies on ``graph_walk``
         (``NodeSubmodule.get_stop_policies``); None when ``check_stop``

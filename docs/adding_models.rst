@@ -1479,6 +1479,12 @@ methods are:
    scheduling overlap. Use this method only to rename outputs for routing. Put decisions
    that depend on tensor values in ``check_stop``.
 
+``token_rows(...)`` and ``record_tokens(...)`` (optional)
+   A node that keeps its host tokens gets them as a step lands, every iteration of a step
+   that repeats, without giving up the runtime's stop check. Whisper's decoder keeps a
+   word-timestamp request's transcript for its align walk this way. Only ``token_rows``'
+   rows are read, so a step with none costs nothing.
+
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop

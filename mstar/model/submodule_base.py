@@ -1143,6 +1143,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def token_rows(self, graph_walk: str, request_ids: Sequence[int]) -> Sequence[int]:
+        """Of a landed step's rows, those ``record_tokens`` wants."""
+        del graph_walk, request_ids
+        return ()
+
+    def record_tokens(
+        self, graph_walk: str, tokens: Mapping[int, Sequence[int]], infos: Mapping[int, CurrentForwardPassInfo],
+    ) -> None:
+        """A landed step's host tokens, every iteration of it, by row, for a
+        node that keeps them (``token_rows``). The stop check doesn't see this:
+        it runs in the graph runtime, on the same tokens, past which a row's
+        later iterations don't count. Before the step routes."""
+        return
+
     def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
         """How each loop-back signal of this walk (``signals``, from the graph)
         moves from one replay of its capture to the next: the output the
