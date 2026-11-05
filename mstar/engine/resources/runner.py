@@ -12,7 +12,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import replace
 from typing import Any
 
-from mstar.engine.resources.admission import Admission
+from mstar.engine.resources.admission import Admission, Refusal
 from mstar.engine.resources.base import CachedLease, CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -462,6 +462,9 @@ class StepRunner:
 
     def newer_than(self, rid: str) -> list[str] | None:
         return self._admission.newer_than(rid)
+
+    def oldest_refusal(self) -> Refusal | None:
+        return self._admission.oldest_refusal()
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
