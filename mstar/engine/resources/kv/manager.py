@@ -4858,8 +4858,11 @@ class KVManager(AttentionResource):
 
     def _claim(self, rid: str, pages: int) -> None:
         """Add the ``pages`` of room a short grant counted to ``rid``'s allotment."""
+        # `_allot` of none would still raise the allotment to what ``rid`` holds, with no move for followers to replay
+        if not pages:
+            return
         self._allot(rid, pages)
-        if self.journal is not None and pages:
+        if self.journal is not None:
             self.journal(MoveKind.ALLOT, rid, pages)
 
     def _earmark(self, rid: str, pages: int, victims: list[str]) -> list[str]:
