@@ -3666,7 +3666,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments.get(rid)
             returns = max(
                 0 if allotment is None else allotment.prompt,
-                sum(self._one_more(history, stream.footprint) for stream in streams),
+                sum(self._one_more(stream.groups, history, stream.footprint) for stream in streams),
             )
             held = self._laid_out_tokens(rid)
             self.reset_request(rid, free=True)
@@ -3956,16 +3956,17 @@ class KVManager(AttentionResource):
         its reload plus a page per stream (`_one_more`, as a drop counts a history), less the reload."""
         reloaded = grown = 0
         for label, state in self._cpu_pool.offloaded[rid].items():
-            pages, first = len(state.host_pages), len(state.groups[0].page_indices)
-            reloaded += pages
-            # a later group's pages have no footprint of their own
-            grown += pages - first + self._one_more(first, self._streams[rid][label].footprint)
+            reloaded += len(state.host_pages)
+            first = len(state.groups[0].page_indices)
+            grown += self._one_more(state.groups, first, self._streams[rid][label].footprint)
         return max(self._asks[rid], grown, reloaded) - reloaded
 
     @staticmethod
-    def _one_more(pages: int, footprint: int | None) -> int:
-        """``pages`` and one page more, at most ``footprint``."""
-        return pages + 1 if footprint is None else min(pages + 1, footprint)
+    def _one_more(groups: Sequence[GroupPages], first: int, footprint: int | None) -> int:
+        """``first`` pages in the first of ``groups`` and one page more, at most ``footprint``, and the pages the later
+        groups hold, which have no footprint of their own."""
+        later = sum(len(part.page_indices) for part in groups[1:])
+        return later + (first + 1 if footprint is None else min(first + 1, footprint))
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
