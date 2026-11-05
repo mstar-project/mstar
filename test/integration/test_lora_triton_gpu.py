@@ -441,8 +441,9 @@ def test_experts_kernels_match_the_reference(tokens, top_k, stage):
     assert torch.equal(got[untouched], y0.to(torch.bfloat16)[untouched])
 
 
-# a small MoE layer: experts, hidden, intermediate, top-k, adapter rank
-MOE_E, MOE_HIDDEN, MOE_INTER, MOE_TOP_K, MOE_RANK = 8, 256, 128, 2, 8
+# a small MoE layer: experts, hidden, intermediate, top-k, adapter rank; the hidden size passes
+# ``routed_fits``, so an unbound layer runs main's per-pair GEMVs at a few tokens
+MOE_E, MOE_HIDDEN, MOE_INTER, MOE_TOP_K, MOE_RANK = 8, 1024, 128, 2, 8
 
 
 def write_experts_adapter(path, seed):
@@ -526,7 +527,13 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
     routing-weighted down delta before the top-k sum), two adapters and base rows in one batch,
     against each row's adapter merged into its experts in fp32: eagerly, and inside one captured
     graph replayed for other adapter mixes (``captured-compiled`` captures the Inductor-compiled
-    forward, as the runner does). Base rows (and bucket padding) are bitwise the unbound layer's."""
+    forward, as the runner does). Base rows (and bucket padding) are bitwise the unbound layer's on
+    the grouped path. An eager step of at most ``ROUTED_MAX_TOKENS`` tokens, where an unbound layer
+    takes the per-pair GEMVs, keeps a bound one on the grouped GEMMs its deltas join."""
+    from mstar.utils.fused_moe.align import moe_align_block_size
+    from mstar.utils.fused_moe.decode import ROUTED_MAX_TOKENS
+    from mstar.utils.fused_moe.runner import MoeAlignment, moe_block_m, runs_per_pair
+
     paths, refs = {}, {}
     for name, seed in (("e1", 1), ("e2", 2)):
         paths[name] = str(tmp_path / f"{name}.safetensors")
@@ -545,13 +552,20 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
                 check(out[rows].float() - base[rows].float(), want, f"experts {name}")
             at += n
 
-    mixes = [[("m0", "e1", 9), ("m1", None, 1), ("m2", "e2", 20)], [("m3", "e2", 5), ("m4", None, 30)]]
+    mixes = [[("m0", "e1", 9), ("m1", None, 1), ("m2", "e2", 20)], [("m3", "e2", 5), ("m4", None, 30)],
+             [("m5", "e1", 3), ("m6", None, 2)]]
     if case == "eager":
         for mix in mixes:
             step, ctx = eager_step(pool, mix)
             x, weights, ids = routed(sum(n for *_, n in mix), g)
+            assert runs_per_pair(x, plain.gate_up_proj) == (len(x) <= ROUTED_MAX_TOKENS)
+            # the unbound layer given the alignment fused_experts would make: the grouped path at
+            # every size, so its rows compare bitwise
+            block_m = moe_block_m(len(x), plain.gate_up_proj, MOE_TOP_K)
+            alignment = MoeAlignment(*moe_align_block_size(ids.to(torch.int32).contiguous(), block_m, MOE_E),
+                                     block_m)
             with torch.no_grad():
-                out, base = bound(x, weights, ids), plain(x, weights, ids)
+                out, base = bound(x, weights, ids), plain(x, weights, ids, alignment=alignment)
             pool.commit(step, ctx)
             compare(mix, out, base, x, weights, ids)
             for rid, *_ in mix:
