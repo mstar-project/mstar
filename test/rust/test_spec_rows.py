@@ -77,8 +77,7 @@ class _StubTM:
 
 class _Scheduler:
     """The scheduler questions the speculation asks: no backlog, an optional
-    cap, every row ready for the next node, and the fresh rows a test queues
-    (the same batch to both builds)."""
+    cap, and the fresh rows a test queues (the same batch to both builds)."""
     failed_rids: set = frozenset()
 
     def __init__(self):
@@ -89,7 +88,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(self, target, continuing, mid_prefill=(), next_iter_of=None):
         # the chain keeps its rows up to the cap whatever loop it advances; the
         # fresh rows come from the take
         rows = list(continuing)
@@ -98,11 +97,8 @@ class _Scheduler:
             held_back=set(), ordered=False,
         ), [])
 
-    def take_chain_step(self, state, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
+    def take_chain_step(self, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
         return self.get_next_batch()
-
-    def _check_ready(self, node_name, rid, fwd_info):
-        return True
 
     def get_next_batch(self, *a, **k):
         if self.fresh is None:
@@ -156,6 +152,7 @@ def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -
         tensor_manager=tm,
         request_state=RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART}),
         scheduler=_Scheduler(),
+        admission=SimpleNamespace(check_ready=lambda node_name, rid, fwd_info: True),
     )
     w.streams = StreamBufferManager(w.request_state, tm, [])
     # no resource splits a walk here, so a mixed step keeps its rows' order
