@@ -346,8 +346,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        says so. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
        the node while a request with log-probs is live. ``device_stop`` (default ``off``):
        ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
-       ending on the first of: every row done, the run's count, ready work on the worker or
-       ``refill_at`` (a share of the run's rows done; default off). A live row hands on to the
+       ending on the first of: every row done, the run's count, ready work on the worker, a
+       new request arriving while it runs, or ``refill_at`` (a share of the run's rows done; default off). A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. ``device_launch: on`` asks for that run
@@ -368,7 +368,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        score each row's stop ids at temperature 1; when a run's last iteration gives a row more
        than ``p``, the next run is cut to ``1 / odds`` iterations, about when that stop lands.
        At startup the worker logs one line per Loop walk with each capability
-       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``) ``on``,
+       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``,
+       ``eos odds``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
        and copies go out from one Rust call with the GIL released; a capture that draws from
        a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for

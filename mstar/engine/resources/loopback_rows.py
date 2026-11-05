@@ -71,7 +71,7 @@ class LoopbackRows(Resource):
         self._device = device
         # request rows, the trash row excluded
         self.capacity = knobs.sampler_slots() if capacity is None else capacity
-        # as the sampler: admission decides at one rank only, or ranks could split on a request
+        # admission decides at one rank only, or ranks could split on a request
         self._decides = decides
         self._max_bs = 1
         self._tables: dict[str, torch.Tensor] = {}

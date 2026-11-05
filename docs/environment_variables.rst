@@ -706,10 +706,10 @@ Worker scheduling
        once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
-       one. For every captured sampler that decides its draws, whether or not
-       its node reads its tokens back on the device, on one rank: above one,
-       where admission doesn't decide, the masters grow and the scatter runs
-       after the replay, as with ``0``. A step that repeats needs it.
+       one. For every captured sampler, whether or not its node reads its
+       tokens back on the device, on every rank: a TP follower runs its
+       leader's steps, so it admits the same rows in the same order. A step
+       that repeats needs it.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when

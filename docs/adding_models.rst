@@ -1680,8 +1680,9 @@ a walk may repeat is settled once, after capture, and the worker logs it per wal
 reason when it can't: the walk must be resident, or planned on the host with a step that
 keeps nothing (a ``KVStep(commit=False)`` and positions that don't advance, as an action
 loop's denoise over a fixed prefix: its one plan serves every replay); its stop must be
-the runtime's (a token stop, or the loop's cap); it must run on one rank, and each of
-its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,
+the runtime's (a token stop, or the loop's cap); under TP every rank runs its leader's
+count, which each rank's resources narrow alike (a follower that settles otherwise stops);
+and each of its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,
 per-iteration or terminal) must be one a run serves, and every resource of the node must answer
 ``Resource.repeat_refusal(walk, host_step)`` with None (``host_step``: its part of a
 host-planned walk's step). The default refuses, so a resource takes part only
