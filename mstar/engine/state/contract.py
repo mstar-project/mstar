@@ -144,8 +144,10 @@ class Array:
         where = f"Array {self.name!r}"
         if not self.nodes:
             raise ValueError(f"{where}.nodes must be non-empty")
-        if not self.layers or not all(type(layer) is int and layer >= 0 for layer in self.layers):
-            raise ValueError(f"{where}.layers must be non-empty ints >= 0, got {sorted(self.layers, key=repr)}")
+        if not all(type(layer) is int and layer >= 0 for layer in self.layers):
+            raise ValueError(f"{where}.layers must be ints >= 0, got {sorted(self.layers, key=repr)}")
+        if not self.layers and not is_value(self):
+            raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not _is_positive(self.max_len):
             raise ValueError(f"{where}.max_len must be a positive int, got {self.max_len!r}")
         self._check_entry()
@@ -155,10 +157,13 @@ class Array:
             self._check_update(key, update)
 
     def _check_entry(self) -> None:
+        # with no layers nothing is stored or read, so an axis may be 0
+        least = 1 if self.layers else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(map(_is_positive, tensor.shape))):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of positive ints, got {tensor.shape!r}")
+            shape = tensor.shape
+            if not (isinstance(shape, tuple) and shape and all(type(axis) is int and axis >= least for axis in shape)):
+                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         for name, kind in self.entry.host.items():

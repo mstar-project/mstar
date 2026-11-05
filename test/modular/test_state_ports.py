@@ -220,12 +220,11 @@ def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
 
 
 @pytest.mark.parametrize("overrides, where", [
-    ({"layer_types": [FULL_ATTENTION] * 32}, "Array 'gdn_state'.layers"),
     ({"layer_types": [LINEAR_ATTENTION] * 32}, "Array 'kv_cache'.layers"),
     ({"linear_conv_kernel_dim": 1}, "Array 'gdn_state'.entry.tensors['conv'].shape"),
     ({"num_attention_heads": 15}, "Array 'kv_cache'.reads['attn'].op"),
     ({"max_position_embeddings": 262144.0}, "Array 'kv_cache'.max_len"),
-], ids=["all full", "all linear", "conv kernel of 1", "query heads off the KV heads", "float length"])
+], ids=["all linear", "conv kernel of 1", "query heads off the KV heads", "float length"])
 def test_qwen3_5_refuses_a_shape_no_published_config_has(overrides, where):
     with pytest.raises(ValueError, match=re.escape(where)):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
