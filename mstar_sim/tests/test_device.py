@@ -693,7 +693,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     a value-less GPU tensor moves nothing but costs its NCCL time. Data moves only
     if every rank holds it."""
     out = run_sim("""
-        import os, tempfile, torch, torch.distributed as dist, torch.multiprocessing as mp
+        import tempfile, torch, torch.distributed as dist, torch.multiprocessing as mp
 
         def rank(r, path):
             dist.init_process_group("nccl", init_method=f"file://{path}", rank=r,
