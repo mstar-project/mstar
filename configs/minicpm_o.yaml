@@ -4,7 +4,8 @@ max_seq_len: 16384
 # encoders run once per request and then idle, so they share the LLM's
 # worker. The TTS and the vocoder each get their own worker loop: a vocoder
 # step takes 40-150 ms, which on a shared loop would hold up the
-# TTS's few-millisecond decode steps (and the LLM's).
+# TTS's few-millisecond decode steps (and the LLM's). After startup the three
+# hold ~57 GiB in all, which fits an 80 GB H100.
 rank_devices: {0: 0, 1: 0, 2: 0}
 # The three workers' kernels overlap as clients of one MPS daemon, rather than
 # time-slicing the GPU.
