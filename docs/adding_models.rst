@@ -2446,8 +2446,8 @@ same state on every SP partner) do; dense, flex, XPU and MLA (``flashinfer_mla``
 cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
 A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
 one plans on the host rather than resident (``resident_planning``). A node that captures a step
-combining labels into one plan (classifier-free guidance, ``total_tokens_multiplier`` above 1) is
-refused at load: a replay's padding rows would sit between its real ones.
+combining labels into one plan (``KVStep.combined_labels``, as classifier-free guidance does) at a
+batch size above 1 is refused at load: a replay's padding rows would sit between its real ones.
 
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages

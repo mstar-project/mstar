@@ -10,6 +10,7 @@ import os
 import sys
 import types
 from dataclasses import dataclass, replace
+from unittest import mock
 
 sys.path.insert(0, ".")
 
@@ -735,23 +736,32 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
     assert len(exchanged) == 1
 
 
-def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load():
+@pytest.mark.parametrize("batch_sizes, multiplier", [([1, 2], 1), ([1], 2)], ids=["padded", "one_row"])
+def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_can_pad(batch_sizes, multiplier):
     """A combined plan is label-major (cond's rows, then uncond's), so a replay's padding rows sit
-    between real ones, which attention over a placed pool can't plan (Chatterbox T3 with CFG)."""
+    between real ones, which attention over a placed pool can't plan (Chatterbox T3 with CFG). The
+    capture's own declaration decides, as Cosmos3's prefill combines labels with no token multiplier;
+    a capture of one row never pads."""
     config = BatchedAcceleratorGraphConfig(
         capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
-        total_tokens_multiplier=2,
+        capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    resources = {"kv": types.SimpleNamespace(placement=PagedKVConfig(
+    kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
-    ).place(joint, "kv"))}
-    with pytest.raises(ValueError, match=r"t3: the captures of \['decode'\] combine labels.*\['kv'\]"):
-        AcceleratorGraphRunner(
-            submodule_name="t3", submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config]),
-            resources=resources, step_runner=None, device=CPU, autocast_dtype=None, joint_comm_group=joint,
-            num_slots=1, head_shards=1,
-        )
+    ).place(joint, "kv"))
+    step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
+    runner = AcceleratorGraphRunner(
+        submodule_name="t3", resources={"kv": kv}, step_runner=mock.Mock(), device=CPU, autocast_dtype=None,
+        submodule=types.SimpleNamespace(get_accelerator_graph_configs=lambda *args: [config],
+                                        declare_step=lambda **kwargs: step),
+        joint_comm_group=joint, num_slots=1, head_shards=1,
+    )
+    if len(batch_sizes) == 1:
+        assert runner.prepare_for_capture()
+        return
+    with pytest.raises(ValueError, match=r"t3: the capture of 'decode' at batch size 2 combines labels.*\['kv'\]"):
+        runner.prepare_for_capture()
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):
