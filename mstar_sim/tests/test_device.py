@@ -669,6 +669,11 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             gathered = torch.zeros(4, 4, device="cuda")
             dist.all_gather_into_tensor(gathered, flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1))
             assert never_computed(gathered._data)
+            # a value one rank never computed taints what every rank received
+            part = torch.ones(1, 4, device="cuda")
+            whole = torch.zeros(2, 4, device="cuda")
+            dist.all_gather_into_tensor(whole, flashinfer.top_k_renorm_probs(part, 1) if r else part)
+            assert never_computed(whole._data)
             # it reads its source and writes its destination: a whole write of computed values
             # ends the fact there, and what didn't move leaves a source computed
             src = torch.arange(4, device="cuda").float()

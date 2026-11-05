@@ -26,10 +26,9 @@ large tensor's, one a stand-in wrote, and what kept ops derive from those, until
 write covers it. So a pass means every value the test itself read was computed, as far
 as the emulator can tell. It can't tell of a host value mstar read from one and handed on
 (a sampled token in a list, whose check then passes on zeros or fails as mstar's), of an
-allocation nothing wrote (it reads as zeros), of another rank's value (the fact doesn't
-cross ranks), or whether a real value could show what the test is for (a race, when values
-land at launch). The fact is per storage, so a real value beside a never-computed one reads
-as never computed, until a whole write.
+allocation nothing wrote (it reads as zeros), or whether a real value could show what the
+test is for (a race, when values land at launch). The fact is per storage, so a real value
+beside a never-computed one reads as never computed, until a whole write.
 
 Every other failure stays a failure: an exception mstar's own code raised (a lifecycle
 or planning error, an API that moved, a crash), whatever ran before it, or an assertion

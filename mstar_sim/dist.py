@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import operator
 import os
 import resource
 import sys
@@ -57,20 +58,22 @@ def _sim_tensors(args, kwargs) -> list[torch.Tensor]:
 
 
 # --- the meet. A rank's descriptor of a collective is one int64 row:
-# (primitive, numel, dtype, op, root, holds values, elements sent to each rank, received
-# from each). The first five must be equal on every rank, and what rank i sends rank j is
-# what j receives from i; the AND of the sixth says whether the data moves.
+# (primitive, numel, dtype, op, root, values, elements sent to each rank, received from
+# each). The first five must be equal on every rank, and what rank i sends rank j is what j
+# receives from i. The sixth is bits, ANDed across ranks: HELD, whether the data moves (every
+# rank holds values), and COMPUTED, whether what it writes is (every rank's were).
 _PRIMITIVES = ("AllReduce", "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllToAll",
                "AllReduceFusion", "Graph", "Barrier")
 _DTYPES = tuple(dict.fromkeys(v for v in vars(torch).values() if isinstance(v, torch.dtype)))
-_HELD = 5
+_HELD = 5  # the values field
+HELD, COMPUTED = 1, 2
 
 
 def row(primitive: str, numel: int = 0, dtype: torch.dtype | None = None, op: int = 0, root: int = 0,
-        held: bool = False, send: list[int] | None = None, recv: list[int] | None = None, size: int = 1):
+        values: int = 0, send: list[int] | None = None, recv: list[int] | None = None, size: int = 1):
     """A collective's descriptor (``send``/``recv``: elements to and from each of the ``size`` ranks)."""
     return [_PRIMITIVES.index(primitive), numel, _DTYPES.index(dtype) if dtype is not None else -1, op, root,
-            int(held), *(send or [0] * size), *(recv or [0] * size)]
+            values, *(send or [0] * size), *(recv or [0] * size)]
 
 
 def _describe(r: list[int]) -> str:
@@ -138,23 +141,23 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     return rows
 
 
-def collective(family: str, group, nbytes: int, desc: list[int] | None) -> bool:
+def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
     """A collective on ``group`` (None: the default one) described by ``desc`` (:func:`row`;
     None for point to point, which has no group to meet on): charged its NCCL time (cost
     ``family``) on the current stream, then met with the group's other ranks, or recorded on
-    the graph being captured, whose replays meet. Returns whether its data can move: every
-    other rank holds its values, and it isn't captured."""
+    the graph being captured, whose replays meet. Returns the values bits every other rank set
+    (all of them with none to meet; none when captured)."""
     size = dist.get_world_size(group) if dist.is_initialized() else 1
     tape = clock.capturing()
     if not clock.FAST:
         clock.charge(cost.collective_seconds(family, size, nbytes, graph=tape is not None))
     if desc is None or size == 1:
-        return tape is None
+        return -1 if tape is None else 0
     group = group or dist.group.WORLD
     if tape is not None:
         tape.collectives.append((group, desc[:_HELD]))
-        return False
-    return all(r[_HELD] for r in _meet(group, desc))
+        return 0
+    return functools.reduce(operator.and_, (r[_HELD] for r in _meet(group, desc)))
 
 
 def seal(tape: clock.Tape) -> None:
@@ -213,8 +216,12 @@ def _collective(name: str, family: str, primitive: str | None):
         a = bound.arguments
         group = a.get("group")
         nbytes = max(t.numel() * t.element_size() for t in tensors)
-        held = all(t._data.device.type != "meta" for t in tensors)
         written = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
+        covered = [] if name in _READS_WHAT_IT_WRITES else [t for t in written if device._covers(t._data)]
+        # what it writes is computed if all it reads was, on every rank
+        mine = (HELD * all(t._data.device.type != "meta" for t in tensors)
+                | COMPUTED * (not any(device.never_computed(t._data) for t in tensors
+                                      if not any(t is c for c in covered))))
         desc = None  # point to point (mstar sends none)
         if primitive is not None:
             size = dist.get_world_size(group) if dist.is_initialized() else 1
@@ -225,18 +232,16 @@ def _collective(name: str, family: str, primitive: str | None):
             root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
             op = a.get("op")
             desc = row(primitive, 0 if send else sum(t.numel() for t in written), (written or tensors)[0].dtype,
-                       op=int(op) if op is not None else 0, root=root, held=held, send=send, recv=recv, size=size)
-        moved = collective(family, group, nbytes, desc) and held
+                       op=int(op) if op is not None else 0, root=root, values=mine, send=send, recv=recv, size=size)
+        values = collective(family, group, nbytes, desc) & mine
+        moved = bool(values & HELD)
         work = _Done() if kwargs.get("async_op") else None
         if moved:
             # every rank holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
             work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
-        covered = [] if name in _READS_WHAT_IT_WRITES else [t for t in written if device._covers(t._data)]
-        # what it wrote is computed if all it read here was (the fact doesn't cross ranks); what
-        # didn't move, or a captured one at each replay, wasn't
-        never = not moved or any(device.never_computed(t._data) for t in tensors
-                                 if not any(t is c for c in covered))
+        # what didn't move, or a captured one at each replay, wasn't computed
+        never = not (moved and values & COMPUTED)
         kept = [t._data for t in written if t._data.device.type != "meta"]
 
         def flag():
