@@ -51,7 +51,8 @@ from mstar.engine.state import (
     rope,
     sample,
 )
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, WithinStepHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.within_step import WithinStepHandle
 
 LAYERS, SLOTS, HEADS, DIM = 4, 64, 2, 8
 TOKENS = 3

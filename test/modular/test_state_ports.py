@@ -175,6 +175,9 @@ class _StubResource:
     def block(self, name, i):
         return torch.empty(0)
 
+    def run(self, q, k=None, v=None, label=None):
+        return q
+
 
 def _bind(node, model, node_name="LLM"):
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}

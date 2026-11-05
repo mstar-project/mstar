@@ -237,35 +237,6 @@ class ArrayHandle(StepHandle):
             self._pool.scatter_(field, value, self._pool_layer[layer], label=self.label)
 
 
-class WithinStepHandle(ArrayHandle):
-    """The calls on an array with ``max_len`` 0, which a block compiled alone traces. With ``compile_op`` set, the read
-    stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
-    on the layer, and the block would retrace per layer. The graph doesn't take the layer at all, so nothing specializes
-    on it."""
-
-    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
-        """Hold k and v for this layer's read. Every add here is scratch."""
-        if keep:
-            raise self._refusal("keep=True, and max_len 0 keeps nothing between steps")
-        if not torch.compiler.is_compiling():
-            self._held_layer = self._layer_id(layer)
-            self._record_add(self._held_layer, keep)
-        self._held = fields["k"], fields["v"]
-
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
-        """Attend ``q`` over this layer's latest add, within each row's segment."""
-        if q is None:
-            raise self._no_layout("a read with no op")
-        if mask_args:
-            raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
-        if not torch.compiler.is_compiling():
-            self._record_read(self._layer_id(layer))
-        # Dropped here, not at the step's end: a compiled frame would otherwise return k and v from its graph, which
-        # keeps the whole projection they are views of alive through the next layer.
-        k, v = self._take_hold(layer)
-        return self.first_read.run(q, k, v, label=self.label)
-
-
 class SamplerHandle(StepHandle):
     """A node's calls on one declared sampler. Its rows are the step's, padding included."""
 
@@ -365,4 +336,7 @@ def last_sampled(s: SamplerHandle) -> torch.Tensor:
 
 def kernel_setting(h: ArrayHandle, read: str, field: str) -> Any:
     """The value of a `kernel_settings` field in effect, YAML included, until the engine picks kernels itself."""
-    return getattr(h.reads[read], field)
+    resource = h.reads[read]
+    if resource is None:
+        raise h._refusal(f"no {field} for read {read!r}, which runs SDPA and has no kernel")
+    return getattr(resource, field)

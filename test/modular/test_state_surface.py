@@ -17,7 +17,8 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.calls import ArrayHandle, WithinStepHandle
+from mstar.engine.state.calls import ArrayHandle
+from mstar.engine.state.within_step import WithinStepHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
 _POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
