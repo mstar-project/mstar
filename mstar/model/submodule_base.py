@@ -832,7 +832,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
     # Walks whose steps may run beside the worker's main chain, on a second
-    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # stream (``StepPipeline._launch_side``); they do where the node's group in
     # the serving config sets ``side_stream: true``. For a stream-fed walk that
     # no chain step waits on. Where the config asks, ``EngineManager.build``
     # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its

@@ -13,7 +13,7 @@ RequestLifecycle.{failed_rids, arrivals, pending_removes, _wires, _unreported}
 (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
 parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
-Worker._pending_loop_stops, RequestStateManager.{per_request_info, _fwd_by_partition}
+RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
