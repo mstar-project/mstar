@@ -1770,7 +1770,7 @@ def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_as_the_move_
     assert "o" in leader._allotments, "v's move didn't make room for o"
     assert ("o" in leader._guaranteed) is not rebuildable, "the host had room for o's prompt"
     delta = lead.take_resident_delta()
-    assert delta.kinds == [MoveKind.RESERVE, MoveKind.OFFLOAD, MoveKind.OFFLOAD], (
+    assert delta.kinds == [MoveKind.WAIT, MoveKind.RESERVE, MoveKind.OFFLOAD, MoveKind.OFFLOAD], (
         "rank 0 journaled o's admit from inside v's move, which a follower replays before v's pages come free"
     )
     assert follow.apply_resident_delta(delta, _rebuilds_none)

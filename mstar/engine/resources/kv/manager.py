@@ -4728,9 +4728,9 @@ class KVManager(AttentionResource):
         earmark ``rid`` holds add nothing. A request on the host is allotted its reload as well, which then leaves
         `_return_pages` on top of what it holds."""
         if rid in self._allotments:
+            del self._asks[rid]
             self._parked.discard(rid)
             self._allot(rid, pages)
-            del self._asks[rid]
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), returning=returning)
@@ -4883,12 +4883,9 @@ class KVManager(AttentionResource):
                 return Victims([], [], [])
             victims = self._choose(pages_short, newer, droppable)
             if victims is None:
-                # Any move of ``rid`` from here on returns it with what its grant needed. Back with a page alone, it
-                # would run short again at once.
-                allotment = self._allotments[rid]
-                allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + short.pages)
-                self._asks[rid] = short.pages
-                self._parked.add(rid)
+                self._wait(rid, short.pages)
+                if self.journal is not None:
+                    self.journal(MoveKind.WAIT, rid, short.pages)
                 pages = self._host_pages(rid)
                 if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
                     self._host(rid, [rid])
@@ -4896,6 +4893,14 @@ class KVManager(AttentionResource):
                 return Victims([], [], [], waits=short.pages)
             self._claim(rid, claim)
             return self._earmark(Earmark(rid, pages_short, set()), victims)
+
+    def _wait(self, rid: str, pages: int) -> None:
+        """Make ``rid``, which holds its allotment, ask for the ``pages`` its grant needed past it. Any move of ``rid``
+        from here on returns it with them, since back with a page alone it would run short again at once."""
+        allotment = self._allotments[rid]
+        allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + pages)
+        self._asks[rid] = pages
+        self._parked.add(rid)
 
     def _claim(self, rid: str, pages: int) -> None:
         """Add the ``pages`` of room a short grant counted to ``rid``'s allotment."""
@@ -4907,8 +4912,9 @@ class KVManager(AttentionResource):
             self.journal(MoveKind.ALLOT, rid, pages)
 
     def any_parked(self) -> bool:
-        """Whether a request waits holding its allotment, as `make_room` needs. Read without the lock."""
-        return bool(self._parked)
+        """Whether a request waits holding its allotment in a pool that decides, as `make_room` needs. Read without
+        the lock."""
+        return self._decides and bool(self._parked)
 
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
@@ -5125,6 +5131,12 @@ class KVManager(AttentionResource):
                 self._asks[rid] = count
             elif kind == MoveKind.ALLOT:
                 self._claim(rid, count)
+            elif kind == MoveKind.WAIT:
+                if rid not in self._allotments:
+                    raise RuntimeError(
+                        f"KV {self.name}: rank 0 made {rid} wait holding an allotment, which this rank doesn't hold"
+                    )
+                self._wait(rid, count)
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
