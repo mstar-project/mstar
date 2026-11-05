@@ -11,6 +11,7 @@ test cannot chown without root.
 import base64
 import logging
 import os
+import re
 import stat
 
 import pytest
@@ -229,6 +230,80 @@ def test_dynamo_tensor_uploads_refuse_the_upload_dir(spec_name, bad_dir):
         _dynamo_tensor_uploads(spec_name, bad_dir)
 
 
+def test_a_dynamo_tensor_request_tells_the_client_only_an_error_id(bad_dir):
+    """Dynamo forwards the exception's message to the client, so the upload dir
+    refusal must not be in it: it names the path and both uids."""
+    import asyncio
+    from types import SimpleNamespace
+
+    pytest.importorskip("PIL")
+    from mstar.integrations.dynamo.bridges import TENSOR_SPECS, TensorBridge
+
+    bridge = TensorBridge(SimpleNamespace(upload_dir=bad_dir), TENSOR_SPECS["pi05"], "pi05")
+    request = {"tensors": [
+        _tensor("images", "Uint8", [2, 2, 2, 3], list(range(24))),
+        _tensor("prompt", "Bytes", [1], [list(b"pick")]),
+    ]}
+
+    async def drive():
+        async for _ in bridge.generate(request):
+            pass
+
+    with pytest.raises(Exception) as caught:  # noqa: PT011 — the type is the point below
+        asyncio.run(drive())
+    assert not isinstance(caught.value, PermissionError), caught.value
+    message = str(caught.value)
+    assert re.fullmatch(r"internal error \(error id [0-9a-f]{12}\)", message), message
+    assert "refusing" not in message and "uid" not in message
+
+
+def test_a_dynamo_realtime_commit_tells_the_client_only_an_error_id(bad_dir):
+    """The same for a committed realtime utterance, whose audio goes through
+    the upload dir: the error event reaches the client."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+    from mstar.integrations.dynamo.bridges import RealtimeBridge
+
+    pcm = base64.b64encode(b"\x00\x01" * 80).decode()
+    events = [
+        {"type": "input_audio_buffer.append", "audio": pcm},
+        {"type": "input_audio_buffer.commit"},
+    ]
+
+    async def client_events():
+        for event in events:
+            yield event
+
+    bridge = RealtimeBridge(SimpleNamespace(upload_dir=bad_dir), ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def collect():
+        return [e async for e in bridge.generate(client_events(), SimpleNamespace(
+            is_stopped=lambda: False, is_killed=lambda: False, stop_generating=lambda: None))]
+
+    errors = [e for e in asyncio.run(collect()) if e.get("type") == "error"]
+    assert errors, "the commit was accepted"
+    message = errors[0]["error"]["message"]
+    assert re.fullmatch(r"internal error \(error id [0-9a-f]{12}\)", message), message
+    assert errors[0]["error"]["type"] == "server_error"
+    assert "refusing" not in message and "uid" not in message
+
+
+def test_a_streamed_transcription_sends_an_error_event_for_a_refused_upload_dir(bad_dir):
+    """After the 200 the refusal has to go in band, with an id and no path:
+    each window's WAV is written through the upload dir."""
+    from mstar.api_server.openai.serving_transcriptions import _cutting_error_event
+
+    try:
+        ensure_private_dir(bad_dir)
+    except PermissionError as exc:
+        event = _cutting_error_event(exc)
+    assert "refusing" not in event and str(bad_dir).rstrip("/") not in event
+    assert re.search(r"internal error \(error id [0-9a-f]{12}\)", event), event
+    assert '"status": 500' in event or "'status': 500" in event or "500" in event
+
+
 def test_an_existing_file_at_the_upload_name_is_not_overwritten(tmp_path, monkeypatch):
     up = ensure_private_dir(tmp_path / "up")
     taken = up / "00000000-0000-0000-0000-000000000000.png"
@@ -387,9 +462,12 @@ def test_generate_rechecks_the_upload_dir_per_request(swapped_upload_dir, monkey
 
     path, target = swapped_upload_dir
     monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(upload_dir=path))
-    client = TestClient(entrypoint.app)
-    with pytest.raises(PermissionError, match="refusing"):
-        client.post("/generate", data={"text": "hi"}, files=[("files", ("a.png", b"img", "image/png"))])
+    client = TestClient(entrypoint.app, raise_server_exceptions=False)
+    r = client.post("/generate", data={"text": "hi"}, files=[("files", ("a.png", b"img", "image/png"))])
+    # the refusal names the dir and both uids, so the client gets an id only
+    assert r.status_code == 500
+    assert re.fullmatch(r"internal error \(error id [0-9a-f]{12}\)", r.json()["detail"]), r.text
+    assert str(path) not in r.text and "uid" not in r.text
     assert _written(path, target) == []
 
 
@@ -411,8 +489,30 @@ def test_generate_ws_rechecks_the_upload_dir_per_message(swapped_upload_dir, mon
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
         ws.send_text(json.dumps({"request_id": "r1", "files": [{"name": "a.png", "data": payload}]}))
         reply = json.loads(ws.receive_text())
-    assert reply["request_id"] == "r1" and reply["error"]
+    assert reply["request_id"] == "r1" and reply["status"] == 500
+    assert re.fullmatch(r"internal error \(error id [0-9a-f]{12}\)", reply["error"]), reply
+    assert str(path) not in json.dumps(reply)
     assert _written(path, target) == []
+
+
+def test_a_refused_upload_dir_is_logged_in_full_and_sent_as_an_id(swapped_upload_dir, monkeypatch, caplog):
+    """The operator needs the path and the owner uid; the client must not have
+    them. The id in the reply matches the one in the log line."""
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    path, _target = swapped_upload_dir
+    monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(upload_dir=path))
+    client = TestClient(entrypoint.app, raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger=entrypoint.logger.name):
+        r = client.post("/generate", data={"text": "hi"},
+                        files=[("files", ("a.png", b"img", "image/png"))])
+    error_id = re.search(r"error id ([0-9a-f]{12})", r.json()["detail"]).group(1)
+    assert f"error id {error_id}" in caplog.text
+    assert "refusing" in caplog.text and str(path) in caplog.text
 
 
 def test_a_realtime_step_rechecks_the_upload_dir(swapped_upload_dir):

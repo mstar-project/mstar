@@ -2620,28 +2620,41 @@ async def generate(
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
     if files:
-        # checked per request, as the OpenAI routes and the Rust frontend do
-        upload_dir = await run_in_threadpool(ensure_private_dir, api_server.upload_dir)
-        for f in files:
-            modality = _detect_modality(f.filename or "")
-            if modality == "unknown":
-                # a refused request is never submitted, so the deferred cleanup
-                # below never sees what it saved
-                _remove_uploads(file_paths)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot determine modality for file: {f.filename}",
-                )
-            # Sanitize: only the final path component of the client name;
-            # embedded separators (../) would escape upload_dir.
-            base = os.path.basename(f.filename or "") or "upload"
-            save_name = f"{uuid.uuid4()}_{base}"
-            save_path = upload_dir / save_name
-            content = await f.read()
-            await run_in_threadpool(write_private_file, save_path, content)
-            paths = file_paths.setdefault(modality, [])
-            parts.append(PromptPart(modality=modality, index=len(paths)))
-            paths.append(str(save_path))
+        try:
+            # checked per request, as the OpenAI routes and the Rust frontend do
+            upload_dir = await run_in_threadpool(ensure_private_dir, api_server.upload_dir)
+            for f in files:
+                modality = _detect_modality(f.filename or "")
+                if modality == "unknown":
+                    # a refused request is never submitted, so the deferred cleanup
+                    # below never sees what it saved
+                    _remove_uploads(file_paths)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot determine modality for file: {f.filename}",
+                    )
+                # Sanitize: only the final path component of the client name;
+                # embedded separators (../) would escape upload_dir.
+                base = os.path.basename(f.filename or "") or "upload"
+                save_name = f"{uuid.uuid4()}_{base}"
+                save_path = upload_dir / save_name
+                content = await f.read()
+                await run_in_threadpool(write_private_file, save_path, content)
+                paths = file_paths.setdefault(modality, [])
+                parts.append(PromptPart(modality=modality, index=len(paths)))
+                paths.append(str(save_path))
+        except OSError as e:
+            # The refusal names the upload dir, this user's uid and the
+            # directory owner's, and a write failure names the file; none of
+            # that may reach a client, so it is logged and the reply carries
+            # the error id only, as /generate/ws and the Rust frontend do.
+            _remove_uploads(file_paths)
+            # not `text`: that is the request's own prompt, read just below
+            detail, _ = client_error_text(
+                e, f"generate request {request_id} could not save its uploads",
+                log=logger, type_name=False,
+            )
+            raise HTTPException(status_code=500, detail=detail) from e
     if text:
         parts.append(PromptPart(modality="text", text=text))
 

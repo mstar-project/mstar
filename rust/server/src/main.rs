@@ -28,6 +28,7 @@
 mod adapters;
 mod auth;
 mod bridge;
+mod client_errors;
 mod media;
 mod protocol;
 mod refusals;
@@ -343,6 +344,21 @@ fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
     }
 }
 
+/// A refusal forwarded from `media`/`adapters`: `default_status` for a bad
+/// request, 500 for one `client_errors::server_error` already turned into an
+/// error id (the upload dir check, an upload write), whose full text is in the
+/// server log and must not reach the client.
+fn forwarded_error(err: &str, default_status: u16) -> Response {
+    let (status, message) = client_errors::status_and_message(err, default_status);
+    error(status, message, error_type(status))
+}
+
+/// The same, FastAPI-`HTTPException`-shaped, for the native `/generate` routes.
+fn forwarded_detail_error(err: &str, default_status: u16) -> Response {
+    let (status, message) = client_errors::status_and_message(err, default_status);
+    detail_error(status, message)
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -525,7 +541,7 @@ async fn chat_completions(
     };
     let mut args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
     // submit token ids and detokenize the reply in Rust, off the GIL.
@@ -734,17 +750,17 @@ async fn audio_speech(
     // frontend cannot produce is the client's error.
     let fmt = match media::check_audio_format(&req.response_format, stream) {
         Ok(fmt) => fmt,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     let args = match adapter.speech_to_request(&req) {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     let chunking = adapter.speech_chunking();
     let pieces =
         match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
             Ok(pieces) => pieces,
-            Err(e) => return error(400, &e, "invalid_request_error"),
+            Err(e) => return forwarded_error(&e, 400),
         };
     let n = pieces.len();
     let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream);
@@ -863,7 +879,7 @@ async fn images_generations(
     };
     let base = match adapter.image_to_request(&req) {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     // OpenAI `n`: submit n engine requests up front and aggregate their images,
     // matching serving_images.create_images. Seeded requests follow the seed
@@ -871,7 +887,7 @@ async fn images_generations(
     // the same request with n=1; unseeded requests draw independent seeds.
     let n = match image_count(req.n, st.max_images_per_request) {
         Ok(n) => n,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
@@ -934,7 +950,7 @@ async fn videos_generations(
     };
     let args = match adapter.video_to_request(&req, &st.upload_dir, st.allow_remote) {
         Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+        Err(e) => return forwarded_error(&e, 400),
     };
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("vid");
@@ -1012,8 +1028,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
     };
     // Persist the uploaded image so the data-worker's loader can read it by path.
-    if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
-        return error(500, &e.to_string(), "server_error");
+    if let Err(e) = media::check_upload_dir(&st.upload_dir) {
+        return forwarded_error(&e, 500);
     }
     let ext = image_filename
         .as_deref()
@@ -1021,7 +1037,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
     if let Err(e) = runtime_dir::write_private_file(&image_path, &image_bytes) {
-        return error(500, &e.to_string(), "server_error");
+        return forwarded_error(&client_errors::server_error(&e, "writing an upload failed"), 500);
     }
 
     let args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
@@ -1112,11 +1128,11 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 "output_modalities" => out_mods_raw = v.into_owned(),
                 "streaming" => match parse_form_bool(&v) {
                     Ok(b) => streaming = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "tokenize" => match parse_form_bool(&v) {
                     Ok(b) => tokenize = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "model_kwargs" => mk_raw = Some(v.into_owned()),
                 "request_id" => request_id = Some(v.into_owned()),
@@ -1166,8 +1182,8 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
-            if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
-                return detail_error(500, &e.to_string());
+            if let Err(e) = media::check_upload_dir(&st.upload_dir) {
+                return forwarded_detail_error(&e, 500);
             }
             // Sanitize: take ONLY the final path component of the
             // client-supplied name. `join` treats embedded separators as
@@ -1181,7 +1197,8 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
             if let Err(e) = runtime_dir::write_private_file(&save_path, &bytes) {
-                return detail_error(500, &e.to_string());
+                return forwarded_detail_error(
+                    &client_errors::server_error(&e, "writing an upload failed"), 500);
             }
             uploads
                 .paths
@@ -1205,11 +1222,11 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 "output_modalities" => out_mods_raw = val,
                 "streaming" => match parse_form_bool(&val) {
                     Ok(b) => streaming = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "tokenize" => match parse_form_bool(&val) {
                     Ok(b) => tokenize = b,
-                    Err(e) => return detail_error(400, &e),
+                    Err(e) => return forwarded_detail_error(&e, 400),
                 },
                 "model_kwargs" => mk_raw = Some(val),
                 "request_id" => request_id = Some(val),

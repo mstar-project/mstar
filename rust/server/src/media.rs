@@ -94,10 +94,26 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
 }
 
-fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
-    crate::runtime_dir::ensure_private_dir(upload_dir)?;
+/// Check the upload dir, and keep the refusal's text out of the answer: it
+/// names the server's upload path and both uids. `client_errors::server_error`
+/// logs it and yields an error id, which the handler sends with a 500.
+pub fn check_upload_dir(upload_dir: &Path) -> Result<(), String> {
+    crate::runtime_dir::ensure_private_dir(upload_dir)
+        .map(|_| ())
+        .map_err(|e| crate::client_errors::server_error(&e, "the upload dir check failed"))
+}
+
+/// Write one upload. The error names the path too (`AlreadyExists` on a file
+/// or symlink planted at the name), so it goes the same way.
+fn write_upload(path: &Path, raw: &[u8]) -> Result<(), String> {
+    crate::runtime_dir::write_private_file(path, raw)
+        .map_err(|e| crate::client_errors::server_error(&e, "writing an upload failed"))
+}
+
+fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> Result<(String, String), String> {
+    check_upload_dir(upload_dir)?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(mime)));
-    crate::runtime_dir::write_private_file(&path, raw)?;
+    write_upload(&path, raw)?;
     Ok((modality_from_mime(mime).to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -119,7 +135,7 @@ fn save_data_url(data_url: &str, upload_dir: &Path) -> Result<(String, String), 
         .unwrap_or("application/octet-stream");
     let raw = decode_b64_lenient(payload)
         .map_err(|e| format!("data URL base64 decode failed: {e}"))?;
-    save_bytes(&raw, mime, upload_dir).map_err(|e| e.to_string())
+    save_bytes(&raw, mime, upload_dir)
 }
 
 /// Persist a bare base64 blob with a known `fmt` (e.g. "wav"). Returns
@@ -130,7 +146,7 @@ pub fn save_base64(
     modality_hint: &str,
     upload_dir: &Path,
 ) -> Result<(String, String), String> {
-    crate::runtime_dir::ensure_private_dir(upload_dir).map_err(|e| e.to_string())?;
+    check_upload_dir(upload_dir)?;
     let raw = decode_b64_lenient(b64)
         .map_err(|e| format!("input_audio base64 decode failed: {e}"))?;
     // Sanitize the client-controlled `format`: keep only alphanumerics, so
@@ -147,7 +163,7 @@ pub fn save_base64(
         format!(".{clean}")
     };
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext));
-    crate::runtime_dir::write_private_file(&path, &raw).map_err(|e| e.to_string())?;
+    write_upload(&path, &raw)?;
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -187,7 +203,7 @@ fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), Str
             _ => "application/octet-stream".to_string(),
         };
     }
-    save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
+    save_bytes(&raw, &mime, upload_dir)
 }
 
 /// Resolve a media reference from a request: a data URL, or an `http(s)` URL

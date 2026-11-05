@@ -537,6 +537,77 @@ def test_server_refuses_a_shared_runtime_dir(tmp_path, which, kind):
     assert "--upload-dir" in proc.stderr
 
 
+def _swap_upload_dir(upload_dir: str) -> None:
+    """Remove the dir the server checked at startup and plant a symlink at its
+    name: a /tmp cleaner took it and someone else recreated it."""
+    import os
+    import pathlib
+
+    p = pathlib.Path(upload_dir)
+    for f in p.iterdir():
+        os.unlink(f)
+    p.rmdir()
+    target = pathlib.Path(upload_dir + "_theirs")
+    target.mkdir(mode=0o700, exist_ok=True)
+    p.symlink_to(target)
+
+
+_LEAK_ROUTES = [
+    ("qwen3_omni", "_StubAPIServer", "/v1/chat/completions", "error"),
+    ("cosmos3", "_VideoStubAPIServer", "/v1/videos/generations", "error"),
+    ("qwen3_omni", "_StubAPIServer", "/generate", "detail"),
+    ("bagel", "_ImageStubAPIServer", "/v1/images/edits", "error"),
+]
+
+
+@pytest.mark.parametrize("model,stub_name,path,shape", _LEAK_ROUTES,
+                         ids=["chat", "videos", "generate", "edits"])
+def test_an_upload_dir_refused_mid_request_tells_the_client_only_an_error_id(
+        model, stub_name, path, shape, capfd):
+    """The refusal names the server's upload path and its uid (another owner's
+    too). Before, chat and videos turned it into a 400 with the whole text and
+    /generate and edits into a 500 with it; all four now answer a fixed 500
+    carrying an error id, with the full text on the server's stderr, as the
+    Python frontend does."""
+    import re
+
+    stub = globals()[stub_name]()
+    with _model_stack(model, stub) as (port, upload_dir):
+        _swap_upload_dir(upload_dir)
+        if path == "/v1/chat/completions":
+            data, ctype = json.dumps({"model": model, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": _TINY_PNG_DATA_URI}}]}]}).encode(), \
+                "application/json"
+        elif path == "/v1/videos/generations":
+            data, ctype = json.dumps({"model": model, "prompt": "x",
+                                      "image": _TINY_PNG_DATA_URI}).encode(), "application/json"
+        elif path == "/generate":
+            b = "----leakboundary"
+            data = (f'--{b}\r\nContent-Disposition: form-data; name="text"\r\n\r\nhi\r\n'
+                    f'--{b}\r\nContent-Disposition: form-data; name="files"; filename="a.png"\r\n'
+                    f"Content-Type: image/png\r\n\r\nPNG\r\n--{b}--\r\n").encode()
+            ctype = f"multipart/form-data; boundary={b}"
+        else:
+            data, ctype = _EDIT_FORM, f"multipart/form-data; boundary={_EDIT_BOUNDARY}"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
+                                     headers={"Content-Type": ctype})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=30)
+        code, body = e.value.code, e.value.read().decode()
+
+    assert code == 500, body
+    payload = json.loads(body)
+    message = payload["detail"] if shape == "detail" else payload["error"]["message"]
+    assert re.fullmatch(r"internal error \(error id [0-9a-f]{12}\)", message), body
+    for secret in (upload_dir, "refusing", "uid ", "symlink"):
+        assert secret not in body, body
+    # the operator gets the whole refusal, under the id the client was given
+    error_id = re.search(r"error id ([0-9a-f]{12})", message).group(1)
+    logged = capfd.readouterr().err
+    assert f"error id {error_id}" in logged and f"refusing {upload_dir}" in logged, logged
+
+
 def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse
