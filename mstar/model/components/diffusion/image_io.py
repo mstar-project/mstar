@@ -152,16 +152,16 @@ _deflate_lock = threading.Lock()
 
 
 def _deflate_pool() -> ThreadPool:
-    """The threads every PNG of this process deflates its blocks on, ``png_threads`` of
-    them. Images encoded at once queue their blocks here instead of each starting
-    threads of its own, so a batch of finished images keeps the CPUs busy without
-    running more deflate threads than the CPU plan sizes for one."""
+    """The threads every PNG of this process deflates its blocks on, the CPU plan's
+    ``deflate_threads``. Images encoded at once queue their blocks here instead of
+    each starting threads of its own, and the images the data worker encodes at
+    once still deflate all their blocks together."""
     global _deflate_threads
     if _deflate_threads is None:
         with _deflate_lock:
             if _deflate_threads is None:
                 _deflate_threads = ThreadPool(
-                    max_workers=cpus.plan().png_threads, thread_name_prefix="mstar-deflate",
+                    max_workers=cpus.plan().deflate_threads, thread_name_prefix="mstar-deflate",
                 )
     return _deflate_threads
 

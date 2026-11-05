@@ -1,6 +1,7 @@
 """PNG deflate on the process's shared pool: the bytes (so the pixels) are the ones the
 per-call threads wrote, concurrent encodes share the pool, and the pool is sized from
-the CPU plan, whose CPUs come from the cgroup quota rather than ``os.cpu_count()``."""
+the CPU plan (the cgroup quota rather than ``os.cpu_count()``) for every image the data
+worker encodes at once."""
 
 from __future__ import annotations
 
@@ -87,13 +88,24 @@ def test_images_encoded_at_once_share_the_pool_and_keep_their_bytes():
     assert out == expected
 
 
-def test_the_deflate_pool_is_sized_from_the_cgroup_quota(monkeypatch):
+@pytest.mark.parametrize(("quota", "png_threads", "encode_workers", "deflate_threads"), [
+    (5.5, 5, 1, 5),
+    (12, 8, 1, 8),
+    (20, 8, 2, 16),
+    (32, 8, 4, 32),  # four images finishing together deflate on 32 threads, 8 each
+    (48, 8, 4, 32),
+])
+def test_the_deflate_pool_is_sized_from_the_plan(monkeypatch, quota, png_threads, encode_workers, deflate_threads):
+    # a 192-CPU host whose cgroup quota is what the process may use
     monkeypatch.setattr(cpus.os, "cpu_count", lambda: 192)
     monkeypatch.setattr(cpus.os, "sched_getaffinity", lambda pid: set(range(192)))
-    monkeypatch.setattr(cpus, "cgroup_cpu_quota", lambda: 5.5)
+    monkeypatch.setattr(cpus, "cgroup_cpu_quota", lambda: quota)
     monkeypatch.setattr(cpus, "_plan", None)
     monkeypatch.setattr(image_io, "_deflate_threads", None)
+    plan = cpus.plan()
+    assert plan.png_threads == png_threads and plan.encode_workers == encode_workers
+    assert plan.deflate_threads == deflate_threads
     try:
-        assert image_io._deflate_pool()._max_workers == cpus.plan().png_threads == 5
+        assert image_io._deflate_pool()._max_workers == deflate_threads
     finally:
         image_io._deflate_pool().shutdown(wait=True)
