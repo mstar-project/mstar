@@ -4674,7 +4674,7 @@ class KVManager(AttentionResource):
         take whole moves there, and any other is dropped, once ``droppable`` says its launched steps allow it.
 
         Returns the victims, or none once the room covers its grant. When no move covers the shortage, ``rid`` moves
-        itself if the room that frees lets in an older request that waits to return, and that request takes the room
+        itself if the room that frees lets in an older request that asks again, and that request takes the room
         first. Otherwise ``rid`` keeps its allotment and asks for every page its grant needed past it, and waits for
         them once the runner asks again. None when the pool doesn't decide or ``newer`` is None, as it is for a
         request the conductor gave no number.

@@ -3,9 +3,9 @@
 A new prompt waits in the runner's queue for room, since a pool admits only its oldest waiting request.
 A request that grows past what it was allotted can't wait that way: every request beside it
 may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
-them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait in the queue at their
-arrival position. A request on the host returns once its pages and one more page fit, and a dropped request
-once its whole history and one more page fit.
+them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait outside the queue and are
+tried ahead of it, oldest first. A request on the host returns once its pages and one more page fit, and a dropped
+request once its whole history and one more page fit.
 So the oldest request always gets its page and finishes.
 """
 

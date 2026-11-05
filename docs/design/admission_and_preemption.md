@@ -80,7 +80,8 @@ The code calls a reservation an `Allotment`, since `manager.py` already uses "re
 Rules:
 
 - **Ingest.** A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).
-- **Queue.** A request joins the runner's waiting list at its first readiness check, by its arrival number (§3.1), or behind every numbered request in the order it first asks when it has none. A request that is dropped or moves to the host asks again at once, at its arrival. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
+- **Queue.** A request joins the runner's waiting list at its first readiness check, by its arrival number (§3.1), or behind every numbered request in the order it first asks when it has none. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
+- **Asking again.** A request that is dropped, moves to the host or waits for its shortage (§3.2) asks again at once and waits in no queue. Each pass tries these requests first, oldest first, once what each didn't fit has grown.
 - **Size.** A preemptible request reserves its prompt. A guaranteed one also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
@@ -104,7 +105,8 @@ What a cache hit costs:
 Why this shape:
 
 - **The rule lives in `_alloc`.** Today it grants any free page, so a growing request could take a page a guaranteed request reserved, and that request's next grant would fail.
-- **Only the head is admitted.** Nothing newer passes the oldest request, so it can't wait forever behind a stream of small ones (§5.5).
+- **Only the head of a queue is admitted.** No newer prompt passes the oldest one, so it can't wait forever behind a stream of small ones.
+- **A request that asks again waits outside the queues.** Waiting at its arrival for its whole history and a page, it held every newer prompt back: 32 Bagel requests over four shared prefixes on 96 pages, with 512 host pages, ran about 3 at once and took about 58 s, against 41 to 54 s today. Today an offloaded request reloads outside admission once its pages fit, and trying returns first in the same way took that run to 40.8 to 47.9 s on R4.
 - **Evictable hits are charged as fresh.** Eviction could hand such a page to another request before the probe leases it.
 
 ---
@@ -125,7 +127,7 @@ class CurrentForwardPassInfo:
     arrival: int | None = None   # set by the conductor when it takes the request
 ```
 
-The conductor numbers each request from a single counter, in the order it takes them, and sends the number with the request. A dropped request keeps its number. The runner keeps the requests in that order, and each pool's queue and its victim choice go by it.
+The conductor numbers each request from a single counter, in the order it takes them, and sends the number with the request. A dropped request keeps its number. The runner keeps the requests in that order, and each pool's queue, the order it tries requests that ask again in, and its victim choice go by it.
 
 A number set by each worker won't work, since requests reach workers on separate sockets, and so two workers can see the same two requests in different orders. Each will drop a different one, and neither makes progress.
 
@@ -133,26 +135,22 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, other than victims still to move, requests waiting on room set aside for them, requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn't landed, since the rebuild runs on its reservation, and a request whose lease holds a walk the cache served, since that KV lives only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn't landed, since the rebuild runs on its reservation, and a request holding a lease, until its walk's admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
 1. If the victims free enough, `preempt` earmarks what R's grant needed past its reservation (§3.3), and moves each victim to the host or drops it (§4).
-2. Otherwise, if no newer victim is still to move and R is one a move can take, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
-3. Otherwise, R keeps its reservation and asks the pool for every page its grant needed past it. It waits in the queue at its arrival, parked as a new prompt is, until the room covers them.
-
-While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
+2. Otherwise, if an older request that asks again (§2) waits, the room R's move frees lets it in, and R can move to the host or be dropped, R gives up its pages, and the older request takes that room as R's move lands (§3.3).
+3. Otherwise, R keeps its reservation and its pages, and asks the pool for every page its grant needed past it. It waits, parked as a new prompt is, until the room covers them.
 
 The choice is one `KVManager.preempt` call under the pool's lock.
 
 Why this shape:
 
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
-- **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
-- **A request waiting on room set aside for it isn't a victim.** Its victims' moves would grow a reservation it had given up.
-- **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older requests, which finish, or by newer ones a move can't take yet: one whose rebuild hasn't landed, or whose lease holds a served walk.
-- **A waiting request waits in the queue.** It is measured again only when the room grows, and let go only once the room covers its whole shortage. Its arrival keeps newer prompts from taking that room first.
+- **R moves itself only for an older request.** Moving whenever nothing newer covered its shortage, R came straight back into the room it freed and ran short again, since nothing older wanted that room. Waiting, it gets its pages once a newer request moves itself for it or a request finishes. A newer request whose rebuild hasn't landed doesn't change this, since R would re-prefill its history for room only newer requests take.
+- **A waiting request waits for its whole shortage.** It is measured again only when the room grows, and let go only once the room covers its whole shortage.
 - **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be preempted every time it grows.
 
@@ -169,6 +167,8 @@ class Earmark:
 The room R's grant counted joins R's reservation at once. As each victim's move lands, what it frees joins too, up to what the grant needed past the reservation, so R's next grant can't fail again. Without it, the head of the queue, or a victim that asks again at once, could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
 Every victim can move in the call that chose it, since no step or read is in flight on its pages. A victim whose move fails comes off the earmark with nothing freed, so R chooses again at its next failed grant.
+
+When R moves itself for an older request W that asks again, the earmark is W's, with R as its victim. W takes the room as R's move lands, if it covers all W asks for, so R, which asks again at once, can't take it back first.
 
 Lifecycle:
 
@@ -228,21 +228,21 @@ Why this shape:
 
 | State | Held as |
 |---|---|
-| running | resident, out of the queue |
-| on the host | its pages on the host, in the queue at its arrival position, no reservation |
-| dropped | not resident, in the queue at its arrival position, no reservation |
-| rebuilding | not resident, out of the queue, holding its return reservation, its rebuild under way in the worker's log |
+| running | resident, admitted |
+| on the host | its pages on the host, waiting to return, no reservation |
+| dropped | not resident, waiting to return, no reservation |
+| rebuilding | not resident, admitted, holding its return reservation, its rebuild under way in the worker's log |
 
-No field holds the state: residency, the host pool, the queue and the log's rebuilds tell the four apart.
+No field holds the state: residency, the host pool, admission and the log's rebuilds tell the four apart.
 
 Lifecycle:
 
 - A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then.
-- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
+- Removing a request in any state releases its earmark, its pages on the host, its wait to return, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check
 
-A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
+A dropped request asks again when it is dropped, and the runner tries it before the queues, oldest first (§2), with this check in place of the fit check:
 
 ```
 need(V) = the larger of V's prompt and, for each label, the pages
@@ -304,16 +304,18 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 A guaranteed request reserves its whole footprint and is never preempted, so it finishes.
 
-Take the oldest preemptible request:
+Take the oldest preemptible request that holds pages, O:
 
-1. When it runs short, newer requests move to the host or are dropped first, and it gives up its own pages only when none of them can free a page for it.
-2. It then waits at the head of its queue, where nothing newer is admitted past it.
-3. It returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
-4. Its footprint fits the pool, so it finishes after a bounded number of returns.
+1. No request chooses O as a victim, since a victim is newer than the request that runs short, and every older request holds no page, so runs no step. O moves itself only to let an older waiting request in, which then holds pages and takes O's place in the argument.
+2. When O runs short, newer requests move to the host or are dropped first. When their moves can't cover the shortage, O waits, holding its pages.
+3. A newer request that then runs short with nothing newer to move moves itself once that lets O in, and O takes that room as the move lands. With O and one other request holding pages, that move always lets O in: it frees every page O doesn't hold, and O's footprint fits the pool. So two requests that hold pages can't wait on each other for good.
+4. O's footprint fits the pool, so O finishes.
 
-The next oldest request then takes its place in the argument.
+The next oldest request then takes its place in the argument. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
 
 For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
+
+> Note: step 3 needs one move to cover O's shortage. When three or more requests each run short by several pages in one step, and none holds enough pages of its own to cover an older one's shortage, all of them wait: three requests holding 4, 3 and 3 pages of a 10-page pool, each 4 pages short, never run again. Moving whenever nothing newer covered the shortage avoided this. Covering it here would take a waiting request keeping what each move frees for it until its shortage is met.
 
 ---
 
