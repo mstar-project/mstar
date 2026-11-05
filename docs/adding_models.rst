@@ -1709,6 +1709,11 @@ way with ``streamed=True``: its table is the row's items of that stream for the 
 window of as many ready items as the step repeats, and the stream answers how far a run
 may go (the fewest items any row has). Items of a window that a step's resources cut short
 go back to the stream ahead of anything newer.
+On the producer side a run sends a row's items of a per-iteration streaming output together:
+each is an item of its own, never the pieces ``Connection.join_dim`` joins (those come from a
+Loop's ``accumulated_outputs``); a run stops short of the iteration whose items a
+``Connection.consumer_walk`` hook would send to another walk; and a spanned per-iteration
+output (``spanned_outputs``) holds a span a replay, each item cut to its own.
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:

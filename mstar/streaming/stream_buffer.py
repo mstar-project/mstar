@@ -128,16 +128,17 @@ class StreamBuffer:
         self._tensor_ids_in_order.append((tensor_id, walk))
 
     def pre_read_register_joined(
-        self, tensor_ids: list[str], walk: str | None = None,
+        self, tensor_ids: list[str], walk: str | None = None, pieces: bool = True,
     ) -> None:
         """Register ``tensor_ids`` as the pieces of ONE item.
 
         A chunked producer emits a piece per chunk; without this each would be
         an item of its own and a policy counting items would hand the consumer
         only the first. Each piece still counts towards the registered total,
-        which is in the producer's units (see below).
+        which is in the producer's units (see below). Not ``pieces``: they are
+        a step's iterations (``StreamBufferManager.pieces``), an item each.
         """
-        if len(tensor_ids) == 1 or self.join_dim is None:
+        if len(tensor_ids) == 1 or self.join_dim is None or not pieces:
             for tensor_id in tensor_ids:
                 self.pre_read_register(tensor_id, walk)
             return

@@ -1703,7 +1703,7 @@ class AcceleratorGraphRunner:
     def repeat(
         self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int, next_replay: Callable[[], None],
         columns: Collection[str] = (), iteration: Mapping[str, torch.Tensor] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """The rest of a step that repeats, after its first replay: before
         each replay, every loop-back signal's output is copied into the static
         input it feeds (``carries``), and each iteration input's column for
@@ -1711,15 +1711,19 @@ class AcceleratorGraphRunner:
         row each, and the row outputs named in ``columns``, ``[rows, ...]``
         each, both with a column per replay (``[rows, repeats, ...]``): a
         replay overwrites what the last one left, so each is copied out on the
-        stream before the next one."""
+        stream before the next one. Third, the spans of the spanned ones
+        among ``columns`` (``[rows, repeats, 2]``)."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
+        # a spanned output's spans, a column a replay like the output itself
+        spans = slot.static_outputs.output_spans or {}
+        spans_out = {name: spans[name] for name in columns if name in spans}
         copies = [(_carried(slot, pair.output), slot.static_inputs[pair.input]) for pair in carries.values()]
         stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
         # two names can share a buffer
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
-        unique.update((id(t), t) for t in rows_out.values())
+        unique.update((id(t), t) for t in (*rows_out.values(), *spans_out.values()))
         wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
         for i in range(repeats):
             if i:
@@ -1734,6 +1738,7 @@ class AcceleratorGraphRunner:
         return (
             {key: wide[id(t)] for key, t in buffers.items()},
             {key: wide[id(t)] for key, t in rows_out.items()},
+            {key: wide[id(t)] for key, t in spans_out.items()},
         )
 
     def carry_refusal(self, walk: str, carries: Mapping[str, CarryPair]) -> str | None:

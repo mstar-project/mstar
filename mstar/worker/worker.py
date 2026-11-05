@@ -477,6 +477,9 @@ class Worker:
     # Set at load; None, every step runs once, so a worker built without it --
     # any test fake -- never repeats.
     _step_repeats: StepRepeats | None = None
+    # partition -> the connection deciding its consumer walk; set at load
+    _walk_drivers: Mapping[str, Connection] = MappingProxyType({})
+
     # (node, walk) -> its stop policy that withholds outputs; set at load
     _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
 
@@ -1436,6 +1439,8 @@ class Worker:
                 walk = walks.get(self._walk_driven_edges.get(edge.name))
                 stream_buf.pre_read_register_joined(
                     [info.uuid for info in edge.tensor_info], walk,
+                    stream_buf.join_dim is None
+                    or self.streams.pieces(edge.tensor_info[0]._source_graph_walk, edge.name),
                 )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -1480,7 +1485,12 @@ class Worker:
                 self._ack_unbuffered(rid, row.request_id, [edge])
                 continue
             # a row is one edge's items: a chunked producer's pieces join
-            stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
+            walk = frame.walk_idx[row.index]
+            stream_buf.pre_read_register_joined(
+                frame.uuids[row.start:row.start + row.count], None,
+                stream_buf.join_dim is None
+                or self.streams.pieces(frame.names[walk] if walk >= 0 else None, row.signal),
+            )
             reads.append((rid, [edge]))
         if reads:
             self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
@@ -2942,7 +2952,45 @@ class Worker:
         if windows:
             repeats = min(repeats, *(e.chunk.num_items for edges in windows.values() for e in edges))
             speculation.node_batch.stream_windows = windows
+        if repeats > 1 and self._walk_drivers:
+            repeats = self._steady_consumer_walks(speculation, repeats)
         speculation.node_batch.step_context.repeats = repeats
+
+    def _steady_consumer_walks(self, speculation: Speculation, repeats: int) -> int:
+        """How far a run may go while every row's streamed items keep their
+        consumer walk: a pass stamps one walk on what it sends, so a run
+        stops short of the iteration whose items would run another
+        (``Connection.consumer_walk``)."""
+        batch = speculation.scheduled_batch
+        key = (batch.node_name, batch.graph_walk)
+        drivers = [
+            self._walk_drivers[partition] for partition in {
+                self._signal_consumer[signal] for signal in self._graph_runtime.get_output_signals(*key)
+                if signal in self._signal_consumer
+            } if partition in self._walk_drivers
+        ]
+        if not drivers:
+            return repeats
+        ctx = ProducerWalkCtx(producer_walk=batch.graph_walk, node=batch.node_name)
+        metadata = speculation.node_batch.per_request_input_metadata
+        loop = speculation.loop_name
+        for rid in speculation.continuing_rids:
+            meta = metadata.get(rid)
+            iters = dict(meta.dynamic_loop_iter_counts) if meta else {}
+            k = iters.get(loop, 0)
+            ctx.fwd_info = speculation.node_batch.per_request_info.get(rid)
+            for conn in drivers:
+                first = None
+                for i in range(repeats):
+                    ctx.loop_iters = {**iters, loop: k + i}
+                    walk = conn.consumer_walk(ctx)
+                    if first is None:
+                        first = walk
+                    elif walk != first:
+                        repeats = i
+                        break
+        ctx.fwd_info = None
+        return max(1, repeats)
 
     def _repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why no step of this walk can stand for several iterations, or None:
@@ -4221,6 +4269,12 @@ class Worker:
             signals |= engine.run_columns(*key)
         row_of = {} if emitted is None else {rid: i for i, rid in enumerate(host_rows.request_ids)}
         emitted = None if emitted is None else emitted.reshape(emitted.shape[0], -1).tolist()
+        # a spanned output's span per replay, [rows, repeats, 2]
+        spans = outputs.host_spans or outputs.output_spans or {}
+        span_of = {
+            name: dict(zip(outputs.span_request_ids, span.tolist(), strict=False))
+            for name, span in spans.items() if span.dim() == 3
+        }
         for rid in step.wg_ids.keys:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -4234,6 +4288,11 @@ class Worker:
                     if name in withhold and (rid, i) in withheld:
                         continue
                     replay = column[:, i] if width > 1 else column
+                    if name in span_of:
+                        start, end = span_of[name][rid][i]
+                        if end <= start:
+                            continue
+                        replay = replay[..., start:end]
                     if counts is None:
                         items.append(replay)
                     else:
@@ -4410,6 +4469,7 @@ class Worker:
                 walks = req_info.per_partition_info[batch_N.partition].current_fwd_info.stream_consumer_walks
                 stream_buf.pre_read_register_joined(
                     uuids, walks.get(consumer) if consumer else None,
+                    stream_buf.join_dim is None or self.streams.pieces(batch_N.batch.walk_of(rid), signal),
                 )
                 for uuid in uuids:
                     stream_buf.put(uuid, uuid)
@@ -4670,6 +4730,8 @@ class Worker:
         cut = False
         empty: dict[int, list[str]] = {}
         for name, span in spans.items():
+            if span.dim() == 3:
+                continue  # a span a replay: each item is cut alone (`_cut_run_items`)
             # columns, not a [start, end] list per row
             starts, ends = span.t().tolist()
             for rid, start, end in zip(outputs.span_request_ids, starts, ends, strict=True):

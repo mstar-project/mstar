@@ -2333,12 +2333,13 @@ class Engine:
             )
             if ctx.repeats > 1:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
-                stops, rows = cg_runner.repeat(
+                stops, rows, spans = cg_runner.repeat(
                     lease, submodule_mgmt.carries[graph_walk], ctx.repeats,
                     partial(self._runner.next_replay, step), columns, batch.iteration_columns,
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
+                    output_spans={**(out.output_spans or {}), **spans} or None,
                 )
             return out
         if release_event is not None:
@@ -2699,7 +2700,8 @@ class Engine:
                 f"returns one for every output spanned_outputs declares"
             )
         for name, span in spans.items():
-            if span.dim() != 2 or span.shape[1] != 2 or span.shape[0] < num_rows:
+            # a step that repeated holds a span a replay: [rows, repeats, 2]
+            if span.dim() not in (2, 3) or span.shape[-1] != 2 or span.shape[0] < num_rows:
                 raise ValueError(
                     f"{type(submodule).__name__}: the span of {name!r} is "
                     f"{tuple(span.shape)}, not [{num_rows}, 2]"

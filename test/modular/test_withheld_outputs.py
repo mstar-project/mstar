@@ -177,7 +177,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path, stop):
     assert len(route.tensors) == 3
 
 
-def _cut(width, tokens, kept=None, emitted=None, columns=("frame",)):
+def _cut(width, tokens, kept=None, emitted=None, columns=("frame",), spans=None):
     """``Worker._cut_run_items`` over two rows whose "frame" holds a column
     per replay (KEEP's values 0.., DROP's 10..) beside each replay's
     ``tokens``; the frames a row routes."""
@@ -189,7 +189,11 @@ def _cut(width, tokens, kept=None, emitted=None, columns=("frame",)):
 
     w = Worker.__new__(Worker)
     w._withholding = WITHHOLDING
-    outputs = BatchedModelOutput(per_rid_outputs={KEEP: {"frame": [column(0)]}, DROP: {"frame": [column(10)]}})
+    outputs = BatchedModelOutput(
+        per_rid_outputs={KEEP: {"frame": [column(0)]}, DROP: {"frame": [column(10)]}},
+        output_spans=None if spans is None else {"frame": torch.tensor(spans)},
+        span_request_ids=None if spans is None else (KEEP, DROP),
+    )
     buffers = {"token": torch.tensor(tokens)}
     if emitted is not None:
         buffers["emitted_count"] = torch.tensor(emitted)
@@ -222,3 +226,10 @@ def test_a_replay_that_emits_two_items_routes_both():
     """``EMITTED_COUNT`` says how many of a replay's items along dim 1 are
     real: KEEP emits 2 then 1, DROP 1 then 2."""
     assert _cut(2, [[1, 2], [3, 4]], emitted=[[2, 1], [1, 2]]) == {KEEP: [0, 1, 2], DROP: [10, 12, 13]}
+
+
+def test_a_run_cuts_each_replays_item_to_its_own_span():
+    """A spanned per-iteration output holds a span a replay: each item is cut
+    to its own, and an empty one routes nothing."""
+    spans = [[[0, 1], [0, 1]], [[0, 1], [1, 1]]]  # DROP's second replay is empty
+    assert _cut(2, [[1, 2], [3, 4]], spans=spans) == {KEEP: [0, 1], DROP: [10]}

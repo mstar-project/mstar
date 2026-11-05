@@ -327,7 +327,7 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay()
         graph=Graph(), static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
         static_outputs=SimpleNamespace(
             check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
-            row_outputs={"frame": frames, "embeds": embeds, "step": step},
+            row_outputs={"frame": frames, "embeds": embeds, "step": step}, output_spans=None,
         ),
     )
     carries = {
@@ -336,7 +336,7 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay()
     }
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    wide, rows = runner.repeat(None, carries, 3, lambda: None, ["frame"])
+    wide, rows, _ = runner.repeat(None, carries, 3, lambda: None, ["frame"])
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
     # the last replay's outputs, each from the replay before's
@@ -2481,7 +2481,7 @@ def test_a_run_stages_each_replays_iteration_input_before_it():
 
     slot = SimpleNamespace(
         graph=Graph(), static_inputs={"cond": cond_in},
-        static_outputs=SimpleNamespace(check_stop_buffers={"t": torch.zeros(2)}, row_outputs={}),
+        static_outputs=SimpleNamespace(check_stop_buffers={"t": torch.zeros(2)}, row_outputs={}, output_spans=None),
     )
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
@@ -2572,3 +2572,29 @@ def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items
     items = torch.arange(6.0).reshape(3, 2)
     metadata = SimpleNamespace(stream_chunks={"chunk": StreamChunkInfo(0, 0, 3, False)})
     assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"], items)
+
+
+def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_walk():
+    """A pass stamps one consumer walk on what it streams, so a run's items
+    must all run the walk its first does: a hook that moves on at k=3 holds a
+    run from k=1 to two iterations."""
+    from mstar.engine.engine import InputMetadata
+    from mstar.streaming.topology import Connection
+
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+    hook = Connection.__new__(Connection)
+    hook.consumer_walk = lambda ctx: "late" if ctx.loop_iters["loop"] >= 3 else "early"
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {"talker": hook}
+    worker._signal_consumer = {"states": "talker"}
+    worker._graph_runtime = SimpleNamespace(get_output_signals=lambda node, walk: ["states"])
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, loop_name="loop", continuing_rids={0},
+        node_batch=SimpleNamespace(
+            per_request_input_metadata={0: InputMetadata(dynamic_loop_iter_counts={"loop": 1})},
+            per_request_info={0: None},
+        ),
+    )
+    assert worker._steady_consumer_walks(speculation, 4) == 2
+    worker._walk_drivers = {}
+    assert worker._steady_consumer_walks(speculation, 4) == 4

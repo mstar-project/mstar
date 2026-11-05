@@ -39,6 +39,19 @@ def consumer_nodes(
     return cache
 
 
+def iteration_edges(walks: dict[str, GraphSection]) -> frozenset[tuple[str, str]]:
+    """(walk, streamed signal) for each signal a node inside a Loop of the walk
+    emits each iteration, rather than gathers at the Loop's end
+    (``Loop.accumulated_outputs``)."""
+    out = set()
+    for walk, section in walks.items():
+        for loop in section.get_loops().values():
+            gathered = {edge.name for edge in loop.accumulated_outputs}
+            for node in loop.get_nodes().values():
+                out.update((walk, e.name) for e in node.outputs if e.is_streaming and e.name not in gathered)
+    return frozenset(out)
+
+
 class StreamBufferManager:
     """The stream buffers of this worker's requests, for the connections whose
     consumer runs here."""
@@ -65,6 +78,8 @@ class StreamBufferManager:
         )
         # edge name -> the partition the stream feeds
         self._partition: dict[str, str] = {c.edge_name: c.to_partition for c in connections}
+        # (producer walk, edge) pairs a Loop's node emits an item an iteration
+        self._iteration_edges = iteration_edges(walks) if walks else frozenset()
         # the rids that own a buffer; empty for a text model, so a speculation
         # skips its per-row stream polls
         self._rids: set[int] = set()
@@ -72,6 +87,13 @@ class StreamBufferManager:
         # stream into it, one an iteration of a step that repeats (a stream
         # window); a node not here takes a chunk a step
         self.windows: dict[str, int] = {}
+
+    def pieces(self, walk: str | None, edge_name: str) -> bool:
+        """Whether what one producer step of ``walk`` sends on ``edge_name``
+        is the pieces of one item (a Loop's gathered output, a chunked
+        producer's), not iterations of a step that repeated: a Loop's node
+        emitting the edge each iteration sends an item each."""
+        return (walk, edge_name) not in self._iteration_edges
 
     def possible(self) -> bool:
         """Whether any live request owns a stream buffer."""

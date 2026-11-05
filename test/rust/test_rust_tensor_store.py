@@ -378,3 +378,15 @@ def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
     assert step.need is PostprocessNeed.DONE, "nothing left for Python to tear down"
     assert ref() is None
     assert store.stored_counts() == (0, 0)
+
+
+def test_a_runs_items_of_one_signal_are_stored_in_iteration_order():
+    """A step that repeated stores a row's items of a per-iteration output
+    under one (row, signal), one uuid an iteration, in order: what a
+    streaming edge then hands its consumer as items."""
+    _, mgr = _pair()
+    mgr.register_request(1, ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}))
+    items = [torch.full((2,), float(i)) for i in range(3)]
+    stored = mgr.store_and_return_tensor_info_batch([1], {1: {"frame": items}}, ["frame"], skip_cuda_sync=True)
+    assert stored.num_tensors == [3]
+    assert [mgr.get_tensor(u)[0].item() for u in stored.flat_uuids] == [0.0, 1.0, 2.0]
