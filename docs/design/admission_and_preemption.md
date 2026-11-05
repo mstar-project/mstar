@@ -323,13 +323,13 @@ For example, an older and a newer request hold 5 pages each of a 10-page pool, a
 
 ## 6. TP followers
 
-Rank 0 decides every reservation and its undo, the host room it sets aside, the room a short grant counted, each flip to guaranteed, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts.
+Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a flip to guaranteed at admission, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step's admit. At TP the host holds no cached pages, since `prefix_cache_tp` refuses a host pool, so its room moves only with moves every rank makes in rank 0's order and is the same on every rank at each of those points.
 
 ```python
 @dataclass
 class OffloadDelta:
     rids: list[str]
-    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, set aside, land, guarantee or allot
+    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, land, guarantee or allot
     ...                     # the page counts and victims the kinds carry
 ```
 
@@ -338,6 +338,7 @@ class OffloadDelta:
 - A follower drops a request with the tokens rank 0's rebuild writes, which its own KV refuses unless it holds as many.
 - A rebuild row rides `ScheduleTPNode` as any row mid-prefill does, with its chunk range. A follower knows the row from its own KV, which replayed rank 0's drop, starts the rebuild at its first row, and builds its input from its own kept ids, which match, since every rank samples rank 0's token.
 - A follower whose counts can't take a move exits.
+- A pre-admit takes only free pages and host room already set aside. Rank 0 can't undo an eviction, a host room set aside or a flip for a stage it throws away, and a follower may never plan the step, so the pre-admit refuses and exec admits the step on every rank.
 
 With speculation on, rank 0 decides only where pages already move today, after the admit fence or after a refused step, so a speculative step never carries a move made after it was sent.
 
