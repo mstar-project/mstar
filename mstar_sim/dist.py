@@ -33,7 +33,7 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
-from mstar_sim import clock, cost, device
+from mstar_sim import clock, cost, cuda, device
 
 
 class _Done:
@@ -391,6 +391,8 @@ def _barrier(group=None, async_op=False, device_ids=None):
     """A barrier meets as a collective (a meet is a barrier): NCCL's, a one-element all-reduce
     on a device group, pairs against its peers' collectives. mstar's barriers are on device
     groups; the fused-AR stand-in's, on a host group, is gloo's own (``__wrapped__``)."""
+    for index in device_ids or ():
+        cuda.device_index(index)
     if dist.get_world_size(group) > 1:
         _meet(group or dist.group.WORLD, row("Barrier", size=dist.get_world_size(group)))
     return _Done() if async_op else None
@@ -431,7 +433,7 @@ def install() -> None:
             args = (_gloo(args[0]), *args[1:])
         if "backend" in kwargs:
             kwargs["backend"] = _gloo(kwargs["backend"])
-        kwargs.pop("device_id", None)  # no device to bind a gloo group to
+        cuda.device_index(kwargs.pop("device_id", None))  # refused as CUDA would; no device to bind a gloo group to
         return init(*args, **kwargs)
 
     dist.init_process_group = init_process_group

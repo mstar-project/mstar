@@ -36,7 +36,7 @@ def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
 
 def test_cuda_semantics():
     out = run_sim("""
-        import subprocess, sys, torch
+        import subprocess, sys, torch, torch.distributed as dist
         assert torch.cuda.is_available() and torch.cuda.get_device_name().startswith("NVIDIA H100")
         m = torch.nn.Linear(8, 4, device="meta").to_empty(device="cuda")
         x = torch.randn(3, 8, device="cuda")
@@ -65,10 +65,14 @@ def test_cuda_semantics():
         # a device argument beside a cuda operand wins over the operand's
         peer = x.to("cuda:1").device
         assert torch.zeros_like(x, device="cuda:1").device == x.new_zeros(2, device="cuda:1").device == peer
+        side = torch.cuda.Stream()
         for past in (lambda: torch.zeros(2, device="cuda:8"), lambda: x.to("cuda:8"),  # 8 emulated GPUs
                      lambda: torch.cuda.set_device(8), lambda: torch.cuda.Stream(8),
                      lambda: torch.zeros_like(x, device="cuda:8"), lambda: x.new_zeros(2, device="cuda:8"),
-                     lambda: torch.cuda.synchronize(8), lambda: torch.cuda.current_stream(8)):
+                     lambda: torch.cuda.synchronize(8), lambda: torch.cuda.current_stream(8),
+                     lambda: torch.cuda.ExternalStream(side.cuda_stream, device="cuda:8"),
+                     lambda: torch._C._cuda_getCurrentRawStream(8), lambda: dist.barrier(device_ids=[8]),
+                     lambda: dist.init_process_group("nccl", device_id=torch.device("cuda", 8))):
             try:
                 past()
                 raise SystemExit("an index past the emulated devices was accepted")

@@ -395,6 +395,7 @@ _STREAMS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 
 
 def ExternalStream(stream_ptr: int, device=None, **_):  # noqa: N802  (torch.cuda.ExternalStream)
+    device_index(device)
     stream = _STREAMS.get(stream_ptr)
     if stream is None:
         raise RuntimeError(f"mstar_sim: no emulated stream has the handle {stream_ptr}")
@@ -560,7 +561,7 @@ TORCH_C = {
     "_cuda_sleep": _noop,  # a spin of N cycles; nothing to wait for
     "_cuda_getDevice": current_device,
     # a raw ``cudaStream_t``: the stream's id (no raw CUDA call takes it here, libcudart is refused)
-    "_cuda_getCurrentRawStream": lambda device=None: current_stream().cuda_stream,
+    "_cuda_getCurrentRawStream": lambda device=None: current_stream(device).cuda_stream,
     "_cuda_beginAllocateToPool": _begin_allocate_to_pool,
     "_cuda_endAllocateToPool": _end_allocate_to_pool,
     "_cuda_releasePool": _release_pool,
