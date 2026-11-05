@@ -98,6 +98,7 @@ class Qwen3OmniTalkerLayer(DecoderLayer):
                     hidden_size, config.num_experts, config.num_experts_per_tok,
                     norm_topk_prob=config.norm_topk_prob, fused_softmax_topk=True,
                 ),
+                moe_backend=config.moe_backend,
             ),
             input_layernorm=RMSNorm(hidden_size, rms_norm_eps),
             post_attention_layernorm=RMSNorm(hidden_size, rms_norm_eps),

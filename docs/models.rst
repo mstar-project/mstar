@@ -234,6 +234,7 @@ Notes
   ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
+  On AMD GPUs the sweep tunes Triton's HIP compiler options too.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
@@ -403,6 +404,28 @@ BAGEL notes
   GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
+
+Qwen3-Omni MoE backend notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
+  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
+  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
+  serving config's ``model_kwargs:`` block. It's read once when the model is
+  built, so a request's own ``model_kwargs`` can't change it::
+
+      model_kwargs:
+        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+
+  ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  output isn't bitwise reproducible (identical calls differ in the last bits),
+  so greedy decoding can flip near-tied tokens and repeated requests may not
+  match. The Triton kernels are reproducible.
+- The Triton kernels take their tiles from the ``moe_gemm`` table for the GPU
+  (``mstar/kernels/tables/moe_gemm/``); tables ship for MI300X and MI325X at the
+  Thinker's and Talker's expert sizes without TP or EP, swept with Triton's AMD
+  compiler options (``waves_per_eu``, ``matrix_instr_nonkdim``, ``kpack``).
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
