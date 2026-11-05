@@ -198,6 +198,9 @@ class BoundedKVManager(Resource):
 
     # Request lifecycle
 
+    def resident_refusal(self, key, streams) -> str | None:
+        return "a step's read layout is a table the host builds from the positions it declares (`row_layout`)"
+
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None):
         del overrides
 

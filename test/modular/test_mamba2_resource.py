@@ -6,6 +6,8 @@ step continues from it, and padding rows leave live slots alone.
 The torch reference path runs on CPU; the Triton kernel is checked against it
 on a GPU when one is present (Nemotron-H's geometry among the cases).
 """
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -300,3 +302,13 @@ def test_triton_step_matches_torch_reference(geom, rows, dtype):
     torch.testing.assert_close(state[slots[live].long()], ref_state[slots[live].long()], atol=1e-4, rtol=1e-4)
     untouched = [s for s in range(1, max_slots) if s not in slots.tolist()]
     torch.testing.assert_close(state[untouched], ref_state[untouched])
+
+
+def test_a_resident_decode_reads_the_plan_its_capture_built():
+    """Slot-only, like GDN: the pool's table fills the slots the capture's plan
+    views, so a resident step plans nothing, repeats, and needs no host step."""
+    manager = Mamba2Manager.__new__(Mamba2Manager)
+    manager._preplanned = False
+    manager._current = captured = {"main": object()}
+    assert manager.resident_refusal("m", {}) is None and manager.repeat_refusal("decode") is None
+    assert manager.plan(None, SimpleNamespace(is_preplan=False, resident=object())) is captured

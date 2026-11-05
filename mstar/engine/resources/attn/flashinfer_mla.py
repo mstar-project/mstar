@@ -258,6 +258,18 @@ class FlashInferMLAManager(AttentionManager):
         )
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        if host_step is not None:
+            return None  # a cache that doesn't grow: one plan serves every replay
+        return "its planned kernel takes each row's length from its plan, which a replay can't move"
+
+    def resident_refusal(self, key, streams) -> str | None:
+        return None
+
+    def resident_gather(self, step) -> None:
+        # its kernel reads the host's plan; the tables fill only where K/V go
+        step.host_planned = True
+
     def depends_on(self):
         return {self._kv_cache_name}
 

@@ -800,6 +800,30 @@ def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, 
     assert (resource().repeat_refusal(WALK) is not None) is refuses
 
 
+@pytest.mark.parametrize(("groups", "why"), [
+    (1, None),  # either layout: its writes go through the same two tables
+    (2, "a sliding-window group frees its front pages at commit"),
+], ids=["one_group", "sliding_window"])
+def test_a_kv_pool_says_what_keeps_it_off_the_tables(groups, why):
+    kv = KVManager.__new__(KVManager)
+    kv._groups = [object()] * groups
+    kv._needs_remote_transfer = False
+    refusal = kv.resident_refusal("kv", {})
+    assert refusal is None if why is None else why in refusal
+
+
+def test_mla_attention_is_resident_on_its_host_plan_and_says_why_it_doesnt_repeat():
+    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+
+    mla = FlashInferMLAManager.__new__(FlashInferMLAManager)
+    assert mla.resident_refusal("attn", {}) is None
+    step = SimpleNamespace(host_planned=False)
+    mla.resident_gather(step)
+    assert step.host_planned
+    assert "takes each row's length from its plan" in mla.repeat_refusal(WALK)
+    assert mla.repeat_refusal(WALK, host_step=object()) is None
+
+
 @pytest.mark.parametrize(("walk", "tensor_cores", "note"), [
     (WALK, True, "tensor-core decode for it"),
     ("other", False, None),  # a walk that doesn't ask keeps the config's choice
@@ -2386,8 +2410,8 @@ def test_a_pool_read_across_nodes_refuses():
     assert planner is None and "across nodes" in why
 
 
-def test_the_mla_layout_refuses():
-    """GLM-5.2's latent pages have no K/V axis to write through."""
+def test_the_mla_layout_takes_the_tables():
+    """GLM-5.2's latent pages take ``write_kv``, through the two buffers the tables fill."""
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=64, page_size=PAGE,
@@ -2396,7 +2420,7 @@ def test_the_mla_layout_refuses():
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     planner, why = _build({"kv": kv})
-    assert planner is None and "MLA" in why
+    assert planner is not None and why == ""
 
 
 def test_a_sliding_window_pool_refuses():
@@ -2428,10 +2452,7 @@ def test_a_pool_without_a_sink_refuses():
 
 @pytest.mark.parametrize("module,name", [
     ("mstar.engine.resources.attn.cross", "CrossAttentionManager"),
-    ("mstar.engine.resources.kv.bounded.manager", "BoundedKVManager"),
     ("mstar.engine.resources.attn.dense", "DenseAttentionManager"),
-    ("mstar.engine.resources.attn.flashinfer_mla", "FlashInferMLAManager"),
-    ("mstar.engine.resources.linear_attn.mamba2", "Mamba2Manager"),
     ("mstar.engine.resources.kv.ring.manager", "RingKVManager"),
 ])
 def test_resources_with_no_table_keep_the_base_refusal(module, name):

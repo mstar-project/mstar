@@ -704,6 +704,8 @@ def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | Non
         if uncarried is None and getattr(resource_step, "commit", True) is False:
             # a step that keeps no tokens: the table's commit would advance past its stream
             uncarried = "commit=False"
+        # `retention` (bounded KV) frees a stream's front pages at commit, a step
+        # behind the device: a row planned past it would point at freed pages
         if uncarried is not None:
             return f"resource {key!r} declares {uncarried}, which a resident step can't carry"
     for key in keys:

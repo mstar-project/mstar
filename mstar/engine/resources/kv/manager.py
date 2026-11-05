@@ -4717,9 +4717,9 @@ class KVManager(AttentionResource):
 
     def resident_refusal(self, key, streams) -> str | None:
         if len(self._groups) > 1:
-            return "a pool with sliding-window layers holds its pages per group, which a block table row can't"
-        if self.kv_cache.layout != KVLayout.NHD:
-            return f"the {self.kv_cache.layout.value} layout has no resident write path"
+            # a table per group would hold the pages; what's missing is the release: a group frees its
+            # front pages at commit, a step behind the device, so a planned step's row would point at them
+            return "a sliding-window group frees its front pages at commit, after the next step is planned on them"
         if self._needs_remote_transfer:
             return "a pool read across nodes takes pages a resident row doesn't track"
         return None

@@ -83,6 +83,13 @@ class Mamba2Manager(LinearAttnManager):
         # `ctx.plan_results`; see `StepRunner.topo_sort`
         return {self._pool_key}
 
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        return None  # decode addresses the pool by slot alone
+
+    def resident_refusal(self, key, streams) -> str | None:
+        # decode addresses the pool by slot alone, which the pool's table holds
+        return None
+
     # Step lifecycle
 
     @property
@@ -94,6 +101,9 @@ class Mamba2Manager(LinearAttnManager):
             "mamba2 preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
+        if ctx.resident is not None:
+            # a replayed decode reads only the pool's slots, which its graph fills
+            return self._current
         self.reset_default_cursors()
         if self._preplanned:
             self._current = self._cached_plan_output
