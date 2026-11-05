@@ -15,8 +15,13 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def caller_env() -> dict[str, str]:
+    """The test run's environment, but for a mask of its own: a case sees all 8 emulated GPUs."""
+    return {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+
+
 def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
-    env = dict(os.environ, MSTAR_SIM="1", MSTAR_SIM_GPU=gpu, **extra_env,
+    env = dict(caller_env(), MSTAR_SIM="1", MSTAR_SIM_GPU=gpu, **extra_env,
                PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT,
                                            os.environ.get("PYTHONPATH", "")]))
     with tempfile.TemporaryDirectory() as tmp:  # a file, so spawned ranks can import it
@@ -159,6 +164,16 @@ def test_cuda_semantics():
         print("ok")
     """)
     assert out.strip() == "ok"
+
+
+def test_a_mask_narrows_the_launchers_gpus_and_leaves_these_tests_alone(monkeypatch):
+    """``CUDA_VISIBLE_DEVICES`` can hide emulated GPUs but not add any, and the caller's own
+    doesn't reach a case that doesn't ask for it."""
+    count = "import torch; print(torch.cuda.device_count())"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert run_sim(count).strip() == "8"
+    assert run_sim(count, CUDA_VISIBLE_DEVICES="0,1,2,3", MSTAR_SIM_NUM_GPUS="2").strip() == "2"
+    assert run_sim(count, CUDA_VISIBLE_DEVICES="0", MSTAR_SIM_NUM_GPUS="2").strip() == "1"
 
 
 def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
@@ -982,7 +997,7 @@ def run_pytest(cwd, *args, emulated: bool = False, **env: str) -> str:
     """pytest's output for ``args`` in ``cwd``, on the emulated GPU when ``emulated``."""
     if emulated:
         env = dict(env, MSTAR_SIM="1", PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT]))
-    env = dict(os.environ, **{"PYTHONPATH": ROOT, **env})
+    env = dict(caller_env(), **{"PYTHONPATH": ROOT, **env})
     proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=cwd, env=env,
                           capture_output=True, text=True, timeout=300, check=False)
     return proc.stdout

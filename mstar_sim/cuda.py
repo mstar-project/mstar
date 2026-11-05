@@ -54,10 +54,11 @@ def spec() -> Spec:
 
 
 def device_count() -> int:
+    count = int(os.environ.get("MSTAR_SIM_NUM_GPUS", "8"))
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is not None:
-        return len([d for d in visible.split(",") if d.strip() != ""])
-    return int(os.environ.get("MSTAR_SIM_NUM_GPUS", "8"))
+        return min(count, len([d for d in visible.split(",") if d.strip() != ""]))
+    return count
 
 
 def current_device() -> int:
