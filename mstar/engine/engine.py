@@ -1819,8 +1819,11 @@ class Engine:
         mgmt = self._submodules[node_name]
         if mgmt.loopback_rows is None or mgmt.joint_comm_group.world_size > 1:
             return
-        if runner is not None and runner.template_step(graph_walk) is None:
-            return  # nothing would place its rows for the captures to read (``rows_refusal`` says so)
+        if runner is not None:
+            if not any(spec.bucket.graph_walk == graph_walk for spec in runner.prepare_for_capture()):
+                return  # no capture to keep rows for (``rows_refusal`` says so)
+            if runner.template_step(graph_walk) is None:
+                return  # nothing would place its rows for the captures to read (``rows_refusal`` says so)
         loopback = getattr(mgmt.submodule, "device_loopback", None)
         own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
         mgmt.row_signals[graph_walk] = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
@@ -1836,6 +1839,8 @@ class Engine:
         runner = mgmt.accelerator_graph_runner
         if runner is None:
             return "runner: the node captures no graphs"
+        if not any(spec.bucket.graph_walk == graph_walk for spec in runner.prepare_for_capture()):
+            return "runner: it has no capture"
         steps = mgmt.template_steps
         step = steps[graph_walk] if graph_walk in steps else runner.template_step(graph_walk)
         if step is None:

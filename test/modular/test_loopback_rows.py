@@ -172,12 +172,19 @@ def _runner(shapes):
 def test_a_walk_keeps_a_loop_back_in_rows_only_at_a_fixed_shape_on_one_rank(shapes, world_size, step, why):
     engine = Engine.__new__(Engine)
     runner = _runner(shapes)
-    runner.template_step = lambda walk: mgmt.template_steps[walk]
+
+    def template_step(walk):
+        if not shapes:
+            raise StopIteration  # as the runner's own: no capture of the walk to template
+        return mgmt.template_steps[walk]
+
+    runner.template_step = template_step
+    runner.prepare_for_capture = lambda: [SimpleNamespace(bucket=SimpleNamespace(graph_walk=WALK))] * bool(shapes)
     mgmt = _mgmt(LoopbackRows(CPU), runner=runner, world_size=world_size, step=step)
     engine._submodules = {"n": mgmt}
     engine._ask_rows("n", WALK, {"h"}, runner)
     # no step: its captures must not read rows at their head either
-    assert (WALK in mgmt.row_signals) is (step and world_size == 1)
+    assert (WALK in mgmt.row_signals) is (step and world_size == 1 and bool(shapes))
     assert engine.rows_refusal("n", WALK) == why
     if why is None:
         assert mgmt.row_signals == {WALK: {"h": CarryPair("h_out", "h")}}
