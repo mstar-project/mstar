@@ -583,8 +583,8 @@ class BagelModel(Model):
 
         A text run following an attachment carries the newline the old suffix
         supplied, and a turn ending on one closes after a newline too, so every
-        image layout a single user turn could express renders to the string that
-        template gave.
+        image layout a single user turn with text could express renders to the
+        string that template gave.
         """
         system_prompt, body = self.BAGEL_DEFAULT_SYSTEM_PROMPT, parts
         if len(parts) > 1 and parts[0].role == "system":
