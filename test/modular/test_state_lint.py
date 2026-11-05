@@ -23,7 +23,7 @@ FORBIDDEN_ATTRIBUTES = {
     "resource", "positions", "_kv", "_pool", "_linear", "_views", "_blocks",
 }
 
-_CAPTURE = "a capture's buckets and compile mode, which the contract leaves to the engine: until PR 20"
+_CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
 ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
@@ -32,7 +32,7 @@ ALLOWED = {
         "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
     )
 } | {
-    ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(): until PR 20",
+    ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
 }
 
