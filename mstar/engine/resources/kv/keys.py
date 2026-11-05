@@ -11,11 +11,10 @@ variable-length field so that no two different spans encode alike.
 """
 
 import hashlib
+import struct
 from collections.abc import Iterable, Mapping, Sequence
 from typing import NamedTuple
 
-# 4 bytes a token, not 8: a full page of 128 then hashes 512 bytes
-_TOKEN_BYTES = 4
 _LEN_BYTES = 4
 _SLOT_BYTES = 4
 
@@ -67,9 +66,8 @@ def page_key(
     """
     hasher = hashlib.sha256()
     hasher.update(_field(prev))
-    hasher.update(_field(b"".join(
-        token.to_bytes(_TOKEN_BYTES, "little") for token in tokens
-    )))
+    # 4 bytes a token, not 8: a full page of 128 then hashes 512 bytes
+    hasher.update(_field(struct.pack(f"<{len(tokens)}I", *tokens)))
     hasher.update(_field(b"".join(_item(item) for item in items)))
     return hasher.digest()
 

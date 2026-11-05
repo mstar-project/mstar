@@ -150,7 +150,9 @@ class PrefixChain:
         self.unkeyed.extend(tokens)
         self.covered_len += len(tokens)
         # Every item on the prompt's partial page ends there, so it takes length - offset of the page's tokens.
-        room = page_size - sum(item.length - item.offset for item in self.unkeyed_items)
+        room = page_size
+        if self.unkeyed_items:
+            room -= sum(item.length - item.offset for item in self.unkeyed_items)
         while len(self.unkeyed) >= room:
             whole = self.keyed_pages
             key = page_key(
