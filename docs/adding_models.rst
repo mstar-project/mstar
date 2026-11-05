@@ -715,19 +715,21 @@ The spec types are:
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.
        The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
-       model declares on its ``PagedKVConfig``, so they share its page table. Each step
-       the submodule stages its rows from the KV plan (``step_inputs``, preprocess outputs
-       a CUDA graph interns) and opens the forward's context (``context``, then ``use``);
-       the layers write their keys, select and attend through ``dsa.paged``
-       (``write_index``, ``select``, ``sparse_attend``), on device and under CUDA graphs.
-       A pass over some of a step's rows writes at their own slots inside
-       ``KVManager.token_rows(rows)``, as ``token_window`` does for a run of them.
+       model declares on its ``PagedKVConfig``, so they share its page table; a row is
+       ``index_head_dim`` wide, three times that with ``kpool`` above 1 (checked at build).
+       A step declares ``DSAStep()``: ``plan`` builds its rows from the KV plan, into
+       buffers of the capture slot under a lease (the graph reads them, every plan refills
+       them), and the layers write their keys, select and attend through the resource
+       (``write_index``, ``select``, ``attend``), on device and under CUDA graphs. A pass
+       over some of a step's rows narrows the plan (``rows``, ``pick``) and writes at their
+       own slots inside ``KVManager.token_window`` or ``token_rows``; ``dense`` leaves a
+       pass to dense attention.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
        (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
        An MTP verify block that the device places after its last accepted row rather than
-       where the host planned it stages with ``step_inputs(mtp_trims=True)`` and moves its
-       rows with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
+       where the host planned it declares ``DSAStep(mtp_trims=True)`` and moves its rows
+       with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
        ``spare_row``, masked in its rope slot.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.

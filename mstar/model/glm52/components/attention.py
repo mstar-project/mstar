@@ -6,7 +6,6 @@ import torch
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.dsa import paged
-from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm52.components.indexer import (
     Glm52Indexer,
@@ -126,8 +125,8 @@ class Glm52MLAAttention(MLAAttention):
         return masked_reference_attention(q, k, v, mask)
 
     def _dsa_ctx(self) -> paged.DSAContext | None:
-        """The forward's DSA context, which the submodule opened on the resource."""
-        return self._dsa.ctx if self._dsa is not None else None
+        """The step's DSA plan, or None where the layers attend densely (``DSAManager.dense``)."""
+        return self._dsa.current() if self._dsa is not None else None
 
     def _selects(self, dsa_selection=None) -> bool:
         return self._dsa_ctx() is not None
@@ -167,13 +166,11 @@ class Glm52MLAAttention(MLAAttention):
                     "FULL layer ran before it")
             return dsa_ctx.last_selection
         keys = self.indexer.compute_k(hidden_states, position_ids)
-        paged.write_index(self._kv, self.index_layer_idx, None, keys, dsa_ctx)
+        self._dsa.write_index(self.index_layer_idx, keys)
         if not dsa_ctx.needs_selection:
             return None
         q, w = self.indexer.compute_query(q_c, hidden_states, position_ids)
-        selection = paged.select(
-            q, w, self._kv.aux_view(INDEX_PLANES, self.index_layer_idx), dsa_ctx,
-            self.dsa_group)
+        selection = self._dsa.select(self.index_layer_idx, q, w, self.dsa_group)
         dsa_ctx.last_selection = selection
         return selection
 
@@ -188,11 +185,9 @@ class Glm52MLAAttention(MLAAttention):
     ) -> torch.Tensor:
         """Write the step's latents at the plan's slots, then attend each row over its own
         selected slots (prefill rows too: each sees its causal top-k)."""
-        dsa_ctx = self._dsa_ctx()
         layer_idx = self.cache_layer_idx
         self._kv.write_kv(latent, None, layer_idx=layer_idx)
-        return paged.sparse_attend(
-            q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)
+        return self._dsa.attend(layer_idx, q_nope, q_pe, slots, self.softmax_scale)
 
     @torch.compiler.disable
     def _attend_written(
@@ -203,6 +198,4 @@ class Glm52MLAAttention(MLAAttention):
         dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``_attend_selected`` once the fused prep has written the step's latents."""
-        return paged.sparse_attend(
-            q_nope, q_pe, self._kv.layer_view(self.cache_layer_idx), slots, self._dsa_ctx(),
-            self.softmax_scale)
+        return self._dsa.attend(self.cache_layer_idx, q_nope, q_pe, slots, self.softmax_scale)
