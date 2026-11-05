@@ -97,6 +97,8 @@ def _stub(cache_open: bool = False):
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None
     stub._poll_stream_buffers = lambda: None
+    stub._apply_removes_whose_step_landed = lambda: None
+    stub.request_state = None
     stub.build_results = []   # what _try_follow_speculation returns, in order
 
     def _process_messages():
@@ -338,6 +340,22 @@ def test_await_builds_a_queued_head_and_arms_it():
     assert _await(s, _pending(4, _future(s, out)), armed.append) == (out, spec)
     assert armed == [spec]
     assert s.communicator.waits == 0
+
+
+def test_await_lets_a_parked_head_row_back_once_a_held_removal_frees_it():
+    """A follower can't leave this wait without a decision, so nothing else
+    unparks a row of its head: the poll applies the removals whose step it
+    reached and asks again (review-r4 F2)."""
+    s = _stub()
+    order = []
+    s._apply_removes_whose_step_landed = lambda: order.append("removes")
+    s.scheduler.let_rows_back = lambda state: order.append("rows")
+    spec = object()
+    s.build_results = [None, spec]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    out = _output()
+    assert _await(s, _pending(4, _future(s, out)))[1] is spec
+    assert order == ["removes", "rows"]
 
 
 def test_await_goes_serial_on_the_marker_without_waiting():

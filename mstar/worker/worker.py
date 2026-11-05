@@ -3762,6 +3762,10 @@ class Worker(RepeatingSteps):
                 return outputs, None
             self.communicator.wait_for_work(20)
             self._process_messages()
+            # A head's row must find room here too: nothing else runs until a decision.
+            # Rank 0's REMOVE comes first on this socket, so a row is rarely short.
+            self._apply_removes_whose_step_landed()
+            self.scheduler.let_rows_back(self.request_state)
             self._check_ready_tensors()
             self._poll_stream_buffers()
             if outputs is not None:

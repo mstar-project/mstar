@@ -1079,7 +1079,7 @@ class MicroScheduler:
                 the chain's.
         """
         # done before any early returns
-        self._let_rows_back(request_state)
+        self.let_rows_back(request_state)
 
         # Note: a TP follow batch has to be scheduled irrespective of failure.
         # Rank 0 already committed to this batch and will sit on the collective
@@ -1383,7 +1383,7 @@ class MicroScheduler:
 
         ``continuing_only``: the rows waiting wait out this step.
         """
-        self._let_rows_back(request_state)
+        self.let_rows_back(request_state)
         key = self._key(*target)
         own_walk = None if self.speculation_mixes(*target) else target[1]
         backlogged = self.backlog.get(key)
@@ -2078,7 +2078,7 @@ class MicroScheduler:
                     return True
         return False
 
-    def _let_rows_back(self, request_state: RequestStateManager) -> None:
+    def let_rows_back(self, request_state: RequestStateManager) -> None:
         """Before a scan: drop the holds that have run out, and unpark the
         rows whose capacity has freed."""
         now = time.monotonic()
