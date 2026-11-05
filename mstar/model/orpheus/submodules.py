@@ -43,12 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 def token_stop(stop_token_id: int) -> TokenStop:
-    """The decode loop's stop id, checked by the graph runtime on every walk;
-    the loop's cap is the token budget."""
-    return TokenStop(
-        loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER,
-        runtime_check=True,
-    )
+    """The decode loop's stop id, on every walk; the loop's cap is the token budget."""
+    return TokenStop(loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER)
 
 
 class OrpheusLLMSubmodule(ARNodeSubmodule):

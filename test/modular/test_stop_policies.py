@@ -15,6 +15,8 @@ import torch
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.orpheus.submodules import token_stop as orpheus_token_stop
 from mstar.model.qwen3_5.submodules import LLMSubmodule, token_stop
+from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule
+from mstar.model.submodule_base import TokenStop
 
 LOOP = "decode_loop"
 EOS = (7, 9)
@@ -25,6 +27,11 @@ MODELS = {
                 ("decode", "prefill_text", "prefill_vision"), token_stop(EOS)),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"),
                 orpheus_token_stop(EOS[0])),
+    # a `TokenStepNode`: the runtime checks its decode walk, which routes the token as text_inputs
+    "qwen3_asr": (Qwen3ASRLLMSubmodule, None, ("prefill", "decode"), TokenStop(
+        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler=Qwen3ASRLLMSubmodule.SAMPLER,
+        walk="decode", prefill_walks=frozenset({"prefill"}),
+    )),
 }
 
 
@@ -82,10 +89,18 @@ def test_a_token_stop_names_the_walks_that_end_its_loop():
     assert both.stops_on("a") and both.stops_on("b") and not both.stops_on("c")
 
 
-def test_a_withholding_token_stop_refuses_the_runtime_check():
-    """The runtime's check never calls ``check_stop``, which is what withholds."""
-    from mstar.model.submodule_base import TokenStop
+@pytest.mark.parametrize("owner", ["withhold", "override"])
+def test_a_token_stop_keeps_check_stop_where_check_stop_does_more(owner):
+    """The runtime's check never calls ``check_stop``: not for a stop that
+    withholds outputs, nor for a class whose own check does more (Whisper keeps
+    each token for its align walk)."""
+    from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 
-    with pytest.raises(ValueError, match="runtime_check"):
-        TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
-                  withhold=("codes",), runtime_check=True)
+    cls = WhisperDecoderSubmodule if owner == "override" else Qwen3ASRLLMSubmodule
+    sub = cls.__new__(cls)
+    torch.nn.Module.__init__(sub)
+    sub.token_stop = TokenStop(
+        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
+        withhold=("codes",) if owner == "withhold" else (),
+    )
+    assert sub.get_stop_policies("decode") is None

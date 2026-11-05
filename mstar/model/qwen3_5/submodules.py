@@ -86,11 +86,11 @@ logger = logging.getLogger(__name__)
 
 
 def token_stop(stop_token_ids) -> TokenStop:
-    """The LLM's stop: a decode row's stop id, checked by the graph runtime."""
+    """The LLM's stop: a decode row's stop id."""
     return TokenStop(
         loop="decode_loop", buffer="new_token", stop_ids=frozenset(stop_token_ids),
         sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
-        last_prefill_flag="last_prefill", runtime_check=True,
+        last_prefill_flag="last_prefill",
     )
 
 

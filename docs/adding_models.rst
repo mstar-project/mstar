@@ -1538,8 +1538,9 @@ methods are:
    walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
    calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
-   ``TokenStop`` with ``runtime_check=True`` declares them for you: its loop's stop ids,
-   as ``StopKind.EOS``, on ``walk``; its ``prefill_walks`` keep ``check_stop``.
+   ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
+   ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a stop
+   that withholds outputs or of a class that overrides the token's stop check.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,

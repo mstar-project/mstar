@@ -55,7 +55,10 @@ class TokenStop:
     enforces.
 
     Declared as ``ARNodeSubmodule.token_stop``; ``check_stop`` and
-    ``check_stop_batched`` follow from it.
+    ``check_stop_batched`` follow from it, and the graph runtime checks the
+    stop itself (``ARNodeSubmodule.get_stop_policies``) on every walk but the
+    prefill walks, unless the stop withholds outputs or the class overrides
+    the check.
     """
 
     loop: str
@@ -78,15 +81,6 @@ class TokenStop:
     # or not (``StopCheck.withheld``): a frame streamed beside the stop token
     # is loop control, and only the stop check's host copy tells it from data
     withhold: tuple[str, ...] = ()
-    # the graph runtime checks ``walk``'s stop ids itself, without calling
-    # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
-    # check_stop, which can end the partition
-    runtime_check: bool = False
-
-    def __post_init__(self):
-        if self.withhold and self.runtime_check:
-            # the runtime's check never calls check_stop, which is what withholds
-            raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
 
     def stops_on(self, graph_walk: str) -> bool:
         """Whether a row of ``graph_walk`` can stop the loop."""
@@ -1495,6 +1489,10 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
 
 
+# What the runtime's EOS policy stands in for: a class overriding any keeps check_stop.
+_TOKEN_STOP_CHECK = ("check_stop", "check_stop_batched", "_token_stops")
+
+
 class ARNodeSubmodule(NodeSubmodule):
     # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
     # The engine probes the prefix cache for a walk that carries them only then.
@@ -1592,7 +1590,13 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
-        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+        if (
+            stop is None or graph_walk in stop.prefill_walks
+            # the runtime's check never calls check_stop, which is what withholds
+            or stop.withhold
+            # a class that overrides the token's stop check answers for it
+            or any(getattr(type(self), name) is not getattr(ARNodeSubmodule, name) for name in _TOKEN_STOP_CHECK)
+        ):
             return super().get_stop_policies(graph_walk)
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
