@@ -4655,7 +4655,10 @@ class KVManager(AttentionResource):
         if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
             return 0
         allotment = self._allotments[rid]
-        grows = max(0, self._footprint(rid) - held)
+        # a lease's lent pages stay in a guaranteed allotment until `_adopt` takes them off
+        grows = max(0, self._footprint(rid) - held) + sum(
+            len(stream.lent.intersection(stream.lease or ())) for stream in self._streams[rid].values()
+        )
         short = grows - allotment.remaining - self._room()
         if short > 0:
             return short
