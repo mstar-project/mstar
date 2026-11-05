@@ -384,8 +384,8 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # `unpausable`: the request streams an output that can't pause, set by the conductor.
     # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
-    # A pool that decides admission reads both at the request's first `KVManager.ask` and at its admission, and a
-    # request no drop can free turns guaranteed at any page after that the host pool has no room for.
+    # A pool that decides admission reads both at the request's first `KVManager.ask` and at its admission. A request
+    # no drop can free can still turn guaranteed later, at the first page the host pool has no room for.
     unpausable: bool = False
     rebuildable: bool = True
 
