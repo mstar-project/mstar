@@ -1,16 +1,17 @@
-"""Backend-neutral RMSNorm custom operator.
+"""Backend-neutral RMSNorm custom operators.
 
-The operator keeps fused accelerator implementations behind one stable
-``mstar::rms_norm`` graph boundary. CUDA currently dispatches to FlashInfer,
-XPU dispatches to vllm-xpu-kernels, and other devices use the portable
-PyTorch implementation. ``mstar::fused_add_rms_norm`` does the same for the
-in-place residual add + RMSNorm: FlashInfer's fused kernel on CUDA in half
-precision, the unfused add and norm elsewhere.
+The operators keep fused accelerator implementations behind stable
+``mstar::rms_norm`` and ``mstar::fused_add_rms_norm`` graph boundaries. NVIDIA
+GPUs run FlashInfer, AMD GPUs FlashInfer's ROCm fork, XPU vllm-xpu-kernels, and
+other devices the portable PyTorch implementation. ``mstar::fused_add_rms_norm``
+is the in-place residual add + RMSNorm: the fused kernel in half precision, the
+unfused add and norm elsewhere.
 """
 
 import torch
 
 from mstar.engine.node_dtype import warn_implicit_downcast
+from mstar.platforms.dispatch import PlatformDispatch
 
 
 def _prepare_inputs(
@@ -47,6 +48,22 @@ def rms_norm(
     return (output * weight).to(orig_dtype)
 
 
+def _flashinfer_rmsnorm():
+    import flashinfer
+
+    return flashinfer.norm.rmsnorm
+
+
+def _rocm_rmsnorm():
+    from mstar.engine.resources.rms_norm.rocm import rmsnorm
+
+    return rmsnorm
+
+
+# torch calls AMD GPUs "cuda" devices too, so the kernel picks by platform
+_rmsnorm = PlatformDispatch("mstar::rms_norm", cuda=_flashinfer_rmsnorm, rocm=_rocm_rmsnorm)
+
+
 @torch.library.register_kernel(rms_norm, "cuda")
 def _rms_norm_cuda(
     x: torch.Tensor,
@@ -54,10 +71,8 @@ def _rms_norm_cuda(
     eps: float,
     norm_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    import flashinfer
-
     x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
-    return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
+    return _rmsnorm(x, weight, eps=eps).to(orig_dtype)
 
 
 @torch.library.register_kernel(rms_norm, "xpu")
@@ -131,13 +146,37 @@ def fused_add_rms_norm(
     _unfused_add_rms_norm(x, residual, weight, eps, gemma_mode)
 
 
+def _flashinfer_fused_add_rms_norm():
+    from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
+
+    def run(hidden_states, residual, weight, eps, gemma):
+        fused = gemma_fused_add_rmsnorm if gemma else fused_add_rmsnorm
+        fused(hidden_states, residual, weight, eps)
+
+    return run
+
+
+def _rocm_fused_add_rms_norm():
+    from mstar.engine.resources.rms_norm.rocm import fused_add_rmsnorm
+
+    return fused_add_rmsnorm
+
+
+_fused_add_rmsnorm = PlatformDispatch(
+    "mstar::fused_add_rms_norm",
+    cuda=_flashinfer_fused_add_rms_norm,
+    rocm=_rocm_fused_add_rms_norm,
+)
+
+
 @torch.library.register_kernel(fused_add_rms_norm, "cuda")
 def _fused_add_rms_norm_cuda(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
 ) -> None:
-    """FlashInfer's fused kernel, which takes half precision only, and reads
-    ``residual`` and ``weight`` in ``x``'s dtype: any other mix runs unfused. It
-    normalizes the sum before rounding it, where the unfused pair rounds first.
+    """FlashInfer's fused kernel (its ROCm fork's on AMD GPUs), which takes half
+    precision only, and reads ``residual`` and ``weight`` in ``x``'s dtype: any
+    other mix runs unfused. It normalizes the sum before rounding it, where the
+    unfused pair rounds first.
 
     The op, rather than calling FlashInfer's wrapper directly, keeps the kernel
     behind a graph boundary: the wrapper is plain Python (its op registration is
@@ -147,9 +186,7 @@ def _fused_add_rms_norm_cuda(
     if x.dtype not in (torch.bfloat16, torch.float16) or not x.dtype == residual.dtype == weight.dtype:
         _unfused_add_rms_norm(x, residual, weight, eps, gemma_mode)
         return
-    from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
-
-    (gemma_fused_add_rmsnorm if gemma_mode else fused_add_rmsnorm)(x, residual, weight, eps)
+    _fused_add_rmsnorm(x, residual, weight, eps, gemma_mode)
 
 
 @fused_add_rms_norm.register_fake
@@ -157,3 +194,12 @@ def _fused_add_rms_norm_fake(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, gemma_mode: bool,
 ) -> None:
     return None
+
+
+def _fused_add_rms_norm_op():
+    return torch.ops.mstar.fused_add_rms_norm
+
+
+# ``(hidden_states, residual, weight, eps, gemma)``, both 2-D, updated in place,
+# through the op on every platform
+run_fused_add_rms_norm = PlatformDispatch("fused_add_rms_norm", default=_fused_add_rms_norm_op)

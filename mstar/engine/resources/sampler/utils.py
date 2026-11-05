@@ -1,8 +1,8 @@
 """Generic token sampling utilities.
 
-Uses device-specific fused top-k/top-p sampling kernels: FlashInfer on CUDA and
-``vllm-xpu-kernels`` on XPU. Model-agnostic — any AR model returns logits, this
-module selects the next token.
+Uses device-specific fused top-k/top-p sampling kernels: FlashInfer on NVIDIA
+GPUs, FlashInfer's ROCm fork on AMD GPUs, and ``vllm-xpu-kernels`` on XPU.
+Model-agnostic — any AR model returns logits, this module selects the next token.
 
 Supports per-request sampling parameters (different temperature/top_k/top_p
 for each request in a batch) via tensor parameters.
@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms.dispatch import PlatformDispatch
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import H2DMirror, PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import sampler_slots
@@ -60,6 +61,17 @@ def _xpu_generator_seed_offset(
     return seed, offset
 
 
+# A block holds at most 1024 threads on both vendors: 32 warps fits NVIDIA's
+# 32-wide warps but not AMD's 64-wide wavefronts, where it cannot launch.
+_MAX_THREADS_PER_BLOCK = 1024
+
+
+def _launchable(configs: list, device: torch.device) -> list:
+    """The autotune configs whose block fits the device."""
+    warp_size = torch.cuda.get_device_properties(device).warp_size
+    return [c for c in configs if c.num_warps * warp_size <= _MAX_THREADS_PER_BLOCK]
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
@@ -71,6 +83,9 @@ def _xpu_generator_seed_offset(
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
     ],
     key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
+    prune_configs_by={"early_config_prune": lambda configs, nargs, **kw: _launchable(
+        configs, nargs["logits_ptr"].device,
+    )},
 )
 @triton.jit
 def _fused_sampling_prep_kernel(
@@ -803,8 +818,6 @@ def filter_top_k_top_p(
       ``L = min(k, n_p)``, ``n_p`` what top-p keeps of the full distribution,
       raised to ``min_keep`` as HF's ``min_tokens_to_keep`` does.
     """
-    import flashinfer
-
     vocab = probs.shape[1]
     k = torch.where(top_k > 0, top_k, vocab).to(torch.int32)
     # one top-p pass for both orders: a top-p-first row's top-k here is the
@@ -820,12 +833,12 @@ def filter_top_k_top_p(
             BLOCK=triton.next_power_of_2(vocab), num_warps=FUSED_FILTER_WARPS,
         )
         return out
-    first = flashinfer.sampling.top_k_renorm_probs(probs, first_k)
+    first = _top_k_renorm_probs(probs, first_k)
     # FlashInfer's top-p expects p in (0, 1); p = 1 removes nothing
-    n = torch.where(top_p >= 1.0, _kept(first), _kept(flashinfer.sampling.top_p_renorm_probs(first, top_p)))
+    n = torch.where(top_p >= 1.0, _kept(first), _kept(_top_p_renorm_probs(first, top_p)))
     if order is not None:
         n = torch.maximum(n, order.min_keep)
-    return flashinfer.sampling.top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
+    return _top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
 
 
 def apply_min_tokens_floor(probs: torch.Tensor, rows: HistoryRows) -> torch.Tensor:
@@ -1496,6 +1509,56 @@ class Sampler(BaseSampler):
         return FilterOrder(top_p_first=dev[0] != 0, min_keep=dev[1].to(torch.int32))
 
 
+def _flashinfer_sampling(name: str):
+    def factory():
+        import flashinfer
+
+        return getattr(flashinfer.sampling, name)
+    return factory
+
+
+def _rocm_sampling(name: str):
+    def factory():
+        from mstar.engine.resources.sampler.rocm import sampling_from_probs
+
+        return sampling_from_probs(name)
+    return factory
+
+
+def _rocm_op(name: str):
+    def factory():
+        from mstar.engine.resources.sampler.rocm import sampling_op
+
+        return sampling_op(name)
+    return factory
+
+
+# FlashInfer's rejection samplers, reading one device seed/offset per row.
+# Every platform but ROCm keeps upstream FlashInfer, as before this dispatch.
+_top_p_sampling_from_probs = PlatformDispatch(
+    "top_p_sampling_from_probs",
+    rocm=_rocm_sampling("top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_p_sampling_from_probs"),
+)
+_top_k_top_p_sampling_from_probs = PlatformDispatch(
+    "top_k_top_p_sampling_from_probs",
+    rocm=_rocm_sampling("top_k_top_p_sampling_from_probs"),
+    default=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
+)
+_sampling_from_probs = PlatformDispatch(
+    "sampling_from_probs",
+    rocm=_rocm_sampling("sampling_from_probs"),
+    default=_flashinfer_sampling("sampling_from_probs"),
+)
+# the renorms filter_top_k_top_p uses past the fused kernel's vocabulary
+_top_k_renorm_probs = PlatformDispatch(
+    "top_k_renorm_probs", rocm=_rocm_op("top_k_renorm_probs"), default=_flashinfer_sampling("top_k_renorm_probs"),
+)
+_top_p_renorm_probs = PlatformDispatch(
+    "top_p_renorm_probs", rocm=_rocm_op("top_p_renorm_probs"), default=_flashinfer_sampling("top_p_renorm_probs"),
+)
+
+
 class Draw(NamedTuple):
     tokens: torch.Tensor
     probs: torch.Tensor  # the distribution the filters ran on
@@ -1517,10 +1580,8 @@ def _sample_cuda(
     order: FilterOrder | None = None,
     return_probs: bool = False,
 ) -> torch.Tensor | Draw:
-    """Sample normalized CUDA inputs with FlashInfer; with ``return_probs``,
-    also the distribution the filters ran on."""
-    import flashinfer
-
+    """Sample normalized CUDA-device inputs with FlashInfer's sampler; with
+    ``return_probs``, also the distribution the filters ran on."""
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
     # (reads probs) to the same device/stream so the write-before-read is
     # ordered without an explicit sync. Otherwise FlashInfer runs on the
@@ -1544,7 +1605,7 @@ def _sample_cuda(
             result = _filter_floor_and_draw(probs, top_k, top_p, seed, rand_offset, history, order)
         elif top_k_zero_count == logits.shape[0]:
             # top-k is off for every row
-            result = flashinfer.sampling.top_p_sampling_from_probs(
+            result = _top_p_sampling_from_probs(
                 probs, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1552,7 +1613,7 @@ def _sample_cuda(
         else:
             # top_k 0 is off: FlashInfer reads it as k=0, so a mixed batch's 0 rows drew token 0
             top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-            result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            result = _top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p,
                 deterministic=True,
                 seed=seed, offset=rand_offset,
@@ -1577,12 +1638,10 @@ def _filter_floor_and_draw(
     order: FilterOrder | None,
 ) -> torch.Tensor:
     """Filter, apply the min-tokens floor, and draw; graph-safe."""
-    import flashinfer
-
     probs = filter_top_k_top_p(probs, top_k, top_p, order)
     if history is not None and history.stop_ids is not None:
         probs = apply_min_tokens_floor(probs, history)
-    return flashinfer.sampling.sampling_from_probs(probs, deterministic=True, seed=seed, offset=offset)
+    return _sampling_from_probs(probs, deterministic=True, seed=seed, offset=offset)
 
 
 def _sample_xpu(
@@ -1875,8 +1934,6 @@ def sample_accelerator_graphable_gpu(
                 min_p=min_p,
             )
     elif logits.device.type == "cuda":
-        import flashinfer
-
         with torch.cuda.device(logits.device):
             if (
                 logits.shape[1] <= FUSED_SAMPLE_MAX_VOCAB and min_p is None
@@ -1905,7 +1962,7 @@ def sample_accelerator_graphable_gpu(
                 # Sampling is thus reproducible only within a fixed batch layout; under
                 # continuous batching (shifting positions) a request's stream is not.
                 # Measured in test/sampling_test/flashinfer_batch_test.py (raw FlashInfer).
-                samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                samples = _top_k_top_p_sampling_from_probs(
                     probs, torch.where(top_k > 0, top_k, logits.shape[1]), top_p, deterministic=True,
                     seed=seed, offset=offset,
                 )
