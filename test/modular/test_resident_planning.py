@@ -328,6 +328,17 @@ def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
     ))
 
 
+def test_cached_pages_are_room_for_a_step_that_repeats():
+    """A long-running server's free pages sink to none while the prefix cache
+    holds them, and those go on demand."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=1)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = SimpleNamespace(evictable=lambda: {5, 6})
+    assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3), resident=object())) == PAGE
+    assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3, 4), resident=object())) == 1
+
+
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
     """A one-token host step leaves a row's length to be refreshed. A run after
     it refreshes it once, not at the head of every replay."""

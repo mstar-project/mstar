@@ -4696,12 +4696,14 @@ class KVManager(AttentionResource):
     # Resident planning
 
     def max_repeats(self, step: KVStep, ctx: StepContext) -> int:
-        """What the free pages cover, one page a row at most: a refused admit
-        would break the chain for pages a shorter run doesn't need."""
+        """What the pool can hand over covers, one page a row at most: a refused
+        admit would break the chain for pages a shorter run doesn't need. Not
+        `_room`, which holds back the allotments these rows draw on themselves."""
         if ctx.resident is None:
             return 1
         rows = max(len(ctx.request_ids), 1)
-        return self._groups[0].page_size if self._arena.num_free >= rows else 1
+        evictable = 0 if self._index is None else len(self._index.evictable())
+        return self._groups[0].page_size if self._arena.num_free + evictable >= rows else 1
 
     def resident_refusal(self) -> str | None:
         if len(self._groups) > 1:
