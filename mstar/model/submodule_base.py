@@ -14,7 +14,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.engine.resources.lora.config import LoraStep
-from mstar.engine.state.adapters import state_steps
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -1509,6 +1508,9 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     no LoRA step, and what it declares about its state expanded (``state_steps``)."""
     # the engine drives duck-typed submodules too
     step = lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
+    from mstar.engine.state.adapters import state_steps
+
     return state_steps(step, getattr(submodule, "state_handles", {}))
 
 
