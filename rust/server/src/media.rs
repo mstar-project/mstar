@@ -11,21 +11,22 @@
 //!    real container (WAV by default) and encode PNG image bytes as a `data:`
 //!    URL for OpenAI chat image output.
 //!
-//! Only the stdlib + `base64` + `uuid` are needed (plus `url` and `rustls` for
-//! the opt-in remote fetch, a minimal HTTP/1.1 GET whose every read is bounded
-//! in size and by the fetch deadline); compressed audio containers
-//! (mp3/flac/ogg) degrade to WAV since the base install has no encoder — the
-//! Python side is where those are produced when `soundfile` is present.
+//! Only the stdlib + `base64` + `uuid` are needed (plus `url` and `ureq` for
+//! the opt-in remote fetch: a GET bounded in size and by the fetch deadline,
+//! which reaches only the addresses this module has vetted); compressed audio
+//! containers (mp3/flac/ogg) degrade to WAV since the base install has no
+//! encoder — the Python side is where those are produced when `soundfile` is
+//! present.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
+use ureq::unversioned::resolver::ResolvedSocketAddrs;
 use uuid::Uuid;
 
 /// Map a MIME type (top-level or full) to a file extension for persisting.
@@ -470,8 +471,11 @@ fn fetch_error(host: &str, reason: &str, detail: impl std::fmt::Display) -> Stri
     format!("remote media fetch failed: {reason}")
 }
 
-fn transport_error(host: &str, deadline: Instant, fired: bool, detail: impl std::fmt::Display) -> String {
-    let reason = if fired || Instant::now() >= deadline { "timed out" } else { "connection failed" };
+/// A transport failure: `timed out` once the deadline has passed (the fetch ran
+/// out of time even if the error itself does not say so), `connection failed`
+/// before it.
+fn transport_error(host: &str, deadline: Instant, detail: impl std::fmt::Display) -> String {
+    let reason = if Instant::now() >= deadline { "timed out" } else { "connection failed" };
     fetch_error(host, reason, detail)
 }
 
@@ -495,13 +499,8 @@ fn save_remote_url(
     let mut url = url::Url::parse(url).map_err(|e| fetch_error("", "invalid URL", e))?;
     let mut host = String::new();
     for _ in 0..=REMOTE_MAX_REDIRECTS {
-        host = url
-            .host_str()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
+        // the same spelling the pinned resolver checks the hop's URI against
+        host = normalized_host(url.host_str().unwrap_or(""));
         let allowlisted = policy.allowlisted(&host, written.as_deref());
         if !matches!(url.scheme(), "http" | "https") || host.is_empty() {
             return Err(fetch_error(&host, "invalid URL", &url));
@@ -535,10 +534,6 @@ fn save_remote_url(
     Err(fetch_error(&host, "too many redirects", ""))
 }
 
-// Response line and header bounds, the same as Python's http.client.
-const MAX_LINE: usize = 65536;
-const MAX_HEADERS: usize = 100;
-
 enum Hop {
     /// The next URL and the `Location` text it came from.
     Redirect(url::Url, String),
@@ -551,208 +546,84 @@ enum BodyError {
     Store(io::Error),
 }
 
-trait Conn: Read + Write {}
-impl<T: Read + Write> Conn for T {}
-
-/// Shuts a connected socket down at the deadline, so no read or write on it
-/// (TLS handshake, headers, chunk framing, body) can outlast the fetch timeout.
-struct Watchdog {
-    fired: Arc<AtomicBool>,
-    _cancel: mpsc::Sender<()>,
+/// `host` as the allowlist and the address check spell it: lower-cased, without
+/// brackets around an IPv6 literal or a trailing dot.
+fn normalized_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
-impl Watchdog {
-    fn arm(sock: &TcpStream, deadline: Instant) -> io::Result<Watchdog> {
-        let sock = sock.try_clone()?;
-        let (cancel, cancelled) = mpsc::channel::<()>();
-        let fired = Arc::new(AtomicBool::new(false));
-        let flag = fired.clone();
-        let left = deadline.saturating_duration_since(Instant::now());
-        std::thread::spawn(move || {
-            // dropping the Watchdog disconnects the channel and ends this wait early
-            if let Err(mpsc::RecvTimeoutError::Timeout) = cancelled.recv_timeout(left) {
-                flag.store(true, Ordering::SeqCst);
-                let _ = sock.shutdown(Shutdown::Both);
-            }
-        });
-        Ok(Watchdog { fired, _cancel: cancel })
-    }
-
-    fn fired(&self) -> bool {
-        self.fired.load(Ordering::SeqCst)
-    }
+/// Answers every lookup with the one address `save_remote_url` has already
+/// vetted, and refuses any other host. ureq's connector reaches only what a
+/// resolver returns, so the name cannot resolve to something else between the
+/// address check and the connect.
+#[derive(Debug)]
+struct Pinned {
+    host: String,
+    addr: SocketAddr,
 }
 
-fn time_left(deadline: Instant) -> io::Result<Duration> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        Err(io::ErrorKind::TimedOut.into())
-    } else {
-        Ok(left)
+impl ureq::unversioned::resolver::Resolver for Pinned {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        // one hop is one vetted host; redirects go back through save_remote_url
+        if normalized_host(uri.host().unwrap_or("")) != self.host {
+            return Err(ureq::Error::HostNotFound);
+        }
+        let mut out = self.empty();
+        out.push(self.addr);
+        Ok(out)
     }
 }
 
-fn invalid(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
-}
-
-fn tls_config() -> Arc<rustls::ClientConfig> {
-    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-            let config = rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::ring::default_provider().into(),
+/// Whether a failed attempt concerns only the address tried, so the next
+/// vetted address may still answer. These are the kinds ureq's own connector
+/// retries, but it reads them from the connect alone while this reads them
+/// from the whole call: a route that disappears after the request was sent
+/// retries the GET on the next vetted address, where the socket client
+/// returned. Both stay inside the checked host, its vetted addresses and the
+/// fetch deadline, and only a call that returned no response is retried.
+fn addr_specific(e: &ureq::Error) -> bool {
+    matches!(
+        e,
+        ureq::Error::Io(io)
+            if matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::AddrNotAvailable
             )
-            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
-            .expect("ring supports TLS 1.2 and 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            Arc::new(config)
-        })
-        .clone()
+    )
 }
 
-/// Connect to the first reachable vetted address (each attempt gets only what
-/// is left of the deadline) and arm the watchdog before any TLS handshake.
-fn connect(
-    url: &url::Url,
-    host: &str,
-    addrs: &[SocketAddr],
-    deadline: Instant,
-) -> io::Result<(Box<dyn Conn>, Watchdog)> {
-    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
-    for addr in addrs {
-        let sock = match TcpStream::connect_timeout(addr, time_left(deadline)?) {
-            Ok(sock) => sock,
-            Err(e) => {
-                last = e;
-                continue;
-            }
-        };
-        let watchdog = Watchdog::arm(&sock, deadline)?;
-        if url.scheme() != "https" {
-            return Ok((Box::new(sock), watchdog));
+/// A failed call as one of the fetch's short reasons. The detail goes to the
+/// log only: ureq's messages name the host, the address and the upstream.
+fn request_error(host: &str, deadline: Instant, max_bytes: u64, e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Timeout(_) => fetch_error(host, "timed out", e),
+        ureq::Error::BodyExceedsLimit(_) => {
+            fetch_error(host, &format!("too large (limit {max_bytes} bytes)"), e)
         }
-        let name = rustls::pki_types::ServerName::try_from(host)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .to_owned();
-        let tls = rustls::ClientConnection::new(tls_config(), name).map_err(io::Error::other)?;
-        return Ok((Box::new(rustls::StreamOwned::new(tls, sock)), watchdog));
-    }
-    Err(last)
-}
-
-/// One line of at most `MAX_LINE` bytes, without its line ending.
-fn read_line(r: &mut impl BufRead) -> io::Result<String> {
-    let mut line = Vec::new();
-    r.take(MAX_LINE as u64 + 1).read_until(b'\n', &mut line)?;
-    if line.len() > MAX_LINE {
-        return Err(invalid("line too long"));
-    }
-    if line.is_empty() {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string())
-}
-
-/// The status code and headers (names lower-cased) of the final response,
-/// skipping `100 Continue`.
-fn read_head(r: &mut impl BufRead) -> io::Result<(u16, Vec<(String, String)>)> {
-    loop {
-        let status = read_line(r)?;
-        let mut parts = status.splitn(3, ' ');
-        let (version, code) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-        let code = match code.parse::<u16>() {
-            Ok(c) if version.starts_with("HTTP/") && code.len() == 3 && (100..=999).contains(&c) => c,
-            _ => return Err(invalid("bad status line")),
-        };
-        let mut headers = Vec::new();
-        loop {
-            let line = read_line(r)?;
-            if line.is_empty() {
-                break;
-            }
-            if headers.len() == MAX_HEADERS {
-                return Err(invalid("too many headers"));
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-            }
-        }
-        if code != 100 {
-            return Ok((code, headers));
-        }
+        ureq::Error::BadUri(_) | ureq::Error::Http(_) => fetch_error(host, "invalid URL", e),
+        ureq::Error::Io(io) => io_error(host, deadline, io),
+        // a protocol error (bad framing, an unreadable Content-Length, too many
+        // headers), a refused connection, or anything ureq adds later
+        _ => transport_error(host, deadline, e),
     }
 }
 
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
-}
-
-/// Copy `want` bytes (to EOF when `None`) from `r` to `out`, failing once more
-/// than `max` body bytes have arrived in all.
-fn copy_some(
-    r: &mut impl Read,
-    out: &mut impl Write,
-    want: Option<u64>,
-    total: &mut u64,
-    max: u64,
-) -> Result<(), BodyError> {
-    let mut buf = [0u8; 1 << 14];
-    let mut left = want;
-    loop {
-        let cap = match left {
-            Some(0) => return Ok(()),
-            Some(n) => n.min(buf.len() as u64) as usize,
-            None => buf.len(),
-        };
-        let n = match r.read(&mut buf[..cap]) {
-            Ok(0) if left.is_none() => return Ok(()),
-            Ok(0) => return Err(BodyError::Read(io::ErrorKind::UnexpectedEof.into())),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            // a TLS peer that closes without close_notify, which Python's ssl also accepts
-            Err(e) if left.is_none() && e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(BodyError::Read(e)),
-        };
-        *total += n as u64;
-        if *total > max {
-            return Err(BodyError::TooLarge);
-        }
-        out.write_all(&buf[..n]).map_err(BodyError::Store)?;
-        if let Some(l) = left.as_mut() {
-            *l -= n as u64;
-        }
+fn io_error(host: &str, deadline: Instant, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::TimedOut {
+        return fetch_error(host, "timed out", e);
     }
-}
-
-fn copy_chunked(r: &mut impl BufRead, out: &mut impl Write, max: u64) -> Result<(), BodyError> {
-    let mut total = 0u64;
-    loop {
-        let line = read_line(r).map_err(BodyError::Read)?;
-        let size = line.split(';').next().unwrap_or("").trim();
-        let size = u64::from_str_radix(size, 16).map_err(|_| BodyError::Read(invalid("bad chunk size")))?;
-        if size == 0 {
-            // trailers up to the blank line; EOF there is accepted, as in Python
-            for _ in 0..=MAX_HEADERS {
-                match read_line(r) {
-                    Ok(line) if !line.is_empty() => continue,
-                    Ok(_) => return Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                    Err(e) => return Err(BodyError::Read(e)),
-                }
-            }
-            return Err(BodyError::Read(invalid("too many trailers")));
-        }
-        if total.saturating_add(size) > max {
-            return Err(BodyError::TooLarge);
-        }
-        copy_some(r, out, Some(size), &mut total, max)?;
-        if !read_line(r).map_err(BodyError::Read)?.is_empty() {
-            return Err(BodyError::Read(invalid("bad chunk end")));
-        }
-    }
+    transport_error(host, deadline, e)
 }
 
 /// The MIME type from `Content-Type`, or from the URL path extension when it
@@ -774,8 +645,39 @@ fn mime_for(content_type: Option<&str>, url: &url::Url) -> String {
     }
 }
 
+/// The client settings for one hop. `proxy(None)` matters: ureq's default
+/// config takes a proxy from `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`, and a
+/// fetch sent to a proxy would reach neither the vetted addresses nor the
+/// checked host.
+fn hop_config(left: Duration) -> ureq::config::Config {
+    ureq::config::Config::builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .user_agent(REMOTE_USER_AGENT)
+        .timeout_global(Some(left))
+        // a fetch is one connection: nothing is kept for a later request
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
+        .build()
+}
+
 /// One GET to the vetted `addrs`: the next URL for a redirect, or the body
 /// saved under `upload_dir`.
+///
+/// ureq does the HTTP/1.1 and TLS work. The redirect loop stays in
+/// `save_remote_url` (`max_redirects(0)`, and a 3xx is a response rather than
+/// an error), so every hop is checked against the allowlist and the blocked
+/// ranges, the `Location` is read as the server wrote it, and the hop count
+/// stays at `REMOTE_MAX_REDIRECTS`.
+///
+/// The addresses are tried one call at a time, each with `timeout_global` set
+/// to what is left of the fetch deadline, so the handshake, the headers, the
+/// chunk framing and the body are all bounded by it and several addresses
+/// cannot spend it more than once. ureq's own address loop would: it moves on
+/// from a refusal without re-reading the clock or shrinking the next
+/// address's share (`try_connect_with` in its `transport::tcp`).
 fn fetch_hop(
     url: &url::Url,
     host: &str,
@@ -784,62 +686,108 @@ fn fetch_hop(
     max_bytes: u64,
     deadline: Instant,
 ) -> Result<Hop, String> {
-    let (stream, watchdog) =
-        connect(url, host, addrs, deadline).map_err(|e| transport_error(host, deadline, false, e))?;
-    let mut r = BufReader::new(stream);
-    let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
-    let host_header = &url[url::Position::BeforeHost..url::Position::AfterPort];
-    let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {REMOTE_USER_AGENT}\r\n\
-         Accept-Encoding: identity\r\nConnection: close\r\n\r\n"
-    );
-    let head = r
-        .get_mut()
-        .write_all(request.as_bytes())
-        .and_then(|_| r.get_mut().flush())
-        .and_then(|_| read_head(&mut r));
-    let (code, headers) = head.map_err(|e| transport_error(host, deadline, watchdog.fired(), e))?;
+    let mut last: Option<ureq::Error> = None;
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(fetch_error(host, "timed out", "the fetch ran out of time"));
+        }
+        let agent = ureq::Agent::with_parts(
+            hop_config(left),
+            ureq::unversioned::transport::DefaultConnector::new(),
+            Pinned { host: host.to_string(), addr: *addr },
+        );
+        let call = agent
+            .get(url.as_str())
+            // the cap counts the bytes written to disk, so take the body as it is
+            .header("accept-encoding", "identity")
+            .call();
+        match call {
+            Ok(resp) => return read_hop(resp, url, host, upload_dir, max_bytes, deadline),
+            Err(e) if addr_specific(&e) => last = Some(e),
+            Err(e) => return Err(request_error(host, deadline, max_bytes, &e)),
+        }
+    }
+    match last {
+        Some(e) => Err(request_error(host, deadline, max_bytes, &e)),
+        None => Err(fetch_error(host, "connection failed", "no vetted address")),
+    }
+}
+
+/// The redirect this response points at, or its body saved under `upload_dir`.
+fn read_hop(
+    mut resp: ureq::http::Response<ureq::Body>,
+    url: &url::Url,
+    host: &str,
+    upload_dir: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<Hop, String> {
+    let code = resp.status().as_u16();
     match code {
         301 | 302 | 303 | 307 | 308 => {
-            let location = header(&headers, "location")
-                .ok_or_else(|| fetch_error(host, "bad redirect", format!("{code} without Location")))?;
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| fetch_error(host, "bad redirect", format!("{code} without Location")))?
+                .to_string();
             if location.contains(URL_DROPPED) {
                 return Err(fetch_error(host, "invalid URL", format!("{location:?}")));
             }
             return url
-                .join(location)
-                .map(|next| Hop::Redirect(next, location.to_string()))
+                .join(&location)
+                .map(|next| Hop::Redirect(next, location))
                 .map_err(|e| fetch_error(host, "invalid URL", e));
         }
         200..=299 => {}
         _ => return Err(fetch_error(host, &format!("upstream returned {code}"), "")),
     }
     let too_large = format!("too large (limit {max_bytes} bytes)");
-    let chunked = header(&headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
-    // as http.client: a non-numeric length is ignored; one past u64 is still a length, over any cap
-    let length = match header(&headers, "content-length") {
-        Some(v) if !chunked && !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
-            Some(v.parse::<u64>().unwrap_or(u64::MAX))
+    // as http.client: a non-numeric length is ignored; one past u64 is still a
+    // length, over any cap. The header is read as well as the framing ureq
+    // chose from it, so a length it does not frame a body with (a 204's, say)
+    // is still checked.
+    let declared = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .map(|v| v.parse::<u64>().unwrap_or(u64::MAX));
+    for length in [resp.body().content_length(), declared].into_iter().flatten() {
+        if length > max_bytes {
+            return Err(fetch_error(host, &too_large, format!("Content-Length {length}")));
         }
-        _ => None,
-    };
-    if let Some(length) = length.filter(|&n| n > max_bytes) {
-        return Err(fetch_error(host, &too_large, format!("Content-Length {length}")));
     }
-    let mime = mime_for(header(&headers, "content-type"), url);
+    let mime = mime_for(resp.headers().get("content-type").and_then(|v| v.to_str().ok()), url);
     std::fs::create_dir_all(upload_dir).map_err(|e| fetch_error(host, "could not save the file", e))?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(&mime)));
+    // Two things ureq's reader is laxer about than the socket client was, both
+    // bounded by the fetch deadline and neither reaching the file: it consumes
+    // chunk trailers without counting their number or their bytes (the old
+    // reader stopped at 100 trailers and a 64 KiB line), and it reads a reset
+    // connection as the end of a body that has no declared length, where the
+    // old reader refused anything but a clean EOF. A body short of its
+    // `Content-Length` is still refused.
     let copied = std::fs::File::create(&path).map_err(BodyError::Store).and_then(|mut f| {
-        if chunked {
-            copy_chunked(&mut r, &mut f, max_bytes)?;
-        } else {
-            copy_some(&mut r, &mut f, length, &mut 0, max_bytes)?;
+        // `limit` stops the read one byte past the cap, so the count below
+        // always reaches `max_bytes` first and names the refusal
+        let mut body = resp.body_mut().with_config().limit(max_bytes.saturating_add(1)).reader();
+        let mut buf = [0u8; 1 << 14];
+        let mut total = 0u64;
+        loop {
+            let n = match body.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(BodyError::Read(e)),
+            };
+            total += n as u64;
+            if total > max_bytes {
+                return Err(BodyError::TooLarge);
+            }
+            f.write_all(&buf[..n]).map_err(BodyError::Store)?;
         }
-        // a body that runs to EOF also "ends" when the watchdog shuts the socket
-        if watchdog.fired() {
-            return Err(BodyError::Read(io::ErrorKind::TimedOut.into()));
-        }
-        Ok(())
     });
     match copied {
         Ok(()) => Ok(Hop::Saved(modality_from_mime(&mime).to_string(), path.to_string_lossy().into_owned())),
@@ -847,7 +795,7 @@ fn fetch_hop(
             let _ = std::fs::remove_file(&path);
             Err(match e {
                 BodyError::TooLarge => fetch_error(host, &too_large, "body exceeded the limit"),
-                BodyError::Read(e) => transport_error(host, deadline, watchdog.fired(), e),
+                BodyError::Read(e) => io_error(host, deadline, &e),
                 BodyError::Store(e) => fetch_error(host, "could not save the file", e),
             })
         }
@@ -1056,8 +1004,8 @@ pub fn b64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::sync::Mutex;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_format_is_refused_with_the_python_text() {
@@ -1129,6 +1077,8 @@ mod tests {
         Stall,
         /// write the prefix, then one byte every 50 ms for 3 s
         Drip(&'static [u8], u8),
+        /// wait, then write: a hop that costs time before it redirects
+        Delayed(Vec<u8>, Duration),
     }
 
     fn http(status: &str, headers: &str, body: &[u8]) -> Reply {
@@ -1159,6 +1109,11 @@ mod tests {
             "/r2" => redirect("307 Temporary Redirect", &format!("http://127.0.0.1:{port}/r3")),
             "/r3" => redirect("308 Permanent Redirect", "a.png"),
             "/loop" => redirect("302 Found", "/loop"),
+            "/to-stall" => redirect("302 Found", "/stall"),
+            "/slow-to-stall" => {
+                let Reply::Bytes(out) = redirect("302 Found", "/stall") else { unreachable!() };
+                Reply::Delayed(out, Duration::from_millis(600))
+            }
             "/to-localhost" => redirect("302 Found", &format!("http://localhost:{port}/a.png")),
             "/to-short-form" => redirect("302 Found", &format!("//127.1:{port}/a.png")),
             "/to-backslash-authority" => redirect("302 Found", &format!("\\\\127.1:{port}/a.png")),
@@ -1181,6 +1136,12 @@ mod tests {
             }
             "/huge-length.png" => {
                 Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\nabc".to_vec())
+            }
+            "/empty-but-long.png" => {
+                Reply::Bytes(b"HTTP/1.1 204 No Content\r\nContent-Length: 5000\r\n\r\n".to_vec())
+            }
+            "/text-length.png" => {
+                Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nabc".to_vec())
             }
             "/negative-chunk" => {
                 Reply::Bytes(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\nabc".to_vec())
@@ -1240,6 +1201,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(700));
                 let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx");
                 std::thread::sleep(Duration::from_secs(3));
+            }
+            Reply::Delayed(out, wait) => {
+                std::thread::sleep(wait);
+                let _ = s.write_all(&out);
             }
             Reply::Drip(prefix, byte) => {
                 let _ = s.write_all(prefix);
@@ -1366,7 +1331,117 @@ mod tests {
         let (port, seen) = serve();
         let (modality, body) = fetch(&format!("http://127.0.0.1:{port}/a.png"), &local()).unwrap();
         assert_eq!((modality.as_str(), body.as_slice()), ("image", PNG));
-        assert!(seen.lock().unwrap()[0].to_ascii_lowercase().contains("\r\nuser-agent: mstar\r\n"));
+        let head = seen.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(head.contains("\r\nuser-agent: mstar\r\n"), "{head:?}");
+        // one identity Accept-Encoding, so the size cap counts the stored bytes
+        assert_eq!(head.matches("\r\naccept-encoding: identity\r\n").count(), 1, "{head:?}");
+        assert_eq!(head.matches("accept-encoding").count(), 1, "{head:?}");
+    }
+
+    /// The fetch reaches the address it was handed and nothing else. The name
+    /// here is in a TLD that never resolves, so a body that arrives can only
+    /// have come from the vetted address, and a hop for a host that was not
+    /// vetted is refused before any connection.
+    #[test]
+    fn the_fetch_goes_only_to_the_vetted_address() {
+        let (port, seen) = serve();
+        let vetted = [SocketAddr::from(([127, 0, 0, 1], port))];
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let url = url::Url::parse("http://pinned.invalid/a.png").unwrap();
+        let hop = fetch_hop(&url, "pinned.invalid", &vetted, &dir, REMOTE_MAX_BYTES, deadline).unwrap();
+        let Hop::Saved(modality, path) = hop else { panic!("expected a saved body") };
+        assert_eq!((modality.as_str(), std::fs::read(&path).unwrap().as_slice()), ("image", PNG));
+        // reached with the name it was asked for, not with the address
+        assert!(seen.lock().unwrap()[0].to_ascii_lowercase().contains("\r\nhost: pinned.invalid\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let other = url::Url::parse("http://other.invalid/a.png").unwrap();
+        let refusal = fetch_hop(&other, "pinned.invalid", &vetted, &dir, REMOTE_MAX_BYTES, deadline);
+        assert!(matches!(&refusal, Err(e) if e == "remote media fetch failed: connection failed"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "a host that was not vetted reaches no server");
+    }
+
+    /// A proxy in the environment does not divert a fetch: ureq's default config
+    /// would take one, and the request would then go to the proxy instead of the
+    /// vetted address, with neither the host nor the address checked.
+    #[test]
+    fn a_proxy_in_the_environment_is_ignored() {
+        let (port, seen) = serve();
+        // a port nothing listens on: were the proxy used, the fetch would fail
+        let sink = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let vars = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"];
+        let was: Vec<_> = vars.iter().map(|v| (v, std::env::var(v).ok())).collect();
+        for var in vars {
+            std::env::set_var(var, format!("http://127.0.0.1:{sink}"));
+        }
+        assert!(hop_config(Duration::from_secs(5)).proxy().is_none());
+        let fetched = fetch(&format!("http://127.0.0.1:{port}/a.png"), &local());
+        for (var, before) in was {
+            match before {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        assert_eq!(fetched.unwrap().1, PNG);
+        assert!(seen.lock().unwrap()[0].starts_with("GET /a.png HTTP/1.1\r\n"), "went straight to the host");
+    }
+
+    /// The deadline covers the whole fetch, not one hop: each hop gets only what
+    /// is left of it. The first hop spends 600 ms of a 1 s budget before it
+    /// redirects, so the stall behind it has about 400 ms; a hop that started
+    /// the budget again would run to about 1.6 s instead.
+    #[test]
+    fn the_deadline_is_not_reset_by_a_redirect() {
+        let (port, seen) = serve();
+        let one_second = policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_secs(1));
+        let started = Instant::now();
+        refused(&format!("http://127.0.0.1:{port}/slow-to-stall"), &one_second, "timed out");
+        let took = started.elapsed();
+        assert!(took > Duration::from_millis(600), "the first hop was not reached: {took:?}");
+        assert!(took < Duration::from_millis(1300), "the deadline restarted: {took:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the redirect was followed, then it timed out");
+    }
+
+    /// Every vetted address is tried in turn, and none is tried once the
+    /// deadline has passed. That the deadline also covers them all together
+    /// comes from the one-address-per-call shape of `fetch_hop`, which keeps
+    /// ureq's own address loop (and its missing elapsed check) out of the way;
+    /// a refused connection returns too quickly to show the difference here.
+    #[test]
+    fn the_addresses_are_tried_in_turn_within_one_deadline() {
+        let (port, seen) = serve();
+        // bound then dropped: nothing listens there, so the connect is refused
+        let refuses = |_| {
+            let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            SocketAddr::from(([127, 0, 0, 1], p))
+        };
+        let addrs = [refuses(0), refuses(1), SocketAddr::from(([127, 0, 0, 1], port))];
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let url = url::Url::parse("http://pinned.invalid/a.png").unwrap();
+        let started = Instant::now();
+        let hop =
+            fetch_hop(&url, "pinned.invalid", &addrs, &dir, REMOTE_MAX_BYTES, started + Duration::from_secs(5))
+                .unwrap();
+        let Hop::Saved(_, path) = hop else { panic!("expected a saved body") };
+        assert_eq!(std::fs::read(&path).unwrap(), PNG, "the third address answered");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // past the deadline no address is tried at all
+        let out = fetch_hop(&url, "pinned.invalid", &addrs, &dir, REMOTE_MAX_BYTES, Instant::now());
+        assert!(matches!(&out, Err(e) if e == "remote media fetch failed: timed out"), "not refused");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing is tried past the deadline");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Content-Length` over the cap is refused even when ureq does not frame
+    /// the body with it (a 204 carrying one is invalid, and was refused before).
+    #[test]
+    fn a_declared_length_over_the_cap_is_refused_whatever_the_framing() {
+        let (port, _) = serve();
+        let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(5));
+        refused(&format!("http://127.0.0.1:{port}/empty-but-long.png"), &small, TOO_LARGE);
     }
 
     #[test]
@@ -1466,17 +1541,28 @@ mod tests {
     #[test]
     fn malformed_bodies_are_refused() {
         let (port, _) = serve();
-        // a chunk-size line longer than MAX_LINE, negative chunk sizes, and a body shorter than its Content-Length
+        // an over-long chunk-size line, negative chunk sizes, and a body shorter
+        // than its Content-Length. ureq bounds the whole size line, extensions
+        // included, at 20 bytes, so it refuses a long one sooner than the Python
+        // frontend's 64 KiB line bound does; a valid chunk extension past 20
+        // bytes is refused here and read there.
         for path in ["/long-chunk-line", "/negative-chunk", "/huge-negative-chunk", "/truncated.png"] {
             refused(&format!("http://127.0.0.1:{port}{path}"), &local(), "connection failed");
         }
     }
 
+    /// A `Content-Length` the HTTP client cannot read is refused before any of
+    /// the body is kept. ureq rejects such a response outright, so both of these
+    /// are `connection failed` here. The Python frontend answers `too large` for
+    /// the one past 64 bits and reads the non-numeric one to EOF, so this is
+    /// where the two frontends differ; nothing is written either way.
     #[test]
-    fn a_content_length_past_u64_is_too_large() {
+    fn an_unreadable_content_length_is_refused() {
         let (port, _) = serve();
         let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(5));
-        refused(&format!("http://127.0.0.1:{port}/huge-length.png"), &small, TOO_LARGE);
+        for path in ["/huge-length.png", "/text-length.png"] {
+            refused(&format!("http://127.0.0.1:{port}{path}"), &small, "connection failed");
+        }
     }
 
     #[test]
