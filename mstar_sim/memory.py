@@ -172,6 +172,12 @@ def _fake_range(nbytes: int) -> int:
     return base
 
 
+def device_of(storage) -> int:
+    """The index of the emulated GPU a storage was counted on (0 if it wasn't)."""
+    entry = _STORAGES.get(storage._cdata)
+    return entry[3].device if entry is not None and entry[3] is not None else 0
+
+
 def fake_base(storage) -> int:
     """The fake address of a value-less storage."""
     entry = _STORAGES.get(storage._cdata)

@@ -109,6 +109,19 @@ def test_cuda_semantics():
                 "t = torch.empty(0).set_(s, 0, (2,), (1,)); t[1] = 5")
         subprocess.run([sys.executable, "-c", code], check=True)
         assert shared.tolist() == [1, 5]
+        # two processes' value-less KV caches, opened as mstar's KV transfer does (one twice)
+        import ast
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+        exported = [ast.literal_eval(subprocess.run(
+            [sys.executable, "-c", f"import torch; kv = torch.empty(1 << 20, device='cuda:{i}'); "
+                                   "print(kv.untyped_storage()._share_cuda_())"], check=True, capture_output=True,
+            text=True).stdout)
+            for i in (0, 1)]
+        opened = [rebuild_cuda_tensor(torch.Tensor, (1 << 20,), (1,), 0, torch.UntypedStorage, torch.float32,
+                                      *exported[i][:4], False, *exported[i][4:]) for i in (0, 0, 1)]
+        assert [str(t.device) for t in opened] == ["cuda:0", "cuda:0", "cuda:1"], opened
+        assert opened[0].data_ptr() == opened[1].data_ptr() != opened[2].data_ptr()
+        torch.empty(1 << 20, device="cuda:1").copy_(opened[2])
         torch.cuda.manual_seed_all(3)  # dynamo saves and restores this state
         assert [gen.initial_seed() for gen in torch.cuda.default_generators] == [3] * torch.cuda.device_count()
         torch.cuda.set_rng_state(torch.cuda.get_rng_state(1), 1)

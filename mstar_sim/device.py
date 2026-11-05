@@ -34,6 +34,7 @@ Behaviour a real GPU has, kept on purpose:
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 
 import torch
@@ -222,13 +223,14 @@ _SHARED = b"mstar_sim"
 
 
 def _share_cuda(storage):
-    """A CUDA IPC handle naming a cuda tensor's storage. Another emulated process opens it
-    (``UntypedStorage._new_shared_cuda``) as the same memory, for a storage with values
-    (moved into shared memory, in place), else as a value-less storage of its size."""
+    """A CUDA IPC handle naming a cuda tensor's storage by its exporter (process, device and
+    address: value-less storages' fake addresses repeat across processes). Another emulated
+    process opens it (``UntypedStorage._new_shared_cuda``) as the same memory, for a storage
+    with values (moved into shared memory, in place), else as a value-less storage of its size."""
     nbytes = storage.nbytes()
     shared = storage._share_filename_cpu_()[:2] if storage.device.type == "cpu" else (b"", b"")
-    return (0, b"|".join((_SHARED, str(storage.data_ptr()).encode(), *shared, str(nbytes).encode())),
-            nbytes, 0, b"", 0, b"", False)
+    name = (_SHARED, str(os.getpid()).encode(), str(storage.data_ptr()).encode(), *shared, str(nbytes).encode())
+    return (memory.device_of(storage), b"|".join(name), nbytes, 0, b"", 0, b"", False)
 
 
 class _FakeStorage:
@@ -1351,7 +1353,7 @@ def install() -> None:
     def _new_shared_cuda(*args):
         handle = args[1] if len(args) > 1 else b""
         if isinstance(handle, bytes) and handle.startswith(_SHARED):
-            _, _, manager, name, nbytes = handle.split(b"|")
+            _, _, _, manager, name, nbytes = handle.split(b"|")
             storage = (torch.UntypedStorage._new_shared_filename_cpu(manager, name, int(nbytes)) if name
                        else torch.UntypedStorage(int(nbytes), device=META))
             storage._sim_imported = True  # the exporter's memory, not this process's
@@ -1360,6 +1362,17 @@ def install() -> None:
 
     torch.UntypedStorage._new_shared_cuda = staticmethod(_new_shared_cuda)
     torch.UntypedStorage._share_cuda_ = _share_cuda  # a kept tensor's storage is a plain one
+    # an emulator handle carries no ref counter for a later rebuild of it to release
+    torch.UntypedStorage._release_ipc_counter = staticmethod(lambda *args, **kwargs: None)
+    from torch.multiprocessing import reductions
+
+    rebuild = reductions.rebuild_cuda_tensor
+
+    def rebuild_cuda_tensor(*args):  # a tensor on the exporter's device, opened from its handle
+        return SimTensor(rebuild(*args), args[6])
+
+    # before mstar binds the name (``from ... import rebuild_cuda_tensor``)
+    reductions.rebuild_cuda_tensor = rebuild_cuda_tensor
     from mstar_sim import patches
 
     patches.relax_blockwise_scaled_mm_meta()
