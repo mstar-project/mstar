@@ -540,9 +540,8 @@ class SequenceShard(Resource):
         count), though ``_decide`` may still plan it copied. ``rows``, the rows of a step that
         isn't packed: one token a row (``tokens == rows``) is a decode step, which never splits,
         as ``_decide`` reads it. In O(1) from what is fixed at bind and what every rank shares, so
-        a compiled frame specializes on its walk, an admission bound skips the steps that run
-        copied, and a resource whose split steps run eagerly leaves out the capture buckets a step
-        may split in (``Resource.captures_bucket``)."""
+        a compiled frame specializes on its walk, and a resource whose split steps run eagerly
+        leaves out the capture buckets a step may split in (``Resource.captures_bucket``)."""
         return (
             self.can_split
             and (walk is None or self.walks is None or walk in self.walks)

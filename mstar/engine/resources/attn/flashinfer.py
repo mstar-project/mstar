@@ -474,7 +474,7 @@ class FlashInferManager(PlacedAttention):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
         if self._shard is not None:
-            # every rank stores a kv_gather pool whole, heads over TP
+            # every rank stores a kv_gather attention's layers whole, heads over TP
             by_head = self._placement is None and self._split_exchange != "kv_gather"
             self._shard.check_bypass(label, "attention run", by_head=by_head)
         if self._layers is not None:

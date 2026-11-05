@@ -78,8 +78,8 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
-# how a split step's tokens reach an attention (`sequence_shard`); "kv_gather" is what one over a
-# pool every SP rank stores whole takes wherever its node splits, never a deployment's choice
+# how a split step's tokens reach an attention (`sequence_shard`); "kv_gather" is what one over
+# layers every SP rank stores whole takes wherever its node splits, never a deployment's choice
 SpExchange = Literal["none", "ulysses", "all_gather", "ring", "kv_gather"]
 # the values a sequence shard's ``exchange`` takes besides ``auto``
 SP_EXCHANGES: tuple[SpExchange, ...] = ("none", "ulysses", "all_gather", "ring")

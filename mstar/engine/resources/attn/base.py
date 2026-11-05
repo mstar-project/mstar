@@ -152,10 +152,11 @@ class AttentionManager(AttentionResource):
             shard.exchanging = False
 
     def _exchange_over_pool(self, run, q, k, v, r):
-        """``exchange``'s ``run`` over a pool not placed by position. Stored by head, heads over every
-        TP and SP rank: a split step's tokens (range ``r``) trade for heads, a copied step's heads are
-        sliced. Whole on every rank (``kv_gather``, a window's layers), heads over TP: a copied step
-        runs as is, a split one gathers its keys."""
+        """``exchange``'s ``run`` over KV this attention doesn't read striped by position. Stored by
+        head, heads over every TP and SP rank: a split step's tokens (range ``r``) trade for heads, a
+        copied step's heads are sliced. Whole on every rank (``kv_gather``: a window's layers of a
+        pool placed by position), heads over TP: a copied step runs as is, a split one gathers its
+        keys."""
         if self._split_exchange == "kv_gather":
             return run(q, k, v) if r is None else kv_gather(run, q, k, v, r)
         return head_slice(run, q, k, v, self._shard.group) if r is None else ulysses(run, q, k, v, r=r)
@@ -531,7 +532,7 @@ class PlacedAttention(AttentionManager):
 
 
 def own_queries(indptrs: PagedIndptrs, r: SeqRange, page_size: int, causal: bool) -> PagedIndptrs:
-    """A split label's plan under ``kv_gather`` over a pool every rank stores whole: this rank's
+    """A split label's plan under ``kv_gather`` over layers every rank stores whole: this rank's
     piece of each row it holds any of (``SeqRange.row_pieces``), over the row's stored context and
     the step's keys up to the piece's end (causal; the row's whole length otherwise),
     bottom-right aligned, as the logical plan ``indptrs`` lays the row's pages out."""
