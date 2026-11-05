@@ -486,7 +486,7 @@ def media_layout(
 ) -> dict[str, list]:
     """A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's
     ``offset`` and ``tokens``, the encoder ``output`` it is read from, and
-    its patch ``grid`` (``[]`` for media without one). Plain lists: it rides
+    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one). Plain lists: it rides
     the step's control message, so every node of the walk reads it on the
     host (`media_grids`)."""
     grids = grids or {}
@@ -501,8 +501,8 @@ def media_layout(
     }
 
 
-def media_grids(layout: Mapping, output: str) -> list[tuple[int, int, int]]:
-    """The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output
+def media_grids(layout: Mapping, output: str) -> list[tuple[int, ...]]:
+    """The grid of each run a ``MEDIA_LAYOUT`` fills from encoder output
     ``output``, in prompt order."""
     return [
         tuple(grid) for grid, out in zip(layout.get("grid", ()), layout.get("output", ()), strict=True)

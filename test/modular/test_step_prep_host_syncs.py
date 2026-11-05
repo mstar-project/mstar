@@ -631,8 +631,9 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     meta device stands in for the accelerator; on it the row stager takes its host branch, so
     the pinned upload itself is not exercised here."""
     from mstar.engine.resources.sampler.resource import SamplerResource
-    from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
+    from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.keys import SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     class _Sampler:
@@ -657,21 +658,20 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
 
 
 def test_higgs_encoder_prep_reads_no_tensor():
-    """The audio encoder's per-chunk embedding counts come from the step
-    metadata ``process_prompt`` filled, not off a lengths tensor."""
+    """The audio encoder's per-chunk embedding counts come from the clip's
+    ``MEDIA_LAYOUT`` grid ``process_prompt`` filled, not off a lengths tensor."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
     from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
+    from mstar.model.multimodal import MEDIA_LAYOUT
 
     config = HiggsAudioModelConfig()
     lens = [400, 400, 123]
     valid = [config.encoder_output_length(n) for n in lens]
-    model = SimpleNamespace(config=config, INTERNAL_KWARGS=HiggsAudioModel.INTERNAL_KWARGS)
-    (key,) = model.INTERNAL_KWARGS
     sub = HiggsAudioEncoderSubmodule(None, None, config)
     features = torch.zeros(len(lens), config.audio_num_mel_bins, 400)
+    layout = {"grid": [lens], "output": ["audio_embeds"]}
     with _HostReads() as reads:
-        row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio", {key: lens}), {
+        row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio", {MEDIA_LAYOUT: layout}), {
             "audio_features": [features],
         })
     assert reads.reads == []

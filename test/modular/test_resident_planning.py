@@ -1886,7 +1886,7 @@ def _qwen35_llm():
 def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
     submodules, llm = _qwen35_llm()
     monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
-    assert llm.resident_walks(None) == {"decode"}
+    assert llm.resident_walks(llm) == {"decode"}
     assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
     assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
 

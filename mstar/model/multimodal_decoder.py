@@ -18,7 +18,7 @@ Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -69,13 +69,14 @@ MIXED_SPLIT = CombinedSplit(MIXED, prefill_walks=(PREFILL_TEXT,))
 class PreparedMedia(NamedTuple):
     """One attachment, ready for its encoder: the encoder's input tensors,
     and the tokens of each run of pads it fills, in prompt order, with each
-    run's patch grid for an encoder that reads one (a ViT's grid maths) or
-    a model that places media by grid (MRoPE). The grids ride the walk's
-    ``MEDIA_LAYOUT``, host values every node reads without a device sync."""
+    run's grid for an encoder that reads one (a ViT's patch grid, an audio
+    tower's mel frames per chunk) or a model that places media by grid
+    (MRoPE). The grids ride the walk's ``MEDIA_LAYOUT``, host values every
+    node reads without a device sync."""
 
     inputs: dict[str, torch.Tensor]
     tokens: list[int]
-    grids: list[torch.Tensor] | None = None
+    grids: list[Sequence[int]] | None = None
 
 
 @dataclass(frozen=True)
