@@ -119,6 +119,18 @@ def test_an_onnx_model_the_host_could_run_stays_real(tmp_path):
     assert manifest["notes"] == []
 
 
+def test_a_repo_of_small_weights_is_copied_and_one_of_none_refused(tmp_path):
+    """Small weights are assets to the copy, but they are the repo's weights all the same."""
+    small = tmp_path / "small"
+    small.mkdir()
+    torch.save({"w": torch.ones(4)}, small / "voice.pth")
+    synthesize(str(small), tmp_path / "small_out")
+    assert torch.load(tmp_path / "small_out" / "voice.pth", weights_only=True)["w"].tolist() == [1.0] * 4
+    (small / "voice.pth").rename(small / "config.json")
+    with pytest.raises(ValueError, match="no weights"):
+        synthesize(str(small), tmp_path / "empty_out")
+
+
 def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
     """mstar's loader under the emulator reads a small tensor's kept bytes, and a shard of a
     large one (which the copy left a hole) as meta, not as the hole's zeros; it refuses a copy

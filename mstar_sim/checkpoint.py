@@ -239,6 +239,8 @@ def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
 
 
 def _build(src, out: Path) -> dict:
+    if not any(rel.endswith((".safetensors", ".pt", ".pth", ".bin", ".onnx")) for rel in src.files):
+        raise ValueError("the source has no weights (safetensors, torch or ONNX files)")
     params, notes = 0, []
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
@@ -258,8 +260,6 @@ def _build(src, out: Path) -> dict:
         else:
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src.fetch(rel), out / rel)
-    if not params:
-        raise ValueError("the source has no weights (safetensors, torch or ONNX files)")
     return {"param_count": params, "notes": notes, "revision": src.revision}
 
 
