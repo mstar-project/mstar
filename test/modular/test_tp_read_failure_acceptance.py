@@ -691,7 +691,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
     # the preemption state `Worker.__init__` sets up, here with no paged KV cache to preempt in
-    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._preemption = SimpleNamespace(
+        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
+    )
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
             getattr(w, setup)()
