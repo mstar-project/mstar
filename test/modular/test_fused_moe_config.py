@@ -121,6 +121,53 @@ def test_compiled_fused_experts_takes_the_tables_tiles(tuned_table, monkeypatch,
 
 
 @CUDA
+@pytest.mark.parametrize("dynamic", [False, None], ids=["captured", "eager_forward"])
+def test_compiled_fused_experts_takes_the_per_pair_crossover_of_its_gpus_entry(tuned_table, monkeypatch, dynamic):
+    """The bf16 per-pair path runs up to the moe_decode entry's crossover for these experts on
+    this GPU, with its tiles, and the grouped GEMMs past it, compiled as the engine compiles
+    (the token count symbolic in the eager forward) as eagerly."""
+    import mstar.engine  # noqa: F401 - the engine's process-wide dynamo settings
+    from mstar.utils.fused_moe import decode, fused_experts
+
+    experts, hidden, inter, top_k = 8, 256, 128, 2
+    path = tuned_table.parent.parent / "moe_decode" / "Test_GPU.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"format": 2, "op": "moe_decode", "entries": [{
+        "dtype": "bfloat16", "shape": {"H": hidden, "E": experts, "I": inter, "K": top_k},
+        "provenance": {"device": "Test GPU", "date": "2026-11-04", "harness": "test"},
+        "rows": {"2": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 4, "bk": 256, "warps": 4},
+                                                    "down": {"bn": 32, "bc": 128, "warps": 4}}},
+                 "*": {"impl": "triton", "config": {"path": "grouped"}}}}]}))
+    registry.reset_lookups()
+    pairs = []
+    routed = decode.routed_experts
+
+    def counted(x, *args, **kwargs):
+        pairs.append(x.shape[0])
+        return routed(x, *args, **kwargs)
+
+    monkeypatch.setattr(decode, "routed_experts", counted)
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    w1 = torch.randn(experts, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    def run(x, logits):
+        weights, ids = logits.topk(top_k, dim=-1)
+        return fused_experts(x, w1, w2, weights.to(x.dtype), ids)
+
+    compiled = torch.compile(run, dynamic=dynamic)
+    with torch.no_grad():
+        for tokens in (1, 2, 3, 5):
+            x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+            logits = torch.rand(tokens, experts, device="cuda")
+            pairs.clear()
+            torch.testing.assert_close(compiled(x, logits), run(x, logits), atol=1e-2, rtol=1e-2)
+            # the compiled call and the eager one each take the per-pair path, up to 2 tokens
+            assert len(pairs) == (2 if tokens <= 2 else 0), (tokens, pairs)
+
+
+@CUDA
 def test_compiled_fused_experts_is_one_graph():
     """fused_experts compiles without a graph break: the tile lookup and the align op's build
     check are constants to dynamo, so a tuned config reaches the launch as a constant."""

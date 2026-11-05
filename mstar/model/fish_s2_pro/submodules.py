@@ -383,6 +383,11 @@ class CodecSubmodule(ARNodeSubmodule):
     capture_cudnn_benchmark = True
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     MAX_BATCH_SIZE = CAPTURE_BATCH_SIZES[-1]
+    # Captured only up to this many frames a step (rows x chunk width), 14 of the 24 buckets:
+    # each bucket costs start-up time (cuDNN times its convs) and graph memory, and on an H200
+    # the larger steps lose little run eagerly (the Fish notes in docs/models.rst). They run
+    # the compiled decode, warmed at start-up (``compile_regions``).
+    CAPTURE_MAX_FRAMES = 64
 
     def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = False):
         super().__init__()
@@ -405,8 +410,35 @@ class CodecSubmodule(ARNodeSubmodule):
     def compile_regions(self) -> dict[str, list[tuple]]:
         """The incremental decode, compiled once for every bucket: Inductor fuses
         the time-major Snake activations, norms and adds between the convs,
-        which eagerly are most of the decode's GPU time."""
-        return {"incremental": []}
+        which eagerly are most of the decode's GPU time.
+
+        Warmed as a step runs it eagerly (past the captures, or with a bucket's
+        slots taken): on fresh tensors, where the captures pass views of their
+        static buffers, as one graph for every batch size past 1 and every
+        chunk width past 1, and one for a single row; a 1-frame window, like a
+        single row, gets its own. Those sizes are declared dynamic with their
+        bounds, so a guard on the batch size or the width alone that would split
+        its range (a conv's backend choice, say) fails this warm-up instead of
+        compiling on a live step. Torch checks the bounds against such
+        single-size guards only: one on rows and width together would pass.
+        Warmed at the largest such step: Inductor picks its kernels' tiles by the
+        sizes it compiled at, and the large steps are the ones whose time counts."""
+        device, blocks = self.get_device(), self.incremental.state_blocks()
+        wide = [width for width in self.windows if width > 1]  # 0/1 specialization: 1 is its own graph
+
+        def example(rows, width):
+            state = {name: torch.zeros(rows, *b.shape, dtype=b.dtype, device=device) for name, b in blocks.items()}
+            codes = torch.zeros(rows, self.config.num_codebooks, width, dtype=torch.long, device=device)
+            lengths = torch.full((rows,), width, dtype=torch.long, device=device)
+            if rows > 1:
+                for tensor in (codes, lengths, *state.values()):
+                    torch._dynamo.mark_dynamic(tensor, 0, min=2, max=self.MAX_BATCH_SIZE)
+            if width > 1 and len(wide) > 1:
+                torch._dynamo.mark_dynamic(codes, 2, min=wide[0], max=wide[-1])
+            return codes, state, lengths
+
+        widths = ([wide[-1]] if wide else []) + ([1] if self.windows[0] == 1 else [])
+        return {"incremental": [example(rows, width) for width in widths for rows in (1, self.MAX_BATCH_SIZE)]}
 
     def _bucket(self, frames: int) -> int:
         """Smallest captured chunk width that holds ``frames``."""
@@ -564,7 +596,9 @@ class CodecSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Every chunk width for every batch bucket, widest first."""
+        """Every chunk width, widest first, for the batch buckets of at most
+        ``CAPTURE_MAX_FRAMES`` frames, and one row at a wider width: a width
+        with no buckets would take the runner's default ladder instead."""
         del tp_world_size
         return [
             BatchedAcceleratorGraphConfig(
@@ -578,7 +612,11 @@ class CodecSubmodule(ARNodeSubmodule):
                     kwargs={"frames": width},
                 ),
                 additional_key_info=width,
-                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                capture_batch_sizes=[
+                    bs for bs in self.CAPTURE_BATCH_SIZES if bs == 1 or bs * width <= self.CAPTURE_MAX_FRAMES
+                ],
+                # an acceleration subset: MAX_BATCH_SIZE caps the batch, eagerly past these
+                caps_eager_batch_size=False,
                 input_seq_dims={"codec_tokens": 0, "lengths": 0},
                 # the decode inside is compiled already
                 compile=False,

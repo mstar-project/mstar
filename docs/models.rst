@@ -692,8 +692,13 @@ Qwen3-Omni notes
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another. On one GPU a
-  decode batch of 8 to 16 tokens also gets its block alignment from that
-  kernel; a smaller one runs its experts as per-pair GEMVs, which need none.
+  decode batch of up to 16 tokens also gets its block alignment from that
+  kernel, unless it is small enough to run its experts as per-pair GEMVs,
+  which need none: up to the ``moe_decode`` kernel table's crossover for the
+  GPU and expert shape (``mstar/kernels/tables/moe_decode``), 2 tokens for the
+  TP1 Thinker on an H200 (aligned from 3), else the built-in 7, swept on an
+  H100 (aligned from 8). The Thinker at TP2 (expert width 384) has no H200
+  entry yet, so it keeps 7 there, unmeasured.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
@@ -939,6 +944,26 @@ Fish Audio S2-Pro notes
   the earlier windowed codec, not yet on the frame-once codec. With
   ``model_kwargs: {codec_exact_fp32: true}`` it runs in fp32 with TF32 off and
   the streamed audio matches the whole-utterance decode to within one int16 step.
+- Start-up and memory. The codec captures CUDA graphs only for steps of at most
+  64 frames (batch rows times chunk width,
+  ``CodecSubmodule.CAPTURE_MAX_FRAMES``), and one row at every width: 14 of its
+  24 buckets. Any other step runs the compiled decode eagerly, as one graph
+  warmed at start-up for every batch size and width. Against capturing all 24,
+  on one H200 (two warm boots per arm, interleaved, main in the round just
+  before; throughput over two repeats of 104 short sentences): start-up 102 to
+  106 s warm and 172 s from cold compile caches, against 146 to 148 s and 278 s;
+  51.1 GiB of GPU memory in use after start-up, against 58.3 GiB; 79.6 to 80.2
+  audio-s/s at 32 requests, as with every bucket (79.7 to 81.0), and 1.4 to 2.5%
+  less at 16 requests (50.2 to 50.9 against 51.6, interleaved with main), the
+  frame cap's cost: in its own round this warm-up matched a codec warmed at two
+  fixed sizes (49.8 to 49.9 against 49.9); the same TTFA p50 (102 to 104 ms at
+  16 requests, 121 to 124 ms at 32, against 104 and 120 to 126). The eager
+  graph's warm-up is 15 to 20 s of that start-up: warming two fixed sizes
+  instead starts in 86 to 88 s, but compiles a live step at a size it missed. A
+  128-frame cap (18 buckets) loses 0.6 to 1.1% at 16 requests and starts in 118
+  to 122 s (one boot each, not interleaved). cuDNN's algorithm search for the
+  captured convs (``capture_cudnn_benchmark``) is about 20 s of a warm start-up
+  with every bucket captured.
 
 VoxCPM2 notes
 -------------

@@ -1,0 +1,16 @@
+{
+  "format": 2,
+  "op": "moe_decode",
+  "entries": [
+    {
+      "dtype": "bfloat16",
+      "shape": {"E": 128, "H": 2048, "I": 768, "K": 8},
+      "provenance": {"device": "NVIDIA H200", "date": "2026-11-04", "harness": "end to end, not swept: Qwen3-Omni Thinker decode ITL p50 (python -m benchmark.runner --model qwen3omni --request-type text_to_text --profiling-type closed_loop, 256 tokens with --ignore-eos, c=1/2/4) on configs/qwen3omni_2gpu.yaml, with per-pair crossovers 0, 2 and 7 served through MSTAR_KERNEL_TABLES, 2 boots each", "mstar": "014c75bb1", "note": "Qwen3-Omni-30B-A3B Thinker experts, TP1. ITL p50 ms at c=1/2/4, 2 boots each: crossover 2 (this entry) 3.11/4.18-4.19/5.70-5.71, 7 (the built-in) 3.14-3.16/4.19-4.22/5.82, 0 (grouped only) 3.28-3.29/4.38-4.39/5.71. Crossovers 2 and 7 run the same per-pair tiles at 1 and 2 tokens, so they differ at c=4 only, where grouped wins; per-pair wins at 1 and 2 tokens. Crossover 1 would run 2 tokens grouped (as crossover 0 does at c=2), and 3 matches 2 in captured decode, whose 3-token steps pad to the 4-token bucket; neither was served. The per-pair tiles are the built-in ones (swept on an H100), unswept here"},
+      "rows": {
+        "1": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 4, "bk": 256, "warps": 4}, "down": {"bn": 32, "bc": 128, "warps": 8}}},
+        "2": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 2, "bk": 1024, "warps": 4}, "down": {"bn": 32, "bc": 128, "warps": 8}}},
+        "*": {"impl": "triton", "config": {"path": "grouped"}}
+      }
+    }
+  ]
+}
