@@ -345,8 +345,11 @@ class KVPageCounts(NamedTuple):
 
 
 class Reservation(NamedTuple):
-    """The pages an admit acquired for one stream's group, and the arena's trail before that admit, which
-    `KVManager.rollback_admit` puts back."""
+    """The pages an admit acquired for one stream's group in one grant, and the arena's trail before that admit,
+    which `KVManager.rollback_admit` puts back."""
+    rid: int
+    label: str
+    group: int
     pages: list[int]
     trail: tuple[int, int] | None
 
@@ -790,7 +793,7 @@ class KVManager(AttentionResource):
         # releases them. recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
 
-        # (rid, label) -> pages the live reservation freshly acquired, for
+        # The pages the live reservation freshly acquired, in the order it took them, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
         # or the GPU thread holds a reservation at a time, and the unwind has to
         # find it whichever it was. Admit, commit and unwind each touch only
@@ -802,8 +805,7 @@ class KVManager(AttentionResource):
         # gets that handle next. ``admit`` clears its rows' entries, but a
         # pre-planned step's admit returns first -- see ``remove_request`` /
         # ``reset_request``.
-        # keyed (rid, label, group)
-        self._admit_reserved_pages: dict[tuple[int, str, int], Reservation] = {}
+        self._admit_reserved_pages: list[Reservation] = []
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -2168,8 +2170,7 @@ class KVManager(AttentionResource):
                     if not alloc_res.success:
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
                     if alloc_res.new_pages:
-                        self._admit_reserved_pages.setdefault(
-                            (rid, to_label, 0), Reservation([], trail)).pages.extend(alloc_res.new_pages)
+                        self._admit_reserved_pages.append(Reservation(rid, to_label, 0, alloc_res.new_pages, trail))
 
             page_size = self.config.tokens_per_page
             sink = step.sink
@@ -2226,8 +2227,7 @@ class KVManager(AttentionResource):
                             ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
                         )
                     if alloc_res.new_pages:
-                        self._admit_reserved_pages.setdefault(
-                            (rid, label, g), Reservation([], trail)).pages.extend(alloc_res.new_pages)
+                        self._admit_reserved_pages.append(Reservation(rid, label, g, alloc_res.new_pages, trail))
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -2356,14 +2356,10 @@ class KVManager(AttentionResource):
                 ).get(segment.label)
                 if stream is not None:
                     stream.step_in_flight = False
-            reserved = self._admit_reserved_pages
-            mine = [key for key in reserved if ctx.is_real_row(key[0])]
+            mine = [held for held in self._admit_reserved_pages if ctx.is_real_row(held.rid)]
+            self._forget_step_reservations(ctx)
             # newest first, since each goes back to the front of the free list
-            for key in reversed(mine):
-                pages, trail = reserved.pop(key)
-                if not pages:
-                    continue  # `page_indices[:-0]` would empty the whole stream
-                rid, label, g = key
+            for rid, label, g, pages, trail in reversed(mine):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is None:
                     continue  # reset or removed under us; its pages went with it
@@ -2395,14 +2391,11 @@ class KVManager(AttentionResource):
 
     def _forget_reservations(self, rid: int) -> None:
         """Drop ``rid``'s unwind record. Caller holds the lock."""
-        for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
-            del self._admit_reserved_pages[key]
+        self._admit_reserved_pages = [held for held in self._admit_reserved_pages if held.rid != rid]
 
     def _forget_step_reservations(self, ctx: StepContext) -> None:
         """Drop the unwind record of this step's rows only. Caller holds the lock."""
-        reserved = self._admit_reserved_pages
-        for key in [k for k in reserved if ctx.is_real_row(k[0])]:
-            del reserved[key]
+        self._admit_reserved_pages = [held for held in self._admit_reserved_pages if not ctx.is_real_row(held.rid)]
 
     def _sequence_views(
         self,
