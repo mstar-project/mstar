@@ -300,3 +300,19 @@ def test_a_repeated_step_refuses_the_worker_paths_that_read_one_iteration(tmp_pa
             wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
             tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3], token_width=3,
         ))
+
+
+def test_loop_room_is_what_every_row_has_left_past_what_it_has_in_flight(tmp_path):
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2)
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 1) == MAX_ITERS - 1
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    column = torch.tensor([1, 2], dtype=torch.int64)
+    _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+        tokens=column, row_rids=rids, inline=InlineColumn(SIG, column), loop_strides=[3, 1],
+    ), {}, model_stops={})
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 0) == MAX_ITERS - 3
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 1) == 0
+    assert rt.loop_room(NODE, WALK, LOOP, [*rids, 99], 0) == 0, "a row not here has no room"

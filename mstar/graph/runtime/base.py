@@ -700,6 +700,8 @@ class PhasedPostprocess:
     _postprocess: _Postprocess | None = None
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
+        # a step that repeats needs inline emit, which only the native path has
+        assert request.token_width == 1, "PhasedPostprocess reads one iteration a row"
         self._postprocess = _Postprocess(request, partition_done=list(request.partition_done))
         return self._run_postprocess()
 
@@ -1349,6 +1351,12 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+        """How many more iterations of ``loop_name`` every row of ``rids`` can
+        take after the ``stride`` each has in flight; 0 if a row isn't here."""
         pass
 
     @abstractmethod

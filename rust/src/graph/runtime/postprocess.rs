@@ -52,7 +52,7 @@ impl TokenColumn {
         self.read_at(row, 0)
     }
 
-    /// Row `row`'s value of iteration `at < self.width`.
+    /// Row `row`'s value of iteration `iter < self.width`.
     fn read_at(&self, row: usize, iter: usize) -> i64 {
         debug_assert!(row < self.rows && iter < self.width);
         // SAFETY: row < rows and iter < width, which the callers check against

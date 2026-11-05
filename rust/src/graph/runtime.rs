@@ -2037,9 +2037,7 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.
-    /// How many more iterations of `loop_name` the rows can all take, after
-    /// the `stride` each has in flight: a repeated step never passes a cap.
+    /// `GraphRuntime.loop_room`: a repeated step never passes a row's cap.
     fn loop_room(
         &self, node_name: &str, graph_walk: &str, loop_name: &str, rids: Vec<u32>, stride: u32,
     ) -> u32 {
@@ -2052,6 +2050,7 @@ impl GraphRuntime {
             .unwrap_or(0)
     }
 
+    /// `GraphRuntime.loop_progress`: (counts, caps), -1 for a row not here.
     fn loop_progress(
         &self, node_name: &str, rids: Vec<u32>, graph_walks: Vec<String>,
         loop_names: Vec<String>,
