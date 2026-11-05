@@ -458,7 +458,14 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
 
 
 def _omni_submodule():
-    return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
+    """A Talker with its declared stop, codec_eos 0."""
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_token_stop
+
+    talker = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(talker)
+    talker.config = SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0))
+    talker.token_stop = talker_token_stop(talker.config)
+    return talker
 
 
 @pytest.mark.parametrize("talker_max_tokens", [2, 3, 64])
