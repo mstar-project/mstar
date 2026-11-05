@@ -333,8 +333,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        times, and stops are read when the step lands. The next step is already running by
        then, so a row that stops inside a step runs up to 2N-1 iterations past its stop,
        against 1 at N=1. A step repeats only inside a speculated chain (async scheduling
-       on), with no new rows, on one rank, for a Loop walk on resident tables with a
-       declared token stop, and at most a KV page's worth of iterations. Each edge of the
+       on), with no new rows, on one rank, for a Loop walk on resident tables or one
+       planned on the host whose step keeps nothing, with a stop the runtime checks, and
+       at most a KV page's worth of iterations. Each edge of the
        node in its Loop must be one a run serves: a loop-back carried on the device, a
        constant input, a Loop output, or the client's copy of the token. Its resources
        can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode other than

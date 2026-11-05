@@ -127,12 +127,7 @@ class StepRepeats:
         for key in sorted(self.edges):
             limit = self.limit(key[0])
             resident = resident_refusal(*key)
-            if limit == 1:
-                repeats = NOT_ASKED
-            elif resident is not None:
-                repeats = "engine: it plans on the host"
-            else:
-                repeats = repeat_refusal(*key)
+            repeats = NOT_ASKED if limit == 1 else repeat_refusal(*key)
             if repeats is None:
                 self._walks.add(key)
             logger.info(

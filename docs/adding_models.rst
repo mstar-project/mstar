@@ -1673,10 +1673,14 @@ it feeds (``NodeSubmodule.repeat_carry``: both named as the signal by default; a
 between replays, so at load the engine feeds each carried signal a probe value through the
 capture template's ``preprocess`` and refuses a walk that changes it on the way. Whether
 a walk may repeat is settled once, after capture, and the worker logs it per walk with the
-reason when it can't: the walk must be resident, have a runtime token stop, run on one rank, and each of
+reason when it can't: the walk must be resident, or planned on the host with a step that
+keeps nothing (a ``KVStep(commit=False)`` and positions that don't advance, as an action
+loop's denoise over a fixed prefix: its one plan serves every replay); its stop must be
+the runtime's (a token stop, or the loop's cap); it must run on one rank, and each of
 its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,
 per-iteration or terminal) must be one a run serves, and every resource of the node must answer
-``Resource.repeat_refusal`` with None. The default refuses, so a resource takes part only
+``Resource.repeat_refusal(walk, host_step)`` with None (``host_step``: its part of a
+host-planned walk's step). The default refuses, so a resource takes part only
 once it says how far its capture advances itself. At admit each resource can narrow a
 step with ``Resource.max_repeats``, for what only that step decides (free pages, a live
 penalty), and the step runs the smallest answer. Whatever it counts per step (stored lengths, positions,

@@ -49,6 +49,7 @@ from mstar.engine.resources.kv.plan import (
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import (
     ADMIT_OK,
     ASKS,
@@ -2109,7 +2110,7 @@ class KVManager(AttentionResource):
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
-                span = ctx.run_span(segment.span)
+                span = ctx.run_span(segment.span, step.commit)
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
@@ -2194,7 +2195,8 @@ class KVManager(AttentionResource):
                 pages = () if part is None else part.page_indices
                 stored = 0 if part is None else part.stored_len
                 # as `admit` reserves it: a chunked row's whole walk
-                more = -(-(stored + ctx.run_span(segment.span) + walk_ahead) // group.page_size) - len(pages)
+                reach = stored + ctx.run_span(segment.span, step.commit) + walk_ahead
+                more = -(-reach // group.page_size) - len(pages)
                 key = (rid, segment.label, g)
                 needed[key] = max(needed.get(key, 0), more)
         extra: dict[str, int] = {}
@@ -2515,7 +2517,7 @@ class KVManager(AttentionResource):
 
     def _plan_label(
         self, segments: list[Segment], pending: dict, ctx: StepContext,
-        sink: frozenset[tuple[str, str]], ring: PinnedIndexRing | None, group: int = 0,
+        sink: frozenset[tuple[str, str]], ring: PinnedIndexRing | None, group: int = 0, keeps: bool = True,
     ) -> KVPlanOutput:
         """One plan label's output in group ``group``:
         ``_plan_output(_sequence_views(...))``, built from columns. One pass
@@ -2526,7 +2528,8 @@ class KVManager(AttentionResource):
         page_size = self._groups[group].page_size
         if pending:
             return self._plan_output(self._sequence_views(segments, pending, ctx, sink, group), page_size, ring)
-        if not ctx.capture and group == 0 and ctx.repeats == 1:
+        # one replay's pages: a step that ran once, or one that keeps none of its tokens
+        if not ctx.capture and group == 0 and (ctx.repeats == 1 or not keeps):
             return self._plan_label_rows(segments, ctx, sink, ring, page_size)
         streams = self._streams
         capture = ctx.capture
@@ -2550,7 +2553,7 @@ class KVManager(AttentionResource):
             stream = streams[s.request_id][s.label].group(group)
             sids.append(stream.page_indices.sid)
             # a step that repeats plans its last replay: every page it reaches
-            lens.append(ctx.run_span(span) + stream.stored_len)
+            lens.append(ctx.run_span(span, keeps) + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
             sink_pages = self._sink_pages
@@ -3100,7 +3103,7 @@ class KVManager(AttentionResource):
             by_label = group_by_plan_label(step.segments, step.combined_labels)
             outputs = [
                 {
-                    plan_label: self._plan_label(segments, pending, ctx, step.sink, ring, g)
+                    plan_label: self._plan_label(segments, pending, ctx, step.sink, ring, g, step.commit)
                     for plan_label, segments in by_label.items()
                 }
                 for g in range(len(self._groups))
@@ -4695,13 +4698,19 @@ class KVManager(AttentionResource):
 
     # Resident planning
 
-    def repeat_refusal(self) -> str | None:
-        return None  # a step reserves and commits its whole run (`StepContext.run_span`)
+    def repeat_refusal(self, walk: str, host_step: KVStep | None = None) -> str | None:
+        # a resident step reserves and commits its whole run (`StepContext.run_span`)
+        if host_step is not None and host_step.commit:
+            return "a host-planned step that commits grows its streams past what one plan holds"
+        return None
 
     def max_repeats(self, step: KVStep, ctx: StepContext) -> int:
         """What the pool can hand over covers, one page a row at most: a refused
         admit would break the chain for pages a shorter run doesn't need. Not
-        `_room`, which holds back the allotments these rows draw on themselves."""
+        `_room`, which holds back the allotments these rows draw on themselves.
+        A host-planned step that commits nothing reads the same pages each replay."""
+        if ctx.resident is None:
+            return ANY_REPEATS if not step.commit else 1
         rows = max(len(ctx.request_ids), 1)
         evictable = 0 if self._index is None else len(self._index.evictable())
         return self._groups[0].page_size if self._arena.num_free + evictable >= rows else 1

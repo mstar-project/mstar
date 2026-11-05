@@ -201,6 +201,8 @@ class SubmoduleManagement:
     carries: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
     # walk -> why its preprocess can't be skipped between replays (checked at load)
     carry_refusals: dict[str, str] = field(default_factory=dict)
+    # walk -> the step its widest capture declares, for each walk that may repeat
+    template_steps: dict[str, SubmoduleStep | None] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -2896,6 +2898,7 @@ class Engine:
         mgmt = self._submodules[node_name]
         if runner.resident_refusal(walk) is not None:
             return  # no batched capture of it: its steps never repeat
+        mgmt.template_steps[walk] = runner.template_step(walk)
         refusal = runner.prepare_template(walk, mgmt.submodule.repeat_carry(walk, signals))
         if refusal is not None:
             mgmt.carry_refusals[walk] = f"node: {refusal}"
@@ -2906,9 +2909,13 @@ class Engine:
         resource of the node each answer. ``signals``: the walk's loop-back
         signals, each carried between replays (``NodeSubmodule.repeat_carry``).
         After capture, which some resources decide at."""
-        if self.resident_refusal(node_name, graph_walk) is not None:
-            return "engine: it plans on the host"
         mgmt = self._submodules[node_name]
+        # a host-planned step replays its one plan: each resource answers for its part
+        host_step = None
+        if self.resident_refusal(node_name, graph_walk) is not None:
+            host_step = mgmt.template_steps.get(graph_walk)
+            if host_step is None:
+                return "engine: it plans on the host and declares no step"
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "deployment: it runs on more than one rank"
@@ -2919,7 +2926,10 @@ class Engine:
         if runner is not None and (refusal := runner.carry_refusal(graph_walk, carries)) is not None:
             return f"runner: {refusal}"
         for key, resource in mgmt.resources.items():
-            if (refusal := resource.repeat_refusal()) is not None:
+            part = None if host_step is None else host_step.get(key)
+            if host_step is not None and part is None:
+                continue  # the step doesn't touch it
+            if (refusal := resource.repeat_refusal(graph_walk, part)) is not None:
                 return f"resource {key!r}: {refusal}"
         mgmt.carries[graph_walk] = carries
         return None

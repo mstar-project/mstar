@@ -362,8 +362,11 @@ class RopeManager(PositionManager):
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
 
-    def repeat_refusal(self) -> str | None:
-        return None  # a resident row's position is its length plus a fixed offset
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        # a resident row's position is its length plus a fixed offset
+        if host_step is not None and (host_step.advance is None or any(host_step.advance)):
+            return "a host-planned step that advances positions moves past what one plan holds"
+        return None
 
     def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:

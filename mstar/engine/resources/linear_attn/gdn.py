@@ -156,7 +156,7 @@ class GDNManager(LinearAttnManager):
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
-    def repeat_refusal(self) -> str | None:
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # decode addresses the pool by slot alone
 
     def resident_refusal(self, key, streams) -> str | None:

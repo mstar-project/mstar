@@ -398,13 +398,13 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
     from mstar.engine.engine import Engine
     from mstar.engine.resources.resident_hooks import ResidentHooks
 
-    willing = SimpleNamespace(repeat_refusal=lambda: None)
+    willing = SimpleNamespace(repeat_refusal=lambda walk, host_step: None)
     engine = Engine.__new__(Engine)
     engine._submodules = {node: SimpleNamespace(
         resident=SimpleNamespace(walks={WALK} - refused.keys()), resident_refusals=refused,
         joint_comm_group=SimpleNamespace(world_size=1),
         submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}),
-        resources=resources, carry_refusals={}, carries={}, accelerator_graph_runner=None,
+        resources=resources, carry_refusals={}, carries={}, accelerator_graph_runner=None, template_steps={},
     ) for node, resources, refused in (
         ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
         ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
@@ -515,7 +515,7 @@ def _attention(*wrappers):
     (lambda: _attention(_CudaCoreDecode, _CudaCoreDecode), True),
 ], ids=["sampler", "history", "no_scatter", "loopback_state", "tensor_core", "cuda_core"])
 def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, refuses):
-    assert (resource().repeat_refusal() is not None) is refuses
+    assert (resource().repeat_refusal(WALK) is not None) is refuses
 
 
 @pytest.mark.parametrize(("block", "why"), [
@@ -2385,3 +2385,53 @@ def test_resident_planning_is_off_unless_asked_for(monkeypatch):
 def test_the_slot_count_is_no_knob():
     with pytest.raises(ValueError):
         knobs.check({"resident_slots": 8})
+
+
+# ---- host-planned steps that keep nothing ----
+
+def test_a_host_planned_step_that_keeps_nothing_repeats_on_one_iterations_lengths():
+    """A step that commits nothing (an action loop's denoise over a fixed
+    prefix) rewrites the same scratch tokens each replay: a run of it reserves
+    and plans one replay's pages, as it does at one iteration."""
+    res = _resources()
+    for rid in (1, 2):
+        _ingest(res, rid)
+    _host_step(res, [1, 2], [5, 6])
+
+    def plan(repeats):
+        segments = (Segment(1, "main", 3), Segment(2, "main", 3))
+        ctx = StepContext(request_ids=(1, 2), graph_walk="action", slot=0, capture=False, repeats=repeats)
+        kv = KVStep(segments=segments, commit=False)
+        assert res["kv"].max_repeats(kv, ctx) > 4
+        assert res["kv"].admit(kv, ctx).ok
+        out = res["kv"].plan(kv, ctx)["main"].cpu_indptrs
+        res["kv"].commit(kv, ctx)
+        return [t.tolist() for t in out[:4]]
+
+    assert plan(4) == plan(1)
+
+
+def test_a_host_planned_walk_repeats_only_if_its_step_keeps_nothing():
+    """Each resource answers for its part of a host-planned walk's step: a KV
+    step that commits, or positions that advance, refuse with their line."""
+    from mstar.engine.engine import Engine
+
+    res = _resources()
+    segments = (Segment(1, "main", 3),)
+
+    def refusal(commit, advance):
+        engine = Engine.__new__(Engine)
+        step = SubmoduleStep(steps={
+            "kv": KVStep(segments=segments, commit=commit), "rope": PositionStep(segments=segments, advance=advance),
+        }, segments=list(segments))
+        engine._submodules = {"n": SimpleNamespace(
+            resident=None, resident_refusals={WALK: "not asked for"}, template_steps={WALK: step},
+            joint_comm_group=SimpleNamespace(world_size=1), submodule=SimpleNamespace(repeat_carry=lambda w, s: {}),
+            resources={"kv": res["kv"], "rope": res["rope"]}, carry_refusals={}, carries={},
+            accelerator_graph_runner=None,
+        )}
+        return engine.repeat_refusal("n", WALK)
+
+    assert refusal(commit=False, advance=(0,)) is None
+    assert refusal(commit=True, advance=(0,)).startswith("resource 'kv': a host-planned step that commits")
+    assert refusal(commit=False, advance=None).startswith("resource 'rope': a host-planned step that advances")

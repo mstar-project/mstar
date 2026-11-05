@@ -196,6 +196,9 @@ class _RaggedManagerBase:
 
     wrapper_class: type[_RaggedPrefillBase]
 
+
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        return None  # attention within one forward: every replay attends the same spans
     def __init__(
         self,
         device: torch.device,

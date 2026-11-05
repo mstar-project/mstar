@@ -403,7 +403,7 @@ class SamplerResource(Resource):
     # Resident planning: the scalars as cells of the planner's rows, by its
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
 
-    def repeat_refusal(self) -> str | None:
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         """Replays need the offset and the last token to move in the graph, and
         no per-step state outside it. Fixed at load, as `_cg_buffers` decides it."""
         if not (self._keep_last_token and sampler_ingraph_scatter() and self._decides):

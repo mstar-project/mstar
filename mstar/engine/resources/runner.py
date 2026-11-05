@@ -558,9 +558,6 @@ class StepRunner:
         ctx = step.ctx
         if ctx.repeats == 1:
             return
-        if ctx.resident is None:
-            ctx.repeats = 1
-            return
         ctx.repeats = max(1, min(
             ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
         ))

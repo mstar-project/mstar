@@ -1135,7 +1135,7 @@ class RecurrentStatePool(Resource):
 
     # Resident planning
 
-    def repeat_refusal(self) -> str | None:
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # a row's state is updated in place, at its slot
 
     def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:

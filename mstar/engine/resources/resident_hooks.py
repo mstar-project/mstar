@@ -24,10 +24,14 @@ class ResidentHooks:
     each owner of that state keeps its own table. A resource overrides these
     only once it has one."""
 
-    def repeat_refusal(self) -> str | None:
-        """Why no step may replay with no host work between replays, from what
-        is fixed by the end of capture, or None if steps may. A resource refuses
-        until it knows better: whatever it stages per step would go stale."""
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        """Why no step of ``walk`` may replay with no host work between
+        replays, from what is fixed by the end of capture, or None if steps
+        may. ``host_step``: this resource's part of the walk's step, for a walk
+        planned on the host, whose one plan every replay reads; None for a
+        resident walk. A resource refuses until it knows better: whatever it
+        stages per step would go stale."""
+        del walk, host_step
         return f"{type(self).__name__} keeps no per-replay support"
 
     def max_repeats(self, step, ctx) -> int:

@@ -2930,8 +2930,9 @@ class Worker:
         """Why no step of this walk can stand for several iterations, or None:
         something about its rows has to reach the host every iteration."""
         engine = self.engine_manager.get_engine(node_name)
-        if self._stop_token_signal.get((node_name, graph_walk)) is None:
-            return "node: the runtime doesn't check its stop: it declares no token stop"
+        if (node_name, graph_walk) not in self._stop_token_signal:
+            # a count stop is the loop's cap, which a run never passes (`loop_room`)
+            return "node: the runtime doesn't check its stop: its own check_stop decides"
         edges = self._step_repeats.edges[(node_name, graph_walk)]
         refusal = edge_refusal(edges)
         if refusal is None:

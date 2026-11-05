@@ -99,12 +99,16 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def repeat_refusal(self) -> str | None:
-        """Decided from the captured decode wrappers, so after capture: which
-        kernel FlashInfer's backend "auto" resolves to is known only once planned."""
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        """Decided from the walk's captured decode wrappers, so after capture:
+        which kernel FlashInfer's backend "auto" resolves to is known only once
+        planned. A host-planned step attends a cache that doesn't grow (its
+        pool answers for that), so one plan serves every replay."""
+        if host_step is not None:
+            return None
         if any(
             isinstance(w, FmhaDecodeWrapper) or (isinstance(w, FlashInferDecodeWrapper) and w.lengths_move)
-            for w in self._cg_plan_states.values()
+            for key, w in self._cg_plan_states.items() if key.bucket.graph_walk == walk
         ):
             return None
         return "no captured decode kernel of it reads a row's length per replay (CUDA-core, fa3 or cuDNN decode)"
@@ -114,7 +118,7 @@ class FlashInferManager(AttentionManager):
         planned for the step's last replay, whose lengths move in `next_replay`.
         Per bucket: each captured its own wrapper."""
         lease = ctx.slot_lease
-        if lease.bucket in ctx.resident.host_plan_free:
+        if ctx.resident is None or lease.bucket in ctx.resident.host_plan_free:
             return ANY_REPEATS
         # a resident walk plans one stream, under its segments' label
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=step.segments[0].label)
@@ -122,6 +126,8 @@ class FlashInferManager(AttentionManager):
         return ANY_REPEATS if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move else 1
 
     def next_replay(self, step, ctx) -> None:
+        if ctx.resident is None:
+            return  # a host-planned step's lengths don't move
         if ctx.slot_lease.bucket in ctx.resident.host_plan_free:
             return  # planned nothing, so what's held is an earlier step's
         for wrapper in self._current_plan_states.values():
