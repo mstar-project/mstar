@@ -447,7 +447,7 @@ Per-model notes:
   parallel windows.
 - **Realtime conversation** (``WS /v1/realtime``, a model that declares an audio client
   stream, such as ``nemotron_duplex``) speaks OpenAI's GA Realtime events, not the beta
-  ones. The whole call is one engine request, opened by the first audio the client
+  ones. The whole call is one engine request, opened by the first append the client
   sends (an ``input_audio_buffer.append``, or a ``conversation.item.create`` of
   ``input_audio`` parts) with the session's ``instructions`` as its prompt; the
   instructions, audio formats and voice are fixed from then on. ``audio.input.format``
