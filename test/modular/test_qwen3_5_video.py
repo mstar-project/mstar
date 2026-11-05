@@ -461,7 +461,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     expected_row = ids.float()
     expected_row[ids == model.config.image_token_id] = IMAGE_MARK
     expected_row[ids == model.config.video_token_id] = VIDEO_MARK
-    assert torch.equal(row.input_embeds[:, 0], expected_row)
+    assert torch.equal(llm._vision_embeds([row])[:, 0], expected_row)
 
     positions, _ = rope_model.get_rope_index(
         ref["input_ids"], ref["mm_token_type_ids"],
@@ -844,7 +844,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 
