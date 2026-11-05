@@ -28,6 +28,7 @@ from mstar.model.components.fastconformer_kernels import (
     glu_depthwise_conv,
     use_triton,
 )
+from mstar.model.components.masking import length_mask
 
 if TYPE_CHECKING:
     from mstar.model.components.audio_features import NemoLogMel
@@ -153,12 +154,6 @@ def _conv_out_len(lengths, kernel: int, stride: int, causal: bool):
     return (lengths + pad - kernel) // stride + 1
 
 
-def _time_mask(lengths: torch.Tensor | None, max_len: int) -> torch.Tensor | None:
-    if lengths is None:
-        return None
-    return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
-
-
 class _Subsampling(nn.Module):
     """Depthwise-separable striding over (time, mel): a full conv into
     ``subsampling_channels``, then depthwise + pointwise pairs, then a linear
@@ -184,6 +179,11 @@ class _Subsampling(nn.Module):
                 nn.ReLU(),
             ]
         self.layers = nn.ModuleList(layers)
+        # refused on every device so the spec does not depend on the path
+        self.lora_unservable = {
+            f"layers.{i}": "run as F.conv2d over its weight on the Triton path (bias_relu_mask_)"
+            for i in range(len(layers) - 1) if isinstance(layers[i + 1], nn.ReLU)
+        }
         freq = config.num_mel_bins
         for _ in range(config.num_subsampling_layers):
             freq = _conv_out_len(freq, k, s, config.causal)
@@ -211,7 +211,7 @@ class _Subsampling(nn.Module):
             else:
                 x = layer(x)
                 if lengths is not None:
-                    x = x * _time_mask(lengths, x.shape[2])[:, None, :, None]
+                    x = x * length_mask(lengths, x.shape[2])[:, None, :, None]
                 x = torch.relu(x)
         b, c, t, f = x.shape
         return self.linear(x.transpose(1, 2).reshape(b, t, c * f))
@@ -244,14 +244,19 @@ class RelPositionAttention(nn.Module):
     """``softmax(((q + u) k^T + skew((q + v) R^T)) / sqrt(d))`` with ``R``
     the projected position sinusoids; the second term enters SDPA as a bias.
     A stream step attends its new frames in the bounded KV ``kv_key`` names
-    instead, which keeps each stream's window of keys and values."""
+    instead, which keeps each stream's window of keys and values, with the
+    distances it can see projected once, at bind (``band``)."""
+
+    lora_unservable = {"relative_k_proj": "projects position encodings, not the step's tokens (a stream's at bind)"}
 
     def __init__(self, config: FastConformerConfig, layer_idx: int = 0, kv_key: str | None = None):
         super().__init__()
         h, d = config.num_heads, config.head_dim
         self.num_heads, self.head_dim = h, d
         self.layer_idx, self._kv_key = layer_idx, kv_key
+        self.left_context = config.left_context
         self.kv = None
+        self.band = None
         self.qkv_proj = nn.Linear(config.hidden_size, 3 * h * d, bias=config.attention_bias)
         self.o_proj = nn.Linear(h * d, config.hidden_size, bias=config.attention_bias)
         self.relative_k_proj = nn.Linear(config.hidden_size, h * d, bias=False)
@@ -261,6 +266,14 @@ class RelPositionAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         if self._kv_key is not None:
             self.kv = resources[self._kv_key]
+            # distances 0..left_context, all a stream's frame sees (row d is
+            # distance d), projected in the weights' dtype, which is what autocast
+            # computes it in: fixed weights, so once, here, before any capture
+            w = self.relative_k_proj.weight
+            n = self.left_context + 1
+            with torch.no_grad():
+                band = rel_positional_encoding(n, w.shape[1], w.device, w.dtype)[:n].flip(0)
+                self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
 
     def _qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, _ = x.shape
@@ -288,15 +301,15 @@ class RelPositionAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
-    def forward_stream(self, x: torch.Tensor, band: torch.Tensor) -> torch.Tensor:
+    def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
         """A stream step: each new frame attends the ``left_context`` frames
         before it and itself, the older ones from the KV, which then keeps this
-        step's. ``band`` holds the sinusoids of distances ``0..left_context``,
-        row d distance d: the position term depends on the distance alone, so it
-        goes in as that band, unscaled, and the kernel scales the sum."""
+        step's. The position term depends on the distance alone, so it goes in
+        as the band of distances projected at bind, unscaled: the kernel scales
+        the sum."""
         q, k, v = self._qkv(x)
         b, t, h, d = q.shape
-        r = self.relative_k_proj(band).view(-1, h, d).transpose(0, 1)  # (H, left + 1, D)
+        r = self.band  # (H, left + 1, D)
         # in k's dtype: under autocast the bias add promotes q, and the kernel takes one dtype
         q_u = (q + self.bias_u).to(k.dtype).transpose(1, 2)
         bias = torch.matmul((q + self.bias_v).transpose(1, 2), r.transpose(-2, -1))  # (B, H, T, left + 1)
@@ -357,8 +370,9 @@ class ConvModule(nn.Module):
         return self._depthwise_pointwise(x)
 
     def _depthwise_pointwise(self, x: torch.Tensor) -> torch.Tensor:
-        """``(B, C, k - 1 + T)`` GLU outputs when causal (zeros offline, the
-        cached inputs in a stream), else ``(B, C, T)``, to ``(B, T, C)``."""
+        """``(B, C, k - 1 + T)`` GLU outputs when causal (zeros before them
+        offline, the cached inputs in a stream), else ``(B, C, T)``, to
+        ``(B, T, C)``."""
         x = self.depthwise_conv(x).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
@@ -392,17 +406,13 @@ class FastConformerBlock(nn.Module):
         self.norm_out = nn.LayerNorm(c)
 
     def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor,
-        mask: torch.Tensor | None, valid: torch.Tensor | None,
+        self, x: torch.Tensor, pos_emb: torch.Tensor, mask: torch.Tensor | None, valid: torch.Tensor | None,
     ) -> torch.Tensor:
         return self._macaron(x, lambda h: self.self_attn(h, pos_emb, mask), lambda h: self.conv(h, valid))
 
-    def forward_stream(self, x: torch.Tensor, band: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
-        """A stream step: ``band`` for the attention and ``tails`` for the conv
-        (see their ``forward_stream``)."""
-        return self._macaron(
-            x, lambda h: self.self_attn.forward_stream(h, band), lambda h: self.conv.forward_stream(h, tails),
-        )
+    def forward_stream(self, x: torch.Tensor, tails: torch.Tensor) -> torch.Tensor:
+        """A stream step: ``tails`` for the conv (see ``ConvModule.forward_stream``)."""
+        return self._macaron(x, self.self_attn.forward_stream, lambda h: self.conv.forward_stream(h, tails))
 
     def _macaron(
         self, x: torch.Tensor,
@@ -457,7 +467,8 @@ def nemo_to_hf_name(name: str) -> str:
 
 class FastConformerEncoder(nn.Module):
     """``(B, T, mel)`` features and per-request frame counts in,
-    ``(B, T', hidden)`` and per-request encoder lengths out.
+    ``(B, T', hidden)`` and per-request encoder lengths out: ``subsample``
+    then ``blocks``, the split NeMo's ``bypass_pre_encode`` makes.
 
     A causal encoder also runs as a stream, a few frames at a time:
     ``blocks_stream`` attends in the bounded KV ``kv_key`` names (each frame
@@ -474,18 +485,53 @@ class FastConformerEncoder(nn.Module):
             FastConformerBlock(config, i, kv_key, conv_key) for i in range(config.num_layers)
         )
 
+    @classmethod
+    def load(
+        cls,
+        config: FastConformerConfig,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+        kv_key: str | None = None,
+        conv_key: str | None = None,
+    ) -> FastConformerEncoder:
+        """Built on ``device`` in ``dtype`` from HF-named ``weights``
+        (``load_hf_weights``), every parameter loaded, in eval mode."""
+        from mstar.model.utils import check_loaded
+
+        with torch.device("meta"):
+            encoder = cls(config, kv_key, conv_key)
+        # cast first, so storage is allocated in the target dtype
+        if dtype is not None:
+            encoder = encoder.to(dtype)
+        encoder = encoder.to_empty(device=device)
+        check_loaded(encoder, encoder.load_hf_weights(weights), "FastConformer encoder")
+        return encoder.eval()
+
     def forward(
         self, features: torch.Tensor, lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``lengths`` (mel frames per row) masks the padding; leave it out
         when no row is padded. No host reads, so the forward captures."""
         x = self.subsample(features, lengths)
-        t = x.shape[1]
         if lengths is None:
-            out_lengths, valid = torch.full((x.shape[0],), t, device=x.device), None
-        else:
-            out_lengths = self.config.output_lengths(lengths)
-            valid = _time_mask(out_lengths, t)
+            return self.blocks(x), torch.full((x.shape[0],), x.shape[1], device=x.device)
+        out_lengths = self.config.output_lengths(lengths)
+        return self.blocks(x, out_lengths), out_lengths
+
+    def subsample(self, features: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """``(B, T, mel)`` -> ``(B, T', hidden)`` block inputs; ``lengths`` as ``forward``'s."""
+        x = self.subsampling(features, lengths)
+        if self.config.scale_input:
+            x = x * math.sqrt(self.config.hidden_size)
+        return x
+
+    def blocks(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """The Conformer blocks over a clip's ``x (B, T', hidden)``, ``lengths``
+        (encoder frames per row) masking the padding."""
+        t = x.shape[1]
+        valid = None if lengths is None else length_mask(lengths, t)
         mask = None
         if self.config.causal:
             mask = chunked_attention_mask(t, self.config.left_context, self.config.lookahead, x.device)[None, None]
@@ -498,13 +544,6 @@ class FastConformerEncoder(nn.Module):
         pos_emb = F.pad(pos_emb, (0, 0, 0, -pos_emb.shape[0] % 8))
         for layer in self.layers:
             x = layer(x, pos_emb, mask, valid)
-        return x, out_lengths
-
-    def subsample(self, features: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
-        """``(B, T, mel)`` -> ``(B, T', hidden)`` block inputs; ``lengths`` as ``forward``'s."""
-        x = self.subsampling(features, lengths)
-        if self.config.scale_input:
-            x = x * math.sqrt(self.config.hidden_size)
         return x
 
     def blocks_stream(self, x: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
@@ -513,15 +552,12 @@ class FastConformerEncoder(nn.Module):
         plans its declaration made for the bound KV and conv pool. A stream with
         no new frame keeps its conv state."""
         b, c = x.shape[0], self.config
-        left = c.left_context
-        # distances 0..left, all a frame sees: row d is distance d
-        band = rel_positional_encoding(left + 1, c.hidden_size, x.device, x.dtype)[: left + 1].flip(0)
         keep = c.conv_kernel_size - 1
         # each stream keeps its newest k - 1 conv inputs: new .. new + k - 1 of cached ++ this step's
         tails = (new.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
             b, c.hidden_size, keep)
         for layer in self.layers:
-            x = layer.forward_stream(x, band, tails)
+            x = layer.forward_stream(x, tails)
         return x
 
     # ------------------------------------------------------------------
@@ -590,20 +626,6 @@ class FastConformerEncoder(nn.Module):
         return loaded
 
 
-# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
-NEMO_MEL_SETTINGS = dict(window="hann", log=True, frame_splicing=1)
-
-
-def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
-    """Refuse a NeMo ``preprocessor`` config that ``NEMO_MEL_SETTINGS`` and the
-    model's own settings don't describe. A key it leaves out is refused too,
-    rather than read as NeMo's default."""
-    expected = {**NEMO_MEL_SETTINGS, **model_settings}
-    unsupported = {k: preprocessor.get(k) for k, v in expected.items() if preprocessor.get(k) != v}
-    if unsupported:
-        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
-
-
 def load_nemo_perception(
     config: FastConformerConfig,
     out_dim: int,
@@ -622,14 +644,10 @@ def load_nemo_perception(
     ``out_dim``; and the featurizer with ``log_mel_settings`` and the
     checkpoint's own (rounded) filters and window."""
     from mstar.model.components.audio_features import NemoLogMel
-    from mstar.model.utils import check_loaded
 
     with torch.device("meta"):
-        encoder = FastConformerEncoder(config, kv_key, conv_key)
         proj = nn.Linear(config.hidden_size, out_dim)
-    if dtype is not None:
-        encoder, proj = encoder.to(dtype), proj.to(dtype)
-    encoder, proj = encoder.to_empty(device=device), proj.to_empty(device=device)
+    proj = (proj if dtype is None else proj.to(dtype)).to_empty(device=device)
     featurizer: dict[str, torch.Tensor] = {}
     head: dict[str, torch.Tensor] = {}
 
@@ -645,7 +663,9 @@ def load_nemo_perception(
                 # e.g. a modality adapter's: skipping it would serve without it
                 raise ValueError(f"unexpected NeMo perception weight {name!r}")
 
-    check_loaded(encoder, encoder.load_hf_weights(encoder_weights()), "FastConformer encoder")
+    encoder = FastConformerEncoder.load(
+        config, encoder_weights(), device=device, dtype=dtype, kv_key=kv_key, conv_key=conv_key,
+    )
     with torch.no_grad():
         proj.weight.copy_(head["weight"])
         proj.bias.copy_(head["bias"])
@@ -653,4 +673,4 @@ def load_nemo_perception(
         num_mel_bins=config.num_mel_bins, device=device,
         mel_filters=featurizer["fb"], window=featurizer["window"], **log_mel_settings,
     )
-    return encoder.eval(), proj.eval(), log_mel
+    return encoder, proj.eval(), log_mel

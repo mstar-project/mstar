@@ -11,6 +11,8 @@ import base64
 import json
 import sys
 import tempfile
+import threading
+import time
 import types
 import wave
 from pathlib import Path
@@ -24,6 +26,7 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI, HTTPException, WebSocketDisconnect  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server import media_io  # noqa: E402
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs, Transcript  # noqa: E402
 
@@ -845,11 +848,21 @@ def test_unsupported_turn_detection_is_refused_and_echoed_as_null(client_and_stu
     assert updated["session"]["input_audio_transcription"]["language"] is None  # the refused update changed nothing
 
 
-@pytest.mark.parametrize("fmt", ["pcm16", {"type": "audio/pcm", "rate": 24000}])
+@pytest.mark.parametrize("fmt", [None, "pcm16"])
+def test_pcm16_is_the_default_16khz(client_and_stub, fmt):
+    """"pcm16" names what an omitted format means, 16 kHz: one meaning for both."""
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"input_audio_format": fmt}}))
+        session = json.loads(ws.receive_text())["session"]
+    assert (session["input_audio_format"], session["mstar"]["sample_rate"]) == ("pcm16", 16000)
+
+
+@pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 24000}])
 def test_24khz_input_is_resampled_onto_the_true_timeline(client_and_stub, fmt):
-    """OpenAI's pcm rate is 24 kHz, "pcm16" included. Declared, it is resampled
-    as it arrives, so one second of audio is one second to the model and in
-    audio_seconds."""
+    """OpenAI's pcm rate, 24 kHz, declared, is resampled as it arrives, so one
+    second of audio is one second to the model and in audio_seconds."""
     client, stub = client_and_stub
     heard = _step_samples(stub)
     tone_24k = (np.sin(2 * np.pi * 440 * np.arange(24000) / 24000) * 8000).astype("<i2")
@@ -859,7 +872,7 @@ def test_24khz_input_is_resampled_onto_the_true_timeline(client_and_stub, fmt):
             "input_audio_format": fmt, "mstar": {"chunk_seconds": 0.5},
         }}))
         updated = json.loads(ws.receive_text())
-        assert updated["session"]["input_audio_format"] == "pcm16"
+        assert updated["session"]["input_audio_format"] == fmt
         assert updated["session"]["mstar"]["sample_rate"] == 24000
         for i in range(0, tone_24k.size, 240):  # 10 ms appends
             _append_bytes(ws, tone_24k[i:i + 240].tobytes())
@@ -1105,6 +1118,10 @@ def test_a_character_split_across_token_chunks_survives_a_step():
 
 class _DuplexModel:
     turn_tokens = (1, 2)
+    channels = 1
+
+    def get_output_audio_channels(self, modality="audio"):
+        return self.channels
 
     def get_output_sample_rate(self, modality="audio"):
         return 24000
@@ -1114,7 +1131,7 @@ class _DuplexModel:
 
 
 class _DuplexAPI:
-    """One live call: records its opening and each append's frames, and
+    """One live call: records its opening and each append's samples, and
     plays ``outputs`` as the call's result chunks; with ``end`` the call
     then ends, else its output goes on."""
 
@@ -1128,26 +1145,25 @@ class _DuplexAPI:
         self.end = end
         self.upload_dir = Path(tempfile.mkdtemp())
         self.submits: list = []
-        self.appends: list[list[np.ndarray]] = []
+        self.appends: list[np.ndarray] = []
         self.aborted: list = []
         self.outputs = list(outputs)
 
+    refuse = 0   # opens refused (at capacity) before one is taken
+
     def submit_request(self, **kw):
+        if self.refuse:
+            self.refuse -= 1
+            raise HTTPException(503, "at capacity")
         self.submits.append(kw)
         return kw["request_id"]
 
     def submission_key(self, request_id):
         return request_id
 
-    def stream_input(self, key, file_paths, file_streams=None, **kw):
-        assert file_streams == {"audio": ["audio_in"] * len(file_paths["audio"])}
-        frames = []
-        for path in file_paths["audio"]:
-            with wave.open(path) as wav:
-                assert wav.getframerate() == 16000
-                frames.append(np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2") / 32768.0)
-            Path(path).unlink()
-        self.appends.append(frames)
+    def stream_input(self, key, file_paths=None, *, samples, **kw):
+        assert file_paths is None and set(samples) == {"audio_in"}
+        self.appends.append(samples["audio_in"])
         return True
 
     async def _chunks(self):
@@ -1189,23 +1205,39 @@ def _session_update(ws, **session):
     return _recv_until(ws, "session.updated")[-1]["session"]
 
 
-def test_a_conversation_needs_turn_tokens(duplex):
+@pytest.mark.parametrize("attr, value, reason", [("turn_tokens", None, "no turn tokens"),
+                                                  ("channels", 2, "speaks in 2 channels")])
+def test_a_conversation_needs_turn_tokens_and_mono_output(duplex, attr, value, reason):
     """A duplex model without turn tokens serves /generate/ws, but a
-    conversation has no replies to cut, so it is refused before any event."""
+    conversation has no replies to cut, and its audio out is mono: either
+    is refused before any event."""
     client, api = duplex()
-    api.model.turn_tokens = None
+    setattr(api.model, attr, value)
     with pytest.raises(WebSocketDisconnect) as refused:
         with client.websocket_connect("/v1/realtime") as ws:
             ws.receive_text()
-    assert refused.value.code == 1008 and "no turn tokens" in refused.value.reason
+    assert refused.value.code == 1008 and reason in refused.value.reason and "/generate/ws" in refused.value.reason
     assert api.submits == []
 
 
+def test_a_model_that_cannot_converse_still_serves_transcription_by_default(client_and_stub, monkeypatch):
+    """An omitted intent is the one the model serves: transcription, when an
+    audio-streaming model has no turn tokens but its adapter transcribes."""
+    from mstar.streaming.topology import CLIENT, ClientAudio, Connection
+
+    client, stub = client_and_stub
+    monkeypatch.setattr(stub, "client_audio", [Connection(CLIENT, "Ear", "audio_in", chunk_policy_factory=lambda: None,
+                                                          audio=ClientAudio(16000, 1280))])
+    stub.model.turn_tokens, stub.model.get_output_audio_channels = None, lambda modality="audio": 1
+    with client.websocket_connect("/v1/realtime") as ws:
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.created"
+
+
 @pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 24000}, {"type": "audio/pcmu"}])
-def test_conversation_audio_reaches_the_model_as_whole_frames(duplex, fmt):
+def test_conversation_audio_reaches_the_stream_resampled(duplex, fmt):
     """Audio in the client's codec and rate reaches the stream resampled to
-    16 kHz and cut into 80 ms frames, the same however the appends split it:
-    a partial frame waits for the next append."""
+    16 kHz, the same however the appends split it (the data worker cuts it
+    into the stream's frames)."""
     from mstar.api_server import media_io
 
     client, api = duplex()
@@ -1228,10 +1260,122 @@ def test_conversation_audio_reaches_the_model_as_whole_frames(duplex, fmt):
             start += n
         _send(ws, "input_audio_buffer.commit")
         _recv_until(ws, "input_audio_buffer.committed")
-    frames = [f for append in api.appends for f in append]
     assert len(api.submits) == 1 and api.submits[0]["end_input"] is False
-    assert [f.size for f in frames] == [1280] * (expected.size // 1280) and len(frames) == 6
-    np.testing.assert_allclose(np.concatenate(frames), expected[:len(frames) * 1280], atol=1 / 32768)
+    assert all(a.dtype == np.float32 for a in api.appends)
+    np.testing.assert_allclose(np.concatenate(api.appends), expected, atol=1 / 32768)
+
+
+def test_a_refused_open_keeps_none_of_its_append(duplex):
+    """An append whose call could not open is not taken, its half sample
+    included, so the retry is read from its own first byte."""
+    client, api = duplex()
+    api.refuse = 1
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\x01\x02\x03").decode())
+        assert "at capacity" in json.loads(ws.receive_text())["error"]["message"]
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(np.array([1000, -2000, 7], "<i2").tobytes()
+                                                                       + b"\x09").decode())
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    (heard,) = api.appends
+    np.testing.assert_array_equal(heard, np.array([1000, -2000, 7], np.float32) / 32768)
+
+
+@pytest.mark.parametrize("half_sample", [False, True])
+def test_a_paused_client_is_padded_with_silence(duplex, monkeypatch, half_sample):
+    """The model steps only on the audio it hears, so the server keeps time:
+    a client that stops sending is padded with silence once it is a frame
+    past JITTER_SECONDS behind, at most MAX_PAD_SECONDS a pause, and never
+    while half a sample is pending."""
+    monkeypatch.setattr(serving_realtime, "MAX_PAD_SECONDS", 0.24)   # three frames
+    client, api = duplex()
+    frame = np.full(1280, 100, "<i2").tobytes() + (b"\x01" if half_sample else b"")
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(frame).decode())
+        time.sleep(0.9)
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    first, *pads = api.appends
+    padded = sum(p.size for p in pads)
+    assert first.size == 1280 and not any(p.any() for p in pads)
+    assert padded == 0 if half_sample else 0 < padded <= 0.24 * 16000 + len(pads)
+
+
+def test_a_late_append_is_not_padded(duplex, monkeypatch):
+    """Audio up to JITTER_SECONDS late is a late packet, not a pause: no
+    silence goes into the middle of it."""
+    monkeypatch.setattr(serving_realtime, "JITTER_SECONDS", 0.5)   # margin for a slow runner
+    client, api = duplex()
+    frame = base64.b64encode(np.full(1280, 100, "<i2").tobytes()).decode()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 16000}}})
+        _send(ws, "input_audio_buffer.append", audio=frame)
+        time.sleep(0.2)   # the second frame arrives 120 ms late
+        _send(ws, "input_audio_buffer.append", audio=frame)
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert [a.size for a in api.appends] == [1280, 1280]
+
+
+def test_clear_waits_for_a_padding_push_in_flight(duplex, monkeypatch):
+    """A padding push at 48 kHz resamples off the event loop; a clear that
+    reset the resampler in the middle of it would leave it emitting nothing
+    for as long as the call had run."""
+    entered, release, reset = threading.Event(), threading.Event(), threading.Event()
+    emit, real_reset = media_io.StreamResampler._emit, media_io.StreamResampler.reset
+
+    def held_emit(self, k_end):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:   # off the event loop: the clock's padding push
+            if not entered.is_set():
+                entered.set()
+                release.wait(5)
+        return emit(self, k_end)
+
+    def noted_reset(self):
+        real_reset(self)
+        if entered.is_set():
+            reset.set()
+
+    monkeypatch.setattr(media_io.StreamResampler, "_emit", held_emit)
+    monkeypatch.setattr(media_io.StreamResampler, "reset", noted_reset)
+    client, api = duplex()
+    tone = (np.sin(np.arange(48000) * 0.05) * 8000).astype("<i2").tobytes()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _session_update(ws, audio={"input": {"format": {"type": "audio/pcm", "rate": 48000}}})
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(tone[:3840]).decode())   # 40 ms, inline
+        assert entered.wait(5)
+        _send(ws, "input_audio_buffer.clear")
+        reset.wait(0.5)   # a reset outside the lock lands now
+        release.set()
+        _recv_until(ws, "input_audio_buffer.cleared")
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(tone).decode())   # 1 s
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert api.appends[-1].size > 15900   # the second, at 16 kHz, less the resampler's lookahead
+
+
+def test_an_append_that_fails_inside_the_server_is_an_error_event(duplex, monkeypatch):
+    client, api = duplex()
+
+    def broken(*a, **k):
+        raise RuntimeError("/srv/secret/path is gone")
+
+    monkeypatch.setattr(api, "stream_input", broken)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        error = json.loads(ws.receive_text())["error"]
+        _send(ws, "input_audio_buffer.commit")   # the socket is still up
+        _recv_until(ws, "input_audio_buffer.committed")
+    assert error["type"] == "server_error" and "error id" in error["message"] and "secret" not in error["message"]
 
 
 def _text(step, data=b"", mark=None):
@@ -1315,6 +1459,22 @@ def test_replies_are_paired_by_step_however_the_chunks_arrive(duplex):
         # a client assembles the text from the deltas, held ones included
         assert "".join(e["delta"] for e in events if e["type"] == "response.output_audio_transcript.delta"
                        and e["response_id"] == response["id"]) == response["output"][0]["content"][0]["transcript"]
+
+
+def test_a_reply_without_an_end_mark_ends_where_the_next_starts(duplex):
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3, mark="start"), _text(4, b"Yo"),
+             _text(5, mark="end"), _text(6)]
+    client, api = duplex([*texts, *(_audio(i) for i in range(7))], end=True)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        events = _until_closed(ws)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert [(r["status"], r["output"][0]["content"][0]["transcript"]) for r in done] == [
+        ("completed", "Hi"), ("completed", "Yo")]
+    for response, steps in zip(done, ([1, 2], [3, 4, 5]), strict=True):
+        assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
+                and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
 
 
 def test_a_call_that_ends_mid_reply_finishes_its_response(duplex):
@@ -1401,7 +1561,26 @@ def test_an_item_is_reported_only_when_its_audio_was_taken(duplex, monkeypatch):
         added = json.loads(ws.receive_text())
     assert added["type"] == "conversation.item.added"
     assert added["item"]["content"] == [{"type": "input_audio"}]
-    assert sum(len(a) for a in api.appends) == 1
+    assert len(api.appends) == 1
+
+
+def test_an_option_the_model_cannot_honour_costs_the_update_nothing_else(duplex):
+    """A stock client's defaults (another voice, input transcription) are
+    answered with an error each, and its instructions still open the call."""
+    client, api = duplex()
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "session.update", session={"instructions": "be brief", "audio": {
+            "input": {"transcription": {"model": "gpt-4o-transcribe"}}, "output": {"voice": "ash"}}})
+        replies = _recv_until(ws, "session.updated")
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        _send(ws, "input_audio_buffer.commit")
+        _recv_until(ws, "input_audio_buffer.committed")
+    errors = [r["error"]["message"] for r in replies if r["type"] == "error"]
+    assert len(errors) == 2 and "transcription" in errors[0] and "voice" in errors[1]
+    served = replies[-1]["session"]
+    assert served["instructions"] == "be brief" and served["audio"]["output"]["voice"] == "Aria"
+    assert api.submits[0]["text"] == "be brief"
 
 
 def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
@@ -1417,15 +1596,17 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
             assert error["type"] == "error" and error["error"]["code"] == "unsupported", kind
         _send(ws, "session.update", session={"audio": {"input": {"turn_detection": None}}})
         assert "turn_detection null is not supported" in json.loads(ws.receive_text())["error"]["message"]
-        # what would change what is heard, and the model cannot do, is refused
+        assert json.loads(ws.receive_text())["type"] == "session.updated"
+        # what the model cannot do is answered with an error, and the served value stays
         for session in ({"max_output_tokens": 100}, {"audio": {"output": {"speed": 1.5}}},
                         {"audio": {"output": {"voice": "Ash"}}}):
             _send(ws, "session.update", session=session)
-            assert json.loads(ws.receive_text())["type"] == "error", session
+            assert json.loads(ws.receive_text())["error"]["code"] == "unsupported", session
+            assert json.loads(ws.receive_text())["type"] == "session.updated"
         _send(ws, "session.update", session={"instructions": "be brief"})
         assert "fixed once audio flows" in json.loads(ws.receive_text())["error"]["message"]
         _send(ws, "input_audio_buffer.append", audio=frame)
         _send(ws, "input_audio_buffer.commit")
         _recv_until(ws, "input_audio_buffer.committed")
         assert not api.aborted
-    assert len(api.submits) == 1 and sum(len(a) for a in api.appends) == 2
+    assert len(api.submits) == 1 and len(api.appends) == 2

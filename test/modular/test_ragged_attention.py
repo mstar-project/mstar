@@ -12,6 +12,7 @@ CPU-only head-dimension validation lives in ``test_ragged_attention_cpu.py``.
 
 from __future__ import annotations
 
+import functools
 import sys
 
 sys.path.insert(0, ".")
@@ -48,6 +49,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
 )
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 pytestmark = pytest.mark.skipif(
@@ -106,7 +108,7 @@ def close(got, want, tol=TOL):
 
 
 def workspace():
-    return torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    return Workspace(torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE), "test")
 
 
 def wrapper(**overrides) -> FlashInferRaggedPrefillWrapper:
@@ -215,19 +217,30 @@ def test_graph_replay_survives_a_poisoned_output_tail():
     """The kernel writes only the planned rows, and reads KV past
     ``cu_seqlens[-1]`` out to the last segment's tile boundary, masking that
     overread additively. Finite values die correctly but NaN/Inf survive
-    (NaN + -inf = NaN), so a poisoned tail would corrupt the last segment's
-    real rows. The wrapper owns the output buffer and re-zeros the tail on
-    every plan so no such value can be there.
+    (NaN + -inf = NaN), so a poisoned output tail, from which the next layer's
+    KV is built, would corrupt the last segment's real rows. The captured graph
+    zeros its output on every replay, so no such value can be there.
     """
     w = graph_wrapper()
     graph, static, out = capture_wrapper(w)
     seg_lens = [100, 60, 30, 0]
     total = sum(seg_lens)
 
-    w._out_buf[total:].fill_(float("nan"))
+    out.fill_(float("nan"))
     close(*replay(w, graph, static, out, seg_lens))
     assert torch.isfinite(out[:total]).all()
-    assert (w._out_buf[total:] == 0).all()
+    assert (out[total:] == 0).all()
+
+
+def test_strided_views_need_no_copy():
+    """q / k / v sliced out of one fused projection are read in place, with the
+    contiguous result."""
+    w, layout = wrapper(head_dim=128), cu([100, 60])
+    fused = torch.randn(160, 3 * HEADS * 128, dtype=DTYPE, device=DEVICE)
+    q, k, v = (t.view(160, HEADS, 128) for t in fused.chunk(3, dim=-1))
+    assert w._pad_head_dim(q) is q
+    w.plan(layout)
+    torch.testing.assert_close(w.run(q, k, v), w.run(q.contiguous(), k.contiguous(), v.contiguous()), rtol=0, atol=0)
 
 
 def test_graph_mode_pads_fewer_segments():
@@ -323,6 +336,69 @@ def test_shards_head_counts_at_build():
     assert mgr._kwargs["num_qo_heads"] == HEADS // 2
     # head_dim never shards
     assert mgr._kwargs["head_dim"] == HEAD_DIM
+
+
+@pytest.mark.parametrize("compile_op", [True, False])
+def test_compiled_caller_keeps_attention_in_its_graph(compile_op):
+    """With ``compile_op``, the resource's ``run`` traces as one custom op: the region
+    keeps one graph around it and computes what eager does. Without it (the default)
+    the region breaks at the attention."""
+    mgr = manager(compile_op=compile_op)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fn = functools.partial(mgr.run, label="main")
+
+    def region(q, k, v):
+        return fn(q * 1.0, k, v) + 1.0
+
+    torch._dynamo.reset()
+    explain = torch._dynamo.explain(region)(q, k, v)
+    assert (explain.graph_break_count == 0) is compile_op
+    close(torch.compile(region)(q, k, v), region(q, k, v))
+
+
+def test_callable_built_inside_a_compiled_region():
+    """A node that builds its callables lazily on first forward does so inside
+    the compiled region; later calls still reach the resource."""
+    mgr = manager(compile_op=True)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fns: dict[int, functools.partial] = {}
+
+    def region(q, k, v):
+        fn = fns.get(id(mgr))
+        if fn is None:
+            fn = fns[id(mgr)] = functools.partial(mgr.run, label="main")
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    expected = mgr.run(q, k, v, label="main") + 1.0
+    for _ in range(2):
+        close(compiled(q, k, v), expected)
+
+
+def test_a_compiled_region_attends_through_a_rebuilt_resource():
+    """Each manager's op key is its resource key plus a number unique in the process.
+    A region compiled against one manager, then called with a manager rebuilt under the
+    same resource key, attends through the rebuilt one's plan, not the old one's, though
+    the old one is still registered under its own op key."""
+    q, k, v = qkv(224)
+
+    def region(fn, q, k, v):
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    old = manager(compile_op=True)
+    old.plan(step(128, 96), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(old.run, label="main"), q, k, v), ref(q, k, v, cu([128, 96])) + 1.0)
+
+    rebuilt = manager(compile_op=True)
+    rebuilt.plan(step(64, 160), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(rebuilt.run, label="main"), q, k, v), ref(q, k, v, cu([64, 160])) + 1.0)
 
 
 def test_plan_then_run_matches_reference():
@@ -755,3 +831,76 @@ def test_cross_pair_under_a_lease_gets_a_graph_wrapper_sized_for_its_keys():
     w = mgr._current_plan_states[cross_label("video", "text")]
     assert isinstance(w, FlashInferRaggedCrossPrefillWrapper) and w.accelerator_graph
     assert w.max_total_kv_tokens == MAX_TOKENS
+
+
+# --- log-sum-exp out, for merging attentions over disjoint key sets ------------
+
+def lse_ref(q, k, q_cu, kv_cu):
+    """Per-segment log-sum-exp (natural log) of query segment i's scaled scores over
+    key segment i, ``[T, H]`` fp32."""
+    lse = torch.full((q.shape[0], HEADS), float("-inf"), device=q.device)
+    q_off, kv_off = q_cu.tolist(), kv_cu.tolist()
+    for qs, qe, ks, ke in zip(q_off[:-1], q_off[1:], kv_off[:-1], kv_off[1:], strict=True):
+        if qe > qs and ke > ks:
+            scores = torch.einsum("qhd,khd->hqk", q[qs:qe].float(), k[ks:ke].float()) * HEAD_DIM ** -0.5
+            lse[qs:qe] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+    return lse
+
+
+def close_lse(got, want):
+    assert got.dtype == torch.float32 and got.shape == want.shape
+    torch.testing.assert_close(got, want, atol=2e-2, rtol=1e-3)
+
+
+def test_eager_cross_returns_the_lse():
+    q_lens, kv_lens = [128, 7], [32, 300]
+    w = cross_wrapper()
+    q = qkv(sum(q_lens), seed=1)[0]
+    _, k, v = qkv(sum(kv_lens), seed=2)
+    w.plan(cu(q_lens), cu(kv_lens))
+    out, lse = w.run(q, k, v, return_lse=True)
+    close(out, cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+    close_lse(lse, lse_ref(q, k, cu(q_lens), cu(kv_lens)))
+
+
+def test_graph_cross_replay_returns_the_lse():
+    """The log-sum-exp out of a captured graph, re-planned to another layout before
+    the replay."""
+    w = cross_wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
+    sq, sk, sv = (torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3))
+    w.plan(cu([MAX_TOKENS // MAX_SEGMENTS] * MAX_SEGMENTS), cu([64] * MAX_SEGMENTS))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            w.run(sq, sk, sv, return_lse=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = w.run(sq, sk, sv, return_lse=True)
+    torch.cuda.synchronize()
+
+    q_lens, kv_lens = [100, 60, 30, 0], [200, 10, 30, 0]
+    q = qkv(sum(q_lens), seed=3)[0]
+    _, k, v = qkv(sum(kv_lens), seed=4)
+    w.plan(cu(q_lens), cu(kv_lens))
+    for buf, real in ((sq, q), (sk, k), (sv, v)):
+        buf.zero_()
+        buf[: real.shape[0]].copy_(real)
+    graph.replay()
+    torch.cuda.synchronize()
+    total = sum(q_lens)
+    close(out[:total], cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+    close_lse(lse[:total], lse_ref(q, k, cu(q_lens), cu(kv_lens)))
+
+
+def test_label_bound_run_hands_back_the_lse():
+    mgr = cross_manager()
+    step_ = RaggedCrossAttentionStep(segments=av_segments([96, 64], [32, 32], [16, 8]), pairs=(("audio", "video"),))
+    mgr.plan(step_, ctx(["r0", "r1"]))
+    q = qkv(24, seed=5)[0]
+    _, k, v = qkv(160, seed=6)
+    attend = functools.partial(mgr.run, label=cross_label("audio", "video"))
+    out, lse = attend(q, k, v, return_lse=True)
+    close(out, attend(q, k, v))
+    close_lse(lse, lse_ref(q, k, cu([16, 8]), cu([96, 64])))

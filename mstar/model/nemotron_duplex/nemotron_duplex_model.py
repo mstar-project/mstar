@@ -65,16 +65,24 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
-    apply_yaml_overrides,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    serving_resources,
+)
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import encoder_kv_config, encoder_state_blocks, front_state_blocks
+from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.config import (
@@ -303,8 +311,10 @@ class NemotronDuplexModel(Model):
             return
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        specs = self.get_node_resources()
-        apply_yaml_overrides(specs, config)
+        try:
+            specs = serving_resources(self, config)
+        except ValueError:
+            return  # a `resources:` block the validation's resource checks report
         for spec in specs:
             if isinstance(spec, RecurrentStateSpec):
                 held, knob = spec.config.usable_slots, "max_slots"
@@ -313,7 +323,7 @@ class NemotronDuplexModel(Model):
             elif spec.resource_key in (TALKER_KV, NANO_KV):
                 kv = spec.config
                 pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
-                per_session = pages(kv.page_size, sessions=1) - 1
+                per_session = pages(kv.tokens_per_page, sessions=1) - 1
                 held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
             else:
                 continue
@@ -344,28 +354,12 @@ class NemotronDuplexModel(Model):
             max_seq_len=nano.max_position_embeddings,
             num_qo_heads=nano.num_attention_heads,
             # a session holds its prompt and every frame for life (no eviction)
-            max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
+            max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
         )
         return [
-            RecurrentStateSpec(
-                resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=self.config.stt.encoder.num_layers,
-                    blocks=encoder_state_blocks(self.config.stt.encoder),       # in the engine's compute dtype
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            RecurrentStateSpec(
-                resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=1, blocks=front_state_blocks(self.config.stt.encoder, self.config.stt.hop_length),
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            # no sink slot: padding rows read and write nothing in it
-            BoundedKVSpec(
-                resource_key=ENCODER_KV, nodes={"conformer_encoder"},
-                config=encoder_kv_config(self.config.stt.encoder, max_slots=self.DEFAULT_SESSIONS),
+            *stream_node_resources(
+                self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
+                kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
             ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(
@@ -416,7 +410,7 @@ class NemotronDuplexModel(Model):
                     # the sliding window plus the speaker warm-up, rounded up
                     max_seq_len=eartts.sliding_window + 512,
                     num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.talker_kv_pages(PagedKVConfig.page_size),
+                    max_num_pages=self.talker_kv_pages(DEFAULT_PAGE_SIZE),
                 ),
             ),
             AttentionSpec(
@@ -551,8 +545,9 @@ class NemotronDuplexModel(Model):
         # the streaming encoder's frame (FastConformerStreamSubmodule.frame_samples)
         frame = stt.hop_length * stt.encoder.subsampling_factor
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
-            # the user's audio, one item per uploaded file or append, at most a
-            # session's samples: past them the talker KV and the decode loops run out
+            # the user's audio, which the data worker cuts on the encoder's frame
+            # (ClientAudio), at most a session's samples: past them the talker KV
+            # and the decode loops run out
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=self.max_session_samples,
@@ -657,22 +652,6 @@ class NemotronDuplexModel(Model):
             NANO_KV: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
             TALKER_KV: {"main": talker, "uncond": talker},
         }
-
-    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
-        # Each appended file is one stream item, in order; audio_in's max_items
-        # caps the call's samples as its audio grows. A piece of a stream can't
-        # be resampled or scaled alone without a seam at every append. The one
-        # client stream is audio_in, so a file's named stream changes nothing.
-        if chunk.text:
-            raise ValueError("this model takes audio appends only; got text")
-        for key, items in chunk.tensors.items():
-            if items and key != "audio_inputs":
-                raise ValueError(f"this model takes audio appends only; got {key.removesuffix('_inputs')}")
-        rate = self.config.stt.sample_rate
-        for meta in chunk.input_metadata.get("audio_inputs") or []:
-            if meta.get("source_sample_rate", rate) != rate:
-                raise ValueError(f"appends must be {rate} Hz audio; got {meta['source_sample_rate']} Hz")
-        return {AUDIO_IN: [self._checked_audio(w).clamp(-1.0, 1.0) for w in chunk.tensors.get("audio_inputs") or []]}
 
     @staticmethod
     def _checked_audio(wav: torch.Tensor) -> torch.Tensor:

@@ -346,7 +346,8 @@ def _dit_schedule(log_text: str, request_ids: set[str]) -> list[tuple[str, ...]]
             continue
         if not isinstance(batch, (list, tuple)):
             continue
-        filtered = tuple(rid for rid in batch if rid in request_ids)
+        base_ids = tuple(str(rid).split("#", 1)[0] for rid in batch)
+        filtered = tuple(rid for rid in base_ids if rid in request_ids)
         if filtered:
             scheduled.append(filtered)
     return scheduled
@@ -387,7 +388,11 @@ _CLEANUP_MARKER = "Request cleanup complete:"
 
 
 def _cleaned_request_ids(log_text: str) -> set[str]:
-    return {line.split(_CLEANUP_MARKER, 1)[1].strip() for line in log_text.splitlines() if _CLEANUP_MARKER in line}
+    # The server logs the internal id, the client's id plus a "#<n>" suffix.
+    return {
+        line.split(_CLEANUP_MARKER, 1)[1].strip().split("#", 1)[0]
+        for line in log_text.splitlines() if _CLEANUP_MARKER in line
+    }
 
 
 def _read_log_since(log_path: Path, offset: int) -> str:

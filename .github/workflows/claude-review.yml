@@ -3,12 +3,11 @@ name: Claude Review
 # Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
 # the reviewer's operating instructions are in .github/review/review-prompt.md.
 #
-# Why pull_request_target: a plain `pull_request` trigger withholds secrets from
-# fork PRs, so the reviewer could never review a fork's code. pull_request_target
-# runs with secrets, and uses
-# the workflow file from the PR's *base branch*, never the PR's version. For a PR
-# into main that is main's; for a stacked PR it is the base branch's copy, which
-# may be old or missing (then use /review, which always runs main's).
+# Why issue_comment: a plain `pull_request` trigger withholds secrets from fork
+# PRs, so the reviewer could never review a fork's code. issue_comment runs with
+# secrets, and always uses the default branch's copy of this workflow file, never
+# the PR's version, whatever the PR's base. The comment body is only matched by
+# the `if` below, never passed to a shell.
 #
 # The safety rules that come with that, and that must hold for any edit here:
 #
@@ -29,33 +28,25 @@ name: Claude Review
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 
-# When it runs, and who can cause it:
-#   - light, once, when a contributor's non-draft PR is opened, reopened or
-#     readied. "Contributor" is the PR author's author_association: OWNER,
-#     MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the team plus anyone who has had
-#     a PR merged here, from a fork or not. First-time contributors and
-#     strangers get no automatic review (cost, spam).
-#   - light, when someone with write access comments `/review` on a PR
-#     (re-review after pushes), or when a contributor comments `/review` on
-#     their own PR, unless it has the `skip-ai-review` label;
-#   - thorough, when someone with write access comments `/review thorough` or
-#     applies the `ai-review-thorough` label.
+# When it runs, and who can cause it. Only on request; opening or pushing to
+# a PR never starts a review.
+#   - light, when someone with write access comments `/review` on a PR, or
+#     when a contributor comments `/review` on their own PR, unless it has the
+#     `skip-ai-review` label. "Contributor" is the commenter's
+#     author_association: OWNER, MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the
+#     team plus anyone who has had a PR merged here, from a fork or not;
+#   - thorough, when someone with write access comments `/review thorough`.
 # Write access (write, maintain or admin) is checked against the user's actual
 # permission in the preflight; author_association can't tell write from read.
 # The PR can be from anyone, so a maintainer can /review a first-timer's PR.
-# Pushes don't trigger a review on their own; comment /review for that.
 #
 # The action refuses to run for an actor without write access unless that
 # actor is listed in allowed_non_write_users. Most contributors' PRs come from
 # forks without write access, so the preflight lists exactly one login there,
 # and only when the actor is the PR's author, is a contributor, and the run is
-# the automatic review or their own light `/review`. Never '*'. Such a run
-# reads the same untrusted PR content as a maintainer's /review of that PR,
-# with the same tools and token; only who can start it changes.
-#
-# issue_comment also runs with secrets and the default branch's workflow file,
-# so the same rules hold. The comment body is only matched by the `if` below,
-# never passed to a shell.
+# their own light `/review`. Never '*'. Such a run reads the same untrusted PR
+# content as a maintainer's /review of that PR, with the same tools and token;
+# only who can start it changes.
 #
 # Failures never turn the PR's check red: every step after the preflight is
 # continue-on-error and gated on the one before it, and if the review didn't
@@ -73,16 +64,13 @@ name: Claude Review
 # `/review continue` starts a fresh session from that handoff with a fresh turn
 # budget, rather than resuming the old session, which would replay the whole
 # transcript, usually after its prompt cache has expired. Only artifacts made
-# by this workflow on issue_comment or pull_request_target are trusted, since a
-# fork's own `pull_request` workflow can upload an artifact with any name.
+# by this workflow on issue_comment are trusted, since a fork's own
+# `pull_request` workflow can upload an artifact with any name.
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
 # in the job summary and a review-usage-* artifact, never on the PR.
 
 on:
-  pull_request_target:
-    # `labeled` is for on-demand thorough reviews; other labels are filtered out below.
-    types: [opened, reopened, ready_for_review, labeled]
   issue_comment:
     types: [created]
 
@@ -96,16 +84,8 @@ jobs:
     # rather than a silently skipped job. It also means a fork that *does* set
     # the key gets reviews, which is how you test changes to this workflow.
     #
-    # For /review and the label this only filters cheaply; the preflight's
-    # permission check decides.
+    # This only filters cheaply; the preflight's permission check decides.
     if: >-
-      (github.event_name == 'pull_request_target' &&
-       !github.event.pull_request.draft &&
-       !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
-       ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
-        (github.event.action != 'labeled' &&
-         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
-      ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        (((github.event.comment.body == '/review' || github.event.comment.body == '/review thorough' ||
@@ -118,7 +98,7 @@ jobs:
     # Job-level, so an unrelated PR comment (which still starts a workflow run
     # that this `if` skips) can never cancel a review in progress.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: claude-review-${{ github.event.issue.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 50
@@ -130,7 +110,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+      PR: ${{ github.event.issue.number }}
       # Credential-shaped strings, removed (sed -E "$REDACT") from everything
       # the workflow posts or saves.
       REDACT: |
@@ -142,8 +122,8 @@ jobs:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
-      # be the PR's author, a contributor, on the automatic review or a light
-      # `/review` (see the header). Anyone else exits green with a notice.
+      # be the PR's author, a contributor, on a light `/review` (see the
+      # header). Anyone else exits green with a notice.
       # non_write_user is set only for that author, and only when they lack
       # write access, so a maintainer's run is unchanged.
       - name: Preflight
@@ -151,15 +131,13 @@ jobs:
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
           ACTOR: ${{ github.actor }}
-          AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
-          # The PR author's association on the automatic run; the commenter's on
-          # /review, where SELF_SERVE also requires commenter == author.
-          ASSOC: ${{ github.event.comment.author_association || github.event.pull_request.author_association }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          # The commenter's association; SELF_SERVE also requires commenter == author.
+          ASSOC: ${{ github.event.comment.author_association }}
           SELF_SERVE: >-
-            ${{ (github.event_name == 'pull_request_target' && github.event.action != 'labeled') ||
-                (github.event_name == 'issue_comment' &&
-                 (github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
-                 !contains(github.event.issue.labels.*.name, 'skip-ai-review')) }}
+            ${{ github.event_name == 'issue_comment' &&
+                (github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
+                !contains(github.event.issue.labels.*.name, 'skip-ai-review') }}
         run: |
           if [ "$KEY_SET" != "true" ]; then
             echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
@@ -206,22 +184,21 @@ jobs:
       # Tell the commenter their /review was picked up; a comment-triggered run
       # is otherwise invisible from the PR.
       - name: Acknowledge the /review comment
-        if: steps.pre.outputs.run == 'true' && github.event_name == 'issue_comment'
+        if: steps.pre.outputs.run == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           COMMENT_ID: ${{ github.event.comment.id }}
         run: gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null
 
-      # The PR's refs and title, the same way for both triggers (an
-      # issue_comment event doesn't carry the PR's head or base). The title is
-      # untrusted; it only ever reaches the prompt.
+      # The PR's refs and title (an issue_comment event doesn't carry the PR's
+      # head or base). The title is untrusted; it only ever reaches the prompt.
       - name: Resolve the PR
         if: steps.pre.outputs.run == 'true'
         id: pr
         continue-on-error: true
         env:
-          THOROUGH: ${{ (github.event.action == 'labeled' || github.event.comment.body == '/review thorough') && 'true' || 'false' }}
+          THOROUGH: ${{ github.event.comment.body == '/review thorough' && 'true' || 'false' }}
           CONTINUE: ${{ github.event.comment.body == '/review continue' && 'true' || 'false' }}
         run: |
           gh api "repos/$REPO/pulls/$PR" > pr.json
@@ -275,7 +252,7 @@ jobs:
               [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
             read -r path event < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.path) \(.event)"') || continue
             case "$path:$event" in
-              .github/workflows/claude-review.yml*:issue_comment|.github/workflows/claude-review.yml*:pull_request_target)
+              .github/workflows/claude-review.yml*:issue_comment)
                 found=$run_id; break ;;
             esac
           done
@@ -301,10 +278,8 @@ jobs:
             echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
           } >> "$GITHUB_OUTPUT"
 
-      # Trusted: main's tip, pinned by name. Without a `ref`, pull_request_target
-      # would check out the PR's base branch, which for a stacked PR is another
-      # feature branch, and the PR's base.sha is where main was when the PR was
-      # opened. Either way the PR would be judged by stale rules.
+      # Trusted: main's tip, pinned by name, never the PR's base branch or
+      # base.sha, which for a stacked or old PR would be stale rules.
       # AGENTS.md and the review prompt come from here.
       - name: Check out main
         if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
@@ -327,11 +302,6 @@ jobs:
           ref: ${{ steps.pr.outputs.head_sha }}
           path: pr-head
           persist-credentials: false
-          # actions/checkout refuses a fork's code under pull_request_target
-          # unless told otherwise (a July 2026 change, backported to v4). Safe
-          # here because of rule 1 above: pr-head/ is only read, never built or
-          # executed, and holds no credentials.
-          allow-unsafe-pr-checkout: true
 
       # The body and all comments are untrusted; the prompt says so.
       - name: Collect the diff, description and existing comments
@@ -434,25 +404,22 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          EVENT: ${{ github.event_name }}
         run: |
           f="$RUNNER_TEMP/claude-execution-output.json"
           if [ ! -s "$f" ]; then
             echo "why=it stopped before Claude Code returned (a timeout or a setup error)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Out of API credit: an automatic review skips with a warning in the
-          # log, rather than leave a "didn't complete" comment on every PR until
-          # it's topped up. A /review someone asked for gets a one-line answer.
+          # Out of API credit: a one-line answer instead of a "didn't complete"
+          # comment, since there's nothing to retry or continue until it's
+          # topped up.
           if jq -e 'any(.[]; .type == "assistant" and (.error == "billing_error" or
                 ([.message.content[]? | select(.type == "text") | .text] | join("") | startswith("Credit balance is too low"))))' \
               "$f" > /dev/null; then
             echo "::warning::The Anthropic API account is out of credit; skipping the review."
             echo "billing=true" >> "$GITHUB_OUTPUT"
-            if [ "$EVENT" = "issue_comment" ]; then
-              gh pr comment "$PR" --repo "$REPO" \
-                --body "The review didn't run: the API account for the review bot is out of credit." > /dev/null
-            fi
+            gh pr comment "$PR" --repo "$REPO" \
+              --body "The review didn't run: the API account for the review bot is out of credit." > /dev/null
             exit 0
           fi
           res=$(jq -c '[.[] | select(.type == "result")] | last // {}' "$f")

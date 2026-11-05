@@ -123,22 +123,25 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
    with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
        ws.send(msgpack.packb({
-           "text": "pick up the mug",
-           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "text": prompt,  # task + view, duration and resolution text
+           "files": [{"name": "obs.png", "data": open("obs.png", "rb").read()}],  # 736x544 composite
            "output_modalities": ["action"],
-           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "model_kwargs": {"size": "736x544",
+                            "robot_state": joints + [gripper]},  # current state, as DROID records it
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
            reply = msgpack.unpackb(ws.recv(), raw=False)
            if reply.get("modality") == "action":
-               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)[:, :8]
            if reply.get("finish") or reply.get("error"):
                break
 
-``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
-loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+The chunk (32 rows), the fps and the domain come from the checkpoint, and the reply holds
+the predicted rows after the state, in the robot's values. ``examples/cosmos3_action_ws_client.py``
+is a complete openpi-style client that builds the observation image and prompt the way
+NVIDIA's RoboLab server does for the DROID policies, runs this loop at a fixed observation
+rate and reports chunks/s, actions/s and latency percentiles.
 
 **Live input.** A model that listens while it runs (a full-duplex speech model, or a TTS
 model fed text as it is written) can keep a request's input open after the opening
@@ -155,8 +158,8 @@ Every field of the record is optional, but an append needs text, files, ``model_
 ``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
 name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
-reach only the model's ``process_stream_chunk``, so they mean what that model reads from
-them, and the opening message's still hold for the request (its sampling settings, say).
+reach only the model's ``process_stream_chunk`` (a model whose streams all declare their
+audio has none and ignores them), so they mean what that model reads from them, and the opening message's still hold for the request (its sampling settings, say).
 ``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
 in an append is its own. An append of text alone, or of ``model_kwargs`` alone (a game
 controller's actions, say) that ends no stream, that the model turns into no stream item is
@@ -195,13 +198,11 @@ is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than 
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
-or ``/v1/realtime``. ``/v1/realtime`` cuts audio into the model's frames for you; over
-``/generate/ws`` the append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
-CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
-audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
-multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
-the call off the graph for the rest of its life. Other sizes are served the same, more
-slowly (see :doc:`models`).
+or ``/v1/realtime``. On either route, a model that declares its audio frame (Nemotron
+VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
+whole frame of an append goes on as a step of its own and the rest waits for the next
+append, or goes with the stream's end, so appends of any size keep the call on the steps
+Nemotron runs as one CUDA graph (see :doc:`models`).
 
 .. code-block:: python
 
@@ -348,11 +349,11 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (24 kHz, as
-       OpenAI reads it; this endpoint read it as 16 kHz before), ``"g711_ulaw"``,
-       ``"g711_alaw"`` or a GA format object such as ``{"type": "audio/pcm", "rate":
-       16000}`` at the rates a conversation takes (below). A session that names no
-       format sends PCM16 at 16 kHz (not OpenAI's 24 kHz). Audio is resampled to 16 kHz. Turn
+       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (PCM16 at 16 kHz,
+       the default; OpenAI reads it as 24 kHz, so an OpenAI client at 24 kHz declares
+       ``{"type": "audio/pcm", "rate": 24000}``), ``"g711_ulaw"``, ``"g711_alaw"`` or
+       a GA format object at the rates a conversation takes (below). Audio is
+       resampled to 16 kHz. Turn
        detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
@@ -386,11 +387,17 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
-  ``/v1/images/edits`` for image output.
+  ``/v1/images/edits`` for image output, with ``output_format`` and ``output_compression``
+  as for FLUX.2 klein below.
 - **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
   klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
   ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
-  WebP quality) and ``png_compress_level`` (0-9, default 1) via ``extra_body``.
+  WebP quality, 0-100) and ``png_compress_level`` (0-9, default 1) via ``extra_body``; a
+  value of the chosen format's knob that is not a whole number in range (``90``, ``90.0``
+  and ``"90"`` are; ``true`` and ``50.9`` are not) is a 400, the other format's knob is
+  ignored, and ``null`` means the default. The PNG writer favours
+  speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL's
+  defaults; a higher ``png_compress_level`` shrinks them.
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
@@ -448,20 +455,28 @@ Per-model notes:
   takes only 24 kHz), ``{"type": "audio/pcmu"}`` or ``{"type": "audio/pcma"}`` (G.711,
   8 kHz). Input is resampled to the model's rate and sent on in its frames (80 ms for
   Nemotron); a partial frame waits for the next append, and one append (or one item's
-  parts together) holds at most 300 s. Keep streaming, silence included: the model hears
-  and answers frame by frame, and a client that stops sending stops the agent too. Each reply
+  parts together) holds at most 300 s. The model hears and answers frame by frame, so the
+  server keeps time: once a client's audio falls more than 200 ms (an allowance for
+  network jitter) and a frame behind real time (a muted mic, a client waiting for the
+  reply), whole frames of silence are appended for it, at most 30 s a pause and
+  counted against the call's length cap, so a client that stops sending past that stops
+  the agent. A client that stops sending hears the reply up to that 200 ms later; one
+  that streams its mic, silence included, doesn't. Each reply
   is one response, ``response.created`` through ``response.done``, with
   ``response.output_audio.delta`` and ``response.output_audio_transcript.delta`` in
   between; audio between replies is silence and is not sent. ``turn_detection``
   ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
   not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
-  ``input_audio_buffer.commit`` is acknowledged and flushes nothing, ``clear`` drops a
-  partial frame, and ``conversation.item.create`` takes a user message of ``input_audio``
+  ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only
+  what the server holds before the model (half a PCM16 sample, the resampler's few
+  milliseconds), since the model hears audio as it comes; and ``conversation.item.create`` takes a user message of ``input_audio``
   parts, all of them or none. ``response.create``, ``response.cancel``,
   ``output_audio_buffer.clear`` and the item-editing events are answered with an
   ``unsupported`` error, and the call goes on. Input transcription and tools are not
   supported, nor are ``max_output_tokens`` and ``audio.output.speed`` other than their
-  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). One response is in
+  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). A ``session.update``
+  asking for one of these gets an ``unsupported`` error for it, keeps the served value,
+  and applies the rest, as ``session.updated`` shows. One response is in
   progress at a time: a reply that starts while the previous one is still speaking is
   its own response, sent once that one is done. If the call ends (its length cap, say),
   the server sends an ``error``, ends a reply still in progress with ``response.done``

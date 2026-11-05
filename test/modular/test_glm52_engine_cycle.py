@@ -35,6 +35,7 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from request_walks import run_walks  # noqa: E402
 
+from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
@@ -50,7 +51,7 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 
@@ -102,8 +103,15 @@ class _Driver:
         kw = self.sub.preprocess(walk, engine_inputs, inputs)
         outs = per_request_outputs(self.sub.forward_batched(walk, engine_inputs, **kw), rids)
         self.runner.commit(step)
-        for rid, (info, _) in batch.items():
-            self.sub.postprocess(rid, info, outs[rid])
+        failures = {}
+        executing = SimpleNamespace(
+            node_name="llm", request_ids=rids, inputs=inputs,
+            per_request_info_wrapped={rid: info for rid, (info, _) in batch.items()},
+            failed_requests=failures, register_failure=failures.__setitem__, step_context=ctx,
+        )
+        engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=self.sub, piecewise_runners={})})
+        Engine._postprocess_batch(engine, executing, BatchedModelOutput(per_rid_outputs=outs))
+        assert not failures, failures
         return outs
 
 
@@ -185,6 +193,8 @@ def test_batch_of_two_matches_single_streams(mla_absorb):
         texts[rid] = out["text_inputs"][0]
     live = set(prompts)
     steps = dict.fromkeys(prompts, 0)
+    # the request's decode cap, which ends a row the stop check lets run on
+    cap = Glm52Model(model_path_hf="", tokenizer_mode="byte").get_loop_caps(max_output_tokens=14)["decode_loop"]
     for _ in range(20):
         if not live:
             break
@@ -194,7 +204,7 @@ def test_batch_of_two_matches_single_streams(mla_absorb):
             texts[rid] = outs[rid]["text_inputs"][0]
             infos[rid].dynamic_loop_iter_counts["decode_loop"] = steps[rid]
             steps[rid] += 1
-            if sub.check_stop(rid, infos[rid], outs[rid]):
+            if sub.check_stop(rid, infos[rid], outs[rid]) or steps[rid] == cap:
                 live.discard(rid)
     for rid in prompts:
         got = torch.cat(emitted[rid])
@@ -286,7 +296,7 @@ def _errors(caplog) -> list[str]:
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
 def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
-    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    # the prefill walk has no decode_loop to stop: its stop ends the partition
     cfg = _cfg(True)
     eos = cfg.eos_token_ids[0]
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
