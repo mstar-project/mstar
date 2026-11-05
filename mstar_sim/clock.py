@@ -133,13 +133,12 @@ def charge(seconds: float, launched: float | None = None) -> float:
     work goes on the tape instead."""
     if FAST:
         return time.perf_counter()
-    seconds *= TIME_SCALE
     tape = capturing()
-    if tape is not None:
+    if tape is not None:  # unscaled: its replay is charged here
         tape.nodes.append((seconds, None))
         return time.perf_counter()
     with _LOCK:
-        return current_timeline().launch(seconds, launched)
+        return current_timeline().launch(seconds * TIME_SCALE, launched)
 
 
 # --------------------------------------------------------------------- capture

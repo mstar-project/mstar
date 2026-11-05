@@ -294,6 +294,13 @@ def test_device_time_follows_the_cost_model_not_the_host(gpu):
         torch.cuda.synchronize()
         start.record(); small.item(); end.record(); end.synchronize()
         assert start.elapsed_time(end) / 1000 > 1000 * cost.copy_seconds(4, "d2h"), start.elapsed_time(end)
+        # a captured copy is scaled once, at its replay
+        host, graph = torch.ones(4), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            host.to("cuda", non_blocking=True)
+        start.record(); graph.replay(); end.record(); end.synchronize()
+        once = 1000 * (cost.copy_seconds(16, "h2d") + cost.graph_node_seconds() + cost.graph_launch_seconds())
+        assert start.elapsed_time(end) / 1000 < 2 * once, (start.elapsed_time(end), once)
     """, gpu, MSTAR_SIM_TIME_SCALE="1000")
     flops = 20 * 2 * 4096**3
     # the device time is the roofline estimate's order of magnitude for this card
