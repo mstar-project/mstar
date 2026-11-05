@@ -462,8 +462,8 @@ class StepRunner:
     def newer_than(self, rid: str) -> list[str] | None:
         return self._admission.newer_than(rid)
 
-    def oldest_refusal(self) -> Refusal | None:
-        return self._admission.oldest_refusal()
+    def refusals(self) -> list[Refusal]:
+        return self._admission.refusals()
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],

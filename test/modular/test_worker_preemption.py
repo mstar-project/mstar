@@ -82,7 +82,7 @@ def _worker(kv):
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid, queued: _runner(kv).readmit(rid, node, queued),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
-        oldest_refusal=lambda: _runner(kv).oldest_refusal(),
+        refusals=lambda: _runner(kv).refusals(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
         admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),

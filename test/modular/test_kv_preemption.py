@@ -310,9 +310,14 @@ def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
 
 
 def _make_room(kv, droppable) -> Victims | None:
-    """`KVManager.make_room` for the oldest waiting request the pool refused, as the worker calls it."""
-    refusal = _runner(kv).oldest_refusal()
-    return kv.make_room(refusal.mark, _runner(kv).newer_than(refusal.rid), droppable)
+    """`KVManager.make_room` for the oldest waiting request the pool refused that moves can let in, as the worker
+    calls it."""
+    runner = _runner(kv)
+    for refusal in runner.refusals():
+        victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), droppable)
+        if victims is not None:
+            return victims
+    return None
 
 
 def test_an_older_waiting_request_moves_a_newer_one_that_waits_holding_pages():

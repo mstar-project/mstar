@@ -3190,9 +3190,9 @@ class Engine:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
 
-    def oldest_refusal(self) -> "Refusal | None":
-        """The oldest waiting request that didn't fit; see `Admission.oldest_refusal`."""
-        return self._runner.oldest_refusal()
+    def refusals(self) -> "list[Refusal]":
+        """The waiting requests that didn't fit, oldest first; see `Admission.refusals`."""
+        return self._runner.refusals()
 
     def readmit_request(self, node_name: str, request_id: int, queued: bool) -> None:
         """Ask the node's resources again for the request, which then waits until they fit it, in its queues

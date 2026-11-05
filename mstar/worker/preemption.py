@@ -83,19 +83,22 @@ class Preemption:
         return True
 
     def make_room(self) -> None:
-        """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused, as
-        `KVManager.make_room` chooses them. No step of theirs runs short to move them, since none of them runs."""
+        """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused
+        that such moves can let in, as `KVManager.make_room` chooses them. No step of theirs runs short to move
+        them, since none of them runs. An older request stuck on something no move frees, another resource or a
+        pool that doesn't move, holds up no younger one."""
         if not self._caches:
             return
         engine = self._engine_manager.engine
-        refusal = engine.oldest_refusal()
-        kv = None if refusal is None else self._caches.get(refusal.key)
-        if kv is None or not self._moves(kv, refusal.mark.node_name):
-            return
-        newer = engine.newer_than(refusal.rid)
-        victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
-        if victims is not None:
-            self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+        for refusal in engine.refusals():
+            kv = self._caches.get(refusal.key)
+            if kv is None or not self._moves(kv, refusal.mark.node_name):
+                continue
+            newer = engine.newer_than(refusal.rid)
+            victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
+            if victims is not None:
+                self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
+                return
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""

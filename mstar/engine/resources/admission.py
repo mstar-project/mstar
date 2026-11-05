@@ -141,11 +141,11 @@ class Admission:
         elif rid not in self._waiting:
             self._returns.pop(rid, None)
 
-    def oldest_refusal(self) -> Refusal | None:
-        """The oldest waiting request that has been tried and didn't fit, or None."""
+    def refusals(self) -> list[Refusal]:
+        """The waiting requests that have been tried and didn't fit, oldest first."""
         refused = [Refusal(rid, *held) for rid, held in self._returns.items() if held is not None]
         refused += [Refusal(self._queues[key][0], key, mark) for key, mark in self._short.items()]
-        return min(refused, key=lambda refusal: self._arrival[refusal.rid], default=None)
+        return sorted(refused, key=lambda refusal: self._arrival[refusal.rid])
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
