@@ -1012,8 +1012,8 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 try:
                     receive(theirs)
                     raise SystemExit("a receive from any source was accepted")
-                except ValueError as e:
-                    assert "does not support recvAnysource" in str(e)
+                except NotImplementedError as e:
+                    assert "does not support recvAnysource" in str(e) and e._mstar_sim_gpu
             # tags pair apart from the order they're posted in, even when only one payload moves
             a, b = torch.zeros(4, device="cuda"), torch.zeros(4, device="cuda")
             if r == 0:

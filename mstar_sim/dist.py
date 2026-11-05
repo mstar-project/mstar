@@ -329,7 +329,8 @@ def _collective(name: str, family: str, primitive: str | None):
         if dist.distributed_c10d._rank_not_in_group(group):
             return real(*args, **kwargs)  # nothing runs on this rank: torch's own answer
         if name in ("recv", "irecv") and a["src"] is None and a["group_src"] is None:
-            raise ValueError("ProcessGroupNCCL does not support recvAnysource")  # gloo's would serve it
+            # gloo, under the stand-in, would serve it
+            raise device.gpu_error(NotImplementedError("ProcessGroupNCCL does not support recvAnysource"))
         nbytes = max(t.numel() * t.element_size() for t in tensors)
         outputs = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
         root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
