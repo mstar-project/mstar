@@ -15,7 +15,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -25,19 +25,8 @@ from mstar.engine.resources.kv.plan import SINK_PAGE, HostLens, PagedIndptrs, fi
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
-
-class PagedKernel(Protocol):
-    """A backend's paged attention kernel, as placed attention plans and runs it
-    (``AttentionManager._context_wrapper``): over this rank's slots of the pool, or over pages of
-    one slot (``OneSlotPages``). FlashInfer's paged wrappers in ``attn/wrappers.py`` and MLA's
-    ``FlashInferMLAWrapper`` are ones."""
-
-    def plan(self, *, causal: bool, dtype: torch.dtype, **paged_indptrs) -> None:
-        """Plans the rows ``paged_indptrs`` lay out (``PagedIndptrs.to_kwargs_dict``)."""
-
-    def run(self, *queries_then_kv: torch.Tensor, return_lse: bool = False):
-        """The planned attention for the query parts (each ``[N, H, *]``), then the paged layer the
-        keys are read from: ``(out, lse)`` with ``return_lse``, lse natural-log fp32 ``[N, H]``."""
+if TYPE_CHECKING:
+    from mstar.engine.resources.attn.wrappers import PagedKernel
 
 
 @dataclass(frozen=True)
@@ -211,7 +200,7 @@ class ContextParallelWrapper(ABC):
             # also on a raise: copies already issued still read the pinned buffer
             if self._pinned_done is not None:
                 self._pinned_done.record()
-        self._qo_indptr_buf = getattr(self.context, "_qo_indptr_buf", None)
+        self._qo_indptr_buf = self.context._qo_indptr_buf
         valid = np.repeat(valid_rows, np.diff(context.qo_indptr.numpy()))
         n = len(valid)
         if self._captured:
@@ -469,7 +458,7 @@ class OneSlotPages(OwnTokensKernel):
     one call with no copy of the keys. Captured for ``(rows, queries)``, it pads each plan as the
     paged planner's fixed buffers read it (``padded``)."""
 
-    def __init__(self, kernel: PagedKernel, dtype: torch.dtype, captured: tuple[int, int] | None = None):
+    def __init__(self, kernel: "PagedKernel", dtype: torch.dtype, captured: tuple[int, int] | None = None):
         self.kernel, self._dtype, self._captured = kernel, dtype, captured
 
     @staticmethod

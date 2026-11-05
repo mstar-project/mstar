@@ -32,6 +32,7 @@ from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
+from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
@@ -664,7 +665,7 @@ def test_zigzag_rows_split_a_steps_tokens_over_the_ranks_with_equal_causal_work(
             assert len(work) == 1, work
 
 
-class _OneSlotPrefill:
+class _OneSlotPrefill(PagedKernel):
     """A paged prefill as ``OneSlotPages`` plans it, as torch math over its pages of one token."""
 
     def plan(self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_lens, causal, dtype):
@@ -811,7 +812,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
-    context = types.SimpleNamespace(plan=lambda **kwargs: None)
+    context = types.SimpleNamespace(plan=lambda **kwargs: None, _qo_indptr_buf=None)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, placement = _cp_attention(joint, CPU, torch.float32)
@@ -844,7 +845,7 @@ def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeyp
     monkeypatch.setattr(fi.BatchPrefillWithRaggedKVCacheWrapper, "plan", counted)
     monkeypatch.setitem(sys.modules, "flashinfer", fi)
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
-    context = types.SimpleNamespace(plan=lambda **kwargs: None)
+    context = types.SimpleNamespace(plan=lambda **kwargs: None, _qo_indptr_buf=None)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, _ = _cp_attention(joint, CPU, torch.float32)

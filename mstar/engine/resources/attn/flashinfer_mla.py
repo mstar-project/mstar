@@ -25,6 +25,7 @@ from mstar.engine.resources.attn.base import (
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import ContextParallel, one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
@@ -94,7 +95,7 @@ def _flashinfer_at_least(version: str) -> bool:
     return Version(flashinfer.__version__) >= Version(version)
 
 
-class FlashInferMLAWrapper:
+class FlashInferMLAWrapper(PagedKernel):
     """Thin wrapper over ``flashinfer.mla.BatchMLAPagedAttentionWrapper``.
 
     Args:

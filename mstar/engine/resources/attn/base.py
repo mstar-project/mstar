@@ -22,7 +22,8 @@ from mstar.engine.resources.kv.keys import fingerprint
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper, PagedKernel
+    from mstar.engine.resources.attn.wrappers import PagedKernel
+    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {

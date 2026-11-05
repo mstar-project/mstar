@@ -17,6 +17,7 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 import functools
 import logging
 import math
+from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
@@ -130,7 +131,31 @@ def _decode_direct_variant(w) -> str | None:
     return None
 
 
-class FlashInferPrefillWrapper:
+class PagedKernel(ABC):
+    """A paged attention kernel as attention over a context-parallel pool plans and runs it
+    (``AttentionManager.paged_kernel``): over this rank's slots of the pool, or over pages of one
+    slot (``context_parallel.OneSlotPages``)."""
+
+    # the plan's query layout on the device, where a kernel keeps one (``select_last_hidden``)
+    _qo_indptr_buf: torch.Tensor | None = None
+
+    @abstractmethod
+    def plan(
+        self, *, paged_kv_indptr: torch.Tensor, paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor, dtype: torch.dtype, **indptrs,
+    ) -> None:
+        """Plans the rows a ``PagedIndptrs`` lays out (``to_kwargs_dict``: ``qo_indptr`` and
+        ``kv_lens`` too, which a decode kernel, one query a row, takes and ignores) and
+        ``causal``."""
+
+    @abstractmethod
+    def run(self, *parts: torch.Tensor, return_lse: bool = False):
+        """The planned attention: ``parts`` are the query parts (each ``[N, H, *]``: ``q``, or
+        MLA's ``q_nope`` and ``q_pe``), then the paged layer the keys are read from. Returns
+        ``out``, and with ``return_lse`` also the natural-log lse ``[N, H]`` fp32."""
+
+
+class FlashInferPrefillWrapper(PagedKernel):
     """Batched prefill attention with paged KV cache.
 
     Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with optional
@@ -446,7 +471,7 @@ class FlashInferPrefillWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True, lse_base="ln")
 
 
-class FlashInferDecodeWrapper:
+class FlashInferDecodeWrapper(PagedKernel):
     """Batched decode attention with paged KV cache.
 
     Optimized for the common decode case where each request appends
