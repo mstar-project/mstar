@@ -157,6 +157,21 @@ class StreamBuffer:
         self._id_to_tensor[tensor_id] = item
         self.maybe_ready = True
 
+    def put_positions(self, positions: list[int], walk: str | None = None) -> None:
+        """Items that stay on the device, in its producer's ring
+        (``step_repeats: stream_queue``): the buffer holds their positions,
+        and a chunk is read from the ring when it is popped."""
+        self._update_buffer()
+        self._buffer.extend(positions)
+        self._num_tensors_registered += len(positions)
+        self._num_buffer_writes += len(positions)
+        if self.walk_tagged and positions:
+            if self._walk_runs and self._walk_runs[-1][0] == walk:
+                self._walk_runs[-1][1] += len(positions)
+            else:
+                self._walk_runs.append([walk, len(positions)])
+        self.maybe_ready = True
+
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
             entry, walk = self._tensor_ids_in_order[0]

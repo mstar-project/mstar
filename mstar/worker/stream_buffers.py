@@ -87,6 +87,9 @@ class StreamBufferManager:
         # stream into it, one an iteration of a step that repeats (a stream
         # window); a node not here takes a chunk a step
         self.windows: dict[str, int] = {}
+        # edge -> the loop-back rows whose ring holds its items on the device
+        # (``step_repeats: stream_queue``); its chunks are read from there
+        self.rings: dict[str, object] = {}
 
     def pieces(self, walk: str | None, edge_name: str) -> bool:
         """Whether what one producer step of ``walk`` sends on ``edge_name``
@@ -215,6 +218,9 @@ class StreamBufferManager:
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
         chunk = sbuf.pop_window(window) if window > 1 else sbuf.pop_chunk()
+        ring = self.rings.get(edge_name)
+        if ring is not None:
+            return self._ring_edge(ring, edge_name, consumer_node, request_id, chunk)
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
@@ -228,6 +234,28 @@ class StreamBufferManager:
             # the increment, so an item in both stays alive
             tm.dereference_batch_uniform(list(chunk.released))
         return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+
+    def _ring_edge(self, ring, edge_name: str, consumer_node: str, request_id: int, chunk) -> StreamingEdge:
+        """A chunk of positions in the producer's ring as one stored tensor,
+        the chunk's window gathered in one read; the positions it moved past
+        go back to the ring."""
+        positions = list(chunk.data.get("data") or [])
+        uuids = []
+        if positions:
+            window = ring.ring_read(edge_name, request_id, positions)
+            (info,) = self._tensor_manager.store_and_return_tensor_info(
+                request_id, {edge_name: [window]}, skip_cuda_sync=True,
+            )[edge_name]
+            uuids = [info.uuid]
+        if chunk.released:
+            ring.ring_release(edge_name, request_id, max(chunk.released) + 1)
+        return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+
+    def push_positions(self, request_id: int, edge_name: str, positions: list[int], walk: str | None) -> None:
+        """A step's items for ``edge_name`` that its producer wrote into its ring."""
+        req_info = self._request_state.per_request_info.get(request_id)
+        if req_info is not None:
+            req_info.stream_buffers[edge_name].put_positions(positions, walk)
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
         """Every request's ready chunks, popped. A buffer nothing has touched

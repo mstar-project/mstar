@@ -777,6 +777,7 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"ready_waits": True}}, "need max above 1"),
     ({"n": {"auto": True}}, "need max above 1"),
     ({"n": {"max": 2, "eos_odds": 1.5}}, "must be in"),
+    ({"n": {"max": 2, "stream_queue": {"depth": 0}}}, "must be {depth"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):

@@ -62,6 +62,9 @@ class RepeatConfig:
     # a run's last iteration gave a row this probability of a stop id or more:
     # the next run is no longer than the iterations that stop takes on average
     eos_odds: float | None = None
+    # the node's streamed items stay on the device for a consumer on its GPU, in
+    # a ring of its rows this many items deep (``{depth: 1024}``)
+    stream_queue: Mapping | None = None
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -90,6 +93,13 @@ class RepeatConfig:
             raise ValueError(
                 f"step_repeats for {node!r}: ready_waits is {config.ready_waits!r}; it must be true or at least 1"
             )
+        if config.stream_queue is not None:
+            depth = config.stream_queue.get("depth", 1024) if isinstance(config.stream_queue, Mapping) else None
+            if type(depth) is not int or depth < 1 or set(config.stream_queue) - {"depth"}:
+                raise ValueError(
+                    f"step_repeats for {node!r}: stream_queue is {config.stream_queue!r}; it must be {{depth: <int>}}"
+                )
+            config = replace(config, stream_queue={"depth": depth})
         if config.eos_odds is not None and not (type(config.eos_odds) in (int, float) and 0 < config.eos_odds < 1):
             raise ValueError(f"step_repeats for {node!r}: eos_odds is {config.eos_odds!r}; it must be in (0, 1)")
         for name in ("stream_tokens", "past_cap", "auto") + (

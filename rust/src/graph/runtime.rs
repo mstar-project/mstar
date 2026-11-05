@@ -2043,6 +2043,17 @@ impl GraphRuntime {
         Ok(())
     }
 
+    /// Counts `n` items of `signal` that a request's consumer on this worker
+    /// took from its producer's device ring rather than a route
+    /// (`step_repeats: stream_queue`), so the producer's done count includes them.
+    fn add_stream_items(&mut self, rid: u32, signal: &str, n: i64) {
+        let sig = self.interner.intern(signal);
+        let me = self.shard.me;
+        if let Some(Some(info)) = self.requests.get_mut(rid as usize) {
+            info.pending.add_stream_items(sig, me, n);
+        }
+    }
+
     /// `GraphRuntime.loop_room`: a repeated step never passes a row's cap, or
     /// with `past_cap` the last row's. A row that isn't here leaves no room.
     #[pyo3(signature = (node_name, graph_walk, loop_name, rids, stride, past_cap = false))]

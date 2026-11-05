@@ -701,6 +701,10 @@ class RustGraphRuntime(GraphRuntime):
             [sorted(p.eos_tokens) for p in policies.values()],
         )
 
+    def add_stream_items(self, rid: int, signal: str, n: int) -> None:
+        """``n`` items of ``signal`` a consumer here took from a device ring, not a route."""
+        self._rust.add_stream_items(rid, signal, n)
+
     def loop_room(
         self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int, past_cap: bool = False,
     ) -> int:

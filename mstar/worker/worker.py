@@ -46,7 +46,7 @@ from mstar.engine.resources.kv.transfer import (
 )
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB, STOP_ODDS
-from mstar.graph.base import GraphEdge, GraphSection
+from mstar.graph.base import EdgeKind, GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
@@ -508,6 +508,9 @@ class Worker:
     _auto_prev_end = None
     # the last phase-timed step's end event, for the gap before the next
     _phase_prev_end = None
+    # node -> its streamed signals whose items stay in a ring on the device
+    # (``_ask_rings``); empty while none do
+    _ring_signals: Mapping[str, frozenset[str]] = MappingProxyType({})
     # a TP follower's settled iterations by step seq, its own and the leader's
     # (``_settle_tp_repeats``); set at init
     _tp_repeats: "tuple[dict[int, int], dict[int, int]] | None" = None
@@ -3021,6 +3024,12 @@ class Worker:
         )
         if owes_run:
             repeats = min(repeats, self._step_repeats.owed_length(batch.node_name))
+        if self._ring_signals.get(batch.node_name):
+            # a ring caps a run as a loop's room does: its rows have room for this many
+            room = self.engine_manager.get_engine(batch.node_name).ring_room(
+                batch.node_name, speculation.continuing_rids,
+            )
+            repeats = max(1, min(repeats, room or 1))
         # a stream window: as many iterations as every row has items for, and
         # what a row took past the step's own count goes back after its admit
         windows = {
@@ -3131,6 +3140,109 @@ class Worker:
         self._streamed[(node_name, graph_walk)] = (policy, signal, edge.output_modality)
         engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
         return None
+
+    def _ask_rings(self) -> None:
+        """``step_repeats: stream_queue``: each streamed signal of an asking
+        node whose consumer is on this worker keeps its items in a ring of the
+        node's rows, which the consumer reads its chunks from."""
+        self._ring_refusals: dict[tuple[str, str], str | None] = {}
+        self._ring_signals: dict[str, frozenset[str]] = {}
+        engine = self.engine_manager.get_engine("")
+        for node in {node for node, _ in self._step_repeats.edges}:
+            queue = self._step_repeats.config(node).stream_queue
+            if queue is None:
+                continue
+            walks_of: dict[str, set[str]] = {}
+            for walk, section in self._walk_graphs.items():
+                for edge in getattr(section.get_nodes().get(node), "outputs", ()):
+                    if edge.is_streaming:
+                        walks_of.setdefault(edge.name, set()).add(walk)
+            ringed = set()
+            for signal, walks in sorted(walks_of.items()):
+                why = self._ring_refusal_for(signal, queue["depth"])
+                if why is None:
+                    rows = engine.ask_ring(node, signal, queue["depth"], walks)
+                    if isinstance(rows, str):
+                        why = rows
+                    else:
+                        self.streams.rings[signal] = rows
+                        ringed.add(signal)
+                for walk in walks:
+                    self._ring_refusals.setdefault((node, walk), why)
+            self._ring_signals[node] = frozenset(ringed)
+
+    def _ring_refusal_for(self, signal: str, depth: int) -> str | None:
+        """Why ``signal``'s items can't stay in a ring ``depth`` deep, or None."""
+        conn = next((c for c in self.streams.connections if c.edge_name == signal), None)
+        consumer = self.streams.consumer_node.get(signal)
+        if conn is None or consumer is None:
+            return "consumer: it is on another worker (that is `carrier: p2p`)"
+        if conn.join_dim is not None:
+            return "consumer: it joins a producer's pieces into one item"
+        if any(
+            node == consumer and self._step_repeats.limit(node) > 1
+            and any(kind is EdgeKind.PER_ITERATION for kind in edges.inputs.values())
+            for (node, _), edges in self._step_repeats.edges.items()
+        ):
+            return "consumer: it reads the stream an item an iteration"
+        policy, take = conn.chunk_policy_factory(), 0
+        for _ in range(64):
+            if not policy.is_ready(1 << 20):
+                break
+            take = max(take, policy.window_size())
+            policy.register_chunk(policy.next_chunk_size(1 << 20))
+        if take > depth:
+            return f"its chunk policy takes {take} items at once, more than the ring's depth of {depth}"
+        return None
+
+    def _ring_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why this walk's streamed items don't stay in a ring on the device, or None."""
+        if self._step_repeats.config(node_name).stream_queue is None:
+            return NOT_ASKED
+        return self._ring_refusals.get((node_name, graph_walk), "graph: the walk streams nothing")
+
+    def _with_ring_room(self, node_name: str, rids: list[int]) -> list[int]:
+        """``rids`` but those whose ring is full: such a row leaves the step,
+        and is ready again (``LoopbackRows.admit_retrieve``) once its consumer
+        frees room."""
+        engine = self.engine_manager.get_engine(node_name)
+        return [rid for rid in rids if engine.ring_room(node_name, [rid]) > 0]
+
+    def _queue_ring_items(
+        self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep, withheld,
+    ) -> None:
+        """STORE, for a ringed signal: each row's kept items are positions in
+        its ring, which its consumer's buffer takes, not tensors to store and
+        route; the runtime counts them toward the producer's done."""
+        signals = self._ring_signals.get(batch_N.node_name) if self._ring_signals else None
+        bases_of = batch_N.node_batch.ring_bases
+        if not signals or not bases_of:
+            return
+        width = batch_N.batch.repeats
+        withhold, withheld = withheld
+        for signal in signals:
+            bases = bases_of.get(signal)
+            if not bases:
+                continue
+            skipped = withheld if signal in withhold else ()
+            consumer = self._walk_driven_edges.get(signal)
+            for rid in step.wg_ids.keys:
+                rid_outputs = outputs.get(rid)
+                if not rid_outputs or signal not in rid_outputs or rid not in bases:
+                    continue
+                del rid_outputs[signal]
+                positions = [
+                    bases[rid] + i for i in range(step.kept.get(rid, width)) if (rid, i) not in skipped
+                ]
+                walk = None
+                if consumer:
+                    req_info = self.request_state.per_request_info[rid]
+                    walk = req_info.per_partition_info[batch_N.partition].current_fwd_info.stream_consumer_walks.get(
+                        consumer,
+                    )
+                self.streams.push_positions(rid, signal, positions, walk)
+                if positions:
+                    self._graph_runtime.add_stream_items(rid, signal, len(positions))
 
     def _odds_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs don't shorten on their rows' stop odds, or None."""
@@ -3405,6 +3517,8 @@ class Worker:
             self._is_tearing_down if self._teardowns_pending() else None,
             self.chunk_loops.speculated,
         )
+        if self._ring_signals.get(spec_node_name):
+            candidates = self._with_ring_room(spec_node_name, candidates)
         if spec_node_name != batch_N.node_name:
             partition = self.request_state.get_partition_for_node(spec_node_name)
             candidates = [
@@ -4235,6 +4349,11 @@ class Worker:
                     if rid_outputs:
                         for name in names:
                             rid_outputs.pop(name, None)
+                if self._ring_signals:
+                    self._queue_ring_items(
+                        batch_N, outputs, step,
+                        self._withheld_items(batch_N, host_rows, cpu_outputs) if self._withholding else ((), ()),
+                    )
                 self._cut_run_items(batch_N, outputs, step, host_rows, cpu_outputs, engine)
                 stored, route_tensors = self._store_outputs(
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
@@ -5559,13 +5678,14 @@ class Worker:
             self._step_repeats.kept_rows(knobs.resident_planning() == "on") if self._step_repeats is not None else {},
         )
         if self._step_repeats is not None:
+            self._ask_rings()
             # after capture: an attention decides repeats from the kernels it captured
             self._step_repeats.settle(
                 self.engine_manager.engine.resident_refusal, self._repeat_refusal,
                 {
                     "rows": self._rows_refusal, "device stop": self._device_stop_refusal,
                     "launch loop": self._launch_refusal, "stream tokens": self._stream_refusal,
-                    "eos odds": self._odds_refusal,
+                    "eos odds": self._odds_refusal, "stream queue": self._ring_refusal,
                 },
                 self.engine_manager.engine.repeat_note,
             )

@@ -367,9 +367,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        hidden it, and eight steps with none lower it by one. ``eos_odds: p`` has the sampler
        score each row's stop ids at temperature 1; when a run's last iteration gives a row more
        than ``p``, the next run is cut to ``1 / odds`` iterations, about when that stop lands.
+       ``stream_queue: {depth: <int>}`` (default depth 1024) keeps the node's streamed items on
+       the device for a consumer on its GPU, in a ring of its rows: the consumer's buffer holds
+       positions and reads each chunk in one gather, so no item is stored or routed on its own.
+       A row whose ring is full sits out a step until its consumer frees room. A consumer on
+       another worker, one that joins pieces or reads an item an iteration, or a chunk policy
+       that takes more than ``depth`` items at once is refused at load.
        At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``,
-       ``eos odds``) ``on``,
+       ``eos odds``, ``stream queue``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
        and copies go out from one Rust call with the GIL released; a capture that draws from
        a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for

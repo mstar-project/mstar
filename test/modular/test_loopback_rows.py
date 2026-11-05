@@ -177,3 +177,27 @@ def test_a_walk_keeps_a_loop_back_in_rows_only_at_a_fixed_shape_on_one_rank(shap
         assert engine.device_loopback_signals("n", WALK) == {"h"}
     else:
         assert mgmt.row_signals == {} and engine.device_loopback_signals("n", WALK) == frozenset()
+
+
+def test_a_ring_wraps_and_a_full_one_holds_its_row_back_until_its_consumer_moves_on():
+    """``stream_queue``: a row's items go into its ring at its write count; a
+    full ring caps the row at 0 and keeps it out of a step, and its consumer
+    moving past positions gives the room back."""
+    rows = LoopbackRows(torch.device("cpu"), capacity=4)
+    rows.ask_ring("frames", depth=4)
+    for rid in (1, 2):
+        rows.add(rid)
+    items = torch.arange(2 * 3 * 2).reshape(2, 3, 2)  # two rows, a run of 3, frames of 2
+    assert rows.ring_write("frames", [1, 2], items) == [0, 0]
+    assert rows.ring_room("frames", 1) == 1 and rows.admit_retrieve(1, "n", "w").ready
+    rows.ring_release("frames", 1, 2)
+    # wraps: positions 3, 4 and 5 are slots 3, 0 and 1
+    assert rows.ring_write("frames", [1], items[1:]) == [3]
+    assert rows.ring_read("frames", 1, [2, 3, 4, 5]).tolist() == [[4, 5], [6, 7], [8, 9], [10, 11]]
+    assert rows.ring_room("frames", 1) == 0 and not rows.admit_retrieve(1, "n", "w").ready
+    rows.ring_release("frames", 1, 4)
+    assert rows.ring_room("frames", 1) == 2 and rows.admit_retrieve(1, "n", "w").ready
+    # torn down mid-stream: its counts go with its row, and the next rid on it starts empty
+    rows.drop(1)
+    rows.add(3)
+    assert rows.ring_room("frames", 3) == 4 and rows.ring_write("frames", [3], items[:1]) == [0]

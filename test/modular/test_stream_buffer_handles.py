@@ -10,7 +10,13 @@ import torch
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.graph.base import TensorPointerInfo
-from mstar.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
+from mstar.streaming.chunk_policy import (
+    FixedChunkPolicy,
+    LeftContextChunkPolicy,
+    RampChunkPolicy,
+    ScheduledLeftContextChunkPolicy,
+    SlidingWindowChunkPolicy,
+)
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import Connection
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -220,3 +226,59 @@ def test_a_window_a_run_ran_short_of_goes_back_first():
     assert rest.chunk.start_offset == 1 and rest.chunk.num_items == 2
     assert _consume(streams, tm, rest)[0].flatten().tolist() == [11, 12]
     assert _consume(streams, tm, streams.pop_edge(buf, EDGE, RID))[0].tolist() == [13]
+
+
+@pytest.mark.parametrize("policy", [
+    lambda: SlidingWindowChunkPolicy(3, 2),
+    lambda: FixedChunkPolicy(2),
+    lambda: LeftContextChunkPolicy(2, 3),
+    lambda: RampChunkPolicy(1, 3, growth=2.0, max_chunk=6),
+    lambda: ScheduledLeftContextChunkPolicy((1, 3, 8), 4, 2),
+], ids=["sliding", "fixed", "left_context", "ramp", "scheduled"])
+def test_a_device_queue_hands_its_consumer_the_chunks_the_host_queue_does(policy):
+    """``stream_queue: device``: the buffer holds positions in the producer's
+    ring and a chunk is read from it in one gather. Every chunk, its window
+    and its geometry match the host queue's, for each chunk policy."""
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    frames = torch.arange(23 * 2).reshape(23, 2)
+    tm = _TM(_bookkeeping("python"))
+    host = StreamBuffer(RID, EDGE, "LLM", policy())
+    device = StreamBuffer(RID, EDGE, "LLM", policy())
+    request_state = SimpleNamespace(per_request_info={RID: SimpleNamespace(stream_buffers={EDGE: host})})
+    streams = StreamBufferManager(request_state, tm, [])
+    streams.consumer_node = {EDGE: NODE}
+    ring = LoopbackRows(torch.device("cpu"), capacity=2)
+    ring.ask_ring(EDGE, depth=12)
+    ring.add(RID)
+    written = 0
+    chunks = {"host": [], "device": []}
+
+    def pop(name, buf):
+        streams.rings = {EDGE: ring} if name == "device" else {}
+        request_state.per_request_info[RID].stream_buffers = {EDGE: buf}
+        while (se := streams.pop_edge(buf, EDGE, RID)) is not None:
+            tensors = [tm.tensor_store.get_tensor(u) for u in se.uuids]
+            items = torch.cat([t.reshape(-1, 2) for t in tensors]) if tensors else torch.zeros(0, 2)
+            chunks[name].append((items.tolist(), se.chunk))
+
+    for want in (3, 4, 1, 5, 2, 8):  # a run's frames, a step at a time
+        # the ring's room caps the run, as it caps the producer's
+        step = min(want, ring.ring_room(EDGE, RID))
+        batch = frames[written:written + step]
+        for k, frame in enumerate(batch):
+            uuid = 100 + written + k
+            tm.tensor_store.put_tensor(RID, uuid, frame[None], _info(uuid))
+            tm.tensor_store.increment_ref(uuid, 1)
+            host.pre_read_register(uuid)
+            host.put(uuid, uuid)
+        base = ring.ring_write(EDGE, [RID], batch[None])[0]
+        device.put_positions(list(range(base, base + step)))
+        written += step
+        pop("host", host)
+        pop("device", device)
+    for buf in (host, device):
+        buf.signal_done(written)
+    pop("host", host)
+    pop("device", device)
+    assert chunks["device"] == chunks["host"] and len(chunks["host"]) > 3

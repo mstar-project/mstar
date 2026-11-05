@@ -6,6 +6,8 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+import torch
+
 from mstar.worker.step_repeats import RepeatConfig, StepRepeats
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
 
@@ -213,3 +215,40 @@ def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step(
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
 
     assert speculation is chunk and not peeked and not excluded
+
+
+def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
+    """``stream_queue``: the ring's room caps a run as a loop's room does; a
+    row with none leaves the step until its consumer frees some."""
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    rows = LoopbackRows(torch.device("cpu"), capacity=4)
+    rows.ask_ring("frames", depth=6)
+    for rid in (0, 1):
+        rows.add(rid)
+    engine = SimpleNamespace(ring_room=lambda node, rids: min(rows.ring_room("frames", rid) for rid in rids))
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {}
+    worker._ring_signals = {"LLM": frozenset({"frames"})}
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8)}, {("LLM", "decode"): None})
+    worker._step_repeats._walks.add(("LLM", "decode"))
+    ctx = StepContext(request_ids=[0, 1], graph_walk="decode", slot=0, capture=False)
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 6
+    rows.ring_write("frames", [0, 1], torch.zeros(2, 5, 1))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 1
+    rows.ring_write("frames", [0], torch.zeros(1, 1, 1))
+    assert worker._with_ring_room("LLM", [0, 1]) == [1]
+    rows.ring_release("frames", 0, 3)
+    assert worker._with_ring_room("LLM", [0, 1]) == [0, 1]
