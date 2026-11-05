@@ -136,7 +136,8 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
                 piece = _encode(audio[at:at + chunk], args.codec)
                 ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(piece).decode()}))
             end = time.perf_counter() + args.tail_s
-            while open_ and time.perf_counter() < end:   # replies still playing finish first
+            # a reply still playing finishes first, and one that hasn't started gets its chance
+            while (open_ or not replies) and time.perf_counter() < end:
                 time.sleep(0.05)
         receiver.join(5)
     except Exception as exc:  # noqa: BLE001 — reported per session
@@ -183,6 +184,7 @@ def run_batch(args, clip: np.ndarray, n: int) -> dict:
     return {
         "sessions": n, "replies": len(replies),
         "not_completed": sum(r["status"] != "completed" for r in replies) + sum(s["unfinished"] for s in results),
+        "sessions_without_a_reply": sum(not s["replies"] for s in results),
         "sessions_with_errors": sum(bool(s["errors"]) for s in results),
         "errors": sorted({e for s in results for e in s["errors"]})[:5],
         "whole_steps": None if not replies else all(s["whole_steps"] is not False for s in results),
