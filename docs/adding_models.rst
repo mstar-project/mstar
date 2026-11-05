@@ -628,7 +628,7 @@ Qwen3.5's declaration shows both kinds of state, and its ViT:
        state = [
            Array(KV_CACHE, nodes={"LLM"}, layers=c.full_layer_indices,
                  entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
-                 max_len=c.max_position_embeddings, positions=Positions(rope=Rope()),
+                 max_len=c.max_position_embeddings, positions=Positions(),
                  reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))}),
            Value(GDN_STATE, nodes={"LLM"}, layers=c.linear_layer_indices, entry=gdn,
                  updates={CONV: CausalConv(), LINEAR_ATTN: GatedDeltaNet(qk_l2norm=True)}),
@@ -1954,9 +1954,9 @@ A model on the contract reads no ``node_resources``, ``engine_inputs.resources``
 - ``per_request_states`` is a ``Mapping`` that is resolved on first read.
 - ``piecewise_runners`` holds the piecewise CUDA-graph runners, keyed by region name.
 
-The shared layers (``Attention``, ``ParallelAttention``, ``ParallelGatedDeltaNet`` and
-``VisionAttention``) take their layer id in the constructor and pick their path at bind from
-what they receive: a handle under their key, or the resources.
+The shared layers take their layer id in the constructor. ``ParallelGatedDeltaNet`` takes a
+handle, and ``Attention``, ``ParallelAttention`` and ``VisionAttention`` pick their path at
+bind from what they receive: a handle under their key, or the resources.
 
 A model that hasn't moved reads ``engine_inputs.resources`` in the forward, keyed by
 ``resource_key``. In a layer, resources are resolved once at load time. The engine calls
