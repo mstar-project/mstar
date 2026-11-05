@@ -6,32 +6,27 @@ reference kept, so the bf16 results match it. Linear layers are the tensor-paral
 ones from ``mstar.model.components.distributed``; with a trivial comm group they are
 plain linears.
 
-Attention itself goes through an ``Attend`` callable the caller supplies (the
-scaffold's ``joint_attention`` over a ragged attention resource, or
-``sdpa_attention``). Layers never pick a kernel.
+Attention itself goes through the read of the array a layer binds, which picks the
+kernel and the sequence-parallel exchange, or SDPA with no array (the text connectors).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import attention_over_sharded_keys, ulysses_attention
-
-# ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
-# ``L``); see ``mstar.model.components.diffusion.attention``.
-Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class RotaryTable(NamedTuple):
@@ -47,22 +42,10 @@ class RotaryTable(NamedTuple):
 
 class SeqParallel(NamedTuple):
     """Ulysses sequence parallelism over a ``[B, L, H, D]`` stream, the video: ``sizes``
-    is each rank's share of its ``L``.
-
-    Only an attention whose queries and keys are both the sharded stream needs the
-    exchange: it attends every token over this rank's head-group (``attend``). A
-    query shard attending a replicated stream needs nothing, and a replicated query
-    attending the sharded keys merges the ranks' partial attentions by their
-    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
+    is each rank's share of its ``L``. An attention's exchange is its array's read."""
 
     group: CommGroup
     sizes: list[int]
-
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
-
-    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
-        return attention_over_sharded_keys(self.group, q, k, v, run)
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -144,8 +127,13 @@ class GatedAttention(nn.Module):
         bias: bool = True,
         out_bias: bool = True,
         eps: float = 1e-6,
+        array: str | None = None,
+        layer: int | None = None,
     ):
         super().__init__()
+        self.array = array
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
         self.is_self = kv_dim is None
         self.heads = heads
         self.head_dim = head_dim
@@ -162,17 +150,16 @@ class GatedAttention(nn.Module):
         self.to_gate_logits = ColumnParallelLinear(comm_group, query_dim, heads, bias=True) if gated else None
         self.to_out = RowParallelLinear(comm_group, inner, query_dim, bias=out_bias)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(self.array)
+
     def forward(
         self,
         x: torch.Tensor,
-        attend: Attend,
         context: torch.Tensor | None = None,
         q_rope: RotaryTable | None = None,
         k_rope: RotaryTable | None = None,
-        exchange: SeqParallel | None = None,
     ) -> torch.Tensor:
-        """``exchange``: a self-attention over a sequence-parallel stream, attended over
-        every token on this rank's head-group."""
         local = self.local_heads * self.head_dim
         if self.is_self:
             q, k, v = self.to_qkv(x).split([local, local, local], dim=-1)
@@ -186,7 +173,7 @@ class GatedAttention(nn.Module):
             q = apply_split_rope(q, q_rope.heads(self.head_offset, self.local_heads))
             k_rope = q_rope if k_rope is None else k_rope
             k = apply_split_rope(k, k_rope.heads(self.head_offset, self.local_heads))
-        out = (attend(q, k, v) if exchange is None else exchange.attend(q, k, v, attend)).to(q.dtype)
+        out = attend(self.state, self.layer, q, k, v).to(q.dtype)
         if self.to_gate_logits is not None:
             out = out * (2.0 * torch.sigmoid(self.to_gate_logits(x))).unsqueeze(-1)
         return self.to_out(out.flatten(-2))

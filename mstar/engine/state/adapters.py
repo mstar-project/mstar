@@ -336,11 +336,11 @@ def node_handles(
 
 def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects, built afresh for
-    each step because `SubmoduleStep` writes the segments onto them. None when every read it lists runs SDPA, which
-    gives the resources nothing to plan."""
+    each step because `SubmoduleStep` writes the segments onto them. None when every read it lists runs SDPA with no
+    exchange, which leaves the step nothing to do."""
     if step is None or not step.state:
         return step
-    if all(getattr(handles.get(name), "runs_sdpa", False) for name in step.state):
+    if all(getattr(handles.get(name), "plans_nothing", False) for name in step.state):
         return None
     steps = dict(step.steps)
     plans: dict[str, _WithinStepPlan] = {}
@@ -355,7 +355,8 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
             if declared.segments is None and step.segments is None:
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
             if isinstance(handle, WithinStepHandle):
-                _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
+                if not handle.runs_sdpa:
+                    _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
             else:
                 _array_steps(handle, declared, step, steps)
         else:

@@ -15,23 +15,31 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.distributed.communication import CommGroup
-from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep
+from mstar.engine.resources import RaggedCrossAttentionSpec
+from mstar.engine.state.adapters import node_resources
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.ltx2_5.components.transformer import (
-    LTX2Attends,
     LTX2DiT,
     audio_positions,
     build_rope,
     video_positions,
 )
 from mstar.model.ltx2_5.config import (
+    AUDIO,
+    AUDIO_FOR_VIDEO,
+    AUDIO_SELF,
+    AUDIO_TEXT,
     DENOISE_LOOP,
     DISTILLED_SIGMA_VALUES,
     LTX25_REPO,
     SNAPSHOT_PATTERNS,
+    TEXT_FOR_AUDIO,
+    TEXT_FOR_VIDEO,
+    VIDEO,
+    VIDEO_FOR_AUDIO,
+    VIDEO_SELF,
+    VIDEO_TEXT,
     LTX2TransformerConfig,
     LTX25Config,
 )
@@ -47,10 +55,6 @@ from mstar.model.ltx2_5.ltx2_5_model import (
     LTX25Model,
 )
 from mstar.model.ltx2_5.submodules import (
-    AUDIO_ATTN,
-    AUDIO_XATTN,
-    VIDEO_ATTN,
-    VIDEO_XATTN,
     LTXDenoiseSubmodule,
     LTXShape,
     distilled_schedule,
@@ -173,16 +177,16 @@ def test_generate_walk_structure(walk, decoders):
 
 
 def test_resources_follow_the_attention_backend():
-    specs = {s.resource_key: s for s in _make_model(attention_backend="flashinfer").get_node_resources()}
-    assert set(specs) == {VIDEO_ATTN, AUDIO_ATTN, VIDEO_XATTN, AUDIO_XATTN}
-    assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_XATTN, AUDIO_XATTN}
-    assert (specs[VIDEO_XATTN].config.head_dim, specs[AUDIO_XATTN].config.head_dim) == (128, 64)
+    specs = {s.resource_key: s for s in node_resources(_make_model())}
+    assert set(specs) == {VIDEO_SELF, AUDIO_SELF, VIDEO_TEXT, AUDIO_TEXT}
+    assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_TEXT, AUDIO_TEXT}
+    assert (specs[VIDEO_TEXT].config.head_dim, specs[AUDIO_TEXT].config.head_dim) == (128, 64)
     assert all(s.nodes == {"dit"} for s in specs.values())
-    assert (specs[VIDEO_ATTN].config.num_qo_heads, specs[VIDEO_ATTN].config.head_dim) == (32, 128)
-    assert (specs[AUDIO_ATTN].config.num_qo_heads, specs[AUDIO_ATTN].config.head_dim) == (32, 64)
-    assert _make_model(attention_backend="sdpa").get_node_resources() == []
-    with pytest.raises(ValueError):
-        _make_model(attention_backend="flash")
+    assert (specs[VIDEO_SELF].config.num_qo_heads, specs[VIDEO_SELF].config.head_dim) == (32, 128)
+    assert (specs[AUDIO_SELF].config.num_qo_heads, specs[AUDIO_SELF].config.head_dim) == (32, 64)
+    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
+    with pytest.raises(ValueError, match="attention_backend is a node group's setting"):
+        _make_model(attention_backend="sdpa")
 
 
 def test_worker_graphs_from_yaml():
@@ -330,8 +334,8 @@ def test_postprocess_video_is_an_mp4():
 # ----------------------------------------------------------------------
 
 
-def _dit(config: LTX25Config, use_ragged: bool = True) -> LTXDenoiseSubmodule:
-    return LTXDenoiseSubmodule(nn_stub(), config, loop_name=DENOISE_LOOP, use_ragged_attention=use_ragged)
+def _dit(config: LTX25Config) -> LTXDenoiseSubmodule:
+    return LTXDenoiseSubmodule(nn_stub(), config, loop_name=DENOISE_LOOP)
 
 
 def nn_stub():
@@ -369,37 +373,21 @@ def test_pack_unpack_round_trip():
     assert torch.equal(unpack_audio(pack_audio(audio), 16), audio)
 
 
-def test_declare_step_spans_and_pairs():
-    cfg = LTX25Config()
-    shape = LTXShape(frames=2, height=3, width=4, audio_frames=5, fps=24.0, text_len=16)
-    inputs = [NodeInputs(resource_step_info=shape) for _ in range(2)]
-    step = _dit(cfg).declare_step("generate_av", [11, 12], inputs)
-    video, audio = step.steps[VIDEO_ATTN], step.steps[AUDIO_ATTN]
-    assert isinstance(video, AttentionStep) and not video.causal and not audio.causal
-    assert {s.label for s in video.segments} == {"video"} and {s.label for s in audio.segments} == {"audio"}
-    video_x, audio_x = step.steps[VIDEO_XATTN], step.steps[AUDIO_XATTN]
-    assert isinstance(video_x, RaggedCrossAttentionStep) and video_x.pairs == (("video", "text"),)
-    assert set(audio_x.pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
-    spans = {(s.request_id, s.label): s.span for s in audio_x.segments}
-    assert spans == {(r, label): n for r in (11, 12) for label, n in (("video", 24), ("audio", 5), ("text", 16))}
-    assert step.cg_key_info == shape
-    assert _dit(cfg, use_ragged=False).declare_step("generate_av", [11], inputs[:1]) is None
-
-
-@pytest.mark.parametrize("rank, shard", [(0, 13), (1, 12)])
-def test_declare_step_under_sequence_parallelism(rank, shard):
-    """The video self-attention spans every video token; the cross-attentions attend
-    from this rank's share of them, and the audio queries attend that share too (the
-    block merges the ranks' partial attentions)."""
+def test_declare_step_lists_all_six_arrays_with_whole_segments():
     cfg = LTX25Config()
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
-                              sp_group=CommGroup(rank, rank, [0, 1]))
-    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=shape)])
-    assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
-    for key in (VIDEO_XATTN, AUDIO_XATTN):
-        assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
-    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
+    step = _dit(cfg).declare_step("generate_av", [11, 12], [NodeInputs(resource_step_info=shape)] * 2)
+    spans = {
+        name: {(s.request_id, s.label, s.span) for s in declared.segments} for name, declared in step.state.items()
+    }
+    video = {(r, "video", 25) for r in (11, 12)}
+    audio = {(r, "audio", 5) for r in (11, 12)}
+    text = {(r, "text", 16) for r in (11, 12)}
+    assert spans == {
+        VIDEO: video, AUDIO: audio, TEXT_FOR_VIDEO: text, TEXT_FOR_AUDIO: text, AUDIO_FOR_VIDEO: audio,
+        VIDEO_FOR_AUDIO: video,
+    }, "a step is the same on every rank, since the engine cuts each read's share"
+    assert step.cg_key_info == shape
 
 
 def test_distilled_schedule_matches_the_scheduler_recipe():
@@ -452,7 +440,6 @@ def test_toy_dit_forward_shapes_and_row_independence():
     for p in dit.parameters():
         torch.nn.init.normal_(p, std=0.05)
     rope = build_rope(cfg.transformer, 2, 2, 3, 24.0, 5, "cpu")
-    attends = LTX2Attends(*([sdpa_attention] * 6))
 
     def run(rows):
         g = torch.Generator().manual_seed(1)
@@ -460,7 +447,7 @@ def test_toy_dit_forward_shapes_and_row_independence():
         a = torch.randn(2, 5, 8, generator=g)[rows]
         t = torch.randn(2, 7, 32, generator=g)[rows]
         at = torch.randn(2, 7, 16, generator=g)[rows]
-        return dit(x, a, t, at, torch.tensor([1000.0, 500.0])[rows], rope, attends)
+        return dit(x, a, t, at, torch.tensor([1000.0, 500.0])[rows], rope)
 
     video, audio = run(slice(0, 2))
     assert video.shape == (2, 12, 8) and audio.shape == (2, 5, 8)

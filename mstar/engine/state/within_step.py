@@ -30,7 +30,7 @@ class WithinStepHandle(ArrayHandle):
 
     ``queried`` is the array whose segments lay out the queries of a cross read. Under sequence parallelism the two
     flags pick the exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
-    ranks' partial attentions when only the keys are. A read with no resource runs SDPA, and no step opens the handle.
+    ranks' partial attentions when only the keys are. A read with no resource runs SDPA.
     """
 
     def __init__(
@@ -45,6 +45,8 @@ class WithinStepHandle(ArrayHandle):
         sharded = sp_group is not None and sp_group.world_size > 1
         self._keys_sharded = sharded and array.seq_sharded
         self._queries_sharded = sharded and (array if queried is None else queried).seq_sharded
+        # Nothing for a step to do here: no plan, and no rank sizes to learn from its segments for a Ulysses exchange.
+        self.plans_nothing = self.runs_sdpa and not (self._keys_sharded and self._queries_sharded)
         self._seq_sizes: list[int] | None = None
         # Both sides fix the plan's label, so it is one string for the life of the handle. See `cross_label`.
         self._plan_label = min(array.labels) if queried is None else cross_label(min(queried.labels), min(array.labels))
