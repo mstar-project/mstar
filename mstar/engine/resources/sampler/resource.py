@@ -409,9 +409,12 @@ class SamplerResource(Resource):
         return None
 
     def max_repeats(self, step, ctx) -> int:
-        """1 while a request on the pool wants log-probs (one a step), or for a
-        step whose rows don't all keep their draw."""
-        if self._logprob_rids or self._kept_rids_of(step, ctx) is not None:
+        """1 for a step with a row that wants log-probs (one a step), or whose
+        rows don't all keep their draw. From the step's own rows only, which
+        are the same on every rank of a lockstep instance: the pool-wide set
+        depends on when each rank ingested its requests."""
+        logprobs = self._logprob_rids
+        if (logprobs and not logprobs.isdisjoint(ctx.request_ids)) or self._kept_rids_of(step, ctx) is not None:
             return 1
         return ANY_REPEATS
 

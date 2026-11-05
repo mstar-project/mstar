@@ -906,6 +906,34 @@ def test_cached_pages_are_room_for_a_step_that_repeats():
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == 1
 
 
+def test_under_tp_a_steps_repeats_never_narrow_on_a_ranks_own_free_pages():
+    """Each rank of a lockstep instance frees pages when its own teardown runs,
+    so its free count is its own: narrowing on it would settle the ranks at
+    different counts of the same collectives (review-r2 F3). The leader's admit
+    still refuses a step the pool can't give, alike on every rank."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=1)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = None
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {}
+    kv._world_size = 2
+    step = SimpleNamespace(segments=())
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == PAGE
+
+
+def test_a_steps_log_probs_narrow_it_only_by_its_own_rows():
+    """Which requests ask log-probs, pool-wide, depends on when each rank
+    ingested them; the step's own rows are the same on every rank (review-r2 F3)."""
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = SamplerResource.__new__(SamplerResource)
+    sampler._logprob_rids = {9}
+    sampler._kept_rids_of = lambda step, ctx: None
+    assert sampler.max_repeats(object(), SimpleNamespace(request_ids=(1, 2))) > 1
+    assert sampler.max_repeats(object(), SimpleNamespace(request_ids=(1, 9))) == 1
+
+
 def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
     """``past_cap`` lets a run outlast a row's count, and a row at the end of
     its context has nowhere to put those tokens."""

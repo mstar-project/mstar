@@ -546,6 +546,8 @@ class KVManager(AttentionResource):
     # extra iterations of the step before it, still in flight, and its own
     _run_lag: int = 0
     _prev_extra: int = 0
+    # the ranks of the lockstep instance this pool is one rank of
+    _world_size: int = 1
 
     def __init__(
         self,
@@ -4712,14 +4714,17 @@ class KVManager(AttentionResource):
         `_room`, which holds back the allotments these rows draw on themselves.
         A host-planned step that commits nothing reads the same pages each replay.
         A run past a row's cap (``past_cap``) still ends inside the row's table,
-        allowing for a run in flight that its stored length doesn't show yet."""
+        allowing for a run in flight that its stored length doesn't show yet.
+        Under TP the free count is each rank's own (each frees at its own
+        teardown), so it doesn't narrow there: the ranks must settle alike."""
         if ctx.resident is None:
             return ANY_REPEATS if not step.commit else 1
         rows = max(len(ctx.request_ids), 1)
-        evictable = 0 if self._index is None else len(self._index.evictable())
         page_size = self._groups[0].page_size
-        if self._arena.num_free + evictable < rows:
-            return 1
+        if self._world_size == 1:
+            evictable = 0 if self._index is None else len(self._index.evictable())
+            if self._arena.num_free + evictable < rows:
+                return 1
         longest = max((
             self._streams[s.request_id][s.label].stored_len for s in step.segments
             if s.label in self._streams.get(s.request_id, ())
