@@ -32,14 +32,13 @@ beside a never-computed one reads as never computed, until a whole write.
 
 Every other failure stays a failure: an exception mstar's own code raised (a lifecycle
 or planning error, an API that moved, a crash), whatever ran before it, or an assertion
-made before any such read. A failure raised inside the emulator's own code, or in a test listed in
-``_STAND_IN_LACKS``, is an emulator gap: reported as an expected failure and listed at
-the end of the run, so a gap doesn't read as a fault of mstar's. Torch's own error on an
-op the interposer ran is mstar's: a ``RuntimeError`` or ``IndexError`` only, so a
-``TypeError`` from a bad call stays a gap, and an emulator bug raising a plain
-``RuntimeError`` from the interposer reads as mstar's. A ``pytest.raises`` that saw nothing
-after a stand-in kernel ran expected the kernel's own error check, which a stand-in doesn't
-have.
+made before any such read. A failure raised inside the emulator's own code is an emulator
+gap: reported as an expected failure and listed at the end of the run, so a gap doesn't
+read as a fault of mstar's. Torch's own error on an op the interposer ran is mstar's: a
+``RuntimeError`` or ``IndexError`` only, so a ``TypeError`` from a bad call stays a gap,
+and an emulator bug raising a plain ``RuntimeError`` from the interposer reads as mstar's.
+A ``pytest.raises`` that saw nothing after a stand-in kernel ran expected the kernel's own
+error check, which a stand-in doesn't have.
 """
 
 from __future__ import annotations
@@ -57,13 +56,6 @@ import pytest
 from mstar_sim import device
 
 GAPS: list[tuple[str, str]] = []
-# tests of what a stand-in doesn't do, which no rule can tell from a failure of mstar's, so
-# each is a gap; one that passes fails the run, so an entry can't go stale
-_STAND_IN_LACKS = dict.fromkeys(
-    ("test_a_sealed_buffer_reports_flashinfers_number",
-     "test_a_captured_paged_wrapper_grows_on_its_first_plan_and_its_later_plans_go_direct",
-     "test_every_wrapper_grows_on_the_real_planner_and_its_next_plan_fits"),
-    "flashinfer's stand-in planner never runs out of workspace")
 # host reads of never-computed values by the test's own code
 TEST_READS = [0]
 
@@ -176,11 +168,6 @@ def _raised_in_emulator(excinfo) -> str | None:
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    lacks = _STAND_IN_LACKS.get(item.name.split("[")[0])
-    if lacks and report.passed and report.when == "call":
-        report.outcome = "failed"
-        report.longrepr = f"mstar_sim: passed, though listed in _STAND_IN_LACKS ({lacks}): delete its entry"
-        return
     if report.passed and report.when == "call" and TEST_READS[0]:
         report.outcome = "skipped"
         report.wasxfail = f"mstar_sim: passed, but it read {TEST_READS[0]} never-computed value(s): unanswered"
@@ -191,7 +178,7 @@ def pytest_runtest_makereport(item, call):
         report.outcome = "skipped"
         report.longrepr = (str(item.path), item.location[1] or 0, "Skipped: needs the Hugging Face Hub (offline)")
         return
-    where = (lacks or _raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
+    where = (_raised_in_emulator(call.excinfo) or _missing_from_stand_in(call.excinfo)
              or _accelerator_without_the_gpu(call.excinfo))
     if where:
         GAPS.append((item.nodeid, f"{where}: {call.excinfo.exconly()[:160]}"))

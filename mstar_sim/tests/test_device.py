@@ -289,6 +289,39 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
     assert out.strip() == "ok"
 
 
+def test_flashinfers_planner_runs_short_of_a_small_workspace():
+    """A plan lays its split-KV partials out in the float workspace as FlashInfer's planner
+    does, so one too small for them raises FlashInfer's overflow, and one that holds what
+    ``workspace_size`` counts plans."""
+    run_sim("""
+        import torch, flashinfer
+        from flashinfer.prefill import get_batch_prefill_module
+        i32 = dict(dtype=torch.int32, device="cuda")
+        workspace = torch.empty(1024, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", use_cuda_graph=True, qo_indptr_buf=torch.zeros(3, **i32),
+            paged_kv_indptr_buf=torch.zeros(3, **i32), paged_kv_indices_buf=torch.zeros(8, **i32),
+            paged_kv_last_page_len_buf=torch.ones(2, **i32), backend="fa2")
+        qo, kv = torch.tensor([0, 16, 32], dtype=torch.int32), torch.tensor([0, 2, 4], dtype=torch.int32)
+
+        def plan():
+            wrapper.plan(qo, kv, torch.arange(4, dtype=torch.int32), torch.tensor([16, 16], dtype=torch.int32),
+                         8, 8, 64, 16, causal=True, q_data_type=torch.bfloat16)
+
+        need, _ = get_batch_prefill_module("fa2").workspace_size(
+            workspace, qo, kv, None, 32, 2, 8, 8, 16, True, 64, 64, True, -1, -1, False, 0, 0)
+        for size, short_of in ((1024, "batch_prefill_tmp_v"), (need - 1, "batch_prefill_tmp_s")):
+            workspace.data = torch.empty(size, dtype=torch.uint8, device="cuda")
+            try:
+                plan()
+                raise SystemExit(f"a {size}-byte workspace held a plan that needs {need}")
+            except RuntimeError as e:
+                assert f"allocating memory for {short_of}" in str(e), e
+        workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
+        plan()
+    """)
+
+
 def test_a_jit_built_cuda_extension_registers_capturable_ops(tmp_path):
     """``cpp_extension.load`` of CUDA sources registers their ``TORCH_LIBRARY`` ops as
     kernels that write their mutable arguments, which a graph captures, whichever of its
@@ -884,8 +917,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
     stays its own, whatever library it names. An assert is a value check, the one failure
     the plugin expects, only once the test has read a never-computed value: not for making a
     scratch buffer, or exporting a storage. A pass isn't reported for a test whose own code
-    read a never-computed value: that check can't answer. A test listed as needing what a
-    stand-in lacks is a gap, and fails the run once it passes."""
+    read a never-computed value: that check can't answer."""
     (tmp_path / "test_cases.py").write_text(textwrap.dedent("""
         import pytest, torch
         def test_host_read_in_capture():
@@ -979,9 +1011,6 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             import flashinfer
             rows = flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
             assert rows[torch.tensor([0], device="cuda")].shape == (2, 4)
-        @pytest.mark.parametrize("fails", [True, False])
-        def test_a_sealed_buffer_reports_flashinfers_number(fails):
-            assert not fails
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
         def test_dynamo_traces_a_device():
@@ -999,8 +1028,6 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_never_computed_write": "XFAIL", "test_parity_of_two_never_computed_values": "XFAIL",
                         "test_mstar_reads_a_sampled_token_and_the_test_checks_a_shape": "PASSED",
                         "test_lifecycle_assert_after_mstar_reads_a_sampled_token": "FAILED",
-                        "test_a_sealed_buffer_reports_flashinfers_number[True]": "XFAIL",
-                        "test_a_sealed_buffer_reports_flashinfers_number[False]": "FAILED",
                         "test_shape_mistake_on_cuda_tensors": "FAILED",
                         "test_shape_mistake_in_a_collective": "FAILED",
                         "test_index_past_the_end": "FAILED",

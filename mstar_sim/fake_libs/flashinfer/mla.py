@@ -6,7 +6,35 @@ import torch
 
 from mstar_sim.device import gpu_error
 
-from ._paged import _copy, _not_supported, attention_kernel, canonical_dtype, element_size, visible_keys
+from ._paged import (
+    _copy,
+    _not_supported,
+    allocate,
+    attention_kernel,
+    buffer_bytes,
+    canonical_dtype,
+    element_size,
+    visible_keys,
+)
+
+
+def mla_allocations(qo: list[int], batch: int, num_heads: int, head_dim_o: int) -> list:
+    """What FlashInfer's MLA planner (``MLAPlan``, its fa2/fa3 backends) allocates: fixed
+    work arrays, and partials for every cluster of SMs in the float workspace."""
+    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    packed = sum(qo[i + 1] - qo[i] for i in range(batch)) * num_heads
+    cluster = 2 if packed // max(batch, 1) > 64 else 1
+    clusters, tile_q = num_sm // cluster, 64 * cluster
+    works, per_sm = 4 * 16384, 4 * num_sm
+    return [("int", name, works, 16) for name in ("mla_q_indptr", "mla_kv_indptr", "mla_partial_indptr")] + [
+        ("int", name, per_sm, 16) for name in (
+            "mla_merge_packed_offset_start", "mla_merge_packed_offset_end",
+            "mla_merge_partial_packed_offset_start", "mla_merge_partial_packed_offset_end",
+            "mla_merge_partial_stride")] + [
+        ("int", name, works, 16) for name in (
+            "mla_q_len", "mla_kv_len", "mla_q_start", "mla_kv_start", "mla_kv_end", "mla_work_indptr")] + [
+        ("float", "mla_partial_o", 2 * clusters * tile_q * 2 * head_dim_o, 16),
+        ("float", "mla_partial_lse", 2 * clusters * tile_q * 4, 16)]
 
 
 class BatchMLAPagedAttentionWrapper:
@@ -61,6 +89,8 @@ class BatchMLAPagedAttentionWrapper:
         qo_host = [int(x) for x in qo_indptr.tolist()]
         lens_host = [int(x) for x in kv_len_arr.tolist()]
         batch = len(qo_host) - 1
+        # every backend plans as fa2/fa3's MLA planner does (auto's choice on Hopper)
+        allocate(mla_allocations(qo_host, batch, num_heads, head_dim_ckv), buffer_bytes(self._float_workspace_buffer))
         if self._use_cuda_graph:
             if batch + 1 != len(self._qo_indptr_buf):
                 raise gpu_error(ValueError(

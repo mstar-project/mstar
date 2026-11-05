@@ -8,6 +8,7 @@ from mstar_sim.device import gpu_error
 
 from ._paged import (
     PagedAttention,
+    PrefillPlanner,
     _copy,
     _not_supported,
     attention_kernel,
@@ -27,6 +28,19 @@ def _check_plan_extras(custom_mask, packed_custom_mask, pos_encoding_mode, **ext
     for name, value in extras.items():
         if value is not None:
             _not_supported(f"prefill plan({name}=...)")
+
+
+def get_batch_prefill_module(backend: str, *args) -> PrefillPlanner:
+    """FlashInfer's batch prefill module for ``backend`` (its dtypes and head dims, ``args``,
+    don't change the planner): its ``plan`` and ``workspace_size``."""
+    return PrefillPlanner(backend)
+
+
+def _resolve_backend(backend: str, device) -> str:
+    """FlashInfer's choice for ``"auto"``: fa3 on Hopper, fa2 elsewhere."""
+    if backend != "auto":
+        return backend
+    return "fa3" if torch.cuda.get_device_capability(device) == (9, 0) else "fa2"
 
 
 class BatchPrefillWithPagedKVCacheWrapper(PagedAttention):
@@ -100,8 +114,7 @@ class BatchPrefillWithPagedKVCacheWrapper(PagedAttention):
             prefix_len_ptr=prefix_len_ptr, token_pos_in_items_ptr=token_pos_in_items_ptr,
             max_item_len_ptr=max_item_len_ptr,
         )
-        if self._backend == "auto":  # FlashInfer's choice: fa3 on Hopper, fa2 elsewhere
-            self._backend = "fa3" if torch.cuda.get_device_capability(self.device) == (9, 0) else "fa2"
+        self._backend = _resolve_backend(self._backend, self.device)
         self._logits_soft_cap = logits_soft_cap or 0.0
         self._set_plan(
             qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
@@ -152,6 +165,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: int | None = None
         self._planned = False
         self._cost = (0.0, 0.0)
+        self._cached_module = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -222,6 +236,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._qo_indptr_buf = _copy(qo_indptr, self.device)
             self._kv_indptr_buf = _copy(kv_indptr, self.device)
 
+        self._backend = _resolve_backend(self._backend, self.device)
+        self._cached_module = self._cached_module or PrefillPlanner(self._backend)
+        fa2_args = [-1, False, 0, 0] if self._backend == "fa2" else []  # as the paged wrapper plans
+        lens = torch.tensor([kv_host[r + 1] - kv_host[r] for r in range(batch)], dtype=torch.int32)
+        self._cached_module.plan(  # FlashInfer plans a ragged batch as pages of one token
+            self._float_workspace_buffer, None, None, qo_indptr, kv_indptr, lens,
+            self._max_total_num_rows or total_rows, batch, num_qo_heads, num_kv_heads, 1,
+            self._use_cuda_graph, head_dim_qk, head_dim_vo or head_dim_qk, causal, window_left, *fa2_args)
         self._batch_size = batch
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads

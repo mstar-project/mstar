@@ -10,6 +10,10 @@ on a checked FlashInfer version, prices the same step. ``run`` is one kernel
 (``clock.kernel_fn``) charged the latest plan's price, so a graph replay
 prices whatever the last plan was.
 
+A planner lays its scratch out as FlashInfer's does (``allocate``), sized by FlashInfer's own
+arithmetic (``prefill_allocations``, ``decode_allocations``; 0.7.2's ``scheduler.cuh``), so a
+float workspace too small for a plan raises FlashInfer's overflow where FlashInfer would.
+
 FlashInfer's conventions, which the pricing follows: a paged request's length
 is ``(num_pages - 1) * page_size + last_page_len``, and a request with ``n``
 queries over ``m`` keys aligns its queries to the end of its keys (causal
@@ -81,6 +85,170 @@ def table_features(rows: list, heads: int, kv_heads: int, head_dim_qk: int, head
             "head_dim": head_dim_qk if head_dim_qk == head_dim_vo else None, "kv_dtype": kv_dtype}
 
 
+# the int workspace each FlashInfer wrapper allocates itself (the float one is the caller's)
+INT_WORKSPACE_BYTES = 8 << 20
+
+
+def buffer_bytes(buffer: torch.Tensor) -> int:
+    return buffer.numel() * buffer.element_size()
+
+
+def allocate(allocations: list, float_bytes: int | None, int_bytes: int | None = INT_WORKSPACE_BYTES):
+    """Lay out a plan's ``allocations`` [(buffer, name, bytes, alignment)] as FlashInfer's
+    ``AlignedAllocator`` does, one per buffer (``"float"`` of ``float_bytes``, ``"int"`` of
+    ``int_bytes``): in order, each at the next multiple of its alignment. One that doesn't fit
+    raises FlashInfer's overflow; a size of None only counts. Returns (float, int) bytes used."""
+    room = {"float": float_bytes, "int": int_bytes}
+    used = {"float": 0, "int": 0}
+    for buffer, name, size, alignment in allocations:
+        pad = -used[buffer] % alignment
+        left = None if room[buffer] is None else room[buffer] - used[buffer]
+        if left is not None and pad + size > left:
+            raise gpu_error(RuntimeError(
+                f"Buffer overflow when allocating memory for {name} with size {size} and alignment "
+                f"{alignment}, but only {left} bytes available in AlignedAllocator. Increase the "
+                "workspace buffer size."))
+        used[buffer] += pad + size
+    return used["float"], used["int"]
+
+
+def _ceil(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _cta_tile_q(packed_qo_len: int, head_dim_vo: int, head_dim_qk: int) -> int:
+    """FlashInfer's ``FA2DetermineCtaTileQ`` on an 8.0-or-newer GPU (every one the emulator
+    offers). Its shared-memory probe at 16 rows or fewer passes for every head dim up to 256
+    on those, so it isn't run."""
+    if head_dim_vo >= 512:
+        return 16 if packed_qo_len <= 32 else 32
+    if head_dim_qk >= 512:
+        return 16
+    if packed_qo_len > 64 and head_dim_vo < 256:
+        return 128
+    return 64 if packed_qo_len > 16 else 16
+
+
+def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch: int, num_qo_heads: int,
+                        num_kv_heads: int, page_size: int, cuda_graph: bool, head_dim_qk: int,
+                        head_dim_vo: int, window_left: int, fixed_split_size: int = -1,
+                        disable_split_kv: bool = False, num_colocated_ctas: int = 0,
+                        uniform_q_len: int = 0) -> list:
+    """What FlashInfer's fa2 prefill planner (``PrefillPlanImpl`` over
+    ``PrefillSplitQOKVIndptr``) allocates for ``qo`` rows and ``kv`` pages per request: the
+    float workspace holds the split-KV partials, only when it splits."""
+    gqa = num_qo_heads // num_kv_heads
+    max_grid = max(0, 2 * torch.cuda.get_device_properties().multi_processor_count - num_colocated_ctas)
+    max_batch_if_split = max_grid // num_kv_heads
+    packed = [(qo[i + 1] - qo[i]) * gqa for i in range(batch)]
+    kv_len = [kv[i + 1] - kv[i] for i in range(batch)]
+    if cuda_graph and uniform_q_len > 0:
+        for i, p in enumerate(packed):
+            if p != uniform_q_len * gqa:
+                raise gpu_error(RuntimeError(
+                    f"qo_indptr gives request {i} a packed qo length of {p}, but "
+                    f"uniform_q_len={uniform_q_len} promises {uniform_q_len * gqa}"))
+        tile = _cta_tile_q(uniform_q_len * gqa, head_dim_vo, head_dim_qk)
+        tiles_q = batch * _ceil(uniform_q_len * gqa, tile)
+    elif cuda_graph:  # sized for the most rows one request could have
+        tile = _cta_tile_q((total_num_rows - batch + 1) * gqa, head_dim_vo, head_dim_qk)
+        tiles_q = _ceil(total_num_rows * gqa, tile) + batch - 1
+    else:
+        tile = _cta_tile_q(sum(packed) // max(batch, 1), head_dim_vo, head_dim_qk)
+        tiles_q = sum(_ceil(p, tile) for p in packed)
+    effective = [min(_ceil(window_left + tile, page_size), n) if window_left >= 0 else n for n in kv_len]
+    split, chunk = False, None
+    if not disable_split_kv and fixed_split_size > 0:
+        chunk = fixed_split_size
+    elif not disable_split_kv:  # the shortest kv chunk whose tiles fit the grid
+        longest = max([1, *effective])
+        low, high = max(128 // page_size, 1), longest
+        while low < high:
+            mid = (low + high) // 2
+            tiles = sum(_ceil(p, tile) * _ceil(max(n, 1), mid) for p, n in zip(packed, effective, strict=True))
+            if tiles > max_batch_if_split:
+                low = mid + 1
+            else:
+                high = mid
+        split, chunk = cuda_graph or low < longest, low
+    chunks = [1 if chunk is None else _ceil(max(n, 1), chunk) for n in effective]
+    if fixed_split_size > 0 and not disable_split_kv:
+        split = split or any(c > 1 for c in chunks)
+    new_batch = sum(_ceil(p, tile) * c for p, c in zip(packed, chunks, strict=True))
+    padded = max(max_batch_if_split, tiles_q) if cuda_graph else new_batch
+    if new_batch > padded:
+        raise gpu_error(RuntimeError(
+            "new batch size should not exceed padded batch size. If you are using fixed split size, "
+            "please consider disabling cuda graph."))
+    out = [("int", "batch_prefill_request_indices", 4 * padded, 16),
+           ("int", "batch_prefill_qo_tile_indices", 4 * padded, 16),
+           ("int", "batch_prefill_kv_tile_indices", 4 * padded, 16),
+           ("int", "batch_prefill_o_indptr", 4 * (batch + 1), 16),
+           ("int", "batch_prefill_kv_chunk_size_ptr", 4, 1)]
+    if cuda_graph:
+        out.append(("int", "batch_prefill_total_num_rows", 4, 16))
+    if split:
+        rows = _ceil(padded * tile, gqa)
+        partial = sum((qo[i + 1] - qo[i]) * chunks[i] for i in range(batch))
+        if partial > rows:
+            raise gpu_error(RuntimeError(
+                f"batch_prefill partial outputs need {partial} rows but the plan reserved {rows}"))
+        out += [("float", "batch_prefill_tmp_v", num_qo_heads * rows * head_dim_vo * 4, 16),
+                ("float", "batch_prefill_tmp_s", num_qo_heads * rows * 4, 16),
+                ("int", "batch_prefill_merge_indptr", 4 * (total_num_rows + 1), 16)]
+    if cuda_graph:
+        out.append(("int", "batch_prefill_block_valid_mask", padded, 16))
+    return out
+
+
+# shared memory per SM by compute capability (CUDA's table), for the decode kernel's occupancy
+_SMEM_PER_SM = {(8, 0): 167936, (8, 6): 102400, (8, 9): 102400, (9, 0): 233472, (10, 0): 233472}
+
+
+def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_heads: int, page_size: int,
+                       cuda_graph: bool, head_dim: int, kv_dtype) -> list:
+    """What FlashInfer's CUDA-core decode planner (``DecodePlanImpl`` over its work
+    estimation) allocates for ``kv`` pages per request. The grid it sizes for is the decode
+    kernel's occupancy, approximated: shared memory and threads bound the blocks per SM, its
+    registers (a fact of the compiled kernel) don't, so the grid can only come out larger."""
+    gqa = num_qo_heads // num_kv_heads
+    kv_bytes = element_size(canonical_dtype(kv_dtype))
+    vec = max(16 // kv_bytes, head_dim // 32)
+    bdx = head_dim // vec
+    threads = max(128, bdx * gqa)
+    bdz = threads // (bdx * gqa)
+    tile = (2 if kv_bytes == 1 else 4) if gqa == 1 else 1
+    props = torch.cuda.get_device_properties()
+    stages = 2  # every GPU the emulator offers is 8.0 or newer
+    smem = 2 * stages * tile * gqa * bdz * head_dim * kv_bytes + max(tile * threads * 8, 2 * gqa * bdz * 4)
+    per_sm = _SMEM_PER_SM[torch.cuda.get_device_capability()]
+    blocks = min(32, props.max_threads_per_multi_processor // threads, per_sm // (smem + 1024))
+    max_grid = blocks * props.multi_processor_count
+    pages = [kv[i + 1] - kv[i] for i in range(batch)]
+    if batch * num_kv_heads >= max_grid:
+        split, new_batch = False, batch
+    else:  # the fewest pages per chunk whose chunks fit the grid
+        low, high = max(128 // page_size, 1), max(pages, default=0)
+        while low < high:
+            mid = (low + high) // 2
+            if sum(_ceil(p, mid) for p in pages) * num_kv_heads > max_grid:
+                low = mid + 1
+            else:
+                high = mid
+        new_batch = sum(_ceil(max(p, 1), low) for p in pages)
+        split = cuda_graph or new_batch != batch
+    padded = (max_grid // num_kv_heads if split else batch) if cuda_graph else new_batch
+    out = [("int", "batch_decode_request_indices", 4 * padded, 16),
+           ("int", "batch_decode_kv_tile_indices", 4 * padded, 16),
+           ("int", "batch_decode_o_indptr", 4 * (padded + 1), 16),
+           ("int", "batch_decode_kv_chunk_size_ptr", 4, 1)]
+    if split:
+        out += [("float", "batch_decode_tmp_v", num_qo_heads * padded * head_dim * 4, 16),
+                ("float", "batch_decode_tmp_s", num_qo_heads * padded * 4, 16),
+                ("int", "batch_decode_block_valid_mask", padded, 16)]
+    return out
+
+
 def _copy(src: torch.Tensor, device) -> torch.Tensor:
     """A device copy of a plan array (a snapshot, as FlashInfer's H2D is)."""
     return src.to(device=device, dtype=torch.int32, copy=True)
@@ -92,20 +260,42 @@ def _host(x) -> list[int]:
 
 
 class PrefillPlanner:
-    """FlashInfer's batch prefill planner module (fa2/fa3; tensor-core decode uses it
-    too): ``plan`` takes FlashInfer's arguments and returns the plan info. It prices
-    its wrapper's next run."""
+    """FlashInfer's batch prefill planner module for ``backend`` (fa2/fa3; tensor-core decode
+    and the ragged wrapper use it too): ``plan`` takes FlashInfer's arguments, lays out the
+    plan's workspace and returns the plan info; ``workspace_size`` counts that layout. A
+    wrapper's own module prices its next run."""
 
-    def __init__(self, wrapper):
+    def __init__(self, backend: str, wrapper=None):
+        self._backend = backend
         self._wrapper = wrapper
+
+    def _allocations(self, qo, kv_pages, total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size,
+                     enable_cuda_graph, head_dim_qk, head_dim_vo, window_left, fa2_args) -> list:
+        if self._backend != "fa2":
+            return []  # fa3 (SM90) splits no KV: no float workspace (its int layout isn't modelled)
+        return prefill_allocations(
+            qo, kv_pages, int(total_num_rows), int(batch_size), num_qo_heads, num_kv_heads, page_size,
+            bool(enable_cuda_graph), head_dim_qk, head_dim_vo, int(window_left), *fa2_args)
 
     def plan(self, float_workspace, int_workspace, pinned_int_workspace, qo_indptr, kv_indptr, kv_len_arr,
              total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,
              head_dim_qk, head_dim_vo, causal, window_left, *fa2_args) -> list[int]:
         qo, kv_pages, lens = _host(qo_indptr), _host(kv_indptr), _host(kv_len_arr)[:batch_size]
-        self._wrapper._price(qo, kv_pages, lens, num_qo_heads, num_kv_heads, page_size, head_dim_qk,
-                             head_dim_vo, bool(causal), int(window_left))
+        allocate(self._allocations(qo, kv_pages, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
+                                   page_size, enable_cuda_graph, head_dim_qk, head_dim_vo, window_left,
+                                   fa2_args), buffer_bytes(float_workspace))
+        if self._wrapper is not None:
+            self._wrapper._price(qo, kv_pages, lens, num_qo_heads, num_kv_heads, page_size, head_dim_qk,
+                                 head_dim_vo, bool(causal), int(window_left))
         return [int(total_num_rows), int(batch_size), qo[-1], kv_pages[-1], sum(lens)]
+
+    def workspace_size(self, device_buffer, qo_indptr, kv_indptr, kv_len_arr, total_num_rows, batch_size,
+                       num_qo_heads, num_kv_heads, page_size, enable_cuda_graph, head_dim_qk, head_dim_vo,
+                       causal, window_left, *fa2_args) -> tuple[int, int]:
+        """(float, int) workspace bytes a plan of these arguments takes."""
+        return allocate(self._allocations(_host(qo_indptr), _host(kv_indptr), total_num_rows, batch_size,
+                                          num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,
+                                          head_dim_qk, head_dim_vo, window_left, fa2_args), None, None)
 
 
 class DecodePlanner:
@@ -120,6 +310,9 @@ class DecodePlanner:
              head_dim_vo, empty_q_data, empty_kv_data) -> list[int]:
         w = self._wrapper
         kv_pages = _host(indptr)
+        allocate(decode_allocations(kv_pages, batch_size, num_qo_heads, num_kv_heads, page_size,
+                                    bool(enable_cuda_graph), head_dim_qk, empty_kv_data.dtype),
+                 buffer_bytes(float_workspace))
         last = _host(w._paged_kv_last_page_len_buf)
         lens = [paged_kv_len(kv_pages[r + 1] - kv_pages[r], last[r], page_size) for r in range(batch_size)]
         w._price(list(range(batch_size + 1)), kv_pages, lens, num_qo_heads, num_kv_heads, page_size,
@@ -168,8 +361,8 @@ class PagedAttention:
         self._planned = False
         self._cost = (0.0, 0.0)
         # FlashInfer's planner workspaces and per-plan state, as its wrappers keep them
-        self._int_workspace_buffer = torch.empty(8 << 20, dtype=torch.uint8, device=self.device)
-        self._pin_memory_int_workspace_buffer = torch.empty(8 << 20, dtype=torch.uint8, device="cpu")
+        self._int_workspace_buffer = torch.empty(INT_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device)
+        self._pin_memory_int_workspace_buffer = torch.empty(INT_WORKSPACE_BYTES, dtype=torch.uint8, device="cpu")
         self._jit_module = None
         self._cached_module = None
         self._plan_info = None
@@ -263,12 +456,12 @@ class PagedAttention:
                 self._use_cuda_graph, self._window_left, self._logits_soft_cap, head_dim_qk, self._head_dim_vo,
                 torch.empty(0, dtype=self._cached_q_data_type), torch.empty(0, dtype=self._cached_kv_data_type))
         else:
-            self._cached_module = self._cached_module or PrefillPlanner(self)
+            self._cached_module = self._cached_module or PrefillPlanner(self._backend, self)
             args = [*workspaces, as_tensor(qo_host), as_tensor(kv_host), as_tensor(lens),
                     self._max_total_num_rows or total_rows, batch, num_qo_heads, num_kv_heads, page_size,
                     self._use_cuda_graph, head_dim_qk, self._head_dim_vo, self._causal, self._window_left]
-            if self._backend == "fa2":
-                args += [-1, False, 0, 0]  # fixed_split_size, disable_split_kv, num_colocated_ctas, uniform_q_len
+            if self._backend == "fa2":  # fixed_split_size, disable_split_kv, num_colocated_ctas, uniform_q_len
+                args += [-1, False, 0, q_len_per_req if qo_indptr is None and q_len_per_req > 1 else 0]
             self._plan_info = self._cached_module.plan(*args)
 
     def _cuda_core_decode(self) -> bool:
