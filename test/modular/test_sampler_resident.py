@@ -109,7 +109,7 @@ def _expected(cfg: SamplingReqConfig) -> tuple:
 class _Node:
     """A planner over a KV pool and a sampler, driven as the engine drives them."""
 
-    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True, loopback: bool = True):
+    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True):
         self.kv = None
         resources = {}
         if with_kv:
@@ -122,8 +122,6 @@ class _Node:
             self.kv._cg_max_seq_len = 64
             resources["kv"] = self.kv
         self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
-        if loopback:
-            self.sampler.enable_device_loopback_reader()
         resources["sampler"] = self.sampler
         # as warmup does: the runners claim their buffers, then the planner binds
         self.sampler.build_accelerator_graph_buffers(
@@ -214,7 +212,6 @@ class _Node:
             self.kv.plan(kv, ctx)
         self.sampler.plan(smp, ctx)
         assert self.sampler._cg_sampler is graph_sampler
-        ids = self.sampler.loopback_tokens(list(padded)) if self.sampler.has_slot_masters else torch.zeros(bs)
         if self.planner is not None:
             self.planner.flush(ctx.resident_plan)
             # what the capture recorded: each owner's gathers (the sampler's cells), the sample
@@ -239,7 +236,7 @@ class _Node:
         self.sampler.commit(smp, ctx)
         if self.planner is not None:
             self.planner.commit(step, ctx)
-        return SimpleNamespace(ids=ids[:n].tolist(), ctx=ctx, out=out)
+        return SimpleNamespace(ctx=ctx, out=out)
 
 
 def _offset(node: _Node, rid: int) -> int:
@@ -358,28 +355,15 @@ def test_tokens_do_not_depend_on_the_slot_or_the_path(drawn, ingraph):
     assert runs[0] == runs[1]
 
 
-def test_the_loopback_read_takes_each_row_by_its_own_sampler_row(drawn, ingraph):
-    node = _Node(max_bs=2)
-    for rid in (1, 2, 3):
-        node.ingest(rid, _cfg(seed=rid))
-    a = node.decode([1, 2])
-    b = node.decode([3, 1], slot=1)
-    c = node.decode([2, 3])
-    assert b.ids[1] == a.out[0].item()
-    assert c.ids == [a.out[1].item(), b.out[0].item()]
-
-
-def test_a_dropped_draw_keeps_its_offset_and_token(drawn, ingraph):
+def test_a_dropped_draw_keeps_its_offset(drawn, ingraph):
     node = _Node(max_bs=2)
     node.ingest(1, _cfg(seed=1))
     node.ingest(2, _cfg(seed=2))
-    first = node.decode([1, 2])
+    node.decode([1, 2])
     node.decode([1, 2], slot=1, kept=frozenset({1}))
     assert _offset(node, 1) == 3 * STRIDE
     assert _offset(node, 2) == 2 * STRIDE
-    # the next step reads row 2's last kept token
-    s = node.decode([1, 2])
-    assert s.ids[1] == first.out[1].item()
+    node.decode([1, 2])
     assert _offset(node, 2) == 3 * STRIDE
     # and the dropping step's capture keeps every draw again on its next step
     node.decode([1, 2], slot=1)
@@ -531,8 +515,8 @@ def test_a_loop_back_free_sampler_drawing_fifteen_times_a_replay_may_repeat(draw
     moves its own offsets in the graph too: its walk may repeat, and each of
     its 15 draws a replay, in each of 4 replays, is fresh."""
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
-    node = _Node(max_bs=2, with_kv=False, loopback=False)
-    assert not node.sampler.has_slot_masters and node.sampler.repeat_refusal(WALK) is None
+    node = _Node(max_bs=2, with_kv=False)
+    assert node.sampler.repeat_refusal(WALK) is None
     node.ingest(1, _cfg(seed=1))
     node.decode([1], replays=4, draws=15)
     offsets = [row[0][4] for row in drawn]

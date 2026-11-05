@@ -409,9 +409,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             loop="thinker_decode_loop", buffer="new_token", stop_ids=frozenset({config.im_end_token_id}),
             sampler=THINKER_SAMPLER, walk=THINKER_DECODE_WALKS,
         )
-        # thinker_text_decode reads its input ids off the sampler's slot masters
+        # thinker_text_decode reads its input ids off the node's loop-back rows
         self.device_loopback = DeviceLoopback(
-            walk=THINKER_TEXT_DECODE, signal="text_inputs", sampler=THINKER_SAMPLER, buffer="new_token",
+            walk=THINKER_TEXT_DECODE, signal="text_inputs", buffer="new_token",
         )
 
         # Pre-compute inverse frequencies for 3D MRoPE
@@ -507,7 +507,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
         if graph_walk in THINKER_DECODE_WALKS:
             if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-                # read off the sampler's slot master in `preprocess`
+                # read off the node's loop-back rows in `preprocess`
                 return row
             # The previous token, embedded in the graph, or with the step's
             # other decode rows in `preprocess`; its MRoPE position (the same
@@ -853,12 +853,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def _decode_tokens(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs], decode: list[int],
     ) -> torch.Tensor:
-        """The tokens of a mixed step's decode rows, routed or on the sampler's
-        slot master."""
+        """The tokens of a mixed step's decode rows, routed or on the node's
+        loop-back rows."""
         masters = None
         if any(inputs[i].input_ids is None for i in decode):
-            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-            masters = sampler.loopback_tokens(engine_inputs.request_ids)
+            masters = self.loopback_tokens(engine_inputs)
         return torch.cat([
             masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
         ])

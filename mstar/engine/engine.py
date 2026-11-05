@@ -24,10 +24,12 @@ from mstar.engine.accelerator_graph_runner import (
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    output_named,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
+from mstar.engine.loopback_rows import LoopbackRows
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -211,6 +213,11 @@ class SubmoduleManagement:
     carry_refusals: dict[str, str] = field(default_factory=dict)
     # walk -> the step its widest capture declares, for each walk that may repeat
     template_steps: dict[str, SubmoduleStep | None] = field(default_factory=dict)
+    # the node's loop-back values kept on the device by request, where it keeps any
+    loopback_rows: LoopbackRows | None = None
+    # walk -> loop-back signal -> the output holding it, kept in those rows
+    # beside a ``DeviceLoopback``'s, for each walk whose config asks
+    row_signals: dict[str, dict[str, str]] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -764,10 +771,9 @@ class Engine:
                 resources[key] for key in getattr(submodule, "lora_keys", ())
             )
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
-            if loopback is not None:
-                # the sampler keeps its slot masters only for a node that
-                # reads them back on the device (see DeviceLoopback)
-                resources[loopback.sampler].enable_device_loopback_reader()
+            if loopback is not None and knobs.device_loopback_enabled():
+                # a node that reads its token back on the device (see DeviceLoopback)
+                self._submodules[node_name].loopback_rows = LoopbackRows(self._device)
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
         """Put each walk in ``looped`` (those that loop ``node_name``) on
@@ -1392,6 +1398,8 @@ class Engine:
             batch.node_name, (),
         )
         loopback = self._loopback_rows(batch)
+        # a kept signal no model hook reads: its row, as if routed
+        kept = mgmt.row_signals.get(walk, {}) if loopback is not None and not mixed else {}
         # a chunked row is cut from its whole input, so no uniform path
         if not mixed and walk not in keyed_walks and not batch.chunk_ranges:
             uniform = submodule.uniform_row_inputs(
@@ -1422,10 +1430,13 @@ class Engine:
                     else:
                         node_inputs.append(req_inputs)
                     continue
+                row_inputs = tensors.get(rid, {})
+                if kept and loopback[i]:
+                    row_inputs = {**row_inputs, **{s: [mgmt.loopback_rows.row(s, rid)] for s in kept}}
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
-                    inputs=tensors.get(rid, {}),
+                    inputs=row_inputs,
                     resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the
@@ -1571,12 +1582,69 @@ class Engine:
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
-        """The node's loop-back signals it keeps on the device this walk, so
-        the worker routes them without a tensor (see the submodule hook)."""
+        """Loop-back signals of this walk whose per-row value the node keeps in
+        its loop-back rows, so the worker routes them with no tensor: the next
+        step reads them there and every fallback batch arrives with the signal
+        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
+        its last step here kept them; a row without it (e.g. its previous
+        step ran on another rank) brings the tensor. On a walk whose output
+        signals all stay on the device the engine builds no per-request
+        output dicts and does not call ``postprocess``: the stop check, the
+        inline emit and the next step's speculation read the step's rows
+        instead. Only a captured node keeps rows; ``MSTAR_DEVICE_LOOPBACK=0``
+        keeps every node on the tensor path."""
         mgmt = self._submodules.get(node_name)
-        if mgmt is None:
+        if mgmt is None or mgmt.loopback_rows is None or mgmt.accelerator_graph_runner is None:
             return frozenset()
-        return mgmt.submodule.device_loopback_signals(graph_walk)
+        return frozenset(self._row_outputs(mgmt, graph_walk))
+
+    @staticmethod
+    def _row_outputs(mgmt: SubmoduleManagement, graph_walk: str) -> dict[str, str]:
+        """Each signal of ``graph_walk`` the node's rows keep -> its output."""
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        out = dict(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else {}
+        out.update(mgmt.row_signals.get(graph_walk, {}))
+        return out
+
+    def keep_loopback_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
+        """Keep each loop-back signal of this walk (``signals``) in the node's
+        loop-back rows, beside a ``DeviceLoopback``'s; why it can't, or None.
+        After capture: each value must be a buffer of every capture of the
+        walk, one fixed-shape row per request."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return "deployment: it runs on more than one rank"
+        runner = mgmt.accelerator_graph_runner
+        if runner is None:
+            return "runner: the node captures no graphs"
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
+        pairs = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
+        outputs = {signal: pair.output for signal, pair in pairs.items()}
+        if (refusal := runner.row_refusal(graph_walk, outputs)) is not None:
+            return f"runner: {refusal}"
+        if mgmt.loopback_rows is None:
+            mgmt.loopback_rows = LoopbackRows(self._device)
+        mgmt.row_signals[graph_walk] = outputs
+        return None
+
+    def _keep_rows(
+        self, mgmt: SubmoduleManagement, graph_walk: str, rids: Sequence, outputs,
+    ) -> None:
+        """A step's tail: each loop-back value the node keeps on the device,
+        out of ``outputs`` (the step's, or its capture's static ones), into the
+        rows of ``rids`` (padding rows into the trash row)."""
+        rows = mgmt.loopback_rows
+        if rows is None or mgmt.accelerator_graph_runner is None:
+            return  # an eager-only node reads none back (``device_loopback_signals``)
+        # a DeviceLoopback's token on every step that samples one: a mixed
+        # step's decode rows read it next under their own walk
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        kept = {**(loopback.outputs() if loopback is not None else {}), **mgmt.row_signals.get(graph_walk, {})}
+        for signal, output in kept.items():
+            value = output_named(outputs, output)
+            if value is not None:
+                rows.write(signal, rids, value)
 
     def after_output_copy(self, batch: ExecutingBatch) -> None:
         if batch.committed is not None:
@@ -2237,6 +2305,7 @@ class Engine:
             real_seq_len=sum(inp.input_seq_len for inp in inputs[:len(request_ids)]),
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
+            loopback_rows=submodule_mgmt.loopback_rows,
         )
         laps.lap("engine_inputs")
         if nvtx:
@@ -2343,15 +2412,21 @@ class Engine:
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
                     output_spans={**(out.output_spans or {}), **spans} or None,
                 )
+            # the last replay's values, which its static outputs still hold
+            self._keep_rows(
+                submodule_mgmt, graph_walk, engine_inputs.request_ids, cg_runner.slot_for(lease).static_outputs,
+            )
             return out
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return BatchedModelOutput.coerce(
+            out = BatchedModelOutput.coerce(
                 submodule_mgmt.forward_batched(
                     graph_walk, engine_inputs=engine_inputs, **preprocessed
                 )
             )
+            self._keep_rows(submodule_mgmt, graph_walk, engine_inputs.request_ids, out)
+            return out
         assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
@@ -3644,6 +3719,9 @@ class Engine:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides)
+        for submodule_mgmt in self._submodules.values():
+            if submodule_mgmt.loopback_rows is not None:
+                submodule_mgmt.loopback_rows.add(request_id)
         if request_info is None:
             return
         try:
@@ -3683,6 +3761,8 @@ class Engine:
                 submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.resident is not None:
                 submodule_mgmt.resident.release(request_id)
+            if submodule_mgmt.loopback_rows is not None:
+                submodule_mgmt.loopback_rows.drop(request_id)
         return freed
 
     def shutdown(self):

@@ -105,16 +105,19 @@ def test_an_llm_run_of_four_tokens_equals_four_one_token_steps():
     assert torch.equal(columns["new_token"], torch.stack(steps, dim=1))
 
 
-def test_a_mixed_step_reads_a_loop_back_rows_token_by_slot_beside_a_prompt():
-    from types import SimpleNamespace
-
+def test_a_mixed_step_reads_a_loop_back_rows_token_off_the_rows_beside_a_prompt():
     import torch
 
-    from mstar.model.orpheus.submodules import SAMPLER, OrpheusLLMSubmodule
-    from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs, DeviceLoopback, ModelInputsFromEngine
 
     llm = OrpheusLLMSubmodule.__new__(OrpheusLLMSubmodule)
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([41, 42, 43])[: len(rids)])
-    engine_inputs = ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, resources={SAMPLER: sampler})
+    llm.device_loopback = DeviceLoopback(walk="decode", signal="text_inputs", buffer="new_token", input="text_inputs")
+    kept = LoopbackRows(torch.device("cpu"))
+    for rid in (1, 2):
+        kept.add(rid)
+    kept.write("text_inputs", [1, 2], torch.tensor([41, 42]))
+    engine_inputs = ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, loopback_rows=kept)
     rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_ids=torch.tensor([7, 8, 9]), input_seq_len=3)]
     assert llm.preprocess("mixed", engine_inputs, rows)["text_inputs"].tolist() == [41, 7, 8, 9]

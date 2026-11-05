@@ -343,8 +343,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        other than tensor-core (CUDA-core, fa3, cuDNN), or a sampler without the in-graph
        scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
        the node while a request with log-probs is live. At startup the worker logs one line per
-       Loop walk with each capability ``on``, ``off: not asked for``, or
-       ``off: <owner>: <reason>``. A setting other than ``max`` on a node whose ``max`` is
+       Loop walk with each capability (``resident``, ``repeats``, ``rows``) ``on``,
+       ``off: not asked for``, or ``off: <owner>: <reason>``. ``rows``: a node asked for
+       resident planning or repeats keeps its fixed-shape loop-back values in device rows
+       between steps (``mstar.engine.loopback_rows``), so a step whose every output stays on
+       the device routes no tensor. A setting other than ``max`` on a node whose ``max`` is
        1, a name that is no node of the model, and an unknown setting fail loading.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token

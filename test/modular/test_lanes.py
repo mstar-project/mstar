@@ -897,7 +897,7 @@ class _Stops(_Codec):
 
 
 class _Loops(_Codec):
-    device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", sampler="s", buffer="tok")
+    device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", buffer="tok")
 
 
 _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])

@@ -1,5 +1,4 @@
 import logging
-from collections.abc import Mapping
 from dataclasses import asdict
 
 import torch
@@ -10,7 +9,6 @@ from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, 
 from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
-    LoopbackState,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
@@ -26,8 +24,7 @@ from mstar.engine.resources.sampler.utils import (
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
-from mstar.utils.h2d import PinnedStager
-from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
+from mstar.utils.knobs import sampler_ingraph_scatter
 from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
@@ -48,7 +45,6 @@ class SamplerResource(Resource):
         device: torch.device,
         comm_group: JointGroups | None=None,
         enable_min_p: bool = False,
-        loopback_state: Mapping[str, LoopbackState] | None = None,
         max_repetition_window: int = 0,
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
@@ -56,7 +52,6 @@ class SamplerResource(Resource):
         enable_processed_logprobs: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
-        self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
@@ -128,19 +123,11 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler: AcceleratorGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
-        # (cg slot, padded bs) of the step planned last, for the last-token
-        # read in ``loopback_tokens``; None on an eager step
-        self._step_slot: tuple[int, int] | None = None
-        # whether the last sampled token is persisted by slot at all: off until
-        # a node that reads the masters registers (``enable_device_loopback_reader``)
-        self._keep_last_token = False
         # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
         # position after them, so a repeated probe replaces its own entry.
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
         # this step's `SamplerStep.kept_rids`, for the eager draw and the in-graph scatter index
         self._kept_rids: frozenset[int] | None = None
-        # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
-        self._row_stager: PinnedStager | None = None
         # this node's resident rows, once its planner binds this sampler
         self._cells: SamplerCells | None = None
         # (bucket, cg slot) of the step planned last when it is resident, and
@@ -170,7 +157,6 @@ class SamplerResource(Resource):
             device=info.device,
             comm_group=info.joint_comm_group,
             enable_min_p=spec.enable_min_p,
-            loopback_state=spec.loopback_state,
             max_repetition_window=spec.max_repetition_window,
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
@@ -201,7 +187,6 @@ class SamplerResource(Resource):
             # every deciding sampler moves its own RNG offset rows in the graph,
             # a node reading its tokens back or not
             ingraph_scatter=sampler_ingraph_scatter() and self._decides,
-            loopback_state=self._loopback_state,
             **self._scalar_options(),
         )
         self._cg_buffers.cells = self._cells
@@ -406,13 +391,13 @@ class SamplerResource(Resource):
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
 
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
-        """Replays need the offset and the last token to move in the graph.
+        """Replays need the RNG offset to move in the graph.
         Fixed at load, as `_cg_buffers` decides it. What else a draw reads
         moves in the graph too, each replay: the seen-token mask, the
         repetition window and the ``min_tokens`` count, gathered once a step
         and kept after its last replay."""
         if not (sampler_ingraph_scatter() and self._decides):
-            return "it scatters its RNG offsets and last tokens outside the graph"
+            return "it scatters its RNG offsets outside the graph"
         return None
 
     def max_repeats(self, step, ctx) -> int:
@@ -431,7 +416,7 @@ class SamplerResource(Resource):
         if self._cg_buffers is not None:
             self._cg_buffers.attach_cells(self._cells)
         logger.info(
-            "resident planning on %s: sampler %r keeps %s as cells; the RNG offset, last token, "
+            "resident planning on %s: sampler %r keeps %s as cells; the RNG offset, "
             "seen-token mask and history stay by its own rows",
             planner.node, key, ", ".join(f.name for f in self._cells.fields),
         )
@@ -450,7 +435,6 @@ class SamplerResource(Resource):
         self._step_rows = rows = (step.bucket, step.slot)
         self._step_index = self._cells.gather_view(*rows)
         self._cg_sampler = self._cells.sampler_for(self._cg_buffers, *rows)
-        self._step_slot = (step.slot, step.bucket.bs)
 
     def _real_rows_index(self, ctx: StepContext) -> torch.Tensor | None:
         """A resident step's real rows by its own index row; None for a host
@@ -548,14 +532,12 @@ class SamplerResource(Resource):
                 self._cg_sampler = self._preplan_cg_sampler
                 self._preplan_cg_sampler = None
                 self._preplanned = False
-                self._step_slot = (ctx.slot_lease.slot, ctx.slot_lease.bucket.bs)
                 return
 
         # invalidated on the inline path here (not in commit, which now runs
         # before output collection); a preplan must leave the in-flight one be
         if not ctx.is_preplan:
             self._cg_sampler = None
-            self._step_slot = None
             self._step_rows = self._step_index = None
             self._sampler.logprobs = None
         lease = ctx.slot_lease
@@ -591,7 +573,6 @@ class SamplerResource(Resource):
             self._gather_dynamic(ctx, lease)
             laps.lap("dynamic")
             self._cg_sampler = sampler
-            self._step_slot = (cg_slot, padded_bs)
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
@@ -630,12 +611,6 @@ class SamplerResource(Resource):
         kept = self._kept_rids_of(step, ctx)
         keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
         keep_gpu = None
-        if self._keep_last_token and step.loopback_writes:
-            # the forward wrote these per-step rows (``store_loopback_state``)
-            keep_gpu = self._cg_buffers.keep_mask(keep)
-            index = self._real_rows_index(ctx)
-            for name in step.loopback_writes:
-                self._cg_buffers.scatter_loopback(name, ctx.slot_lease.slot, keep=keep_gpu, index=index)
         if self._history is not None:
             # gathered and scattered outside the graph, whichever way the offsets go
             if keep_gpu is None:
@@ -655,9 +630,6 @@ class SamplerResource(Resource):
         index = self._real_rows_index(ctx)
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot, keep=keep_gpu, index=index)
         laps.lap("offset")
-        if self._keep_last_token:
-            self._cg_buffers.scatter_last_token(ctx.slot_lease.slot, keep=keep_gpu, index=index)
-            laps.lap("last_token")
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
@@ -714,10 +686,6 @@ class SamplerResource(Resource):
                 slots, offsets, _rng_offset_stride(logits.device.type, logits.shape[-1]),
                 keep=None if kept is None else bufs.keep_mask([rid in kept for rid in request_ids]),
             )
-        # An eager step has no per-step row to scatter from: write the masters
-        # by request, so the next step can still read its token on the device.
-        if self._keep_last_token and by_slot:
-            bufs.write_last_tokens(request_ids, tokens)
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
@@ -731,73 +699,3 @@ class SamplerResource(Resource):
         rows = self._cg_sampler.logprob_buf if self._cg_sampler is not None else self._sampler.logprobs
         return {} if rows is None else {SAMPLED_LOGPROB: rows}
 
-    def enable_device_loopback_reader(self) -> None:
-        """A node of this sampler declares it reads its last sampled tokens
-        back on the device (``ARNodeSubmodule.device_loopback``). Only then
-        are the slot masters kept: the eager-step write behind them is a small
-        synchronous host-to-device copy per step, and a node that takes its
-        tokens on the host would pay it for nothing. Honours the knob."""
-        self._keep_last_token = device_loopback_enabled()
-
-    @property
-    def has_slot_masters(self) -> bool:
-        """Whether the last sampled token of every request is kept on the
-        device by slot (the graph-buffer path): what the device-side
-        loop-back needs. False on an eager-only node or with the knob off."""
-        return self._cg_buffers is not None and self._keep_last_token
-
-    def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
-        """The last sampled token of each row of this step, as its input ids,
-        read on the device. Under a slot lease the planned slot's index row
-        orders them (padding rows read slot 0); an eager step looks its
-        requests up by slot. Call after ``plan``."""
-        bufs = self._cg_buffers
-        if bufs is None:
-            raise RuntimeError("device loop-back needs the sampler's slot masters")
-        if self._cg_sampler is not None and self._step_slot is not None:
-            cg_slot, padded_bs = self._step_slot
-            return bufs.gather_last_tokens(cg_slot, padded_bs, index=self._step_index)
-        return bufs.last_tokens_for(request_ids)
-
-    def loopback_state(self, name: str, request_ids: list[str]) -> torch.Tensor:
-        """``[rows, width]``: each row's declared loop-back state ``name``
-        (``SamplerSpec.loopback_state``), read like ``loopback_tokens``. A row
-        whose slot was just (re)registered reads the state's default. Call
-        after ``plan``."""
-        bufs = self._cg_buffers
-        if bufs is None:
-            raise RuntimeError("device loop-back needs the sampler's slot masters")
-        if self._cg_sampler is not None and self._step_slot is not None:
-            cg_slot, padded_bs = self._step_slot
-            return bufs.gather_loopback(name, cg_slot, padded_bs, index=self._step_index)
-        return bufs.loopback_for(name, request_ids)
-
-    @torch.compiler.disable
-    def store_loopback_state(self, name: str, request_ids: list[str], values: torch.Tensor) -> None:
-        """This step's new state ``name`` for every row, from the forward.
-        Under a lease it lands in the slot's per-step row (captured with the
-        step) and commit persists it, when the step declares it in
-        ``SamplerStep.loopback_writes``; an eager step writes the slots by
-        request."""
-        bufs = self._cg_buffers
-        if bufs is None:
-            raise RuntimeError("device loop-back needs the sampler's slot masters")
-        if self._cg_sampler is not None and self._step_slot is not None:
-            cg_slot, padded_bs = self._step_slot
-            bufs.loopback[name].slot_view(cg_slot, padded_bs).copy_(values)
-        else:
-            bufs.write_loopback(name, request_ids, values)
-
-    def overwrite_rows(self, rows: list[int], *updates: tuple[torch.Tensor, torch.Tensor]) -> None:
-        """``dst[rows] = src`` for each ``(dst, src)``: the rows of a
-        loop-back read whose last step routed their value as a tensor instead
-        (a request's first decode step). The row index goes up in one
-        non-blocking copy from a pinned buffer the stager holds until it lands."""
-        if not rows:
-            return
-        if self._row_stager is None:
-            self._row_stager = PinnedStager(torch.long, numel=64)
-        index = torch.empty(len(rows), dtype=torch.long, device=updates[0][0].device)
-        self._row_stager.copy_(index, rows)
-        for dst, src in updates:
-            dst.index_copy_(0, index, src.to(dst.dtype))

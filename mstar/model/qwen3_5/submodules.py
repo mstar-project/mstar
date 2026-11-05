@@ -169,9 +169,9 @@ class LLMSubmodule(ARNodeSubmodule):
         self.config = config
         self.vision_config = vision_config
         self.token_stop = token_stop(config.stop_token_ids)
-        # the decode walk reads its input ids off the sampler's slot masters
+        # the decode walk reads its input ids off the node's loop-back rows
         self.device_loopback = DeviceLoopback(
-            walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
+            walk="decode", signal="text_inputs", buffer="new_token",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -384,7 +384,7 @@ class LLMSubmodule(ARNodeSubmodule):
             return self._vision_inputs(fwd_info, inputs)
 
         if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-            # one token per row, read off the sampler's slot master in
+            # one token per row, read off the node's loop-back rows in
             # `preprocess`; the routed signal is empty (or ignored) here
             return row
         input_ids = inputs["text_inputs"][0]
@@ -460,11 +460,10 @@ class LLMSubmodule(ARNodeSubmodule):
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
         ):
             # device loop-back: every row of a decode step is its request's
-            # last sampled token, read by slot (padding rows read slot 0)
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            # last sampled token, off the loop-back rows (padding rows read the trash row)
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = self.loopback_tokens(engine_inputs)
             laps.lap("tokens")
             decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
@@ -584,7 +583,7 @@ class LLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = self.loopback_tokens(engine_inputs)
         if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # the tables come from the planned positions, inside the graph
             # (off a captured decode's per-step critical path); the static

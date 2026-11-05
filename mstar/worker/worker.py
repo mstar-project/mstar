@@ -43,6 +43,7 @@ from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
 )
+from mstar.engine.resources.resident import NOT_ASKED
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
@@ -3009,6 +3010,15 @@ class Worker:
             refusal = engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
         return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk, loop_back(edges))
 
+    def _rows_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why this walk's loop-back values can't stay in the node's device
+        rows between its steps, or None: asked where the node's config asks
+        for resident planning or repeats."""
+        if self._step_repeats.limit(node_name) == 1 and knobs.resident_planning() != "on":
+            return NOT_ASKED
+        edges = self._step_repeats.edges[(node_name, graph_walk)]
+        return self.engine_manager.get_engine(node_name).keep_loopback_rows(node_name, graph_walk, loop_back(edges))
+
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
             return False
@@ -5281,7 +5291,9 @@ class Worker:
         )
         if self._step_repeats is not None:
             # after capture: an attention decides repeats from the kernels it captured
-            self._step_repeats.settle(self.engine_manager.engine.resident_refusal, self._repeat_refusal)
+            self._step_repeats.settle(
+                self.engine_manager.engine.resident_refusal, self._repeat_refusal, self._rows_refusal,
+            )
             self.streams.windows = self._step_repeats.windows()
 
         # Sync every worker before the main loop opens. Per-batch-size

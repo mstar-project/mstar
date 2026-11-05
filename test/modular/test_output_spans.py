@@ -341,7 +341,7 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
 
     stop = TokenStop(loop="loop", buffer="token", stop_ids=frozenset({0}), sampler="s",
                      withhold=("audio", "token"))
-    loopback = DeviceLoopback(walk=WALK, signal="token", sampler="s", buffer="token")
+    loopback = DeviceLoopback(walk=WALK, signal="token", buffer="token")
     talker = {NODE: SimpleNamespace(token_stop=stop, device_loopback=loopback)}
 
     def graph(edge, async_scheduling=False):

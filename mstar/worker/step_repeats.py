@@ -132,18 +132,23 @@ class StepRepeats:
 
     def settle(
         self, resident_refusal: Callable[[str, str], str | None], repeat_refusal: Callable[[str, str], str | None],
+        rows_refusal: Callable[[str, str], str | None] = lambda node, walk: NOT_ASKED,
     ) -> None:
-        """Which walks may repeat, and the line for each."""
+        """Which walks may repeat, and the line for each. ``rows_refusal``:
+        why a walk's loop-back values can't stay in device rows between its
+        steps (``Engine.keep_loopback_rows``)."""
         for key in sorted(self.edges):
             limit = self.limit(key[0])
             resident = resident_refusal(*key)
             repeats = NOT_ASKED if limit == 1 else repeat_refusal(*key)
             if repeats is None:
                 self._walks.add(key)
+            rows = rows_refusal(*key)
             logger.info(
-                "%s/%s: resident %s | repeats %s", *key,
+                "%s/%s: resident %s | repeats %s | rows %s", *key,
                 "on" if resident is None else f"off: {resident}",
                 f"on, up to {limit}" if repeats is None else f"off: {repeats}",
+                "on" if rows is None else f"off: {rows}",
             )
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:

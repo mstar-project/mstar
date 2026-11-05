@@ -274,7 +274,7 @@ Higgs Audio notes
   tower eagerly.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
-- Decode keeps each request's last token in the sampler's slot master and
+- Decode keeps each request's last token in the node's loop-back rows and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
 

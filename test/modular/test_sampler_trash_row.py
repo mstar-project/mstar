@@ -54,7 +54,6 @@ def test_no_request_is_given_row_zero(ingraph):
     bufs._sync_device_capacity()
     grown = graph_rows if ingraph else 2 * cap + 1
     assert bufs.offset.master.shape[0] == grown
-    assert bufs.last_token.master.shape[0] == grown
     assert bufs._rid_to_slot["extra"] > cap
     assert 0 not in bufs._free_slots
 
@@ -94,7 +93,6 @@ def test_capture_rows_take_no_master_rows(ingraph, monkeypatch):
     monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "8")
     max_bs, vocab = 8, 32
     res = SamplerResource(vocab_size=vocab, enable_repetion_penalty=True, device=CPU)
-    res._keep_last_token = ingraph
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=s) for s in (0, 1)], max_bs, 1)
     bufs = res._cg_buffers
     assert bufs.ingraph_scatter == ingraph

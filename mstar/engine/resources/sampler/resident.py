@@ -8,7 +8,7 @@ row of planner slots, so a resident step stages none of them on the host.
 
 What only the device knows stays by the sampler's own row, which a request
 keeps from registration to removal (`SamplerBuffers`): the RNG offset, the
-last token, loop-back state, the seen-token mask and the generation history.
+seen-token mask and the generation history.
 A slot is a cache and a request can lose it, so none of that can live on the
 planner's rows. A resident step reads them by an index row of its sampler
 rows, gathered on the host from what each planner slot holds and uploaded

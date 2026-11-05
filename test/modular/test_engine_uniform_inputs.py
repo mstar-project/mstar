@@ -63,15 +63,18 @@ class _Sub:
     def prepare_inputs(self, **kw):
         self.calls.append(kw["graph_walk"])
         self.row_loopback.append(kw["has_loopback"])
+        self.row_inputs = getattr(self, "row_inputs", []) + [kw["inputs"]]
         return SimpleNamespace(input_seq_len=1)
 
     def can_batch(self, batch, model_inputs):
         return len(model_inputs) > 0
 
 
-def _engine(sub):
+def _engine(sub, rows=None, row_signals=None):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
+    eng._submodules = {"llm": SimpleNamespace(
+        submodule=sub, resources={}, loopback_rows=rows, row_signals=row_signals or {},
+    )}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     # no policies: these steps are not chunked
@@ -173,3 +176,28 @@ def test_other_steps_pad_with_template_clones():
         assert padded[:2] == inputs
         assert all(p.input_ids is not None and p.input_seq_len == 1 for p in padded[2:])
         assert padded[2] is not padded[3]
+
+
+def test_a_row_the_node_kept_reads_its_kept_signal_off_its_row():
+    """A loop-back signal kept in the node's rows (``Engine.keep_loopback_rows``)
+    arrives empty on a row whose last step here kept it; the engine hands
+    ``prepare_inputs`` its row as the routed value would be."""
+    from mstar.engine.loopback_rows import LoopbackRows
+
+    rows = LoopbackRows(torch.device("cpu"))
+    for rid in (1, 2):
+        rows.add(rid)
+    # the last step's tail
+    rows.write("h", [1, 2], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    sub = _Sub(uniform=None)
+    eng = _engine(sub, rows, {"decode": {"h": "h"}})
+    ran = _Batch([1])
+    ran.rows_only = True
+    eng._record_loopback(ran)
+    batch = _Batch([1, 2])
+    batch.per_request_input_tensors = {2: {"h": [torch.tensor([9.0, 9.0])]}}
+    eng.prepare_inputs(batch)
+    assert sub.row_loopback == [True, False]
+    (kept,), (routed,) = sub.row_inputs[0]["h"], sub.row_inputs[1]["h"]
+    assert kept.tolist() == [1.0, 2.0] and routed.tolist() == [9.0, 9.0]
+

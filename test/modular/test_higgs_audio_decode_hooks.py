@@ -12,9 +12,9 @@ from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, HostRows
 
 
-def _submodule(slot_masters=True):
+def _submodule():
     sub = HiggsAudioLLMSubmodule(torch.nn.Linear(1, 1), HiggsAudioModelConfig())
-    sub.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=slot_masters)}
+    sub.node_resources = {SAMPLER: SimpleNamespace()}
     return sub
 
 
@@ -37,20 +37,15 @@ def test_decode_loop_routes_one_signal_to_itself_and_the_client():
     }
 
 
-def test_decode_keeps_its_token_on_the_device_only_with_slot_masters():
+def test_decode_keeps_its_token_on_the_device():
     sub = _submodule()
-    assert sub.device_loopback_signals("decode") == {"text_inputs"}
-    assert sub.device_loopback_signals("prefill_audio") == frozenset()
+    assert sub.device_loopback.walk == "decode" and sub.device_loopback.outputs() == {"text_inputs": "new_token"}
     assert sub.inline_client_signals("decode") == {"text_inputs": "new_token"}
     assert sub.inline_client_signals("prefill_audio") == {}
     row = sub.prepare_inputs("decode", _info(), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs("decode", has_loopback=True).input_seq_len == 1
     assert sub.uniform_row_inputs("decode", has_loopback=False) is None
-
-    eager = _submodule(slot_masters=False)
-    assert eager.device_loopback_signals("decode") == frozenset()
-    assert eager.uniform_row_inputs("decode", has_loopback=True) is None
 
 
 def test_batched_stop_check_agrees_with_the_per_request_one():

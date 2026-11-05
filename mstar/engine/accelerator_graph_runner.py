@@ -642,10 +642,10 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
-def _carried(slot: "AcceleratorGraphSlot", name: str) -> torch.Tensor | None:
-    """The buffer a replay leaves ``name`` in: a row output, a stop buffer, or
-    a packed output under ``__name__``, row i request i."""
-    outputs = slot.static_outputs
+def output_named(outputs, name: str) -> torch.Tensor | None:
+    """The tensor a step's ``outputs`` (``BatchedModelOutput``, or a capture's
+    static ones) leave ``name`` in, row i request i: a row output, a stop
+    buffer, or a packed output under ``__name__``."""
     for buffers, key in (
         (outputs.row_outputs, name), (outputs.check_stop_buffers, name),
         (outputs.packed_outputs, f"__{name}__"),
@@ -1726,7 +1726,10 @@ class AcceleratorGraphRunner:
         # a spanned output's spans, a column a replay like the output itself
         spans = slot.static_outputs.output_spans or {}
         spans_out = {name: spans[name] for name in columns if name in spans}
-        copies = [(_carried(slot, pair.output), slot.static_inputs[pair.input]) for pair in carries.values()]
+        copies = [
+            (output_named(slot.static_outputs, pair.output), slot.static_inputs[pair.input])
+            for pair in carries.values()
+        ]
         stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
         # two names can share a buffer
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
@@ -1757,7 +1760,7 @@ class AcceleratorGraphRunner:
                 continue
             for slot in bucket.slots:
                 for signal, pair in sorted(carries.items()):
-                    source = _carried(slot, pair.output)
+                    source = output_named(slot.static_outputs, pair.output)
                     target = slot.static_inputs.get(pair.input)
                     if source is None or not isinstance(target, torch.Tensor):
                         return f"its capture holds no {pair.output!r} -> {pair.input!r} to carry loop-back {signal!r}"
@@ -1766,6 +1769,28 @@ class AcceleratorGraphRunner:
                             f"loop-back {signal!r} leaves {tuple(source.shape)} in {pair.output!r}, "
                             f"but its input {pair.input!r} is {tuple(target.shape)}"
                         )
+        return None
+
+    def row_refusal(self, walk: str, outputs: Mapping[str, str]) -> str | None:
+        """Why ``walk``'s captures can't keep each loop-back signal's value in
+        a fixed-shape row per request (``outputs``: signal -> the output that
+        holds it), or None: each must be a buffer of every capture, one row
+        per request, the same shape in every bucket."""
+        shapes: dict[str, set[tuple[int, ...]]] = {signal: set() for signal in outputs}
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for signal, output in sorted(outputs.items()):
+                    value = output_named(slot.static_outputs, output)
+                    if value is None:
+                        return f"its capture holds no {output!r} for loop-back {signal!r}"
+                    shapes[signal].add(tuple(value.shape[1:]))
+        for signal, seen in sorted(shapes.items()):
+            if not seen:
+                return "it has no capture"
+            if len(seen) > 1:
+                return f"loop-back {signal!r} changes shape with the bucket"
         return None
 
     def run_column_refusal(self, walk: str, signals: Collection[str]) -> str | None:

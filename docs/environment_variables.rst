@@ -680,16 +680,14 @@ Worker scheduling
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:
-       the sampler writes each request's last token to a slot-addressed
-       master and the next step reads its input ids from it, so the worker
-       routes the signal with no tensor (no per-request store, hold or
-       cleanup per step). Only nodes that declare the read
-       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
-       Whisper, which also keeps its timestamp rule state in the sampler's
-       declared loop-back state) and only when the sampler has graph
-       buffers; the sampler keeps the masters for those nodes alone, so a
-       node that takes its tokens on the host does not pay the eager-step
-       master write. ``0`` keeps every node on the per-request tensor path.
+       each step writes each request's last token into the node's loop-back
+       rows (``mstar.engine.loopback_rows``) and the next step reads its input
+       ids from them, so the worker routes the signal with no tensor (no
+       per-request store, hold or cleanup per step). Only captured nodes that
+       declare the read (``DeviceLoopback``: the decode walks of Qwen3.5,
+       Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and Whisper, which also
+       keeps its timestamp rule state there). ``0`` keeps every node on the
+       per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
@@ -699,13 +697,12 @@ Worker scheduling
        on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``1``
-     - The captured sampler gathers its RNG offsets from the slot masters
-       and scatters the advanced offsets and the sampled tokens back inside
-       the graph, so a replayed decode step issues none of those launches on
+     - The captured sampler gathers its RNG offsets from the slot master
+       and scatters the advanced offsets back inside the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
        postprocess wins). Padding rows, and the rows a step drops
-       (``SamplerStep.kept_rids``), write a trash master row. The offset and
-       last-token masters, which the captured graphs index, are allocated
+       (``SamplerStep.kept_rids``), write a trash master row. The offset
+       master, which the captured graphs index, is allocated
        once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees

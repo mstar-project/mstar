@@ -36,7 +36,7 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
     RecurrentStep,
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
-from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.resident import NOT_ASKED, TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
@@ -434,12 +434,18 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
         ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
     )}
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
-        _repeats(limit, "abc").settle(engine.resident_refusal, engine.repeat_refusal)
+        _repeats(limit, "abc").settle(
+            engine.resident_refusal, engine.repeat_refusal,
+            lambda node, walk: NOT_ASKED if limit == 1 else engine.keep_loopback_rows(node, walk, {"t"}),
+        )
     lines = {line.split(":", 1)[0]: line for line in caplog.messages}
-    want = "resident on | repeats on, up to 4" if limit > 1 else "resident on | repeats off: not asked for"
+    want = (
+        "resident on | repeats on, up to 4 | rows off: runner: the node captures no graphs" if limit > 1
+        else "resident on | repeats off: not asked for | rows off: not asked for"
+    )
     assert lines[f"a/{WALK}"].endswith(want)
     if limit > 1:
-        assert lines[f"b/{WALK}"].endswith("repeats off: resource 'pool': ResidentHooks keeps no per-replay support")
+        assert "repeats off: resource 'pool': ResidentHooks keeps no per-replay support |" in lines[f"b/{WALK}"]
     assert lines[f"c/{WALK}"].startswith(f"c/{WALK}: resident off: resource 'kv': why | repeats off")
 
 
@@ -2320,6 +2326,7 @@ def test_a_resident_preprocess_that_reads_what_the_graph_fills_stops_the_worker(
     submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: read("preprocess"))
     mgmt = SimpleNamespace(
         accelerator_graph_runner=None, submodule=submodule, piecewise_runners={}, fp32_precision=None, resources={},
+        loopback_rows=None,
     )
     ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
     ctx.resident = object()
@@ -2385,9 +2392,9 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     stub = SimpleNamespace(
         _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
+        loopback_tokens=lambda engine_inputs: token,
     )
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2])
     out = llm.preprocess(stub, "decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 

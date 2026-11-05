@@ -135,10 +135,10 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=config.stop_token_ids,
             sampler=self.SAMPLER, walk=DECODE_WALK, prefill_walks=frozenset({PREFILL_WALK}),
         )
-        # decode reads its last token off the sampler's slot masters, and its
+        # decode reads its last token off the node's loop-back rows, and its
         # client token rides inline
         self.device_loopback = DeviceLoopback(
-            walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
+            walk=DECODE_WALK, signal="text_inputs", buffer="new_token",
         )
 
     def get_accelerator_graph_configs(
@@ -183,7 +183,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         **kwargs,
     ) -> ARNodeInputs:
         if (row := self.uniform_row_inputs(graph_walk, kwargs.get("has_loopback", False))) is not None:
-            # one token per row, read off the sampler's slot master in
+            # one token per row, read off the node's loop-back rows in
             # `preprocess`; the routed signal is empty here
             return row
         device = self.get_device()
@@ -229,7 +229,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         if graph_walk == DECODE_WALK:
             if any(inp.input_ids is None for inp in inputs):
                 # device loop-back: every row is its request's last sampled
-                # token, read by slot
+                # token, off the loop-back rows
                 return self.loopback_inputs(engine_inputs, inputs)
             return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}

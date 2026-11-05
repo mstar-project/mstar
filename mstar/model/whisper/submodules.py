@@ -222,7 +222,6 @@ class WhisperEncoderSubmodule(NodeSubmodule):
 # ===================================================================
 
 
-_DECODE_LOOPBACK_WRITES = frozenset({TS_RULES})
 
 
 class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
@@ -284,11 +283,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             loop=self.DECODE_LOOP, buffer="new_token",
             stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
         )
-        # The decode walk reads its last token off the sampler's slot masters and
+        # The decode walk reads its last token off the node's loop-back rows and
         # its timestamp rule state from the sampler's declared loop-back state
         # beside it (`device_loopback_signals`).
         self.device_loopback = DeviceLoopback(
-            walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
+            walk=DECODE_WALK, signal="text_inputs", buffer="new_token", states=(TS_RULES,),
         )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
@@ -392,7 +391,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         **kwargs,
     ) -> ARNodeInputs:
         if (row := self.uniform_row_inputs(graph_walk, kwargs.get("has_loopback", False))) is not None:
-            # the token and its rule state are read by slot in `preprocess`
+            # the token and its rule state are read off the loop-back rows in `preprocess`
             return row
         device = self.get_device()
         if graph_walk == ALIGN_WALK:
@@ -539,12 +538,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 CROSS_ATTN: AttentionStep(
                     segments=context_segments, causal=False,
                 ),
-                SAMPLER: SamplerStep(
-                    apply_penalty=False,
-                    # the decode forward stores its rows' advanced rule state
-                    # (persisted only on the device loop-back path)
-                    loopback_writes=_DECODE_LOOPBACK_WRITES if graph_walk == DECODE_WALK else frozenset(),
-                ),
+                SAMPLER: SamplerStep(apply_penalty=False),
                 POS: PositionStep(),
             },
         )
@@ -572,8 +566,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 "audio_frames": inp.kwargs["audio_frames"],
             }
         if graph_walk == DECODE_WALK and any(inp.input_ids is None for inp in inputs):
-            # the token and its rule state, read by slot
-            return self.loopback_inputs(engine_inputs, inputs, (TS_RULES,))
+            # the token and its rule state, off the loop-back rows
+            return self.loopback_inputs(engine_inputs, inputs)
         rows = [self._row_ids(inp) for inp in inputs]
         device = rows[0].device
         rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
@@ -600,13 +594,6 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 [inp.tensor_inputs["encoder_states"] for inp in inputs], dim=0,
             ))
         return preprocessed
-
-    # -- device loop-back --------------------------------------------------
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        # the token's rule state rides beside it
-        signals = super().device_loopback_signals(graph_walk)
-        return signals | {"ts_rules"} if signals else signals
 
     def _write_context(self, encoder_states: torch.Tensor) -> None:
         self.decoder.write_cross_kv(encoder_states)
@@ -724,10 +711,6 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         # persisted first token.
         if graph_walk == DECODE_WALK:
             rows = {"text_inputs": new_tokens}
-            if next_rules is not None and self._reads_loopback(graph_walk):
-                engine_inputs.resources[SAMPLER].store_loopback_state(
-                    TS_RULES, engine_inputs.request_ids, next_rules,
-                )
         else:
             rows = {"new_token": new_tokens}
         if next_rules is not None:

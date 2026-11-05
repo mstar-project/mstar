@@ -1080,17 +1080,27 @@ def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 10, 11, 12, EOT]
 
 
-def test_decode_loopback_contract(monkeypatch):
-    from mstar.model.whisper.config import SAMPLER
-
+def test_decode_loopback_contract():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
-    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.device_loopback.walk == DECODE_WALK
+    assert sub.device_loopback.outputs() == {"text_inputs": "new_token", "ts_rules": "ts_rules"}
     assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
     row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
-    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
+    # the rule state rides beside the token: a routed row writes both first
+    from mstar.engine.loopback_rows import LoopbackRows
+
+    kept = LoopbackRows(torch.device("cpu"))
+    for rid in (1, 2):
+        kept.add(rid)
+    kept.write("text_inputs", [1], torch.tensor([10]))
+    kept.write("ts_rules", [1], torch.arange(4).reshape(1, 4))
+    routed = sub.prepare_inputs(DECODE_WALK, _fwd(2), {
+        "text_inputs": [torch.tensor([7])], "ts_rules": [torch.arange(4, 8)],
+    })
+    out = sub.loopback_inputs(ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, loopback_rows=kept),
+                              [row, routed])
+    assert out["input_ids"].tolist() == [10, 7]
+    assert out["ts_rules"].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]

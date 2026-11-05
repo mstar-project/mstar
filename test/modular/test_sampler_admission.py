@@ -31,7 +31,6 @@ def _resource(monkeypatch, slots: int, max_bs: int, comm_group=None, ingraph: bo
     monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", str(slots))
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
     res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU, comm_group=comm_group)
-    res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=s) for s in (0, 1)], max_bs, 1)
     return res
 
@@ -43,7 +42,7 @@ def _waiting(rid, node_name):
 def test_a_request_waits_for_a_row_and_takes_the_one_a_removed_request_frees(monkeypatch):
     res = _resource(monkeypatch, slots=2, max_bs=1)
     bufs = res._cg_buffers
-    offset, last_token = bufs.offset.master, bufs.last_token.master
+    offset = bufs.offset.master
     runner = StepRunner({"sampler": res}, node_resources={NODE: ["sampler"]})
     for rid in ("a", "b", "c"):
         res.ingest_request(rid)
@@ -58,7 +57,7 @@ def test_a_request_waits_for_a_row_and_takes_the_one_a_removed_request_frees(mon
     runner.remove_request("a")
     assert runner.admit_waiting(_waiting) == [(NODE, "c")]
     assert bufs._rid_to_slot["c"] == freed and bufs.free_rows == 0
-    assert bufs.offset.master is offset and bufs.last_token.master is last_token
+    assert bufs.offset.master is offset
 
 
 def test_a_row_taken_for_a_request_another_resource_holds_back_is_given_back(monkeypatch):
@@ -104,7 +103,7 @@ def test_a_dropped_rows_offset_stays_uncommitted_through_plan_and_commit(monkeyp
         s = res._cg_sampler
         s.gather_in_graph()
         s.offset_buf += 1
-        s.scatter_in_graph(torch.tensor([5, 6, 0, 0]))
+        s.scatter_in_graph()
         res.commit(sampler_step, ctx)
 
     step(frozenset({1}))

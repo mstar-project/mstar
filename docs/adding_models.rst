@@ -764,9 +764,7 @@ The spec types are:
        ``repetition_penalty`` values of the resident requests.
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
-       ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
-       decode loop keeps on the device beside its last sampled token. See
-       `Device loop-back`_.
+       ``SamplingReqConfig`` above.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -1735,11 +1733,10 @@ resource key:
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
   the stream counters. Pass explicit ids, keyed by plan label, when the model computes
   positions itself.
-- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=, loopback_writes=)``.
+- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=)``.
   ``prefill_tracked_tokens`` initializes the repetition-penalty mask with the prompt
   tokens. Only the prefill step passes them, because the sampler tracks every token it
-  samples afterwards. ``loopback_writes`` names the declared loop-back states this step's
-  forward stores (see `Device loop-back`_).
+  samples afterwards.
 
 The Orpheus declaration is the simplest form. It uses one label, computes spans directly
 from the prepared inputs, and steps all four resources together:
@@ -1885,42 +1882,32 @@ inductor specialize on that integer. The frame is then retraced once per layer.
 
 **Device loop-back.** A decode loop normally routes its sampled token back to itself as a
 tensor per request. An AR node that sets ``self.device_loopback = DeviceLoopback(walk,
-signal, sampler, buffer)`` instead reads each row's last sampled token off the sampler on
-the device (``MSTAR_DEVICE_LOOPBACK``): the base class's ``device_loopback_signals`` names
-the signal, so the worker routes it without a tensor and sends the client's copy inline,
-``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
-``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
-row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.
+signal, buffer)`` instead keeps each request's last token on the device, in the node's
+loop-back rows (``mstar.engine.loopback_rows``, ``MSTAR_DEVICE_LOOPBACK``): each step's tail
+writes the token from its stop buffer ``buffer`` into the rows, the worker routes the signal
+without a tensor and sends the client's copy inline, ``prepare_inputs`` returns
+``self.uniform_row_inputs(...)`` for such a row, and ``preprocess`` reads the tokens with
+``self.loopback_inputs(engine_inputs, inputs)``. A row whose last step did not keep its
+value there (its first decode step, after the prefill) brings it routed, and that read
+writes it into the row first. Qwen3.5, Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and
+Whisper declare it. Only a captured node keeps the rows.
 
-On such a node a captured step writes each row's token and RNG offset back to the request's
-row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
-allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
-admits it and waits while none is free, as it does for a recurrent state slot. A row the
-step drops (``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
+A captured sampler writes each row's RNG offset back to the request's row inside the graph
+(``knobs: sampler_ingraph_scatter``, on by default). Those rows are allocated once,
+``knobs: sampler_slots`` of them, so a request takes its row when the runner admits it and
+waits while none is free, as it does for a recurrent state slot. A row the step drops
+(``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
 
 State that a decode loop carries from step to step beside the token, such as Whisper's
-timestamp rule state, is declared on the sampler, not kept in the model (Whisper adds its
-signal to ``device_loopback_signals`` and passes its name to ``loopback_inputs``):
+timestamp rule state, is named in ``DeviceLoopback(states=...)``: a row output of the same
+name, kept in the rows beside the token and read back by ``loopback_inputs``. A row that
+first reads it brings it routed, as it does its token.
 
-.. code-block:: python
-
-   SamplerSpec(
-       resource_key=SAMPLER, nodes={"decoder"}, vocab_size=vocab,
-       loopback_state={"ts_rules": LoopbackState(
-           width=4, dtype=torch.long, default=tuple(inactive_state()),
-       )},
-   )
-
-The sampler keeps one row per request by slot, grows it with its other per-request
-buffers, and resets a row to ``default`` when its slot is given to a new request. A step
-reads the rows with ``sampler.loopback_state(name, request_ids)`` in ``preprocess`` and
-stores the next ones from the forward with ``sampler.store_loopback_state(name,
-request_ids, values)``. Under a CUDA-graph slot the store is captured into a per-step
-buffer and commit persists it, so the step must list the name in
-``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
-address rows the same way, and the model never sees a slot index.
+A node whose config asks for resident planning or step repeats also keeps its other
+fixed-shape loop-back signals in the rows (the line ``rows on``): a row whose last step
+kept them gets its row as the routed input would be. A signal whose shape changes with the
+capture bucket, a walk with no capture, or a walk on more than one rank says why it can't
+(``rows off: ...``).
 
 .. warning::
 

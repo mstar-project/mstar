@@ -281,9 +281,9 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
             sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_audio"}),
         )
-        # decode reads its input ids off the sampler's slot masters
+        # decode reads its input ids off the node's loop-back rows
         self.device_loopback = DeviceLoopback(
-            walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
+            walk="decode", signal="text_inputs", buffer="new_token",
         )
 
     def get_accelerator_graph_configs(
@@ -327,7 +327,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-            # the token is read off the sampler's slot master in `preprocess`
+            # the token is read off the node's loop-back rows in `preprocess`
             return row
 
         if graph_walk == "prefill_audio":
@@ -393,7 +393,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "decode":
             if all(inp.input_ids is not None for inp in inputs):
                 return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
-            # device loop-back: each row's last sampled token, read by slot
+            # device loop-back: each row's last sampled token, off the loop-back rows
             return self.loopback_inputs(engine_inputs, inputs)
         return {
             "input_embeds": torch.cat(
@@ -413,7 +413,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
 
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = self.loopback_tokens(engine_inputs)
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
         hidden = self.model(input_embeds=input_embeds, label="main")

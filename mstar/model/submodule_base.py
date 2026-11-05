@@ -14,7 +14,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.engine.resources.lora.config import LoraStep
-from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
 # a prefill that sampled a stop token, before its decode loop exists. The
@@ -125,18 +124,15 @@ class CarryPair(NamedTuple):
 
 
 class DeviceLoopback(NamedTuple):
-    """A decode walk whose rows read their last sampled token off the
-    sampler's slot masters instead of a routed tensor
-    (``MSTAR_DEVICE_LOOPBACK``), while the client edge carries the token
-    inline, off the stop check's host copy.
+    """A decode walk whose rows read their last sampled token off the node's
+    device loop-back rows (``mstar.engine.loopback_rows``) instead of a routed
+    tensor (``MSTAR_DEVICE_LOOPBACK``), while the client edge carries the
+    token inline, off the stop check's host copy.
 
     Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks
-    (``uniform_row_inputs``, ``device_loopback_signals``,
-    ``inline_client_signals``) and the read in ``preprocess``
-    (``loopback_inputs``) follow from it. The sampler keeps the masters only
-    for a node that declares this: their eager step write is a small
-    synchronous host-to-device copy per step, which a node that reads its
-    tokens on the host would pay for nothing.
+    (``uniform_row_inputs``, ``inline_client_signals``) and the read in
+    ``preprocess`` (``loopback_inputs``) follow from it. The engine keeps the
+    rows only for a captured node that declares this.
 
     It also names the token's pair for a step that repeats
     (``repeat_carry``): from ``buffer`` to ``input`` between replays.
@@ -145,18 +141,24 @@ class DeviceLoopback(NamedTuple):
     walk: str
     # the input signal the walk's token loops back to
     signal: str
-    # resource key of the sampler keeping the slot masters
-    sampler: str
     # the row-addressed output (``check_stop_buffers`` entry) holding the token
     buffer: str
     # the forward input the token feeds (a key of ``preprocess``'s output)
     input: str = "input_ids"
+    # loop-back signals the walk keeps on the device beside its token, each a
+    # row output of the same name (Whisper's timestamp rule state)
+    states: tuple[str, ...] = ()
+
+    def outputs(self) -> dict[str, str]:
+        """Each signal the rows keep -> the output its value leaves the step in."""
+        return {self.signal: self.buffer, **{name: name for name in self.states}}
 
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.loopback_rows import LoopbackRows
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -821,6 +823,10 @@ class ModelInputsFromEngine:
     # return itself (a walk that packs its rows its own way, say).
     iteration_inputs: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
+    # The node's device loop-back rows, where the engine keeps them; a
+    # ``DeviceLoopback`` walk reads its token there (``loopback_inputs``).
+    loopback_rows: "LoopbackRows | None" = None
+
     @property
     @torch.compiler.disable
     def single_request_info(self):
@@ -1170,22 +1176,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         beside it."""
         del graph_walk, fwd_info
         return prev_seq_len if prev_seq_len >= 0 else None
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        """Loop-back input signals of this walk whose per-row value the node
-        keeps on the device itself (a sampler's slot master), so the worker
-        routes them with no tensor: the next step reads the value in
-        ``preprocess`` and every fallback batch arrives with the signal
-        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
-        its last step here kept the value on the device; a row without it
-        (e.g. its previous step ran on another rank) brings the tensor.
-        On a walk whose output signals all stay on the device the
-        engine builds no per-request output dicts and does not call
-        ``postprocess``: the stop check, the inline emit and the next step's
-        speculation read the step's rows instead. Empty by default;
-        ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""
-        del graph_walk
-        return frozenset()
 
     def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
         """Outputs of this walk that may come with a valid span per row, in
@@ -1615,26 +1605,13 @@ class ARNodeSubmodule(NodeSubmodule):
         loopback = self.device_loopback
         return loopback is not None and graph_walk == loopback.walk
 
-    def _reads_loopback(self, graph_walk: str) -> bool:
-        """Whether this walk's rows read their token off the slot masters: a
-        loop-back walk, the knob on, and a sampler that keeps masters."""
-        return (
-            self._loops_back(graph_walk) and device_loopback_enabled()
-            and self.node_resources[self.device_loopback.sampler].has_slot_masters
-        )
-
     def uniform_row_inputs(
         self, graph_walk: str, has_loopback: bool = False,
     ) -> "NodeInputs | None":
         # the loop-back decode row: one token, read in ``preprocess``
-        if has_loopback and self._reads_loopback(graph_walk):
+        if has_loopback and self._loops_back(graph_walk):
             return ARNodeInputs(input_seq_len=1)
         return super().uniform_row_inputs(graph_walk, has_loopback)
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if self._reads_loopback(graph_walk):
-            return frozenset({self.device_loopback.signal})
-        return super().device_loopback_signals(graph_walk)
 
     def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
         pairs = super().repeat_carry(graph_walk, signals)
@@ -1649,28 +1626,30 @@ class ARNodeSubmodule(NodeSubmodule):
             return {self.device_loopback.signal: self.device_loopback.buffer}
         return super().inline_client_signals(graph_walk)
 
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        """Each row's last sampled token, off the node's loop-back rows
+        (padding rows read the trash row)."""
+        return engine_inputs.loopback_rows.read(self.device_loopback.signal, engine_inputs.request_ids)
+
     def loopback_inputs(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
-        states: tuple[str, ...] = (),
     ) -> dict[str, torch.Tensor]:
-        """A loop-back step's ``input_ids``, and each of the sampler's declared
-        loop-back ``states``, one row per row of the step, read by slot
-        (padding rows read the trash row). A row whose last step did not keep
-        them on the device (its first decode step, after the prefill) brings
-        them routed, in ``input_ids`` and ``tensor_inputs[state]``, and they
-        override its slot's."""
-        sampler = engine_inputs.resources[self.device_loopback.sampler]
+        """A loop-back step's token (as ``device_loopback.input``) and each of
+        its ``states``, one row per row of the step, off the node's loop-back
+        rows. A row whose last step did not keep them there (its first decode
+        step, after the prefill) brings them routed, in ``input_ids`` and
+        ``tensor_inputs[state]``: its rows' first write."""
+        loopback = self.device_loopback
+        rows = engine_inputs.loopback_rows
         rids = engine_inputs.request_ids
-        key = self.device_loopback.input
-        out = {key: sampler.loopback_tokens(rids)}
-        out.update((name, sampler.loopback_state(name, rids)) for name in states)
         routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None and inp.input_seq_len]
         if routed:
-            sampler.overwrite_rows(
-                routed,
-                (out[key], torch.cat([inputs[i].input_ids for i in routed])),
-                *((out[name], torch.stack([inputs[i].tensor_inputs[name] for i in routed])) for name in states),
-            )
+            first = [rids[i] for i in routed]
+            rows.write(loopback.signal, first, torch.cat([inputs[i].input_ids for i in routed]))
+            for name in loopback.states:
+                rows.write(name, first, torch.stack([inputs[i].tensor_inputs[name] for i in routed]))
+        out = {loopback.input: rows.read(loopback.signal, rids)}
+        out.update((name, rows.read(name, rids)) for name in loopback.states)
         return out
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
