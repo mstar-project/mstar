@@ -3572,25 +3572,43 @@ class Worker:
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
         """Why N's verdict voids a head built on it, or ``None``. Both fields are
-        final once N's future is done; the leader clears on exactly these two."""
+        final once N's result is taken (``_step_result``); the leader clears on exactly these two."""
         if pending.node_batch.admit_error is not None:
             return "admit_error"
         if pending.node_batch.failed_requests:
             return "failed rids"
         return None
 
+    def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
+        """N's outputs. A forward that raised becomes N's verdict instead: no
+        outputs and every row failed (``failed_requests``), which voids a head
+        built on N and lets a step independent of N run, on every rank alike.
+        Dropping such a step on one rank only would leave the others in its
+        collectives."""
+        try:
+            return pending.future.result()
+        except Exception as exc:
+            err, _ = client_error_text(
+                exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
+                log=logger,
+            )
+            failed = pending.node_batch.failed_requests
+            for rid in pending.batch.request_to_worker_graph:
+                failed.setdefault(rid, f"Error in worker: {err}")
+            return BatchedModelOutput()
+
     def _await_tp_follow_step(
         self, pending: PendingBatch, arm: Callable[[Speculation], None],
-    ) -> tuple[dict[int, NameToTensorList] | None, Speculation | None]:
+    ) -> tuple[BatchedModelOutput | None, Speculation | None]:
         """Wait for step N and settle the leader's decision about N+1. Returns
         ``(outputs or None, armed head or None)``. Once N is done this never
         returns without a decision: going serial early strands the leader."""
         s = pending.tp_seq
-        outputs: dict[int, NameToTensorList] | None = None
+        outputs: BatchedModelOutput | None = None
         t_done = last_warn = 0.0
         while True:
             if outputs is None and pending.future.done():
-                outputs = pending.future.result()
+                outputs = self._step_result(pending)
                 t_done = last_warn = _time.perf_counter()
             if s in self._tp_nospec:
                 return outputs, None
@@ -4723,7 +4741,7 @@ class Worker:
 
     def _drop_failed_rids(
         self, pending: PendingBatch,
-        outputs: dict[int, NameToTensorList],
+        outputs: BatchedModelOutput,
         failed_requests: Collection[int],
     ) -> None:
         """Excise ``failed_requests`` (rids, or a rid -> error map) from a finished batch.
@@ -4742,6 +4760,7 @@ class Worker:
             outputs.pop(rid, None)
             pending.batch.discard_rid(rid)
             pending.node_batch.per_request_info.pop(rid, None)
+            pending.node_batch.cached_rids.discard(rid)
             # Clear what we just reported, so a later stage that fails more
             # rids (check_stop, below the forward) can tell its own from these
             # and doesn't report them to the conductor twice.
@@ -4763,8 +4782,8 @@ class Worker:
     ) -> None:
         """Fail everything the crashed iteration touched and drain its futures.
 
-        Attribution is batch-granular here: a raise out of the forward, the
-        batch build, or output routing can't be pinned on one request (the
+        Attribution is batch-granular here: a raise out of the batch build or
+        output routing can't be pinned on one request (the
         stages that *can* attribute report through
         ``ExecutingBatch.failed_requests`` instead), so every rid this iteration
         touched fails together. Sequential retry of the batch — see the design
@@ -4774,10 +4793,8 @@ class Worker:
         The caller still has to clear its own in-flight state; see the main
         loop's handler.
         """
-        # The exception is usually surfacing out of ``pending.future.result()``,
-        # where the concurrent.futures machinery has already wrapped the
-        # engine's traceback. Report the leaf exception to the client and keep
-        # the full chain in the log.
+        # Report the leaf exception to the client and keep the full chain in
+        # the log. A forward's own raise doesn't come here (``_step_result``).
         err, _ = client_error_text(
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
@@ -4791,8 +4808,8 @@ class Worker:
             self._clear_in_flight_flag(stale.batch)
             # Drain before dropping the reference: the future owns engine state
             # on the GPU thread, and an abandoned one leaves that thread writing
-            # into a batch nobody will collect. Already-finished futures (the
-            # common case — one of them is what just raised) return at once.
+            # into a batch nobody will collect. Already-finished futures return
+            # at once.
             if stale.future is None:
                 continue
             try:
@@ -5308,7 +5325,7 @@ class Worker:
                 # with GPU(N+1).
                 spec_pending = None
                 if pending is not None:
-                    outputs: dict[int, NameToTensorList] | None = None
+                    outputs: BatchedModelOutput | None = None
                     if speculation is None and self._is_tp_follow_pending(pending):
                         # Follower: watch for the head while N runs and settle
                         # the leader's decision before N is post-processed.
@@ -5327,7 +5344,7 @@ class Worker:
                         if self.enable_nvtx:
                             range_push("worker.await_gpu", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
-                        outputs = pending.future.result()
+                        outputs = self._step_result(pending)
                         if phase_period:
                             _phase_record("await_gpu", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
