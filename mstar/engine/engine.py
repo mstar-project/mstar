@@ -165,7 +165,8 @@ def _last_iteration_loops_back(outputs: dict, columns: Collection[str], loop_bac
     for signal in loop_back:
         values = outputs.get(signal)
         if values and all(id(t) in kept for t in values):
-            outputs[signal] = [run_item(t, -1) for t in values]
+            # a one-element iteration as a view of the row: no kernel a row a step
+            outputs[signal] = [t.reshape(-1)[-1:] if t.numel() == t.shape[1] else run_item(t, -1) for t in values]
 
 
 def node_lanes_of(walk_lanes: Mapping[tuple[str, str], int]) -> dict[str, int]:

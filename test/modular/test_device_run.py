@@ -585,7 +585,9 @@ def test_a_loop_back_aliasing_a_run_column_goes_on_as_its_last_iteration():
     )
     outputs = BatchedModelOutput(per_rid_outputs={1: {"new_token": [torch.tensor([[4, 5, 6]])]}})
     engine._postprocess_batch(batch, outputs)
-    assert outputs.get(1)["text_inputs"][0].tolist() == [6]
+    token = outputs.get(1)["text_inputs"][0]
+    assert token.tolist() == [6] and token.stride() == (1,), "a routed edge's byte view takes it"
+    assert token.data_ptr() == outputs.get(1)["new_token"][0][0, 2:].data_ptr(), "a view: no kernel a row"
     assert outputs.get(1)["new_token"][0].tolist() == [[4, 5, 6]], "the client's items are the whole column"
     ctx.repeats = 1
     outputs = BatchedModelOutput(per_rid_outputs={1: {"new_token": [torch.tensor([7])]}})
