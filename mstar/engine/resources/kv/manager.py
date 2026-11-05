@@ -705,8 +705,9 @@ class KVManager(AttentionResource):
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
         # Every rank of a leading pool keeps the allotments and earmarks and refuses a grant past the room.
-        # Rank 0 alone decides: it asks, takes allotments and chooses victims, and the other ranks replay its moves,
-        # so each rank admits a step from the same counts.
+        # Rank 0 alone makes the decisions that read state the other ranks lack: it asks, takes allotments and
+        # chooses victims, and the other ranks replay its moves. Every rank works out the rest itself, so each rank
+        # admits a step from the same counts.
         self._counts = leads
         self._decides = leads and self._rank == 0
         self._trails_counts = _DEBUG_ASSERTS and leads and self._world_size > 1
@@ -4613,19 +4614,13 @@ class KVManager(AttentionResource):
         self._asks[rid] = pages
         return None
 
-    def _sets_aside(self, rid: str, pages: int) -> bool:
-        """Whether the host sets ``pages`` aside for ``rid``'s move there. A pool that decides asks the host and
-        journals the answer. The other ranks replay it, since they ask for ``rid`` only as they replay its
-        reservation, by when other moves can have changed the host's room."""
-        if self._cpu_pool is None:
-            return False
-        if not self._decides:
-            return rid in self._cpu_pool.reserved
-        if not self._cpu_pool.reserve(rid, pages):
-            return False
-        if self.journal is not None:
-            self.journal(MoveKind.SET_ASIDE, rid, pages)
-        return True
+    def _sets_aside(self, rid: str) -> bool:
+        """Whether the host has the room ``rid`` needs to be admitted. A request that can move only there, and has
+        neither an allotment nor room set aside, gets room for its prompt set aside now."""
+        return (
+            rid in self._allotments or self._overrides[rid].rebuildable or rid in self._guaranteed
+            or rid in self._cpu_pool.reserved or self._cpu_pool.reserve(rid, self._asks[rid])
+        )
 
     def _footprint(self, rid: str) -> int:
         """The pages ``rid`` would hold once the loops this worker runs reach their caps."""
@@ -4655,11 +4650,12 @@ class KVManager(AttentionResource):
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
             # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
             # grows it page by page. With no room for even that, the request reserves what it grows into.
-            if (
-                rid not in self._allotments and not self._overrides[rid].rebuildable and rid not in self._guaranteed
-                and rid not in self._cpu_pool.reserved and not self._sets_aside(rid, self._asks[rid])
-            ):
-                self._guarantee(rid, self._footprint(rid))
+            if not self._sets_aside(rid):
+                self._guarantee(rid)
+                self._asks[rid] = self._footprint(rid)
+                # the other ranks replay the flip, since it can come passes before the reservation they replay
+                if self.journal is not None:
+                    self.journal(MoveKind.GUARANTEE, rid, self._asks[rid])
                 pages = self._need(rid, node_name, graph_walk, published)
                 if pages > room:
                     return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
@@ -4685,37 +4681,25 @@ class KVManager(AttentionResource):
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
             # a request that holds nothing waits in the queue with no room set aside on the host
-            gives_back = (
-                self._cpu_pool is not None and rid in self._cpu_pool.reserved and self._unwritten(rid)
-                and not self._on_host(rid)
-            )
-            if gives_back:
+            if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
                 self._cpu_pool.unreserve(rid)
             if self.journal is not None:
-                self.journal(MoveKind.UNRESERVE, rid, int(gives_back))
+                self.journal(MoveKind.UNRESERVE, rid, 0)
 
-    def _guarantee(self, rid: str, pages: int) -> None:
-        """Make ``rid`` guaranteed, since the host has no room to set aside for its move. It then asks for
-        ``pages``, or holds an allotment of ``pages`` once it has one."""
+    def _guarantee(self, rid: str) -> None:
+        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
         self._guaranteed.add(rid)
         self._cpu_pool.unreserve(rid)
         if self._decides:
             self._cpu_pool.count_guaranteed(rid)
-        allotment = self._allotments.get(rid)
-        if allotment is None:
-            self._asks[rid] = pages
-        else:
-            allotment.pages = pages
-            self._recount(rid)
-        if self.journal is not None:
-            self.journal(MoveKind.GUARANTEE, rid, pages)
 
-    def _cover_move(self, rid: str, n: int) -> int:
+    def _cover_move(self, rid: str, n: int, undoable: bool) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
         when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
-        nothing."""
-        # rank 0 decides, and the other ranks replay its SET_ASIDE and GUARANTEE
-        reserved = None if self._cpu_pool is None or not self._decides else self._cpu_pool.reserved.get(rid)
+        nothing.
+
+        ``undoable`` changes neither, as `_grant` with it evicts nothing, and returns ``n`` when one was due."""
+        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
         if reserved is None:
             return 0
         # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
@@ -4723,14 +4707,20 @@ class KVManager(AttentionResource):
             len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
             for stream in self._streams[rid].values()
         )
-        if held + n <= reserved or self._sets_aside(rid, held + n):
+        if held + n <= reserved:
+            return 0
+        if undoable:
+            return n
+        if self._cpu_pool.reserve(rid, held + n):
             return 0
         allotment = self._allotments[rid]
         grows = max(0, self._footprint(rid) - held)
         short = grows - allotment.remaining - self._room()
         if short > 0:
             return short
-        self._guarantee(rid, self._held(rid) + grows)
+        self._guarantee(rid)
+        allotment.pages = self._held(rid) + grows
+        self._recount(rid)
         return 0
 
     def grew_since(self, mark: RoomMark) -> bool:
@@ -5011,6 +5001,11 @@ class KVManager(AttentionResource):
                     self._asks[rid] = count
                 elif (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
+                elif not self._sets_aside(rid):
+                    raise RuntimeError(
+                        f"KV {self.name}: rank 0 reserved {rid} with host room set aside, and this rank's host has "
+                        "no room for it"
+                    )
                 self._reserve(rid, count)
             elif kind == MoveKind.OFFLOAD:
                 stale = [victim for victim in victims if victim not in self._streams]
@@ -5022,10 +5017,9 @@ class KVManager(AttentionResource):
                 self._host(rid, victims)
             elif kind == MoveKind.UNRESERVE:
                 self.unreserve(rid)
-            elif kind == MoveKind.SET_ASIDE:
-                self._cpu_pool.reserved[rid] = count
             elif kind == MoveKind.GUARANTEE:
-                self._guarantee(rid, count)
+                self._guarantee(rid)
+                self._asks[rid] = count
             elif kind == MoveKind.ALLOT:
                 self._claim(rid, count)
 
@@ -5276,7 +5270,7 @@ class KVManager(AttentionResource):
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
             if num_new_pages > 0:
-                short = self._cover_move(request_id, num_new_pages)
+                short = self._cover_move(request_id, num_new_pages, undoable)
                 allotment = self._allotments.get(request_id)
                 within = 0 if allotment is None else min(num_new_pages, allotment.remaining)
                 new_pages = None if short else self._grant(

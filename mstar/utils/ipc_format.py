@@ -181,8 +181,8 @@ class Move(NamedTuple):
     rid: str
     kind: MoveKind
     # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
-    # `count` is the number of pages of a RESERVE, an EARMARK, a SET_ASIDE or an ALLOT, the pages a GUARANTEE asks
-    # for or allots, the tokens a DROP's rebuild writes, and for an UNRESERVE 1 when it gave the host's room back.
+    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE asks for, and the
+    # tokens a DROP's rebuild writes.
     pool: str = ""
     count: int = 0
     victims: tuple[str, ...] = ()

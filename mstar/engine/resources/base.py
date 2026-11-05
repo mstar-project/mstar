@@ -150,10 +150,9 @@ class MoveKind(IntEnum):
     UNRESERVE = 3
     EARMARK = 4
     DROP = 5
-    SET_ASIDE = 6
-    LAND = 7
-    GUARANTEE = 8
-    ALLOT = 9
+    LAND = 6
+    GUARANTEE = 7
+    ALLOT = 8
 
 
 class Resource(ResidentHooks, ABC):
