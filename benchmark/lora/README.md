@@ -116,9 +116,11 @@ What to read:
 
 * `base-captured` against `off-captured` at c=32/64: the price of turning LoRA on
   for traffic that does not use it (the zero-adapter rows still run the kernels,
-  which exit at once), which includes resident decode planning, off on the LLM node
-  with a `lora:` block (the pool keeps no resident table yet). Expect `res.plan.lora` in tens of microseconds and
-  `worker.gpu_thread.exec` close to `off`.
+  which exit at once). Expect `res.plan.lora` in tens of microseconds. It includes
+  resident decode planning (#1127), which a `lora:` block turns off on the LLM node
+  (the pool keeps no resident table yet): `base` plans decode on the host, so its
+  other `res.plan.*` decode rows, which `off` no longer has, and a lower tok/s on the
+  CPU-bound 0.8B are that cost, not the kernels'.
 * `adapters-captured` against `base-captured`: the kernels' GPU time
   (`worker.postprocess.event_sync` grows if the step is GPU-bound) and tok/s.
 * `*-eager` against `*-captured`: the graphs' win with adapters, which was the
@@ -127,7 +129,8 @@ What to read:
 Any `failed` request in a `load_c*.json` invalidates that run.
 
 A step none of whose rows names an adapter replays a capture with no LoRA kernel in it
-(an idle capture, see "Idle captures" in `docs/adding_models.rst`). On an H200 with
+(an idle capture, see "Idle captures" in `docs/adding_models.rst`). Measured before
+main had resident decode planning (#1127), on an H200 with
 `compare_engines` (3 rounds, per-arm `e_off`), Qwen3.5-9B base-model traffic (GPU-bound)
 kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without it and
 100.0/99.8/100.4% with it; one-adapter and mixed traffic did not move, and 0.8B
