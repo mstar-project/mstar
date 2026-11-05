@@ -1368,7 +1368,9 @@ Cosmos3 environment requirements
   pip-installable).
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
-  automatically.
+  automatically. On AMD GPUs the decode runs in bf16, MIOpen's fast conv3d
+  dtype. ``COSMOS3_VAE_DECODE_FP32`` (``WAN22_VAE_DECODE_FP32`` for Wan2.2)
+  forces either choice.
 - Two GPUs (H200 numbers, measured before the Cosmos3-Edge Blackwell changes,
   so the one-GPU baselines are older): ``configs/cosmos3_nano_sp2.yaml`` halves
   one request's denoise (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while

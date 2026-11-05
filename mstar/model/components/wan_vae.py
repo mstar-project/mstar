@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
 from torch import nn
 
+from mstar.platforms import current_platform
+
 
 class ChannelsLastCausalConv3d(WanCausalConv3d):
     """``WanCausalConv3d`` whose input reaches the kernel channels-last.
@@ -306,17 +308,27 @@ def decode_causal(
 
 
 def decode_dtype(fp32_env: str | None = None) -> torch.dtype:
-    """The decode dtype a Wan VAE decoder node runs in, read from the live cuDNN.
+    """The decode dtype a Wan VAE decoder node runs in, read from the live conv library.
 
     cuDNN ships fast Hopper bf16 conv3d for this decode only from 9.16; before
     that bf16 is 2-10x slower than fp32/TF32 (measured via a single-variable
-    cuDNN swap), so an upgrade flips the choice on its own. ``fp32_env`` names
+    cuDNN swap), so an upgrade flips the choice on its own. On ROCm bf16 is the
+    fast one (3.5x vs fp32 on an MI300X), and ``cudnn.version()`` there is
+    MIOpen's, so it can't be compared to 9.16. ``fp32_env`` names
     the model's override variable, if it has one: set, it forces fp32, or bf16
     when it is 0/false/no/off."""
     override = os.environ.get(fp32_env) if fp32_env else None
     if override is not None:
         return torch.bfloat16 if override.lower() in ("0", "false", "no", "off") else torch.float32
+    if current_platform.is_rocm():
+        return torch.bfloat16
     return torch.bfloat16 if (torch.backends.cudnn.version() or 0) >= 91600 else torch.float32
+
+
+def conv_library_version() -> str:
+    """Conv library name and version, for logging."""
+    library = "MIOpen" if current_platform.is_rocm() else "cuDNN"
+    return f"{library} {torch.backends.cudnn.version()}"
 
 
 class FastDecoder:
